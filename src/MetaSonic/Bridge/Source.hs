@@ -721,7 +721,15 @@ per-UGen cases for 'BusOut' / 'BusIn' because their effect annotation
 inferKind :: UGen -> NodeKind
 inferKind = uvKind . ugenView
 
--- | Infer the rate of a UGen from its kind.
+-- | Infer the *kind-level minimum* rate of a UGen — its floor.
+--
+-- This is only the first half of rate assignment. The actual rate of
+-- a node in a compiled graph is computed by
+-- 'MetaSonic.Bridge.IR.propagateRates', which lifts each node's rate
+-- to the join of its inputs' rates and this floor. So a 'Gain' (floor
+-- 'CompileRate') fed by a 'SinOsc' (floor 'SampleRate') ends up with
+-- 'irRate = SampleRate' after propagation, even though 'inferRate'
+-- alone returns 'CompileRate'.
 --
 -- Derived from the 'kindSpec' table via 'ugenView'. See Note [Per-kind
 -- metadata table] in "MetaSonic.Types" and Note [Rate inference vs rate

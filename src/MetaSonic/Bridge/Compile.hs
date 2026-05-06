@@ -85,13 +85,18 @@ allow CompileRate nodes into any region (since their value is
 known statically), or allow BlockRate nodes into SampleRate
 regions with automatic sample-and-hold at the region boundary.
 
-Rate assignment itself affects region formation: if inferRate
-in MetaSonic.IR unconditionally marks Gain as SampleRate, a
-Gain fed by two BlockRate inputs can never be placed in a
-block-rate region, even when that would be correct and more
-efficient.
+Rate assignment is computed by 'MetaSonic.Bridge.IR.propagateRates'
+before this pass runs: each node's 'irRate' is the join of its
+kind's floor rate and the rates of its inputs. So a 'Gain' fed by
+two 'Param' literals receives 'irRate = CompileRate' and forms (or
+joins) a CompileRate region; the same 'Gain' fed by a 'SinOsc'
+receives 'irRate = SampleRate' and joins a sample-rate region. This
+is what makes region formation non-degenerate — pre-propagation
+every node was unconditionally SampleRate, so the entire graph
+formed one region.
 
-See Note [Rate inference vs rate propagation] in MetaSonic.IR.
+See Note [Rate inference vs rate propagation] in
+"MetaSonic.Bridge.IR".
 -}
 
 {- Note [Why greedy extension is correct but not optimal]

@@ -362,7 +362,10 @@ unitTests = testGroup "Unit tests"
                 out 0 o
           busEdges g @?= []
 
-      , testCase "feedback graph through busInDelayed topologically sorts" $ do
+      , -- Rate propagation tests live just below; rate machinery
+        -- and bus machinery share the same IR pipeline so it's
+        -- convenient to keep them adjacent.
+        testCase "feedback graph through busInDelayed topologically sorts" $ do
           -- This is the smoke test for the whole Phase 2 design: a
           -- graph whose only "cycle" closes through BusInDelayed must
           -- be accepted by the scheduler. Replacing busInDelayed with
@@ -380,6 +383,142 @@ unitTests = testGroup "Unit tests"
             Left err -> assertFailure $
               "feedback graph through busInDelayed should sort, got: " <> err
             Right _  -> pure ()
+      ]
+
+  , -- Rate propagation: 'inferRate' returns each kind's *floor*; the
+    -- post-lowering pass 'propagateRates' lifts a node's rate to the
+    -- join of its inputs and that floor. These tests pin the matrix
+    -- of floor × input-rate combinations (stateful kinds stay at
+    -- SampleRate; stateless transforms inherit; pure-Param subgraphs
+    -- collapse to CompileRate).
+    --
+    -- See Note [Rate inference vs rate propagation] in
+    -- "MetaSonic.Bridge.IR".
+    testGroup "Rate propagation"
+      [ testCase "kind floors: producers SampleRate, transforms CompileRate" $ do
+          ksRate (kindSpec KSinOsc)        @?= SampleRate
+          ksRate (kindSpec KSawOsc)        @?= SampleRate
+          ksRate (kindSpec KNoiseGen)      @?= SampleRate
+          ksRate (kindSpec KLPF)           @?= SampleRate
+          ksRate (kindSpec KEnv)           @?= SampleRate
+          ksRate (kindSpec KBusIn)         @?= SampleRate
+          ksRate (kindSpec KBusInDelayed)  @?= SampleRate
+          ksRate (kindSpec KGain)          @?= CompileRate
+          ksRate (kindSpec KAdd)           @?= CompileRate
+          ksRate (kindSpec KOut)           @?= CompileRate
+          ksRate (kindSpec KBusOut)        @?= CompileRate
+
+      , testCase "SinOsc: floor wins over Param inputs (still SampleRate)" $ do
+          let g = runSynth $ do
+                _ <- sinOsc 440.0 0.0
+                pure ()
+          rateOfFirst KSinOsc g @?= SampleRate
+
+      , testCase "Pure-Param Gain stays at CompileRate" $ do
+          -- Both inputs are Param literals (CompileRate); Gain's floor
+          -- is CompileRate; the join is CompileRate. A future pass
+          -- could fold this away — for now, assert it's at least
+          -- annotated correctly.
+          let g = runSynth $ do
+                _ <- gain (Param 0.5) (Param 0.3)
+                pure ()
+          rateOfFirst KGain g @?= CompileRate
+
+      , testCase "Gain fed by SinOsc lifts to SampleRate" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                _ <- gain o 0.5
+                pure ()
+          rateOfFirst KGain g @?= SampleRate
+
+      , testCase "Out inherits its input's rate" $ do
+          -- Audio-driven Out → SampleRate.
+          let gAudio = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                out 0 o
+          rateOfFirst KOut gAudio @?= SampleRate
+          -- Param-driven Out → CompileRate.
+          let gParam = runSynth $ out 0 (Param 0.0)
+          rateOfFirst KOut gParam @?= CompileRate
+
+      , testCase "Stateful LPF keeps SampleRate even with all-Param inputs" $ do
+          -- LPF's biquad delay state cannot be coarsened, so its floor
+          -- is SampleRate regardless of input rates.
+          let g = runSynth $ do
+                _ <- lpf (Param 0.0) (Param 800.0) (Param 0.7)
+                pure ()
+          rateOfFirst KLPF g @?= SampleRate
+
+      , testCase "Add: CompileRate when both Param, SampleRate when one is audio" $ do
+          let gConst = runSynth $ do
+                _ <- add (Param 1.0) (Param 2.0)
+                pure ()
+          rateOfFirst KAdd gConst @?= CompileRate
+          let gMix = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                _ <- add (Param 1.0) o
+                pure ()
+          rateOfFirst KAdd gMix @?= SampleRate
+
+      , testCase "multi-hop chain: every downstream node lifts to SampleRate" $ do
+          -- SinOsc → Gain → Gain → Out: the SampleRate floor at the
+          -- source propagates all the way to the sink.
+          let g = runSynth $ do
+                o   <- sinOsc 440.0 0.0
+                g1  <- gain o 0.7
+                g2  <- gain g1 0.5
+                out 0 g2
+          case lowerGraph g of
+            Left err -> assertFailure $ "lowerGraph failed: " <> err
+            Right ir ->
+              let rates = map irRate (giNodes ir)
+              in assertEqual
+                   "every node along the chain should be SampleRate"
+                   (replicate (length rates) SampleRate)
+                   rates
+
+      , testCase "disjoint subgraphs: CompileRate and SampleRate coexist" $ do
+          -- One subgraph runs on Params only (Gain Param Param); the
+          -- other is audio-driven (SinOsc → Out). Expect at least one
+          -- of each rate among the lowered nodes.
+          let g = runSynth $ do
+                _   <- gain (Param 0.5) (Param 0.3)  -- CompileRate cluster
+                o   <- sinOsc 440.0 0.0              -- SampleRate
+                out 0 o                              -- SampleRate via inherit
+          case lowerGraph g of
+            Left err -> assertFailure $ "lowerGraph failed: " <> err
+            Right ir -> do
+              let rates = map irRate (giNodes ir)
+              assertBool
+                ("expected at least one CompileRate node, got " <> show rates)
+                (CompileRate `elem` rates)
+              assertBool
+                ("expected at least one SampleRate node, got " <> show rates)
+                (SampleRate `elem` rates)
+
+      , testCase "BusOut/BusIn through-graph: rates lift to SampleRate" $ do
+          -- BusOut floor is CompileRate but its input (SinOsc) is
+          -- SampleRate, so the BusOut node ends up SampleRate. BusIn
+          -- floor is SampleRate (intrinsic).
+          let g = runSynth $ do
+                o   <- sinOsc 440.0 0.0
+                busOut 5 o
+                tap <- busIn 5
+                out 0 tap
+          rateOfFirst KBusOut g @?= SampleRate
+          rateOfFirst KBusIn  g @?= SampleRate
+
+      , testCase "propagateRates is idempotent" $ do
+          -- Running propagation twice must yield the same IR as
+          -- running it once. This is the post-condition of a
+          -- correctly-defined fixed-point lift.
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                g1 <- gain o 0.7
+                out 0 g1
+          case lowerGraph g of
+            Left err -> assertFailure err
+            Right ir -> propagateRates (propagateRates ir) @?= ir
       ]
 
   , testCase "kindTag is injective" $
@@ -445,6 +584,20 @@ cycleGraph = SynthGraph $ M.fromList
     , NodeSpec (NodeID 1) "gain-b"
         (Gain (Audio (NodeID 0) (PortIndex 0)) (Param 0.5)) )
   ]
+
+-- | The propagated 'irRate' of the first node of the given kind in
+-- the lowered IR. The rate-propagation unit tests use this to assert
+-- per-kind rate outcomes after 'lowerGraph' (which runs
+-- 'propagateRates' as part of its pipeline). Errors loudly when the
+-- graph fails to lower or doesn't contain a node of that kind, so
+-- a misspelled test setup surfaces as a clear test failure rather
+-- than a silent wrong rate.
+rateOfFirst :: NodeKind -> SynthGraph -> Rate
+rateOfFirst k g = case lowerGraph g of
+  Left err -> error $ "rateOfFirst: lowerGraph failed: " <> err
+  Right ir -> case [ irRate n | n <- giNodes ir, irKind n == k ] of
+    (r : _) -> r
+    []      -> error $ "rateOfFirst: no node of kind " <> show k <> " in graph"
 
 assertDenseIndices :: RuntimeGraph -> Assertion
 assertDenseIndices rt =
@@ -520,6 +673,29 @@ properties = testGroup "Properties"
 
   , QC.testProperty "every BusOut precedes every same-bus BusIn in the schedule" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propBusOrdering
+
+  , -- Rate propagation: see Note [Rate inference vs rate propagation]
+    -- in "MetaSonic.Bridge.IR" for the algorithm. These properties pin
+    -- the three structural invariants of the lift:
+    --
+    --   1. each node's rate is at least its kind's floor
+    --   2. each node's rate is at least every input's rate
+    --   3. running the lift twice is the same as running it once
+    --
+    -- (1) is the kind-floor guarantee. (2) is the join law of the
+    -- lattice — the whole point of propagation. (3) is idempotence:
+    -- the lift reaches a fixed point in one pass.
+    QC.testProperty "every node's irRate ≥ kind floor (post-propagation)" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propRateAtLeastFloor
+
+  , QC.testProperty "every node's irRate ≥ max of its inputs' rates" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propRateAtLeastInputs
+
+  , QC.testProperty "propagateRates is idempotent on lowered IR" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propPropagationIdempotent
+
+  , QC.testProperty "propagateRates preserves all fields except irRate" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propPropagationStructural
   ]
 
 propDenseIndices :: SynthGraph -> Property
@@ -712,6 +888,77 @@ propBusOrdering g = case validateAndSort g of
           , pw >= pr
           ]
     in counterexample ("bad bus orderings: " <> show bad) (null bad)
+
+-- | Every node's propagated rate must be at least its kind's floor.
+-- This is the trivial half of the join: a kind floor is one of the
+-- arguments of 'max', so the result is always ≥ the floor.
+propRateAtLeastFloor :: SynthGraph -> Property
+propRateAtLeastFloor g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir -> conjoin
+    [ counterexample
+        ("node " <> show (irNodeID n) <> " of kind " <> show (irKind n)
+          <> ": irRate " <> show (irRate n)
+          <> " < floor " <> show floor_)
+        (irRate n >= floor_)
+    | n <- giNodes ir
+    , let floor_ = ksRate (kindSpec (irKind n))
+    ]
+
+-- | Every node's propagated rate must be at least the maximum rate of
+-- its inputs (FromNode inputs contribute the source node's rate;
+-- Literal inputs contribute CompileRate). This is the load-bearing
+-- half of the join: it's the property that makes
+-- 'MetaSonic.Bridge.IR.checkRateEdges' vacuous post-propagation.
+propRateAtLeastInputs :: SynthGraph -> Property
+propRateAtLeastInputs g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir ->
+    let rateMap = M.fromList [ (irNodeID n, irRate n) | n <- giNodes ir ]
+    in conjoin
+         [ counterexample
+             ("node " <> show (irNodeID n)
+               <> ": irRate " <> show (irRate n)
+               <> " < input rate " <> show inRate
+               <> " (input " <> show inp <> ")")
+             (irRate n >= inRate)
+         | n   <- giNodes ir
+         , inp <- irInputs n
+         , let inRate = case inp of
+                 FromNode src _ -> M.findWithDefault CompileRate src rateMap
+                 Literal _      -> CompileRate
+         ]
+
+-- | Propagation reaches a fixed point in one pass. Running it twice
+-- on a lowered IR must yield the same IR as running it once. This is
+-- a defensive correctness check: a non-idempotent join would mean
+-- some node's rate is changing on the second pass, which can only
+-- happen if the first pass missed a join somewhere.
+propPropagationIdempotent :: SynthGraph -> Property
+propPropagationIdempotent g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir -> propagateRates ir === ir
+
+-- | Propagation only touches 'irRate'. NodeID, kind, inputs,
+-- controls, and effects must be byte-identical before and after.
+-- A regression here would mean the lift is mutating something it
+-- shouldn't — and any of those fields drifting would break
+-- downstream lowering, FFI marshalling, or scheduling.
+propPropagationStructural :: SynthGraph -> Property
+propPropagationStructural g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir ->
+    let lifted = propagateRates ir
+        same field name =
+          counterexample ("propagation changed " <> name) $
+            map field (giNodes ir) === map field (giNodes lifted)
+    in conjoin
+         [ same irNodeID   "irNodeID"
+         , same irKind     "irKind"
+         , same irInputs   "irInputs"
+         , same irControls "irControls"
+         , same irEffects  "irEffects"
+         ]
 
 -- | Region rate matches its members'. A region with mixed rates would
 -- be a broken merge in formRegions.

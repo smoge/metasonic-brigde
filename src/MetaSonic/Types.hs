@@ -206,10 +206,22 @@ that is honest and overrides for the kinds whose effects depend on
 constructor fields. See Note [Effect-induced edges (E_r)] in
 "MetaSonic.Bridge.Validate" for how those annotations drive scheduling.
 
-The same shape applies to 'inferRate': today every kind is 'SampleRate' so
-'ksRate' is load-bearing, but when rate propagation lands (a 'Gain' fed by
-'BlockRate' inputs becomes 'BlockRate'), 'ksRate' will become a
-kind-level *minimum* and 'inferRate' will override per-instance.
+'ksRate' is interpreted as the kind's *intrinsic minimum* rate — a floor.
+The actual rate of a node is the join (max) of this floor and the rates
+of its inputs, computed by 'MetaSonic.Bridge.IR.propagateRates' as a
+post-pass on the lowered IR. So a 'Gain' (floor 'CompileRate') fed by
+two 'Param' literals stays at 'CompileRate'; the same 'Gain' fed by a
+'SinOsc' (floor 'SampleRate') is lifted to 'SampleRate' by propagation.
+A 'SinOsc' is *always* 'SampleRate' regardless of inputs because its
+floor is 'SampleRate' and the join can only raise the rate, never lower
+it. See Note [Rate inference vs rate propagation] in
+"MetaSonic.Bridge.IR" for the algorithm.
+
+The split between "stateful/producer" floors ('SampleRate') and
+"stateless transform" floors ('CompileRate') is what makes region
+formation and future block-rate optimization meaningful: a region of
+all-'Param' nodes can collapse to a one-time evaluation, while a region
+fed by an oscillator necessarily runs sample-by-sample.
 -}
 
 -- | Per-kind metadata. Indexed by 'NodeKind' via 'kindSpec'.
@@ -217,8 +229,13 @@ data KindSpec = KindSpec
   { ksTag          :: !CInt
     -- ^ ABI tag. Must match the C++ @kind_from_tag@ dispatch.
   , ksRate         :: !Rate
-    -- ^ Kind-level rate (today every kind is 'SampleRate'; see
-    -- Note [Rate inference vs rate propagation] in "MetaSonic.Bridge.IR").
+    -- ^ Kind-level *minimum* rate. The actual rate of a node is
+    -- @max ksRate (max of input rates)@, computed by
+    -- 'MetaSonic.Bridge.IR.propagateRates'. Stateful or sample-producing
+    -- kinds set this to 'SampleRate'; stateless transforms and consumers
+    -- set it to 'CompileRate' so they inherit from inputs. See
+    -- Note [Per-kind metadata table] and Note [Rate inference vs rate
+    -- propagation] in "MetaSonic.Bridge.IR".
   , ksAudioArity   :: !Int
     -- ^ Number of @Connection@ inputs the corresponding 'UGen' constructor
     -- carries.
@@ -240,14 +257,22 @@ data KindSpec = KindSpec
 -- against the C++ @kind_from_tag@ dispatch.
 kindSpec :: NodeKind -> KindSpec
 kindSpec = \case
-  KSinOsc   -> KindSpec 1  SampleRate 2 2 "sinOsc"
-  KOut      -> KindSpec 2  SampleRate 1 1 "out"
-  KGain     -> KindSpec 3  SampleRate 2 1 "gain"
-  KSawOsc   -> KindSpec 5  SampleRate 2 2 "sawOsc"
-  KNoiseGen -> KindSpec 6  SampleRate 0 0 "noiseGen"
-  KLPF      -> KindSpec 7  SampleRate 3 2 "lpf"
-  KAdd      -> KindSpec 8  SampleRate 2 2 "add"
-  KEnv      -> KindSpec 9  SampleRate 1 5 "env"
+  -- Producers / stateful kinds: floor is SampleRate. They generate or
+  -- carry sample-rate information that cannot be coarsened without
+  -- losing audio.
+  --
+  --   * Oscillators (SinOsc, SawOsc) run a phase accumulator per sample
+  --     so the per-sample lookup yields the right waveform.
+  --   * NoiseGen uses a PRNG that produces one value per sample.
+  --   * LPF and Env are stateful: a block-rate biquad would alias and
+  --     a block-rate envelope would miss gate transitions.
+  --   * BusIn / BusInDelayed read sample-rate bus storage; coarsening
+  --     them would silently drop samples.
+  KSinOsc       -> KindSpec 1  SampleRate  2 2 "sinOsc"
+  KSawOsc       -> KindSpec 5  SampleRate  2 2 "sawOsc"
+  KNoiseGen     -> KindSpec 6  SampleRate  0 0 "noiseGen"
+  KLPF          -> KindSpec 7  SampleRate  3 2 "lpf"
+  KEnv          -> KindSpec 9  SampleRate  1 5 "env"
   -- Bus routing: same-cycle BusOut/BusIn and one-block-delayed BusInDelayed.
   -- Effects are per-instance (BusWrite n / BusRead n / BusReadDelayed n)
   -- and live in 'inferEff', not here. The C++ runtime stores all buses
@@ -258,9 +283,25 @@ kindSpec = \case
   -- the previous-block snapshot.
   -- See Note [Effect-induced edges (E_r)] in MetaSonic.Bridge.Validate
   -- and Note [Bus pool double-buffering] in tinysynth/rt_graph.cpp.
-  KBusOut       -> KindSpec 10 SampleRate 1 1 "busOut"
-  KBusIn        -> KindSpec 11 SampleRate 0 1 "busIn"
-  KBusInDelayed -> KindSpec 12 SampleRate 0 1 "busInDelayed"
+  KBusIn        -> KindSpec 11 SampleRate  0 1 "busIn"
+  KBusInDelayed -> KindSpec 12 SampleRate  0 1 "busInDelayed"
+
+  -- Consumers / stateless transforms: floor is CompileRate. They have
+  -- no intrinsic rate of their own; 'propagateRates' lifts them to the
+  -- maximum rate of their inputs. A Gain with two Param inputs stays
+  -- at CompileRate (no-op multiplication of constants); the same Gain
+  -- fed by a SinOsc lifts to SampleRate by propagation.
+  --
+  --   * Gain, Add: stateless arithmetic.
+  --   * LPF would also be stateless except for its biquad delay state,
+  --     which is why it sits in the stateful group above.
+  --   * Out / BusOut: writers don't change the rate of the data they
+  --     write; the bus pool just holds whatever rate the writer
+  --     contributes (sample-and-hold for slower writers).
+  KOut          -> KindSpec 2  CompileRate 1 1 "out"
+  KGain         -> KindSpec 3  CompileRate 2 1 "gain"
+  KAdd          -> KindSpec 8  CompileRate 2 2 "add"
+  KBusOut       -> KindSpec 10 CompileRate 1 1 "busOut"
 
 -- | Must agree with the NodeKind enum and kind_from_tag dispatch in
 -- rt_graph.cpp. Verified by a contract test in Spec.hs.

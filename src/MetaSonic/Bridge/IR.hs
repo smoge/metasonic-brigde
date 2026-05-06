@@ -17,6 +17,8 @@ module MetaSonic.Bridge.IR
   , GraphIR (..)
   , -- * Lowering from source
     lowerGraph
+  , -- * Rate propagation
+    propagateRates
   , -- * Rate validation
     checkRateEdges
   ) where
@@ -125,35 +127,71 @@ data GraphIR = GraphIR
 
 {- Note [Rate inference vs rate propagation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Rate inference currently dispatches on NodeKind alone:
+Rate assignment proceeds in two stages.
 
-  SinOsc → SampleRate
-  Out    → SampleRate
-  Gain   → SampleRate
+Stage 1 — kind-level minimum, in 'inferRate' (MetaSonic.Bridge.Source).
+Each node receives a starting rate equal to 'ksRate' for its kind.
+'ksRate' is interpreted as a *floor*, not as the final rate. The
+split is:
 
-This is correct for the current node set but does not
-propagate. A Gain node is unconditionally SampleRate even if
-both its inputs are BlockRate.
+  Producers / stateful kinds (floor SampleRate):
+    SinOsc, SawOsc, NoiseGen — generate sample-rate streams.
+    LPF, Env                 — carry per-sample state.
+    BusIn, BusInDelayed      — read sample-rate bus storage.
 
-The correct algorithm walks the graph bottom-up, computing
-each node's rate as the join (maximum) of its input rates,
-clamped to the node's intrinsic minimum rate. For example:
+  Consumers / stateless transforms (floor CompileRate):
+    Gain, Add                — stateless arithmetic, no rate of own.
+    Out, BusOut              — writers; the bus holds whatever rate
+                               the writer contributes.
 
-  - A SinOsc always has minimum rate SampleRate (it produces
-    a sample-rate stream by definition)
-  - A Gain has no intrinsic minimum rate; it inherits the
-    rate of its inputs
-  - An Out inherits from its input
+Stage 2 — propagation, in 'propagateRates' below. The graph is
+walked in topological order (already established by 'topoSort'); each
+node's final rate is
 
-This matters for region formation: if Gain is unconditionally
-SampleRate, it can never be placed in a block-rate region,
-even when that would be correct and more efficient.
+    irRate(n) = max (ksRate (kindOf n)) (max [ rate(in) | in <- inputs n ])
 
-See Note [Region rate compatibility] in MetaSonic.Compile.
+where the input rate of a 'FromNode src _' is the previously
+computed 'irRate src' and the input rate of a 'Literal _' is
+'CompileRate' (the lattice bottom).
 
-Faust's semantic typing handles this through its "speed"
-dimension, which propagates through the signal graph.
-This is a key extension.
+Worked examples:
+
+  * 'Gain (Param 0.5) (Param 0.3)'
+      floor = CompileRate; inputs both CompileRate; final = CompileRate.
+      The whole node is constant; a future optimization could fold it.
+
+  * 'Gain o (Param 0.5)' where 'o' is a 'SinOsc'
+      floor = CompileRate; inputs = [SampleRate, CompileRate];
+      final = SampleRate. The Gain is lifted to match its sample-rate
+      input.
+
+  * 'SinOsc (Param 440) (Param 0)'
+      floor = SampleRate; inputs both CompileRate; final = SampleRate.
+      The floor wins; an oscillator with constant inputs is still
+      sample-rate.
+
+  * 'Out 0 (Param 0)'
+      floor = CompileRate; input CompileRate; final = CompileRate.
+      A silent / constant Out — currently still scheduled, but a
+      future pass could elide it.
+
+This matters for region formation: a graph mixing all-Param
+subexpressions with sample-rate signal paths now produces distinct
+regions instead of one degenerate sample-rate region. See Note
+[Region rate compatibility] in "MetaSonic.Bridge.Compile".
+
+The lattice is total: 'CompileRate < InitRate < BlockRate <
+SampleRate' (see Note [Rate discipline] in "MetaSonic.Types"), so
+'max' is well-defined. Propagation is monotone: a node's final rate
+is always at least each of its inputs' rates and at least its kind
+floor. Together with topological order, this guarantees that
+'checkRateEdges' becomes vacuous post-propagation — every edge runs
+"upward" in rate by construction. We keep the check as a defensive
+post-condition.
+
+Faust's semantic typing handles the same problem through its "speed"
+dimension; MetaSonic's lattice and join is the same idea expressed
+on a smaller, totally-ordered carrier set.
 -}
 
 {- Note [Rate edge validation]
@@ -264,16 +302,24 @@ lowerGraph g = do
   let nodeMap = sgNodes g
 
   -- Step 2+3: lower each node in execution order, annotating
-  -- with rate and effects.
+  -- with kind floor rate and effects.
   -- See Note [Execution order invariant].
-  let !irNodes = map (lowerNode nodeMap) execOrder
+  let !irNodes0 = map (lowerNode nodeMap) execOrder
 
-  -- Step 4: validate rate discipline across edges.
+  -- Step 4: refine each node's irRate to the join of its inputs
+  -- and its kind floor. Topological order makes this a single
+  -- forward pass.
+  -- See Note [Rate inference vs rate propagation].
+  let !ir = propagateRates GraphIR { giNodes = irNodes0 }
+
+  -- Step 5: validate rate discipline across edges. After
+  -- propagation this should always succeed; we keep the check
+  -- as a defensive post-condition.
   -- See Note [Rate edge validation].
-  let !irMap = M.fromList [(irNodeID n, n) | n <- irNodes]
+  let !irMap = M.fromList [(irNodeID n, n) | n <- giNodes ir]
   checkRateEdges irMap
 
-  pure GraphIR { giNodes = irNodes }
+  pure ir
 
 {- Note [Per-node lowering]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -341,3 +387,57 @@ lowerConn (Param x)        = Literal x
 -- Note [Uniform UGen view] in "MetaSonic.Bridge.Source".
 extractControls :: UGen -> [Double]
 extractControls = uvControls . ugenView
+
+-- | Propagate rates bottom-up through an already-lowered 'GraphIR'.
+--
+-- Each node's rate is replaced by
+--
+-- > max (kind floor) (max [ rate(input) | input <- inputs ])
+--
+-- where a 'FromNode' input contributes the source node's previously
+-- computed rate and a 'Literal' input contributes 'CompileRate'.
+--
+-- Pre-conditions:
+--
+--   * 'giNodes' is in topological order. This holds whenever the
+--     'GraphIR' came out of 'lowerGraph' (see Note [Execution order
+--     invariant]).
+--   * Each node's initial 'irRate' is the kind floor (set by
+--     'lowerNode' via 'inferRate').
+--
+-- Post-condition: every node's 'irRate' is the join of its inputs'
+-- rates and its kind floor. Idempotent: a second call returns the
+-- same 'GraphIR'.
+--
+-- See Note [Rate inference vs rate propagation].
+propagateRates :: GraphIR -> GraphIR
+propagateRates ir =
+  -- foldl' (strict left fold) avoids accumulating thunks in the rate
+  -- map across long graphs.
+  let (_finalRates, revRefined) = foldl' step (M.empty, []) (giNodes ir)
+  in  ir { giNodes = reverse revRefined }
+  where
+    -- The accumulator carries the rate of every node visited so far
+    -- (rates) and the refined nodes in reverse order (revRefined).
+    -- Topological order guarantees that every 'FromNode' input has
+    -- already been visited when we refine the current node.
+    step (!rates, acc) node =
+      let inputRates  = map (inputRate rates) (irInputs node)
+          -- 'irRate node' here is the kind floor from 'lowerNode'.
+          -- 'maximum' is partial in general but the list always has
+          -- at least 'irRate node', so the call is total here.
+          !refined    = maximum (irRate node : inputRates)
+          !node'      = node { irRate = refined }
+          !rates'     = M.insert (irNodeID node) refined rates
+      in (rates', node' : acc)
+
+    -- Lookups should never fail under the topological-order
+    -- precondition; missing source is an internal bug, not user
+    -- error.
+    inputRate rates (FromNode src _) =
+      case M.lookup src rates of
+        Just r  -> r
+        Nothing -> error $
+          "propagateRates: unresolved source " ++ show src
+            ++ " (giNodes is not in topological order)"
+    inputRate _     (Literal _)      = CompileRate
