@@ -340,7 +340,7 @@ A RuntimeNode carries:
 A RuntimeInput is either:
 
   RFrom NodeIndex PortIndex — read from the dense array
-  RConst Float              — compile-time constant (was a
+  RConst Double             — compile-time constant (was a
                               Literal in the IR)
 
 After fusion, a RuntimeNode (or its successor type) may
