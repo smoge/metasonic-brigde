@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase                 #-}
 
 {- Note [Pipeline reading order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -57,6 +58,9 @@ module MetaSonic.Types
   , -- * Node classification
     NodeKind (..)
   , kindTag
+  , -- * Per-kind metadata
+    KindSpec (..)
+  , kindSpec
   , -- * Rate discipline
     Rate (..)
   , -- * Resource effects
@@ -165,16 +169,57 @@ data NodeKind
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
+{- Note [Per-kind metadata table]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'KindSpec' centralises the kind-level facts that used to be scattered across
+'kindTag', 'inferRate', 'inferEff' and the per-constructor builders. Adding a
+new 'NodeKind' is now a single row here plus a constructor in 'NodeKind', a
+constructor in 'UGen', a row in 'ugenView' (Source), and a builder.
+
+The 'ksAudioArity' and 'ksControlArity' fields are cross-checked against
+'ugenView' by a property test, so drift between the table and the constructor
+shape is caught at test time rather than in the runtime.
+-}
+
+-- | Per-kind metadata. Indexed by 'NodeKind' via 'kindSpec'.
+data KindSpec = KindSpec
+  { ksTag          :: !CInt
+    -- ^ ABI tag. Must match the C++ @kind_from_tag@ dispatch.
+  , ksRate         :: !Rate
+  , ksEffects      :: ![Eff]
+  , ksAudioArity   :: !Int
+    -- ^ Number of @Connection@ inputs the corresponding 'UGen' constructor
+    -- carries.
+  , ksControlArity :: !Int
+    -- ^ Number of control slots the C++ kernel expects, in declared order.
+    -- The mapping from inputs to controls is per-kind and is realised by
+    -- 'MetaSonic.Bridge.Source.ugenView'; this field exists for cross-check
+    -- only.
+  , ksLabel        :: !String
+    -- ^ Human-readable label used by source-level builders for 'nsName'.
+  }
+
+-- | Resolve per-kind metadata.
+--
+-- Note: tag 4 was reserved for a generic biquad family but is intentionally
+-- unallocated. The Haskell→C++ contract test (see Spec.hs) iterates
+-- @[minBound..maxBound]@ via the derived 'Enum'\/'Bounded' instances on
+-- 'NodeKind', so any new constructor added here is automatically asserted
+-- against the C++ @kind_from_tag@ dispatch.
+kindSpec :: NodeKind -> KindSpec
+kindSpec = \case
+  KSinOsc   -> KindSpec 1 SampleRate [Pure] 2 2 "sinOsc"
+  KOut      -> KindSpec 2 SampleRate [Pure] 1 1 "out"
+  KGain     -> KindSpec 3 SampleRate [Pure] 2 1 "gain"
+  KSawOsc   -> KindSpec 5 SampleRate [Pure] 2 2 "sawOsc"
+  KNoiseGen -> KindSpec 6 SampleRate [Pure] 0 0 "noiseGen"
+  KLPF      -> KindSpec 7 SampleRate [Pure] 3 2 "lpf"
+  KAdd      -> KindSpec 8 SampleRate [Pure] 2 2 "add"
+
 -- | Must agree with the NodeKind enum and kind_from_tag dispatch in
 -- rt_graph.cpp. Verified by a contract test in Spec.hs.
 kindTag :: NodeKind -> CInt
-kindTag KSinOsc   = 1
-kindTag KOut      = 2
-kindTag KGain     = 3
-kindTag KSawOsc   = 5
-kindTag KNoiseGen = 6
-kindTag KLPF      = 7
-kindTag KAdd      = 8
+kindTag = ksTag . kindSpec
 
 {- Note [Rate discipline]
 ~~~~~~~~~~~~~~~~~~~~~~~~~

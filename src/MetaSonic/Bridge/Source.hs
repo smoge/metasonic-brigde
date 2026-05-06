@@ -40,6 +40,9 @@ module MetaSonic.Bridge.Source
   , add
   , -- * Connection helpers
     audio
+  , -- * Uniform UGen view
+    UGenView (..)
+  , ugenView
   , -- * Dependency extraction
     dependencies
   ) where
@@ -485,6 +488,75 @@ busOut bus src =
 -- unused — see 'busOut'.)
 busIn :: Int -> SynthM Connection
 busIn bus = insertNodeC "busIn" (BusIn bus)
+
+{- Note [Uniform UGen view]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'UGenView' is the canonical projection from a 'UGen' constructor into the
+triple @(NodeKind, audio inputs, control defaults)@. Downstream passes that
+used to enumerate every constructor (kind inference, input lowering, control
+extraction) are derived from this one function.
+
+The typed 'UGen' constructors are preserved — they are the user-facing
+surface, statically arity-checked, and remain pattern-matchable. 'ugenView'
+is the *only* per-constructor enumeration in the codebase outside the
+'kindSpec' table and the builder layer.
+
+A property test cross-checks 'ugenView' against 'kindSpec' so the two
+sources of per-kind shape information cannot drift apart.
+
+The 'BusIn' / 'BusOut' constructors are not yet wired through the runtime;
+'ugenView' errors on them in the same way 'inferKind' did before. They
+remain valid for graph *construction* and for 'dependencies' extraction,
+but compilation will reject any graph that contains them until the
+shared-bus runtime support lands.
+-}
+
+-- | A uniform projection of a 'UGen' into kind plus input and control
+-- payload.
+--
+-- The control list is given explicitly per kind (rather than derived from
+-- the inputs), because the C++ kernel layout is per-kind: signal inputs
+-- carry no paired control default ('LPF', 'Gain'), while parameter inputs
+-- do ('SinOsc', 'Add'), and some kinds carry metadata-only controls with
+-- no input pair ('Out' channel).
+--
+-- See Note [Uniform UGen view].
+data UGenView = UGenView
+  { uvKind     :: !NodeKind
+  , uvInputs   :: ![Connection]
+    -- ^ Audio inputs in declared order. Length matches
+    -- 'MetaSonic.Types.ksAudioArity'.
+  , uvControls :: ![Double]
+    -- ^ Control defaults in the C++ kernel's declared order. Length
+    -- matches 'MetaSonic.Types.ksControlArity'.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Default value carried by a 'Connection' when used as a control: a
+-- 'Param' literal contributes its value, an 'Audio' edge contributes 0.0
+-- (the runtime fallback when no audio is connected).
+connDefault :: Connection -> Double
+connDefault (Param x)   = x
+connDefault (Audio _ _) = 0.0
+
+-- | The canonical per-constructor projection.
+--
+-- Each clause states inputs and control defaults together so the per-kind
+-- mapping is visible in one place.
+--
+-- 'BusIn' / 'BusOut' error here intentionally — they are not yet supported
+-- by the runtime. See Note [Uniform UGen view].
+ugenView :: UGen -> UGenView
+ugenView = \case
+  SinOsc f p   -> UGenView KSinOsc   [f, p]    [connDefault f, connDefault p]
+  SawOsc f p   -> UGenView KSawOsc   [f, p]    [connDefault f, connDefault p]
+  NoiseGen     -> UGenView KNoiseGen []        []
+  LPF s f q    -> UGenView KLPF      [s, f, q] [connDefault f, connDefault q]
+  Gain s a     -> UGenView KGain     [s, a]    [connDefault a]
+  Add a b      -> UGenView KAdd      [a, b]    [connDefault a, connDefault b]
+  Out ch s     -> UGenView KOut      [s]       [fromIntegral ch]
+  BusIn _      -> error "ugenView: BusIn not implemented yet"
+  BusOut _ _   -> error "ugenView: BusOut not implemented yet"
 
 -- | Extract explicit structural 'NodeID' dependencies from
 -- a 'UGen'.

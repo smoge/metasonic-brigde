@@ -2,7 +2,6 @@
 {-# LANGUAGE DeriveAnyClass     #-}
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE LambdaCase         #-}
 
 -- |
 -- Module      : MetaSonic.IR
@@ -162,38 +161,22 @@ This is a key extension.
 
 -- | Infer the rate of a UGen from its kind.
 --
--- See Note [Rate inference vs rate propagation].
+-- Derived from the 'kindSpec' table via 'ugenView'. See
+-- Note [Per-kind metadata table] in "MetaSonic.Types" and
+-- Note [Rate inference vs rate propagation].
 inferRate :: UGen -> Rate
-inferRate = \case
-  SinOsc _ _   -> SampleRate
-  SawOsc _ _   -> SampleRate
-  NoiseGen     -> SampleRate
-  LPF _ _ _    -> SampleRate
-  Out _ _      -> SampleRate
-  Gain _ _     -> SampleRate
-  Add _ _      -> SampleRate
-  BusOut _ _   -> SampleRate
-  BusIn _      -> SampleRate
+inferRate = ksRate . kindSpec . uvKind . ugenView
 
 -- | Infer the effect set of a UGen.
 --
--- Currently all nodes are 'Pure'. When buses and buffers
--- become real shared resources, Out will carry
--- @BusWrite bus@, and a future In node will carry
--- @BusRead bus@.
+-- Derived from the 'kindSpec' table via 'ugenView'. Currently
+-- all nodes are 'Pure'. When buses and buffers become real
+-- shared resources, Out will carry @BusWrite bus@, and a
+-- future In node will carry @BusRead bus@.
 --
 -- See Note [Resource effects] in MetaSonic.Types.
 inferEff :: UGen -> [Eff]
-inferEff = \case
-  SinOsc _ _   -> [Pure]
-  SawOsc _ _   -> [Pure]
-  NoiseGen     -> [Pure]
-  LPF _ _ _    -> [Pure]
-  Out _ _      -> [Pure]
-  Gain _ _     -> [Pure]
-  Add _ _      -> [Pure]
-  BusOut _ _   -> [Pure]
-  BusIn _      -> [Pure]
+inferEff = ksEffects . kindSpec . uvKind . ugenView
 
 {- Note [Rate edge validation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -363,53 +346,26 @@ lowerNode nodeMap nid =
 
 -- | Map a UGen constructor to its NodeKind tag.
 --
--- See Note [Adding a new node kind] in MetaSonic.Types.
+-- See Note [Uniform UGen view] in "MetaSonic.Bridge.Source".
 inferKind :: UGen -> NodeKind
-inferKind = \case
-  SinOsc _ _   -> KSinOsc
-  SawOsc _ _   -> KSawOsc
-  NoiseGen     -> KNoiseGen
-  LPF _ _ _    -> KLPF
-  Out _ _      -> KOut
-  Gain _ _     -> KGain
-  Add _ _      -> KAdd
-  BusOut _ _   -> error "inferKind: BusOut not fully implemented yet"
-  BusIn _      -> error "inferKind: BusIn not fully implemented yet"
+inferKind = uvKind . ugenView
 
 -- | Lower UGen connections to IR InputConns.
 --
--- See Note [IR vocabulary stripping].
+-- See Note [IR vocabulary stripping] and
+-- Note [Uniform UGen view] in "MetaSonic.Bridge.Source".
 lowerInputs :: UGen -> [InputConn]
-lowerInputs = \case
-  SinOsc freq phase    -> [lowerConn freq, lowerConn phase]
-  SawOsc freq phase    -> [lowerConn freq, lowerConn phase]
-  NoiseGen             -> []
-  LPF sig freq q       -> [lowerConn sig, lowerConn freq, lowerConn q]
-  Out _ sig            -> [lowerConn sig]
-  Gain sig amt         -> [lowerConn sig, lowerConn amt]
-  Add a b              -> [lowerConn a, lowerConn b]
-  BusOut _ sig         -> [lowerConn sig]
-  BusIn _              -> []
+lowerInputs = map lowerConn . uvInputs . ugenView
 
 lowerConn :: Connection -> InputConn
 lowerConn (Audio nid port) = FromNode nid port
 lowerConn (Param x)        = Literal x
 
--- | Extract default control values from a UGen's
--- connections.
+-- | Extract default control values from a UGen.
 --
--- See Note [Per-node lowering].
+-- The control layout is per-kind and is given by 'uvControls'.
+--
+-- See Note [Per-node lowering] and
+-- Note [Uniform UGen view] in "MetaSonic.Bridge.Source".
 extractControls :: UGen -> [Double]
-extractControls = \case
-  SinOsc freq phase  -> [connDefault freq, connDefault phase]
-  SawOsc freq phase  -> [connDefault freq, connDefault phase]
-  NoiseGen           -> []
-  LPF _ freq q       -> [connDefault freq, connDefault q]
-  Out bus _          -> [fromIntegral bus]
-  Gain _ amt         -> [connDefault amt]
-  Add a b            -> [connDefault a, connDefault b]
-  BusOut bus _       -> [fromIntegral bus]
-  BusIn bus          -> [fromIntegral bus]
-  where
-    connDefault (Param x)   = x
-    connDefault (Audio _ _) = 0.0
+extractControls = uvControls . ugenView

@@ -272,6 +272,9 @@ properties = testGroup "Properties"
 
   , QC.testProperty "validateAndSort succeeds on well-formed graphs" $
       forAllShrink genWellFormedGraph (const []) propValidates
+
+  , QC.testProperty "ugenView arities match kindSpec for every UGen" $
+      forAllShrink genWellFormedGraph (const []) propUgenViewMatchesSpec
   ]
 
 propDenseIndices :: SynthGraph -> Property
@@ -303,6 +306,20 @@ propValidates :: SynthGraph -> Property
 propValidates g = case validateAndSort g of
   Left err -> counterexample ("validateAndSort failed: " <> err) False
   Right _  -> property True
+
+-- | Drift guard for the per-kind metadata: for every UGen in a
+-- generated graph, the arities reported by @ugenView@ must match
+-- the @kindSpec@ table.
+propUgenViewMatchesSpec :: SynthGraph -> Property
+propUgenViewMatchesSpec g = conjoin
+  [ counterexample (show u) $
+         length (uvInputs   v) === ksAudioArity   ks
+    .&&. length (uvControls v) === ksControlArity ks
+  | ns <- M.elems (sgNodes g)
+  , let u  = nsUgen ns
+        v  = ugenView u
+        ks = kindSpec (uvKind v)
+  ]
 
 ------------------------------------------------------------
 -- Generator: well-formed SynthGraphs
