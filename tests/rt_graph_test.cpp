@@ -2955,23 +2955,26 @@ TEST_CASE("Multi-instance: two SinOsc instances at different frequencies") {
     int inst1 = rt_graph_instance_add(g);
     REQUIRE(inst1 == 1);
     rt_graph_instance_set_control(g, inst1, 0, 0, 660.0);
+    // §2.C: server bus pool is shared. Route inst1's Out to bus 1 so
+    // each voice writes its own bus and we can read them separately.
+    rt_graph_instance_set_control(g, inst1, 1, 0, 1.0);
 
     rt_graph_process(g, kFrames);
 
-    std::vector<float> bus0_inst0(kFrames, 0.0f);
-    std::vector<float> bus0_inst1(kFrames, 0.0f);
-    rt_graph_instance_read_bus(g, 0, 0, kFrames, bus0_inst0.data());
-    rt_graph_instance_read_bus(g, 1, 0, kFrames, bus0_inst1.data());
+    std::vector<float> bus0(kFrames, 0.0f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
     rt_graph_destroy(g);
 
-    CHECK(peak_abs(bus0_inst0) > 0.9f);
-    CHECK(peak_abs(bus0_inst1) > 0.9f);
+    CHECK(peak_abs(bus0) > 0.9f);
+    CHECK(peak_abs(bus1) > 0.9f);
 
     // 440 Hz × (1024/48000 s) ≈ 9.4 cycles → ~19 zero crossings;
     // 660 Hz × (1024/48000 s) ≈ 14.1 cycles → ~28 ZCs. The two should
     // differ meaningfully.
-    const int zc0 = zero_crossings(bus0_inst0);
-    const int zc1 = zero_crossings(bus0_inst1);
+    const int zc0 = zero_crossings(bus0);
+    const int zc1 = zero_crossings(bus1);
     INFO("zc0=" << zc0 << " zc1=" << zc1);
     CHECK(zc0 >= 15);
     CHECK(zc0 <= 22);
@@ -3002,18 +3005,19 @@ TEST_CASE("Multi-instance: per-instance Delay state is independent") {
 
     int inst1 = rt_graph_instance_add(g);
     REQUIRE(inst1 == 1);
-    // Instance 1: constant 1.0 → 5 ms delay.
+    // Instance 1: constant 1.0 → 5 ms delay → bus 1 (separate from inst 0).
     rt_graph_instance_set_control(g, 1, 0, 0, 1.0);
     rt_graph_instance_set_control(g, 1, 0, 1, 0.0);
     rt_graph_instance_set_control(g, 1, 1, 0, 0.01);
     rt_graph_instance_set_control(g, 1, 1, 1, 0.005);
+    rt_graph_instance_set_control(g, 1, 2, 0, 1.0);  // Out → bus 1
 
     rt_graph_process(g, kFrames);
 
-    std::vector<float> bus0_inst0(kFrames, 0.0f);
-    std::vector<float> bus0_inst1(kFrames, 0.0f);
-    rt_graph_instance_read_bus(g, 0, 0, kFrames, bus0_inst0.data());
-    rt_graph_instance_read_bus(g, 1, 0, kFrames, bus0_inst1.data());
+    std::vector<float> bus0(kFrames, 0.0f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
     rt_graph_destroy(g);
 
     auto first_nonsilent = [](const std::vector<float> &xs) {
@@ -3022,8 +3026,8 @@ TEST_CASE("Multi-instance: per-instance Delay state is independent") {
         }
         return -1;
     };
-    const int t0 = first_nonsilent(bus0_inst0);
-    const int t1 = first_nonsilent(bus0_inst1);
+    const int t0 = first_nonsilent(bus0);
+    const int t1 = first_nonsilent(bus1);
     REQUIRE(t0 >= 0);
     REQUIRE(t1 >= 0);
 
@@ -3050,14 +3054,17 @@ TEST_CASE("Multi-instance: lifecycle (add, remove, re-add reuses slot)") {
     int id_a = rt_graph_instance_add(g);
     REQUIRE(id_a == 1);
     rt_graph_instance_set_control(g, id_a, 0, 0, 1000.0);
+    // §2.C: route to bus 1 so we can isolate this instance's contribution
+    // (instance 0 still writes 440 Hz to bus 0).
+    rt_graph_instance_set_control(g, id_a, 1, 0, 1.0);
 
     REQUIRE(rt_graph_instance_count(g) == 2);
     REQUIRE(rt_graph_instance_alive(g, 1) == 1);
 
     rt_graph_process(g, kFrames);
-    std::vector<float> tmp(kFrames, 0.0f);
-    rt_graph_instance_read_bus(g, id_a, 0, kFrames, tmp.data());
-    CHECK(peak_abs(tmp) > 0.9f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
+    CHECK(peak_abs(bus1) > 0.9f);
 
     // Remove and re-add: the new instance should get the same id (slot
     // 1 reused) with a fresh state — control 0 (freq) back to default 0.
@@ -3067,11 +3074,14 @@ TEST_CASE("Multi-instance: lifecycle (add, remove, re-add reuses slot)") {
     int id_b = rt_graph_instance_add(g);
     CHECK(id_b == 1);
     REQUIRE(rt_graph_instance_alive(g, 1) == 1);
+    // Route the fresh instance to bus 1 too. Default freq=0 → SinOsc
+    // phase doesn't advance → output is sin(0)=0 forever, so bus 1
+    // (where only this instance writes) should be silent.
+    rt_graph_instance_set_control(g, id_b, 1, 0, 1.0);
 
-    // SinOsc at default freq=0 → phase doesn't advance → output ≈ 0.
     rt_graph_process(g, kFrames);
     std::vector<float> fresh(kFrames, 0.0f);
-    rt_graph_instance_read_bus(g, id_b, 0, kFrames, fresh.data());
+    rt_graph_read_bus(g, 1, kFrames, fresh.data());
     rt_graph_destroy(g);
 
     CHECK(peak_abs(fresh) < 1e-3f);
@@ -3191,4 +3201,103 @@ TEST_CASE("Multi-instance: removing instance 0 disables legacy API") {
     CHECK(peak_abs(samples) > 0.9f);
 
     rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Server-global buses (§2.C)
+// ----------------------------------------------------------------
+//
+// The bus pool moved out of GraphInstance into a Server shared by
+// all instances. Two consequences:
+//   * Instances writing to the same bus index sum into one bus.
+//   * One instance's BusOut feeds another instance's BusIn within
+//     the same block (subject to instance iteration order).
+
+TEST_CASE("Server buses §2.C: two voices on the same bus sum into one signal") {
+    // §2.C global pool: two instances writing constants to bus 0
+    // produce bus 0 = a + b. This is the polyphonic-mixer pattern that
+    // motivated shared buses.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 8);                          // Add (constant)
+    rt_graph_add_node(g, 1, 2);                          // Out
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    // Instance 0: constant +0.3 → bus 0.
+    rt_graph_instance_set_control(g, 0, 0, 0, 0.3);
+    rt_graph_instance_set_control(g, 0, 0, 1, 0.0);
+    rt_graph_instance_set_control(g, 0, 1, 0, 0.0);
+
+    int inst1 = rt_graph_instance_add(g);
+    REQUIRE(inst1 == 1);
+    // Instance 1: constant +0.4 → bus 0.
+    rt_graph_instance_set_control(g, 1, 0, 0, 0.4);
+    rt_graph_instance_set_control(g, 1, 0, 1, 0.0);
+    rt_graph_instance_set_control(g, 1, 1, 0, 0.0);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_destroy(g);
+
+    // Bus 0 should be exactly 0.3 + 0.4 = 0.7 sample-by-sample.
+    for (auto s : bus0) {
+        CHECK(s == doctest::Approx(0.7f).epsilon(1e-6));
+    }
+}
+
+TEST_CASE("Server buses §2.C: cross-instance routing through a shared bus") {
+    // The headline §2.C demo: voice A writes its SinOsc to bus 5,
+    // voice B's BusIn(5) reads it within the same block, voice B
+    // routes the result to hardware bus 0. Because A is added first
+    // (instance 0) and instances run in vector order, A's BusOut
+    // executes before B's BusIn; the bus pool acts as the inter-voice
+    // wire.
+    //
+    // Shared graph topology — both instances run all four nodes:
+    //   SinOsc → BusOut    (write to bus controlled by per-instance ctl)
+    //   BusIn → Out        (read from bus, write to bus controlled by ctl)
+    //
+    // Per-instance controls steer each voice into "produce" or
+    // "consume" mode by aiming its bus indices at the cross bus or
+    // at junk-bus 99.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_add_node(g, 1, 10);                         // BusOut
+    rt_graph_connect(g, 0, 0, 1, 0);
+    rt_graph_add_node(g, 2, 11);                         // BusIn
+    rt_graph_add_node(g, 3, 2);                          // Out
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    // Voice A (instance 0): produce 440 Hz on bus 5; reads/writes
+    // junk bus 99 for its own (unused) BusIn → Out path.
+    rt_graph_instance_set_control(g, 0, 0, 0, 440.0);
+    rt_graph_instance_set_control(g, 0, 1, 0, 5.0);
+    rt_graph_instance_set_control(g, 0, 2, 0, 99.0);
+    rt_graph_instance_set_control(g, 0, 3, 0, 99.0);
+
+    int inst1 = rt_graph_instance_add(g);
+    REQUIRE(inst1 == 1);
+    // Voice B (instance 1): SinOsc muted; BusIn reads bus 5 (voice A's
+    // signal) and Out routes it to hardware bus 0.
+    rt_graph_instance_set_control(g, 1, 0, 0, 0.0);
+    rt_graph_instance_set_control(g, 1, 1, 0, 99.0);
+    rt_graph_instance_set_control(g, 1, 2, 0, 5.0);
+    rt_graph_instance_set_control(g, 1, 3, 0, 0.0);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_destroy(g);
+
+    // Bus 0 should carry voice A's 440 Hz sine, having travelled
+    // A.BusOut(5) → server.bus[5] → B.BusIn(5) → B.Out(0).
+    CHECK(peak_abs(bus0) > 0.9f);
+    const int zc = zero_crossings(bus0);
+    INFO("zc=" << zc);
+    CHECK(zc >= 15);
+    CHECK(zc <= 22);
 }

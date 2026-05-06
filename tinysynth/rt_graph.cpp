@@ -112,24 +112,32 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KBusOut       = 10           BusOut        = 10
   kindTag KBusIn        = 11           BusIn         = 11
   kindTag KBusInDelayed = 12           BusInDelayed  = 12
-  kindTag KDelay        = 13           Delay         = 13
+  kindTag KDelay        = 13           Delay        = 13
 
   Bus model: Out, BusOut, BusIn, and BusInDelayed all operate on the
-  same bus pool. The pool is double-buffered (inst.output_buses for
-  the current block and inst.output_buses_prev for the previous
-  block's snapshot). Each GraphInstance owns its own pool — see
-  Note [§2.B: per-instance state]. Out and BusOut share the same
-  kernel writing to output_buses — Out is just a source-level alias
-  for "BusOut to a hardware-routed bus". The audio callback routes
-  buses [0..output_channels-1] to hardware regardless of which kind
-  wrote them. BusIn reads from the live output_buses; BusInDelayed
-  reads from the frozen output_buses_prev snapshot.
+  same bus pool, owned by the Server (see Note [§2.C: server-global
+  buses]). The pool is double-buffered (server.output_buses for the
+  current block and server.output_buses_prev for the previous block's
+  snapshot). Out and BusOut share the same kernel writing to
+  output_buses — Out is just a source-level alias for "BusOut to a
+  hardware-routed bus". The audio callback routes buses
+  [0..output_channels-1] to hardware regardless of which kind wrote
+  them. BusIn reads from the live output_buses; BusInDelayed reads
+  from the frozen output_buses_prev snapshot.
 
-  Same-cycle ordering between BusOut and BusIn is enforced on the
-  Haskell side via E_r edges in effectiveDeps; BusInDelayed
-  deliberately produces no E_r edge so feedback loops are schedulable.
-  See Note [Effect-induced edges (E_r)] in MetaSonic.Bridge.Validate
-  and Note [Bus pool double-buffering] below.
+  Same-cycle ordering between BusOut and BusIn within one instance
+  is enforced on the Haskell side via E_r edges in effectiveDeps;
+  BusInDelayed deliberately produces no E_r edge so feedback loops
+  are schedulable. See Note [Effect-induced edges (E_r)] in
+  MetaSonic.Bridge.Validate and Note [Bus pool double-buffering]
+  below.
+
+  Cross-instance routing (§2.C): because the bus pool is shared,
+  voice A writing bus 5 is visible to voice B's BusIn(5) within the
+  same block (assuming A's Out runs before B's BusIn — which holds
+  if A precedes B in the instance vector and the per-instance
+  topological order respects bus E_r edges). For deterministic
+  cross-block feedback, B uses BusInDelayed(5).
 
   Delay model: Delay nodes own per-instance fractional ring buffers
   (q::delay). No shared resource, no Eff annotation beyond Pure. See
@@ -274,9 +282,9 @@ happens when the delay's geometry changes, which is at graph load.
 
 Per-instance buffer means there's no shared resource: Eff is Pure on
 the Haskell side, no E_r edges, scheduling is pure-data-dependency.
-Multi-instance (§2.B): each GraphInstance has its own DelayState, so
-voices with the same MetaDef-template Delay maintain independent
-ring buffers.
+Multi-instance: each GraphInstance has its own DelayState, so voices
+with the same MetaDef-template Delay maintain independent ring
+buffers — the per-node state vector survived the §2.C bus split.
 */
 struct DelayState {
   std::optional<q::delay> line;
@@ -306,12 +314,11 @@ Each node's *spec* (immutable per template) is separated from its
     preallocated to max_frames, and the kernel state variant
     (OscState, LPFState, …).
 
-§2.B made the multi-instance shape concrete: a single MetaDef now
-hosts a vector of GraphInstances. Adding a node updates the spec
-once and walks every live instance to install state for that slot;
-adding an instance walks every spec to populate that instance's
-NodeInstanceState vector. §2.C will move the bus pool out of
-GraphInstance into a shared Server.
+§2.B made the multi-instance shape concrete: a single MetaDef hosts
+a vector of GraphInstances. §2.C moved the bus pool out of the
+GraphInstance into a Server shared by all instances of an RTGraph,
+enabling cross-voice routing (voice A writes bus 5; voice B's
+BusIn(5) reads it within the same block).
 
 Convention used throughout the kernels:
 
@@ -320,8 +327,8 @@ Convention used throughout the kernels:
 destructures the per-instance node state at the top. spec.input_refs
 is read indirectly via resolve_input(g, inst, node_idx, …); node.
 controls / node.outputs / node.state are read and written directly.
-inst.output_buses / inst.output_buses_prev are accessed by the
-bus-write/bus-read kernels.
+g.server.output_buses / g.server.output_buses_prev are accessed by
+the bus-write/bus-read kernels.
 */
 
 struct NodeSpec {
@@ -347,6 +354,33 @@ output_span(const NodeInstanceState &node, PortIndex port, int nframes) noexcept
   return {node.outputs[to_size(port)].data(), static_cast<std::size_t>(nframes)};
 }
 
+/* Note [§2.C: server-global buses]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The bus pool is owned by a Server that is shared across all
+GraphInstances of an RTGraph. The two parallel vectors
+(output_buses and output_buses_prev) hold the live and
+previous-block contents respectively, double-buffered exactly as
+before — but now the swap+clear runs *once per block* at the Server
+level, before any instance processes.
+
+This unlocks cross-voice routing. Voice A's BusOut(5) writes into
+server.output_buses[5]; voice B's BusIn(5) (in a later instance,
+same block) reads it back. For cross-block feedback or "send
+return" patterns where A and B run in any order, B uses
+BusInDelayed(5) and reads from output_buses_prev[5].
+
+In SuperCollider terms, the Server's output_buses corresponds to the
+private/output bus space that all Synths share. Future §2.D groups
+will let users constrain ordering between instances within a group;
+right now instances run in vector-index order, which the user
+controls via rt_graph_instance_add ordering.
+*/
+
+struct Server {
+  std::vector<std::vector<float>> output_buses;
+  std::vector<std::vector<float>> output_buses_prev;
+};
+
 /* Note [MetaDef and GraphInstance]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 MetaDef is the immutable template:
@@ -360,13 +394,12 @@ MetaDef is the immutable template:
 GraphInstance is one running copy:
 
   * def — non-owning pointer back to the MetaDef this instance was
-    created from. Today set to &g->def at create time; in §2.C+ a
-    Server may host instances of different MetaDefs.
+    created from. Today set to &g->def at create time.
   * nodes — parallel-by-index vector of per-node mutable state.
-  * output_buses / output_buses_prev — bus pool for this instance.
-    In §2.C this moves to a shared Server so instances can route
-    audio to each other. Until then each instance has private buses
-    and the audio callback sums them onto hardware channels.
+
+The bus pool is *not* on GraphInstance any more — it lives on the
+Server, shared across instances. See Note [§2.C: server-global
+buses].
 */
 
 struct MetaDef {
@@ -377,8 +410,6 @@ struct MetaDef {
 struct GraphInstance {
   const MetaDef *def = nullptr;
   std::vector<NodeInstanceState> nodes;
-  std::vector<std::vector<float>> output_buses;
-  std::vector<std::vector<float>> output_buses_prev;
 };
 
 /* Note [Node configuration: spec vs state]
@@ -399,7 +430,8 @@ Adding a node decomposes into two independent steps:
 
 The architectural invariant is that the DSP loop performs no
 allocation. All buffer growth happens here while loading or
-reloading the graph, or while creating an instance.
+reloading the graph, or while creating an instance. Bus-pool growth
+happens on the Server, not on instances; see ensure_output_bus_count.
 */
 
 static void configure_spec(NodeSpec &spec, NodeKind kind) {
@@ -451,7 +483,7 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
   case NodeKind::BusOut:
     // BusOut is a sink, like Out: control 0 = bus index, one input,
     // no per-node output buffer (writes directly into
-    // inst.output_buses). See Note [Bus model].
+    // server.output_buses). See Note [Bus model].
     spec.default_controls.resize(1, 0.0); // [bus]
     spec.input_refs.resize(1);            // [signal_in]
     break;
@@ -522,7 +554,7 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
   case NodeKind::Out:
   case NodeKind::BusOut:
     // Sinks: no per-node output buffer. Writes go directly into
-    // inst.output_buses inside the bus-write kernel.
+    // server.output_buses inside the bus-write kernel.
     break;
   }
 
@@ -545,8 +577,8 @@ Its job is (deliberately) narrow:
 
   * when the audio callback fires, run process_graph for the current
     frame count
-  * sum each live instance's output buses onto q_io's
-    non-interleaved output channel spans
+  * copy each Server output bus onto q_io's non-interleaved output
+    channel spans
   * set a one-way "started" flag once the callback has actually run
 
 Crucially, the callback does not call back into the Haskell side,
@@ -572,18 +604,23 @@ struct GraphAudioStream : q::audio_stream {
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 RTGraph is the sole owner of runtime state.
 
-Today it owns exactly one MetaDef (the immutable template) and a
-vector of GraphInstances (each a running copy). A default instance
-is created at index 0 by rt_graph_create so the back-compatibility
-single-instance API (rt_graph_set_control, rt_graph_read_bus) can
-operate without an explicit instance argument. §2.C will hoist the
-bus pool from each GraphInstance into a shared Server.
+Today it owns:
+
+  * one MetaDef (the immutable template)
+  * a vector of GraphInstances (each a running copy with per-node
+    state but no bus pool)
+  * one Server that holds the shared bus pool
+
+A default GraphInstance is created at index 0 by rt_graph_create so
+the back-compatibility single-instance API (rt_graph_set_control,
+rt_graph_read_bus) can operate without an explicit instance argument.
 
 Contains:
 
   * the dense def (NodeSpec vector, max_frames)
   * the instance vector (live + dead slots; dead slots reused by
     rt_graph_instance_add)
+  * the Server bus pool (shared across instances)
   * the maximum frame size used for all preallocations
   * the currently active sample rate
   * an optional realtime audio stream
@@ -594,7 +631,7 @@ All ownership, lifetime, and mutation live here.
 
 /* Note [Bus pool double-buffering]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The bus pool is split into two parallel vectors of identical shape:
+The server bus pool is split into two parallel vectors of identical shape:
 
   * output_buses       — this block's *live* contents. BusOut/Out
                          accumulate into it; BusIn reads from it.
@@ -602,7 +639,7 @@ The bus pool is split into two parallel vectors of identical shape:
                          the duration of the current block.
                          BusInDelayed reads from this.
 
-At the start of every block (in process_instance) we:
+At the start of every block (in process_graph) we:
 
   1. swap(output_buses, output_buses_prev). After the swap, the
      vector that was "live" last block is now the "prev" snapshot,
@@ -611,32 +648,35 @@ At the start of every block (in process_instance) we:
   2. zero the new live buffer (clear_output_buses). BusOut accumulates
      additively, so it needs to start from zero.
 
+The swap runs *once per block* at the Server level — every instance
+processed in this block sees the same prev snapshot and writes into
+the same live buffer. Cross-instance routing follows directly: A's
+BusOut(5) and B's BusIn(5) hit the same server.output_buses[5].
+
 Within a block, reads and writes have well-defined origins:
 
-  - BusOut writes go into output_buses[bus].
-  - BusIn reads from output_buses[bus]. The Haskell scheduler's E_r
-    edges force every same-bus BusOut to execute before BusIn, so
-    by the time BusIn runs the live buffer holds this block's
-    accumulated value.
-  - BusInDelayed reads from output_buses_prev[bus]. No E_r edge
-    relates BusInDelayed to BusOut: the snapshot is immutable for
-    the duration of the block. BusInDelayed can therefore appear
+  - BusOut writes go into server.output_buses[bus].
+  - BusIn reads from server.output_buses[bus]. Within one instance
+    the Haskell scheduler's E_r edges force every same-bus
+    BusOut/Out to execute before BusIn, so by the time an
+    intra-instance BusIn runs the live buffer holds this block's
+    accumulated value. Cross-instance, ordering depends on instance
+    iteration order (instance vector index, today).
+  - BusInDelayed reads from server.output_buses_prev[bus]. No E_r
+    edge relates BusInDelayed to BusOut: the snapshot is immutable
+    for the duration of the block. BusInDelayed can therefore appear
     *before* same-bus BusOut in the topological order, which is
-    exactly what makes feedback loops schedulable.
+    exactly what makes feedback loops schedulable across blocks
+    (and across instances).
 
 On the very first block, output_buses_prev contains the
 zero-initialised state assigned by ensure_output_bus_count, so a
 first-block BusInDelayed produces silence. After block N completes,
 its writes become block N+1's "prev" snapshot.
 
-§2.B note: each GraphInstance has its own pool, so feedback paths
-do not bleed between instances. Two voices with BusInDelayed loops
-are independent ring-of-swaps, evolving on their own histories.
-
-Memory cost: 2× the bus pool *per instance*. With 64 buses × 1024
-frames × 4 bytes that's 512 KB per instance — bounded and small.
-The swap is O(1) per instance (a pointer-swap on the std::vector
-heads); no copies on the audio thread.
+Memory cost: 2× the bus pool, total. With 64 buses × 1024 frames ×
+4 bytes that's 512 KB regardless of how many instances run — instances
+are stateful but bus-pool-free.
 
 ensure_output_bus_count grows both vectors in lockstep so the swap
 never needs to reconcile sizes. rt_graph_clear empties both.
@@ -651,6 +691,7 @@ struct RTGraph {
   float sample_rate = kDefaultSampleRate;
   MetaDef def;
   std::vector<std::optional<GraphInstance>> instances;
+  Server server;
   std::unique_ptr<GraphAudioStream> audio;
 };
 
@@ -684,7 +725,8 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
 // source node's outputs from the instance side (inst.nodes). The
 // instance argument tells us *which* instance's outputs to read —
 // every kernel reads sources from its own instance, never from a
-// sibling's.
+// sibling's. (Cross-instance signal flow goes through the server bus
+// pool via BusOut/BusIn, not via direct port wiring.)
 [[nodiscard]] static std::span<const float> resolve_input(
     const RTGraph &g,
     const GraphInstance &inst,
@@ -729,8 +771,8 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
   return output_span(src, ref.src_port, nframes);
 }
 
-// Forward decl so add_node helpers can grow bus pools.
-static void ensure_output_bus_count(GraphInstance &inst, std::size_t count, int max_frames);
+// Forward decl so add_node helpers can grow the server's bus pool.
+static void ensure_output_bus_count(Server &server, std::size_t count, int max_frames);
 
 // Ensure the dense def vector and every live instance's nodes vector
 // are large enough to hold node_index. Both halves are grown in
@@ -756,12 +798,13 @@ static void ensure_node_slot(RTGraph &g, NodeIndex node_index) {
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out nodes do not write directly to a hardware device.
 
-Each Out node accumulates its input signal directly into one runtime output bus,
-selected by control slot 0.
+Each Out node accumulates its input signal directly into one Server
+output bus, selected by control slot 0.
 
 This gives the runtime a useful intermediate abstraction:
 
-  * multiple Out nodes may sum onto the same bus
+  * multiple Out nodes (within one instance or across many instances)
+    may sum onto the same bus
   * offline processing can inspect buses without opening audio
   * realtime output can map buses to device channels in a separate step
 
@@ -771,22 +814,22 @@ and accumulation remain allocation-free inside the DSP loop.
 
 // Grow both halves of the double-buffered bus pool to hold at least
 // `count` buses. The two vectors must always be the same size so the
-// per-block std::swap in process_instance stays size-consistent. New
+// per-block std::swap in process_graph stays size-consistent. New
 // slots are zero-initialised on both sides — a first-block
 // BusInDelayed reading from output_buses_prev therefore gets silence
 // rather than uninitialised memory. See Note [Bus pool
 // double-buffering].
-static void ensure_output_bus_count(GraphInstance &inst, std::size_t count, int max_frames) {
-  if (inst.output_buses.size() >= count) {
+static void ensure_output_bus_count(Server &server, std::size_t count, int max_frames) {
+  if (server.output_buses.size() >= count) {
     return;
   }
 
-  const std::size_t old_size = inst.output_buses.size();
-  inst.output_buses.resize(count);
-  inst.output_buses_prev.resize(count);
+  const std::size_t old_size = server.output_buses.size();
+  server.output_buses.resize(count);
+  server.output_buses_prev.resize(count);
   for (std::size_t i = old_size; i < count; ++i) {
-    inst.output_buses[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
-    inst.output_buses_prev[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
+    server.output_buses[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
+    server.output_buses_prev[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
   }
 }
 
@@ -795,9 +838,9 @@ static void ensure_output_bus_count(GraphInstance &inst, std::size_t count, int 
 // alone — that's the buffer BusInDelayed is reading from, and any
 // writes to it would corrupt feedback paths. See Note [Bus pool
 // double-buffering].
-static void clear_output_buses(GraphInstance &inst, int nframes) noexcept {
+static void clear_output_buses(Server &server, int nframes) noexcept {
   const std::size_t frames = static_cast<std::size_t>(nframes);
-  for (auto &bus : inst.output_buses) {
+  for (auto &bus : server.output_buses) {
     std::fill_n(bus.begin(), frames, 0.0f);
   }
 }
@@ -1161,9 +1204,9 @@ static void process_env(const RTGraph &g, GraphInstance &inst,
 /* Note [Bus-write kernel: Out and BusOut share this]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out and BusOut are operationally identical: both accumulate their input
-signal additively into 'inst.output_buses[bus]', where 'bus' is read
-from control slot 0. The only difference is at the *source* level —
-Out reads as "final hardware output", BusOut reads as "intermediate
+signal additively into 'g.server.output_buses[bus]', where 'bus' is
+read from control slot 0. The only difference is at the *source* level
+— Out reads as "final hardware output", BusOut reads as "intermediate
 audio bus". The audio callback routes buses [0..output_channels-1] to
 hardware regardless of which kind wrote them, so an Out targeting bus
 5 and a BusOut targeting bus 5 produce identical audible results.
@@ -1174,15 +1217,19 @@ process_instance. See Note [Bus model] near the NodeKind enum.
 The kernel performs no allocation: the bus pool was sized at graph
 load via 'ensure_output_bus_count' inside
 'rt_graph_instance_set_control', and zeroed each block by
-'clear_output_buses'. Same-cycle ordering between BusOut and BusIn
-(a BusIn n always sees the live, accumulated value) is enforced on
-the Haskell side via E_r edges in 'effectiveDeps'; the runtime
-simply iterates nodes in the resulting topological order.
+'clear_output_buses' at the Server level. Same-cycle ordering between
+BusOut and BusIn within an instance (a BusIn always sees the live,
+accumulated value) is enforced on the Haskell side via E_r edges in
+'effectiveDeps'; the runtime simply iterates nodes in the resulting
+topological order. Cross-instance accumulation happens because all
+instances write to the same shared pool; the bus contents at any
+given moment reflect every BusOut/Out that has run so far in this
+block (in instance-iteration × per-instance topo-order).
 
 If the input is unconnected or the bus index is invalid, the node
 contributes nothing. Multiple writers to the same bus sum.
 */
-static void process_out(const RTGraph &g, GraphInstance &inst,
+static void process_out(RTGraph &g, GraphInstance &inst,
                         std::size_t node_idx, int nframes) noexcept {
   auto &node = inst.nodes[node_idx];
   const auto in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -1190,10 +1237,10 @@ static void process_out(const RTGraph &g, GraphInstance &inst,
     return;
 
   const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= inst.output_buses.size())
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.server.output_buses.size())
     return;
 
-  auto &dst = inst.output_buses[static_cast<std::size_t>(bus)];
+  auto &dst = g.server.output_buses[static_cast<std::size_t>(bus)];
   for (int i = 0; i < nframes; ++i) {
     dst[static_cast<std::size_t>(i)] += in[static_cast<std::size_t>(i)];
   }
@@ -1202,32 +1249,34 @@ static void process_out(const RTGraph &g, GraphInstance &inst,
 /* Note [BusIn kernel: read live bus contents]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 BusIn is a source: it copies the current contents of
-'inst.output_buses[bus]' into the node's output port 0, so downstream
-consumers can read it like any other audio source.
+'g.server.output_buses[bus]' into the node's output port 0, so
+downstream consumers can read it like any other audio source.
 
-Same-cycle semantics: by the time process_busin runs, every BusOut/Out on
-the same bus has already accumulated this block's contributions, because
-the topological sort on the Haskell side put writers before readers via
-the E_r edges derived from BusWrite/BusRead effects. So BusIn always sees
-the live value — never stale data, never zeros (unless the bus genuinely
-had no writer this block).
+Same-cycle semantics within an instance: by the time a BusIn runs,
+every BusOut/Out on the same bus *within the same instance* has
+already accumulated this block's contributions, because the topological
+sort on the Haskell side put writers before readers via the E_r edges
+derived from BusWrite/BusRead effects. Across instances, ordering
+depends on the iteration order of g.instances — for deterministic
+cross-instance feedback, use BusInDelayed instead.
 
-If the bus index is out of range, the kernel emits silence. Reading a bus
-that no node wrote in this block is well-defined: clear_output_buses
-zeroed the bus at the start of the block, so BusIn gets zero.
+If the bus index is out of range, the kernel emits silence. Reading a
+bus that no node wrote in this block is well-defined:
+clear_output_buses zeroed the bus at the start of the block, so BusIn
+gets zero.
 */
-static void process_busin(const RTGraph &, GraphInstance &inst,
+static void process_busin(const RTGraph &g, GraphInstance &inst,
                           std::size_t node_idx, int nframes) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
   const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= inst.output_buses.size()) {
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.server.output_buses.size()) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  const auto &src = inst.output_buses[static_cast<std::size_t>(bus)];
+  const auto &src = g.server.output_buses[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
   std::copy_n(src.begin(), frames, out.begin());
 }
@@ -1235,9 +1284,9 @@ static void process_busin(const RTGraph &, GraphInstance &inst,
 /* Note [BusInDelayed kernel: read previous block's snapshot]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 BusInDelayed is the feedback primitive. It reads from
-'inst.output_buses_prev[bus]' — the frozen snapshot of what the
+'g.server.output_buses_prev[bus]' — the frozen snapshot of what the
 previous block wrote — rather than from the live
-'inst.output_buses[bus]'. The swap-and-clear in process_instance
+'g.server.output_buses[bus]'. The swap-and-clear in process_graph
 guarantees that:
 
   * output_buses_prev[bus] holds exactly what the previous block's
@@ -1245,13 +1294,15 @@ guarantees that:
     or the initial zero state on the very first block);
   * output_buses_prev is *not* mutated during the current block;
   * BusInDelayed therefore returns a stable, deterministic value
-    regardless of where it sits in the topological order.
+    regardless of where it sits in the topological order or which
+    instance reads it.
 
 The third point is the design's payoff. On the Haskell side
 'BusReadDelayed' is excluded from E_r edges, so a BusInDelayed n can
 appear *before* a same-bus BusOut n in the schedule — closing a
 feedback loop whose only true cycle is across the block boundary,
-where the swap breaks it.
+where the swap breaks it. With server-global buses, this also closes
+*cross-instance* feedback loops without ordering hazards.
 
 Out-of-range bus indices emit silence (same as BusIn). Reading a bus
 that no node ever wrote — including on the first block, before any
@@ -1265,19 +1316,19 @@ one-block latency.
 See Note [Bus pool double-buffering].
 */
 static void process_busin_delayed(
-    const RTGraph &, GraphInstance &inst,
+    const RTGraph &g, GraphInstance &inst,
     std::size_t node_idx, int nframes
 ) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
   const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= inst.output_buses_prev.size()) {
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.server.output_buses_prev.size()) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  const auto &src = inst.output_buses_prev[static_cast<std::size_t>(bus)];
+  const auto &src = g.server.output_buses_prev[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
   std::copy_n(src.begin(), frames, out.begin());
 }
@@ -1383,33 +1434,19 @@ computed on the Haskell side. There is therefore no separate
 scheduler in this file. The dense node vector is already the
 "schedule". That simplicity is by design. Thus the name "tinysynth".
 
-§2.B note: instances run independently and in arbitrary order
-within the audio callback. Each instance carries its own bus pool
-and per-node state, so there's no cross-instance ordering
-constraint at this layer. §2.C+ Server adds groups and inter-
-instance bus routing, which will introduce ordering between
-instances within a group.
+Across instances, the order is the order of g.instances (vector
+index). Server-global buses (§2.C) make cross-instance ordering
+visible: instance A writing bus N before instance B reading bus N
+is observable. For deterministic feedback that doesn't depend on
+this ordering, use BusInDelayed which reads from the
+previous-block snapshot.
+
+§2.D groups will let users constrain inter-instance ordering
+explicitly; today instance ordering is implicit in the
+rt_graph_instance_add call sequence.
 */
 
-static void process_instance(const RTGraph &g, GraphInstance &inst, int nframes) noexcept {
-  // Ping-pong this instance's bus pool, then zero the new live buffer.
-  //
-  // After the swap:
-  //   * output_buses_prev holds what was just written *last* block —
-  //     BusInDelayed reads this stable snapshot.
-  //   * output_buses (now pointing at the buffer that was prev before
-  //     the swap, i.e. two-blocks-old data) is about to be cleared
-  //     and accumulated into by this block's BusOut/Out kernels.
-  //
-  // The swap is O(1) (vector-of-vectors has its heap pointers swapped
-  // wholesale; no per-bus copies). Doing it before clear means
-  // BusInDelayed is reading the freshly-rotated prev while BusOut is
-  // accumulating into a freshly-zeroed live — no aliasing risk.
-  //
-  // See Note [Bus pool double-buffering].
-  std::swap(inst.output_buses, inst.output_buses_prev);
-  clear_output_buses(inst, nframes);
-
+static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexcept {
   const std::size_t node_count = std::min(g.def.nodes.size(), inst.nodes.size());
   for (std::size_t i = 0; i < node_count; ++i) {
     switch (g.def.nodes[i].kind) {
@@ -1459,6 +1496,13 @@ static void process_instance(const RTGraph &g, GraphInstance &inst, int nframes)
 }
 
 static void process_graph(RTGraph &g, int nframes) noexcept {
+  // Ping-pong the server bus pool, then zero the new live buffer.
+  // This runs ONCE per block, before any instance executes — every
+  // instance in this block sees the same prev snapshot and writes
+  // into the same live buffer. See Note [Bus pool double-buffering].
+  std::swap(g.server.output_buses, g.server.output_buses_prev);
+  clear_output_buses(g.server, nframes);
+
   for (auto &maybe_inst : g.instances) {
     if (maybe_inst) {
       process_instance(g, *maybe_inst, nframes);
@@ -1479,21 +1523,16 @@ GraphAudioStream::GraphAudioStream(
 The q_io callback receives one non-interleaved output span per hardware
 channel.
 
-Sum-mixing across instances (§2.B): for each hardware channel ch, the
-callback zeroes the destination, then walks every live instance and
-accumulates that instance's bus[ch] (or bus[0] if the instance only has
-one bus and the device has multiple channels) into the destination.
-This makes a polyphonic synth as natural as adding instances: each
-voice contributes additively, the hardware hears the mix.
+§2.C: the server bus pool is shared across all instances, so the
+callback can copy each bus directly to the matching hardware channel
+without per-instance summing — mixing already happened at the bus
+level when each instance's BusOut/Out wrote into server.output_buses.
 
-Instances with no buses configured contribute nothing. An instance
-with N buses feeds channels 0..N-1; channels above N receive no
-contribution from that instance (so wider hardware than the synth
-expects produces silence on the extra channels rather than a loud
-duplicate).
+The runtime maps output buses to channels as follows:
 
-§2.C will replace this per-instance mixing with explicit shared
-output buses owned by the Server.
+  * if the graph has multiple buses, bus N feeds channel N when present
+  * if the graph has exactly one bus but the device has multiple output
+    channels, bus 0 is duplicated to every channel
 */
 
 void GraphAudioStream::process(out_channels const &out) {
@@ -1508,21 +1547,19 @@ void GraphAudioStream::process(out_channels const &out) {
     auto dst = out[ch];
     std::fill(dst.begin(), dst.end(), 0.0f);
 
-    for (const auto &maybe_inst : graph.instances) {
-      if (!maybe_inst) continue;
-      const auto &inst = *maybe_inst;
-      if (inst.output_buses.empty()) continue;
+    if (graph.server.output_buses.empty()) {
+      continue;
+    }
 
-      const std::size_t bus =
-          (inst.output_buses.size() == 1 && out.size() > 1) ? 0 : ch;
+    const std::size_t bus =
+        (graph.server.output_buses.size() == 1 && out.size() > 1) ? 0 : ch;
 
-      if (bus >= inst.output_buses.size()) continue;
-
-      const auto &src = inst.output_buses[bus];
-      const std::size_t frames = static_cast<std::size_t>(nframes);
-      for (std::size_t i = 0; i < frames; ++i) {
-        dst[i] += src[i];
-      }
+    if (bus < graph.server.output_buses.size()) {
+      std::copy_n(
+          graph.server.output_buses[bus].begin(),
+          static_cast<std::size_t>(nframes),
+          dst.begin()
+      );
     }
   }
 }
@@ -1639,33 +1676,16 @@ open_audio_stream(RTGraph &g, int requested_output_channels, int requested_devic
 }
 
 // Build a fresh GraphInstance for the given def, with its own per-node
-// state and a bus pool sized to mirror an existing live instance (or
-// empty if no live instance exists).
-static GraphInstance make_instance(const MetaDef &def, int max_frames,
-                                   std::size_t mirror_bus_count) {
+// state. The bus pool lives on the Server, so a new instance carries
+// no bus state of its own.
+static GraphInstance make_instance(const MetaDef &def, int max_frames) {
   GraphInstance inst;
   inst.def = &def;
   inst.nodes.resize(def.nodes.size());
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
     init_node_state(inst.nodes[i], def.nodes[i], max_frames);
   }
-  if (mirror_bus_count > 0) {
-    ensure_output_bus_count(inst, mirror_bus_count, max_frames);
-  }
   return inst;
-}
-
-// Largest output_buses size across live instances. Used when adding a
-// new instance so it inherits a bus pool wide enough for the existing
-// graph.
-static std::size_t max_live_bus_count(const RTGraph &g) noexcept {
-  std::size_t bus_count = 0;
-  for (const auto &maybe : g.instances) {
-    if (maybe && maybe->output_buses.size() > bus_count) {
-      bus_count = maybe->output_buses.size();
-    }
-  }
-  return bus_count;
 }
 
 } // namespace
@@ -1678,10 +1698,11 @@ extern "C" {
 
 // Allocate one runtime graph handle. No nodes are configured yet.
 //
-// Initialises one MetaDef (the immutable template) and pushes a
-// default GraphInstance at index 0. Back-compat single-instance
-// callers (rt_graph_set_control, rt_graph_read_bus) operate on this
-// default instance until it is removed.
+// Initialises one MetaDef (the immutable template), pushes a default
+// GraphInstance at index 0, and starts with an empty Server bus pool
+// (grown lazily by add_node and set_control). Back-compat
+// single-instance callers (rt_graph_set_control, rt_graph_read_bus)
+// operate on the default instance until it is removed.
 RTGraph *rt_graph_create(int capacity, int max_frames) {
   auto *g = new RTGraph{};
   g->capacity = std::max(0, capacity);
@@ -1714,8 +1735,8 @@ void rt_graph_destroy(RTGraph *g) {
 rt_graph_clear is the graph-reload entry point.
 
 It stops active audio, resets the sample rate to the default placeholder value,
-removes all nodes (def + every instance) and bus pools, and reinstates a
-fresh default instance at index 0. The graph handle is preserved for reuse.
+removes all nodes (def + every instance) and the server bus pool, and reinstates
+a fresh default instance at index 0. The graph handle is preserved for reuse.
 */
 
 void rt_graph_clear(RTGraph *g) {
@@ -1727,6 +1748,8 @@ void rt_graph_clear(RTGraph *g) {
   g->sample_rate = kDefaultSampleRate;
   g->def.nodes.clear();
   g->instances.clear();
+  g->server.output_buses.clear();
+  g->server.output_buses_prev.clear();
   if (g->capacity > 0) {
     g->def.nodes.reserve(static_cast<std::size_t>(g->capacity));
   }
@@ -1773,14 +1796,10 @@ void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
         g->max_frames);
   }
 
-  // Out nodes imply at least one runtime output bus exists, on every
-  // live instance.
+  // Out nodes imply at least one runtime output bus exists, on the
+  // shared server pool.
   if (kind == NodeKind::Out) {
-    for (auto &maybe_inst : g->instances) {
-      if (maybe_inst) {
-        ensure_output_bus_count(*maybe_inst, 1, g->max_frames);
-      }
-    }
+    ensure_output_bus_count(g->server, 1, g->max_frames);
   }
 }
 
@@ -1850,12 +1869,10 @@ void rt_graph_process(RTGraph *g, int nframes) {
     return;
   }
 
-  // Default-instance back-compat: if instance 0 exists with no buses,
-  // grow it to at least 1 so legacy callers can read bus 0.
-  if (auto *inst0 = instance_at(*g, 0)) {
-    if (inst0->output_buses.empty()) {
-      ensure_output_bus_count(*inst0, 1, g->max_frames);
-    }
+  // Ensure at least one server bus exists so single-instance default
+  // graphs can read bus 0 without explicit setup.
+  if (g->server.output_buses.empty()) {
+    ensure_output_bus_count(g->server, 1, g->max_frames);
   }
 
   process_graph(*g, nframes);
@@ -1873,8 +1890,8 @@ rt_graph_start_audio opens and starts the q_io / PortAudio stream.
 
 output_channels controls the hardware channel count requested from the
 stream. If the caller passes a non-positive value, the runtime infers a
-channel count from the configured output buses on the largest live
-instance (with a minimum of one).
+channel count from the configured server output buses (with a minimum
+of one).
 
 The function only succeeds once the stream is valid and started. A
 separate rt_graph_wait_started call can then wait until the callback has
@@ -1891,15 +1908,11 @@ int rt_graph_start_audio(RTGraph *g, int output_channels, int device_id) {
   }
 
   if (output_channels <= 0) {
-    output_channels = std::max(1, static_cast<int>(max_live_bus_count(*g)));
+    output_channels = std::max(1, static_cast<int>(g->server.output_buses.size()));
   }
 
-  // Default-instance back-compat: ensure instance 0 has at least one
-  // bus so single-instance graphs are audible without explicit setup.
-  if (auto *inst0 = instance_at(*g, 0)) {
-    if (inst0->output_buses.empty()) {
-      ensure_output_bus_count(*inst0, 1, g->max_frames);
-    }
+  if (g->server.output_buses.empty()) {
+    ensure_output_bus_count(g->server, 1, g->max_frames);
   }
 
   auto stream = open_audio_stream(*g, output_channels, device_id);
@@ -1939,13 +1952,13 @@ void rt_graph_stop_audio(RTGraph *g) {
 }
 
 // ----------------------------------------------------------------
-// Multi-instance FFI (§2.B)
+// Multi-instance FFI
 // ----------------------------------------------------------------
 
 int rt_graph_instance_add(RTGraph *g) {
   if (!g) return -1;
 
-  GraphInstance inst = make_instance(g->def, g->max_frames, max_live_bus_count(*g));
+  GraphInstance inst = make_instance(g->def, g->max_frames);
 
   // Reuse a free slot if any, otherwise append.
   for (std::size_t i = 0; i < g->instances.size(); ++i) {
@@ -2012,10 +2025,12 @@ void rt_graph_instance_set_control(
 
   node.controls[cidx] = value;
 
-  // For Out / BusOut / BusIn / BusInDelayed nodes, control 0 is the bus
-  // index. All four share this instance's double-buffered bus pool;
-  // growing the pool here ensures the DSP loop never has to.
-  // See Note [Bus model] and Note [Bus pool double-buffering].
+  // For Out / BusOut / BusIn / BusInDelayed nodes, control 0 is the
+  // bus index. All four reference the shared Server bus pool;
+  // growing the pool here ensures the DSP loop never has to. The
+  // pool grows once globally even if only one instance touches that
+  // bus index — every other instance can then read or write the same
+  // bus without further setup. See Note [§2.C: server-global buses].
   const bool kind_uses_bus_slot =
       spec.kind == NodeKind::Out
       || spec.kind == NodeKind::BusOut
@@ -2023,7 +2038,7 @@ void rt_graph_instance_set_control(
       || spec.kind == NodeKind::BusInDelayed;
   if (kind_uses_bus_slot && cidx == 0 && value >= 0.0) {
     const auto bus = static_cast<std::size_t>(static_cast<int>(value));
-    ensure_output_bus_count(*inst, bus + 1, g->max_frames);
+    ensure_output_bus_count(g->server, bus + 1, g->max_frames);
   }
 
   if (cidx == 1 && (spec.kind == NodeKind::SinOsc || spec.kind == NodeKind::SawOsc)) {
@@ -2031,6 +2046,10 @@ void rt_graph_instance_set_control(
   }
 }
 
+// Read one bus from the server pool. The instance_id argument acts as
+// a scope check (must reference a live instance) but the data comes
+// from the shared pool — under §2.C, "instance K's view of bus N" is
+// just bus N. A dead instance returns 0 with the buffer untouched.
 int rt_graph_instance_read_bus(
     RTGraph *g, int instance_id, int bus_index, int nframes, float *out
 ) {
@@ -2038,17 +2057,16 @@ int rt_graph_instance_read_bus(
     return 0;
   }
 
-  const GraphInstance *inst = instance_at(*g, instance_id);
-  if (!inst) {
+  if (!instance_at(*g, instance_id)) {
     return 0;
   }
 
   const std::size_t bus = static_cast<std::size_t>(bus_index);
-  if (bus >= inst->output_buses.size()) {
+  if (bus >= g->server.output_buses.size()) {
     return 0;
   }
 
-  const auto &src = inst->output_buses[bus];
+  const auto &src = g->server.output_buses[bus];
   const std::size_t to_copy =
       std::min(static_cast<std::size_t>(nframes), src.size());
   std::copy_n(src.begin(), to_copy, out);
