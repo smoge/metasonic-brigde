@@ -83,7 +83,7 @@ ringModGraph :: SynthGraph
 ringModGraph = runSynth $ do
   carrier   <- sinOsc 440.0 0.0
   modulator <- sinOsc 7.0 0.0
-  ring      <- gain' (audio carrier) (audio modulator)
+  ring      <- gain carrier modulator
   amped     <- gain ring 0.3
   out 0 amped
 
@@ -92,7 +92,7 @@ fmGraph = runSynth $ do
   lfo       <- sinOsc 5.0 0.0
   deviation <- gain lfo 30.0
   freq      <- add 440.0 deviation
-  carrier   <- sinOsc' (audio freq) (Param 0.0)
+  carrier   <- sinOsc freq 0.0
   amped     <- gain carrier 0.3
   out 0 amped
 
@@ -351,34 +351,34 @@ genWellFormedGraph = sized $ \sz -> do
 interpret :: [Op] -> SynthM ()
 interpret = go []
   where
-    go :: [NodeID] -> [Op] -> SynthM ()
+    go :: [Connection] -> [Op] -> SynthM ()
     go _ [] = pure ()
 
     go xs (OSinOsc f p : rest) = do
-      n <- sinOsc f p
-      go (xs <> [n]) rest
+      c <- sinOsc (Param f) (Param p)
+      go (xs <> [c]) rest
 
     go xs (OSawOsc f p : rest) = do
-      n <- sawOsc f p
-      go (xs <> [n]) rest
+      c <- sawOsc (Param f) (Param p)
+      go (xs <> [c]) rest
 
     go xs (ONoise : rest) = do
-      n <- noiseGen
-      go (xs <> [n]) rest
+      c <- noiseGen
+      go (xs <> [c]) rest
 
     go xs (OGain i a : rest)
       | null xs   = go xs rest
       | otherwise = do
           let src = xs !! (i `mod` length xs)
-          n <- gain src a
-          go (xs <> [n]) rest
+          c <- gain src (Param a)
+          go (xs <> [c]) rest
 
     go xs (OLPF i f q : rest)
       | null xs   = go xs rest
       | otherwise = do
           let src = xs !! (i `mod` length xs)
-          n <- lpf src f q
-          go (xs <> [n]) rest
+          c <- lpf src (Param f) (Param q)
+          go (xs <> [c]) rest
 
     go xs (OOut ch i : rest)
       | null xs   = go xs rest

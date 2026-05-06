@@ -73,11 +73,11 @@ filteredSawGraph = runSynth $ do
 detunedSawGraph :: SynthGraph
 detunedSawGraph = runSynth $ do
   osc1 <- sawOsc 220.0 0.0
-  osc2 <- sawOsc 220.5 0.5   --  phase offset avoids phase cancellation
+  osc2 <- sawOsc 220.5 0.5     --  phase offset avoids phase cancellation
   g1   <- gain osc1 0.3
   g2   <- gain osc2 0.3
   out 0 g1
-  out 0 g2                   -- second out accumulates onto same bus
+  out 0 g2                     -- second out accumulates onto same bus
 
 -- Ring modulation: 440 Hz carrier multiplied sample-by-sample by a 7 Hz
 -- modulator. Both signals are bipolar, so this is genuine ring mod
@@ -87,7 +87,7 @@ ringModGraph :: SynthGraph
 ringModGraph = runSynth $ do
   carrier   <- sinOsc 440.0 0.0
   modulator <- sinOsc 7.0 0.0
-  ring      <- gain' (audio carrier) (audio modulator)
+  ring      <- gain carrier modulator
   amped     <- gain ring 0.3
   out 0 amped
 
@@ -97,9 +97,9 @@ ringModGraph = runSynth $ do
 fmGraph :: SynthGraph
 fmGraph = runSynth $ do
   lfo       <- sinOsc 5.0 0.0
-  deviation <- gain lfo 30.0      -- ±30 Hz
+  deviation <- gain lfo 30.0           -- ±30 Hz
   freq      <- add 440.0 deviation
-  carrier   <- sinOsc' (audio freq) (Param 0.0)
+  carrier   <- sinOsc freq 0.0
   amped     <- gain carrier 0.3
   out 0 amped
 

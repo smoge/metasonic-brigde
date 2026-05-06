@@ -28,7 +28,9 @@ module MetaSonic.Bridge.Source
   , -- * Builder monad
     SynthM
   , runSynth
-  , -- * DSL combinators (constant inputs)
+  , -- * DSL combinators
+    --
+    -- $combinators
     sinOsc
   , sawOsc
   , noiseGen
@@ -36,15 +38,8 @@ module MetaSonic.Bridge.Source
   , gain
   , lpf
   , add
-  , -- * DSL combinators (modulatable inputs)
-    --
-    -- $modulation
+  , -- * Connection helpers
     audio
-  , sinOsc'
-  , sawOsc'
-  , gain'
-  , lpf'
-  , add'
   , -- * Dependency extraction
     dependencies
   ) where
@@ -147,6 +142,53 @@ data Connection
     -- graph construction time.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
+
+{- Note [Num/Fractional Connection]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'fromInteger' and 'fromRational' make 'Connection' a target of numeric
+literal defaulting, so the user can write @sinOsc 440.0 0.0@ and have
+the literals lower to @Param 440.0@ and @Param 0.0@. Without this,
+every literal would need an explicit @Param@ wrapper.
+
+Arithmetic operators are partial: 'Param a + Param b' folds to a single
+'Param', but operating on an 'Audio' edge is a compile-time error
+because there is no meaningful constant-folding for runtime signals.
+The user-facing remedy is to use the 'add' or 'gain' graph nodes
+instead, which represent that operation at the runtime level.
+-}
+
+instance Num Connection where
+  fromInteger n = Param (fromInteger n)
+
+  Param a + Param b = Param (a + b)
+  l + r             = audioArithErr "(+)" [l, r]
+
+  Param a * Param b = Param (a * b)
+  l * r             = audioArithErr "(*)" [l, r]
+
+  Param a - Param b = Param (a - b)
+  l - r             = audioArithErr "(-)" [l, r]
+
+  abs (Param a) = Param (abs a)
+  abs c         = audioArithErr "abs" [c]
+
+  signum (Param a) = Param (signum a)
+  signum c         = audioArithErr "signum" [c]
+
+  negate (Param a) = Param (negate a)
+  negate c         = audioArithErr "negate" [c]
+
+instance Fractional Connection where
+  fromRational r = Param (fromRational r)
+
+  Param a / Param b = Param (a / b)
+  l / r             = audioArithErr "(/)" [l, r]
+
+audioArithErr :: String -> [Connection] -> a
+audioArithErr op _ = error $
+  "Num/Fractional Connection: " <> op
+  <> " on an audio-rate Connection is undefined at compile time. "
+  <> "Use the 'add' or 'gain' graph nodes for runtime arithmetic."
 
 {- Note [UGen extensibility]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -342,156 +384,107 @@ insertNode name ugen = do
   put st { ssGraph = graph { sgNodes = nodes } }
   pure nid
 
-{- Note [DSL combinator design]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Each combinator constructs a single node and returns its
-NodeID, which can then be passed as a Connection to downstream
-nodes:
+{- $combinators
 
-  do osc <- sinOsc 440.0 0.0
-     g   <- gain osc 0.5
-     out 0 g
-
-The returned NodeID is the handle that the caller uses to wire
-this node's output into other nodes' inputs. This is the
-"named dependency" pattern: every dependency is explicit and
-named.
-
-Currently the combinators take raw Floats and produce Param
-connections internally. A future typed DSL could distinguish
-audio-rate signals from control-rate signals at the type
-level, preventing wiring errors statically rather than
-catching them in checkRateEdges (MetaSonic.IR).
-
-Higher-level combinators (chain, parallel, mix, templates)
-would elaborate down to these primitives, making the
-elaboration pass a meaningful transformation rather
-than identity.
--}
-
--- | Create a sine oscillator with a fixed frequency and
--- initial phase.
-sinOsc :: Float -> Float -> SynthM NodeID
-sinOsc freq phase =
-  insertNode "sinOsc" (SinOsc (Param freq) (Param phase))
-
--- | Create a bandlimited sawtooth oscillator.
-sawOsc :: Float -> Float -> SynthM NodeID
-sawOsc freq phase =
-  insertNode "sawOsc" (SawOsc (Param freq) (Param phase))
-
--- | Create a white noise generator.
-noiseGen :: SynthM NodeID
-noiseGen = insertNode "noiseGen" NoiseGen
-
--- | Create a low-pass filter.
-lpf :: NodeID -> Float -> Float -> SynthM NodeID
-lpf src freq q =
-  insertNode "lpf" (LPF (Audio src (PortIndex 0)) (Param freq) (Param q))
-
--- | Create a hardware output node.
---
--- Writes a signal to a final output channel intended for the
--- audio device. The @Int@ argument sets the output channel
---
--- This is a terminal node.
-out :: Int -> NodeID -> SynthM ()
-out channel src =
-  void $ insertNode "out" (Out channel (Audio src (PortIndex 0)))
-
-
--- | Write a signal to a shared intermediate bus.
---
--- The Int argument selects the bus index. The signal written
--- here may be read later by other subgraphs or synth fragments
--- using 'busIn'.
---
--- Unlike 'out', this does not target the hardware device. It is
--- part of the internal routing.
---
--- This is a terminal node: it introduces a side effect
--- (writing to a bus) but doesn't returns/produce a downstream signal.
-busOut :: Int -> NodeID -> SynthM ()
-busOut bus src =
-  void $ insertNode "busOut" (BusOut bus (Audio src (PortIndex 0)))
-
-
--- | Read a signal from a shared intermediate bus.
---
--- The @Int@ argument selects the bus index. The returned
--- 'NodeID' can be used as a signal source for further
--- processing
---
--- This is the dual of 'busOut'. It introduces a signal into
--- the graph without requiring an explicit structural edge,
--- and will carry a 'BusRead' effect.
-busIn :: Int -> SynthM NodeID
-busIn bus = insertNode "busIn" (BusIn bus)
-
-
-gain :: NodeID -> Float -> SynthM NodeID
-gain src amount =
-  insertNode "gain" (Gain (Audio src (PortIndex 0)) (Param amount))
-
--- | Add a constant bias to a signal: @add bias src@ produces
--- @bias + src[i]@ at each sample.
-add :: Float -> NodeID -> SynthM NodeID
-add bias src =
-  insertNode "add" (Add (Param bias) (Audio src (PortIndex 0)))
-
-{- $modulation
-
-The primed combinators ('sinOsc'', 'sawOsc'', 'gain'', 'lpf'') accept raw
-'Connection' values for every input slot, so any input can be either a
-'Param' constant or an 'Audio' edge from another node's output. This is
-how one node modulates another at audio rate (FM, AM, ring modulation,
-audio-rate filter cutoff).
-
-The unprimed combinators are kept for the common case where every input
-is a constant.
+Every combinator both takes and returns 'Connection'. Numeric literals
+become 'Param' connections automatically via 'fromRational' /
+'fromInteger', and node-producing combinators return their output as
+an 'Audio' Connection, so values chain naturally without explicit
+lifting:
 
 >>> -- Ring modulation: carrier * modulator at audio rate
 >>> ringModGraph = runSynth $ do
 >>>   carrier   <- sinOsc 440.0 0.0
 >>>   modulator <- sinOsc 7.0 0.0
->>>   ring      <- gain' (audio carrier) (audio modulator)
->>>   out 0 ring
+>>>   ring      <- gain carrier modulator
+>>>   amped     <- gain ring 0.3
+>>>   out 0 amped
 
-The 'audio' helper lifts a 'NodeID' to a 'Connection' on output port 0
-(the only port any current UGen exposes).
+>>> -- Vibrato via FM: 5 Hz LFO biased by 440 Hz
+>>> vibratoGraph = runSynth $ do
+>>>   lfo       <- sinOsc 5.0 0.0
+>>>   deviation <- gain lfo 30.0
+>>>   freq      <- add 440.0 deviation
+>>>   carrier   <- sinOsc freq 0.0
+>>>   out 0 carrier
+
+The 'NodeID' machinery still exists internally for the source-graph
+map, but it is wrapped in @Audio nid 0@ before being returned to the
+caller — so the user-facing handle is always 'Connection' and the
+distinction between "constant" and "audio-rate" inputs is invisible
+to type-check, just like 'Param' vs 'Audio' inside 'Connection'.
+
+The 'audio' helper survives for hand-built graphs that reference a
+'NodeID' directly. User code rarely needs it.
+
+A future typed DSL could distinguish audio-rate from control-rate
+signals at the type level, preventing wiring errors statically rather
+than catching them in @checkRateEdges@. Higher-level combinators
+(chain, parallel, mix, templates) would elaborate down to these
+primitives, making the elaboration pass a meaningful transformation
+rather than identity.
 -}
 
 -- | Lift a 'NodeID' to an audio-rate 'Connection' on output port 0.
+-- Rarely needed in user code: combinators already return their
+-- output as a 'Connection'. Useful for hand-built graphs.
 audio :: NodeID -> Connection
 audio n = Audio n (PortIndex 0)
 
--- | Sine oscillator with explicit 'Connection' inputs. Either input may
--- be a 'Param' constant or an 'Audio' edge from another node, enabling
--- audio-rate frequency modulation (FM) and phase modulation.
-sinOsc' :: Connection -> Connection -> SynthM NodeID
-sinOsc' freq phase = insertNode "sinOsc" (SinOsc freq phase)
+-- Internal helper: register a node and return its output as a
+-- 'Connection' on port 0.
+insertNodeC :: String -> UGen -> SynthM Connection
+insertNodeC name ugen = audio <$> insertNode name ugen
 
--- | Bandlimited sawtooth with explicit 'Connection' inputs.
-sawOsc' :: Connection -> Connection -> SynthM NodeID
-sawOsc' freq phase = insertNode "sawOsc" (SawOsc freq phase)
+-- | Sine oscillator. Either input may be a numeric literal (which
+-- becomes a 'Param' constant) or another node's 'Connection', so
+-- this is the FM construction site.
+sinOsc :: Connection -> Connection -> SynthM Connection
+sinOsc freq phase = insertNodeC "sinOsc" (SinOsc freq phase)
 
--- | Multiply with explicit 'Connection' inputs. With both inputs as
--- 'Audio' edges this is sample-accurate amplitude modulation (ring
--- modulation when both signals are bipolar).
-gain' :: Connection -> Connection -> SynthM NodeID
-gain' sig amount = insertNode "gain" (Gain sig amount)
+-- | Bandlimited sawtooth. Same input shape as 'sinOsc'.
+sawOsc :: Connection -> Connection -> SynthM Connection
+sawOsc freq phase = insertNodeC "sawOsc" (SawOsc freq phase)
 
--- | Low-pass filter with explicit 'Connection' inputs. Note: audio-rate
--- modulation of cutoff or Q produces zipper artifacts with the current
--- biquad implementation; treat this as control-rate for now.
-lpf' :: Connection -> Connection -> Connection -> SynthM NodeID
-lpf' sig freq q = insertNode "lpf" (LPF sig freq q)
+-- | White noise generator. No inputs.
+noiseGen :: SynthM Connection
+noiseGen = insertNodeC "noiseGen" NoiseGen
 
--- | Sum two inputs with explicit 'Connection' arguments. Either or
--- both may be 'Audio' edges, so this is sample-accurate addition
--- regardless of input shape.
-add' :: Connection -> Connection -> SynthM NodeID
-add' a b = insertNode "add" (Add a b)
+-- | Low-pass filter. Audio-rate modulation of cutoff or Q produces
+-- zipper artifacts with the current biquad implementation; treat
+-- those inputs as control-rate for now.
+lpf :: Connection -> Connection -> Connection -> SynthM Connection
+lpf sig freq q = insertNodeC "lpf" (LPF sig freq q)
+
+-- | Multiply two inputs sample-by-sample. With both as audio edges
+-- this is ring modulation; with one as a constant it is scaling.
+gain :: Connection -> Connection -> SynthM Connection
+gain sig amount = insertNodeC "gain" (Gain sig amount)
+
+-- | Sum two inputs sample-by-sample. Used to bias a bipolar modulator
+-- off zero (turning ring mod into AM, or through-zero FM into vibrato).
+add :: Connection -> Connection -> SynthM Connection
+add a b = insertNodeC "add" (Add a b)
+
+-- | Hardware output: writes a Connection to a hardware output bus.
+-- In practice the source is an 'Audio' connection from another
+-- node; passing a 'Param' constant would silently produce silence
+-- because the runtime does not synthesize from constant-only inputs.
+-- Terminal node; produces no downstream signal.
+out :: Int -> Connection -> SynthM ()
+out channel src =
+  void $ insertNode "out" (Out channel src)
+
+-- | Write a signal to a shared intermediate bus. (Currently
+-- unused — the runtime side of bus routing is not implemented yet.)
+busOut :: Int -> Connection -> SynthM ()
+busOut bus src =
+  void $ insertNode "busOut" (BusOut bus src)
+
+-- | Read a signal from a shared intermediate bus. (Currently
+-- unused — see 'busOut'.)
+busIn :: Int -> SynthM Connection
+busIn bus = insertNodeC "busIn" (BusIn bus)
 
 -- | Extract explicit structural 'NodeID' dependencies from
 -- a 'UGen'.
