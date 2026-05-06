@@ -878,6 +878,72 @@ crossCuttingTests = testGroup "End-to-end FFI"
           assertBool ("expected peak ≈ 0.5 from BusOut→BusIn round-trip, got " <> show peak)
                      (abs (peak - 0.5) < 0.05)
 
+  , testCase "Out and BusOut writing to the same bus sum (unified pool)" $ do
+      -- Pins the unified-pool model: a bus written by Out and a bus
+      -- written by BusOut targeting the same bus number share the
+      -- same memory and accumulate together. If the runtime ever
+      -- regressed to two pools, this test would catch it.
+      --
+      -- SinOsc → Out 0 (peak ≈ 1) AND SinOsc' → BusOut 0 (peak ≈ 1)
+      -- on the same bus number. The bus pool is unified, so the read
+      -- of bus 0 should see the sum (peak ≈ 2).
+      let nframes = 256
+          graph = runSynth $ do
+            o1 <- sinOsc 440.0 0.0
+            o2 <- sinOsc 440.0 0.0
+            out 0 o1
+            busOut 0 o2
+
+      rt <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          let peak = maximum (map (\(CFloat x) -> x) cs)
+          assertBool
+            ("expected Out + BusOut to sum to peak ≈ 2 on shared bus 0, got "
+              <> show peak)
+            (peak > 1.5 && peak < 2.1)
+
+  , testCase "two BusIn readers on the same bus see the same value (fan-out)" $ do
+      -- BusIn 5 read by two consumers; both should see the live value.
+      -- We feed each into a Gain (one ×0.3, one ×0.7) and route both
+      -- to the hardware via separate Out channels, then check that
+      -- the reads were *of the same source* by recovering their sum
+      -- on bus 0 — peak should be (0.3 + 0.7) × 1 = 1.0.
+      let nframes = 256
+          graph = runSynth $ do
+            o      <- sinOsc 440.0 0.0
+            busOut 5 o
+            tap1   <- busIn 5
+            tap2   <- busIn 5
+            g1     <- gain tap1 0.3
+            g2     <- gain tap2 0.7
+            out 0 g1
+            out 0 g2  -- accumulates onto bus 0 with g1
+
+      rt <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          let peak = maximum (map (\(CFloat x) -> abs x) cs)
+          assertBool
+            ("expected (0.3 + 0.7) × SinOsc peak ≈ 1.0, got " <> show peak)
+            (abs (peak - 1.0) < 0.05)
+
   , testCase "Env(gate=0) idle stays silent" $ do
       let nframes = 256
           graph = runSynth $ do
