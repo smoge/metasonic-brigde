@@ -17,9 +17,6 @@ module MetaSonic.Bridge.IR
   , GraphIR (..)
   , -- * Lowering from source
     lowerGraph
-  , -- * Rate and effect inference
-    inferRate
-  , inferEff
   , -- * Rate validation
     checkRateEdges
   ) where
@@ -158,25 +155,6 @@ Faust's semantic typing handles this through its "speed"
 dimension, which propagates through the signal graph.
 This is a key extension.
 -}
-
--- | Infer the rate of a UGen from its kind.
---
--- Derived from the 'kindSpec' table via 'ugenView'. See
--- Note [Per-kind metadata table] in "MetaSonic.Types" and
--- Note [Rate inference vs rate propagation].
-inferRate :: UGen -> Rate
-inferRate = ksRate . kindSpec . uvKind . ugenView
-
--- | Infer the effect set of a UGen.
---
--- Derived from the 'kindSpec' table via 'ugenView'. Currently
--- all nodes are 'Pure'. When buses and buffers become real
--- shared resources, Out will carry @BusWrite bus@, and a
--- future In node will carry @BusRead bus@.
---
--- See Note [Resource effects] in MetaSonic.Types.
-inferEff :: UGen -> [Eff]
-inferEff = ksEffects . kindSpec . uvKind . ugenView
 
 {- Note [Rate edge validation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -343,12 +321,6 @@ lowerNode nodeMap nid =
             , irInputs   = lowerInputs ugen
             , irControls = extractControls ugen
             }
-
--- | Map a UGen constructor to its NodeKind tag.
---
--- See Note [Uniform UGen view] in "MetaSonic.Bridge.Source".
-inferKind :: UGen -> NodeKind
-inferKind = uvKind . ugenView
 
 -- | Lower UGen connections to IR InputConns.
 --

@@ -108,7 +108,17 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KLPF      = 7                LPF      = 7
   kindTag KAdd      = 8                Add      = 8
   kindTag KEnv      = 9                Env      = 9
+  kindTag KBusOut   = 10               BusOut   = 10
+  kindTag KBusIn    = 11               BusIn    = 11
 
+  Bus model: Out, BusOut and BusIn all operate on the same bus pool
+  (g.output_buses). Out and BusOut share the same kernel — Out is just a
+  source-level alias for "BusOut to a hardware-routed bus". The audio
+  callback routes buses [0..output_channels-1] to hardware regardless of
+  which kind wrote them. BusIn reads from the same pool. Same-cycle
+  ordering is enforced on the Haskell side via E_r edges in
+  effectiveDeps; see Note [Effect-induced edges (E_r)] in
+  MetaSonic.Bridge.Validate.
 */
 
 enum class NodeKind : int {
@@ -120,6 +130,8 @@ enum class NodeKind : int {
   LPF = 7,
   Add = 8,
   Env = 9,
+  BusOut = 10,
+  BusIn = 11,
 };
 
 // Single source of truth for the integer-tag → NodeKind mapping.
@@ -137,6 +149,8 @@ kind_from_tag(int node_kind) noexcept {
   case 7: return NodeKind::LPF;
   case 8: return NodeKind::Add;
   case 9: return NodeKind::Env;
+  case 10: return NodeKind::BusOut;
+  case 11: return NodeKind::BusIn;
   default: return std::nullopt;
   }
 }
@@ -378,6 +392,21 @@ static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
     node.input_refs.resize(1); // [gate_in]
     node.outputs.resize(1);
     node.state = EnvState{};
+    break;
+
+  case NodeKind::BusOut:
+    // BusOut is a sink, like Out: control 0 = bus index, one input,
+    // no per-node output buffer (writes directly into g.output_buses).
+    // See Note [Bus model] above.
+    node.controls.resize(1, 0.0); // [bus]
+    node.input_refs.resize(1);    // [signal_in]
+    break;
+
+  case NodeKind::BusIn:
+    // BusIn is a source: control 0 = bus index, no inputs, one output
+    // buffer that downstream nodes can read.
+    node.controls.resize(1, 0.0); // [bus]
+    node.outputs.resize(1);
     break;
   }
 
@@ -843,30 +872,28 @@ static void process_env(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
   }
 }
 
-/* Note [Out node processing — direct bus accumulation]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Out is a pure sink: it accumulates its input signal into a shared
-output bus.
+/* Note [Bus-write kernel: Out and BusOut share this]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Out and BusOut are operationally identical: both accumulate their input
+signal additively into 'g.output_buses[bus]', where 'bus' is read from
+control slot 0. The only difference is at the *source* level — Out reads
+as "final hardware output", BusOut reads as "intermediate audio bus".
+The audio callback routes buses [0..output_channels-1] to hardware
+regardless of which kind wrote them, so an Out targeting bus 5 and a
+BusOut targeting bus 5 produce identical audible results.
 
-Previously, process_out performed two passes over the frame data:
+Both kinds dispatch to this single kernel ('process_out') from
+process_graph. See Note [Bus model] near the NodeKind enum.
 
-  1. copy the resolved input into the node's local output buffer
-  2. accumulate that local buffer into the destination bus
-
-The local buffer was write-only dead storage — Out is a terminal node
-for now, and no downstream node ever reads its output port. The new
-version eliminates the intermediate copy and accumulates the resolved
-input directly into the bus.
+The kernel performs no allocation: the bus pool was sized at graph load
+via 'ensure_output_bus_count' inside 'rt_graph_set_control', and zeroed
+each block by 'clear_output_buses'. Same-cycle ordering between BusOut
+and BusIn (a BusIn n always sees the live, accumulated value) is
+enforced on the Haskell side via E_r edges in 'effectiveDeps'; the
+runtime simply iterates nodes in the resulting topological order.
 
 If the input is unconnected or the bus index is invalid, the node
-contributes nothing. Multiple Out nodes may target the same
-bus.
-
-This design also aligns with the (not yet implemented) bus-routing
-model: when cross-graph communication arrives, a dedicated BusIn node
-will read from the bus, NOT from the Out output port. The bus is the
-shared memory abstraction (just like SC3's Out.ar & In.ar
-design). Keeping Out as a pure accumulator avoids ambiguity.
+contributes nothing. Multiple writers to the same bus sum.
 */
 static void process_out(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
   NodeRuntime &node = g.nodes[node_idx];
@@ -882,6 +909,41 @@ static void process_out(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
   for (int i = 0; i < nframes; ++i) {
     dst[static_cast<std::size_t>(i)] += in[static_cast<std::size_t>(i)];
   }
+}
+
+/* Note [BusIn kernel: read live bus contents]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+BusIn is a source: it copies the current contents of 'g.output_buses[bus]'
+into the node's output port 0, so downstream consumers can read it like
+any other audio source.
+
+Same-cycle semantics: by the time process_busin runs, every BusOut/Out on
+the same bus has already accumulated this block's contributions, because
+the topological sort on the Haskell side put writers before readers via
+the E_r edges derived from BusWrite/BusRead effects. So BusIn always sees
+the live value — never stale data, never zeros (unless the bus genuinely
+had no writer this block).
+
+If the bus index is out of range, the kernel emits silence. Reading a bus
+that no node wrote in this block is well-defined: clear_output_buses
+zeroed the bus at the start of the block, so BusIn gets zero. (This is
+also what SuperCollider does for unwritten audio buses, modulo SC's
+default of *not* clearing audio buses across cycles — a Phase 2 concern
+when we add 'BusInDelayed' for one-block-delayed reads.)
+*/
+static void process_busin(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
+  NodeRuntime &node = g.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+
+  const int bus = static_cast<int>(node.controls[0]);
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.output_buses.size()) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  const auto &src = g.output_buses[static_cast<std::size_t>(bus)];
+  const std::size_t frames = static_cast<std::size_t>(nframes);
+  std::copy_n(src.begin(), frames, out.begin());
 }
 
 /* Note [Execution order]
@@ -922,6 +984,14 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       break;
     case NodeKind::Env:
       process_env(g, i, nframes);
+      break;
+    case NodeKind::BusOut:
+      // Out and BusOut share the same bus-write kernel; see
+      // Note [Bus-write kernel: Out and BusOut share this].
+      process_out(g, i, nframes);
+      break;
+    case NodeKind::BusIn:
+      process_busin(g, i, nframes);
       break;
     default:
       assert(false && "unhandled NodeKind in process_graph");
@@ -1205,9 +1275,14 @@ void rt_graph_set_control(RTGraph *g, int node_index, int control_index, double 
 
   node.controls[cidx] = value;
 
-  // For Out nodes, control 0 is the destination output bus.
-  // Growing the bus array here ensures the DSP loop never has to do it.
-  if (node.kind == NodeKind::Out && cidx == 0 && value >= 0.0f) {
+  // For Out / BusOut / BusIn nodes, control 0 is the bus index. All three
+  // share the same bus pool (g.output_buses); growing the array here
+  // ensures the DSP loop never has to do it. See Note [Bus model].
+  const bool kind_uses_bus_slot =
+      node.kind == NodeKind::Out
+      || node.kind == NodeKind::BusOut
+      || node.kind == NodeKind::BusIn;
+  if (kind_uses_bus_slot && cidx == 0 && value >= 0.0) {
     const auto bus = static_cast<std::size_t>(static_cast<int>(value));
     ensure_output_bus_count(*g, bus + 1);
   }

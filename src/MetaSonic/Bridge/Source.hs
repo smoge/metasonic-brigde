@@ -39,11 +39,17 @@ module MetaSonic.Bridge.Source
   , lpf
   , add
   , env
+  , busOut
+  , busIn
   , -- * Connection helpers
     audio
   , -- * Uniform UGen view
     UGenView (..)
   , ugenView
+  , -- * Per-UGen projections used by lowering and scheduling
+    inferKind
+  , inferRate
+  , inferEff
   , -- * Dependency extraction
     dependencies
   ) where
@@ -200,34 +206,65 @@ Each UGen constructor defines a DSP primitive. The
 constructor's fields are Connections, not raw values — every
 input is uniformly either a constant or a dependency.
 
-The current set is still small for simplicity, but it now distinguishes between
-two different routing roles that were previously blurred together:
+The current set covers signal sources, stateless transforms, an envelope
+generator, and bus routing:
 
-  SinOsc  — oscillator, a signal source
-  Gain    — stateless signal transform
-  BusOut  — write a signal to an intermediate shared bus
-  BusIn   — read a signal from an intermediate shared bus
-  Out     — write a signal to a final hardware output channel
+  SinOsc, SawOsc, NoiseGen   — signal sources
+  Gain, LPF, Add             — stateless signal transforms
+  Env                        — ADSR envelope generator
+  Out                        — write a signal to a hardware output channel
+  BusOut                     — write a signal to a shared audio bus
+  BusIn                      — read a signal from a shared audio bus
 
-This distinction matters architecturally.
+Adding a new UGen constructor requires coordinated changes across:
 
-BusOut and BusIn model internal routing between subgraphs or synth regions. They
-are not final output. Their semantics are tied to shared resources, ordering
-constraints, and planned effect-aware scheduling.
+  - 'NodeKind' constructor + 'kindSpec' row in "MetaSonic.Types"
+  - 'UGen' constructor + 'ugenView' row + builder in this module
+  - per-instance 'inferEff' case in "MetaSonic.Bridge.IR" if effects
+    depend on a constructor field (see 'BusOut' / 'BusIn')
+  - C++ enum value, 'configure_node' case, 'process_*' kernel, and
+    'process_graph' dispatch case in @rt_graph.cpp@
 
-Out, by contrast, is reserved for final hardware-facing output. It is the
-terminal step, a side-effect-only "sink".
+A property test in @test/Spec.hs@ cross-checks 'kindSpec' against
+'ugenView' so the two sources of per-kind shape information cannot drift.
+-}
 
-That separation keeps the source language aligned with the intended runtime.
+{- Note [Bus model: SC-style same-cycle audio buses]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'Out', 'BusOut' and 'BusIn' all operate on the same underlying pool of
+audio buses. The C++ runtime stores one 'output_buses' vector indexed by
+bus number; the audio callback routes 'output_buses[0..output_channels-1]'
+to hardware regardless of which UGen wrote to them. So 'Out' is, in the
+runtime, just a 'BusOut' to a bus number that happens to be hardware-routed.
 
-It also prepares the compiler for future effect analysis:
+  Out 0     ≡  BusOut 0   when bus 0 is a hardware output
+  BusOut 5  ≡  Out 5      if you reconfigure bus 5 as a hardware output
 
-  BusOut bus  — will carry BusWrite bus
-  BusIn bus   — will carry BusRead bus
-  Out chan    — remains a terminal hardware-output node
+We keep 'Out' and 'BusOut' as separate UGen constructors at the source
+level for documentation: 'Out' reads as "final output" while 'BusOut' reads
+as "intermediate routing". They share the same C++ kernel.
 
-Adding a new UGen constructor still requires coordinated
-changes across the Haskell and C++ sides.
+Semantics within a block (mirrors SuperCollider's 'Out.ar' / 'In.ar'):
+
+  - At the start of each block, every bus is zeroed.
+  - 'BusOut n' accumulates its input additively into bus n. Multiple
+    writers to the same bus sum.
+  - 'BusIn n' reads the current contents of bus n.
+  - Ordering: 'BusOut n' executes before 'BusIn n' in the same block, so
+    'BusIn' always sees the live value. This is enforced by E_r edges
+    derived from the 'BusWrite n' / 'BusRead n' effects on the writer/
+    reader; the ordering is *not* a runtime convention but a compile-time
+    edge in the dependency graph used by topological sort.
+
+Same-cycle only for the MVP. Read-before-write feedback ("read previous
+block's value") would need a separate 'BusInDelayed' constructor with a
+double-buffered bus pool — a Phase 2 extension. A graph that creates a
+cycle through buses (BusIn n → ... → BusOut n) is rejected by the cycle
+detector for the same reason a structural cycle is.
+
+See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate" for
+the scheduling pass that derives the BusOut → BusIn edges, and Note
+[Resource effects] in "MetaSonic.Types" for the underlying 'Eff' type.
 -}
 
 -- | A unit generator specification.
@@ -244,37 +281,33 @@ changes across the Haskell and C++ sides.
 -- regions or fused kernels, so the final runtime unit need not
 -- correspond one-to-one with a single 'UGen'. Even so, 'UGen'
 -- remains the basic source-level notion of a primitive node in
--- the graph. At least in the currect vocabulaty.
+-- the graph.
 --
--- Routing is intentionally split into two layers:
---
---   * 'BusOut' and 'BusIn' are for intermediate shared-bus
---     communication between subgraphs or synth regions.
---
---   * 'Out' is reserved for final output.
---
--- This avoids overloading one constructor with two different
--- meanings and keeps the source DSL closer to the runtime model.
+-- See Note [Bus model: SC-style same-cycle audio buses] for how
+-- 'Out', 'BusOut' and 'BusIn' relate.
 data UGen
   = Out !Int !Connection
-    -- ^ Final hardware output: output channel, input signal.
+    -- ^ Hardware output: output channel, input signal.
     --
-    -- Writes a signal to a hardware-facing output channel.
-    -- This is a terminal routing node, conceptually distinct
-    -- from shared-bus communication.
+    -- Operationally identical to 'BusOut' on a bus number that the
+    -- audio callback routes to hardware. Kept as a separate
+    -- constructor for source-level documentation ("final output"
+    -- vs. "intermediate routing"). Carries a 'BusWrite' effect on
+    -- its channel number; same-cycle E_r ordering applies.
   | BusOut !Int !Connection
-    -- ^ Shared-bus write: bus index, input signal.
+    -- ^ Audio-bus write: bus index, input signal.
     --
-    -- Writes a signal to an intermediate bus that may be read
-    -- later by other subgraphs or synth regions.
-    --
-    -- This is a shared-resource operation and will eventually
-    -- carry a 'BusWrite' effect.
+    -- Accumulates the input signal additively into the named bus
+    -- over the block. Multiple writers to the same bus sum.
+    -- Carries 'BusWrite n' as its effect, which produces an E_r
+    -- edge to every same-bus 'BusIn' in the topological sort.
   | BusIn !Int
-    -- ^ Shared-bus read: bus index.
+    -- ^ Audio-bus read: bus index.
     --
-    -- Reads a signal from an intermediate shared bus and
-    -- reintroduces it into the graph as a source node.
+    -- Reads the current contents of the named bus into its output
+    -- port. Carries 'BusRead n', which makes it execute *after*
+    -- every 'BusOut' / 'Out' on the same bus in the same block —
+    -- so 'BusIn' always sees the live, accumulated value.
   | SinOsc !Connection !Connection
     -- ^ Sine oscillator: frequency, initial phase.
   | SawOsc !Connection !Connection
@@ -508,14 +541,19 @@ out :: Int -> Connection -> SynthM ()
 out channel src =
   void $ insertNode "out" (Out channel src)
 
--- | Write a signal to a shared intermediate bus. (Currently
--- unused — the runtime side of bus routing is not implemented yet.)
+-- | Write a signal to a shared audio bus. The bus is part of the
+-- runtime's bus pool; the same pool serves hardware-routed buses
+-- (used by 'Out'). 'BusOut' carries a 'BusWrite' effect, so any
+-- 'BusIn' on the same bus is forced to execute after this node in
+-- the same block — see Note [Effect-induced edges (E_r)] in
+-- "MetaSonic.Bridge.Validate".
 busOut :: Int -> Connection -> SynthM ()
 busOut bus src =
   void $ insertNode "busOut" (BusOut bus src)
 
--- | Read a signal from a shared intermediate bus. (Currently
--- unused — see 'busOut'.)
+-- | Read a signal from a shared audio bus. Returns a 'Connection'
+-- that downstream nodes can wire to their inputs. Carries a
+-- 'BusRead' effect so it executes after every same-bus writer.
 busIn :: Int -> SynthM Connection
 busIn bus = insertNodeC "busIn" (BusIn bus)
 
@@ -534,11 +572,10 @@ is the *only* per-constructor enumeration in the codebase outside the
 A property test cross-checks 'ugenView' against 'kindSpec' so the two
 sources of per-kind shape information cannot drift apart.
 
-The 'BusIn' / 'BusOut' constructors are not yet wired through the runtime;
-'ugenView' errors on them in the same way 'inferKind' did before. They
-remain valid for graph *construction* and for 'dependencies' extraction,
-but compilation will reject any graph that contains them until the
-shared-bus runtime support lands.
+Effects are *not* covered by this projection — 'inferEff' is a separate
+per-UGen function because some kinds ('BusOut', 'BusIn') carry per-instance
+effect data (a bus number) that a kind-level table cannot represent. See
+Note [Effects are per-UGen, not per-kind] in "MetaSonic.Bridge.IR".
 -}
 
 -- | A uniform projection of a 'UGen' into kind plus input and control
@@ -574,8 +611,7 @@ connDefault (Audio _ _) = 0.0
 -- Each clause states inputs and control defaults together so the per-kind
 -- mapping is visible in one place.
 --
--- 'BusIn' / 'BusOut' error here intentionally — they are not yet supported
--- by the runtime. See Note [Uniform UGen view].
+-- See Note [Uniform UGen view].
 ugenView :: UGen -> UGenView
 ugenView = \case
   SinOsc f p   -> UGenView KSinOsc   [f, p]    [connDefault f, connDefault p]
@@ -587,8 +623,74 @@ ugenView = \case
   Env g a d s r ->
     UGenView KEnv [g] [connDefault g, connDefault a, connDefault d, connDefault s, connDefault r]
   Out ch s     -> UGenView KOut      [s]       [fromIntegral ch]
-  BusIn _      -> error "ugenView: BusIn not implemented yet"
-  BusOut _ _   -> error "ugenView: BusOut not implemented yet"
+  BusOut bus s -> UGenView KBusOut   [s]       [fromIntegral bus]
+  BusIn bus    -> UGenView KBusIn    []        [fromIntegral bus]
+
+{- Note [Per-UGen projections]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'inferKind', 'inferRate' and 'inferEff' are the source-level projections
+used by every downstream pass (lowering in "MetaSonic.Bridge.IR",
+scheduling in "MetaSonic.Bridge.Validate"). They live here, in the source
+layer, because:
+
+  1. Their input is 'UGen' — the source-level type. They don't need any
+     IR-level vocabulary.
+  2. Both the IR pass and the scheduler need them, and putting them in IR
+     would force a cyclic module dependency
+     (Validate would have to import IR which imports Validate).
+
+'inferKind' and 'inferRate' are derived from 'kindSpec' through 'ugenView',
+so they're one-liners. 'inferEff' is the odd one out: it has explicit
+per-UGen cases for 'BusOut' / 'BusIn' because their effect annotation
+('BusWrite n' / 'BusRead n') depends on a constructor field. See Note
+[Effects are per-UGen, not per-kind].
+-}
+
+-- | Map a UGen constructor to its 'NodeKind' tag.
+--
+-- See Note [Per-UGen projections].
+inferKind :: UGen -> NodeKind
+inferKind = uvKind . ugenView
+
+-- | Infer the rate of a UGen from its kind.
+--
+-- Derived from the 'kindSpec' table via 'ugenView'. See Note [Per-kind
+-- metadata table] in "MetaSonic.Types" and Note [Rate inference vs rate
+-- propagation] in "MetaSonic.Bridge.IR".
+inferRate :: UGen -> Rate
+inferRate = ksRate . kindSpec . uvKind . ugenView
+
+{- Note [Effects are per-UGen, not per-kind]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'inferEff' is the single source of truth for the effect set of a UGen. It
+deliberately does *not* go through 'kindSpec' — see Note [Per-kind metadata
+table] in "MetaSonic.Types" for why.
+
+The short version: 'BusOut n' and 'BusIn n' carry a bus number in a
+constructor field, so their effects ('BusWrite n' / 'BusRead n') depend on
+per-instance data that a kind-level table cannot represent. Putting '[Pure]'
+in a kind-level effect column for those kinds would be a lie that defeats
+the scheduling pass — the busEdges derivation in
+"MetaSonic.Bridge.Validate" walks 'inferEff' looking for 'BusWrite' /
+'BusRead' annotations to add E_r edges, and a stale '[Pure]' would silently
+return zero edges.
+
+So 'inferEff' lists per-UGen cases for the kinds that need per-instance
+overrides, and falls through to '[Pure]' for everything else. It is by
+design less compact than 'inferKind' / 'inferRate' / 'lowerInputs' /
+'extractControls' (all derived through 'ugenView'); honesty wins over
+compactness here.
+-}
+
+-- | Infer the effect set of a UGen.
+--
+-- See Note [Effects are per-UGen, not per-kind].
+-- See Note [Resource effects] in "MetaSonic.Types".
+-- See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
+inferEff :: UGen -> [Eff]
+inferEff (BusOut bus _) = [BusWrite bus]
+inferEff (BusIn  bus)   = [BusRead  bus]
+inferEff _              = [Pure]
 
 -- | Extract explicit structural 'NodeID' dependencies from
 -- a 'UGen'.

@@ -292,6 +292,65 @@ unitTests = testGroup "Unit tests"
             @?= [NodeID 42]
       ]
 
+  , testGroup "Bus routing (BusIn/BusOut and E_r edges)"
+      [ testCase "validateAndSort orders BusOut before BusIn on the same bus" $ do
+          -- Structurally there is no edge between the BusOut and the
+          -- BusIn — only the bus number connects them. The E_r edge
+          -- derived from BusWrite/BusRead must force the writer first.
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                busOut 5 o
+                t <- busIn 5
+                out 0 t
+          case validateAndSort g of
+            Left err  -> assertFailure $ "validateAndSort failed: " <> err
+            Right ord ->
+              let nodes = sgNodes g
+                  posOf nid = head [ i | (i, k) <- zip [0..] ord, k == nid ]
+                  busOutPos = head
+                    [ posOf nid
+                    | (nid, ns) <- M.toList nodes
+                    , case nsUgen ns of BusOut{} -> True; _ -> False ]
+                  busInPos = head
+                    [ posOf nid
+                    | (nid, ns) <- M.toList nodes
+                    , case nsUgen ns of BusIn{} -> True; _ -> False ]
+              in assertBool
+                   ("BusOut at " <> show busOutPos
+                    <> " must precede BusIn at " <> show busInPos)
+                   (busOutPos < busInPos)
+
+      , testCase "validateAndSort rejects a BusOut→BusIn cycle on the same bus" $ do
+          -- A node both writes and reads bus 5: BusIn 5 feeds a Gain
+          -- whose output is written back via BusOut 5. Structurally
+          -- this is acyclic (BusIn has no input, BusOut has one input),
+          -- but the E_r edge BusOut→BusIn closes the loop.
+          let g = runSynth $ do
+                t <- busIn 5
+                amped <- gain t 0.9
+                busOut 5 amped
+                out 0 t
+          case validateAndSort g of
+            Right _   -> assertFailure
+              "expected validateAndSort to reject a same-bus E_r cycle"
+            Left err  ->
+              assertBool ("expected 'Cycle' in error, got: " <> err)
+                         ("Cycle" `isPrefixOf` err)
+
+      , testCase "different buses are independent (no spurious edges)" $ do
+          -- BusOut 5 and BusIn 6 must not be ordered: they touch
+          -- different buses. This catches a regression where busEdges
+          -- ignored the bus-number guard.
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                busOut 5 o
+                _ <- busIn 6  -- never written, but should still validate
+                out 0 o
+          case validateAndSort g of
+            Left err -> assertFailure $ "validateAndSort failed: " <> err
+            Right _  -> pure ()
+      ]
+
   , testCase "kindTag is injective" $
       let ks = [minBound .. maxBound :: NodeKind]
           ts = map kindTag ks
@@ -701,6 +760,41 @@ crossCuttingTests = testGroup "End-to-end FFI"
                      (peak > 0.9)
           assertBool ("sustain tail should sit near 0.5, got avg " <> show tailAvg)
                      (abs (tailAvg - 0.5) < 0.1)
+
+  , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
+      -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
+      -- read is gain-attenuated and sent to hardware bus 0. We then
+      -- read bus 0 and check we hear the original sine, halved.
+      --
+      -- This exercises:
+      --   * E_r ordering: BusOut(5) must execute before BusIn(5).
+      --   * Same-cycle semantics: BusIn sees the live, accumulated value.
+      --   * Bus pool unification: bus 5 lives in the same pool as bus 0.
+      let nframes = 256
+          graph = runSynth $ do
+            o      <- sinOsc 440.0 0.0
+            busOut 5 o
+            tap    <- busIn 5
+            scaled <- gain tap 0.5
+            out 0 scaled
+
+      rt <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          let peak = maximum (map (\(CFloat x) -> abs x) cs)
+          -- Original SinOsc has peak 1.0, gain 0.5 halves it. If E_r
+          -- ordering broke and BusIn ran before BusOut, the bus would
+          -- still be zero and the peak would be ~0.
+          assertBool ("expected peak ≈ 0.5 from BusOut→BusIn round-trip, got " <> show peak)
+                     (abs (peak - 0.5) < 0.05)
 
   , testCase "Env(gate=0) idle stays silent" $ do
       let nframes = 256

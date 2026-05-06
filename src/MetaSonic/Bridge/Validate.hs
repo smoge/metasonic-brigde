@@ -23,9 +23,11 @@ module MetaSonic.Bridge.Validate
   , -- * Individual passes (useful for testing)
     checkDependencies
   , topoSort
+  , -- * Dependency derivation (useful for testing the scheduler)
+    busEdges
+  , effectiveDeps
   ) where
 
-import           Control.Monad           (mapM_)
 import           Data.Foldable           (foldlM)
 import qualified Data.Map.Strict         as M
 import qualified Data.Set                as S
@@ -109,6 +111,64 @@ result is threaded forward to lowerGraph in MetaSonic.IR, which
 uses it directly without re-sorting.
 -}
 
+{- Note [Effect-induced edges (E_r)]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Why this pass exists, in one paragraph: 'BusOut n' and 'BusIn n' (and 'Out',
+which writes to a hardware-routed bus the same way 'BusOut' writes to a
+plain bus) interact through a *shared resource* — the bus, identified by an
+integer. There is no structural 'Audio' edge between a writer and a reader;
+they are connected only by the fact that they name the same bus number. So
+the structural dependency graph alone (E_s, what 'dependencies' returns)
+does not constrain their execution order. Topological sort over E_s alone
+could schedule a 'BusIn 5' before any 'BusOut 5' on the same bus, and the
+reader would see a zero-cleared bus instead of the live signal it expects.
+
+The 'Eff' type was designed for exactly this: every node carries an effect
+annotation ('BusWrite n', 'BusRead n', 'BufRead n', 'BufWrite n', or
+'Pure'), and the *semantically schedulable* graph is
+
+    G* = (N, E_s ∪ E_r ∪ E_t)
+
+where E_s are structural edges (audio connections), E_r are
+resource-induced edges derived from effects, and E_t are temporal /
+rate-boundary edges. (E_t is future work; we only deal with E_s and E_r
+today.)
+
+This pass derives E_r:
+
+  - For every node, ask 'inferEff' for its effect annotations.
+  - For every pair (writer with 'BusWrite n', reader with 'BusRead n')
+    on the same bus number, emit edge writer → reader.
+  - Merge those edges into the dependency map used by 'topoSort'.
+
+That's it. The topological sort then operates over G* = E_s ∪ E_r and
+produces an ordering that respects both kinds of dependencies. Cycle
+detection works uniformly: a graph that creates a cycle through buses
+(e.g. 'BusIn 5' → ... → 'BusOut 5') is rejected by the same cycle detector
+that rejects structural cycles.
+
+Same-cycle semantics only. A 'BusIn n' always reads the live, accumulated
+value because it is forced to follow every 'BusOut n' on the same bus in
+the same block. Read-before-write feedback (one-block-delayed reads, like
+SuperCollider's natural behaviour when a synth tree places 'In.ar' before
+the corresponding 'Out.ar') would need a separate 'BusInDelayed'
+constructor with a snapshot of the previous block's bus contents — a
+Phase 2 extension that adds *no* E_r edge and so can sit anywhere in the
+schedule, but reads from a frozen buffer rather than the live one.
+
+Why the codebase uses E_r rather than runtime phasing (e.g. "run all
+BusOut nodes first, then everything else"): runtime phasing fails on
+chained buses (a node that reads bus A and writes bus B), recreates the
+same dependency analysis at a different layer, and doesn't compose with
+region formation or a future scheduler. E_r is the abstraction the
+codebase has been building toward since 'Eff' was introduced; this pass
+just connects two notes that were sitting next to each other.
+
+See also: Note [Resource effects] in "MetaSonic.Types", Note [Bus model:
+SC-style same-cycle audio buses] in "MetaSonic.Bridge.Source", and Note
+[Effects are per-UGen, not per-kind] in "MetaSonic.Bridge.Source".
+-}
+
 -- | Verify that every 'NodeID' referenced by a 'Connection'
 -- exists in the graph. Returns 'Left' with a diagnostic on
 -- the first missing dependency.
@@ -124,6 +184,42 @@ checkDependencies g =
     checkDep nid
       | M.member nid (sgNodes g) = Right ()
       | otherwise = Left $ "Missing dependency: " ++ show nid
+
+-- | Pairs (writer, reader) for every same-bus 'BusWrite' / 'BusRead' effect
+-- in the graph. These are the E_r edges that augment the structural
+-- dependency map before topological sort.
+--
+-- 'BusOut n' and 'Out n' both produce 'BusWrite n' via 'inferEff', and
+-- 'BusIn n' produces 'BusRead n'; this function pairs them up by bus
+-- number so the scheduler sees an explicit writer → reader edge.
+--
+-- See Note [Effect-induced edges (E_r)].
+busEdges :: SynthGraph -> [(NodeID, NodeID)]
+busEdges g =
+  let nodes   = M.toList (sgNodes g)
+      writers = [ (nid, n)
+                | (nid, ns) <- nodes
+                , BusWrite n <- inferEff (nsUgen ns) ]
+      readers = [ (nid, n)
+                | (nid, ns) <- nodes
+                , BusRead  n <- inferEff (nsUgen ns) ]
+  in [ (w, r) | (w, bw) <- writers, (r, br) <- readers, bw == br ]
+
+-- | The effective dependency map used by topological sort: the structural
+-- graph (E_s) merged with the resource-induced edges (E_r) returned by
+-- 'busEdges'.
+--
+-- Reader-keyed: @effectiveDeps g ! reader@ gives every node that must
+-- execute before @reader@ — both structural producers and same-bus
+-- writers.
+--
+-- See Note [Effect-induced edges (E_r)].
+effectiveDeps :: SynthGraph -> M.Map NodeID [NodeID]
+effectiveDeps g =
+  foldr addBusEdge structural (busEdges g)
+  where
+    structural = M.map (dependencies . nsUgen) (sgNodes g)
+    addBusEdge (writer, reader) = M.insertWith (++) reader [writer]
 
 {- Note [Toposort algorithm]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -145,24 +241,35 @@ The accumulator is built in reverse; the final result is
 reversed to produce execution order (dependencies before
 dependents).
 
-The dependency adjacency map (depMap) is pre-computed once
-from the SynthGraph to avoid repeated traversal of UGen
-constructors during the DFS.
+The dependency adjacency map (depMap) is 'effectiveDeps': it merges the
+structural edges (E_s, from 'dependencies') with the resource-induced
+edges (E_r, from 'busEdges'). The toposort therefore respects both kinds
+of dependency uniformly. Cycles in either set — or cycles that span both —
+are caught by the same back-edge detection.
+
+See Note [Effect-induced edges (E_r)] for what E_r contributes and why.
 -}
 
 -- | Produce a topological ordering of 'NodeID's, or fail
 -- with a cycle diagnostic.
 --
+-- The dependency map consumed here is 'effectiveDeps' — structural
+-- edges plus resource-induced E_r edges from same-bus 'BusWrite' /
+-- 'BusRead' pairs. A 'BusOut n' always appears before any 'BusIn n'
+-- in the result.
+--
 -- See Note [Toposort algorithm].
 -- See Note [Topological sort as compilation target].
+-- See Note [Effect-induced edges (E_r)].
 topoSort :: SynthGraph -> Either String [NodeID]
 topoSort g = do
   (_, _, order) <- foldlM visit (S.empty, S.empty, []) (M.keys (sgNodes g))
   pure (reverse order)
   where
-    -- Pre-compute the dependency adjacency map once.
+    -- Pre-compute the augmented dependency map once: structural deps
+    -- plus E_r edges from bus writers/readers.
     depMap :: M.Map NodeID [NodeID]
-    !depMap = M.map (dependencies . nsUgen) (sgNodes g)
+    !depMap = effectiveDeps g
 
     visit
       :: (S.Set NodeID, S.Set NodeID, [NodeID])

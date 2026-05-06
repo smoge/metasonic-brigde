@@ -167,19 +167,40 @@ data NodeKind
   | KLPF
   | KAdd
   | KEnv
+  | KBusOut
+  | KBusIn
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
 {- Note [Per-kind metadata table]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-'KindSpec' centralises the kind-level facts that used to be scattered across
-'kindTag', 'inferRate', 'inferEff' and the per-constructor builders. Adding a
-new 'NodeKind' is now a single row here plus a constructor in 'NodeKind', a
-constructor in 'UGen', a row in 'ugenView' (Source), and a builder.
+'KindSpec' centralises the *kind-level* facts about each 'NodeKind': ABI tag,
+rate, audio/control arities, and label. Adding a new 'NodeKind' is one row
+here plus a constructor in 'NodeKind', a constructor in 'UGen', a row in
+'ugenView' (Source), and a builder.
 
 The 'ksAudioArity' and 'ksControlArity' fields are cross-checked against
 'ugenView' by a property test, so drift between the table and the constructor
 shape is caught at test time rather than in the runtime.
+
+Effects are deliberately *not* stored here. 'BusOut n' / 'BusIn n' carry a
+bus number in a constructor field, so their 'Eff' annotation
+('BusWrite n' / 'BusRead n') depends on per-instance data that the kind-level
+table cannot represent. Putting '[Pure]' in a kind-level effects column for
+those kinds would be a lie that defeats the scheduling pass — the whole
+point of the 'Eff' machinery is that 'BusRead' / 'BusWrite' annotations
+drive effect-induced edges in 'MetaSonic.Bridge.Validate'.
+
+The corresponding per-UGen function 'MetaSonic.Bridge.IR.inferEff' is the
+single source of truth for effects; it returns '[Pure]' for the kinds where
+that is honest and overrides for the kinds whose effects depend on
+constructor fields. See Note [Effect-induced edges (E_r)] in
+"MetaSonic.Bridge.Validate" for how those annotations drive scheduling.
+
+The same shape applies to 'inferRate': today every kind is 'SampleRate' so
+'ksRate' is load-bearing, but when rate propagation lands (a 'Gain' fed by
+'BlockRate' inputs becomes 'BlockRate'), 'ksRate' will become a
+kind-level *minimum* and 'inferRate' will override per-instance.
 -}
 
 -- | Per-kind metadata. Indexed by 'NodeKind' via 'kindSpec'.
@@ -187,7 +208,8 @@ data KindSpec = KindSpec
   { ksTag          :: !CInt
     -- ^ ABI tag. Must match the C++ @kind_from_tag@ dispatch.
   , ksRate         :: !Rate
-  , ksEffects      :: ![Eff]
+    -- ^ Kind-level rate (today every kind is 'SampleRate'; see
+    -- Note [Rate inference vs rate propagation] in "MetaSonic.Bridge.IR").
   , ksAudioArity   :: !Int
     -- ^ Number of @Connection@ inputs the corresponding 'UGen' constructor
     -- carries.
@@ -209,14 +231,23 @@ data KindSpec = KindSpec
 -- against the C++ @kind_from_tag@ dispatch.
 kindSpec :: NodeKind -> KindSpec
 kindSpec = \case
-  KSinOsc   -> KindSpec 1 SampleRate [Pure] 2 2 "sinOsc"
-  KOut      -> KindSpec 2 SampleRate [Pure] 1 1 "out"
-  KGain     -> KindSpec 3 SampleRate [Pure] 2 1 "gain"
-  KSawOsc   -> KindSpec 5 SampleRate [Pure] 2 2 "sawOsc"
-  KNoiseGen -> KindSpec 6 SampleRate [Pure] 0 0 "noiseGen"
-  KLPF      -> KindSpec 7 SampleRate [Pure] 3 2 "lpf"
-  KAdd      -> KindSpec 8 SampleRate [Pure] 2 2 "add"
-  KEnv      -> KindSpec 9 SampleRate [Pure] 1 5 "env"
+  KSinOsc   -> KindSpec 1  SampleRate 2 2 "sinOsc"
+  KOut      -> KindSpec 2  SampleRate 1 1 "out"
+  KGain     -> KindSpec 3  SampleRate 2 1 "gain"
+  KSawOsc   -> KindSpec 5  SampleRate 2 2 "sawOsc"
+  KNoiseGen -> KindSpec 6  SampleRate 0 0 "noiseGen"
+  KLPF      -> KindSpec 7  SampleRate 3 2 "lpf"
+  KAdd      -> KindSpec 8  SampleRate 2 2 "add"
+  KEnv      -> KindSpec 9  SampleRate 1 5 "env"
+  -- Bus routing: same-cycle BusOut/BusIn. Effects are per-instance
+  -- (BusWrite n / BusRead n) and live in 'inferEff', not here. The C++
+  -- runtime stores all buses in one pool (g.output_buses); the audio
+  -- callback routes [0..N-1] to hardware regardless of which kind wrote
+  -- them, so KOut and KBusOut are operationally identical and BusIn
+  -- reads from the same pool.
+  -- See Note [Effect-induced edges (E_r)] in MetaSonic.Bridge.Validate.
+  KBusOut   -> KindSpec 10 SampleRate 1 1 "busOut"
+  KBusIn    -> KindSpec 11 SampleRate 0 1 "busIn"
 
 -- | Must agree with the NodeKind enum and kind_from_tag dispatch in
 -- rt_graph.cpp. Verified by a contract test in Spec.hs.
