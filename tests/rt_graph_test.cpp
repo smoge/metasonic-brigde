@@ -442,6 +442,136 @@ TEST_CASE("NoiseGen produces bounded, non-constant, near-zero-mean output") {
     rt_graph_destroy(g);
 }
 
+TEST_CASE("NoiseGen samples roughly fill [-1, 1] with no bin starvation") {
+    // Render a long run and bin into 16 buckets across [-1, 1]. With
+    // ~16k samples and uniform [-1, 1] noise, each bin should hold
+    // ~1000 samples. We check no bin is empty and no bin holds more
+    // than ~3× the expected count — a forgiving sanity bound that
+    // would still flag a kernel that suddenly produced only positive
+    // values, biased values, or DC.
+    constexpr int kBlocks = 16;
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 6);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    constexpr int kBins = 16;
+    int hist[kBins] = {0};
+    int total = 0;
+
+    for (int b = 0; b < kBlocks; ++b) {
+        auto samples = render_bus0(g, kFrames);
+        for (auto s : samples) {
+            ++total;
+            const float clamped = std::max(-1.0f, std::min(1.0f, s));
+            int bin = static_cast<int>((clamped + 1.0f) * 0.5f * kBins);
+            if (bin >= kBins) bin = kBins - 1;
+            if (bin < 0)      bin = 0;
+            ++hist[bin];
+        }
+    }
+    rt_graph_destroy(g);
+
+    const int expected = total / kBins;
+    for (int i = 0; i < kBins; ++i) {
+        CHECK(hist[i] > expected / 4); // no near-empty bin
+        CHECK(hist[i] < expected * 3); // no dominant bin
+    }
+}
+
+TEST_CASE("NoiseGen has low autocorrelation at lag 1") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 6);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    // Centre samples on the empirical mean (already near 0, but be safe).
+    double mean = 0.0;
+    for (auto s : samples) mean += s;
+    mean /= static_cast<double>(samples.size());
+
+    double num = 0.0;
+    double den = 0.0;
+    for (std::size_t i = 1; i < samples.size(); ++i) {
+        const double a = samples[i - 1] - mean;
+        const double b = samples[i] - mean;
+        num += a * b;
+        den += a * a;
+    }
+    const double r1 = num / den;
+
+    // White noise has expected r1 = 0; a deterministic ramp or
+    // strong correlation would push |r1| → 1. We allow 0.1 slack.
+    CHECK(std::abs(r1) < 0.1);
+}
+
+// ----------------------------------------------------------------
+// Env (ADSR) kernel
+// ----------------------------------------------------------------
+
+TEST_CASE("Env(gate=1) attacks toward 1 and decays to sustain") {
+    // Hold the gate high (control default = 1.0). With A=0.5ms, D=2ms,
+    // S=0.5, R=10ms at 48 kHz, the envelope should reach near-1 inside
+    // the first 30 samples and settle near 0.5 after the decay segment.
+    constexpr int kBlock = 1024;
+    auto *g = rt_graph_create(2, kBlock);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 9);                  // Env
+    rt_graph_set_control(g, 0, 0, 1.0);          // gate held high
+    rt_graph_set_control(g, 0, 1, 0.0005);       // attack 0.5 ms
+    rt_graph_set_control(g, 0, 2, 0.002);        // decay 2 ms
+    rt_graph_set_control(g, 0, 3, 0.5);          // sustain 0.5
+    rt_graph_set_control(g, 0, 4, 0.01);         // release 10 ms
+    rt_graph_add_node(g, 1, 2);                  // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kBlock);
+    rt_graph_destroy(g);
+
+    const float peak = *std::max_element(samples.begin(), samples.end());
+    CHECK(peak > 0.9f);
+
+    // Tail average over the last quarter of the block — well past the
+    // attack+decay transient, so this is the sustain level.
+    double tail = 0.0;
+    for (int i = 768; i < kBlock; ++i) tail += samples[static_cast<std::size_t>(i)];
+    tail /= static_cast<double>(kBlock - 768);
+    CHECK(std::abs(tail - 0.5) < 0.1);
+}
+
+TEST_CASE("Env(gate=0) idle stays silent") {
+    // Gate held low: prev_gate starts at 0, no rising edge ever fires,
+    // envelope_gen stays in idle and emits zeros.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 9);
+    rt_graph_set_control(g, 0, 0, 0.0); // gate low
+    rt_graph_set_control(g, 0, 1, 0.01);
+    rt_graph_set_control(g, 0, 2, 0.05);
+    rt_graph_set_control(g, 0, 3, 0.5);
+    rt_graph_set_control(g, 0, 4, 0.1);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    for (auto s : samples) {
+        CHECK(std::abs(s) < 1e-6f);
+    }
+}
+
 // ----------------------------------------------------------------
 // LPF kernel
 // ----------------------------------------------------------------

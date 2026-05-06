@@ -27,6 +27,7 @@ module MetaSonic.Bridge.FFI
     c_rt_graph_kind_supported
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
+  , c_rt_graph_read_bus
   , c_rt_graph_start_audio
   , c_rt_graph_wait_started
   , c_rt_graph_stop_audio
@@ -234,6 +235,13 @@ foreign import ccall safe "rt_graph_stop_audio"
 -- no graph state needed. 'unsafe' is correct.
 foreign import ccall unsafe "rt_graph_kind_supported"
   c_rt_graph_kind_supported :: CInt -> IO CInt
+
+-- | Copy nframes samples from one output bus into the caller's buffer.
+-- Returns the number of samples written; 0 on bad arguments. Used by
+-- the offline test path; production code reads buses via the realtime
+-- callback.
+foreign import ccall unsafe "rt_graph_read_bus"
+  c_rt_graph_read_bus :: Ptr RTGraph -> CInt -> CInt -> Ptr CFloat -> IO CInt
 
 -- | Allocate a C++ runtime graph, run an action with it, and
 -- guarantee cleanup via bracket.
