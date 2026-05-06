@@ -573,12 +573,18 @@ static void process_sawosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
 /* Note [NoiseGen processing semantics]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-NoiseGen uses q::white_noise_gen, a fast xorshift PRNG, values uniformly in [-1,
-1]. The generator state persists across blocks, so the noise stream is
-continuous.
+NoiseGen uses q::white_noise_gen, a fast xorshift PRNG. The generator state
+persists across blocks, so the noise stream is continuous.
+
+q's white_noise_gen documents its output as [-1, 1] but the implementation
+multiplies an unsigned uint32 by `2.0 / UINT32_MAX`, producing values in
+[0, 2] with mean +1 — the standard "fast whitenoise" trick relies on
+casting to int32 first (see vendor/q/q_lib/include/q/synth/noise_gen.hpp).
+Subtracting 1 here re-centers the output to bipolar [-1, 1] without
+modifying upstream q code. A future upstream fix would let us drop the
+correction.
 
 No controls or inputs.
-
 */
 
 static void process_noisegen(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
@@ -592,7 +598,7 @@ static void process_noisegen(RTGraph &g, std::size_t node_idx, int nframes) noex
   }
 
   for (int i = 0; i < nframes; ++i) {
-    out[static_cast<std::size_t>(i)] = noisegen->noise();
+    out[static_cast<std::size_t>(i)] = noisegen->noise() - 1.0f;
   }
 }
 
