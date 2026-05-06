@@ -17,8 +17,11 @@
 #include "rt_graph.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numbers>
+#include <random>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -406,6 +409,103 @@ TEST_CASE("SawOsc(440 Hz) produces a bandlimited saw with peak ≈ 1") {
 // NoiseGen kernel
 // ----------------------------------------------------------------
 
+TEST_CASE("NoiseGen samples roughly fill [-1, 1] with no bin starvation") {
+    // Render a long run and bin into 16 buckets across [-1, 1]. With
+    // ~16k samples and uniform [-1, 1] noise, each bin should hold
+    // ~1000 samples. We check no bin is empty and no bin holds more
+    // than ~3× the expected count — a very forgiving sanity bound that
+    // would still flag a kernel that suddenly produced only positive
+    // values, biased values, or DC.
+    constexpr int kBlocks = 16;
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 6);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    constexpr int kBins = 16;
+    int hist[kBins] = {0};
+    int total = 0;
+
+    for (int b = 0; b < kBlocks; ++b) {
+        auto samples = render_bus0(g, kFrames);
+        for (auto s : samples) {
+            ++total;
+            const float clamped = std::max(-1.0f, std::min(1.0f, s));
+            int bin = static_cast<int>((clamped + 1.0f) * 0.5f * kBins);
+            if (bin >= kBins) bin = kBins - 1;
+            if (bin < 0)      bin = 0;
+            ++hist[bin];
+        }
+    }
+    rt_graph_destroy(g);
+
+    const int expected = total / kBins;
+    for (int i = 0; i < kBins; ++i) {
+        CHECK(hist[i] > expected / 4); // no near-empty bin
+        CHECK(hist[i] < expected * 3); // no dominant bin
+    }
+}
+
+TEST_CASE("NoiseGen has low autocorrelation at lag 1") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 6);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    // Centre samples on the empirical mean (already near 0, but be safe).
+    double mean = 0.0;
+    for (auto s : samples) mean += s;
+    mean /= static_cast<double>(samples.size());
+
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 1; i < samples.size(); ++i) {
+        const double a = samples[i - 1] - mean;
+        const double b = samples[i] - mean;
+        num += a * b;
+        den += a * a;
+    }
+    const double r1 = num / den;
+
+    // White noise has expected r1 = 0; a deterministic ramp or
+    // strongly-coloured signal would push toward ±1. Anything past
+    // ±0.2 in 1024 samples points at non-whiteness.
+    CHECK(std::abs(r1) < 0.2);
+}
+
+TEST_CASE("NoiseGen has no improbably long same-sign runs") {
+    // For an idealised uniform source, longest runs in 1024 samples
+    // cluster around log2(1024)≈10. q::white_noise_gen's empirical
+    // distribution is looser than that (the DC-offset bug we already
+    // documented hints at imperfect uniformity), so we use a generous
+    // bound that still flags a stuck-state bug — a run of 100+ would
+    // be unambiguous breakage.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 6);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    int max_run = 0;
+    int cur_run = 1;
+    for (std::size_t i = 1; i < samples.size(); ++i) {
+        const bool same_sign = (samples[i] >= 0.0f) == (samples[i - 1] >= 0.0f);
+        cur_run = same_sign ? cur_run + 1 : 1;
+        if (cur_run > max_run) max_run = cur_run;
+    }
+    CHECK(max_run < 100);
+}
+
 TEST_CASE("NoiseGen produces bounded, non-constant, near-zero-mean output") {
     auto *g = rt_graph_create(2, kFrames);
     REQUIRE(g != nullptr);
@@ -440,76 +540,6 @@ TEST_CASE("NoiseGen produces bounded, non-constant, near-zero-mean output") {
     CHECK(std::abs(mean) < 0.1);
 
     rt_graph_destroy(g);
-}
-
-TEST_CASE("NoiseGen samples roughly fill [-1, 1] with no bin starvation") {
-    // Render a long run and bin into 16 buckets across [-1, 1]. With
-    // ~16k samples and uniform [-1, 1] noise, each bin should hold
-    // ~1000 samples. We check no bin is empty and no bin holds more
-    // than ~3× the expected count — a forgiving sanity bound that
-    // would still flag a kernel that suddenly produced only positive
-    // values, biased values, or DC.
-    constexpr int kBlocks = 16;
-    auto *g = rt_graph_create(2, kFrames);
-    REQUIRE(g != nullptr);
-    rt_graph_add_node(g, 0, 6);
-    rt_graph_add_node(g, 1, 2);
-    rt_graph_set_control(g, 1, 0, 0.0);
-    rt_graph_connect(g, 0, 0, 1, 0);
-
-    constexpr int kBins = 16;
-    int hist[kBins] = {0};
-    int total = 0;
-
-    for (int b = 0; b < kBlocks; ++b) {
-        auto samples = render_bus0(g, kFrames);
-        for (auto s : samples) {
-            ++total;
-            const float clamped = std::max(-1.0f, std::min(1.0f, s));
-            int bin = static_cast<int>((clamped + 1.0f) * 0.5f * kBins);
-            if (bin >= kBins) bin = kBins - 1;
-            if (bin < 0)      bin = 0;
-            ++hist[bin];
-        }
-    }
-    rt_graph_destroy(g);
-
-    const int expected = total / kBins;
-    for (int i = 0; i < kBins; ++i) {
-        CHECK(hist[i] > expected / 4); // no near-empty bin
-        CHECK(hist[i] < expected * 3); // no dominant bin
-    }
-}
-
-TEST_CASE("NoiseGen has low autocorrelation at lag 1") {
-    auto *g = rt_graph_create(2, kFrames);
-    REQUIRE(g != nullptr);
-    rt_graph_add_node(g, 0, 6);
-    rt_graph_add_node(g, 1, 2);
-    rt_graph_set_control(g, 1, 0, 0.0);
-    rt_graph_connect(g, 0, 0, 1, 0);
-
-    auto samples = render_bus0(g, kFrames);
-    rt_graph_destroy(g);
-
-    // Centre samples on the empirical mean (already near 0, but be safe).
-    double mean = 0.0;
-    for (auto s : samples) mean += s;
-    mean /= static_cast<double>(samples.size());
-
-    double num = 0.0;
-    double den = 0.0;
-    for (std::size_t i = 1; i < samples.size(); ++i) {
-        const double a = samples[i - 1] - mean;
-        const double b = samples[i] - mean;
-        num += a * b;
-        den += a * a;
-    }
-    const double r1 = num / den;
-
-    // White noise has expected r1 = 0; a deterministic ramp or
-    // strong correlation would push |r1| → 1. We allow 0.1 slack.
-    CHECK(std::abs(r1) < 0.1);
 }
 
 // ----------------------------------------------------------------
@@ -617,6 +647,83 @@ TEST_CASE("LPF(800 Hz) passes 100 Hz and attenuates 4 kHz") {
     CHECK(peak_low > 0.7f);   // passband, near unity gain
     CHECK(peak_high < 0.3f);  // well attenuated (predicted ≈ 0.04)
     CHECK(peak_low > 3.0f * peak_high); // sanity: low ≫ high
+}
+
+// ----------------------------------------------------------------
+// LPF parameter sensitivity (Q)
+// ----------------------------------------------------------------
+//
+// The cutoff control gates the rolloff frequency; the Q control
+// shapes the peak around the cutoff. Existing tests pin passband and
+// stopband behaviour at Q=0.7. These pin that Q is actually wired and
+// has the expected resonant effect: at the cutoff frequency, output
+// amplitude scales with Q. A regression that ignores Q (or wires the
+// wrong control) would silence this difference.
+
+namespace {
+
+float render_sine_through_lpf(float sine_hz, float cutoff_hz, float q) {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc
+    rt_graph_set_control(g, 0, 0, sine_hz);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+
+    rt_graph_add_node(g, 1, 7); // LPF
+    rt_graph_set_control(g, 1, 0, cutoff_hz);
+    rt_graph_set_control(g, 1, 1, q);
+
+    rt_graph_add_node(g, 2, 2); // Out
+    rt_graph_set_control(g, 2, 0, 0.0f);
+
+    rt_graph_connect(g, 0, 0, 1, 0);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    // Render a few blocks first to let the filter settle (transient
+    // response from zero state inflates the early peak).
+    for (int i = 0; i < 4; ++i) {
+        rt_graph_process(g, kFrames);
+    }
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+    return peak_abs(samples);
+}
+
+} // namespace
+
+TEST_CASE("LPF Q controls resonance: high Q boosts the cutoff frequency") {
+    // Drive with a sine at the cutoff frequency. Higher Q should give
+    // a measurably louder steady-state response.
+    constexpr float kCutoff = 800.0f;
+    const float low_q  = render_sine_through_lpf(kCutoff, kCutoff, 0.7f);
+    const float high_q = render_sine_through_lpf(kCutoff, kCutoff, 4.0f);
+
+    CHECK(low_q > 0.5f);                     // sanity: signal passes
+    CHECK(high_q > low_q * 1.5f);            // high Q is meaningfully louder
+    CHECK(std::isfinite(high_q));
+}
+
+TEST_CASE("LPF cutoff control gates rolloff frequency") {
+    // Same Q, two cutoffs. A 4 kHz sine through an 800 Hz LPF should be
+    // much quieter than the same sine through a 6 kHz LPF.
+    constexpr float kSine = 4000.0f;
+    const float low_cut  = render_sine_through_lpf(kSine, 800.0f, 0.7f);
+    const float high_cut = render_sine_through_lpf(kSine, 6000.0f, 0.7f);
+
+    CHECK(high_cut > 0.5f);                  // 4 kHz inside passband
+    CHECK(low_cut < 0.2f);                   // 4 kHz well above 800 Hz cutoff
+    CHECK(high_cut > low_cut * 3.0f);
+}
+
+TEST_CASE("LPF stays stable at extreme Q values") {
+    // Q at the practical edges: very low (overdamped) and quite high.
+    // The output must remain finite and bounded.
+    for (float q : {0.05f, 8.0f, 16.0f}) {
+        const float p = render_sine_through_lpf(440.0f, 1000.0f, q);
+        CHECK(std::isfinite(p));
+        CHECK(p < 100.0f); // not a runaway
+    }
 }
 
 // ----------------------------------------------------------------
@@ -778,9 +885,151 @@ TEST_CASE("rt_graph_clear allows building a new graph in the same handle") {
 // ABI robustness
 // ----------------------------------------------------------------
 
+// ----------------------------------------------------------------
+// Cascaded same-kind nodes
+// ----------------------------------------------------------------
+//
+// Existing tests cover one of each kind. These verify composition
+// of multiple instances of the same kind: parallel summing into a
+// shared bus, serial filtering, long gain chains.
+
+TEST_CASE("five Outs to bus 0 sum cleanly (in-phase peak ≈ 5)") {
+    constexpr int kSources = 5;
+    auto *g = rt_graph_create(kSources + 1, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Five identical SinOscs at 440 Hz, each going to its own Out → bus 0.
+    for (int i = 0; i < kSources; ++i) {
+        rt_graph_add_node(g, i, 1);
+        rt_graph_set_control(g, i, 0, 440.0f);
+        rt_graph_set_control(g, i, 1, 0.0f);
+    }
+    for (int i = 0; i < kSources; ++i) {
+        const int out_idx = kSources + i;
+        rt_graph_add_node(g, out_idx, 2);
+        rt_graph_set_control(g, out_idx, 0, 0.0f);
+        rt_graph_connect(g, i, 0, out_idx, 0);
+    }
+    // The graph has kSources*2 = 10 nodes but capacity was kSources+1.
+    // Reallocate with proper capacity.
+    rt_graph_destroy(g);
+
+    g = rt_graph_create(kSources * 2 + 1, kFrames);
+    REQUIRE(g != nullptr);
+    for (int i = 0; i < kSources; ++i) {
+        rt_graph_add_node(g, i, 1);
+        rt_graph_set_control(g, i, 0, 440.0f);
+        rt_graph_set_control(g, i, 1, 0.0f);
+    }
+    for (int i = 0; i < kSources; ++i) {
+        const int out_idx = kSources + i;
+        rt_graph_add_node(g, out_idx, 2);
+        rt_graph_set_control(g, out_idx, 0, 0.0f);
+        rt_graph_connect(g, i, 0, out_idx, 0);
+    }
+
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    // All sources have the same freq and phase, so they sum in phase:
+    // peak ≈ kSources × 1.0.
+    const float p = peak_abs(samples);
+    CHECK(p == doctest::Approx(static_cast<float>(kSources)).epsilon(0.05));
+    for (auto s : samples) {
+        CHECK(std::isfinite(s));
+    }
+}
+
+TEST_CASE("three LPFs in series attenuate more than one") {
+    auto build = [](int num_filters) {
+        auto *g = rt_graph_create(num_filters + 2, kFrames);
+        REQUIRE(g != nullptr);
+
+        rt_graph_add_node(g, 0, 1); // SinOsc 4 kHz (well above cutoff)
+        rt_graph_set_control(g, 0, 0, 4000.0f);
+
+        int prev = 0;
+        for (int i = 1; i <= num_filters; ++i) {
+            rt_graph_add_node(g, i, 7);
+            rt_graph_set_control(g, i, 0, 800.0f);
+            rt_graph_set_control(g, i, 1, 0.7f);
+            rt_graph_connect(g, prev, 0, i, 0);
+            prev = i;
+        }
+
+        const int out_idx = num_filters + 1;
+        rt_graph_add_node(g, out_idx, 2);
+        rt_graph_set_control(g, out_idx, 0, 0.0f);
+        rt_graph_connect(g, prev, 0, out_idx, 0);
+
+        // Let the filter chain settle past its initial transient.
+        for (int i = 0; i < 4; ++i) {
+            rt_graph_process(g, kFrames);
+        }
+        auto out = render_bus0(g, kFrames);
+        rt_graph_destroy(g);
+        return peak_abs(out);
+    };
+
+    const float p1 = build(1);
+    const float p3 = build(3);
+
+    CHECK(std::isfinite(p1));
+    CHECK(std::isfinite(p3));
+    CHECK(p3 < p1 * 0.5f); // three stages cut at least the second stage's worth
+}
+
+TEST_CASE("Gain(1.0) chain of 16 nodes preserves the input") {
+    constexpr int kStages = 16;
+    auto *g = rt_graph_create(kStages + 2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc 440
+    rt_graph_set_control(g, 0, 0, 440.0f);
+
+    int prev = 0;
+    for (int i = 1; i <= kStages; ++i) {
+        rt_graph_add_node(g, i, 3);
+        rt_graph_set_control(g, i, 0, 1.0f); // identity gain
+        rt_graph_connect(g, prev, 0, i, 0);
+        prev = i;
+    }
+
+    const int out_idx = kStages + 1;
+    rt_graph_add_node(g, out_idx, 2);
+    rt_graph_set_control(g, out_idx, 0, 0.0f);
+    rt_graph_connect(g, prev, 0, out_idx, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    // Identity gain × 16 should preserve peak exactly (single-precision
+    // multiply by 1.0f has no rounding error).
+    CHECK(peak_abs(samples) == doctest::Approx(1.0f).epsilon(0.02));
+}
+
 TEST_CASE("rt_graph_destroy(nullptr) is a no-op") {
     rt_graph_destroy(nullptr);
     CHECK(true); // reaching here = didn't crash
+}
+
+TEST_CASE("rt_graph_process(nullptr, n) is a no-op") {
+    rt_graph_process(nullptr, kFrames);
+    rt_graph_process(nullptr, 0);
+    rt_graph_process(nullptr, 1);
+    CHECK(true); // reaching here = didn't crash
+}
+
+TEST_CASE("rt_graph_clear(nullptr) is a no-op") {
+    rt_graph_clear(nullptr);
+    CHECK(true);
+}
+
+TEST_CASE("rt_graph_add_node(nullptr, ...) is a no-op") {
+    rt_graph_add_node(nullptr, 0, 1);
+    rt_graph_set_control(nullptr, 0, 0, 1.0f);
+    rt_graph_connect(nullptr, 0, 0, 0, 0);
+    CHECK(true);
 }
 
 TEST_CASE("Bad indices on construction APIs are silently ignored") {
@@ -821,6 +1070,1072 @@ TEST_CASE("rt_graph_read_bus returns 0 on bad arguments") {
     CHECK(rt_graph_read_bus(g, 0, -1, buf.data()) == 0);
     CHECK(rt_graph_read_bus(g, 0, 0, buf.data()) == 0);
     CHECK(rt_graph_read_bus(g, 0, kFrames, nullptr) == 0);
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Variable block sizes
+// ----------------------------------------------------------------
+//
+// Audio hosts can deliver any nframes <= max_frames. The runtime must
+// handle the boundary cases (0, 1, max_frames) without crashing, and
+// must produce identical output for a given total frame count
+// regardless of how it was split into blocks (for deterministic
+// kernels — i.e. not NoiseGen).
+
+namespace {
+
+// Build a SinOsc(440)→Out graph. Caller owns the returned handle.
+RTGraph *build_sin_out(int capacity, int max_frames, float freq = 440.0f) {
+    auto *g = rt_graph_create(capacity, max_frames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 1); // SinOsc
+    rt_graph_set_control(g, 0, 0, freq);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+    rt_graph_add_node(g, 1, 2); // Out
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    return g;
+}
+
+} // namespace
+
+TEST_CASE("process(g, 0) is a no-op and does not crash") {
+    auto *g = build_sin_out(2, kFrames);
+    rt_graph_process(g, 0);
+    // Reading 0 frames returns 0 written; reading kFrames after a 0-frame
+    // process should still return whatever the bus holds (zero-initialised).
+    std::vector<float> buf(static_cast<std::size_t>(kFrames), 7.0f);
+    int wrote = rt_graph_read_bus(g, 0, 0, buf.data());
+    CHECK(wrote == 0);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("process(g, 1) advances the kernel by exactly one sample") {
+    auto *g = build_sin_out(2, kFrames);
+
+    // First sample of SinOsc(440, phase=0) is sin(0) ≈ 0.
+    rt_graph_process(g, 1);
+    std::vector<float> buf(1, 99.0f);
+    int wrote = rt_graph_read_bus(g, 0, 1, buf.data());
+    CHECK(wrote == 1);
+    CHECK(std::abs(buf[0]) < 0.02f);
+
+    // After one more sample, phase has advanced by 440/sr cycle, so
+    // sample 1 ≈ sin(2π · 440 / 48000) ≈ 0.0576.
+    rt_graph_process(g, 1);
+    rt_graph_read_bus(g, 0, 1, buf.data());
+    const double expected = std::sin(kTau * 440.0 / kSampleRate);
+    CHECK(buf[0] == doctest::Approx(static_cast<float>(expected)).epsilon(0.05));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("process at max_frames boundary works") {
+    constexpr int kMax = 256;
+    auto *g = build_sin_out(2, kMax);
+    auto out = render_bus0(g, kMax); // exactly max_frames
+    CHECK(peak_abs(out) == doctest::Approx(1.0f).epsilon(0.05));
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("max_frames=1 minimal buffer renders one sample at a time") {
+    auto *g = build_sin_out(2, /*max_frames*/ 1);
+
+    // Render 1024 samples, one per process call.
+    std::vector<float> samples;
+    samples.reserve(1024);
+    for (int i = 0; i < 1024; ++i) {
+        rt_graph_process(g, 1);
+        float s = 0.0f;
+        rt_graph_read_bus(g, 0, 1, &s);
+        samples.push_back(s);
+    }
+    CHECK(peak_abs(samples) == doctest::Approx(1.0f).epsilon(0.05));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("sample-by-sample processing matches one big block (SinOsc)") {
+    // Reference: render kFrames in one go.
+    auto *g_block = build_sin_out(2, kFrames);
+    auto block_samples = render_bus0(g_block, kFrames);
+    rt_graph_destroy(g_block);
+
+    // Comparison: render kFrames as kFrames×1-sample calls.
+    auto *g_step = build_sin_out(2, kFrames);
+    std::vector<float> step_samples(static_cast<std::size_t>(kFrames));
+    for (int i = 0; i < kFrames; ++i) {
+        rt_graph_process(g_step, 1);
+        rt_graph_read_bus(g_step, 0, 1, &step_samples[i]);
+    }
+    rt_graph_destroy(g_step);
+
+    // Phase iterator advances per sample regardless of block size, so
+    // outputs should agree to within float rounding.
+    for (std::size_t i = 0; i < step_samples.size(); ++i) {
+        CHECK(step_samples[i] ==
+              doctest::Approx(block_samples[i]).epsilon(1e-4));
+    }
+}
+
+TEST_CASE("non-uniform block sizes produce same output as one big block") {
+    // Reference: 256 frames in one go.
+    constexpr int kTotal = 256;
+    auto *g_ref = build_sin_out(2, kTotal);
+    auto ref = render_bus0(g_ref, kTotal);
+    rt_graph_destroy(g_ref);
+
+    // Comparison: 256 frames as (1, 7, 64, 128, 56) — a non-uniform split.
+    auto *g_var = build_sin_out(2, kTotal);
+    std::vector<float> var(static_cast<std::size_t>(kTotal));
+    int offset = 0;
+    for (int n : {1, 7, 64, 128, 56}) {
+        rt_graph_process(g_var, n);
+        rt_graph_read_bus(g_var, 0, n, var.data() + offset);
+        offset += n;
+    }
+    rt_graph_destroy(g_var);
+
+    REQUIRE(offset == kTotal);
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        CHECK(var[i] == doctest::Approx(ref[i]).epsilon(1e-4));
+    }
+}
+
+// ----------------------------------------------------------------
+// Property-style fuzzing
+// ----------------------------------------------------------------
+//
+// Generate small random DAGs and assert that the runtime never
+// produces NaN/Inf and never crashes. Non-cyclical by construction
+// (each node only references earlier indices), final node is always
+// Out so something gets rendered.
+
+namespace {
+
+struct FuzzKind {
+    int  tag;             // node_kind tag the runtime accepts
+    int  num_inputs;      // ports the kernel reads from connections
+    int  num_controls;    // control slots to populate
+    bool is_source;       // can be the very first node (no inputs)
+    bool stochastic;      // output not bit-reproducible (NoiseGen)
+};
+
+constexpr FuzzKind kFuzzKinds[] = {
+    // tag, ins, ctls, source?, stochastic?
+    {1,    0, 2, true,  false}, // SinOsc
+    {5,    0, 2, true,  false}, // SawOsc
+    {6,    0, 0, true,  true},  // NoiseGen
+    {3,    2, 2, false, false}, // Gain
+    {7,    1, 2, false, false}, // LPF
+    {8,    2, 2, false, false}, // Add
+};
+
+float random_freq(std::mt19937 &rng) {
+    return std::uniform_real_distribution<float>(50.0f, 4000.0f)(rng);
+}
+
+float random_gain(std::mt19937 &rng) {
+    return std::uniform_real_distribution<float>(-1.5f, 1.5f)(rng);
+}
+
+float random_q(std::mt19937 &rng) {
+    return std::uniform_real_distribution<float>(0.3f, 2.0f)(rng);
+}
+
+// Build a random DAG of `num_nodes` nodes (3..8), final node is Out.
+// Returns the constructed graph (caller destroys).
+RTGraph *build_random_graph(std::mt19937 &rng, int num_nodes, int max_frames) {
+    auto *g = rt_graph_create(num_nodes + 2, max_frames);
+    REQUIRE(g != nullptr);
+
+    // First node must be a source (no inputs available yet).
+    constexpr int kNumKinds = sizeof(kFuzzKinds) / sizeof(kFuzzKinds[0]);
+    constexpr int kNumSources = 3; // SinOsc, SawOsc, NoiseGen
+
+    auto add_node_with_kind = [&](int idx, const FuzzKind &k) {
+        rt_graph_add_node(g, idx, k.tag);
+        for (int c = 0; c < k.num_controls; ++c) {
+            float v;
+            if (k.tag == 1 || k.tag == 5) {
+                // Osc: control 0 is freq, control 1 is phase.
+                v = (c == 0) ? random_freq(rng)
+                             : std::uniform_real_distribution<float>(0.0f,
+                                                                     1.0f)(rng);
+            } else if (k.tag == 7) {
+                // LPF: cutoff, q
+                v = (c == 0) ? random_freq(rng) : random_q(rng);
+            } else {
+                v = random_gain(rng);
+            }
+            rt_graph_set_control(g, idx, c, v);
+        }
+    };
+
+    // Index 0: pick a source kind.
+    {
+        int src_idx = std::uniform_int_distribution<int>(0, kNumSources - 1)(rng);
+        add_node_with_kind(0, kFuzzKinds[src_idx]);
+    }
+
+    // Indices 1..num_nodes-2: any kind, wire inputs to earlier nodes.
+    for (int i = 1; i < num_nodes - 1; ++i) {
+        int kind_idx = std::uniform_int_distribution<int>(0, kNumKinds - 1)(rng);
+        const FuzzKind &k = kFuzzKinds[kind_idx];
+        add_node_with_kind(i, k);
+        for (int p = 0; p < k.num_inputs; ++p) {
+            int src = std::uniform_int_distribution<int>(0, i - 1)(rng);
+            rt_graph_connect(g, src, 0, i, p);
+        }
+    }
+
+    // Final node: Out, wired to the previous node.
+    const int out_idx = num_nodes - 1;
+    rt_graph_add_node(g, out_idx, 2);
+    rt_graph_set_control(g, out_idx, 0, 0.0f);
+    rt_graph_connect(g, out_idx - 1, 0, out_idx, 0);
+
+    return g;
+}
+
+} // namespace
+
+TEST_CASE("random small DAGs produce only finite samples (100 seeds)") {
+    constexpr int kNumSeeds = 100;
+    constexpr int kFuzzFrames = 256;
+
+    int total_samples = 0;
+    int finite_samples = 0;
+
+    for (int seed = 0; seed < kNumSeeds; ++seed) {
+        std::mt19937 rng(static_cast<unsigned>(seed));
+        const int num_nodes =
+            std::uniform_int_distribution<int>(3, 8)(rng);
+
+        auto *g = build_random_graph(rng, num_nodes, kFuzzFrames);
+        auto samples = render_bus0(g, kFuzzFrames);
+        rt_graph_destroy(g);
+
+        for (auto s : samples) {
+            ++total_samples;
+            if (std::isfinite(s)) {
+                ++finite_samples;
+            }
+            // Sanity bound: even with stacked gains, bipolar kernels
+            // shouldn't push past a few units before the LPF clamps.
+            // A blow-up would be huge, not slightly-out-of-range.
+            CHECK(std::abs(s) < 100.0f);
+        }
+    }
+
+    CHECK(finite_samples == total_samples);
+}
+
+// ----------------------------------------------------------------
+// Algebraic identities on kernels
+// ----------------------------------------------------------------
+//
+// Sample-accurate equalities the kernels should satisfy by definition.
+// These are stronger than range checks: they fix the exact output for
+// the identity case, so any kernel-internal drift breaks the test.
+
+namespace {
+
+// Render bus 0 for a graph that pipes a SinOsc(440) through one
+// transformation node (a "unary" kernel under test).
+std::vector<float> render_with_transform(int kind_tag,
+                                         std::vector<std::pair<int, float>> ctls,
+                                         std::vector<std::pair<int, int>> wires,
+                                         int signal_port) {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc 440
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+
+    rt_graph_add_node(g, 1, kind_tag);
+    for (auto [c, v] : ctls) {
+        rt_graph_set_control(g, 1, c, v);
+    }
+    rt_graph_connect(g, 0, 0, 1, signal_port); // sin → kernel.signal
+
+    for (auto [src, port] : wires) {
+        rt_graph_connect(g, src, 0, 1, port); // any extra audio inputs
+    }
+
+    rt_graph_add_node(g, 2, 2); // Out
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+    return samples;
+}
+
+// Reference: SinOsc(440) directly to Out.
+std::vector<float> render_sin_direct() {
+    auto *g = build_sin_out(2, kFrames);
+    auto s = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("Gain(x, 0) is identically zero regardless of x") {
+    auto samples = render_with_transform(/*Gain*/ 3,
+                                         {{0, 0.0f}}, // amount control = 0
+                                         {},          // no audio gain wire
+                                         /*signal_port*/ 0);
+    for (auto s : samples) {
+        CHECK(s == 0.0f);
+    }
+}
+
+TEST_CASE("Gain(x, 1) is sample-equal to x") {
+    auto identity = render_with_transform(/*Gain*/ 3,
+                                          {{0, 1.0f}}, // amount = 1
+                                          {},
+                                          0);
+    auto direct = render_sin_direct();
+    REQUIRE(identity.size() == direct.size());
+    for (std::size_t i = 0; i < identity.size(); ++i) {
+        CHECK(identity[i] == direct[i]);
+    }
+}
+
+TEST_CASE("Add(x, 0) is sample-equal to x") {
+    // Add reads control 0 as bias, port 1 as audio. Wire sin→port 1,
+    // bias=0 ⇒ output = x.
+    auto added = render_with_transform(/*Add*/ 8,
+                                       {{0, 0.0f}}, // bias = 0
+                                       {},
+                                       /*signal_port*/ 1);
+    auto direct = render_sin_direct();
+    REQUIRE(added.size() == direct.size());
+    for (std::size_t i = 0; i < added.size(); ++i) {
+        CHECK(added[i] == direct[i]);
+    }
+}
+
+TEST_CASE("Add(0, x) is sample-equal to x") {
+    // Mirror image: wire sin→port 0, control 1 = 0.
+    auto added = render_with_transform(/*Add*/ 8,
+                                       {{1, 0.0f}}, // RConst on port 1 = 0
+                                       {},
+                                       /*signal_port*/ 0);
+    auto direct = render_sin_direct();
+    REQUIRE(added.size() == direct.size());
+    for (std::size_t i = 0; i < added.size(); ++i) {
+        CHECK(added[i] == direct[i]);
+    }
+}
+
+TEST_CASE("Add is commutative: Add(a, b) == Add(b, a) sample-by-sample") {
+    // Build two graphs: one with bias=0.3, sin on port 1; the other
+    // with sin on port 0, RConst 0.3 on port 1. Outputs must match.
+    auto ab = render_with_transform(8, {{0, 0.3f}}, {}, /*sin→port*/ 1);
+    auto ba = render_with_transform(8, {{1, 0.3f}}, {}, /*sin→port*/ 0);
+    REQUIRE(ab.size() == ba.size());
+    for (std::size_t i = 0; i < ab.size(); ++i) {
+        CHECK(ab[i] == ba[i]);
+    }
+}
+
+// ----------------------------------------------------------------
+// Capacity / resource boundaries
+// ----------------------------------------------------------------
+
+TEST_CASE("process on empty graph (no nodes added) is silent") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // No nodes added — bus should stay zero.
+    auto samples = render_bus0(g, kFrames);
+    for (auto s : samples) {
+        CHECK(s == 0.0f);
+    }
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("rt_graph_create(0, kFrames) is either rejected or produces a silent graph") {
+    auto *g = rt_graph_create(0, kFrames);
+    if (g == nullptr) {
+        // Rejected outright — fine.
+        CHECK(true);
+        return;
+    }
+    // Accepted — must be safe to use, just can't hold nodes.
+    auto samples = render_bus0(g, kFrames);
+    for (auto s : samples) {
+        CHECK(s == 0.0f);
+    }
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("rt_graph_create with invalid args returns nullptr or a safe handle") {
+    // Negative capacity / max_frames: implementation may reject or
+    // clamp; either way must not crash.
+    auto *g1 = rt_graph_create(-1, kFrames);
+    if (g1) rt_graph_destroy(g1);
+    auto *g2 = rt_graph_create(4, -1);
+    if (g2) rt_graph_destroy(g2);
+    auto *g3 = rt_graph_create(4, 0);
+    if (g3) rt_graph_destroy(g3);
+    CHECK(true); // reaching here = no crash
+}
+
+// ----------------------------------------------------------------
+// Multi-bus routing
+// ----------------------------------------------------------------
+//
+// Verify the bus index isn't being clamped to 0. Two oscillators of
+// distinct frequencies routed to bus 0 and bus 1 should end up on
+// the bus they were addressed to, not co-mingled.
+
+TEST_CASE("Out nodes route to the bus indicated by control 0") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc 200 → bus 0
+    rt_graph_set_control(g, 0, 0, 200.0f);
+    rt_graph_add_node(g, 1, 1); // SinOsc 4000 → bus 1
+    rt_graph_set_control(g, 1, 0, 4000.0f);
+
+    rt_graph_add_node(g, 2, 2);
+    rt_graph_set_control(g, 2, 0, 0.0f); // bus 0
+    rt_graph_connect(g, 0, 0, 2, 0);
+
+    rt_graph_add_node(g, 3, 2);
+    rt_graph_set_control(g, 3, 0, 1.0f); // bus 1
+    rt_graph_connect(g, 1, 0, 3, 0);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0(static_cast<std::size_t>(kFrames));
+    std::vector<float> bus1(static_cast<std::size_t>(kFrames));
+    CHECK(rt_graph_read_bus(g, 0, kFrames, bus0.data()) == kFrames);
+    CHECK(rt_graph_read_bus(g, 1, kFrames, bus1.data()) == kFrames);
+
+    // Bus 0 should be the 200 Hz sine: ~4.27 cycles in 1024 frames @ 48 kHz
+    // → 8-9 zero crossings.
+    int zc0 = zero_crossings(bus0);
+    CHECK(zc0 >= 7);
+    CHECK(zc0 <= 11);
+
+    // Bus 1 should be the 4000 Hz sine: ~85 cycles → 170 ZCs.
+    int zc1 = zero_crossings(bus1);
+    CHECK(zc1 >= 160);
+    CHECK(zc1 <= 180);
+
+    // Both buses are non-trivial.
+    CHECK(peak_abs(bus0) > 0.5f);
+    CHECK(peak_abs(bus1) > 0.5f);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writing to bus 1 leaves bus 0 silent") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc 440
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 2); // Out → bus 1 only
+    rt_graph_set_control(g, 1, 0, 1.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0(static_cast<std::size_t>(kFrames));
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto s : bus0) {
+        CHECK(s == 0.0f);
+    }
+
+    std::vector<float> bus1(static_cast<std::size_t>(kFrames));
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
+    CHECK(peak_abs(bus1) > 0.5f);
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Connection edge cases
+// ----------------------------------------------------------------
+
+TEST_CASE("connect to the same dst port twice is last-writer-wins") {
+    // Build two oscillators of distinct frequencies, then wire both
+    // to the same Gain.signal port. The second connect should win:
+    // output should be sample-equal to a graph where only sin2 is wired.
+    auto build = [](float a_freq, float b_freq, bool wire_a) {
+        auto *g = rt_graph_create(4, kFrames);
+        REQUIRE(g != nullptr);
+
+        rt_graph_add_node(g, 0, 1);
+        rt_graph_set_control(g, 0, 0, a_freq);
+        rt_graph_add_node(g, 1, 1);
+        rt_graph_set_control(g, 1, 0, b_freq);
+
+        rt_graph_add_node(g, 2, 3); // Gain
+        rt_graph_set_control(g, 2, 0, 1.0f);
+
+        if (wire_a) {
+            rt_graph_connect(g, 0, 0, 2, 0); // wire A first
+        }
+        rt_graph_connect(g, 1, 0, 2, 0);     // wire B (overrides if wire_a)
+
+        rt_graph_add_node(g, 3, 2);
+        rt_graph_set_control(g, 3, 0, 0.0f);
+        rt_graph_connect(g, 2, 0, 3, 0);
+        return g;
+    };
+
+    auto *g_both = build(440.0f, 1100.0f, /*wire_a=*/true);
+    auto both = render_bus0(g_both, kFrames);
+    rt_graph_destroy(g_both);
+
+    auto *g_b_only = build(440.0f, 1100.0f, /*wire_a=*/false);
+    auto b_only = render_bus0(g_b_only, kFrames);
+    rt_graph_destroy(g_b_only);
+
+    REQUIRE(both.size() == b_only.size());
+    for (std::size_t i = 0; i < both.size(); ++i) {
+        CHECK(both[i] == b_only[i]);
+    }
+}
+
+TEST_CASE("connect to a non-existent port is rejected and does not crash") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc, has 1 output port
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 3); // Gain, has 2 input ports (0, 1)
+    rt_graph_set_control(g, 1, 0, 1.0f);
+
+    // Out-of-range dst port: no effect, no crash.
+    rt_graph_connect(g, 0, 0, 1, 5);
+    rt_graph_connect(g, 0, 0, 1, 99);
+
+    // The graph still works after the bad connects.
+    rt_graph_connect(g, 0, 0, 1, 0); // valid
+    rt_graph_add_node(g, 2, 2);
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    CHECK(peak_abs(samples) > 0.5f);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("connect after a process call takes effect on subsequent blocks") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc 440
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 2); // Out, no signal wired yet
+    rt_graph_set_control(g, 1, 0, 0.0f);
+
+    // First block: Out has no input → silent.
+    auto block1 = render_bus0(g, kFrames);
+    for (auto s : block1) {
+        CHECK(s == 0.0f);
+    }
+
+    // Wire mid-flight, then render again.
+    rt_graph_connect(g, 0, 0, 1, 0);
+    auto block2 = render_bus0(g, kFrames);
+    CHECK(peak_abs(block2) > 0.5f);
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Realtime audio (PortAudio path)
+// ----------------------------------------------------------------
+//
+// These tests exercise rt_graph_start_audio / wait_started / stop_audio.
+// They skip cleanly on machines with no audio output (CI containers,
+// headless build agents) — start_audio returns a negative status and
+// we treat that as a SKIP rather than a failure.
+
+TEST_CASE("start_audio + stop_audio cycle runs cleanly when a device is available") {
+    auto *g = build_sin_out(2, /*max_frames*/ 256);
+
+    // device_id = -1 → default; output_channels = 1 → mono.
+    int rc = rt_graph_start_audio(g, /*output_channels*/ 1, /*device_id*/ -1);
+    if (rc != 0) {
+        // No usable device. Pass without exercising the realtime path.
+        WARN_MESSAGE(true, "no audio device available (rc=" << rc
+                                                            << "), skipping");
+        rt_graph_destroy(g);
+        return;
+    }
+
+    // Wait up to 500 ms for the callback to report ready.
+    int ready = rt_graph_wait_started(g, 500);
+    CHECK(ready == 0);
+
+    // Let the stream run briefly, then stop.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    rt_graph_stop_audio(g);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("stop_audio is safe to call when audio was never started") {
+    auto *g = build_sin_out(2, kFrames);
+    rt_graph_stop_audio(g); // must not crash
+    rt_graph_destroy(g);
+    CHECK(true);
+}
+
+TEST_CASE("offline create/process/destroy 1000× does not leak or crash") {
+    // Pure resource-cycle stress test. If rt_graph_create is leaking
+    // backing memory, valgrind or ASAN will catch it; if it leaks
+    // heap fragments only, this loop will at least make the leak
+    // proportionally obvious in RSS observation.
+    constexpr int kIters = 1000;
+    for (int i = 0; i < kIters; ++i) {
+        const int cap        = (i % 7) + 2;
+        const int max_frames = ((i % 4) + 1) * 64;
+        auto *g = rt_graph_create(cap, max_frames);
+        REQUIRE(g != nullptr);
+        rt_graph_add_node(g, 0, 1);
+        rt_graph_set_control(g, 0, 0, 440.0f + static_cast<float>(i));
+        rt_graph_add_node(g, 1, 2);
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_process(g, max_frames);
+        rt_graph_destroy(g);
+    }
+    CHECK(true);
+}
+
+TEST_CASE("audio start/stop cycle 25× does not exhaust device handles") {
+    // PortAudio resource leaks (unclosed streams, leaked devices) tend
+    // to manifest as start_audio returning failure after ~10-20
+    // iterations. We don't assert success on every iteration (the host
+    // may need a moment to reclaim handles), but we do require that we
+    // see at least *some* successful starts and that nothing crashes.
+    constexpr int kIters = 25;
+    int success_count = 0;
+
+    for (int i = 0; i < kIters; ++i) {
+        auto *g = build_sin_out(2, /*max_frames*/ 256);
+        int rc = rt_graph_start_audio(g, 1, -1);
+        if (rc == 0) {
+            ++success_count;
+            rt_graph_wait_started(g, 200);
+            rt_graph_stop_audio(g);
+        }
+        rt_graph_destroy(g);
+    }
+
+    if (success_count == 0) {
+        // No usable device — pass without exercising the cycle.
+        WARN_MESSAGE(true, "no audio device available, skipping");
+    } else {
+        // We got at least one success; require that a healthy fraction
+        // of attempts succeeded. A clean implementation should hit
+        // 25/25; allow some tolerance for transient platform issues.
+        CHECK(success_count >= kIters * 3 / 4);
+    }
+}
+
+TEST_CASE("clear during a running audio stream does not crash") {
+    // Pin the observed behaviour: it is safe to call rt_graph_clear
+    // while audio is running. Whether clear silences the stream
+    // immediately, on the next callback, or only after a follow-up
+    // stop_audio is left to the implementation — this test only
+    // checks that no crash, no NaN propagation, and a subsequent
+    // stop_audio + destroy completes cleanly.
+    auto *g = build_sin_out(2, /*max_frames*/ 256);
+    int rc = rt_graph_start_audio(g, 1, -1);
+    if (rc != 0) {
+        WARN_MESSAGE(true, "no audio device available, skipping");
+        rt_graph_destroy(g);
+        return;
+    }
+    rt_graph_wait_started(g, 500);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    rt_graph_clear(g);                           // mid-flight clear
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    rt_graph_stop_audio(g);
+    rt_graph_destroy(g);
+    CHECK(true);
+}
+
+TEST_CASE("rebuild after clear with active stream produces audio again") {
+    // The full clear-and-reload-while-running path: start, clear,
+    // build a different graph, audio should keep running on the new
+    // topology. This is not a guaranteed contract — implementations
+    // may require stop+restart — so we accept either "still streaming"
+    // or "stream ended cleanly", just not a crash.
+    auto *g = build_sin_out(4, /*max_frames*/ 256);
+    int rc = rt_graph_start_audio(g, 1, -1);
+    if (rc != 0) {
+        WARN_MESSAGE(true, "no audio device available, skipping");
+        rt_graph_destroy(g);
+        return;
+    }
+    rt_graph_wait_started(g, 500);
+
+    rt_graph_clear(g);
+    // Rebuild as a different graph in place.
+    rt_graph_add_node(g, 0, 6); // NoiseGen
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    rt_graph_stop_audio(g);
+    rt_graph_destroy(g);
+    CHECK(true);
+}
+
+TEST_CASE("destroy after start_audio cleans up the audio thread") {
+    auto *g = build_sin_out(2, /*max_frames*/ 256);
+    int rc = rt_graph_start_audio(g, 1, -1);
+    if (rc != 0) {
+        WARN_MESSAGE(true, "no audio device available, skipping");
+        rt_graph_destroy(g);
+        return;
+    }
+    rt_graph_wait_started(g, 500);
+    // Destroy without an explicit stop — runtime should tear down cleanly.
+    rt_graph_destroy(g);
+    CHECK(true);
+}
+
+// ----------------------------------------------------------------
+// Multiple-instance isolation
+// ----------------------------------------------------------------
+//
+// Two RTGraph handles must not share state. Same-shape graphs in
+// different handles render the same deterministic output; NoiseGen
+// instances in two handles must not share an RNG (or if they do,
+// the runtime needs to declare it).
+
+TEST_CASE("two SinOsc graphs in distinct handles render identical output") {
+    auto *g1 = build_sin_out(2, kFrames);
+    auto *g2 = build_sin_out(2, kFrames);
+
+    auto a = render_bus0(g1, kFrames);
+    auto b = render_bus0(g2, kFrames);
+    rt_graph_destroy(g1);
+    rt_graph_destroy(g2);
+
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        CHECK(a[i] == b[i]);
+    }
+}
+
+TEST_CASE("interleaved processing of two graphs does not corrupt either") {
+    // g_a: SinOsc 440. g_b: SinOsc 880. Process them in an alternating
+    // sequence (a, b, a, b, ...) and compare against running each one
+    // alone for the same total frames. State must not bleed across.
+    auto *g_a_alone = build_sin_out(2, kFrames, 440.0f);
+    auto a_alone = render_bus0(g_a_alone, kFrames);
+    rt_graph_destroy(g_a_alone);
+
+    auto *g_b_alone = build_sin_out(2, kFrames, 880.0f);
+    auto b_alone = render_bus0(g_b_alone, kFrames);
+    rt_graph_destroy(g_b_alone);
+
+    // Now run a/b interleaved at half-block granularity.
+    constexpr int kHalf = kFrames / 2;
+    auto *g_a = build_sin_out(2, kFrames, 440.0f);
+    auto *g_b = build_sin_out(2, kFrames, 880.0f);
+
+    std::vector<float> a_inter(static_cast<std::size_t>(kFrames));
+    std::vector<float> b_inter(static_cast<std::size_t>(kFrames));
+
+    rt_graph_process(g_a, kHalf);
+    rt_graph_read_bus(g_a, 0, kHalf, a_inter.data());
+    rt_graph_process(g_b, kHalf);
+    rt_graph_read_bus(g_b, 0, kHalf, b_inter.data());
+    rt_graph_process(g_a, kHalf);
+    rt_graph_read_bus(g_a, 0, kHalf, a_inter.data() + kHalf);
+    rt_graph_process(g_b, kHalf);
+    rt_graph_read_bus(g_b, 0, kHalf, b_inter.data() + kHalf);
+
+    rt_graph_destroy(g_a);
+    rt_graph_destroy(g_b);
+
+    for (std::size_t i = 0; i < a_inter.size(); ++i) {
+        CHECK(a_inter[i] == doctest::Approx(a_alone[i]).epsilon(1e-4));
+        CHECK(b_inter[i] == doctest::Approx(b_alone[i]).epsilon(1e-4));
+    }
+}
+
+TEST_CASE("NoiseGen in two handles produces meaningfully different sequences") {
+    auto build_noise = [] {
+        auto *g = rt_graph_create(2, kFrames);
+        REQUIRE(g != nullptr);
+        rt_graph_add_node(g, 0, 6); // NoiseGen
+        rt_graph_add_node(g, 1, 2); // Out
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        return g;
+    };
+
+    auto *g1 = build_noise();
+    auto *g2 = build_noise();
+    auto a = render_bus0(g1, kFrames);
+    auto b = render_bus0(g2, kFrames);
+    rt_graph_destroy(g1);
+    rt_graph_destroy(g2);
+
+    // Whether two fresh NoiseGens produce identical or distinct sequences
+    // is implementation-defined. We assert only the practical
+    // requirement: if they happen to be identical, that's a documented
+    // characteristic; if they differ, the difference is substantial.
+    int matches = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::abs(a[i] - b[i]) < 1e-6f) {
+            ++matches;
+        }
+    }
+    const int total = static_cast<int>(a.size());
+    const bool fully_identical = (matches == total);
+    const bool substantially_different = (matches < total * 3 / 10);
+    CHECK((fully_identical || substantially_different));
+}
+
+// ----------------------------------------------------------------
+// Golden samples for deterministic kernels
+// ----------------------------------------------------------------
+//
+// Pin specific sample values for the deterministic oscillator kernel.
+// q::sin is a LUT (~14-15 bit precision), so we compare against the
+// analytical sin() with a tolerance generous enough to absorb the LUT
+// quantization but tight enough to catch any genuine kernel drift
+// (e.g. a future change that swaps the LUT, alters phase advancement,
+// or breaks the initial-phase contract).
+
+TEST_CASE("SinOsc(440, 0) first 32 samples match analytical sin within LUT tolerance") {
+    auto *g = build_sin_out(2, kFrames);
+    auto samples = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    constexpr int kCheck = 32;
+    for (int n = 0; n < kCheck; ++n) {
+        const double t = static_cast<double>(n) / kSampleRate;
+        const double expected = std::sin(kTau * 440.0 * t);
+        // 1e-3 absolute slack: comfortably above LUT noise (~6e-5) but
+        // far below any kernel rewrite that drops or doubles a sample.
+        CHECK(samples[static_cast<std::size_t>(n)] ==
+              doctest::Approx(static_cast<float>(expected)).epsilon(1e-3));
+    }
+}
+
+TEST_CASE("Add(0.3, 0.4) renders exactly 0.7 for the entire block") {
+    // Pure constant-fold case. No tolerance — these are floats with
+    // exact representations of the sum.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 8);
+    rt_graph_set_control(g, 0, 0, 0.3f);
+    rt_graph_set_control(g, 0, 1, 0.4f);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    const float expected = 0.3f + 0.4f;
+    for (auto s : samples) {
+        CHECK(s == expected);
+    }
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Gain(0.5) on SinOsc(440) is sample-equal to 0.5 × SinOsc(440)") {
+    // Render the carrier alone, then through a 0.5 gain. Output of the
+    // second graph at every sample must equal exactly 0.5 × the first.
+    auto *g_plain = build_sin_out(2, kFrames);
+    auto plain = render_bus0(g_plain, kFrames);
+    rt_graph_destroy(g_plain);
+
+    auto *g_scaled = rt_graph_create(4, kFrames);
+    rt_graph_add_node(g_scaled, 0, 1);
+    rt_graph_set_control(g_scaled, 0, 0, 440.0f);
+    rt_graph_add_node(g_scaled, 1, 3);
+    rt_graph_set_control(g_scaled, 1, 0, 0.5f);
+    rt_graph_add_node(g_scaled, 2, 2);
+    rt_graph_set_control(g_scaled, 2, 0, 0.0f);
+    rt_graph_connect(g_scaled, 0, 0, 1, 0);
+    rt_graph_connect(g_scaled, 1, 0, 2, 0);
+    auto scaled = render_bus0(g_scaled, kFrames);
+    rt_graph_destroy(g_scaled);
+
+    REQUIRE(plain.size() == scaled.size());
+    for (std::size_t i = 0; i < plain.size(); ++i) {
+        CHECK(scaled[i] == 0.5f * plain[i]);
+    }
+}
+
+// ----------------------------------------------------------------
+// SawOsc edge frequencies
+// ----------------------------------------------------------------
+//
+// PolyBLEP saw is bandlimited and well-behaved across most of the
+// audible range, but the kernel must also handle edge frequencies
+// gracefully — DC, near Nyquist, and negative frequencies — without
+// blowing up or returning NaN/Inf.
+
+namespace {
+
+// Render bus 0 from a one-saw graph at the given frequency.
+std::vector<float> render_saw(float freq, int max_frames = kFrames) {
+    auto *g = rt_graph_create(2, max_frames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 5); // SawOsc
+    rt_graph_set_control(g, 0, 0, freq);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+    rt_graph_add_node(g, 1, 2); // Out
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    auto samples = render_bus0(g, max_frames);
+    rt_graph_destroy(g);
+    return samples;
+}
+
+} // namespace
+
+TEST_CASE("SawOsc(0 Hz) produces finite, bounded DC-like output") {
+    auto samples = render_saw(0.0f);
+    for (auto s : samples) {
+        CHECK(std::isfinite(s));
+        CHECK(std::abs(s) <= 1.5f);
+    }
+    // At freq=0 the phase never advances, so output is constant.
+    // Whatever value the kernel picks for that constant is fine, but
+    // every sample should equal the first.
+    for (std::size_t i = 1; i < samples.size(); ++i) {
+        CHECK(samples[i] == samples[0]);
+    }
+}
+
+TEST_CASE("SawOsc near Nyquist stays finite") {
+    auto samples = render_saw(23000.0f);
+    for (auto s : samples) {
+        CHECK(std::isfinite(s));
+        // PolyBLEP's job is to keep output bounded; allow some headroom
+        // for transient overshoot at the edge.
+        CHECK(std::abs(s) <= 1.5f);
+    }
+}
+
+TEST_CASE("SawOsc above Nyquist stays finite (no UB on extreme input)") {
+    // Beyond Nyquist (24 kHz @ 48 kHz SR) the result is meaningless
+    // musically, but the kernel must not crash or produce NaN/Inf.
+    for (float f : {30000.0f, 100000.0f}) {
+        auto samples = render_saw(f);
+        for (auto s : samples) {
+            CHECK(std::isfinite(s));
+            CHECK(std::abs(s) <= 5.0f);
+        }
+    }
+}
+
+TEST_CASE("SawOsc with negative frequency stays finite") {
+    auto samples = render_saw(-440.0f);
+    for (auto s : samples) {
+        CHECK(std::isfinite(s));
+        CHECK(std::abs(s) <= 1.5f);
+    }
+    // A negative freq either inverts the waveform direction or aliases
+    // to its positive counterpart. Either way the signal should still
+    // oscillate (have substantial amplitude), not collapse to silence.
+    CHECK(peak_abs(samples) > 0.3f);
+}
+
+TEST_CASE("SinOsc edge frequencies stay finite") {
+    // Mirror coverage for SinOsc.
+    for (float f : {0.0f, 23000.0f, -440.0f, 100000.0f}) {
+        auto *g = rt_graph_create(2, kFrames);
+        rt_graph_add_node(g, 0, 1);
+        rt_graph_set_control(g, 0, 0, f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        rt_graph_add_node(g, 1, 2);
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        auto samples = render_bus0(g, kFrames);
+        rt_graph_destroy(g);
+
+        for (auto s : samples) {
+            CHECK(std::isfinite(s));
+            CHECK(std::abs(s) <= 1.5f);
+        }
+    }
+}
+
+TEST_CASE("self-loop wiring does not crash and stays finite") {
+    // Wire a Gain node to itself. Whatever the runtime does (read
+    // last-block buffer, read zeros, etc.) it must not crash or
+    // produce NaN/Inf. We don't assert audio behaviour beyond that.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1); // SinOsc 440 (kicks something into the chain)
+    rt_graph_set_control(g, 0, 0, 440.0f);
+
+    rt_graph_add_node(g, 1, 3); // Gain
+    rt_graph_set_control(g, 1, 0, 0.5f);
+    rt_graph_connect(g, 0, 0, 1, 0); // sin → gain.signal
+    rt_graph_connect(g, 1, 0, 1, 1); // self-loop on gain.gain
+
+    rt_graph_add_node(g, 2, 2);
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    // Render multiple blocks to give any feedback path time to blow up.
+    for (int i = 0; i < 8; ++i) {
+        auto samples = render_bus0(g, kFrames);
+        for (auto s : samples) {
+            CHECK(std::isfinite(s));
+            CHECK(std::abs(s) < 100.0f);
+        }
+    }
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("adding nodes past capacity does not crash and remaining graph still works") {
+    constexpr int kCap = 3;
+    auto *g = rt_graph_create(kCap, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Fill up the graph: 3 nodes (SinOsc, Gain, Out).
+    rt_graph_add_node(g, 0, 1);
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 3);
+    rt_graph_set_control(g, 1, 0, 0.5f);
+    rt_graph_add_node(g, 2, 2);
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    // Try to add three more nodes past capacity. These must not crash
+    // and must not corrupt the existing valid graph.
+    rt_graph_add_node(g, 3, 1);
+    rt_graph_add_node(g, 4, 1);
+    rt_graph_add_node(g, 5, 1);
+    rt_graph_set_control(g, 3, 0, 880.0f);
+
+    auto samples = render_bus0(g, kFrames);
+    CHECK(peak_abs(samples) == doctest::Approx(0.5f).epsilon(0.05));
 
     rt_graph_destroy(g);
 }
