@@ -79,6 +79,18 @@ detunedSawGraph = runSynth $ do
   out 0 g1
   out 0 g2                   -- second out accumulates onto same bus
 
+-- Ring modulation: 440 Hz carrier multiplied sample-by-sample by a 7 Hz
+-- modulator. Both signals are bipolar, so this is genuine ring mod
+-- (sum/difference frequencies) rather than amplitude modulation.
+-- Final 0.3 gain stage keeps the output at a reasonable level.
+ringModGraph :: SynthGraph
+ringModGraph = runSynth $ do
+  carrier   <- sinOsc 440.0 0.0
+  modulator <- sinOsc 7.0 0.0
+  ring      <- gain' (audio carrier) (audio modulator)
+  amped     <- gain ring 0.3
+  out 0 amped
+
 demoTable :: [Demo]
 demoTable =
   [ Demo "simple"    "Simple (SinOsc → Out)"                           simpleGraph
@@ -89,6 +101,7 @@ demoTable =
   , Demo "noise-lpf" "Filtered noise (NoiseGen → LPF → Gain → Out)"   noiseLpfGraph
   , Demo "saw-lpf"   "Resonant bass (SawOsc → LPF → Gain → Out)"      filteredSawGraph
   , Demo "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"  detunedSawGraph
+  , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"        ringModGraph
   ]
 
 data Demo = Demo

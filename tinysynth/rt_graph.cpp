@@ -588,15 +588,12 @@ static void process_lpf(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
 
 /* Note [Gain processing semantics]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Gain is currently scalar gain with block-latched modulation.
+Gain is sample-accurate when port 1 is wired to another node's output:
+both signal and modulator are read per sample, so this is the
+ring-modulation / AM path. When port 1 is unconnected, the kernel falls
+back to the scalar control default for the whole block.
 
-If input port 1 is connected, the kernel reads sample 0 from that input
-and uses it as the gain amount for the entire block. If no signal input
-is connected, the output is silence.
-
-As with SinOsc, this is a deliberate "simple now, elaborate later" design:
-the dataflow shape already supports future sample-accurate gain without
-changing the ABI!
+If the signal input (port 0) is unconnected, output is silence.
 */
 
 static void process_gain(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
@@ -605,16 +602,24 @@ static void process_gain(RTGraph &g, std::size_t node_idx, int nframes) noexcept
   const auto sig_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
   const auto gain_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
 
-  const float amount = !gain_in.empty() ? gain_in[0] : node.controls[0];
-
   if (sig_in.empty()) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  for (int i = 0; i < nframes; ++i) {
-    const std::size_t fi = static_cast<std::size_t>(i);
-    out[fi] = sig_in[fi] * amount;
+  if (!gain_in.empty()) {
+    // Sample-accurate gain: read modulator per sample.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      out[fi] = sig_in[fi] * gain_in[fi];
+    }
+  } else {
+    // Constant gain from the control default.
+    const float amount = node.controls[0];
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      out[fi] = sig_in[fi] * amount;
+    }
   }
 }
 

@@ -78,6 +78,14 @@ noiseLpfGraph = runSynth $ do
   g <- gain f 0.4
   out 0 g
 
+ringModGraph :: SynthGraph
+ringModGraph = runSynth $ do
+  carrier   <- sinOsc 440.0 0.0
+  modulator <- sinOsc 7.0 0.0
+  ring      <- gain' (audio carrier) (audio modulator)
+  amped     <- gain ring 0.3
+  out 0 amped
+
 demoGraphs :: [(String, SynthGraph)]
 demoGraphs =
   [ ("simple",    simpleGraph)
@@ -85,6 +93,7 @@ demoGraphs =
   , ("fanout",    fanOutGraph)
   , ("saw",       sawGraph)
   , ("noise-lpf", noiseLpfGraph)
+  , ("ringmod",   ringModGraph)
   ]
 
 ------------------------------------------------------------
@@ -136,6 +145,19 @@ unitTests = testGroup "Unit tests"
         Left err ->
           assertBool ("expected 'Cycle' in error, got: " <> err)
                     ("Cycle" `isPrefixOf` err)
+
+  , testCase "ringmod: a gain node has both inputs wired as RFrom" $
+      case lowerGraph ringModGraph >>= compileRuntimeGraph of
+        Left err -> assertFailure err
+        Right rt ->
+          let -- The ring-mod multiply is the Gain node whose BOTH inputs
+              -- are RFrom. The output gain stage has only its port 0 wired.
+              hasTwoAudioInputs n =
+                rnKind n == KGain
+                && length [() | RFrom _ _ <- rnInputs n] == 2
+          in assertBool
+               "expected a Gain node with two RFrom inputs in ringmod"
+               (any hasTwoAudioInputs (rgNodes rt))
   ]
 
 -- A hand-built graph that references a non-existent NodeID. The DSL
