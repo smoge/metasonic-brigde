@@ -35,6 +35,7 @@ library:
     - MetaSonic.Bridge.Validate
     - MetaSonic.Bridge.IR
     - MetaSonic.Bridge.Compile
+    - MetaSonic.Bridge.Templates
     - MetaSonic.Bridge.FFI
     - MetaSonic.Visualize.Trace
     - MetaSonic.Visualize.TUI

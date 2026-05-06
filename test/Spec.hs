@@ -27,7 +27,8 @@ module Main (main) where
 
 import qualified Data.Map.Strict           as M
 import qualified Data.Set                  as S
-import           Data.List                 (isPrefixOf, nub, sort, sortBy)
+import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
+                                            sortBy)
 import           Data.Ord                  (comparing)
 import           Foreign.C.Types           (CFloat (..))
 import           Foreign.Marshal.Alloc     (allocaBytes)
@@ -46,6 +47,7 @@ import           MetaSonic.Bridge.FFI      (c_rt_graph_kind_supported,
                                             withRTGraph)
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
+import           MetaSonic.Bridge.Templates
 import           MetaSonic.Bridge.Validate
 import           MetaSonic.Types
 
@@ -412,6 +414,208 @@ unitTests = testGroup "Unit tests"
             Left err -> assertFailure $
               "feedback graph through busInDelayed should sort, got: " <> err
             Right _  -> pure ()
+      ]
+
+  , -- Template-level precedence from bus dataflow. busFootprint
+    -- summarises a single template's bus surface; compileTemplateGraph
+    -- composes several templates and derives a topological execution
+    -- order from their footprints. The pattern mirrors the intra-graph
+    -- E_r machinery one tier up; see Note [Template-level precedence
+    -- from bus dataflow] in "MetaSonic.Bridge.Templates".
+    testGroup "TemplateGraph (inter-template ordering)"
+      [ testCase "busFootprint of a graph with no bus ops contains only the Out write" $ do
+          let g  = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                amped <- gain o 0.5
+                out 0 amped
+              ir = case lowerGraph g of
+                     Right ir' -> ir'
+                     Left err  -> error err
+              fp = busFootprint ir
+          -- Out 0 contributes BusWrite 0 — Out and BusOut share the
+          -- annotation now. The graph has no live or delayed reads.
+          bfWrites       fp @?= S.singleton 0
+          bfReads        fp @?= S.empty
+          bfDelayedReads fp @?= S.empty
+
+      , testCase "busFootprint records BusOut writes and BusIn reads" $ do
+          let g  = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                busOut 5 o
+                t <- busIn 7
+                out 0 t
+              ir = case lowerGraph g of
+                     Right ir' -> ir'
+                     Left err  -> error err
+              fp = busFootprint ir
+          bfWrites       fp @?= S.fromList [0, 5]   -- Out 0 + BusOut 5
+          bfReads        fp @?= S.singleton 7
+          bfDelayedReads fp @?= S.empty
+
+      , testCase "busFootprint separates delayed reads from live reads" $ do
+          let g  = runSynth $ do
+                tap <- busInDelayed 9
+                o   <- sinOsc 220.0 0.0
+                mix <- add o tap
+                amp <- gain mix 0.5
+                busOut 9 amp
+                out 0 amp
+              ir = case lowerGraph g of
+                     Right ir' -> ir'
+                     Left err  -> error err
+              fp = busFootprint ir
+          bfWrites       fp @?= S.fromList [0, 9]
+          bfReads        fp @?= S.empty
+          bfDelayedReads fp @?= S.singleton 9
+
+      , testCase "single template compiles to a one-element TemplateGraph" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                out 0 o
+          case compileTemplateGraph [("solo", g)] of
+            Left err -> assertFailure $ "compileTemplateGraph failed: " <> err
+            Right tg -> do
+              length (tgTemplates tg) @?= 1
+              tplName (head (tgTemplates tg)) @?= "solo"
+              -- One template can't precede itself; the precedence
+              -- entry maps to the empty set.
+              M.findWithDefault S.empty (TemplateID 0) (tgPrecedence tg)
+                @?= S.empty
+
+      , testCase "writer template precedes reader template (cross-bus dataflow)" $ do
+          -- Producer writes bus 5; Consumer reads bus 5 and routes to
+          -- hardware. compileTemplateGraph must put Producer first.
+          let producer = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                busOut 5 o
+              consumer = runSynth $ do
+                t <- busIn 5
+                out 0 t
+          case compileTemplateGraph
+                 [("consumer", consumer), ("producer", producer)] of
+            Left err -> assertFailure $ "compileTemplateGraph failed: " <> err
+            Right tg -> do
+              -- Order: producer before consumer, regardless of input
+              -- order. The TemplateID is the input position; the
+              -- producer was input #1 (consumer was input #0).
+              map tplName (tgTemplates tg) @?= ["producer", "consumer"]
+              -- Precedence is reader-keyed: consumer (TemplateID 0)
+              -- depends on producer (TemplateID 1).
+              M.findWithDefault S.empty (TemplateID 0) (tgPrecedence tg)
+                @?= S.singleton (TemplateID 1)
+
+      , testCase "templates with disjoint buses run in input order (no precedence)" $ do
+          -- Two leaf voices on different hardware channels; neither
+          -- reads what the other writes. There is no precedence and
+          -- the topo sort preserves input order.
+          let voiceA = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                out 0 o
+              voiceB = runSynth $ do
+                o <- sinOsc 660.0 0.0
+                out 1 o
+          case compileTemplateGraph [("a", voiceA), ("b", voiceB)] of
+            Left err -> assertFailure $ "compileTemplateGraph failed: " <> err
+            Right tg -> do
+              map tplName (tgTemplates tg) @?= ["a", "b"]
+              M.findWithDefault S.empty (TemplateID 0) (tgPrecedence tg)
+                @?= S.empty
+              M.findWithDefault S.empty (TemplateID 1) (tgPrecedence tg)
+                @?= S.empty
+
+      , testCase "three-template chain sorts transitively (A→B→C)" $ do
+          -- A writes 5; B reads 5 and writes 7; C reads 7. The only
+          -- valid order is A, B, C.
+          let a = runSynth $ do { o <- sinOsc 440.0 0.0; busOut 5 o }
+              b = runSynth $ do
+                    s <- busIn 5
+                    g <- gain s 0.5
+                    busOut 7 g
+              c = runSynth $ do
+                    t <- busIn 7
+                    out 0 t
+          -- Intentionally feed in an order other than A, B, C to
+          -- prove the sort is real and not just preserving input
+          -- order.
+          case compileTemplateGraph [("c", c), ("a", a), ("b", b)] of
+            Left err -> assertFailure $ "compileTemplateGraph failed: " <> err
+            Right tg ->
+              map tplName (tgTemplates tg) @?= ["a", "b", "c"]
+
+      , testCase "BusInDelayed reader does not induce inter-template precedence" $ do
+          -- producer writes bus 5; reader reads bus 5 *delayed*. There
+          -- is no live-read intersection, so the templates can run in
+          -- either order — the topo sort preserves input order.
+          let producer = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                busOut 5 o
+              reader = runSynth $ do
+                t <- busInDelayed 5
+                out 0 t
+          case compileTemplateGraph
+                 [("reader", reader), ("producer", producer)] of
+            Left err -> assertFailure $ "compileTemplateGraph failed: " <> err
+            Right tg -> do
+              -- No precedence either way.
+              M.findWithDefault S.empty (TemplateID 0) (tgPrecedence tg)
+                @?= S.empty
+              M.findWithDefault S.empty (TemplateID 1) (tgPrecedence tg)
+                @?= S.empty
+              -- And the reader's delayed read shows up in the
+              -- footprint where it belongs.
+              let readerTpl = head [ t | t <- tgTemplates tg
+                                       , tplName t == "reader" ]
+              bfDelayedReads (tplFootprint readerTpl)
+                @?= S.singleton 5
+
+      , testCase "mutual live writes/reads form a cycle (rejected)" $ do
+          -- A writes 5 and reads 7; B writes 7 and reads 5. Each
+          -- template depends on the other through a live read, which
+          -- is unschedulable across templates within one block. The
+          -- compiler must reject this; the user's remedy is to turn
+          -- one of the live reads into a delayed read.
+          let a = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                busOut 5 o
+                t <- busIn 7
+                out 0 t
+              b = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                busOut 7 s
+                u <- busIn 5
+                out 1 u
+          case compileTemplateGraph [("a", a), ("b", b)] of
+            Right _  -> assertFailure
+              "expected compileTemplateGraph to reject a precedence cycle"
+            Left err ->
+              assertBool ("expected 'cycle' diagnostic, got: " <> err)
+                         ("cycle" `isInfixOf` err)
+
+      , testCase "duplicate template names are rejected" $ do
+          let g = runSynth $ do { o <- sinOsc 440.0 0.0; out 0 o }
+          case compileTemplateGraph [("dup", g), ("dup", g)] of
+            Right _  -> assertFailure
+              "expected compileTemplateGraph to reject duplicate names"
+            Left err ->
+              assertBool ("expected 'duplicate' diagnostic, got: " <> err)
+                         ("duplicate" `isInfixOf` err)
+
+      , testCase "per-template lowering errors are surfaced with the template name" $ do
+          -- Build a SynthGraph with a dangling NodeID by hand. The
+          -- diagnostic must mention the template's name so multi-
+          -- template setups are debuggable.
+          let badGraph = SynthGraph $ M.fromList
+                [ ( NodeID 0
+                  , NodeSpec (NodeID 0) "out"
+                      (Out 0 (Audio (NodeID 99) (PortIndex 0)))
+                  )
+                ]
+          case compileTemplateGraph [("naughty", badGraph)] of
+            Right _  -> assertFailure
+              "expected per-template compile error to surface"
+            Left err ->
+              assertBool ("expected template name in error, got: " <> err)
+                         ("naughty" `isInfixOf` err)
       ]
 
   , -- Rate propagation: 'inferRate' returns each kind's *floor*; the
