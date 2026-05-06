@@ -1068,6 +1068,186 @@ TEST_CASE("BusInDelayed feedback path: stable attenuated loop") {
     rt_graph_destroy(g);
 }
 
+TEST_CASE("Delay inside a BusInDelayed feedback loop stays bounded (echo/comb)") {
+    // The canonical single-tap echo: an impulse-like source mixed with a
+    // delayed, attenuated copy of itself, where the delay line lives
+    // inside the loop. Validates that swap+clear (Phase 2 plumbing) and
+    // the per-node Delay state (Phase 1.5) compose under feedback.
+    //
+    //   SinOsc(220) → Gain(0.05) ─┐
+    //                              ├→ Add → Delay(20ms) → Gain(0.6) → BusOut(7) → Out(0)
+    //   BusInDelayed(7) ──────────┘
+    //
+    // The cross-block feedback edge (BusOut(7) → BusInDelayed(7)) is
+    // exactly what BusInDelayed exists to schedule. Adding the Delay in
+    // the loop adds intra-block latency on top of the inter-block
+    // snapshot, so the effective loop period is one block + 20 ms.
+    constexpr int kBus = 7;
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 220.0);
+    rt_graph_set_control(g, 0, 1, 0.0);
+
+    rt_graph_add_node(g, 1, 3);                          // Gain(0.05) — input trim
+    rt_graph_set_control(g, 1, 0, 0.05);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 12);                         // BusInDelayed(7)
+    rt_graph_set_control(g, 2, 0, static_cast<double>(kBus));
+
+    rt_graph_add_node(g, 3, 8);                          // Add: trimmed src + delayed loop
+    rt_graph_connect(g, 1, 0, 3, 0);
+    rt_graph_connect(g, 2, 0, 3, 1);
+
+    rt_graph_add_node(g, 4, 13);                         // Delay inside the loop
+    rt_graph_set_control(g, 4, 0, 0.05);                 // max = 50 ms
+    rt_graph_set_control(g, 4, 1, 0.02);                 // time = 20 ms
+    rt_graph_connect(g, 3, 0, 4, 0);
+
+    rt_graph_add_node(g, 5, 3);                          // Gain(0.6) — loop attenuator
+    rt_graph_set_control(g, 5, 0, 0.6);
+    rt_graph_connect(g, 4, 0, 5, 0);
+
+    rt_graph_add_node(g, 6, 10);                         // BusOut(7) — closes the loop
+    rt_graph_set_control(g, 6, 0, static_cast<double>(kBus));
+    rt_graph_connect(g, 5, 0, 6, 0);
+
+    rt_graph_add_node(g, 7, 2);                          // Out(0) — what we listen to
+    rt_graph_set_control(g, 7, 0, 0.0);
+    rt_graph_connect(g, 5, 0, 7, 0);
+
+    // Run several blocks so the loop has time to ring.
+    for (int blk = 0; blk < 16; ++blk) {
+        rt_graph_process(g, kFrames);
+    }
+    std::vector<float> out(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, out.data());
+    rt_graph_destroy(g);
+
+    // Bounded: with loop gain 0.6 < 1 the geometric series converges.
+    // Source peak after the 0.05 trim is ~0.05; steady-state envelope is
+    // ~0.05 / (1 - 0.6) = 0.125. Allow generous slack.
+    const float peak = peak_abs(out);
+    CHECK(peak > 0.0f);
+    CHECK(peak < 1.0f);
+    for (auto s : out) {
+        CHECK(std::isfinite(s));
+    }
+}
+
+TEST_CASE("Two Delay nodes in one graph keep independent ring-buffer state") {
+    // State-isolation check for the std::variant per-node model: two
+    // Delay nodes driven by the same constant source with different
+    // delay times must transition from silence to constant at their
+    // own configured times. If their ring buffers aliased (or shared
+    // state via the variant somehow) the two outputs would be
+    // identical. This pins the load-bearing assumption for §2: each
+    // GraphInstance has its own per-node state.
+    constexpr double kShortDelaySec = 0.001;             // 1 ms (~48 samples)
+    constexpr double kLongDelaySec  = 0.005;             // 5 ms (~240 samples)
+    constexpr int    kShortExpect   = 48;
+    constexpr int    kLongExpect    = 240;
+
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 8);                          // Add — constant 1.0 source
+    rt_graph_set_control(g, 0, 0, 1.0);
+    rt_graph_set_control(g, 0, 1, 0.0);
+
+    rt_graph_add_node(g, 1, 13);                         // Delay #1 — short
+    rt_graph_set_control(g, 1, 0, 0.01);                 // max = 10 ms
+    rt_graph_set_control(g, 1, 1, kShortDelaySec);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 13);                         // Delay #2 — long
+    rt_graph_set_control(g, 2, 0, 0.01);
+    rt_graph_set_control(g, 2, 1, kLongDelaySec);
+    rt_graph_connect(g, 0, 0, 2, 0);
+
+    rt_graph_add_node(g, 3, 2);                          // Out(bus 0) — short
+    rt_graph_set_control(g, 3, 0, 0.0);
+    rt_graph_connect(g, 1, 0, 3, 0);
+
+    rt_graph_add_node(g, 4, 2);                          // Out(bus 1) — long
+    rt_graph_set_control(g, 4, 0, 1.0);
+    rt_graph_connect(g, 2, 0, 4, 0);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
+    rt_graph_destroy(g);
+
+    auto first_nonsilent = [](const std::vector<float> &xs) {
+        for (int i = 0; i < static_cast<int>(xs.size()); ++i) {
+            if (std::abs(xs[static_cast<std::size_t>(i)]) > 0.5f) return i;
+        }
+        return -1;
+    };
+
+    int short_at = first_nonsilent(bus0);
+    int long_at  = first_nonsilent(bus1);
+    REQUIRE(short_at >= 0);
+    REQUIRE(long_at  >= 0);
+
+    // Each node hits its own configured delay, ±2-sample API slop.
+    CHECK(std::abs(short_at - kShortExpect) <= 2);
+    CHECK(std::abs(long_at  - kLongExpect)  <= 2);
+
+    // The two transition points must be far apart — independent state,
+    // not a shared buffer that splits the difference.
+    CHECK((long_at - short_at) > 100);
+}
+
+TEST_CASE("Two LPF nodes in one graph hold independent biquad state") {
+    // Companion check: same source through two LPFs at very different
+    // cutoffs must produce two different waveforms. If the variant-
+    // wrapped LPFState shared coefficients across nodes the outputs
+    // would converge.
+    auto build_chain = [](RTGraph *g, int sin_id, int lpf_id, int out_id,
+                          double cutoff_hz, double bus) {
+        rt_graph_add_node(g, sin_id, 1);                 // SinOsc(880)
+        rt_graph_set_control(g, sin_id, 0, 880.0);
+        rt_graph_set_control(g, sin_id, 1, 0.0);
+
+        rt_graph_add_node(g, lpf_id, 7);                 // LPF
+        rt_graph_set_control(g, lpf_id, 0, cutoff_hz);
+        rt_graph_set_control(g, lpf_id, 1, 0.7);
+        rt_graph_connect(g, sin_id, 0, lpf_id, 0);
+
+        rt_graph_add_node(g, out_id, 2);                 // Out
+        rt_graph_set_control(g, out_id, 0, bus);
+        rt_graph_connect(g, lpf_id, 0, out_id, 0);
+    };
+
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    build_chain(g, 0, 1, 2, /*cutoff*/ 200.0,  /*bus*/ 0.0);  // far below carrier — heavy attenuation
+    build_chain(g, 3, 4, 5, /*cutoff*/ 8000.0, /*bus*/ 1.0);  // well above carrier — pass-through
+
+    // Let the filters settle, then read.
+    rt_graph_process(g, kFrames);
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
+    rt_graph_destroy(g);
+
+    const float peak_low  = peak_abs(bus0);
+    const float peak_high = peak_abs(bus1);
+
+    // High cutoff lets the 880 Hz carrier through; low cutoff crushes it.
+    CHECK(peak_high > 0.5f);
+    CHECK(peak_low  < 0.3f);
+    // And the ratio is meaningful — they aren't sharing state.
+    CHECK(peak_high > peak_low * 2.0f);
+}
+
 TEST_CASE("BusIn on out-of-range bus emits silence safely") {
     // Bus index larger than the pool grew to: should be a no-op, not a
     // crash or out-of-bounds read.
@@ -1149,6 +1329,61 @@ TEST_CASE("Env(gate=0) idle stays silent") {
 
     for (auto s : samples) {
         CHECK(std::abs(s) < 1e-6f);
+    }
+}
+
+TEST_CASE("Env release: gate 1→0 triggers a ramp toward zero") {
+    // §2's instance lifecycle hinges on "gate-off triggers envelope
+    // release; instance freed when silent" (ROADMAP §2.2). The existing
+    // Env tests cover gate-held-high (attack→sustain) and gate-held-low
+    // (idle silence); neither exercises the falling edge that fires
+    // env.release(). Walk through three phases:
+    //
+    //   Block 0: gate=1  — attack and reach sustain (S=0.5).
+    //   Block 1: gate=0  — falling edge triggers release; tail of the
+    //                      block decays meaningfully below sustain.
+    //   Block 2: gate=0  — release continues; final samples are near
+    //                      zero, well below the post-release block tail.
+    constexpr int kBlock = 1024;
+    auto *g = rt_graph_create(2, kBlock);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 9);                          // Env
+    rt_graph_set_control(g, 0, 0, 1.0);                  // gate high
+    rt_graph_set_control(g, 0, 1, 0.0005);               // A = 0.5 ms
+    rt_graph_set_control(g, 0, 2, 0.002);                // D = 2 ms
+    rt_graph_set_control(g, 0, 3, 0.5);                  // S = 0.5
+    rt_graph_set_control(g, 0, 4, 0.005);                // R = 5 ms
+    rt_graph_add_node(g, 1, 2);                          // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto block0 = render_bus0(g, kBlock);
+
+    // Last sample of block 0 should be near sustain (~0.5).
+    const float at_sustain = block0[kBlock - 1];
+    INFO("end-of-attack-block sample = " << at_sustain);
+    CHECK(at_sustain > 0.3f);
+    CHECK(at_sustain < 0.7f);
+
+    // Drop the gate; render the release block.
+    rt_graph_set_control(g, 0, 0, 0.0);
+    auto block1 = render_bus0(g, kBlock);
+
+    // Tail of release block must be meaningfully lower than sustain.
+    // R = 5 ms ≈ 240 samples — well within a 1024-sample block, so by
+    // the end the release segment is essentially complete.
+    const float release_tail = block1[kBlock - 1];
+    INFO("release-block tail sample = " << release_tail);
+    CHECK(release_tail < at_sustain * 0.5f);
+    CHECK(release_tail >= 0.0f);
+
+    // One more block with gate held low: should be silent.
+    auto block2 = render_bus0(g, kBlock);
+    rt_graph_destroy(g);
+
+    for (auto s : block2) {
+        CHECK(std::abs(s) < 1e-3f);
     }
 }
 
