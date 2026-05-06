@@ -372,8 +372,8 @@ ugenKind = \case
   Add{}     -> KAdd
   Env{}     -> KEnv
   Out{}     -> KOut
-  BusIn{}   -> error "ugenKind: BusIn not implemented yet"
-  BusOut{}  -> error "ugenKind: BusOut not implemented yet"
+  BusOut{}  -> KBusOut
+  BusIn{}   -> KBusIn
 
 -- The empty graph: no nodes at all.
 emptyGraph_ :: SynthGraph
@@ -485,6 +485,9 @@ properties = testGroup "Properties"
 
   , QC.testProperty "every region's rate matches its member nodes" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propRegionRateAgreement
+
+  , QC.testProperty "every BusOut precedes every same-bus BusIn in the schedule" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propBusOrdering
   ]
 
 propDenseIndices :: SynthGraph -> Property
@@ -648,6 +651,36 @@ propRegionDepsWellFormed g = case lowerGraph g of
          | r <- rgRegions rg
          ]
 
+-- | Every same-bus (BusWrite n, BusRead n) pair must have the writer
+-- precede the reader in the topological order. This is the property
+-- version of the unit tests in @Bus routing (BusIn/BusOut and E_r
+-- edges)@: it asserts that 'effectiveDeps' actually puts every
+-- writer before every reader, on every randomly generated graph.
+--
+-- Cycles in E_s ∪ E_r show up as a 'Left' from 'validateAndSort' and
+-- are skipped (the cycle-rejection unit test covers those).
+propBusOrdering :: SynthGraph -> Property
+propBusOrdering g = case validateAndSort g of
+  Left _    -> property True
+  Right ord ->
+    let posOf   = M.fromList (zip ord [(0 :: Int) ..])
+        nodes   = M.toList (sgNodes g)
+        writers = [ (nid, n) | (nid, ns) <- nodes
+                             , BusWrite n <- inferEff (nsUgen ns) ]
+        readers = [ (nid, n) | (nid, ns) <- nodes
+                             , BusRead  n <- inferEff (nsUgen ns) ]
+        bad =
+          [ (w, r, n)
+          | (w, bw) <- writers
+          , (r, br) <- readers
+          , bw == br
+          , let n  = bw
+                pw = posOf M.! w
+                pr = posOf M.! r
+          , pw >= pr
+          ]
+    in counterexample ("bad bus orderings: " <> show bad) (null bad)
+
 -- | Region rate matches its members'. A region with mixed rates would
 -- be a broken merge in formRegions.
 propRegionRateAgreement :: SynthGraph -> Property
@@ -761,6 +794,55 @@ crossCuttingTests = testGroup "End-to-end FFI"
           assertBool ("sustain tail should sit near 0.5, got avg " <> show tailAvg)
                      (abs (tailAvg - 0.5) < 0.1)
 
+  , testCase "rendering 2×N frames matches one 2N block (state continuity across blocks)" $ do
+      -- Two consecutive blocks of N frames must produce the same samples
+      -- as a single 2N-frame render. This pins the runtime's per-block
+      -- state continuity (oscillator phase, LPF state, future bus
+      -- snapshots) end-to-end. It is the precondition for any work that
+      -- extends across-block semantics — Phase 2's BusInDelayed in
+      -- particular — so a regression here would invalidate that work
+      -- before it starts.
+      --
+      -- The graph mixes a SinOsc (phase state), an LPF (filter state)
+      -- and a BusOut/BusIn round-trip (bus pool state). If any of
+      -- those were reset at block boundaries, the two halves wouldn't
+      -- splice cleanly into the single block.
+      let nhalf     = 128
+          nfull     = 2 * nhalf
+          maxFrames = nfull
+          graph     = runSynth $ do
+            o      <- sinOsc 440.0 0.0
+            busOut 5 o
+            tap    <- busIn 5
+            filt   <- lpf tap 800.0 0.7
+            out 0 filt
+      rt <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      let renderN handle n = allocaBytes (n * sizeOfFloat) $ \buf -> do
+            c_rt_graph_process handle (fromIntegral n)
+            _  <- c_rt_graph_read_bus handle 0 (fromIntegral n) (castPtr buf)
+            cs <- peekArray n (buf :: PtrCFloat)
+            pure (map (\(CFloat x) -> x) cs)
+
+      full <- withRTGraph (length (rgNodes rt)) maxFrames $ \handle -> do
+        loadRuntimeGraph handle rt
+        renderN handle nfull
+
+      halves <- withRTGraph (length (rgNodes rt)) maxFrames $ \handle -> do
+        loadRuntimeGraph handle rt
+        h1 <- renderN handle nhalf
+        h2 <- renderN handle nhalf
+        pure (h1 ++ h2)
+
+      length full @?= nfull
+      length halves @?= nfull
+      let maxDiff = maximum (zipWith (\a b -> abs (a - b)) full halves)
+      assertBool
+        ("expected bit-equivalent samples, max diff = " <> show maxDiff)
+        (maxDiff < 1e-5)
+
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
       -- read is gain-attenuated and sent to hardware bus 0. We then
@@ -858,6 +940,8 @@ data Op
   | OAddMod    Int Int         -- audio + audio
   | OEnv       Int Double Double Double Double
                                -- gate-source-idx, A, D, S, R
+  | OBusOut    Int Int         -- bus, audio source-index
+  | OBusIn     Int             -- bus
   | OOut       Int Int         -- channel, source-index
   deriving (Eq, Show)
 
@@ -875,6 +959,8 @@ genOp = oneof
   , OEnv     <$> nonNegInt
              <*> choose (0.001, 0.1) <*> choose (0.001, 0.5)
              <*> choose (0.0, 1.0)   <*> choose (0.001, 0.5)
+  , OBusOut  <$> choose (0, 3) <*> nonNegInt
+  , OBusIn   <$> choose (0, 3)
   , OOut     <$> choose (0, 1) <*> nonNegInt
   ]
   where
@@ -904,80 +990,108 @@ shrinkSynthGraph g =
     allDeps    = concatMap (dependencies . nsUgen) (M.elems nodes)
     isLeaf nid = nid `notElem` allDeps
 
+{- Note [Generator avoids E_r cycles]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'OBusOut' / 'OBusIn' Ops can interact through bus numbers, so the
+generator could in principle build a graph where 'BusIn n' is
+structurally upstream of a later 'BusOut n', closing a cycle through the
+E_r edge that the scheduler adds. 'validateAndSort' would then reject
+the graph and 'propValidates' would fail — *not* a real bug, just
+generator noise.
+
+The interpreter avoids this by tracking the set of bus numbers already
+"poisoned" by a 'BusIn' op. A later 'OBusOut n' on a poisoned bus is
+silently skipped. With this discipline, no generated graph contains an
+E_r cycle by construction, so all existing properties extend cleanly to
+graphs with bus routing.
+-}
+
 interpret :: [Op] -> SynthM ()
-interpret = go []
+interpret = go [] S.empty
   where
-    go :: [Connection] -> [Op] -> SynthM ()
-    go _ [] = pure ()
+    go :: [Connection] -> S.Set Int -> [Op] -> SynthM ()
+    go _ _ [] = pure ()
 
-    go xs (OSinOsc f p : rest) = do
+    go xs r (OSinOsc f p : rest) = do
       c <- sinOsc (Param f) (Param p)
-      go (xs <> [c]) rest
+      go (xs <> [c]) r rest
 
-    go xs (OSinOscMod i p : rest)
-      | null xs   = go xs rest
+    go xs r (OSinOscMod i p : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let freq = xs !! (i `mod` length xs)
           c <- sinOsc freq (Param p)
-          go (xs <> [c]) rest
+          go (xs <> [c]) r rest
 
-    go xs (OSawOsc f p : rest) = do
+    go xs r (OSawOsc f p : rest) = do
       c <- sawOsc (Param f) (Param p)
-      go (xs <> [c]) rest
+      go (xs <> [c]) r rest
 
-    go xs (ONoise : rest) = do
+    go xs r (ONoise : rest) = do
       c <- noiseGen
-      go (xs <> [c]) rest
+      go (xs <> [c]) r rest
 
-    go xs (OGain i a : rest)
-      | null xs   = go xs rest
+    go xs r (OGain i a : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let src = xs !! (i `mod` length xs)
           c <- gain src (Param a)
-          go (xs <> [c]) rest
+          go (xs <> [c]) r rest
 
-    go xs (OGainMod i j : rest)
-      | null xs   = go xs rest
+    go xs r (OGainMod i j : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let m = length xs
               s = xs !! (i `mod` m)
               a = xs !! (j `mod` m)
           c <- gain s a
-          go (xs <> [c]) rest
+          go (xs <> [c]) r rest
 
-    go xs (OLPF i f q : rest)
-      | null xs   = go xs rest
+    go xs r (OLPF i f q : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let src = xs !! (i `mod` length xs)
           c <- lpf src (Param f) (Param q)
-          go (xs <> [c]) rest
+          go (xs <> [c]) r rest
 
-    go xs (OAdd b i : rest)
-      | null xs   = go xs rest
+    go xs r (OAdd b i : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let src = xs !! (i `mod` length xs)
           c <- add (Param b) src
-          go (xs <> [c]) rest
+          go (xs <> [c]) r rest
 
-    go xs (OAddMod i j : rest)
-      | null xs   = go xs rest
+    go xs r (OAddMod i j : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let m = length xs
               a = xs !! (i `mod` m)
               b = xs !! (j `mod` m)
           c <- add a b
-          go (xs <> [c]) rest
+          go (xs <> [c]) r rest
 
-    go xs (OEnv i a d s r : rest)
-      | null xs   = go xs rest
+    go xs r (OEnv i ea ed es er : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let gate = xs !! (i `mod` length xs)
-          c <- env gate (Param a) (Param d) (Param s) (Param r)
-          go (xs <> [c]) rest
+          c <- env gate (Param ea) (Param ed) (Param es) (Param er)
+          go (xs <> [c]) r rest
 
-    go xs (OOut ch i : rest)
-      | null xs   = go xs rest
+    go xs r (OBusOut bus i : rest)
+      | null xs            = go xs r rest
+      | bus `S.member` r   = go xs r rest  -- skip to avoid an E_r cycle
+      | otherwise          = do
+          let src = xs !! (i `mod` length xs)
+          busOut bus src
+          go xs r rest
+
+    go xs r (OBusIn bus : rest) = do
+      c <- busIn bus
+      go (xs <> [c]) (S.insert bus r) rest
+
+    go xs r (OOut ch i : rest)
+      | null xs   = go xs r rest
       | otherwise = do
           let src = xs !! (i `mod` length xs)
           out ch src
-          go xs rest
+          go xs r rest
