@@ -31,6 +31,7 @@ import           Test.Tasty.HUnit
 import           Test.Tasty.QuickCheck     as QC
 
 import           MetaSonic.Bridge.Compile
+import           MetaSonic.Bridge.FFI      (c_rt_graph_kind_supported)
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Validate
@@ -195,6 +196,22 @@ unitTests = testGroup "Unit tests"
           in assertBool
                "expected an Add node with bias=440.0 and modulated port 1"
                (any isVibratoBias (rgNodes rt))
+
+  , -- Contract test: every Haskell NodeKind must map to a kindTag
+    -- that the C++ runtime recognizes via kind_from_tag. Adding a
+    -- constructor to NodeKind without updating rt_graph.cpp will fail
+    -- here. Enum/Bounded on NodeKind ensures new constructors are
+    -- automatically covered.
+    testGroup "C ABI agrees on every NodeKind tag"
+      [ testCase (show k) $ do
+          ok <- c_rt_graph_kind_supported (kindTag k)
+          assertBool
+            ("rt_graph_kind_supported(" <> show (kindTag k) <> ") "
+              <> "returned 0 for " <> show k <> " — C++ kind_from_tag "
+              <> "is missing this case")
+            (ok == 1)
+      | k <- [minBound .. maxBound :: NodeKind]
+      ]
   ]
 
 -- A hand-built graph that references a non-existent NodeID. The DSL

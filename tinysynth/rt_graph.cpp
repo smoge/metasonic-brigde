@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <span>
 #include <thread>
 #include <utility>
@@ -116,6 +117,24 @@ enum class NodeKind : int {
   LPF = 7,
   Add = 8,
 };
+
+// Single source of truth for the integer-tag → NodeKind mapping.
+// Both rt_graph_add_node and rt_graph_kind_supported go through this,
+// so the C ABI's "is this tag known" answer cannot drift from the
+// dispatch table.
+[[nodiscard]] constexpr std::optional<NodeKind>
+kind_from_tag(int node_kind) noexcept {
+  switch (node_kind) {
+  case 1: return NodeKind::SinOsc;
+  case 2: return NodeKind::Out;
+  case 3: return NodeKind::Gain;
+  case 5: return NodeKind::SawOsc;
+  case 6: return NodeKind::NoiseGen;
+  case 7: return NodeKind::LPF;
+  case 8: return NodeKind::Add;
+  default: return std::nullopt;
+  }
+}
 
 /* Note [Input references and control fallback]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -994,33 +1013,12 @@ void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
     return;
   }
 
-  NodeKind kind{};
-  switch (node_kind) {
-  case 1:
-    kind = NodeKind::SinOsc;
-    break;
-  case 2:
-    kind = NodeKind::Out;
-    break;
-  case 3:
-    kind = NodeKind::Gain;
-    break;
-  case 5:
-    kind = NodeKind::SawOsc;
-    break;
-  case 6:
-    kind = NodeKind::NoiseGen;
-    break;
-  case 7:
-    kind = NodeKind::LPF;
-    break;
-  case 8:
-    kind = NodeKind::Add;
-    break;
-  default:
+  const auto maybe_kind = kind_from_tag(node_kind);
+  if (!maybe_kind) {
     std::fprintf(stderr, "Unknown node kind: %d\n", node_kind);
     return;
   }
+  const NodeKind kind = *maybe_kind;
 
   const NodeIndex idx{node_index};
   if (!valid(idx)) {
@@ -1034,6 +1032,20 @@ void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
   if (kind == NodeKind::Out) {
     ensure_output_bus_count(*g, 1);
   }
+}
+
+/* Note [Kind-tag introspection]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+rt_graph_kind_supported lets the Haskell side machine-check the
+agreement between MetaSonic.Types.kindTag and this file's enum
+NodeKind / kind_from_tag. The intended caller is a contract test
+that enumerates every Haskell NodeKind, computes its kindTag, and
+asserts this function returns 1 — catching the silent-drift case
+where someone adds a NodeKind in Haskell without updating C++.
+*/
+
+int rt_graph_kind_supported(int node_kind) {
+  return kind_from_tag(node_kind).has_value() ? 1 : 0;
 }
 
 // Set one control slot on one node.

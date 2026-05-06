@@ -149,24 +149,28 @@ newtype ControlIndex = ControlIndex Int
   deriving stock   (Eq, Ord, Show, Generic)
   deriving newtype (NFData)
 
+-- | Note: tag 4 was reserved for a generic biquad family but is
+-- intentionally unallocated. The Haskell→C++ contract test
+-- (see Spec.hs) iterates [minBound..maxBound] via the derived
+-- 'Enum'\/'Bounded' instances, so any new constructor added here
+-- is automatically asserted against the C++ kind_from_tag dispatch.
 data NodeKind
   = KSinOsc
   | KOut
   | KGain
-  | KBiquad
   | KSawOsc
   | KNoiseGen
   | KLPF
   | KAdd
-  deriving stock    (Eq, Show, Generic)
+  deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
--- | Must agree with the NodeKind enum in rt_graph.cpp.
+-- | Must agree with the NodeKind enum and kind_from_tag dispatch in
+-- rt_graph.cpp. Verified by a contract test in Spec.hs.
 kindTag :: NodeKind -> CInt
 kindTag KSinOsc   = 1
 kindTag KOut      = 2
 kindTag KGain     = 3
-kindTag KBiquad   = 4
 kindTag KSawOsc   = 5
 kindTag KNoiseGen = 6
 kindTag KLPF      = 7

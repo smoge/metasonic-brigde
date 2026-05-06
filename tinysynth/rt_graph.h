@@ -37,6 +37,12 @@ int rt_graph_wait_started(RTGraph *g, int timeout_ms);
 // Stop realtime audio if it is running.
 void rt_graph_stop_audio(RTGraph *g);
 
+// Introspection: returns 1 if node_kind names a kind this runtime knows
+// how to construct (i.e. it has a case in rt_graph_add_node), 0 otherwise.
+// Intended for contract tests that verify Haskell's NodeKind tags agree
+// with this file's enum.
+int rt_graph_kind_supported(int node_kind);
+
 #ifdef __cplusplus
 }
 #endif

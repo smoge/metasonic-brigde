@@ -23,6 +23,8 @@ module MetaSonic.Bridge.FFI
     startAudio
   , waitAudioStarted
   , stopAudio
+  , -- * Introspection
+    c_rt_graph_kind_supported
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
   , c_rt_graph_start_audio
@@ -227,6 +229,11 @@ foreign import ccall safe "rt_graph_wait_started"
 
 foreign import ccall safe "rt_graph_stop_audio"
   c_rt_graph_stop_audio :: Ptr RTGraph -> IO ()
+
+-- | Pure switch dispatch on the C++ side: no allocation, no blocking,
+-- no graph state needed. 'unsafe' is correct.
+foreign import ccall unsafe "rt_graph_kind_supported"
+  c_rt_graph_kind_supported :: CInt -> IO CInt
 
 -- | Allocate a C++ runtime graph, run an action with it, and
 -- guarantee cleanup via bracket.
