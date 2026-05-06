@@ -70,3 +70,17 @@ executables:
       - -threaded
     dependencies:
       - metasonic-bridge
+
+tests:
+  metasonic-bridge-test:
+    main: Spec.hs
+    source-dirs: test
+    ghc-options:
+      - -threaded
+    dependencies:
+      - metasonic-bridge
+      - containers
+      - tasty
+      - tasty-hunit
+      - tasty-quickcheck
+      - QuickCheck
