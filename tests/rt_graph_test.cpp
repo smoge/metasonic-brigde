@@ -2924,3 +2924,271 @@ TEST_CASE("adding nodes past capacity does not crash and remaining graph still w
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// Multi-instance support (§2.B)
+// ----------------------------------------------------------------
+//
+// One MetaDef hosts a vector of GraphInstances. Each instance has
+// independent kernel state, controls, and bus pool. Tests below pin
+// the per-instance behavior expected of the API:
+//   * Instance 0 is the default; legacy single-instance API targets it.
+//   * Instances added later don't disturb existing instances.
+//   * Slot reuse after rt_graph_instance_remove.
+//   * Independent state evolution per instance.
+//   * Removed instances disappear (no cross-block residue, read_bus → 0).
+
+TEST_CASE("Multi-instance: two SinOsc instances at different frequencies") {
+    // Build SinOsc → Out template once, then host two instances of it
+    // at different frequencies. Verify each instance's bus 0 oscillates
+    // at its own freq — this is the load-bearing claim of §2.B (per-
+    // instance controls and per-instance kernel state).
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);                // instance 0 freq
+    rt_graph_add_node(g, 1, 2);                          // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    int inst1 = rt_graph_instance_add(g);
+    REQUIRE(inst1 == 1);
+    rt_graph_instance_set_control(g, inst1, 0, 0, 660.0);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0_inst0(kFrames, 0.0f);
+    std::vector<float> bus0_inst1(kFrames, 0.0f);
+    rt_graph_instance_read_bus(g, 0, 0, kFrames, bus0_inst0.data());
+    rt_graph_instance_read_bus(g, 1, 0, kFrames, bus0_inst1.data());
+    rt_graph_destroy(g);
+
+    CHECK(peak_abs(bus0_inst0) > 0.9f);
+    CHECK(peak_abs(bus0_inst1) > 0.9f);
+
+    // 440 Hz × (1024/48000 s) ≈ 9.4 cycles → ~19 zero crossings;
+    // 660 Hz × (1024/48000 s) ≈ 14.1 cycles → ~28 ZCs. The two should
+    // differ meaningfully.
+    const int zc0 = zero_crossings(bus0_inst0);
+    const int zc1 = zero_crossings(bus0_inst1);
+    INFO("zc0=" << zc0 << " zc1=" << zc1);
+    CHECK(zc0 >= 15);
+    CHECK(zc0 <= 22);
+    CHECK(zc1 >= 25);
+    CHECK(zc1 <= 32);
+    CHECK(zc1 > zc0);
+}
+
+TEST_CASE("Multi-instance: per-instance Delay state is independent") {
+    // Same Add → Delay → Out template, two instances, different delay
+    // times. Verifies that q::delay's ring buffer is per-instance state
+    // (independent ring buffers, no cross-instance pollution).
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 8);                          // Add
+    rt_graph_add_node(g, 1, 13);                         // Delay
+    rt_graph_connect(g, 0, 0, 1, 0);
+    rt_graph_add_node(g, 2, 2);                          // Out
+    rt_graph_set_control(g, 2, 0, 0.0);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    // Instance 0: constant 1.0 → 1ms delay.
+    rt_graph_instance_set_control(g, 0, 0, 0, 1.0);      // Add a = 1.0
+    rt_graph_instance_set_control(g, 0, 0, 1, 0.0);      // Add b = 0.0
+    rt_graph_instance_set_control(g, 0, 1, 0, 0.01);     // Delay max = 10 ms
+    rt_graph_instance_set_control(g, 0, 1, 1, 0.001);    // Delay time = 1 ms
+
+    int inst1 = rt_graph_instance_add(g);
+    REQUIRE(inst1 == 1);
+    // Instance 1: constant 1.0 → 5 ms delay.
+    rt_graph_instance_set_control(g, 1, 0, 0, 1.0);
+    rt_graph_instance_set_control(g, 1, 0, 1, 0.0);
+    rt_graph_instance_set_control(g, 1, 1, 0, 0.01);
+    rt_graph_instance_set_control(g, 1, 1, 1, 0.005);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0_inst0(kFrames, 0.0f);
+    std::vector<float> bus0_inst1(kFrames, 0.0f);
+    rt_graph_instance_read_bus(g, 0, 0, kFrames, bus0_inst0.data());
+    rt_graph_instance_read_bus(g, 1, 0, kFrames, bus0_inst1.data());
+    rt_graph_destroy(g);
+
+    auto first_nonsilent = [](const std::vector<float> &xs) {
+        for (int i = 0; i < static_cast<int>(xs.size()); ++i) {
+            if (std::abs(xs[static_cast<std::size_t>(i)]) > 0.5f) return i;
+        }
+        return -1;
+    };
+    const int t0 = first_nonsilent(bus0_inst0);
+    const int t1 = first_nonsilent(bus0_inst1);
+    REQUIRE(t0 >= 0);
+    REQUIRE(t1 >= 0);
+
+    // 1 ms ≈ 48 samples; 5 ms ≈ 240 samples. ±2-sample API slop.
+    CHECK(std::abs(t0 - 48) <= 2);
+    CHECK(std::abs(t1 - 240) <= 2);
+    // The two transitions must be clearly far apart.
+    CHECK((t1 - t0) > 100);
+}
+
+TEST_CASE("Multi-instance: lifecycle (add, remove, re-add reuses slot)") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);
+    rt_graph_add_node(g, 1, 2);                          // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    REQUIRE(rt_graph_instance_count(g) == 1);
+    REQUIRE(rt_graph_instance_alive(g, 0) == 1);
+    REQUIRE(rt_graph_instance_alive(g, 1) == 0);
+
+    int id_a = rt_graph_instance_add(g);
+    REQUIRE(id_a == 1);
+    rt_graph_instance_set_control(g, id_a, 0, 0, 1000.0);
+
+    REQUIRE(rt_graph_instance_count(g) == 2);
+    REQUIRE(rt_graph_instance_alive(g, 1) == 1);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> tmp(kFrames, 0.0f);
+    rt_graph_instance_read_bus(g, id_a, 0, kFrames, tmp.data());
+    CHECK(peak_abs(tmp) > 0.9f);
+
+    // Remove and re-add: the new instance should get the same id (slot
+    // 1 reused) with a fresh state — control 0 (freq) back to default 0.
+    rt_graph_instance_remove(g, id_a);
+    REQUIRE(rt_graph_instance_alive(g, 1) == 0);
+
+    int id_b = rt_graph_instance_add(g);
+    CHECK(id_b == 1);
+    REQUIRE(rt_graph_instance_alive(g, 1) == 1);
+
+    // SinOsc at default freq=0 → phase doesn't advance → output ≈ 0.
+    rt_graph_process(g, kFrames);
+    std::vector<float> fresh(kFrames, 0.0f);
+    rt_graph_instance_read_bus(g, id_b, 0, kFrames, fresh.data());
+    rt_graph_destroy(g);
+
+    CHECK(peak_abs(fresh) < 1e-3f);
+}
+
+TEST_CASE("Multi-instance: removing an instance silences its bus") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);
+    rt_graph_add_node(g, 1, 2);                          // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    int inst1 = rt_graph_instance_add(g);
+    REQUIRE(inst1 == 1);
+    rt_graph_instance_set_control(g, 1, 0, 0, 880.0);
+
+    // Both alive and producing.
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus_inst1(kFrames, 0.0f);
+    rt_graph_instance_read_bus(g, 1, 0, kFrames, bus_inst1.data());
+    CHECK(peak_abs(bus_inst1) > 0.9f);
+
+    // Remove instance 1: read_bus on it must now return 0; instance 0
+    // is unaffected.
+    rt_graph_instance_remove(g, 1);
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> dead(kFrames, 0.0f);
+    int n = rt_graph_instance_read_bus(g, 1, 0, kFrames, dead.data());
+    CHECK(n == 0);
+
+    std::vector<float> inst0_after(kFrames, 0.0f);
+    rt_graph_instance_read_bus(g, 0, 0, kFrames, inst0_after.data());
+    CHECK(peak_abs(inst0_after) > 0.9f);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Multi-instance: counting and aliveness on null/bad ids") {
+    CHECK(rt_graph_instance_count(nullptr) == 0);
+    CHECK(rt_graph_instance_alive(nullptr, 0) == 0);
+
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    CHECK(rt_graph_instance_alive(g, -1) == 0);
+    CHECK(rt_graph_instance_alive(g, 99) == 0);
+    CHECK(rt_graph_instance_count(g) == 1);  // default instance 0
+    CHECK(rt_graph_instance_alive(g, 0) == 1);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Multi-instance: legacy API targets instance 0") {
+    // Verifies the back-compat invariant: rt_graph_set_control and
+    // rt_graph_read_bus operate on instance 0, even when other
+    // instances exist.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);                // legacy → instance 0
+    rt_graph_add_node(g, 1, 2);                          // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    int inst1 = rt_graph_instance_add(g);
+    rt_graph_instance_set_control(g, inst1, 0, 0, 880.0);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> via_legacy(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, via_legacy.data());
+
+    std::vector<float> via_new(kFrames, 0.0f);
+    rt_graph_instance_read_bus(g, 0, 0, kFrames, via_new.data());
+
+    rt_graph_destroy(g);
+
+    REQUIRE(via_legacy.size() == via_new.size());
+    for (std::size_t i = 0; i < via_legacy.size(); ++i) {
+        CHECK(via_legacy[i] == via_new[i]);
+    }
+}
+
+TEST_CASE("Multi-instance: removing instance 0 disables legacy API") {
+    // After removing instance 0, the legacy single-instance API is a
+    // silent no-op (or returns 0). A subsequent rt_graph_instance_add
+    // claims the slot back and the legacy API works again.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 1);
+    rt_graph_set_control(g, 0, 0, 440.0);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_process(g, kFrames);
+
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_instance_alive(g, 0) == 0);
+
+    // Legacy read after removal: returns 0, buffer untouched.
+    std::vector<float> sentinel(kFrames, 7.0f);
+    int n = rt_graph_read_bus(g, 0, kFrames, sentinel.data());
+    CHECK(n == 0);
+    CHECK(sentinel[0] == 7.0f);
+
+    // Re-add: slot 0 is reused, legacy API works again.
+    int reborn = rt_graph_instance_add(g);
+    CHECK(reborn == 0);
+    rt_graph_set_control(g, 0, 0, 440.0);
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> samples(kFrames, 0.0f);
+    int got = rt_graph_read_bus(g, 0, kFrames, samples.data());
+    CHECK(got == kFrames);
+    CHECK(peak_abs(samples) > 0.9f);
+
+    rt_graph_destroy(g);
+}
