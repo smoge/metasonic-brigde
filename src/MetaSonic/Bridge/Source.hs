@@ -41,6 +41,7 @@ module MetaSonic.Bridge.Source
   , env
   , busOut
   , busIn
+  , busInDelayed
   , -- * Connection helpers
     audio
   , -- * Uniform UGen view
@@ -215,6 +216,8 @@ generator, and bus routing:
   Out                        — write a signal to a hardware output channel
   BusOut                     — write a signal to a shared audio bus
   BusIn                      — read a signal from a shared audio bus
+  BusInDelayed               — read the previous block's snapshot of a bus
+                               (the feedback primitive)
 
 Adding a new UGen constructor requires coordinated changes across:
 
@@ -256,15 +259,40 @@ Semantics within a block (mirrors SuperCollider's 'Out.ar' / 'In.ar'):
     reader; the ordering is *not* a runtime convention but a compile-time
     edge in the dependency graph used by topological sort.
 
-Same-cycle only for the MVP. Read-before-write feedback ("read previous
-block's value") would need a separate 'BusInDelayed' constructor with a
-double-buffered bus pool — a Phase 2 extension. A graph that creates a
-cycle through buses (BusIn n → ... → BusOut n) is rejected by the cycle
-detector for the same reason a structural cycle is.
+Cross-cycle ("delayed") read: 'BusInDelayed n' is the second reader form.
+It reads the previous block's snapshot of bus n rather than the live
+contents. Concretely:
+
+  - 'BusInDelayed' carries 'BusReadDelayed n' as its effect, *not*
+    'BusRead n'. The scheduler's E_r derivation (in
+    "MetaSonic.Bridge.Validate") only pairs 'BusWrite' with 'BusRead' —
+    it ignores 'BusReadDelayed' — so a 'BusInDelayed n' can sit anywhere
+    in the topological order relative to 'BusOut n'.
+  - The runtime maintains a double-buffered bus pool: at the start of
+    each block it swaps the live and snapshot buffers and zeroes the
+    new live buffer. 'BusOut' writes to live; 'BusIn' reads live;
+    'BusInDelayed' reads the frozen snapshot of what the *previous*
+    block wrote. See Note [Bus pool double-buffering] in
+    @tinysynth/rt_graph.cpp@.
+  - On the very first block the snapshot is zero (initial state), so a
+    first-block 'BusInDelayed' produces silence — same as reading a
+    bus that no one ever wrote.
+
+This split lets the user express genuine feedback graphs without
+introducing run-time graph rewriting or implicit delays. A graph like
+'BusInDelayed n → gain → BusOut n' is valid: the only "cycle" closes
+across the block boundary, where the snapshot buffer breaks the loop.
+A graph that uses live 'BusIn n' instead of 'BusInDelayed n' inside a
+feedback path is rejected by the cycle detector, exactly as before.
+
+In SuperCollider terms, 'BusIn' corresponds to 'In.ar' and 'BusInDelayed'
+corresponds to 'InFeedback.ar'.
 
 See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate" for
-the scheduling pass that derives the BusOut → BusIn edges, and Note
-[Resource effects] in "MetaSonic.Types" for the underlying 'Eff' type.
+the scheduling pass that derives the BusOut → BusIn edges, Note
+[Resource effects] in "MetaSonic.Types" for the underlying 'Eff' type,
+and Note [Bus pool double-buffering] in @tinysynth/rt_graph.cpp@ for
+the runtime-side ping-pong implementation.
 -}
 
 -- | A unit generator specification.
@@ -308,6 +336,21 @@ data UGen
     -- port. Carries 'BusRead n', which makes it execute *after*
     -- every 'BusOut' / 'Out' on the same bus in the same block —
     -- so 'BusIn' always sees the live, accumulated value.
+  | BusInDelayed !Int
+    -- ^ Audio-bus delayed read: bus index. Reads the *previous*
+    -- block's accumulated contents of the named bus.
+    --
+    -- This is the feedback primitive. Carries 'BusReadDelayed n',
+    -- which the scheduler does *not* convert into an E_r edge against
+    -- same-bus 'BusWrite' — so a 'BusInDelayed n' may legally precede
+    -- a 'BusOut n' in the topological order, closing a feedback path
+    -- whose only cycle crosses the block boundary. The runtime swaps
+    -- the live and snapshot bus buffers at the start of every block,
+    -- so the snapshot 'BusInDelayed' reads is always exactly what the
+    -- previous block wrote (zero on the very first block).
+    --
+    -- The delayed read is the SuperCollider 'InFeedback.ar' analogue;
+    -- see Note [Bus model: SC-style same-cycle audio buses].
   | SinOsc !Connection !Connection
     -- ^ Sine oscillator: frequency, initial phase.
   | SawOsc !Connection !Connection
@@ -557,6 +600,31 @@ busOut bus src =
 busIn :: Int -> SynthM Connection
 busIn bus = insertNodeC "busIn" (BusIn bus)
 
+-- | Read the previous block's accumulated contents of a shared audio
+-- bus. The feedback primitive: unlike 'busIn', a 'busInDelayed' creates
+-- *no* ordering constraint with a same-bus 'busOut', so a graph that
+-- closes a feedback loop through a 'busInDelayed' is well-formed and
+-- topologically sortable. The runtime serves the read from a snapshot
+-- of the previous block's bus pool (the snapshot is zero on the first
+-- block), so the delay is exactly one block.
+--
+-- Use this for self-referential / feedback patches:
+--
+-- > feedbackGraph = runSynth $ do
+-- >   tap   <- busInDelayed 5    -- previous block's bus 5 (zero on block 0)
+-- >   src   <- sinOsc 220.0 0.0
+-- >   mixed <- add src tap        -- inject delayed feedback into the path
+-- >   amp   <- gain mixed 0.6     -- attenuate to keep the loop stable
+-- >   busOut 5 amp                -- this block's bus 5 contents
+-- >   out 0 amp                   -- and to hardware
+--
+-- Carries a 'BusReadDelayed' effect; see Note [Bus model: SC-style
+-- same-cycle audio buses] for the same-cycle vs. delayed distinction
+-- and Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate"
+-- for why 'BusReadDelayed' deliberately *does not* contribute to E_r.
+busInDelayed :: Int -> SynthM Connection
+busInDelayed bus = insertNodeC "busInDelayed" (BusInDelayed bus)
+
 {- Note [Uniform UGen view]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 'UGenView' is the canonical projection from a 'UGen' constructor into the
@@ -622,9 +690,10 @@ ugenView = \case
   Add a b      -> UGenView KAdd      [a, b]    [connDefault a, connDefault b]
   Env g a d s r ->
     UGenView KEnv [g] [connDefault g, connDefault a, connDefault d, connDefault s, connDefault r]
-  Out ch s     -> UGenView KOut      [s]       [fromIntegral ch]
-  BusOut bus s -> UGenView KBusOut   [s]       [fromIntegral bus]
-  BusIn bus    -> UGenView KBusIn    []        [fromIntegral bus]
+  Out ch s          -> UGenView KOut          [s] [fromIntegral ch]
+  BusOut bus s      -> UGenView KBusOut       [s] [fromIntegral bus]
+  BusIn bus         -> UGenView KBusIn        []  [fromIntegral bus]
+  BusInDelayed bus  -> UGenView KBusInDelayed []  [fromIntegral bus]
 
 {- Note [Per-UGen projections]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -684,13 +753,29 @@ compactness here.
 
 -- | Infer the effect set of a UGen.
 --
+-- 'BusOut' / 'BusIn' / 'BusInDelayed' carry per-instance bus numbers, so
+-- their effect annotations encode that bus number directly. Crucially,
+-- 'BusInDelayed' produces 'BusReadDelayed' rather than 'BusRead': the
+-- 'Validate' layer treats those two as semantically distinct (only
+-- 'BusRead' contributes to E_r), so a 'BusInDelayed n' can sit anywhere
+-- in the schedule relative to a 'BusOut n' — which is exactly what
+-- enables feedback loops to typecheck.
+--
+-- 'Out' is deliberately 'Pure' (not 'BusWrite'): an 'Out' targets a
+-- hardware-routed bus that nothing reads back from inside the graph, so
+-- it cannot participate in an E_r edge with any 'BusIn' or
+-- 'BusInDelayed'. (If you want to read what an 'Out' wrote, use a plain
+-- 'BusOut' to the same bus number — 'Out' and 'BusOut' share the same
+-- runtime kernel and the same bus pool.)
+--
 -- See Note [Effects are per-UGen, not per-kind].
 -- See Note [Resource effects] in "MetaSonic.Types".
 -- See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
 inferEff :: UGen -> [Eff]
-inferEff (BusOut bus _) = [BusWrite bus]
-inferEff (BusIn  bus)   = [BusRead  bus]
-inferEff _              = [Pure]
+inferEff (BusOut       bus _) = [BusWrite        bus]
+inferEff (BusIn        bus)   = [BusRead         bus]
+inferEff (BusInDelayed bus)   = [BusReadDelayed  bus]
+inferEff _                    = [Pure]
 
 -- | Extract explicit structural 'NodeID' dependencies from
 -- a 'UGen'.
@@ -706,16 +791,21 @@ inferEff _              = [Pure]
 -- alone.
 dependencies :: UGen -> [NodeID]
 dependencies = \case
-  Out _ a     -> deps [a]
-  BusOut _ a  -> deps [a]
-  BusIn _     -> []
-  SinOsc a b  -> deps [a, b]
-  SawOsc a b  -> deps [a, b]
-  NoiseGen    -> []
-  LPF a b c   -> deps [a, b, c]
-  Gain a b    -> deps [a, b]
-  Add a b     -> deps [a, b]
-  Env g _ _ _ _ -> deps [g]
+  Out _ a          -> deps [a]
+  BusOut _ a       -> deps [a]
+  BusIn _          -> []
+  BusInDelayed _   -> []
+    -- ^ Like 'BusIn', no structural edge: the bus connection is
+    -- expressed through the 'BusReadDelayed' effect, not through an
+    -- 'Audio' Connection. Unlike 'BusIn', no E_r edge either; see
+    -- Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
+  SinOsc a b       -> deps [a, b]
+  SawOsc a b       -> deps [a, b]
+  NoiseGen         -> []
+  LPF a b c        -> deps [a, b, c]
+  Gain a b         -> deps [a, b]
+  Add a b          -> deps [a, b]
+  Env g _ _ _ _    -> deps [g]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

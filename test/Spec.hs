@@ -349,6 +349,37 @@ unitTests = testGroup "Unit tests"
           case validateAndSort g of
             Left err -> assertFailure $ "validateAndSort failed: " <> err
             Right _  -> pure ()
+
+      , testCase "busInDelayed contributes no E_r edge (busEdges ignores it)" $ do
+          -- A graph with BusOut 5 and BusInDelayed 5 (no live BusIn)
+          -- must produce zero E_r edges. If busEdges ever started
+          -- pairing BusReadDelayed with BusWrite, feedback graphs
+          -- would stop scheduling — this test pins the asymmetry.
+          let g = runSynth $ do
+                o   <- sinOsc 440.0 0.0
+                busOut 5 o
+                _   <- busInDelayed 5
+                out 0 o
+          busEdges g @?= []
+
+      , testCase "feedback graph through busInDelayed topologically sorts" $ do
+          -- This is the smoke test for the whole Phase 2 design: a
+          -- graph whose only "cycle" closes through BusInDelayed must
+          -- be accepted by the scheduler. Replacing busInDelayed with
+          -- busIn would (correctly) close an E_r cycle and be
+          -- rejected — see "rejects a BusOut→BusIn cycle on the same
+          -- bus" above.
+          let g = runSynth $ do
+                tap <- busInDelayed 5
+                o   <- sinOsc 220.0 0.0
+                mix <- add o tap
+                amp <- gain mix 0.5
+                busOut 5 amp
+                out 0 amp
+          case validateAndSort g of
+            Left err -> assertFailure $
+              "feedback graph through busInDelayed should sort, got: " <> err
+            Right _  -> pure ()
       ]
 
   , testCase "kindTag is injective" $
@@ -364,16 +395,17 @@ unitTests = testGroup "Unit tests"
 -- preservation property.
 ugenKind :: UGen -> NodeKind
 ugenKind = \case
-  SinOsc{}  -> KSinOsc
-  SawOsc{}  -> KSawOsc
-  NoiseGen  -> KNoiseGen
-  LPF{}     -> KLPF
-  Gain{}    -> KGain
-  Add{}     -> KAdd
-  Env{}     -> KEnv
-  Out{}     -> KOut
-  BusOut{}  -> KBusOut
-  BusIn{}   -> KBusIn
+  SinOsc{}        -> KSinOsc
+  SawOsc{}        -> KSawOsc
+  NoiseGen        -> KNoiseGen
+  LPF{}           -> KLPF
+  Gain{}          -> KGain
+  Add{}           -> KAdd
+  Env{}           -> KEnv
+  Out{}           -> KOut
+  BusOut{}        -> KBusOut
+  BusIn{}         -> KBusIn
+  BusInDelayed{}  -> KBusInDelayed
 
 -- The empty graph: no nodes at all.
 emptyGraph_ :: SynthGraph
@@ -943,6 +975,67 @@ crossCuttingTests = testGroup "End-to-end FFI"
           assertBool
             ("expected (0.3 + 0.7) × SinOsc peak ≈ 1.0, got " <> show peak)
             (abs (peak - 1.0) < 0.05)
+
+  , testCase "BusInDelayed: one-block delay end-to-end through the FFI" $ do
+      -- The Haskell-side counterpart to the C++ "BusInDelayed reads
+      -- the previous block's BusOut contents" test. Renders two
+      -- consecutive blocks of the same graph and asserts:
+      --
+      --   * On block 1, BusInDelayed reads zero (no previous block),
+      --     so Out(0) is silence.
+      --   * On block 2, BusInDelayed reads what BusOut wrote during
+      --     block 1, so Out(0) on block 2 is bit-identical to bus 5
+      --     on block 1.
+      --
+      -- This pins the entire Phase 2 path: the C++ swap, the
+      -- BusReadDelayed effect being excluded from E_r, the schedule
+      -- placing BusInDelayed wherever it falls, the FFI marshalling
+      -- of KBusInDelayed, and the runtime kernel reading from
+      -- output_buses_prev.
+      let nframes = 128
+          maxFrames = nframes
+          graph = runSynth $ do
+            o   <- sinOsc 440.0 0.0
+            busOut 5 o
+            tap <- busInDelayed 5
+            out 0 tap
+      rt <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      let readBus handle bus n = allocaBytes (n * sizeOfFloat) $ \buf -> do
+            _  <- c_rt_graph_read_bus handle (fromIntegral bus)
+                                      (fromIntegral n) (castPtr buf)
+            cs <- peekArray n (buf :: PtrCFloat)
+            pure (map (\(CFloat x) -> x) cs)
+
+      withRTGraph (length (rgNodes rt)) maxFrames $ \handle -> do
+        loadRuntimeGraph handle rt
+
+        -- Block 1.
+        c_rt_graph_process handle (fromIntegral nframes)
+        block1Out  <- readBus handle 0 nframes
+        block1Bus5 <- readBus handle 5 nframes
+
+        let peak1 = maximum (map abs block1Out)
+        assertBool
+          ("block 1 should be silence (snapshot is zero), got peak " <> show peak1)
+          (peak1 < 1e-5)
+        let peakBus5 = maximum (map abs block1Bus5)
+        assertBool
+          ("block 1's BusOut should still write a real sine to bus 5, got peak "
+            <> show peakBus5)
+          (peakBus5 > 0.9)
+
+        -- Block 2.
+        c_rt_graph_process handle (fromIntegral nframes)
+        block2Out <- readBus handle 0 nframes
+
+        let maxDiff = maximum (zipWith (\a b -> abs (a - b)) block1Bus5 block2Out)
+        assertBool
+          ("block 2's BusInDelayed must reproduce block 1's bus 5; max diff = "
+            <> show maxDiff)
+          (maxDiff < 1e-5)
 
   , testCase "Env(gate=0) idle stays silent" $ do
       let nframes = 256

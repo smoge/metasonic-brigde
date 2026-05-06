@@ -63,22 +63,23 @@ int zero_crossings(const std::vector<float> &xs) {
 // ----------------------------------------------------------------
 
 TEST_CASE("kind_from_tag accepts every defined tag") {
-    CHECK(rt_graph_kind_supported(1) == 1); // SinOsc
-    CHECK(rt_graph_kind_supported(2) == 1); // Out
-    CHECK(rt_graph_kind_supported(3) == 1); // Gain
-    CHECK(rt_graph_kind_supported(5) == 1); // SawOsc
-    CHECK(rt_graph_kind_supported(6) == 1); // NoiseGen
-    CHECK(rt_graph_kind_supported(7) == 1); // LPF
-    CHECK(rt_graph_kind_supported(8) == 1); // Add
-    CHECK(rt_graph_kind_supported(9) == 1); // Env
+    CHECK(rt_graph_kind_supported(1) == 1);  // SinOsc
+    CHECK(rt_graph_kind_supported(2) == 1);  // Out
+    CHECK(rt_graph_kind_supported(3) == 1);  // Gain
+    CHECK(rt_graph_kind_supported(5) == 1);  // SawOsc
+    CHECK(rt_graph_kind_supported(6) == 1);  // NoiseGen
+    CHECK(rt_graph_kind_supported(7) == 1);  // LPF
+    CHECK(rt_graph_kind_supported(8) == 1);  // Add
+    CHECK(rt_graph_kind_supported(9) == 1);  // Env
     CHECK(rt_graph_kind_supported(10) == 1); // BusOut
     CHECK(rt_graph_kind_supported(11) == 1); // BusIn
+    CHECK(rt_graph_kind_supported(12) == 1); // BusInDelayed
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
-    CHECK(rt_graph_kind_supported(4) == 0); // intentional gap
-    CHECK(rt_graph_kind_supported(12) == 0);
+    CHECK(rt_graph_kind_supported(4) == 0);  // intentional gap
+    CHECK(rt_graph_kind_supported(13) == 0); // first unallocated past KBusInDelayed
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
 }
@@ -635,6 +636,132 @@ TEST_CASE("BusIn from an unwritten bus is silence") {
     for (auto s : bus0) {
         CHECK(std::abs(s) < 1e-6f);
     }
+}
+
+TEST_CASE("BusInDelayed reads the previous block's BusOut contents") {
+    // Phase 2 ping-pong test. Build:
+    //   SinOsc(440) → BusOut(5)
+    //   BusInDelayed(5) → Out(0)
+    // Block 1: prev is zero-initialised, so BusInDelayed → Out(0) = silence.
+    //          BusOut still writes block 1's sine into live bus 5.
+    // Block 2: the swap moves block 1's bus 5 into the snapshot;
+    //          BusInDelayed therefore reads block 1's sine into Out(0),
+    //          while BusOut writes block 2's sine into live bus 5.
+    //
+    // The assertion that Out(0) in block 2 equals bus 5 captured at the
+    // end of block 1 is the proof that:
+    //   - the snapshot persists exactly what was last written to live;
+    //   - the swap happens before the block's writes (otherwise the
+    //     snapshot would already contain block 2's data);
+    //   - BusInDelayed reads from the snapshot, not from live.
+    constexpr int kBus = 5;
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);
+
+    rt_graph_add_node(g, 1, 10);                         // BusOut
+    rt_graph_set_control(g, 1, 0, static_cast<double>(kBus));
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 12);                         // BusInDelayed
+    rt_graph_set_control(g, 2, 0, static_cast<double>(kBus));
+
+    rt_graph_add_node(g, 3, 2);                          // Out
+    rt_graph_set_control(g, 3, 0, 0.0);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    // Block 1.
+    rt_graph_process(g, kFrames);
+    std::vector<float> block1_bus5(kFrames, 0.0f);
+    rt_graph_read_bus(g, kBus, kFrames, block1_bus5.data());
+    std::vector<float> block1_out(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, block1_out.data());
+
+    // BusInDelayed sees zero on the very first block.
+    CHECK(peak_abs(block1_out) < 1e-6f);
+    // BusOut still wrote a real sine into bus 5 this block.
+    CHECK(peak_abs(block1_bus5) > 0.9f);
+
+    // Block 2.
+    rt_graph_process(g, kFrames);
+    std::vector<float> block2_out(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, block2_out.data());
+
+    // BusInDelayed in block 2 must read exactly what BusOut wrote in
+    // block 1 — the snapshot is bit-identical to block 1's live bus 5.
+    float max_diff = 0.0f;
+    for (int i = 0; i < kFrames; ++i) {
+        max_diff = std::max(max_diff, std::abs(block1_bus5[i] - block2_out[i]));
+    }
+    CHECK(max_diff < 1e-6f);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("BusInDelayed feedback path: stable attenuated loop") {
+    // Pin the use case the abstraction exists for: feedback. Build a
+    // graph that on each block reads the previous block's bus 5,
+    // attenuates by 0.5, mixes with a fresh impulse-shaped source,
+    // and writes the result back to bus 5. With attenuation the loop
+    // stays bounded; without the snapshot mechanism the topological
+    // sorter would refuse to schedule this graph.
+    //
+    //   NoiseGen → Gain(0.1) ─┐
+    //                          ├→ Add → Gain(0.5) → BusOut(5) → Out(0)
+    //   BusInDelayed(5) ──────┘
+    //
+    // We just check the output is finite and non-zero after several
+    // blocks — a hard correctness oracle would require modelling the
+    // feedback transfer function. The test's real value is that it
+    // exercises the swap+clear+kernel sequence under feedback load
+    // and that nothing becomes NaN/inf.
+    constexpr int kBus = 5;
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 6);                          // NoiseGen
+    rt_graph_add_node(g, 1, 3);                          // Gain(0.1)
+    rt_graph_set_control(g, 1, 0, 0.1);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 12);                         // BusInDelayed(5)
+    rt_graph_set_control(g, 2, 0, static_cast<double>(kBus));
+
+    rt_graph_add_node(g, 3, 8);                          // Add
+    rt_graph_connect(g, 1, 0, 3, 0);                     // noise → Add.a
+    rt_graph_connect(g, 2, 0, 3, 1);                     // delayed → Add.b
+
+    rt_graph_add_node(g, 4, 3);                          // Gain(0.5)
+    rt_graph_set_control(g, 4, 0, 0.5);
+    rt_graph_connect(g, 3, 0, 4, 0);
+
+    rt_graph_add_node(g, 5, 10);                         // BusOut(5)
+    rt_graph_set_control(g, 5, 0, static_cast<double>(kBus));
+    rt_graph_connect(g, 4, 0, 5, 0);
+
+    rt_graph_add_node(g, 6, 2);                          // Out(0)
+    rt_graph_set_control(g, 6, 0, 0.0);
+    rt_graph_connect(g, 4, 0, 6, 0);
+
+    // Run several blocks; loop should stay bounded (gain 0.5 < 1).
+    for (int blk = 0; blk < 8; ++blk) {
+        rt_graph_process(g, kFrames);
+    }
+    std::vector<float> out(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, out.data());
+
+    const float peak = peak_abs(out);
+    // Bounded by the noise input × 0.1 / (1 - 0.5) = ~0.2 in the
+    // limit; allow generous slack since the input is white noise.
+    CHECK(peak > 0.0f);
+    CHECK(peak < 1.0f);
+    for (auto s : out) {
+        CHECK(std::isfinite(s));
+    }
+
+    rt_graph_destroy(g);
 }
 
 TEST_CASE("BusIn on out-of-range bus emits silence safely") {

@@ -169,6 +169,15 @@ data NodeKind
   | KEnv
   | KBusOut
   | KBusIn
+  | KBusInDelayed
+    -- ^ Read the *previous* block's contents of an audio bus.
+    -- Sibling of 'KBusIn' but reads from the frozen prior-block snapshot
+    -- in the runtime's double-buffered bus pool, so feedback loops can be
+    -- expressed as @BusInDelayed → ... → BusOut@ without closing an E_r
+    -- cycle. See Note [Effect-induced edges (E_r)] in
+    -- "MetaSonic.Bridge.Validate" for why the schedulable graph drops
+    -- 'BusReadDelayed' from E_r, and Note [Bus pool double-buffering] in
+    -- @tinysynth/rt_graph.cpp@ for the runtime swap.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -239,15 +248,19 @@ kindSpec = \case
   KLPF      -> KindSpec 7  SampleRate 3 2 "lpf"
   KAdd      -> KindSpec 8  SampleRate 2 2 "add"
   KEnv      -> KindSpec 9  SampleRate 1 5 "env"
-  -- Bus routing: same-cycle BusOut/BusIn. Effects are per-instance
-  -- (BusWrite n / BusRead n) and live in 'inferEff', not here. The C++
-  -- runtime stores all buses in one pool (g.output_buses); the audio
-  -- callback routes [0..N-1] to hardware regardless of which kind wrote
-  -- them, so KOut and KBusOut are operationally identical and BusIn
-  -- reads from the same pool.
-  -- See Note [Effect-induced edges (E_r)] in MetaSonic.Bridge.Validate.
-  KBusOut   -> KindSpec 10 SampleRate 1 1 "busOut"
-  KBusIn    -> KindSpec 11 SampleRate 0 1 "busIn"
+  -- Bus routing: same-cycle BusOut/BusIn and one-block-delayed BusInDelayed.
+  -- Effects are per-instance (BusWrite n / BusRead n / BusReadDelayed n)
+  -- and live in 'inferEff', not here. The C++ runtime stores all buses
+  -- in one double-buffered pool (g.output_buses + g.output_buses_prev);
+  -- the audio callback routes [0..N-1] to hardware regardless of which
+  -- kind wrote them, so KOut and KBusOut are operationally identical
+  -- and KBusIn reads from the live pool while KBusInDelayed reads from
+  -- the previous-block snapshot.
+  -- See Note [Effect-induced edges (E_r)] in MetaSonic.Bridge.Validate
+  -- and Note [Bus pool double-buffering] in tinysynth/rt_graph.cpp.
+  KBusOut       -> KindSpec 10 SampleRate 1 1 "busOut"
+  KBusIn        -> KindSpec 11 SampleRate 0 1 "busIn"
+  KBusInDelayed -> KindSpec 12 SampleRate 0 1 "busInDelayed"
 
 -- | Must agree with the NodeKind enum and kind_from_tag dispatch in
 -- rt_graph.cpp. Verified by a contract test in Spec.hs.
@@ -329,22 +342,42 @@ edges.
 
 The Eff type captures the resource dimension:
 
-  Pure      — no shared-resource interaction; can be freely
-              reordered or parallelized (subject to data deps)
-  BusRead   — reads from a shared bus; induces an ordering
-              constraint with any BusWrite on the same bus
-  BusWrite  — writes to a shared bus; induces ordering with
-              both BusRead and other BusWrite on the same bus
-  BufRead   — reads from a shared buffer
-  BufWrite  — writes to a shared buffer
+  Pure            — no shared-resource interaction; can be freely
+                    reordered or parallelized (subject to data deps)
+  BusRead         — reads from a shared bus *in the current block*;
+                    induces an ordering constraint with any BusWrite
+                    on the same bus (a same-cycle E_r edge)
+  BusReadDelayed  — reads from the *previous block's* snapshot of a
+                    shared bus; induces *no* E_r edge, because the
+                    read targets a different time slice than this
+                    block's writes. This is what makes feedback loops
+                    schedulable: a cycle that threads through a
+                    BusReadDelayed node closes only across blocks,
+                    not within one. See Note [Effect-induced edges
+                    (E_r)] in "MetaSonic.Bridge.Validate".
+  BusWrite        — writes to a shared bus; induces ordering with
+                    both BusRead (same bus) and other BusWrite (same
+                    bus). Has no relationship with BusReadDelayed:
+                    the delayed reader is reading a frozen snapshot
+                    that this block's BusWrite cannot mutate.
+  BufRead         — reads from a shared buffer
+  BufWrite        — writes to a shared buffer
+
+The asymmetry between BusRead and BusReadDelayed is the central
+abstraction enabling Phase 2 feedback. In SuperCollider terms,
+BusRead corresponds to 'In.ar' and BusReadDelayed corresponds to
+'InFeedback.ar'.
 -}
 
 -- | Resource effects carried by a node.
+--
+-- See Note [Resource effects].
 data Eff
-  = Pure                -- ^ No shared-resource interaction
-  | BusRead  !Int       -- ^ Reads from shared bus N
-  | BusWrite !Int       -- ^ Writes to shared bus N
-  | BufRead  !Int       -- ^ Reads from shared buffer N
-  | BufWrite !Int       -- ^ Writes to shared buffer N
+  = Pure                  -- ^ No shared-resource interaction
+  | BusRead         !Int  -- ^ Reads shared bus N's *current*-block contents
+  | BusReadDelayed  !Int  -- ^ Reads shared bus N's *previous*-block snapshot
+  | BusWrite        !Int  -- ^ Writes to shared bus N
+  | BufRead         !Int  -- ^ Reads from shared buffer N
+  | BufWrite        !Int  -- ^ Writes to shared buffer N
   deriving stock    (Eq, Ord, Show, Generic)
   deriving anyclass (NFData)

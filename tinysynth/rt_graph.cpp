@@ -100,38 +100,47 @@ NodeKind must align with the integer tags emitted by the compiler.
 
   Haskell (MetaSonic.Types.kindTag)    C++ (NodeKind)
   ---------------------------------    --------------
-  kindTag KSinOsc   = 1                SinOsc   = 1
-  kindTag KOut      = 2                Out      = 2
-  kindTag KGain     = 3                Gain     = 3
-  kindTag KSawOsc   = 5                SawOsc   = 5
-  kindTag KNoiseGen = 6                NoiseGen = 6
-  kindTag KLPF      = 7                LPF      = 7
-  kindTag KAdd      = 8                Add      = 8
-  kindTag KEnv      = 9                Env      = 9
-  kindTag KBusOut   = 10               BusOut   = 10
-  kindTag KBusIn    = 11               BusIn    = 11
+  kindTag KSinOsc       = 1            SinOsc        = 1
+  kindTag KOut          = 2            Out           = 2
+  kindTag KGain         = 3            Gain          = 3
+  kindTag KSawOsc       = 5            SawOsc        = 5
+  kindTag KNoiseGen     = 6            NoiseGen      = 6
+  kindTag KLPF          = 7            LPF           = 7
+  kindTag KAdd          = 8            Add           = 8
+  kindTag KEnv          = 9            Env           = 9
+  kindTag KBusOut       = 10           BusOut        = 10
+  kindTag KBusIn        = 11           BusIn         = 11
+  kindTag KBusInDelayed = 12           BusInDelayed  = 12
 
-  Bus model: Out, BusOut and BusIn all operate on the same bus pool
-  (g.output_buses). Out and BusOut share the same kernel — Out is just a
-  source-level alias for "BusOut to a hardware-routed bus". The audio
-  callback routes buses [0..output_channels-1] to hardware regardless of
-  which kind wrote them. BusIn reads from the same pool. Same-cycle
-  ordering is enforced on the Haskell side via E_r edges in
-  effectiveDeps; see Note [Effect-induced edges (E_r)] in
-  MetaSonic.Bridge.Validate.
+  Bus model: Out, BusOut, BusIn, and BusInDelayed all operate on the
+  same bus pool. The pool is double-buffered (g.output_buses for the
+  current block and g.output_buses_prev for the previous block's
+  snapshot). Out and BusOut share the same kernel writing to
+  output_buses — Out is just a source-level alias for "BusOut to a
+  hardware-routed bus". The audio callback routes buses
+  [0..output_channels-1] to hardware regardless of which kind wrote
+  them. BusIn reads from the live output_buses; BusInDelayed reads
+  from the frozen output_buses_prev snapshot.
+
+  Same-cycle ordering between BusOut and BusIn is enforced on the
+  Haskell side via E_r edges in effectiveDeps; BusInDelayed
+  deliberately produces no E_r edge so feedback loops are schedulable.
+  See Note [Effect-induced edges (E_r)] in MetaSonic.Bridge.Validate
+  and Note [Bus pool double-buffering] below.
 */
 
 enum class NodeKind : int {
-  SinOsc = 1,
-  Out = 2,
-  Gain = 3,
-  SawOsc = 5,
-  NoiseGen = 6,
-  LPF = 7,
-  Add = 8,
-  Env = 9,
-  BusOut = 10,
-  BusIn = 11,
+  SinOsc       = 1,
+  Out          = 2,
+  Gain         = 3,
+  SawOsc       = 5,
+  NoiseGen     = 6,
+  LPF          = 7,
+  Add          = 8,
+  Env          = 9,
+  BusOut       = 10,
+  BusIn        = 11,
+  BusInDelayed = 12,
 };
 
 // Single source of truth for the integer-tag → NodeKind mapping.
@@ -151,6 +160,7 @@ kind_from_tag(int node_kind) noexcept {
   case 9: return NodeKind::Env;
   case 10: return NodeKind::BusOut;
   case 11: return NodeKind::BusIn;
+  case 12: return NodeKind::BusInDelayed;
   default: return std::nullopt;
   }
 }
@@ -408,6 +418,17 @@ static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
     node.controls.resize(1, 0.0); // [bus]
     node.outputs.resize(1);
     break;
+
+  case NodeKind::BusInDelayed:
+    // BusInDelayed is shaped exactly like BusIn (1 control [bus], 0
+    // inputs, 1 output) but the kernel reads from the previous-block
+    // snapshot (g.output_buses_prev) instead of the live pool. The
+    // shape match is deliberate: from the rest of the graph's point
+    // of view it's just another audio source, only the data origin
+    // differs. See Note [Bus pool double-buffering].
+    node.controls.resize(1, 0.0); // [bus]
+    node.outputs.resize(1);
+    break;
   }
 
   for (auto &out : node.outputs) {
@@ -463,12 +484,64 @@ The Haskell side sees RTGraph only as an opaque pointer.
 All ownership, lifetime, and mutation live here.
 */
 
+/* Note [Bus pool double-buffering]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The bus pool is split into two parallel vectors of identical shape:
+
+  * output_buses       — this block's *live* contents. BusOut/Out
+                         accumulate into it; BusIn reads from it.
+  * output_buses_prev  — the *previous* block's snapshot, frozen for
+                         the duration of the current block.
+                         BusInDelayed reads from this.
+
+At the start of every block (in process_graph) we:
+
+  1. swap(output_buses, output_buses_prev). After the swap, the
+     vector that was "live" last block is now the "prev" snapshot,
+     and the vector that *was* "prev" (whose data is two blocks old)
+     is recycled as the new "live" buffer.
+  2. zero the new live buffer (clear_output_buses). BusOut accumulates
+     additively, so it needs to start from zero.
+
+Within a block, reads and writes have well-defined origins:
+
+  - BusOut writes go into output_buses[bus].
+  - BusIn reads from output_buses[bus]. The Haskell scheduler's E_r
+    edges force every same-bus BusOut to execute before BusIn, so
+    by the time BusIn runs the live buffer holds this block's
+    accumulated value.
+  - BusInDelayed reads from output_buses_prev[bus]. No E_r edge
+    relates BusInDelayed to BusOut: the snapshot is immutable for
+    the duration of the block. BusInDelayed can therefore appear
+    *before* same-bus BusOut in the topological order, which is
+    exactly what makes feedback loops schedulable.
+
+On the very first block, output_buses_prev contains the
+zero-initialised state assigned by ensure_output_bus_count, so a
+first-block BusInDelayed produces silence. After block N completes,
+its writes become block N+1's "prev" snapshot.
+
+Memory cost: 2× the bus pool. With 64 buses × 1024 frames × 4 bytes
+that's 512 KB total — bounded and small. The swap is O(1) (a
+pointer-swap on the std::vector heads); no copies on the audio
+thread. The trade-off the codebase chose for double-buffering vs.
+snapshot-via-memcpy: see the Phase 2 design discussion in the
+project notes.
+
+ensure_output_bus_count grows both vectors in lockstep so the swap
+never needs to reconcile sizes. rt_graph_clear empties both.
+
+In SuperCollider terms, output_buses corresponds to In.ar's source
+and output_buses_prev corresponds to InFeedback.ar's source.
+*/
+
 struct RTGraph {
   int capacity = 0;
   int max_frames = 0;
   float sample_rate = kDefaultSampleRate;
   std::vector<NodeRuntime> nodes;
   std::vector<std::vector<float>> output_buses;
+  std::vector<std::vector<float>> output_buses_prev;
   std::unique_ptr<GraphAudioStream> audio;
 };
 
@@ -503,6 +576,13 @@ The bus vectors are preallocated exactly like node outputs, so clearing
 and accumulation remain allocation-free inside the DSP loop.
 */
 
+// Grow both halves of the double-buffered bus pool to hold at least
+// `count` buses. The two vectors must always be the same size so the
+// per-block std::swap in process_graph stays size-consistent. New
+// slots are zero-initialised on both sides — a first-block
+// BusInDelayed reading from output_buses_prev therefore gets silence
+// rather than uninitialised memory. See Note [Bus pool
+// double-buffering].
 static void ensure_output_bus_count(RTGraph &g, std::size_t count) {
   if (g.output_buses.size() >= count) {
     return;
@@ -510,12 +590,18 @@ static void ensure_output_bus_count(RTGraph &g, std::size_t count) {
 
   const std::size_t old_size = g.output_buses.size();
   g.output_buses.resize(count);
+  g.output_buses_prev.resize(count);
   for (std::size_t i = old_size; i < count; ++i) {
     g.output_buses[i].resize(static_cast<std::size_t>(g.max_frames), 0.0f);
+    g.output_buses_prev[i].resize(static_cast<std::size_t>(g.max_frames), 0.0f);
   }
 }
 
-// Zero the first nframes of each output bus before one block render.
+// Zero the first nframes of each *live* output bus before one block
+// render. The previous-block snapshot (output_buses_prev) is left
+// alone — that's the buffer BusInDelayed is reading from, and any
+// writes to it would corrupt feedback paths. See Note [Bus pool
+// double-buffering].
 static void clear_output_buses(RTGraph &g, int nframes) noexcept {
   const std::size_t frames = static_cast<std::size_t>(nframes);
   for (auto &bus : g.output_buses) {
@@ -926,10 +1012,7 @@ had no writer this block).
 
 If the bus index is out of range, the kernel emits silence. Reading a bus
 that no node wrote in this block is well-defined: clear_output_buses
-zeroed the bus at the start of the block, so BusIn gets zero. (This is
-also what SuperCollider does for unwritten audio buses, modulo SC's
-default of *not* clearing audio buses across cycles — a Phase 2 concern
-when we add 'BusInDelayed' for one-block-delayed reads.)
+zeroed the bus at the start of the block, so BusIn gets zero.
 */
 static void process_busin(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
   NodeRuntime &node = g.nodes[node_idx];
@@ -946,6 +1029,54 @@ static void process_busin(RTGraph &g, std::size_t node_idx, int nframes) noexcep
   std::copy_n(src.begin(), frames, out.begin());
 }
 
+/* Note [BusInDelayed kernel: read previous block's snapshot]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+BusInDelayed is the feedback primitive. It reads from
+'g.output_buses_prev[bus]' — the frozen snapshot of what the previous
+block wrote — rather than from the live 'g.output_buses[bus]'. The
+swap-and-clear in process_graph guarantees that:
+
+  * output_buses_prev[bus] holds exactly what the previous block's
+    BusOut nodes accumulated (or zero if no node wrote that bus,
+    or the initial zero state on the very first block);
+  * output_buses_prev is *not* mutated during the current block;
+  * BusInDelayed therefore returns a stable, deterministic value
+    regardless of where it sits in the topological order.
+
+The third point is the design's payoff. On the Haskell side
+'BusReadDelayed' is excluded from E_r edges, so a BusInDelayed n can
+appear *before* a same-bus BusOut n in the schedule — closing a
+feedback loop whose only true cycle is across the block boundary,
+where the swap breaks it.
+
+Out-of-range bus indices emit silence (same as BusIn). Reading a bus
+that no node ever wrote — including on the first block, before any
+swap — also produces silence, because ensure_output_bus_count
+zero-initialises both halves of the pool.
+
+The kernel is a straight memcpy from prev[bus] into the node's output
+port; downstream consumers see no difference from BusIn beyond the
+one-block latency.
+
+See Note [Bus pool double-buffering].
+*/
+static void process_busin_delayed(
+    RTGraph &g, std::size_t node_idx, int nframes
+) noexcept {
+  NodeRuntime &node = g.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+
+  const int bus = static_cast<int>(node.controls[0]);
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.output_buses_prev.size()) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  const auto &src = g.output_buses_prev[static_cast<std::size_t>(bus)];
+  const std::size_t frames = static_cast<std::size_t>(nframes);
+  std::copy_n(src.begin(), frames, out.begin());
+}
+
 /* Note [Execution order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 The runtime processes nodes in storage order.
@@ -957,6 +1088,22 @@ already the "schedule". That simplicity is by design. Thus the name "tinysynth".
 */
 
 static void process_graph(RTGraph &g, int nframes) noexcept {
+  // Ping-pong the bus pool, then zero the new live buffer.
+  //
+  // After the swap:
+  //   * output_buses_prev holds what was just written *last* block —
+  //     BusInDelayed reads this stable snapshot.
+  //   * output_buses (now pointing at the buffer that was prev before
+  //     the swap, i.e. two-blocks-old data) is about to be cleared
+  //     and accumulated into by this block's BusOut/Out kernels.
+  //
+  // The swap is O(1) (vector-of-vectors has its heap pointers swapped
+  // wholesale; no per-bus copies). Doing it before clear means
+  // BusInDelayed is reading the freshly-rotated prev while BusOut is
+  // accumulating into a freshly-zeroed live — no aliasing risk.
+  //
+  // See Note [Bus pool double-buffering].
+  std::swap(g.output_buses, g.output_buses_prev);
   clear_output_buses(g, nframes);
 
   for (std::size_t i = 0; i < g.nodes.size(); ++i) {
@@ -992,6 +1139,9 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       break;
     case NodeKind::BusIn:
       process_busin(g, i, nframes);
+      break;
+    case NodeKind::BusInDelayed:
+      process_busin_delayed(g, i, nframes);
       break;
     default:
       assert(false && "unhandled NodeKind in process_graph");
@@ -1204,6 +1354,7 @@ void rt_graph_clear(RTGraph *g) {
   g->sample_rate = kDefaultSampleRate;
   g->nodes.clear();
   g->output_buses.clear();
+  g->output_buses_prev.clear();  // double-buffer; both halves live or die together
   if (g->capacity > 0) {
     g->nodes.reserve(static_cast<std::size_t>(g->capacity));
   }
@@ -1275,13 +1426,15 @@ void rt_graph_set_control(RTGraph *g, int node_index, int control_index, double 
 
   node.controls[cidx] = value;
 
-  // For Out / BusOut / BusIn nodes, control 0 is the bus index. All three
-  // share the same bus pool (g.output_buses); growing the array here
-  // ensures the DSP loop never has to do it. See Note [Bus model].
+  // For Out / BusOut / BusIn / BusInDelayed nodes, control 0 is the bus
+  // index. All four share the same double-buffered bus pool; growing
+  // the pool here (in both halves) ensures the DSP loop never has to.
+  // See Note [Bus model] and Note [Bus pool double-buffering].
   const bool kind_uses_bus_slot =
       node.kind == NodeKind::Out
       || node.kind == NodeKind::BusOut
-      || node.kind == NodeKind::BusIn;
+      || node.kind == NodeKind::BusIn
+      || node.kind == NodeKind::BusInDelayed;
   if (kind_uses_bus_slot && cidx == 0 && value >= 0.0) {
     const auto bus = static_cast<std::size_t>(static_cast<int>(value));
     ensure_output_bus_count(*g, bus + 1);

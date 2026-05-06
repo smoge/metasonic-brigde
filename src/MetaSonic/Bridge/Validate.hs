@@ -124,8 +124,8 @@ could schedule a 'BusIn 5' before any 'BusOut 5' on the same bus, and the
 reader would see a zero-cleared bus instead of the live signal it expects.
 
 The 'Eff' type was designed for exactly this: every node carries an effect
-annotation ('BusWrite n', 'BusRead n', 'BufRead n', 'BufWrite n', or
-'Pure'), and the *semantically schedulable* graph is
+annotation ('BusWrite n', 'BusRead n', 'BusReadDelayed n', 'BufRead n',
+'BufWrite n', or 'Pure'), and the *semantically schedulable* graph is
 
     G* = (N, E_s ∪ E_r ∪ E_t)
 
@@ -137,8 +137,8 @@ today.)
 This pass derives E_r:
 
   - For every node, ask 'inferEff' for its effect annotations.
-  - For every pair (writer with 'BusWrite n', reader with 'BusRead n')
-    on the same bus number, emit edge writer → reader.
+  - For every pair (writer with 'BusWrite n', *live* reader with
+    'BusRead n') on the same bus number, emit edge writer → reader.
   - Merge those edges into the dependency map used by 'topoSort'.
 
 That's it. The topological sort then operates over G* = E_s ∪ E_r and
@@ -147,14 +147,32 @@ detection works uniformly: a graph that creates a cycle through buses
 (e.g. 'BusIn 5' → ... → 'BusOut 5') is rejected by the same cycle detector
 that rejects structural cycles.
 
-Same-cycle semantics only. A 'BusIn n' always reads the live, accumulated
-value because it is forced to follow every 'BusOut n' on the same bus in
-the same block. Read-before-write feedback (one-block-delayed reads, like
-SuperCollider's natural behaviour when a synth tree places 'In.ar' before
-the corresponding 'Out.ar') would need a separate 'BusInDelayed'
-constructor with a snapshot of the previous block's bus contents — a
-Phase 2 extension that adds *no* E_r edge and so can sit anywhere in the
-schedule, but reads from a frozen buffer rather than the live one.
+Same-cycle semantics for 'BusRead'. A 'BusIn n' always reads the live,
+accumulated value because it is forced to follow every 'BusOut n' on the
+same bus in the same block.
+
+Cross-cycle semantics for 'BusReadDelayed' — feedback. 'BusInDelayed n'
+carries 'BusReadDelayed n', and this pass *deliberately* does not pair
+'BusReadDelayed' with 'BusWrite'. The reader is reading the *previous
+block's* snapshot of bus n, which by definition is not modified by any
+node executing in the current block. Two consequences:
+
+  1. A 'BusInDelayed n' may sit anywhere in the topological order
+     relative to a 'BusOut n' — including *before* it. This is what
+     makes feedback loops schedulable: the cycle that closes through
+     'BusInDelayed → ... → BusOut' has no E_r edge to pair with the
+     structural edges, so it is not a cycle in G* at all. The only
+     "cycle" is across blocks, broken by the runtime's swap of the
+     bus pool's snapshot and live buffers.
+  2. 'BusInDelayed' on a bus with no writer is well-defined: the
+     snapshot stays at the zero-initialised state and the read produces
+     silence — same as 'BusIn' on an unwritten bus.
+
+The asymmetric treatment of 'BusRead' vs 'BusReadDelayed' is the central
+abstraction that lets the same scheduler accept both same-cycle routing
+graphs and feedback graphs without runtime graph rewriting or implicit
+delays. In SuperCollider terms, 'BusRead' is 'In.ar' and 'BusReadDelayed'
+is 'InFeedback.ar'.
 
 Why the codebase uses E_r rather than runtime phasing (e.g. "run all
 BusOut nodes first, then everything else"): runtime phasing fails on
@@ -165,8 +183,10 @@ codebase has been building toward since 'Eff' was introduced; this pass
 just connects two notes that were sitting next to each other.
 
 See also: Note [Resource effects] in "MetaSonic.Types", Note [Bus model:
-SC-style same-cycle audio buses] in "MetaSonic.Bridge.Source", and Note
-[Effects are per-UGen, not per-kind] in "MetaSonic.Bridge.Source".
+SC-style same-cycle audio buses] in "MetaSonic.Bridge.Source", Note
+[Effects are per-UGen, not per-kind] in "MetaSonic.Bridge.Source", and
+Note [Bus pool double-buffering] in @tinysynth/rt_graph.cpp@ for the
+runtime-side ping-pong that realises the snapshot semantics.
 -}
 
 -- | Verify that every 'NodeID' referenced by a 'Connection'
@@ -189,9 +209,17 @@ checkDependencies g =
 -- in the graph. These are the E_r edges that augment the structural
 -- dependency map before topological sort.
 --
--- 'BusOut n' and 'Out n' both produce 'BusWrite n' via 'inferEff', and
--- 'BusIn n' produces 'BusRead n'; this function pairs them up by bus
--- number so the scheduler sees an explicit writer → reader edge.
+-- Only the *live* reader effect 'BusRead' is paired here.
+-- 'BusReadDelayed' (carried by 'BusInDelayed') is intentionally
+-- excluded: a delayed reader targets the *previous* block's snapshot
+-- of the bus, which the current block's writers cannot mutate, so
+-- there is no execution-order constraint between them. Excluding
+-- delayed readers from E_r is what makes feedback loops schedulable —
+-- see Note [Effect-induced edges (E_r)] for the rationale.
+--
+-- 'BusOut n' produces 'BusWrite n' via 'inferEff' and 'BusIn n'
+-- produces 'BusRead n'; this function pairs them up by bus number so
+-- the scheduler sees an explicit writer → reader edge.
 --
 -- See Note [Effect-induced edges (E_r)].
 busEdges :: SynthGraph -> [(NodeID, NodeID)]
@@ -203,6 +231,9 @@ busEdges g =
       readers = [ (nid, n)
                 | (nid, ns) <- nodes
                 , BusRead  n <- inferEff (nsUgen ns) ]
+                    -- BusReadDelayed is *not* listed: it must not
+                    -- contribute to E_r. See Note [Effect-induced
+                    -- edges (E_r)].
   in [ (w, r) | (w, bw) <- writers, (r, br) <- readers, bw == br ]
 
 -- | The effective dependency map used by topological sort: the structural
