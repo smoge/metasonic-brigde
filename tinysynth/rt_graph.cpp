@@ -285,83 +285,93 @@ struct DelayState {
 using NodeState =
     std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState, DelayState>;
 
-/* Note [NodeRuntime layout]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-NodeRuntime is the concrete execution unit owned by RTGraph.
+/* Note [§2.A spec/state split]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each node's *spec* (immutable per template) is separated from its
+*state* (mutable per instance):
 
-Each node stores:
+  * NodeSpec — the parts that don't change as the graph runs: the
+    kind tag, the input-port wiring (input_refs) set by
+    rt_graph_connect, and the control defaults inherited from
+    configure_node. In §2.B+ a single NodeSpec is shared across many
+    GraphInstances of the same MetaDef.
 
-  * its kind tag
-  * its control defaults
-  * its incoming edge references
-  * output buffers (when applicable), preallocated to max_frames
-  * optional per-node state
+  * NodeInstanceState — the parts each instance owns: its current
+    control values (initialised from the spec's defaults; mutable
+    via rt_graph_set_control), per-port output buffers preallocated
+    to max_frames, and the kernel state variant (OscState, LPFState,
+    …).
 
-The runtime chooses a structure-of-vectors style at the node boundary:
-controls, inputs, and outputs are each kept in dedicated vectors sized
-according to the node kind. This keeps configuration logic local to
-configure_node and keeps processing kernels compact.
+Today there is one MetaDef and one GraphInstance per RTGraph, so the
+split is a memory-layout refactor with no FFI-visible change. §2.B
+adds multi-instance support by letting one MetaDef own many
+GraphInstances; §2.C moves the bus pool out of GraphInstance into a
+shared Server. Drawing the spec/state line cleanly *now* is what
+makes those later steps incremental rather than another rewrite.
+
+Convention used throughout the kernels:
+
+    auto &inst = g.instance.nodes[node_idx];
+
+destructures the per-instance state at the top. spec.input_refs is
+read indirectly via resolve_input(g, node_idx, …); inst.controls /
+inst.outputs / inst.state are read and written directly.
 */
 
-struct NodeRuntime {
+struct NodeSpec {
   NodeKind kind = NodeKind::Out;
-  std::vector<double> controls;
+  std::vector<double> default_controls;
   std::vector<InputRef> input_refs;
+};
+
+struct NodeInstanceState {
+  std::vector<double> controls;
   std::vector<std::vector<float>> outputs;
   NodeState state{};
 };
 
 // View one output buffer as a span over the first nframes samples.
 [[nodiscard]] static std::span<float>
-output_span(NodeRuntime &node, PortIndex port, int nframes) noexcept {
-  return {node.outputs[to_size(port)].data(), static_cast<std::size_t>(nframes)};
+output_span(NodeInstanceState &inst, PortIndex port, int nframes) noexcept {
+  return {inst.outputs[to_size(port)].data(), static_cast<std::size_t>(nframes)};
 }
 
 [[nodiscard]] static std::span<const float>
-output_span(const NodeRuntime &node, PortIndex port, int nframes) noexcept {
-  return {node.outputs[to_size(port)].data(), static_cast<std::size_t>(nframes)};
+output_span(const NodeInstanceState &inst, PortIndex port, int nframes) noexcept {
+  return {inst.outputs[to_size(port)].data(), static_cast<std::size_t>(nframes)};
 }
 
-// Resolve one connected input to the source node's output span.
-// An empty span means the input is unavailable and the caller should
-// fall back to the corresponding control value or silence.
-[[nodiscard]] static std::span<const float> resolve_input(
-    const std::vector<NodeRuntime> &nodes,
-    const NodeRuntime &dst,
-    PortIndex input_index,
-    int nframes
-) noexcept {
-  if (!valid(input_index)) {
-    return {};
-  }
+/* Note [MetaDef and GraphInstance]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+MetaDef is the immutable template:
 
-  const std::size_t idx = to_size(input_index);
-  if (idx >= dst.input_refs.size()) {
-    return {};
-  }
+  * max_frames — the per-block buffer size every NodeInstanceState's
+    outputs were sized to at configure_node time. Multiple instances
+    of the same MetaDef must share max_frames.
+  * nodes — vector of NodeSpec, parallel to GraphInstance::nodes by
+    NodeIndex.
 
-  const InputRef &ref = dst.input_refs[idx];
-  if (!valid(ref.src_node) || !valid(ref.src_port)) {
-    return {};
-  }
+GraphInstance is one running copy:
 
-  const std::size_t src_index = to_size(ref.src_node);
-  if (src_index >= nodes.size()) {
-    return {};
-  }
+  * def — non-owning pointer back to the MetaDef this instance was
+    created from (for §2.B+ where one def hosts many instances).
+  * nodes — parallel-by-index vector of per-node mutable state.
+  * output_buses / output_buses_prev — bus pool for this instance.
+    In §2.C this moves to a shared Server so instances can route
+    audio to each other.
+*/
 
-  const NodeRuntime &src = nodes[src_index];
-  const std::size_t src_port = to_size(ref.src_port);
-  if (src_port >= src.outputs.size()) {
-    return {};
-  }
+struct MetaDef {
+  int max_frames = 0;
+  std::vector<NodeSpec> nodes;
+};
 
-  if (src.outputs[src_port].size() < static_cast<std::size_t>(nframes)) {
-    return {};
-  }
-
-  return output_span(src, ref.src_port, nframes);
-}
+struct GraphInstance {
+  const MetaDef *def = nullptr;
+  std::vector<NodeInstanceState> nodes;
+  std::vector<std::vector<float>> output_buses;
+  std::vector<std::vector<float>> output_buses_prev;
+};
 
 /* Note [Node configuration and preallocation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -375,93 +385,105 @@ Two jobs:
 
 The architectural invariant is that the DSP loop performs no allocation. All
 buffer growth happens here while loading or reloading the graph.
+
+Spec/state split: writes to both the per-template NodeSpec
+(default_controls, input_refs slots — sized but unwired) and the
+per-instance NodeInstanceState (controls initialised from defaults,
+output buffers preallocated, state variant chosen). This is the only
+site where a NodeSpec and the matching NodeInstanceState are touched
+in the same call; everything else operates on one or the other.
 */
 
-static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
-  node.kind = kind;
-  node.controls.clear();
-  node.input_refs.clear();
-  node.outputs.clear();
-  node.state = std::monostate{};
+static void configure_node(
+    NodeSpec &spec,
+    NodeInstanceState &inst,
+    NodeKind kind,
+    int max_frames
+) {
+  spec.kind = kind;
+  spec.default_controls.clear();
+  spec.input_refs.clear();
+  inst.outputs.clear();
+  inst.state = std::monostate{};
 
   switch (kind) {
   case NodeKind::SinOsc:
-    node.controls.resize(2, 0.0f); // [freq, initial_phase]
-    node.input_refs.resize(2);     // [freq_in, phase_in]
-    node.outputs.resize(1);
-    node.state = OscState{};
+    spec.default_controls.resize(2, 0.0); // [freq, initial_phase]
+    spec.input_refs.resize(2);            // [freq_in, phase_in]
+    inst.outputs.resize(1);
+    inst.state = OscState{};
     break;
 
   case NodeKind::Out:
-    node.controls.resize(1, 0.0f); // [bus]
-    node.input_refs.resize(1);     // [signal_in]
+    spec.default_controls.resize(1, 0.0); // [bus]
+    spec.input_refs.resize(1);            // [signal_in]
     // No outputs — Out accumulates directly into the bus
     break;
 
   case NodeKind::Gain:
-    node.controls.resize(1, 1.0f); // [gain_amount]
-    node.input_refs.resize(2);     // [signal_in, gain_in]
-    node.outputs.resize(1);
+    spec.default_controls.resize(1, 1.0); // [gain_amount]
+    spec.input_refs.resize(2);            // [signal_in, gain_in]
+    inst.outputs.resize(1);
     break;
 
   case NodeKind::SawOsc:
-    node.controls.resize(2, 0.0f); // [freq, initial_phase]
-    node.input_refs.resize(2);     // [freq_in, phase_in]
-    node.outputs.resize(1);
-    node.state = OscState{};
+    spec.default_controls.resize(2, 0.0); // [freq, initial_phase]
+    spec.input_refs.resize(2);            // [freq_in, phase_in]
+    inst.outputs.resize(1);
+    inst.state = OscState{};
     break;
 
   case NodeKind::NoiseGen:
     // No controls, no inputs — pure source
-    node.outputs.resize(1);
-    node.state = NoiseGenState{};
+    inst.outputs.resize(1);
+    inst.state = NoiseGenState{};
     break;
 
   case NodeKind::LPF:
-    node.controls = {1000.0, 0.707}; // [cutoff_freq, q]
-    node.input_refs.resize(3);         // [signal_in, freq_in, q_in]
-    node.outputs.resize(1);
-    node.state = LPFState{};
+    spec.default_controls = {1000.0, 0.707}; // [cutoff_freq, q]
+    spec.input_refs.resize(3);               // [signal_in, freq_in, q_in]
+    inst.outputs.resize(1);
+    inst.state = LPFState{};
     break;
 
   case NodeKind::Add:
-    node.controls.resize(2, 0.0f); // [a_default, b_default] — fallbacks
-    node.input_refs.resize(2);     // [a_in, b_in]
-    node.outputs.resize(1);
+    spec.default_controls.resize(2, 0.0); // [a_default, b_default] — fallbacks
+    spec.input_refs.resize(2);            // [a_in, b_in]
+    inst.outputs.resize(1);
     break;
 
   case NodeKind::Env:
     // [gate_default, attack_s, decay_s, sustain_lin, release_s]
-    node.controls = {0.0, 0.01, 0.05, 0.5, 0.1};
-    node.input_refs.resize(1); // [gate_in]
-    node.outputs.resize(1);
-    node.state = EnvState{};
+    spec.default_controls = {0.0, 0.01, 0.05, 0.5, 0.1};
+    spec.input_refs.resize(1);            // [gate_in]
+    inst.outputs.resize(1);
+    inst.state = EnvState{};
     break;
 
   case NodeKind::BusOut:
     // BusOut is a sink, like Out: control 0 = bus index, one input,
-    // no per-node output buffer (writes directly into g.output_buses).
+    // no per-node output buffer (writes directly into instance.output_buses).
     // See Note [Bus model] above.
-    node.controls.resize(1, 0.0); // [bus]
-    node.input_refs.resize(1);    // [signal_in]
+    spec.default_controls.resize(1, 0.0); // [bus]
+    spec.input_refs.resize(1);            // [signal_in]
     break;
 
   case NodeKind::BusIn:
     // BusIn is a source: control 0 = bus index, no inputs, one output
     // buffer that downstream nodes can read.
-    node.controls.resize(1, 0.0); // [bus]
-    node.outputs.resize(1);
+    spec.default_controls.resize(1, 0.0); // [bus]
+    inst.outputs.resize(1);
     break;
 
   case NodeKind::BusInDelayed:
     // BusInDelayed is shaped exactly like BusIn (1 control [bus], 0
     // inputs, 1 output) but the kernel reads from the previous-block
-    // snapshot (g.output_buses_prev) instead of the live pool. The
-    // shape match is deliberate: from the rest of the graph's point
-    // of view it's just another audio source, only the data origin
-    // differs. See Note [Bus pool double-buffering].
-    node.controls.resize(1, 0.0); // [bus]
-    node.outputs.resize(1);
+    // snapshot (instance.output_buses_prev) instead of the live pool.
+    // The shape match is deliberate: from the rest of the graph's
+    // point of view it's just another audio source, only the data
+    // origin differs. See Note [Bus pool double-buffering].
+    spec.default_controls.resize(1, 0.0); // [bus]
+    inst.outputs.resize(1);
     break;
 
   case NodeKind::Delay:
@@ -472,14 +494,19 @@ static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
     // [signal, delay_time]. One output. State is the q::delay
     // instance, allocated lazily once we know the active sample rate.
     // See Note [Per-node delay state].
-    node.controls = {0.2, 0.0};   // [max_time_s, delay_time_s]
-    node.input_refs.resize(2);    // [signal_in, time_in]
-    node.outputs.resize(1);
-    node.state = DelayState{};
+    spec.default_controls = {0.2, 0.0};   // [max_time_s, delay_time_s]
+    spec.input_refs.resize(2);            // [signal_in, time_in]
+    inst.outputs.resize(1);
+    inst.state = DelayState{};
     break;
   }
 
-  for (auto &out : node.outputs) {
+  // Per-instance controls take their initial values from the spec's
+  // defaults. rt_graph_set_control later writes here, leaving the
+  // spec untouched.
+  inst.controls = spec.default_controls;
+
+  for (auto &out : inst.outputs) {
     out.resize(static_cast<std::size_t>(max_frames), 0.0f);
   }
 }
@@ -520,12 +547,17 @@ struct GraphAudioStream : q::audio_stream {
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 RTGraph is the sole owner of runtime state.
 
+Today it owns exactly one MetaDef (the immutable template) and exactly
+one GraphInstance (the running copy). §2.B will let one MetaDef own
+many GraphInstances; §2.C will hoist the bus pool from GraphInstance
+into a shared Server. Until then, the one-of-each layout below is the
+single-instance degenerate case of that future shape.
+
 Contains:
 
-  * the dense node array
+  * the dense def + instance pair
   * the maximum frame size used for all preallocations
   * the currently active sample rate
-  * output buses that accumulate the contribution of Out nodes
   * an optional realtime audio stream
 
 The Haskell side sees RTGraph only as an opaque pointer.
@@ -587,23 +619,77 @@ struct RTGraph {
   int capacity = 0;
   int max_frames = 0;
   float sample_rate = kDefaultSampleRate;
-  std::vector<NodeRuntime> nodes;
-  std::vector<std::vector<float>> output_buses;
-  std::vector<std::vector<float>> output_buses_prev;
+  MetaDef def;
+  GraphInstance instance;
   std::unique_ptr<GraphAudioStream> audio;
 };
 
 namespace {
 
-// Ensure the dense node vector is large enough to hold node_index.
+// Resolve one connected input to the source node's output span.
+// An empty span means the input is unavailable and the caller should
+// fall back to the corresponding control value or silence.
+//
+// Reads dst's input_refs from the spec side (g.def.nodes) and the
+// source node's outputs from the instance side (g.instance.nodes).
+[[nodiscard]] static std::span<const float> resolve_input(
+    const RTGraph &g,
+    std::size_t dst_idx,
+    PortIndex input_index,
+    int nframes
+) noexcept {
+  if (!valid(input_index)) {
+    return {};
+  }
+
+  if (dst_idx >= g.def.nodes.size()) {
+    return {};
+  }
+
+  const NodeSpec &dst_spec = g.def.nodes[dst_idx];
+  const std::size_t idx = to_size(input_index);
+  if (idx >= dst_spec.input_refs.size()) {
+    return {};
+  }
+
+  const InputRef &ref = dst_spec.input_refs[idx];
+  if (!valid(ref.src_node) || !valid(ref.src_port)) {
+    return {};
+  }
+
+  const std::size_t src_index = to_size(ref.src_node);
+  if (src_index >= g.instance.nodes.size()) {
+    return {};
+  }
+
+  const NodeInstanceState &src = g.instance.nodes[src_index];
+  const std::size_t src_port = to_size(ref.src_port);
+  if (src_port >= src.outputs.size()) {
+    return {};
+  }
+
+  if (src.outputs[src_port].size() < static_cast<std::size_t>(nframes)) {
+    return {};
+  }
+
+  return output_span(src, ref.src_port, nframes);
+}
+
+// Ensure the dense def + instance vectors are large enough to hold
+// node_index. Both halves are grown in lockstep so the parallel
+// indexing invariant (def.nodes[i] describes the spec for the same
+// node that instance.nodes[i] holds the state for) is preserved.
 static void ensure_node_slot(RTGraph &g, NodeIndex node_index) {
   if (!valid(node_index)) {
     return;
   }
 
   const std::size_t idx = to_size(node_index);
-  if (g.nodes.size() <= idx) {
-    g.nodes.resize(idx + 1);
+  if (g.def.nodes.size() <= idx) {
+    g.def.nodes.resize(idx + 1);
+  }
+  if (g.instance.nodes.size() <= idx) {
+    g.instance.nodes.resize(idx + 1);
   }
 }
 
@@ -631,17 +717,17 @@ and accumulation remain allocation-free inside the DSP loop.
 // BusInDelayed reading from output_buses_prev therefore gets silence
 // rather than uninitialised memory. See Note [Bus pool
 // double-buffering].
-static void ensure_output_bus_count(RTGraph &g, std::size_t count) {
-  if (g.output_buses.size() >= count) {
+static void ensure_output_bus_count(GraphInstance &inst, std::size_t count, int max_frames) {
+  if (inst.output_buses.size() >= count) {
     return;
   }
 
-  const std::size_t old_size = g.output_buses.size();
-  g.output_buses.resize(count);
-  g.output_buses_prev.resize(count);
+  const std::size_t old_size = inst.output_buses.size();
+  inst.output_buses.resize(count);
+  inst.output_buses_prev.resize(count);
   for (std::size_t i = old_size; i < count; ++i) {
-    g.output_buses[i].resize(static_cast<std::size_t>(g.max_frames), 0.0f);
-    g.output_buses_prev[i].resize(static_cast<std::size_t>(g.max_frames), 0.0f);
+    inst.output_buses[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
+    inst.output_buses_prev[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
   }
 }
 
@@ -650,15 +736,15 @@ static void ensure_output_bus_count(RTGraph &g, std::size_t count) {
 // alone — that's the buffer BusInDelayed is reading from, and any
 // writes to it would corrupt feedback paths. See Note [Bus pool
 // double-buffering].
-static void clear_output_buses(RTGraph &g, int nframes) noexcept {
+static void clear_output_buses(GraphInstance &inst, int nframes) noexcept {
   const std::size_t frames = static_cast<std::size_t>(nframes);
-  for (auto &bus : g.output_buses) {
+  for (auto &bus : inst.output_buses) {
     std::fill_n(bus.begin(), frames, 0.0f);
   }
 }
 
-void set_osc_initial_phase(NodeRuntime &node, double value) noexcept {
-  auto *osc = std::get_if<OscState>(&node.state);
+void set_osc_initial_phase(NodeInstanceState &inst, double value) noexcept {
+  auto *osc = std::get_if<OscState>(&inst.state);
   assert(osc && "oscillator node has non-oscillator state");
   if (!osc) {
     return;
@@ -704,11 +790,11 @@ runtime path that adds to _phase per sample.
 */
 
 static void process_sinosc(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto freq_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
+  const auto freq_in = resolve_input(g, node_idx, PortIndex{0}, nframes);
 
-  auto *osc = std::get_if<OscState>(&node.state);
+  auto *osc = std::get_if<OscState>(&inst.state);
   assert(osc && "SinOsc node has non-oscillator state");
   if (!osc) {
     std::fill(out.begin(), out.end(), 0.0f);
@@ -725,7 +811,7 @@ static void process_sinosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
     }
   } else {
     // Constant frequency: set the increment once per block.
-    const double freq = node.controls[0];
+    const double freq = inst.controls[0];
     osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       out[static_cast<std::size_t>(i)] = q::sin(osc->phase_iter++);
@@ -750,11 +836,11 @@ Phase port (port 1) is initial-only, same as SinOsc.
 */
 
 static void process_sawosc(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto freq_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
+  const auto freq_in = resolve_input(g, node_idx, PortIndex{0}, nframes);
 
-  auto *osc = std::get_if<OscState>(&node.state);
+  auto *osc = std::get_if<OscState>(&inst.state);
   assert(osc && "SawOsc node has non-oscillator state");
   if (!osc) {
     std::fill(out.begin(), out.end(), 0.0f);
@@ -771,7 +857,7 @@ static void process_sawosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
     }
   } else {
     // Constant frequency: set the increment once per block.
-    const double freq = node.controls[0];
+    const double freq = inst.controls[0];
     osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       out[static_cast<std::size_t>(i)] = q::saw(osc->phase_iter++);
@@ -797,9 +883,9 @@ No controls or inputs.
 */
 
 static void process_noisegen(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  auto *noisegen = std::get_if<NoiseGenState>(&node.state);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
+  auto *noisegen = std::get_if<NoiseGenState>(&inst.state);
   assert(noisegen && "NoiseGen node has non-noisegen state");
   if (!noisegen) {
     std::fill(out.begin(), out.end(), 0.0f);
@@ -826,22 +912,22 @@ If the signal input is unconnected, output is silence.
 */
 
 static void process_lpf(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto sig_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g, node_idx, PortIndex{0}, nframes);
 
   if (sig_in.empty()) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  const auto freq_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
-  const auto q_in = resolve_input(g.nodes, node, PortIndex{2}, nframes);
+  const auto freq_in = resolve_input(g, node_idx, PortIndex{1}, nframes);
+  const auto q_in = resolve_input(g, node_idx, PortIndex{2}, nframes);
 
-  const double freq = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
-  const double q_val = !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1];
+  const double freq = !freq_in.empty() ? static_cast<double>(freq_in[0]) : inst.controls[0];
+  const double q_val = !q_in.empty() ? static_cast<double>(q_in[0]) : inst.controls[1];
 
-  auto *lpf = std::get_if<LPFState>(&node.state);
+  auto *lpf = std::get_if<LPFState>(&inst.state);
   assert(lpf && "LPF node has non-LPF state");
   if (!lpf) {
     std::fill(out.begin(), out.end(), 0.0f);
@@ -873,10 +959,10 @@ If the signal input (port 0) is unconnected, output is silence.
 */
 
 static void process_gain(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto sig_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
-  const auto gain_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g, node_idx, PortIndex{0}, nframes);
+  const auto gain_in = resolve_input(g, node_idx, PortIndex{1}, nframes);
 
   if (sig_in.empty()) {
     std::fill(out.begin(), out.end(), 0.0f);
@@ -891,7 +977,7 @@ static void process_gain(RTGraph &g, std::size_t node_idx, int nframes) noexcept
     }
   } else {
     // Constant gain from the control default.
-    const float amount = static_cast<float>(node.controls[0]);
+    const float amount = static_cast<float>(inst.controls[0]);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       out[fi] = sig_in[fi] * amount;
@@ -913,13 +999,13 @@ modulated frequency or amplitude).
 */
 
 static void process_add(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto a_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
-  const auto b_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
+  const auto a_in = resolve_input(g, node_idx, PortIndex{0}, nframes);
+  const auto b_in = resolve_input(g, node_idx, PortIndex{1}, nframes);
 
-  const float a_const = static_cast<float>(node.controls[0]);
-  const float b_const = static_cast<float>(node.controls[1]);
+  const float a_const = static_cast<float>(inst.controls[0]);
+  const float b_const = static_cast<float>(inst.controls[1]);
 
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
@@ -946,22 +1032,22 @@ current sample rate — kDefaultSampleRate is a placeholder that may be wrong
 once realtime audio opens with a different rate.
 */
 static void process_env(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
 
-  auto *st = std::get_if<EnvState>(&node.state);
+  auto *st = std::get_if<EnvState>(&inst.state);
   assert(st && "Env node has non-Env state");
   if (!st) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  const auto gate_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
-  const float gate_default = static_cast<float>(node.controls[0]);
-  const double a_sec = node.controls[1];
-  const double d_sec = node.controls[2];
-  const double s_lin = node.controls[3];
-  const double r_sec = node.controls[4];
+  const auto gate_in = resolve_input(g, node_idx, PortIndex{0}, nframes);
+  const float gate_default = static_cast<float>(inst.controls[0]);
+  const double a_sec = inst.controls[1];
+  const double d_sec = inst.controls[2];
+  const double s_lin = inst.controls[3];
+  const double r_sec = inst.controls[4];
 
   // (Re)build the envelope_gen against the active sample rate on first
   // call or after a sample-rate change.
@@ -1009,12 +1095,12 @@ static void process_env(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
 /* Note [Bus-write kernel: Out and BusOut share this]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out and BusOut are operationally identical: both accumulate their input
-signal additively into 'g.output_buses[bus]', where 'bus' is read from
-control slot 0. The only difference is at the *source* level — Out reads
-as "final hardware output", BusOut reads as "intermediate audio bus".
-The audio callback routes buses [0..output_channels-1] to hardware
-regardless of which kind wrote them, so an Out targeting bus 5 and a
-BusOut targeting bus 5 produce identical audible results.
+signal additively into 'g.instance.output_buses[bus]', where 'bus' is
+read from control slot 0. The only difference is at the *source* level
+— Out reads as "final hardware output", BusOut reads as "intermediate
+audio bus". The audio callback routes buses [0..output_channels-1] to
+hardware regardless of which kind wrote them, so an Out targeting bus 5
+and a BusOut targeting bus 5 produce identical audible results.
 
 Both kinds dispatch to this single kernel ('process_out') from
 process_graph. See Note [Bus model] near the NodeKind enum.
@@ -1030,16 +1116,16 @@ If the input is unconnected or the bus index is invalid, the node
 contributes nothing. Multiple writers to the same bus sum.
 */
 static void process_out(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  const auto in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  const auto in = resolve_input(g, node_idx, PortIndex{0}, nframes);
   if (in.empty())
     return;
 
-  const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= g.output_buses.size())
+  const int bus = static_cast<int>(inst.controls[0]);
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.instance.output_buses.size())
     return;
 
-  auto &dst = g.output_buses[static_cast<std::size_t>(bus)];
+  auto &dst = g.instance.output_buses[static_cast<std::size_t>(bus)];
   for (int i = 0; i < nframes; ++i) {
     dst[static_cast<std::size_t>(i)] += in[static_cast<std::size_t>(i)];
   }
@@ -1047,9 +1133,9 @@ static void process_out(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
 
 /* Note [BusIn kernel: read live bus contents]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-BusIn is a source: it copies the current contents of 'g.output_buses[bus]'
-into the node's output port 0, so downstream consumers can read it like
-any other audio source.
+BusIn is a source: it copies the current contents of
+'g.instance.output_buses[bus]' into the node's output port 0, so
+downstream consumers can read it like any other audio source.
 
 Same-cycle semantics: by the time process_busin runs, every BusOut/Out on
 the same bus has already accumulated this block's contributions, because
@@ -1063,16 +1149,16 @@ that no node wrote in this block is well-defined: clear_output_buses
 zeroed the bus at the start of the block, so BusIn gets zero.
 */
 static void process_busin(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
 
-  const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= g.output_buses.size()) {
+  const int bus = static_cast<int>(inst.controls[0]);
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.instance.output_buses.size()) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  const auto &src = g.output_buses[static_cast<std::size_t>(bus)];
+  const auto &src = g.instance.output_buses[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
   std::copy_n(src.begin(), frames, out.begin());
 }
@@ -1080,9 +1166,10 @@ static void process_busin(RTGraph &g, std::size_t node_idx, int nframes) noexcep
 /* Note [BusInDelayed kernel: read previous block's snapshot]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 BusInDelayed is the feedback primitive. It reads from
-'g.output_buses_prev[bus]' — the frozen snapshot of what the previous
-block wrote — rather than from the live 'g.output_buses[bus]'. The
-swap-and-clear in process_graph guarantees that:
+'g.instance.output_buses_prev[bus]' — the frozen snapshot of what the
+previous block wrote — rather than from the live
+'g.instance.output_buses[bus]'. The swap-and-clear in process_graph
+guarantees that:
 
   * output_buses_prev[bus] holds exactly what the previous block's
     BusOut nodes accumulated (or zero if no node wrote that bus,
@@ -1111,16 +1198,16 @@ See Note [Bus pool double-buffering].
 static void process_busin_delayed(
     RTGraph &g, std::size_t node_idx, int nframes
 ) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
 
-  const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= g.output_buses_prev.size()) {
+  const int bus = static_cast<int>(inst.controls[0]);
+  if (bus < 0 || static_cast<std::size_t>(bus) >= g.instance.output_buses_prev.size()) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  const auto &src = g.output_buses_prev[static_cast<std::size_t>(bus)];
+  const auto &src = g.instance.output_buses_prev[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
   std::copy_n(src.begin(), frames, out.begin());
 }
@@ -1161,16 +1248,16 @@ rate change (which is extraordinarily rare).
 See Note [Per-node delay state] for the state struct.
 */
 static void process_delay(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
-  NodeRuntime &node = g.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto sig_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+  auto &inst = g.instance.nodes[node_idx];
+  auto out = output_span(inst, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g, node_idx, PortIndex{0}, nframes);
 
   if (sig_in.empty()) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
 
-  auto *st = std::get_if<DelayState>(&node.state);
+  auto *st = std::get_if<DelayState>(&inst.state);
   assert(st && "Delay node has non-Delay state");
   if (!st) {
     std::fill(out.begin(), out.end(), 0.0f);
@@ -1178,7 +1265,7 @@ static void process_delay(RTGraph &g, std::size_t node_idx, int nframes) noexcep
   }
 
   // controls[0] = max_time_s, controls[1] = delay_time_s default.
-  const double max_time = node.controls[0];
+  const double max_time = inst.controls[0];
 
   // (Re)build the ring buffer on first call or after a sample-rate /
   // max-time change. q::delay's constructor sizes the buffer to
@@ -1189,7 +1276,7 @@ static void process_delay(RTGraph &g, std::size_t node_idx, int nframes) noexcep
     st->last_max_time = max_time;
   }
 
-  const auto time_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
+  const auto time_in = resolve_input(g, node_idx, PortIndex{1}, nframes);
   const float buf_size = static_cast<float>(st->line->size());
   // Reading at sample 0 means "the value just pushed" (no delay).
   // Reading at buf_size - 1 means "the maximum delay this buffer
@@ -1207,7 +1294,7 @@ static void process_delay(RTGraph &g, std::size_t node_idx, int nframes) noexcep
   } else {
     // Constant delay time from the control default.
     const float t_samples = std::clamp(
-      static_cast<float>(node.controls[1]) * g.sample_rate, 0.0f, max_idx);
+      static_cast<float>(inst.controls[1]) * g.sample_rate, 0.0f, max_idx);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       out[fi] = (*st->line)(sig_in[fi], t_samples);
@@ -1241,11 +1328,11 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // accumulating into a freshly-zeroed live — no aliasing risk.
   //
   // See Note [Bus pool double-buffering].
-  std::swap(g.output_buses, g.output_buses_prev);
-  clear_output_buses(g, nframes);
+  std::swap(g.instance.output_buses, g.instance.output_buses_prev);
+  clear_output_buses(g.instance, nframes);
 
-  for (std::size_t i = 0; i < g.nodes.size(); ++i) {
-    switch (g.nodes[i].kind) {
+  for (std::size_t i = 0; i < g.def.nodes.size(); ++i) {
+    switch (g.def.nodes[i].kind) {
     case NodeKind::SinOsc:
       process_sinosc(g, i, nframes);
       break;
@@ -1324,15 +1411,18 @@ void GraphAudioStream::process(out_channels const &out) {
     auto dst = out[ch];
     std::fill(dst.begin(), dst.end(), 0.0f);
 
-    if (graph.output_buses.empty()) {
+    if (graph.instance.output_buses.empty()) {
       continue;
     }
 
-    const std::size_t bus = (graph.output_buses.size() == 1 && out.size() > 1) ? 0 : ch;
+    const std::size_t bus =
+        (graph.instance.output_buses.size() == 1 && out.size() > 1) ? 0 : ch;
 
-    if (bus < graph.output_buses.size()) {
+    if (bus < graph.instance.output_buses.size()) {
       std::copy_n(
-          graph.output_buses[bus].begin(), static_cast<std::size_t>(nframes), dst.begin()
+          graph.instance.output_buses[bus].begin(),
+          static_cast<std::size_t>(nframes),
+          dst.begin()
       );
     }
   }
@@ -1458,12 +1548,19 @@ open_audio_stream(RTGraph &g, int requested_output_channels, int requested_devic
 extern "C" {
 
 // Allocate one runtime graph handle. No nodes are configured yet.
+//
+// Initialises one MetaDef (the immutable template) and one
+// GraphInstance (the running copy) — the §2.A degenerate case of
+// the future "one MetaDef hosts many instances" shape.
 RTGraph *rt_graph_create(int capacity, int max_frames) {
   auto *g = new RTGraph{};
   g->capacity = std::max(0, capacity);
   g->max_frames = std::max(0, max_frames);
+  g->def.max_frames = g->max_frames;
+  g->instance.def = &g->def;
   if (g->capacity > 0) {
-    g->nodes.reserve(static_cast<std::size_t>(g->capacity));
+    g->def.nodes.reserve(static_cast<std::size_t>(g->capacity));
+    g->instance.nodes.reserve(static_cast<std::size_t>(g->capacity));
   }
   return g;
 }
@@ -1482,7 +1579,8 @@ void rt_graph_destroy(RTGraph *g) {
 rt_graph_clear is the graph-reload entry point.
 
 It stops active audio, resets the sample rate to the default placeholder value,
-removes all nodes and output buses, and preserves the graph handle for reuse.
+removes all nodes (def + instance) and output buses, and preserves the graph
+handle for reuse.
 
 */
 
@@ -1493,11 +1591,13 @@ void rt_graph_clear(RTGraph *g) {
 
   stop_audio_stream(*g);
   g->sample_rate = kDefaultSampleRate;
-  g->nodes.clear();
-  g->output_buses.clear();
-  g->output_buses_prev.clear();  // double-buffer; both halves live or die together
+  g->def.nodes.clear();
+  g->instance.nodes.clear();
+  g->instance.output_buses.clear();
+  g->instance.output_buses_prev.clear();  // double-buffer; both halves live or die together
   if (g->capacity > 0) {
-    g->nodes.reserve(static_cast<std::size_t>(g->capacity));
+    g->def.nodes.reserve(static_cast<std::size_t>(g->capacity));
+    g->instance.nodes.reserve(static_cast<std::size_t>(g->capacity));
   }
 }
 
@@ -1520,11 +1620,15 @@ void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
   }
 
   ensure_node_slot(*g, idx);
-  configure_node(g->nodes[to_size(idx)], kind, g->max_frames);
+  configure_node(
+      g->def.nodes[to_size(idx)],
+      g->instance.nodes[to_size(idx)],
+      kind,
+      g->max_frames);
 
   // Out nodes imply at least one runtime output bus exists.
   if (kind == NodeKind::Out) {
-    ensure_output_bus_count(*g, 1);
+    ensure_output_bus_count(g->instance, 1, g->max_frames);
   }
 }
 
@@ -1555,38 +1659,43 @@ void rt_graph_set_control(RTGraph *g, int node_index, int control_index, double 
   }
 
   const std::size_t nidx = to_size(ni);
-  if (nidx >= g->nodes.size()) {
+  if (nidx >= g->def.nodes.size()) {
     return;
   }
 
-  NodeRuntime &node = g->nodes[nidx];
+  // kind comes from the spec; the value we mutate lives on the instance.
+  const NodeSpec &spec = g->def.nodes[nidx];
+  NodeInstanceState &inst = g->instance.nodes[nidx];
   const std::size_t cidx = to_size(ci);
-  if (cidx >= node.controls.size()) {
+  if (cidx >= inst.controls.size()) {
     return;
   }
 
-  node.controls[cidx] = value;
+  inst.controls[cidx] = value;
 
   // For Out / BusOut / BusIn / BusInDelayed nodes, control 0 is the bus
   // index. All four share the same double-buffered bus pool; growing
   // the pool here (in both halves) ensures the DSP loop never has to.
   // See Note [Bus model] and Note [Bus pool double-buffering].
   const bool kind_uses_bus_slot =
-      node.kind == NodeKind::Out
-      || node.kind == NodeKind::BusOut
-      || node.kind == NodeKind::BusIn
-      || node.kind == NodeKind::BusInDelayed;
+      spec.kind == NodeKind::Out
+      || spec.kind == NodeKind::BusOut
+      || spec.kind == NodeKind::BusIn
+      || spec.kind == NodeKind::BusInDelayed;
   if (kind_uses_bus_slot && cidx == 0 && value >= 0.0) {
     const auto bus = static_cast<std::size_t>(static_cast<int>(value));
-    ensure_output_bus_count(*g, bus + 1);
+    ensure_output_bus_count(g->instance, bus + 1, g->max_frames);
   }
 
-  if (cidx == 1 && (node.kind == NodeKind::SinOsc || node.kind == NodeKind::SawOsc)) {
-    set_osc_initial_phase(node, value);
+  if (cidx == 1 && (spec.kind == NodeKind::SinOsc || spec.kind == NodeKind::SawOsc)) {
+    set_osc_initial_phase(inst, value);
   }
 }
 
 // Connect one source output port to one destination input port.
+//
+// Wiring lives on the spec side (NodeSpec::input_refs), so all
+// instances of a MetaDef share the same connectivity.
 void rt_graph_connect(
     RTGraph *g, int src_index, int src_port, int dst_index, int dst_port
 ) {
@@ -1606,16 +1715,16 @@ void rt_graph_connect(
   const std::size_t didx = to_size(dst);
   const std::size_t dport = to_size(dp);
 
-  if (sidx >= g->nodes.size() || didx >= g->nodes.size()) {
+  if (sidx >= g->def.nodes.size() || didx >= g->def.nodes.size()) {
     return;
   }
 
-  NodeRuntime &dst_node = g->nodes[didx];
-  if (dport >= dst_node.input_refs.size()) {
+  NodeSpec &dst_spec = g->def.nodes[didx];
+  if (dport >= dst_spec.input_refs.size()) {
     return;
   }
 
-  dst_node.input_refs[dport] = InputRef{src, sp};
+  dst_spec.input_refs[dport] = InputRef{src, sp};
 }
 
 // Render one block offline into the graph's internal output buses.
@@ -1629,8 +1738,8 @@ void rt_graph_process(RTGraph *g, int nframes) {
     return;
   }
 
-  if (g->output_buses.empty()) {
-    ensure_output_bus_count(*g, 1);
+  if (g->instance.output_buses.empty()) {
+    ensure_output_bus_count(g->instance, 1, g->max_frames);
   }
 
   process_graph(*g, nframes);
@@ -1643,11 +1752,11 @@ int rt_graph_read_bus(RTGraph *g, int bus_index, int nframes, float *out) {
   }
 
   const std::size_t bus = static_cast<std::size_t>(bus_index);
-  if (bus >= g->output_buses.size()) {
+  if (bus >= g->instance.output_buses.size()) {
     return 0;
   }
 
-  const auto &src = g->output_buses[bus];
+  const auto &src = g->instance.output_buses[bus];
   const std::size_t to_copy =
       std::min(static_cast<std::size_t>(nframes), src.size());
   std::copy_n(src.begin(), to_copy, out);
@@ -1677,11 +1786,11 @@ int rt_graph_start_audio(RTGraph *g, int output_channels, int device_id) {
   }
 
   if (output_channels <= 0) {
-    output_channels = std::max(1, static_cast<int>(g->output_buses.size()));
+    output_channels = std::max(1, static_cast<int>(g->instance.output_buses.size()));
   }
 
-  if (g->output_buses.empty()) {
-    ensure_output_bus_count(*g, 1);
+  if (g->instance.output_buses.empty()) {
+    ensure_output_bus_count(g->instance, 1, g->max_frames);
   }
 
   auto stream = open_audio_stream(*g, output_channels, device_id);
