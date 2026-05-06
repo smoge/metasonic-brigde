@@ -42,6 +42,7 @@ module MetaSonic.Bridge.Source
   , busOut
   , busIn
   , busInDelayed
+  , delayL
   , -- * Connection helpers
     audio
   , -- * Uniform UGen view
@@ -208,7 +209,7 @@ constructor's fields are Connections, not raw values — every
 input is uniformly either a constant or a dependency.
 
 The current set covers signal sources, stateless transforms, an envelope
-generator, and bus routing:
+generator, bus routing, and a delay line:
 
   SinOsc, SawOsc, NoiseGen   — signal sources
   Gain, LPF, Add             — stateless signal transforms
@@ -218,6 +219,7 @@ generator, and bus routing:
   BusIn                      — read a signal from a shared audio bus
   BusInDelayed               — read the previous block's snapshot of a bus
                                (the feedback primitive)
+  Delay                      — per-node fractional delay line (q::delay)
 
 Adding a new UGen constructor requires coordinated changes across:
 
@@ -366,6 +368,26 @@ data UGen
     -- 'Param' constant (acting as a bias) or an 'Audio' edge.
     -- Used to bias a bipolar modulator off zero (turning ring mod
     -- into AM, or through-zero FM into vibrato).
+  | Delay !Double !Connection !Connection
+    -- ^ Per-node fractional delay line: max-delay (s, compile-time),
+    -- input signal, delay time (s).
+    --
+    -- The maximum delay time is a compile-time 'Double' (not a
+    -- 'Connection') because it determines the size of the per-node
+    -- ring buffer the runtime allocates at graph load. Choose it
+    -- as the worst-case delay your patch will ever request.
+    --
+    -- The actual delay time is a 'Connection' and may be a constant
+    -- ('Param') or an audio-rate signal. With audio-rate modulation
+    -- the read position is interpolated per sample (linear), so
+    -- moving the delay time produces smooth pitch shifts via the
+    -- usual delay-line tricks (chorus, flanger, vibrato).
+    --
+    -- Stateful: the buffer carries per-sample history. Effect is
+    -- 'Pure' (the buffer is per-instance, not shared); rate is
+    -- 'SampleRate' regardless of input rates.
+    --
+    -- See Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
   | Env !Connection !Connection !Connection !Connection !Connection
     -- ^ ADSR envelope generator: gate, attack (sec), decay (sec),
     -- sustain (linear 0..1), release (sec).
@@ -600,6 +622,36 @@ busOut bus src =
 busIn :: Int -> SynthM Connection
 busIn bus = insertNodeC "busIn" (BusIn bus)
 
+-- | Per-node fractional delay line. Allocates a circular buffer of
+-- @ceil (maxDelay * sampleRate)@ floats per instance and reads back
+-- with linear interpolation, so sub-sample delay times work. The
+-- delay time may be a 'Param' constant or an audio-rate 'Connection'
+-- — modulating it at audio rate yields the standard delay-modulation
+-- effects (chorus, flanger, vibrato by pitch shift).
+--
+-- The maximum delay must be known at graph-construction time
+-- because it sizes the per-instance buffer; runtime requests for a
+-- delay time greater than @maxDelay@ are clamped at the kernel.
+-- Choose @maxDelay@ as the worst case your patch will ever need.
+--
+-- > -- 50 ms slap-back echo
+-- > slapback = runSynth $ do
+-- >   src   <- sinOsc 440.0 0.0
+-- >   d     <- delayL 0.1 src 0.05    -- 50 ms delay, max 100 ms
+-- >   mixed <- add src d
+-- >   out 0 mixed
+--
+-- The "L" suffix follows SuperCollider's naming
+-- (@DelayN@/@DelayL@/@DelayC@): @delayL@ uses linear interpolation,
+-- which is what Q's 'fractional_ring_buffer' provides by default.
+-- See Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
+delayL
+  :: Double      -- ^ maximum delay time in seconds (compile-time)
+  -> Connection  -- ^ input signal
+  -> Connection  -- ^ delay time in seconds
+  -> SynthM Connection
+delayL maxT sig time = insertNodeC "delay" (Delay maxT sig time)
+
 -- | Read the previous block's accumulated contents of a shared audio
 -- bus. The feedback primitive: unlike 'busIn', a 'busInDelayed' creates
 -- *no* ordering constraint with a same-bus 'busOut', so a graph that
@@ -690,10 +742,11 @@ ugenView = \case
   Add a b      -> UGenView KAdd      [a, b]    [connDefault a, connDefault b]
   Env g a d s r ->
     UGenView KEnv [g] [connDefault g, connDefault a, connDefault d, connDefault s, connDefault r]
-  Out ch s          -> UGenView KOut          [s] [fromIntegral ch]
-  BusOut bus s      -> UGenView KBusOut       [s] [fromIntegral bus]
-  BusIn bus         -> UGenView KBusIn        []  [fromIntegral bus]
-  BusInDelayed bus  -> UGenView KBusInDelayed []  [fromIntegral bus]
+  Out ch s          -> UGenView KOut          [s]    [fromIntegral ch]
+  BusOut bus s      -> UGenView KBusOut       [s]    [fromIntegral bus]
+  BusIn bus         -> UGenView KBusIn        []     [fromIntegral bus]
+  BusInDelayed bus  -> UGenView KBusInDelayed []     [fromIntegral bus]
+  Delay maxT s t    -> UGenView KDelay        [s, t] [maxT, connDefault t]
 
 {- Note [Per-UGen projections]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -807,6 +860,7 @@ dependencies = \case
     -- expressed through the 'BusReadDelayed' effect, not through an
     -- 'Audio' Connection. Unlike 'BusIn', no E_r edge either; see
     -- Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
+  Delay _ s t      -> deps [s, t]
   SinOsc a b       -> deps [a, b]
   SawOsc a b       -> deps [a, b]
   NoiseGen         -> []

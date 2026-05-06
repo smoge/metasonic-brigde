@@ -74,12 +74,13 @@ TEST_CASE("kind_from_tag accepts every defined tag") {
     CHECK(rt_graph_kind_supported(10) == 1); // BusOut
     CHECK(rt_graph_kind_supported(11) == 1); // BusIn
     CHECK(rt_graph_kind_supported(12) == 1); // BusInDelayed
+    CHECK(rt_graph_kind_supported(13) == 1); // Delay
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
     CHECK(rt_graph_kind_supported(4) == 0);  // intentional gap
-    CHECK(rt_graph_kind_supported(13) == 0); // first unallocated past KBusInDelayed
+    CHECK(rt_graph_kind_supported(14) == 0); // first unallocated past KDelay
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
 }
@@ -862,6 +863,145 @@ TEST_CASE("BusIn (live) and BusInDelayed (prev) coexist on the same bus") {
     CHECK(advance > 0.05f);
 
     rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Delay (per-node fractional delay line via q::delay)
+// ----------------------------------------------------------------
+//
+// q::delay's read API returns the value at a fractional index that
+// represents (i+1) samples of delay (it reads BEFORE pushing). Our
+// kernel maps user-facing time-in-seconds to samples_back via
+// time*sps, so the perceived delay is effectively (time*sps + 1)
+// samples. The +1 is a sub-millisecond artifact at audio rates and
+// the tests below allow ±2 samples of slop where it matters.
+
+TEST_CASE("Delay: constant input becomes silence then constant after delay catches up") {
+    // Use Add(Param 1.0, Param 0.0) as a trivial constant 1.0 source —
+    // process_add reads control fallbacks per sample when no audio
+    // is wired, which gives us a steady DC signal at 1.0. Pipe that
+    // through a Delay with max=10ms and time=1ms; expect silence for
+    // ~48 samples then constant 1.0 thereafter.
+    constexpr double kDelaySec = 0.001;
+    // 1024-frame block at 48kHz default. 1ms = 48 samples. We allow
+    // ±2 around that to absorb the API's off-by-one.
+    constexpr int kExpectedDelaySamples = 48;
+
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 8);                           // Add (constant)
+    rt_graph_set_control(g, 0, 0, 1.0);                   // a = 1.0
+    rt_graph_set_control(g, 0, 1, 0.0);                   // b = 0.0
+
+    rt_graph_add_node(g, 1, 13);                          // Delay
+    rt_graph_set_control(g, 1, 0, 0.01);                  // max = 10ms
+    rt_graph_set_control(g, 1, 1, kDelaySec);             // time = 1ms
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 2);                           // Out
+    rt_graph_set_control(g, 2, 0, 0.0);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    auto bus0 = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    // Find where the buffer transitions from silence (~0) to constant
+    // (~1.0). That index is the perceived delay length in samples.
+    int silence_end = -1;
+    for (int i = 0; i < kFrames; ++i) {
+        if (std::abs(bus0[i]) > 0.5f) { silence_end = i; break; }
+    }
+    REQUIRE(silence_end >= 0);
+    CHECK(silence_end >= kExpectedDelaySamples - 2);
+    CHECK(silence_end <= kExpectedDelaySamples + 2);
+
+    // After the transition, output should hold steady at 1.0.
+    for (int i = silence_end + 5; i < kFrames; ++i) {
+        INFO("post-delay sample " << i << " should be ≈ 1.0");
+        CHECK(std::abs(bus0[i] - 1.0f) < 1e-3f);
+    }
+}
+
+TEST_CASE("Delay: requested time > max_time saturates safely") {
+    // The kernel clamps t_samples to [0, buf_size - 1]. Verify a
+    // request well beyond max doesn't crash, doesn't produce NaN,
+    // and effectively saturates at the maximum delay (so post-
+    // saturation we still get the constant input back).
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 8);                           // Add 1.0
+    rt_graph_set_control(g, 0, 0, 1.0);
+    rt_graph_set_control(g, 0, 1, 0.0);
+
+    rt_graph_add_node(g, 1, 13);                          // Delay
+    rt_graph_set_control(g, 1, 0, 0.001);                 // max = 1ms (~48 samples)
+    rt_graph_set_control(g, 1, 1, 0.1);                   // requested = 100ms
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 2);                           // Out
+    rt_graph_set_control(g, 2, 0, 0.0);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    auto bus0 = render_bus0(g, kFrames);
+    rt_graph_destroy(g);
+
+    for (auto s : bus0) { CHECK(std::isfinite(s)); }
+    // Max delay is ~48 samples; well past that we still see the
+    // constant input, regardless of the over-large time request.
+    CHECK(std::abs(bus0[kFrames - 1] - 1.0f) < 1e-3f);
+}
+
+TEST_CASE("Delay: continuity across blocks") {
+    // Render two N-frame blocks sequentially and assert the result
+    // matches a single 2N-frame block. This pins that the ring
+    // buffer's read/write pointers survive block boundaries (the
+    // q::delay state lives across calls into process_delay).
+    constexpr int nhalf = 256;
+    constexpr int nfull = 2 * nhalf;
+
+    auto build = [](RTGraph *g) {
+        rt_graph_add_node(g, 0, 1);                       // SinOsc
+        rt_graph_set_control(g, 0, 0, 440.0);
+        rt_graph_add_node(g, 1, 13);                      // Delay
+        rt_graph_set_control(g, 1, 0, 0.01);              // max = 10ms
+        rt_graph_set_control(g, 1, 1, 0.005);             // time = 5ms
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_add_node(g, 2, 2);                       // Out
+        rt_graph_set_control(g, 2, 0, 0.0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+    };
+
+    // Single 2N-frame render.
+    auto *g_full = rt_graph_create(4, nfull);
+    REQUIRE(g_full != nullptr);
+    build(g_full);
+    std::vector<float> full(nfull, 0.0f);
+    rt_graph_process(g_full, nfull);
+    rt_graph_read_bus(g_full, 0, nfull, full.data());
+    rt_graph_destroy(g_full);
+
+    // Two N-frame renders concatenated.
+    auto *g_split = rt_graph_create(4, nfull);
+    REQUIRE(g_split != nullptr);
+    build(g_split);
+    std::vector<float> split(nfull, 0.0f);
+    std::vector<float> half(nhalf, 0.0f);
+    rt_graph_process(g_split, nhalf);
+    rt_graph_read_bus(g_split, 0, nhalf, half.data());
+    std::copy(half.begin(), half.end(), split.begin());
+    rt_graph_process(g_split, nhalf);
+    rt_graph_read_bus(g_split, 0, nhalf, half.data());
+    std::copy(half.begin(), half.end(), split.begin() + nhalf);
+    rt_graph_destroy(g_split);
+
+    float max_diff = 0.0f;
+    for (int i = 0; i < nfull; ++i) {
+        max_diff = std::max(max_diff, std::abs(full[i] - split[i]));
+    }
+    INFO("split vs full max_diff = " << max_diff);
+    CHECK(max_diff < 1e-5f);
 }
 
 TEST_CASE("BusInDelayed feedback path: stable attenuated loop") {

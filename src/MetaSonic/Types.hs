@@ -178,6 +178,13 @@ data NodeKind
     -- "MetaSonic.Bridge.Validate" for why the schedulable graph drops
     -- 'BusReadDelayed' from E_r, and Note [Bus pool double-buffering] in
     -- @tinysynth/rt_graph.cpp@ for the runtime swap.
+  | KDelay
+    -- ^ Per-node fractional delay line. Each instance owns its own
+    -- circular buffer (sized by a compile-time max delay), so this
+    -- introduces no shared resource — its 'Eff' is 'Pure'. Wraps Q's
+    -- @q::delay@ (a 'fractional_ring_buffer' with linear interpolation),
+    -- so the delay time can be sub-sample and modulated at audio rate.
+    -- See Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -285,6 +292,12 @@ kindSpec = \case
   -- and Note [Bus pool double-buffering] in tinysynth/rt_graph.cpp.
   KBusIn        -> KindSpec 11 SampleRate  0 1 "busIn"
   KBusInDelayed -> KindSpec 12 SampleRate  0 1 "busInDelayed"
+  -- Delay line: per-node fractional ring buffer. Stateful (the
+  -- buffer carries per-sample history) so the floor is SampleRate.
+  -- 2 audio inputs: signal, delay-time-in-seconds. 2 controls:
+  -- [max_delay_seconds, delay_time_default]. The runtime allocates
+  -- the buffer lazily at first process() using control 0.
+  KDelay        -> KindSpec 13 SampleRate  2 2 "delay"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to the

@@ -519,6 +519,22 @@ unitTests = testGroup "Unit tests"
           case lowerGraph g of
             Left err -> assertFailure err
             Right ir -> propagateRates (propagateRates ir) @?= ir
+
+      , testCase "Delay: floor SampleRate (stateful per-node ring buffer)" $ do
+          -- The delay's floor is SampleRate because its read/write are
+          -- per-sample and the buffer carries per-sample history. Even
+          -- with all-Param inputs, the floor wins.
+          let g = runSynth $ do
+                _ <- delayL 0.01 (Param 0.0) (Param 0.005)
+                pure ()
+          rateOfFirst KDelay g @?= SampleRate
+
+      , testCase "Delay fed by SinOsc: SampleRate (floor and inputs agree)" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                _ <- delayL 0.01 o (Param 0.005)
+                pure ()
+          rateOfFirst KDelay g @?= SampleRate
       ]
 
   , testCase "kindTag is injective" $
@@ -545,6 +561,7 @@ ugenKind = \case
   BusOut{}        -> KBusOut
   BusIn{}         -> KBusIn
   BusInDelayed{}  -> KBusInDelayed
+  Delay{}         -> KDelay
 
 -- The empty graph: no nodes at all.
 emptyGraph_ :: SynthGraph
@@ -1284,6 +1301,61 @@ crossCuttingTests = testGroup "End-to-end FFI"
             <> show maxDiff)
           (maxDiff < 1e-5)
 
+  , testCase "delayL: 5ms delay shifts a SinOsc output by ~240 samples" $ do
+      -- Render one block of a SinOsc → delayL 0.01 (max) ~ 0.005 (time)
+      -- → Out chain. The kernel's q::delay maps time*sps to a
+      -- fractional read index that produces (time*sps + 1) samples of
+      -- effective delay. At sps=48000, 5ms ≈ 240 samples.
+      --
+      -- The first ~240 output samples should be silence (the buffer
+      -- still holds zeros). After that, the SinOsc output appears.
+      -- We allow ±2 samples of slop and only assert that:
+      --
+      --   * a clear silence-then-signal transition exists
+      --   * the transition lands within 240 ± 5 samples
+      --   * post-transition the peak resembles a sine (≈ 1.0)
+      --
+      -- This is the FFI-level proof that the delay UGen survives
+      -- marshalling, configures the q::delay buffer at load, and
+      -- produces correct output across the boundary.
+      let nframes = 1024
+          sps :: Double
+          sps = 48000.0
+          delaySec = 0.005
+          expectedDelay = round (delaySec * sps) :: Int   -- 240
+          graph = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            d <- delayL 0.01 o (Param delaySec)
+            out 0 d
+      rt <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _  <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                    (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          let samples = map (\(CFloat x) -> x) cs
+
+              -- Locate the silence→signal transition point.
+              isSilent x = abs x < 0.05
+              transition = length (takeWhile isSilent samples)
+
+          assertBool
+            ("expected silence-then-signal transition near sample "
+              <> show expectedDelay <> ", got transition at " <> show transition)
+            (abs (transition - expectedDelay) <= 5)
+
+          -- Post-transition the SinOsc shape should be intact (peak ~1).
+          let postDelay = drop (transition + 20) samples
+              peakPost  = maximum (map abs postDelay)
+          assertBool
+            ("expected post-delay peak ≈ 1.0, got " <> show peakPost)
+            (abs (peakPost - 1.0) < 0.05)
+
   , testCase "Env(gate=0) idle stays silent" $ do
       let nframes = 256
           graph = runSynth $ do
@@ -1346,10 +1418,13 @@ data Op
   | OAddMod    Int Int         -- audio + audio
   | OEnv       Int Double Double Double Double
                                -- gate-source-idx, A, D, S, R
-  | OBusOut         Int Int    -- bus, audio source-index
-  | OBusIn          Int        -- bus
-  | OBusInDelayed   Int        -- bus (feedback-safe reader)
-  | OOut            Int Int    -- channel, source-index
+  | OBusOut         Int Int          -- bus, audio source-index
+  | OBusIn          Int              -- bus
+  | OBusInDelayed   Int              -- bus (feedback-safe reader)
+  | ODelay          Double Double Int
+                                     -- max-time (s), time const (s), signal-idx
+  | ODelayMod       Double Int Int   -- max-time (s), signal-idx, time-source-idx
+  | OOut            Int Int          -- channel, source-index
   deriving (Eq, Show)
 
 genOp :: Gen Op
@@ -1369,6 +1444,16 @@ genOp = oneof
   , OBusOut       <$> choose (0, 3) <*> nonNegInt
   , OBusIn        <$> choose (0, 3)
   , OBusInDelayed <$> choose (0, 3)
+  -- Delay max-time stays bounded so the runtime allocator doesn't
+  -- chase pathological buffer sizes during randomised testing. Time
+  -- (the read offset) is allowed to overshoot the max occasionally;
+  -- the kernel clamps. Both are exercised against propagateRates,
+  -- the kindSpec arity check, and dense lowering by every property.
+  , ODelay        <$> choose (0.001, 0.05)
+                  <*> choose (0.0,   0.04)
+                  <*> nonNegInt
+  , ODelayMod     <$> choose (0.001, 0.05)
+                  <*> nonNegInt <*> nonNegInt
   , OOut          <$> choose (0, 1) <*> nonNegInt
   ]
   where
@@ -1515,6 +1600,27 @@ interpret = go [] S.empty
     go xs r (OBusInDelayed bus : rest) = do
       c <- busInDelayed bus
       go (xs <> [c]) r rest
+
+    -- Delay with a constant time. Floor is SampleRate (stateful),
+    -- effect is Pure (per-instance buffer), so propagation and E_r
+    -- machinery already cover it through the existing properties.
+    go xs r (ODelay maxT t i : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let src = xs !! (i `mod` length xs)
+          c <- delayL maxT src (Param t)
+          go (xs <> [c]) r rest
+
+    -- Delay with audio-rate delay-time modulation: pulls another
+    -- node's output into port 1.
+    go xs r (ODelayMod maxT i j : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let m   = length xs
+              sig = xs !! (i `mod` m)
+              tin = xs !! (j `mod` m)
+          c <- delayL maxT sig tin
+          go (xs <> [c]) r rest
 
     go xs r (OOut ch i : rest)
       | null xs   = go xs r rest

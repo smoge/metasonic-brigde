@@ -10,6 +10,7 @@
 #include "rt_graph.h"
 
 #include <q/fx/biquad.hpp>
+#include <q/fx/delay.hpp>
 #include <q/support/duration.hpp>
 #include <q/support/phase.hpp>
 #include <q/synth/envelope_gen.hpp>
@@ -111,6 +112,7 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KBusOut       = 10           BusOut        = 10
   kindTag KBusIn        = 11           BusIn         = 11
   kindTag KBusInDelayed = 12           BusInDelayed  = 12
+  kindTag KDelay        = 13           Delay         = 13
 
   Bus model: Out, BusOut, BusIn, and BusInDelayed all operate on the
   same bus pool. The pool is double-buffered (g.output_buses for the
@@ -127,6 +129,10 @@ NodeKind must align with the integer tags emitted by the compiler.
   deliberately produces no E_r edge so feedback loops are schedulable.
   See Note [Effect-induced edges (E_r)] in MetaSonic.Bridge.Validate
   and Note [Bus pool double-buffering] below.
+
+  Delay model: Delay nodes own per-instance fractional ring buffers
+  (q::delay). No shared resource, no Eff annotation beyond Pure. See
+  Note [Per-node delay state] below.
 */
 
 enum class NodeKind : int {
@@ -141,6 +147,7 @@ enum class NodeKind : int {
   BusOut       = 10,
   BusIn        = 11,
   BusInDelayed = 12,
+  Delay        = 13,
 };
 
 // Single source of truth for the integer-tag → NodeKind mapping.
@@ -161,6 +168,7 @@ kind_from_tag(int node_kind) noexcept {
   case 10: return NodeKind::BusOut;
   case 11: return NodeKind::BusIn;
   case 12: return NodeKind::BusInDelayed;
+  case 13: return NodeKind::Delay;
   default: return std::nullopt;
   }
 }
@@ -246,10 +254,36 @@ struct EnvState {
   float prev_gate = 0.0f;
 };
 
+/* Note [Per-node delay state]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Delay nodes own a fractional ring buffer (q::delay = basic_delay over
+fractional_ring_buffer<float> with linear interpolation). The buffer
+is sized by control[0] (the compile-time max delay in seconds, sent
+from the Haskell side via UGenView's controls list). The actual delay
+time is control[1] (when port 1 is unconnected) or input port 1 read
+per sample (audio-rate modulation).
+
+The buffer is built lazily on first process() — same pattern as Env
+and LPF — so we have the active sample rate. last_max_time and
+last_sps memos drive a rebuild when either changes, which is
+extremely rare on the audio path (sample rate is fixed once audio is
+opened, max delay never changes for a compiled graph). The rebuild
+loses any prior buffer contents; this is acceptable because it only
+happens when the delay's geometry changes, which is at graph load.
+
+Per-instance buffer means there's no shared resource: Eff is Pure on
+the Haskell side, no E_r edges, scheduling is pure-data-dependency.
+*/
+struct DelayState {
+  std::optional<q::delay> line;
+  double last_max_time = -1.0;
+  float  last_sps      = -1.0f;
+};
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
 using NodeState =
-    std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState>;
+    std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState, DelayState>;
 
 /* Note [NodeRuntime layout]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -428,6 +462,20 @@ static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
     // differs. See Note [Bus pool double-buffering].
     node.controls.resize(1, 0.0); // [bus]
     node.outputs.resize(1);
+    break;
+
+  case NodeKind::Delay:
+    // Per-node fractional delay line. controls[0] is the max delay
+    // time in seconds (used by process_delay to size the q::delay
+    // buffer on first call); controls[1] is the delay-time default
+    // (used per-block when port 1 is unconnected). Two audio inputs:
+    // [signal, delay_time]. One output. State is the q::delay
+    // instance, allocated lazily once we know the active sample rate.
+    // See Note [Per-node delay state].
+    node.controls = {0.2, 0.0};   // [max_time_s, delay_time_s]
+    node.input_refs.resize(2);    // [signal_in, time_in]
+    node.outputs.resize(1);
+    node.state = DelayState{};
     break;
   }
 
@@ -1077,6 +1125,96 @@ static void process_busin_delayed(
   std::copy_n(src.begin(), frames, out.begin());
 }
 
+/* Note [Delay processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Delay kernel wraps q::delay (a fractional ring buffer with
+linear interpolation). For each sample it:
+
+  1. Reads delayed = line(signal[i], samples_back), which atomically
+     pushes the new sample and returns the value at fractional index
+     samples_back into the past.
+  2. Writes delayed to the output buffer.
+
+samples_back is computed as 'delay_time_seconds * sample_rate' and
+clamped to [0, buffer_size - 1] so an out-of-range request can't
+read past the ring. samples_back may be fractional — q::delay's
+linear interpolator handles that, which is what makes the kernel
+suitable for chorus/flanger/vibrato (audio-rate delay-time
+modulation).
+
+When port 1 (delay time) is wired to another node's output, the
+kernel is sample-accurate: it reads the modulator per sample and
+queries the ring at the per-sample fractional index. When port 1 is
+unconnected, the delay time is block-latched from controls[1] —
+same pattern as LPF's freq/q.
+
+If the signal input (port 0) is unconnected, output is silence;
+nothing is pushed into the ring (so a paused signal source doesn't
+"poison" the buffer with stale zeros that later get read out as
+bogus delayed taps).
+
+Buffer (re)allocation is gated on (max_time, sample_rate) memos in
+DelayState, so the steady-state path does no allocation —
+allocation only happens on the very first call and after a sample-
+rate change (which is extraordinarily rare).
+
+See Note [Per-node delay state] for the state struct.
+*/
+static void process_delay(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
+  NodeRuntime &node = g.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+
+  if (sig_in.empty()) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  auto *st = std::get_if<DelayState>(&node.state);
+  assert(st && "Delay node has non-Delay state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  // controls[0] = max_time_s, controls[1] = delay_time_s default.
+  const double max_time = node.controls[0];
+
+  // (Re)build the ring buffer on first call or after a sample-rate /
+  // max-time change. q::delay's constructor sizes the buffer to
+  // ceil(max_time * sps) samples and zero-initialises it.
+  if (!st->line || st->last_sps != g.sample_rate || st->last_max_time != max_time) {
+    st->line.emplace(q::duration{max_time}, g.sample_rate);
+    st->last_sps = g.sample_rate;
+    st->last_max_time = max_time;
+  }
+
+  const auto time_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
+  const float buf_size = static_cast<float>(st->line->size());
+  // Reading at sample 0 means "the value just pushed" (no delay).
+  // Reading at buf_size - 1 means "the maximum delay this buffer
+  // can express." Anything in between is fractional and interpolated.
+  const float max_idx = std::max(0.0f, buf_size - 1.0f);
+
+  if (!time_in.empty()) {
+    // Sample-accurate delay-time modulation.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float t_samples = std::clamp(
+        static_cast<float>(time_in[fi]) * g.sample_rate, 0.0f, max_idx);
+      out[fi] = (*st->line)(sig_in[fi], t_samples);
+    }
+  } else {
+    // Constant delay time from the control default.
+    const float t_samples = std::clamp(
+      static_cast<float>(node.controls[1]) * g.sample_rate, 0.0f, max_idx);
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      out[fi] = (*st->line)(sig_in[fi], t_samples);
+    }
+  }
+}
+
 /* Note [Execution order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 The runtime processes nodes in storage order.
@@ -1142,6 +1280,9 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       break;
     case NodeKind::BusInDelayed:
       process_busin_delayed(g, i, nframes);
+      break;
+    case NodeKind::Delay:
+      process_delay(g, i, nframes);
       break;
     default:
       assert(false && "unhandled NodeKind in process_graph");
