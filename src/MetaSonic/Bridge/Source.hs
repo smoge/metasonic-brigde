@@ -814,25 +814,27 @@ compactness here.
 
 -- | Infer the effect set of a UGen.
 --
--- 'BusOut' / 'BusIn' / 'BusInDelayed' carry per-instance bus numbers, so
--- their effect annotations encode that bus number directly. Crucially,
+-- 'Out' / 'BusOut' / 'BusIn' / 'BusInDelayed' carry per-instance bus numbers,
+-- so their effect annotations encode that bus number directly.
+--
+-- 'Out n' and 'BusOut n' both produce 'BusWrite n'. The two constructors
+-- share a runtime kernel and write into the same bus pool (see Note [Bus
+-- model: SC-style same-cycle audio buses]); the source-level split is
+-- documentation only ("final output" vs. "intermediate routing"). An 'Out n'
+-- in the same graph as a 'BusIn n' must therefore induce the same E_r
+-- writer→reader ordering as a 'BusOut n' would.
+--
 -- 'BusInDelayed' produces 'BusReadDelayed' rather than 'BusRead': the
 -- 'Validate' layer treats those two as semantically distinct (only
--- 'BusRead' contributes to E_r), so a 'BusInDelayed n' can sit anywhere
--- in the schedule relative to a 'BusOut n' — which is exactly what
--- enables feedback loops to typecheck.
---
--- 'Out' is deliberately 'Pure' (not 'BusWrite'): an 'Out' targets a
--- hardware-routed bus that nothing reads back from inside the graph, so
--- it cannot participate in an E_r edge with any 'BusIn' or
--- 'BusInDelayed'. (If you want to read what an 'Out' wrote, use a plain
--- 'BusOut' to the same bus number — 'Out' and 'BusOut' share the same
--- runtime kernel and the same bus pool.)
+-- 'BusRead' contributes to E_r), so a 'BusInDelayed n' can sit anywhere in
+-- the schedule relative to any 'BusWrite n' — which is exactly what enables
+-- feedback loops to typecheck.
 --
 -- See Note [Effects are per-UGen, not per-kind].
 -- See Note [Resource effects] in "MetaSonic.Types".
 -- See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
 inferEff :: UGen -> [Eff]
+inferEff (Out          bus _) = [BusWrite        bus]
 inferEff (BusOut       bus _) = [BusWrite        bus]
 inferEff (BusIn        bus)   = [BusRead         bus]
 inferEff (BusInDelayed bus)   = [BusReadDelayed  bus]

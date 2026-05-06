@@ -320,6 +320,35 @@ unitTests = testGroup "Unit tests"
                     <> " must precede BusIn at " <> show busInPos)
                    (busOutPos < busInPos)
 
+      , testCase "validateAndSort orders Out before BusIn on the same bus" $ do
+          -- Out and BusOut share a runtime kernel and the same bus pool,
+          -- so an Out n must induce the same E_r writer→reader ordering
+          -- against a BusIn n that a BusOut n does. Earlier versions made
+          -- Out 'Pure', a latent bug exposed once cross-template bus
+          -- routing made Out and BusOut's disagreement visible.
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                out 0 o
+                t <- busIn 0
+                busOut 9 t
+          case validateAndSort g of
+            Left err  -> assertFailure $ "validateAndSort failed: " <> err
+            Right ord ->
+              let nodes  = sgNodes g
+                  posOf nid = head [ i | (i, k) <- zip [0..] ord, k == nid ]
+                  outPos = head
+                    [ posOf nid
+                    | (nid, ns) <- M.toList nodes
+                    , case nsUgen ns of Out{} -> True; _ -> False ]
+                  busInPos = head
+                    [ posOf nid
+                    | (nid, ns) <- M.toList nodes
+                    , case nsUgen ns of BusIn{} -> True; _ -> False ]
+              in assertBool
+                   ("Out at " <> show outPos
+                    <> " must precede BusIn at " <> show busInPos)
+                   (outPos < busInPos)
+
       , testCase "validateAndSort rejects a BusOut→BusIn cycle on the same bus" $ do
           -- A node both writes and reads bus 5: BusIn 5 feeds a Gain
           -- whose output is written back via BusOut 5. Structurally
@@ -1485,18 +1514,19 @@ shrinkSynthGraph g =
 
 {- Note [Generator avoids E_r cycles]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-'OBusOut' / 'OBusIn' Ops can interact through bus numbers, so the
-generator could in principle build a graph where 'BusIn n' is
-structurally upstream of a later 'BusOut n', closing a cycle through the
-E_r edge that the scheduler adds. 'validateAndSort' would then reject
-the graph and 'propValidates' would fail — *not* a real bug, just
-generator noise.
+'OBusOut' / 'OOut' / 'OBusIn' Ops can interact through bus numbers, so
+the generator could in principle build a graph where 'BusIn n' is
+structurally upstream of a later 'BusOut n' (or 'Out n' — the two share
+a kernel and a 'BusWrite n' effect), closing a cycle through the E_r
+edge that the scheduler adds. 'validateAndSort' would then reject the
+graph and 'propValidates' would fail — *not* a real bug, just generator
+noise.
 
 The interpreter avoids this by tracking the set of bus numbers already
-"poisoned" by a 'BusIn' op. A later 'OBusOut n' on a poisoned bus is
-silently skipped. With this discipline, no generated graph contains an
-E_r cycle by construction, so all existing properties extend cleanly to
-graphs with bus routing.
+"poisoned" by a 'BusIn' op. A later 'OBusOut n' or 'OOut n' on a poisoned
+bus is silently skipped. With this discipline, no generated graph contains
+an E_r cycle by construction, so all existing properties extend cleanly
+to graphs with bus routing.
 
 'OBusInDelayed' is *deliberately* not in this poisoning set. A
 'BusInDelayed n' carries 'BusReadDelayed n' rather than 'BusRead n',
@@ -1623,8 +1653,9 @@ interpret = go [] S.empty
           go (xs <> [c]) r rest
 
     go xs r (OOut ch i : rest)
-      | null xs   = go xs r rest
-      | otherwise = do
+      | null xs            = go xs r rest
+      | ch  `S.member` r   = go xs r rest  -- skip to avoid an E_r cycle
+      | otherwise          = do
           let src = xs !! (i `mod` length xs)
           out ch src
           go xs r rest
