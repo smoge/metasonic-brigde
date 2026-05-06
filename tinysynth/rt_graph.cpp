@@ -448,11 +448,23 @@ sample-computing function.
     one cycle (0–2pi), overflow wraps phase naturally with no fmod or
     conditional branch.
 
-  * phase_iterator::set updates the per-sample increment (dt), the accumulated
-    phase is preserved. Calling it every block implements block-rate
-    frequency control without phase discontinuities.
+  * phase_iterator::set updates the per-sample increment (_step) from a
+    frequency, leaving the accumulated phase (_phase) untouched. We exploit
+    that for both the constant and modulated paths.
 
   * q::sin is a lookup-table sine that carries no mutable state.
+
+When port 0 (frequency) is wired to another node's output, the kernel
+runs sample-accurately: phase_iter.set() is called every sample with
+the modulator's value, then phase is advanced and the sine is read.
+This is the FM path. When port 0 is unconnected, the kernel sets the
+phase increment once per block from the control default — same cost as
+before.
+
+The phase port (port 1) is currently consumed only as an initial-phase
+control via set_osc_initial_phase at graph load. Wiring an audio source
+to port 1 has no effect today; phase modulation (PM) needs a separate
+runtime path that adds to _phase per sample.
 */
 
 static void process_sinosc(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
@@ -460,7 +472,6 @@ static void process_sinosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto freq_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
 
-  const float freq = !freq_in.empty() ? freq_in[0] : node.controls[0];
   auto *osc = std::get_if<OscState>(&node.state);
   assert(osc && "SinOsc node has non-oscillator state");
   if (!osc) {
@@ -468,11 +479,21 @@ static void process_sinosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
     return;
   }
 
-  // update per-sample increment, preserving accumulated phase across blocks
-  osc->phase_iter.set(q::frequency{static_cast<double>(freq)}, g.sample_rate);
-
-  for (int i = 0; i < nframes; ++i) {
-    out[static_cast<std::size_t>(i)] = q::sin(osc->phase_iter++);
+  if (!freq_in.empty()) {
+    // Sample-accurate FM: update the phase increment per sample.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      osc->phase_iter.set(
+          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      out[fi] = q::sin(osc->phase_iter++);
+    }
+  } else {
+    // Constant frequency: set the increment once per block.
+    const float freq = node.controls[0];
+    osc->phase_iter.set(q::frequency{static_cast<double>(freq)}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      out[static_cast<std::size_t>(i)] = q::sin(osc->phase_iter++);
+    }
   }
 }
 
@@ -480,14 +501,16 @@ static void process_sinosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SawOsc is just like SinOsc: q::phase_iterator accumulates phase across blocks
-and q::saw computes.
+and q::saw computes the sample using poly-BLEP antialiasing. The phase_iterator
+supplies both the current phase and the per-sample step (dt) for the BLEP
+correction term, so updating freq via phase_iter.set() also refreshes dt for
+the BLEP — no separate bookkeeping needed.
 
-In the case of SawOsc, it uses poly-BLEP antialiasing. The phase_iterator
-supplies both the current phase and the per-sample step (dt) for BLEP correction
-term.
+Frequency follows the same rule as SinOsc: when port 0 is wired, the kernel
+updates phase_iter per sample (sample-accurate FM); otherwise the increment
+is set once per block from the control default.
 
-Frequency is block-latched for now. TODO: implement frequency control at sample
-rate.
+Phase port (port 1) is initial-only, same as SinOsc.
 */
 
 static void process_sawosc(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
@@ -495,17 +518,28 @@ static void process_sawosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto freq_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
 
-  const float freq = !freq_in.empty() ? freq_in[0] : node.controls[0];
   auto *osc = std::get_if<OscState>(&node.state);
   assert(osc && "SawOsc node has non-oscillator state");
   if (!osc) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
-  osc->phase_iter.set(q::frequency{static_cast<double>(freq)}, g.sample_rate);
 
-  for (int i = 0; i < nframes; ++i) {
-    out[static_cast<std::size_t>(i)] = q::saw(osc->phase_iter++);
+  if (!freq_in.empty()) {
+    // Sample-accurate FM: update the phase increment per sample.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      osc->phase_iter.set(
+          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      out[fi] = q::saw(osc->phase_iter++);
+    }
+  } else {
+    // Constant frequency: set the increment once per block.
+    const float freq = node.controls[0];
+    osc->phase_iter.set(q::frequency{static_cast<double>(freq)}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      out[static_cast<std::size_t>(i)] = q::saw(osc->phase_iter++);
+    }
   }
 }
 
