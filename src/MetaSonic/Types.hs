@@ -157,6 +157,7 @@ data NodeKind
   | KSawOsc
   | KNoiseGen
   | KLPF
+  | KAdd
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -169,6 +170,7 @@ kindTag KBiquad   = 4
 kindTag KSawOsc   = 5
 kindTag KNoiseGen = 6
 kindTag KLPF      = 7
+kindTag KAdd      = 8
 
 {- Note [Rate discipline]
 ~~~~~~~~~~~~~~~~~~~~~~~~~

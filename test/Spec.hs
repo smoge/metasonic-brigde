@@ -86,6 +86,15 @@ ringModGraph = runSynth $ do
   amped     <- gain ring 0.3
   out 0 amped
 
+fmGraph :: SynthGraph
+fmGraph = runSynth $ do
+  lfo       <- sinOsc 5.0 0.0
+  deviation <- gain lfo 30.0
+  freq      <- add 440.0 deviation
+  carrier   <- sinOsc' (audio freq) (Param 0.0)
+  amped     <- gain carrier 0.3
+  out 0 amped
+
 demoGraphs :: [(String, SynthGraph)]
 demoGraphs =
   [ ("simple",    simpleGraph)
@@ -94,6 +103,7 @@ demoGraphs =
   , ("saw",       sawGraph)
   , ("noise-lpf", noiseLpfGraph)
   , ("ringmod",   ringModGraph)
+  , ("fm",        fmGraph)
   ]
 
 ------------------------------------------------------------
@@ -158,6 +168,33 @@ unitTests = testGroup "Unit tests"
           in assertBool
                "expected a Gain node with two RFrom inputs in ringmod"
                (any hasTwoAudioInputs (rgNodes rt))
+
+  , testCase "fm: a SinOsc has its frequency port wired as RFrom" $
+      case lowerGraph fmGraph >>= compileRuntimeGraph of
+        Left err -> assertFailure err
+        Right rt ->
+          let -- The FM carrier is a SinOsc whose port-0 (freq) input
+              -- is RFrom (audio-rate modulator). The LFO SinOsc has
+              -- port-0 as RConst (literal 5 Hz).
+              hasModulatedFreq n = case (rnKind n, rnInputs n) of
+                (KSinOsc, RFrom _ _ : _) -> True
+                _                        -> False
+          in assertBool
+               "expected a SinOsc with RFrom on port 0 in fm graph"
+               (any hasModulatedFreq (rgNodes rt))
+
+  , testCase "fm: contains an Add node biasing freq off zero" $
+      case lowerGraph fmGraph >>= compileRuntimeGraph of
+        Left err -> assertFailure err
+        Right rt ->
+          let -- The Add node should have 440.0 as its first control
+              -- (the bias) and an RFrom on port 1 (the deviation).
+              isVibratoBias n = case (rnKind n, rnControls n, rnInputs n) of
+                (KAdd, 440.0 : _, _ : RFrom _ _ : _) -> True
+                _                                    -> False
+          in assertBool
+               "expected an Add node with bias=440.0 and modulated port 1"
+               (any isVibratoBias (rgNodes rt))
   ]
 
 -- A hand-built graph that references a non-existent NodeID. The DSL

@@ -35,6 +35,7 @@ module MetaSonic.Bridge.Source
   , out
   , gain
   , lpf
+  , add
   , -- * DSL combinators (modulatable inputs)
     --
     -- $modulation
@@ -43,6 +44,7 @@ module MetaSonic.Bridge.Source
   , sawOsc'
   , gain'
   , lpf'
+  , add'
   , -- * Dependency extraction
     dependencies
   ) where
@@ -237,6 +239,11 @@ data UGen
     -- ^ Low-pass filter: signal in, cutoff frequency, Q factor.
   | Gain !Connection !Connection
     -- ^ Multiply: input signal, gain amount.
+  | Add !Connection !Connection
+    -- ^ Sum two inputs sample-by-sample. Either input may be a
+    -- 'Param' constant (acting as a bias) or an 'Audio' edge.
+    -- Used to bias a bipolar modulator off zero (turning ring mod
+    -- into AM, or through-zero FM into vibrato).
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -426,6 +433,12 @@ gain :: NodeID -> Float -> SynthM NodeID
 gain src amount =
   insertNode "gain" (Gain (Audio src (PortIndex 0)) (Param amount))
 
+-- | Add a constant bias to a signal: @add bias src@ produces
+-- @bias + src[i]@ at each sample.
+add :: Float -> NodeID -> SynthM NodeID
+add bias src =
+  insertNode "add" (Add (Param bias) (Audio src (PortIndex 0)))
+
 {- $modulation
 
 The primed combinators ('sinOsc'', 'sawOsc'', 'gain'', 'lpf'') accept raw
@@ -474,6 +487,12 @@ gain' sig amount = insertNode "gain" (Gain sig amount)
 lpf' :: Connection -> Connection -> Connection -> SynthM NodeID
 lpf' sig freq q = insertNode "lpf" (LPF sig freq q)
 
+-- | Sum two inputs with explicit 'Connection' arguments. Either or
+-- both may be 'Audio' edges, so this is sample-accurate addition
+-- regardless of input shape.
+add' :: Connection -> Connection -> SynthM NodeID
+add' a b = insertNode "add" (Add a b)
+
 -- | Extract explicit structural 'NodeID' dependencies from
 -- a 'UGen'.
 --
@@ -496,6 +515,7 @@ dependencies = \case
   NoiseGen    -> []
   LPF a b c   -> deps [a, b, c]
   Gain a b    -> deps [a, b]
+  Add a b     -> deps [a, b]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

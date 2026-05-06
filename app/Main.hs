@@ -91,6 +91,18 @@ ringModGraph = runSynth $ do
   amped     <- gain ring 0.3
   out 0 amped
 
+-- Vibrato: a 5 Hz LFO biased by 440 Hz drives the carrier's
+-- frequency between 410 and 470 Hz. Demonstrates the full bias-and-
+-- scale pattern: gain to set deviation depth, add to set the centre.
+fmGraph :: SynthGraph
+fmGraph = runSynth $ do
+  lfo       <- sinOsc 5.0 0.0
+  deviation <- gain lfo 30.0      -- ±30 Hz
+  freq      <- add 440.0 deviation
+  carrier   <- sinOsc' (audio freq) (Param 0.0)
+  amped     <- gain carrier 0.3
+  out 0 amped
+
 demoTable :: [Demo]
 demoTable =
   [ Demo "simple"    "Simple (SinOsc → Out)"                           simpleGraph
@@ -102,6 +114,7 @@ demoTable =
   , Demo "saw-lpf"   "Resonant bass (SawOsc → LPF → Gain → Out)"      filteredSawGraph
   , Demo "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"  detunedSawGraph
   , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"        ringModGraph
+  , Demo "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)" fmGraph
   ]
 
 data Demo = Demo

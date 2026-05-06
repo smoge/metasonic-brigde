@@ -103,6 +103,7 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KSawOsc   = 5                SawOsc   = 5
   kindTag KNoiseGen = 6                NoiseGen = 6
   kindTag KLPF      = 7                LPF      = 7
+  kindTag KAdd      = 8                Add      = 8
 
 */
 
@@ -113,6 +114,7 @@ enum class NodeKind : int {
   SawOsc = 5,
   NoiseGen = 6,
   LPF = 7,
+  Add = 8,
 };
 
 /* Note [Input references and control fallback]
@@ -305,6 +307,12 @@ static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
     node.input_refs.resize(3);         // [signal_in, freq_in, q_in]
     node.outputs.resize(1);
     node.state = LPFState{};
+    break;
+
+  case NodeKind::Add:
+    node.controls.resize(2, 0.0f); // [a_default, b_default] — fallbacks
+    node.input_refs.resize(2);     // [a_in, b_in]
+    node.outputs.resize(1);
     break;
   }
 
@@ -657,6 +665,36 @@ static void process_gain(RTGraph &g, std::size_t node_idx, int nframes) noexcept
   }
 }
 
+/* Note [Add processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Add is a sample-accurate two-input sum. Either input may be wired to
+another node's output (read per sample) or left unconnected (in which
+case the corresponding control default is used as a constant).
+
+The control defaults come from any 'Param' literals on the source side:
+@add 440.0 mod@ lowers to an Add node with control[0]=440.0 and port 1
+wired to mod, so the kernel computes 440.0 + mod[i] per sample. This is
+the canonical bias use case (turning a bipolar modulator into a
+modulated frequency or amplitude).
+*/
+
+static void process_add(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
+  NodeRuntime &node = g.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto a_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+  const auto b_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
+
+  const float a_const = node.controls[0];
+  const float b_const = node.controls[1];
+
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    const float a = !a_in.empty() ? a_in[fi] : a_const;
+    const float b = !b_in.empty() ? b_in[fi] : b_const;
+    out[fi] = a + b;
+  }
+}
+
 /* Note [Out node processing — direct bus accumulation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out is a pure sink: it accumulates its input signal into a shared
@@ -730,6 +768,9 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       break;
     case NodeKind::LPF:
       process_lpf(g, i, nframes);
+      break;
+    case NodeKind::Add:
+      process_add(g, i, nframes);
       break;
     default:
       assert(false && "unhandled NodeKind in process_graph");
@@ -972,6 +1013,9 @@ void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
     break;
   case 7:
     kind = NodeKind::LPF;
+    break;
+  case 8:
+    kind = NodeKind::Add;
     break;
   default:
     std::fprintf(stderr, "Unknown node kind: %d\n", node_kind);

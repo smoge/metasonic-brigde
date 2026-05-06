@@ -171,6 +171,7 @@ inferRate = \case
   LPF _ _ _    -> SampleRate
   Out _ _      -> SampleRate
   Gain _ _     -> SampleRate
+  Add _ _      -> SampleRate
   BusOut _ _   -> SampleRate
   BusIn _      -> SampleRate
 
@@ -190,6 +191,7 @@ inferEff = \case
   LPF _ _ _    -> [Pure]
   Out _ _      -> [Pure]
   Gain _ _     -> [Pure]
+  Add _ _      -> [Pure]
   BusOut _ _   -> [Pure]
   BusIn _      -> [Pure]
 
@@ -370,6 +372,7 @@ inferKind = \case
   LPF _ _ _    -> KLPF
   Out _ _      -> KOut
   Gain _ _     -> KGain
+  Add _ _      -> KAdd
   BusOut _ _   -> error "inferKind: BusOut not fully implemented yet"
   BusIn _      -> error "inferKind: BusIn not fully implemented yet"
 
@@ -384,6 +387,7 @@ lowerInputs = \case
   LPF sig freq q       -> [lowerConn sig, lowerConn freq, lowerConn q]
   Out _ sig            -> [lowerConn sig]
   Gain sig amt         -> [lowerConn sig, lowerConn amt]
+  Add a b              -> [lowerConn a, lowerConn b]
   BusOut _ sig         -> [lowerConn sig]
   BusIn _              -> []
 
@@ -403,6 +407,7 @@ extractControls = \case
   LPF _ freq q       -> [connDefault freq, connDefault q]
   Out bus _          -> [fromIntegral bus]
   Gain _ amt         -> [connDefault amt]
+  Add a b            -> [connDefault a, connDefault b]
   BusOut bus _       -> [fromIntegral bus]
   BusIn bus          -> [fromIntegral bus]
   where
