@@ -82,7 +82,7 @@ annotation system that the IR introduces.
 A Connection is the atomic unit of wiring in the source graph.
 It is either an audio-rate edge from another node's output
 port (Audio NodeID PortIndex), or a literal parameter value
-(Param Float).
+(Param Double).
 
 This distinction matters for compilation:
 
@@ -137,7 +137,7 @@ data Connection
   = Audio !NodeID !PortIndex
     -- ^ An audio-rate edge. Creates a data dependency that
     -- constrains execution order.
-  | Param !Float
+  | Param !Double
     -- ^ A literal parameter value. No dependency; known at
     -- graph construction time.
   deriving stock    (Eq, Show, Generic)

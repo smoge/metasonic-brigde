@@ -320,11 +320,11 @@ propValidates g = case validateAndSort g of
 -- the very start, before any source has been added.
 
 data Op
-  = OSinOsc Float Float
-  | OSawOsc Float Float
+  = OSinOsc Double Double
+  | OSawOsc Double Double
   | ONoise
-  | OGain   Int Float        -- source-index, gain amount
-  | OLPF    Int Float Float  -- source-index, cutoff, q
+  | OGain   Int Double       -- source-index, gain amount
+  | OLPF    Int Double Double  -- source-index, cutoff, q
   | OOut    Int Int          -- channel, source-index
   deriving (Eq, Show)
 

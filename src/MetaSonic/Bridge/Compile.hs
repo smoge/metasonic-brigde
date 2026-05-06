@@ -355,7 +355,7 @@ source node. The runtime does not distinguish the two cases.
 data RuntimeInput
   = RFrom  !NodeIndex !PortIndex
     -- ^ Read from node at this dense index, this port.
-  | RConst !Float
+  | RConst !Double
     -- ^ Compile-time constant (was a 'Literal' in the IR).
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
@@ -378,7 +378,7 @@ data RuntimeNode = RuntimeNode
     -- ^ Dense input references. Each 'RFrom' points to a
     -- node that appears earlier in the array (guaranteed
     -- by topological ordering).
-  , rnControls   :: ![Float]
+  , rnControls   :: ![Double]
     -- ^ Default control values, sent to C++ at load time.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)

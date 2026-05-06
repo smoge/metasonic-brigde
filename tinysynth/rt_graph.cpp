@@ -181,8 +181,8 @@ struct NoiseGenState {
 // controls.
 struct LPFState {
   q::lowpass filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
-  float last_freq = -1.0f;
-  float last_q = -1.0f;
+  double last_freq = -1.0;
+  double last_q = -1.0;
 };
 
 // Stateless nodes use monostate: this keeps each runtime node from dealing
@@ -209,7 +209,7 @@ configure_node and keeps processing kernels compact.
 
 struct NodeRuntime {
   NodeKind kind = NodeKind::Out;
-  std::vector<float> controls;
+  std::vector<double> controls;
   std::vector<InputRef> input_refs;
   std::vector<std::vector<float>> outputs;
   NodeState state{};
@@ -322,7 +322,7 @@ static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
     break;
 
   case NodeKind::LPF:
-    node.controls = {1000.0f, 0.707f}; // [cutoff_freq, q]
+    node.controls = {1000.0, 0.707}; // [cutoff_freq, q]
     node.input_refs.resize(3);         // [signal_in, freq_in, q_in]
     node.outputs.resize(1);
     node.state = LPFState{};
@@ -448,14 +448,14 @@ static void clear_output_buses(RTGraph &g, int nframes) noexcept {
   }
 }
 
-void set_osc_initial_phase(NodeRuntime &node, float value) noexcept {
+void set_osc_initial_phase(NodeRuntime &node, double value) noexcept {
   auto *osc = std::get_if<OscState>(&node.state);
   assert(osc && "oscillator node has non-oscillator state");
   if (!osc) {
     return;
   }
 
-  const float frac = std::isfinite(value) ? value - std::floor(value) : 0.0F;
+  const double frac = std::isfinite(value) ? value - std::floor(value) : 0.0;
 
   // Note [Phase setting semantics]
   // q::phase_iterator has no public API for setting _phase independently of _step.
@@ -463,7 +463,7 @@ void set_osc_initial_phase(NodeRuntime &node, float value) noexcept {
   // operator=(phase) also sets _step, not _phase — a counterintuitive trap.
   //
   // Let's keep this direct field access here so a Q API change breaks in one place...
-  osc->phase_iter._phase = q::frac_to_phase(static_cast<double>(frac));
+  osc->phase_iter._phase = q::frac_to_phase(frac);
 }
 
 /* Note [SinOsc processing semantics]
@@ -516,8 +516,8 @@ static void process_sinosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
     }
   } else {
     // Constant frequency: set the increment once per block.
-    const float freq = node.controls[0];
-    osc->phase_iter.set(q::frequency{static_cast<double>(freq)}, g.sample_rate);
+    const double freq = node.controls[0];
+    osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       out[static_cast<std::size_t>(i)] = q::sin(osc->phase_iter++);
     }
@@ -562,8 +562,8 @@ static void process_sawosc(RTGraph &g, std::size_t node_idx, int nframes) noexce
     }
   } else {
     // Constant frequency: set the increment once per block.
-    const float freq = node.controls[0];
-    osc->phase_iter.set(q::frequency{static_cast<double>(freq)}, g.sample_rate);
+    const double freq = node.controls[0];
+    osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       out[static_cast<std::size_t>(i)] = q::saw(osc->phase_iter++);
     }
@@ -629,8 +629,8 @@ static void process_lpf(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
   const auto freq_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
   const auto q_in = resolve_input(g.nodes, node, PortIndex{2}, nframes);
 
-  const float freq = !freq_in.empty() ? freq_in[0] : node.controls[0];
-  const float q_val = !q_in.empty() ? q_in[0] : node.controls[1];
+  const double freq = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
+  const double q_val = !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1];
 
   auto *lpf = std::get_if<LPFState>(&node.state);
   assert(lpf && "LPF node has non-LPF state");
@@ -641,7 +641,7 @@ static void process_lpf(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
 
   if (freq != lpf->last_freq || q_val != lpf->last_q) {
     lpf->filter.config(
-        q::frequency{static_cast<double>(freq)}, g.sample_rate, static_cast<double>(q_val)
+        q::frequency{freq}, g.sample_rate, q_val
     );
     lpf->last_freq = freq;
     lpf->last_q = q_val;
@@ -682,7 +682,7 @@ static void process_gain(RTGraph &g, std::size_t node_idx, int nframes) noexcept
     }
   } else {
     // Constant gain from the control default.
-    const float amount = node.controls[0];
+    const float amount = static_cast<float>(node.controls[0]);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       out[fi] = sig_in[fi] * amount;
@@ -709,8 +709,8 @@ static void process_add(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
   const auto a_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
   const auto b_in = resolve_input(g.nodes, node, PortIndex{1}, nframes);
 
-  const float a_const = node.controls[0];
-  const float b_const = node.controls[1];
+  const float a_const = static_cast<float>(node.controls[0]);
+  const float b_const = static_cast<float>(node.controls[1]);
 
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
@@ -1055,7 +1055,7 @@ int rt_graph_kind_supported(int node_kind) {
 }
 
 // Set one control slot on one node.
-void rt_graph_set_control(RTGraph *g, int node_index, int control_index, float value) {
+void rt_graph_set_control(RTGraph *g, int node_index, int control_index, double value) {
   if (!g) {
     return;
   }

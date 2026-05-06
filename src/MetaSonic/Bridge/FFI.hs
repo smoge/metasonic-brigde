@@ -86,7 +86,7 @@ Step 5b is the realtime path for q_io / PortAudio output.
 Steps 1 and 6 are managed by withRTGraph via bracket.
 
 The integer-based wire format (node kinds as ints, indices as
-ints, controls as floats) is deliberately simple: it avoids
+ints, controls as doubles) is deliberately simple: it avoids
 any C++ types in the ABI, ensuring that the boundary is
 portable and trivially serializable.
 
@@ -213,7 +213,7 @@ foreign import ccall unsafe "rt_graph_add_node"
   c_rt_graph_add_node :: Ptr RTGraph -> CInt -> CInt -> IO ()
 
 foreign import ccall unsafe "rt_graph_set_control"
-  c_rt_graph_set_control :: Ptr RTGraph -> CInt -> CInt -> CFloat -> IO ()
+  c_rt_graph_set_control :: Ptr RTGraph -> CInt -> CInt -> CDouble -> IO ()
 
 foreign import ccall unsafe "rt_graph_connect"
   c_rt_graph_connect :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
@@ -307,7 +307,7 @@ loadRuntimeGraph g rg = do
         c_rt_graph_set_control g
           (cNodeIndex    (rnIndex node))
           (cControlIndex (ControlIndex i))
-          (CFloat v)
+          (CDouble v)
 
     wireNode :: RuntimeNode -> IO ()
     wireNode node =

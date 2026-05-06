@@ -43,7 +43,7 @@ The IR is the compiler's internal representation, stripped of the DSL vocabulary
   ──────────────     ──────────     ──────────────────────
   Audio NodeID p     FromNode nid p  renamed; rate info moves
                                      to the node's irRate field
-  Param Float        Literal Float   renamed
+  Param Double       Literal Double  renamed
   UGen               NodeIR          annotated with Rate, [Eff]
   Connection         InputConn       uniform dependency/constant
   SynthGraph         GraphIR         nodes in execution order
@@ -67,7 +67,7 @@ lowering] in MetaSonic.Compile.
 data InputConn
   = FromNode !NodeID !PortIndex
     -- ^ A dependency on another node's output port.
-  | Literal  !Float
+  | Literal  !Double
     -- ^ A compile-time constant. Carries no dependency.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
@@ -89,7 +89,7 @@ data NodeIR = NodeIR
   , irInputs   :: ![InputConn]
     -- ^ The data dependency edges. Only FromNode entries
     -- create execution-order constraints.
-  , irControls :: ![Float]
+  , irControls :: ![Double]
     -- ^ Default control values, sent to C++ at graph load
     -- time. Serve as fallbacks when no audio-rate input
     -- is connected.
@@ -399,7 +399,7 @@ lowerConn (Param x)        = Literal x
 -- connections.
 --
 -- See Note [Per-node lowering].
-extractControls :: UGen -> [Float]
+extractControls :: UGen -> [Double]
 extractControls = \case
   SinOsc freq phase  -> [connDefault freq, connDefault phase]
   SawOsc freq phase  -> [connDefault freq, connDefault phase]

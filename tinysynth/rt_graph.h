@@ -14,7 +14,7 @@ void rt_graph_clear(RTGraph *g);
 // Graph construction
 void rt_graph_add_node(RTGraph *g, int node_index, int node_kind);
 void rt_graph_set_control(RTGraph *g, int node_index, int control_index,
-                          float value);
+                          double value);
 void rt_graph_connect(RTGraph *g, int src_index, int src_port, int dst_index,
                       int dst_port);
 
