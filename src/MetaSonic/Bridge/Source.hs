@@ -28,13 +28,21 @@ module MetaSonic.Bridge.Source
   , -- * Builder monad
     SynthM
   , runSynth
-  , -- * DSL combinators
+  , -- * DSL combinators (constant inputs)
     sinOsc
   , sawOsc
   , noiseGen
   , out
   , gain
   , lpf
+  , -- * DSL combinators (modulatable inputs)
+    --
+    -- $modulation
+    audio
+  , sinOsc'
+  , sawOsc'
+  , gain'
+  , lpf'
   , -- * Dependency extraction
     dependencies
   ) where
@@ -417,6 +425,54 @@ busIn bus = insertNode "busIn" (BusIn bus)
 gain :: NodeID -> Float -> SynthM NodeID
 gain src amount =
   insertNode "gain" (Gain (Audio src (PortIndex 0)) (Param amount))
+
+{- $modulation
+
+The primed combinators ('sinOsc'', 'sawOsc'', 'gain'', 'lpf'') accept raw
+'Connection' values for every input slot, so any input can be either a
+'Param' constant or an 'Audio' edge from another node's output. This is
+how one node modulates another at audio rate (FM, AM, ring modulation,
+audio-rate filter cutoff).
+
+The unprimed combinators are kept for the common case where every input
+is a constant.
+
+>>> -- Ring modulation: carrier * modulator at audio rate
+>>> ringModGraph = runSynth $ do
+>>>   carrier   <- sinOsc 440.0 0.0
+>>>   modulator <- sinOsc 7.0 0.0
+>>>   ring      <- gain' (audio carrier) (audio modulator)
+>>>   out 0 ring
+
+The 'audio' helper lifts a 'NodeID' to a 'Connection' on output port 0
+(the only port any current UGen exposes).
+-}
+
+-- | Lift a 'NodeID' to an audio-rate 'Connection' on output port 0.
+audio :: NodeID -> Connection
+audio n = Audio n (PortIndex 0)
+
+-- | Sine oscillator with explicit 'Connection' inputs. Either input may
+-- be a 'Param' constant or an 'Audio' edge from another node, enabling
+-- audio-rate frequency modulation (FM) and phase modulation.
+sinOsc' :: Connection -> Connection -> SynthM NodeID
+sinOsc' freq phase = insertNode "sinOsc" (SinOsc freq phase)
+
+-- | Bandlimited sawtooth with explicit 'Connection' inputs.
+sawOsc' :: Connection -> Connection -> SynthM NodeID
+sawOsc' freq phase = insertNode "sawOsc" (SawOsc freq phase)
+
+-- | Multiply with explicit 'Connection' inputs. With both inputs as
+-- 'Audio' edges this is sample-accurate amplitude modulation (ring
+-- modulation when both signals are bipolar).
+gain' :: Connection -> Connection -> SynthM NodeID
+gain' sig amount = insertNode "gain" (Gain sig amount)
+
+-- | Low-pass filter with explicit 'Connection' inputs. Note: audio-rate
+-- modulation of cutoff or Q produces zipper artifacts with the current
+-- biquad implementation; treat this as control-rate for now.
+lpf' :: Connection -> Connection -> Connection -> SynthM NodeID
+lpf' sig freq q = insertNode "lpf" (LPF sig freq q)
 
 -- | Extract explicit structural 'NodeID' dependencies from
 -- a 'UGen'.
