@@ -67,12 +67,13 @@ TEST_CASE("kind_from_tag accepts every defined tag") {
     CHECK(rt_graph_kind_supported(6) == 1); // NoiseGen
     CHECK(rt_graph_kind_supported(7) == 1); // LPF
     CHECK(rt_graph_kind_supported(8) == 1); // Add
+    CHECK(rt_graph_kind_supported(9) == 1); // Env
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
     CHECK(rt_graph_kind_supported(4) == 0); // intentional gap
-    CHECK(rt_graph_kind_supported(9) == 0);
+    CHECK(rt_graph_kind_supported(10) == 0);
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
 }

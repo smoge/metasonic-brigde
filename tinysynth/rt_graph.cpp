@@ -10,7 +10,9 @@
 #include "rt_graph.h"
 
 #include <q/fx/biquad.hpp>
+#include <q/support/duration.hpp>
 #include <q/support/phase.hpp>
+#include <q/synth/envelope_gen.hpp>
 #include <q/synth/noise_gen.hpp>
 #include <q/synth/saw_osc.hpp>
 #include <q/synth/sin_osc.hpp>
@@ -105,6 +107,7 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KNoiseGen = 6                NoiseGen = 6
   kindTag KLPF      = 7                LPF      = 7
   kindTag KAdd      = 8                Add      = 8
+  kindTag KEnv      = 9                Env      = 9
 
 */
 
@@ -116,6 +119,7 @@ enum class NodeKind : int {
   NoiseGen = 6,
   LPF = 7,
   Add = 8,
+  Env = 9,
 };
 
 // Single source of truth for the integer-tag → NodeKind mapping.
@@ -132,6 +136,7 @@ kind_from_tag(int node_kind) noexcept {
   case 6: return NodeKind::NoiseGen;
   case 7: return NodeKind::LPF;
   case 8: return NodeKind::Add;
+  case 9: return NodeKind::Env;
   default: return std::nullopt;
   }
 }
@@ -185,9 +190,42 @@ struct LPFState {
   double last_q = -1.0;
 };
 
+/* Note [Envelope state]
+~~~~~~~~~~~~~~~~~~~~~~~~
+EnvState wraps q::adsr_envelope_gen plus the bookkeeping needed for the
+runtime's reconfigure-on-change discipline:
+
+  * 'env' — the q ADSR generator. Constructed lazily on first process() so
+    we can hand it the active sample rate rather than kDefaultSampleRate.
+  * 'last_*' — the last A/D/S/R/sps values applied to the ramp segments.
+    Initialised to -1 so the first process call reconfigures the segments
+    against the current controls.
+  * 'prev_gate' — sample-by-sample edge detection. A rising edge calls
+    env.attack(), a falling edge calls env.release(). The threshold is
+    fixed at 0.5 so a gate held at @Param 1@ stays in attack/decay/sustain
+    until a downward transition.
+
+q::adsr_envelope_gen owns four segments (attack, decay, sustain, release).
+We expose attack/decay/release rates and a linear sustain *level* — not q's
+own decibel sustain_level setter, which writes to the wrong segment. We set
+segment[1].level() (decay's destination, equal to the sustain plateau)
+directly. The sustain *rate* (q's slow background fade during sustain) is
+held at the q default of 50 s.
+*/
+struct EnvState {
+  std::optional<q::adsr_envelope_gen> env;
+  double last_a = -1.0;
+  double last_d = -1.0;
+  double last_s = -1.0;
+  double last_r = -1.0;
+  float last_sps = -1.0f;
+  float prev_gate = 0.0f;
+};
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
-using NodeState = std::variant<std::monostate, OscState, NoiseGenState, LPFState>;
+using NodeState =
+    std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState>;
 
 /* Note [NodeRuntime layout]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -332,6 +370,14 @@ static void configure_node(NodeRuntime &node, NodeKind kind, int max_frames) {
     node.controls.resize(2, 0.0f); // [a_default, b_default] — fallbacks
     node.input_refs.resize(2);     // [a_in, b_in]
     node.outputs.resize(1);
+    break;
+
+  case NodeKind::Env:
+    // [gate_default, attack_s, decay_s, sustain_lin, release_s]
+    node.controls = {0.0, 0.01, 0.05, 0.5, 0.1};
+    node.input_refs.resize(1); // [gate_in]
+    node.outputs.resize(1);
+    node.state = EnvState{};
     break;
   }
 
@@ -720,6 +766,83 @@ static void process_add(RTGraph &g, std::size_t node_idx, int nframes) noexcept 
   }
 }
 
+/* Note [Envelope processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The envelope kernel does three things per block:
+
+  1. Reconfigure the q ramp segments if A/D/S/R or sps changed since the
+     last block (block-rate parameter latching, same idiom as LPF).
+  2. Walk the gate input sample-by-sample, calling env.attack() on a rising
+     edge and env.release() on a falling edge. The gate falls back to the
+     control default (slot 0) if no audio source is wired, so 'env (Param 1)
+     ...' holds the gate high for the duration of the graph.
+  3. Sample the envelope on every step and write to the output buffer.
+
+The envelope_gen is constructed lazily on first call, against the runtime's
+current sample rate — kDefaultSampleRate is a placeholder that may be wrong
+once realtime audio opens with a different rate.
+*/
+static void process_env(RTGraph &g, std::size_t node_idx, int nframes) noexcept {
+  NodeRuntime &node = g.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+
+  auto *st = std::get_if<EnvState>(&node.state);
+  assert(st && "Env node has non-Env state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  const auto gate_in = resolve_input(g.nodes, node, PortIndex{0}, nframes);
+  const float gate_default = static_cast<float>(node.controls[0]);
+  const double a_sec = node.controls[1];
+  const double d_sec = node.controls[2];
+  const double s_lin = node.controls[3];
+  const double r_sec = node.controls[4];
+
+  // (Re)build the envelope_gen against the active sample rate on first
+  // call or after a sample-rate change.
+  if (!st->env || st->last_sps != g.sample_rate) {
+    st->env.emplace(q::adsr_envelope_gen::config{}, g.sample_rate);
+    st->last_sps = g.sample_rate;
+    st->last_a = st->last_d = st->last_s = st->last_r = -1.0;
+  }
+
+  if (a_sec != st->last_a) {
+    st->env->attack_rate(q::duration{a_sec}, g.sample_rate);
+    st->last_a = a_sec;
+  }
+  if (d_sec != st->last_d) {
+    st->env->decay_rate(q::duration{d_sec}, g.sample_rate);
+    st->last_d = d_sec;
+  }
+  if (s_lin != st->last_s) {
+    // Set decay's destination level — the actual sustain plateau. q's own
+    // sustain_level() setter writes to segment[2] (the slow sustain decay's
+    // endpoint, =0 by default) which is not what callers want.
+    (*st->env)[1].level(static_cast<float>(s_lin));
+    st->last_s = s_lin;
+  }
+  if (r_sec != st->last_r) {
+    st->env->release_rate(q::duration{r_sec}, g.sample_rate);
+    st->last_r = r_sec;
+  }
+
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    const float gate = !gate_in.empty() ? gate_in[fi] : gate_default;
+
+    if (st->prev_gate <= 0.5f && gate > 0.5f) {
+      st->env->attack();
+    } else if (st->prev_gate > 0.5f && gate <= 0.5f) {
+      st->env->release();
+    }
+    st->prev_gate = gate;
+
+    out[fi] = (*st->env)();
+  }
+}
+
 /* Note [Out node processing — direct bus accumulation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out is a pure sink: it accumulates its input signal into a shared
@@ -796,6 +919,9 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       break;
     case NodeKind::Add:
       process_add(g, i, nframes);
+      break;
+    case NodeKind::Env:
+      process_env(g, i, nframes);
       break;
     default:
       assert(false && "unhandled NodeKind in process_graph");

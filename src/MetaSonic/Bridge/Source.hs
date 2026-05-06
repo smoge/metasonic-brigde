@@ -38,6 +38,7 @@ module MetaSonic.Bridge.Source
   , gain
   , lpf
   , add
+  , env
   , -- * Connection helpers
     audio
   , -- * Uniform UGen view
@@ -289,6 +290,20 @@ data UGen
     -- 'Param' constant (acting as a bias) or an 'Audio' edge.
     -- Used to bias a bipolar modulator off zero (turning ring mod
     -- into AM, or through-zero FM into vibrato).
+  | Env !Connection !Connection !Connection !Connection !Connection
+    -- ^ ADSR envelope generator: gate, attack (sec), decay (sec),
+    -- sustain (linear 0..1), release (sec).
+    --
+    -- The gate is a sample-accurate trigger: a rising edge
+    -- (0 → > 0.5) starts the attack phase, a falling edge starts
+    -- the release phase. A/D/S/R are block-rate constants; A, D, R
+    -- are durations in seconds, S is a linear amplitude in [0, 1].
+    -- A 'Param' on the gate input acts as a constant gate value:
+    -- @env (Param 1) ...@ holds the gate high indefinitely (handy
+    -- for one-shot test graphs that never release).
+    --
+    -- The output is the envelope amplitude in [0, 1] at sample
+    -- rate. Multiply with a signal to apply the envelope.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -469,6 +484,21 @@ gain sig amount = insertNodeC "gain" (Gain sig amount)
 add :: Connection -> Connection -> SynthM Connection
 add a b = insertNodeC "add" (Add a b)
 
+-- | ADSR envelope generator: @env gate attack decay sustain release@.
+--
+-- Gate is sample-accurate: a rising edge starts attack, a falling edge
+-- starts release. Attack/decay/release are durations in seconds; sustain
+-- is a linear amplitude in [0, 1]. A 'Param' on the gate input acts as a
+-- constant gate level (use @Param 1@ for an always-on test envelope).
+env
+  :: Connection -- ^ gate
+  -> Connection -- ^ attack (s)
+  -> Connection -- ^ decay (s)
+  -> Connection -- ^ sustain (linear 0..1)
+  -> Connection -- ^ release (s)
+  -> SynthM Connection
+env gate a d s r = insertNodeC "env" (Env gate a d s r)
+
 -- | Hardware output: writes a Connection to a hardware output bus.
 -- In practice the source is an 'Audio' connection from another
 -- node; passing a 'Param' constant would silently produce silence
@@ -554,6 +584,8 @@ ugenView = \case
   LPF s f q    -> UGenView KLPF      [s, f, q] [connDefault f, connDefault q]
   Gain s a     -> UGenView KGain     [s, a]    [connDefault a]
   Add a b      -> UGenView KAdd      [a, b]    [connDefault a, connDefault b]
+  Env g a d s r ->
+    UGenView KEnv [g] [connDefault g, connDefault a, connDefault d, connDefault s, connDefault r]
   Out ch s     -> UGenView KOut      [s]       [fromIntegral ch]
   BusIn _      -> error "ugenView: BusIn not implemented yet"
   BusOut _ _   -> error "ugenView: BusOut not implemented yet"
@@ -581,6 +613,7 @@ dependencies = \case
   LPF a b c   -> deps [a, b, c]
   Gain a b    -> deps [a, b]
   Add a b     -> deps [a, b]
+  Env g _ _ _ _ -> deps [g]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

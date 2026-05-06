@@ -166,6 +166,7 @@ data NodeKind
   | KNoiseGen
   | KLPF
   | KAdd
+  | KEnv
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -215,6 +216,7 @@ kindSpec = \case
   KNoiseGen -> KindSpec 6 SampleRate [Pure] 0 0 "noiseGen"
   KLPF      -> KindSpec 7 SampleRate [Pure] 3 2 "lpf"
   KAdd      -> KindSpec 8 SampleRate [Pure] 2 2 "add"
+  KEnv      -> KindSpec 9 SampleRate [Pure] 1 5 "env"
 
 -- | Must agree with the NodeKind enum and kind_from_tag dispatch in
 -- rt_graph.cpp. Verified by a contract test in Spec.hs.
