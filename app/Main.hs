@@ -103,6 +103,19 @@ fmGraph = runSynth $ do
   amped     <- gain carrier 0.3
   out 0 amped
 
+-- Plucked-tone shape: an ADSR envelope with gate held high (Param 1)
+-- shapes a 220 Hz sine. Attack 5 ms, decay 200 ms, sustain 0.0
+-- (linear) makes the envelope fade to silence after the percussive
+-- hit. Release time is unused while the gate is held, but is set to
+-- 100 ms for completeness.
+envPluckGraph :: SynthGraph
+envPluckGraph = runSynth $ do
+  e     <- env 1.0 0.005 0.2 0.0 0.1
+  tone  <- sinOsc 220.0 0.0
+  amped <- gain tone e
+  scale <- gain amped 0.5
+  out 0 scale
+
 demoTable :: [Demo]
 demoTable =
   [ Demo "simple"    "Simple (SinOsc → Out)"                           simpleGraph
@@ -115,6 +128,7 @@ demoTable =
   , Demo "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"  detunedSawGraph
   , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"        ringModGraph
   , Demo "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)" fmGraph
+  , Demo "env-pluck" "Plucked-tone envelope (Env → Gain × SinOsc → Out)" envPluckGraph
   ]
 
 data Demo = Demo
