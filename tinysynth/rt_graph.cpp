@@ -1135,6 +1135,24 @@ void rt_graph_process(RTGraph *g, int nframes) {
   process_graph(*g, nframes);
 }
 
+// Copy nframes samples from output bus bus_index into the user buffer.
+int rt_graph_read_bus(RTGraph *g, int bus_index, int nframes, float *out) {
+  if (!g || !out || bus_index < 0 || nframes <= 0) {
+    return 0;
+  }
+
+  const std::size_t bus = static_cast<std::size_t>(bus_index);
+  if (bus >= g->output_buses.size()) {
+    return 0;
+  }
+
+  const auto &src = g->output_buses[bus];
+  const std::size_t to_copy =
+      std::min(static_cast<std::size_t>(nframes), src.size());
+  std::copy_n(src.begin(), to_copy, out);
+  return static_cast<int>(to_copy);
+}
+
 /* Note [Realtime startup]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 rt_graph_start_audio opens and starts the q_io / PortAudio stream.

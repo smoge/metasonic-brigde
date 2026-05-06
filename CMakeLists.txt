@@ -31,3 +31,39 @@ add_executable(rt_graph_smoke
 )
 
 target_link_libraries(rt_graph_smoke PRIVATE tinysynth_rt)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+# C++-native unit tests for rt_graph.cpp internals and DSP correctness.
+# The Haskell test suite covers structural / FFI invariants; these tests
+# cover what only C++ can: actual sample values from process_*, the
+# kind_from_tag dispatch, and edge cases in resolve_input.
+#
+# Disable with -DMETASONIC_BUILD_TESTS=OFF if no network on first configure.
+option(METASONIC_BUILD_TESTS "Build C++ tests for tinysynth_rt" ON)
+
+if(METASONIC_BUILD_TESTS)
+    enable_testing()
+
+    include(FetchContent)
+    fetchcontent_declare(
+        doctest
+        GIT_REPOSITORY https://github.com/doctest/doctest.git
+        GIT_TAG        v2.4.11
+        GIT_SHALLOW    TRUE
+    )
+    fetchcontent_makeavailable(doctest)
+
+    add_executable(tinysynth_tests
+        tests/rt_graph_test.cpp
+    )
+
+    target_link_libraries(tinysynth_tests PRIVATE
+        tinysynth_rt
+        doctest::doctest
+    )
+
+    include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
+    doctest_discover_tests(tinysynth_tests)
+endif()

@@ -22,6 +22,13 @@ void rt_graph_connect(RTGraph *g, int src_index, int src_port, int dst_index,
 // nframes must be between 0 and max_frames inclusive.
 void rt_graph_process(RTGraph *g, int nframes);
 
+// Copy nframes samples from one output bus into out (which must point to
+// at least nframes floats). Returns the number of samples written, or 0
+// if bus_index is out of range / nframes is invalid.
+// Intended for offline rendering and for inspecting buses from tests
+// without going through the realtime audio path.
+int rt_graph_read_bus(RTGraph *g, int bus_index, int nframes, float *out);
+
 // Realtime audio via q_io/PortAudio.
 // output_channels <= 0 means: infer from configured Out buses, minimum 1.
 // device_id < 0 means: use the PortAudio default output device if possible,

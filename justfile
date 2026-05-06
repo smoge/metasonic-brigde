@@ -39,4 +39,7 @@ cpp-lsp: cpp-configure
 cpp-run: cpp-build
     ./{{cpp_build_dir}}/{{cpp_exe}}
 
+cpp-test: cpp-build
+    ctest --test-dir {{cpp_build_dir}} --output-on-failure
+
 build: stack-build cpp-build
