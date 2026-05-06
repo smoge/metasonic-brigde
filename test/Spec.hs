@@ -1099,9 +1099,10 @@ data Op
   | OAddMod    Int Int         -- audio + audio
   | OEnv       Int Double Double Double Double
                                -- gate-source-idx, A, D, S, R
-  | OBusOut    Int Int         -- bus, audio source-index
-  | OBusIn     Int             -- bus
-  | OOut       Int Int         -- channel, source-index
+  | OBusOut         Int Int    -- bus, audio source-index
+  | OBusIn          Int        -- bus
+  | OBusInDelayed   Int        -- bus (feedback-safe reader)
+  | OOut            Int Int    -- channel, source-index
   deriving (Eq, Show)
 
 genOp :: Gen Op
@@ -1118,9 +1119,10 @@ genOp = oneof
   , OEnv     <$> nonNegInt
              <*> choose (0.001, 0.1) <*> choose (0.001, 0.5)
              <*> choose (0.0, 1.0)   <*> choose (0.001, 0.5)
-  , OBusOut  <$> choose (0, 3) <*> nonNegInt
-  , OBusIn   <$> choose (0, 3)
-  , OOut     <$> choose (0, 1) <*> nonNegInt
+  , OBusOut       <$> choose (0, 3) <*> nonNegInt
+  , OBusIn        <$> choose (0, 3)
+  , OBusInDelayed <$> choose (0, 3)
+  , OOut          <$> choose (0, 1) <*> nonNegInt
   ]
   where
     nonNegInt = choose (0, 100)
@@ -1163,6 +1165,16 @@ The interpreter avoids this by tracking the set of bus numbers already
 silently skipped. With this discipline, no generated graph contains an
 E_r cycle by construction, so all existing properties extend cleanly to
 graphs with bus routing.
+
+'OBusInDelayed' is *deliberately* not in this poisoning set. A
+'BusInDelayed n' carries 'BusReadDelayed n' rather than 'BusRead n',
+which the scheduler ignores when deriving E_r — so a downstream
+'OBusOut n' on the same bus closes a feedback path that crosses the
+block boundary, not a within-block cycle. The generator is therefore
+free to emit feedback patterns ('OBusInDelayed bus' followed by
+'OBusOut bus') and 'propValidates' must accept them. This is the QC
+counterpart of the dedicated unit test "feedback graph through
+busInDelayed topologically sorts".
 -}
 
 interpret :: [Op] -> SynthM ()
@@ -1247,6 +1259,15 @@ interpret = go [] S.empty
     go xs r (OBusIn bus : rest) = do
       c <- busIn bus
       go (xs <> [c]) (S.insert bus r) rest
+
+    -- Feedback-safe reader: contributes no E_r edge, so no bus
+    -- needs to be poisoned. A later 'OBusOut bus' on the same
+    -- bus is allowed and closes a (cross-block) feedback path
+    -- that the scheduler accepts. See Note [Generator avoids E_r
+    -- cycles] for why this is the deliberate distinction.
+    go xs r (OBusInDelayed bus : rest) = do
+      c <- busInDelayed bus
+      go (xs <> [c]) r rest
 
     go xs r (OOut ch i : rest)
       | null xs   = go xs r rest

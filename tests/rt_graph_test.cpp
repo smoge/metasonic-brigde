@@ -700,6 +700,170 @@ TEST_CASE("BusInDelayed reads the previous block's BusOut contents") {
     rt_graph_destroy(g);
 }
 
+TEST_CASE("BusInDelayed snapshot is one-block-old across many blocks") {
+    // The "BusInDelayed reads the previous block's BusOut contents"
+    // test verifies blocks 1 and 2 of the swap. This test extends
+    // that to several blocks: a swap-direction regression that only
+    // shows up on block 3+ (e.g. ping-ponging back to a stale
+    // buffer instead of advancing the snapshot every block) wouldn't
+    // be caught by the 2-block test but would here.
+    //
+    //   SinOsc(440) → BusOut(5)
+    //   BusInDelayed(5) → Out(0)
+    //
+    // Invariant: for every block N >= 1, Out(0) at block N must be
+    // bit-equal to bus 5 captured at the *end* of block N-1.
+    constexpr int kBus = 5;
+    constexpr int kBlocks = 5;
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);
+
+    rt_graph_add_node(g, 1, 10);                         // BusOut
+    rt_graph_set_control(g, 1, 0, static_cast<double>(kBus));
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 12);                         // BusInDelayed
+    rt_graph_set_control(g, 2, 0, static_cast<double>(kBus));
+
+    rt_graph_add_node(g, 3, 2);                          // Out(0)
+    rt_graph_set_control(g, 3, 0, 0.0);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    std::vector<std::vector<float>> bus5(kBlocks, std::vector<float>(kFrames, 0.0f));
+    std::vector<std::vector<float>> out0(kBlocks, std::vector<float>(kFrames, 0.0f));
+
+    for (int blk = 0; blk < kBlocks; ++blk) {
+        rt_graph_process(g, kFrames);
+        rt_graph_read_bus(g, 0, kFrames, out0[blk].data());
+        rt_graph_read_bus(g, kBus, kFrames, bus5[blk].data());
+    }
+
+    // Block 0: prev was zero-initialised → Out(0) is silence.
+    CHECK(peak_abs(out0[0]) < 1e-6f);
+
+    // Sanity: each block produces a non-trivial sine on bus 5
+    // (otherwise the equality test below would be vacuous).
+    for (int n = 0; n < kBlocks; ++n) {
+        INFO("block " << n << " bus 5 should carry a sine");
+        CHECK(peak_abs(bus5[n]) > 0.9f);
+    }
+
+    // The core invariant: for every block N >= 1, BusInDelayed in
+    // block N reads exactly what BusOut wrote in block N-1.
+    for (int n = 1; n < kBlocks; ++n) {
+        float max_diff = 0.0f;
+        for (int i = 0; i < kFrames; ++i) {
+            max_diff = std::max(max_diff, std::abs(out0[n][i] - bus5[n - 1][i]));
+        }
+        INFO("block " << n << ": delayed read should equal block " << n - 1
+                      << "'s bus 5; max_diff=" << max_diff);
+        CHECK(max_diff < 1e-6f);
+    }
+
+    // Sanity: consecutive blocks of the sine differ (phase advances
+    // across blocks). Without this, a swap regression that copied
+    // the same buffer twice could pass the equality check.
+    for (int n = 1; n < kBlocks; ++n) {
+        float phase_diff = 0.0f;
+        for (int i = 0; i < kFrames; ++i) {
+            phase_diff = std::max(phase_diff, std::abs(bus5[n][i] - bus5[n - 1][i]));
+        }
+        INFO("block " << n << " bus 5 should differ from block " << n - 1);
+        CHECK(phase_diff > 0.05f);
+    }
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("BusIn (live) and BusInDelayed (prev) coexist on the same bus") {
+    // SC analogue: In.ar(5) and InFeedback.ar(5) on the same bus.
+    // The live BusIn is forced to follow BusOut by an E_r edge, so
+    // it sees this block's writes; BusInDelayed reads the snapshot,
+    // unconstrained, so it sees the previous block's writes. Both
+    // routed to separate output buses so they can be inspected
+    // independently.
+    //
+    //   SinOsc(440) → BusOut(5)
+    //   BusIn(5)        → Out(0)   (live read)
+    //   BusInDelayed(5) → Out(1)   (delayed read)
+    //
+    // Block 1: bus 0 = block 1 sine; bus 1 = silence (no prev).
+    // Block 2: bus 0 = block 2 sine; bus 1 = block 1 sine.
+    constexpr int kBus = 5;
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);
+
+    rt_graph_add_node(g, 1, 10);                         // BusOut
+    rt_graph_set_control(g, 1, 0, static_cast<double>(kBus));
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 11);                         // BusIn (live)
+    rt_graph_set_control(g, 2, 0, static_cast<double>(kBus));
+    rt_graph_add_node(g, 3, 2);                          // Out(0)
+    rt_graph_set_control(g, 3, 0, 0.0);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    rt_graph_add_node(g, 4, 12);                         // BusInDelayed
+    rt_graph_set_control(g, 4, 0, static_cast<double>(kBus));
+    rt_graph_add_node(g, 5, 2);                          // Out(1)
+    rt_graph_set_control(g, 5, 0, 1.0);
+    rt_graph_connect(g, 4, 0, 5, 0);
+
+    // Block 1.
+    rt_graph_process(g, kFrames);
+    std::vector<float> b1_bus0(kFrames, 0.0f), b1_bus1(kFrames, 0.0f),
+                       b1_bus5(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, b1_bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, b1_bus1.data());
+    rt_graph_read_bus(g, kBus, kFrames, b1_bus5.data());
+
+    // Live: bus 0 must equal bus 5 (the live BusIn read this block's
+    // accumulated writes after E_r-forced ordering).
+    float live_diff_b1 = 0.0f;
+    for (int i = 0; i < kFrames; ++i) {
+        live_diff_b1 = std::max(live_diff_b1, std::abs(b1_bus0[i] - b1_bus5[i]));
+    }
+    CHECK(live_diff_b1 < 1e-6f);
+    // Delayed: bus 1 is silence (zero-initialised snapshot).
+    CHECK(peak_abs(b1_bus1) < 1e-6f);
+
+    // Block 2.
+    rt_graph_process(g, kFrames);
+    std::vector<float> b2_bus0(kFrames, 0.0f), b2_bus1(kFrames, 0.0f),
+                       b2_bus5(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, b2_bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, b2_bus1.data());
+    rt_graph_read_bus(g, kBus, kFrames, b2_bus5.data());
+
+    // Live: still tracks block 2's bus 5.
+    float live_diff_b2 = 0.0f;
+    for (int i = 0; i < kFrames; ++i) {
+        live_diff_b2 = std::max(live_diff_b2, std::abs(b2_bus0[i] - b2_bus5[i]));
+    }
+    CHECK(live_diff_b2 < 1e-6f);
+    // Delayed: matches block 1's bus 5 (the snapshot).
+    float delayed_diff = 0.0f;
+    for (int i = 0; i < kFrames; ++i) {
+        delayed_diff = std::max(delayed_diff, std::abs(b2_bus1[i] - b1_bus5[i]));
+    }
+    CHECK(delayed_diff < 1e-6f);
+    // Sanity: block 2's bus 5 differs from block 1's. Without this,
+    // both equality checks above could pass on a degenerate signal.
+    float advance = 0.0f;
+    for (int i = 0; i < kFrames; ++i) {
+        advance = std::max(advance, std::abs(b2_bus5[i] - b1_bus5[i]));
+    }
+    CHECK(advance > 0.05f);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("BusInDelayed feedback path: stable attenuated loop") {
     // Pin the use case the abstraction exists for: feedback. Build a
     // graph that on each block reads the previous block's bus 5,
