@@ -732,34 +732,53 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
   }
 }
 
+// Reset a per-node state slot in place, preserving vector capacities
+// across reuse. The first time a slot is initialised for a given kind
+// the buffers and controls vector grow to size, allocating; subsequent
+// reuses (same shape) reset values without allocating. This is the
+// path realtime_reserve hits, so keeping it allocation-free in steady
+// state matters for the producer-thread budget.
+//
+// Capacity preservation rules:
+//   * node.outputs: grow with emplace_back when target size exceeds
+//     current size (allocates a new inner vector); never shrink, so
+//     a slot reused for a smaller-shape kind keeps its old inner
+//     buffers around with capacity intact for the next time it goes
+//     back to a larger shape.
+//   * inner output buffers: assign(n, 0.0f) sets size and zeroes in
+//     place; allocates only if current capacity < n.
+//   * node.controls: assign(begin, end) preserves capacity for the
+//     same reason.
+//   * node.state: a single variant assignment per kind. Each state
+//     struct's default constructor is non-allocating (lazy-constructed
+//     q kernels live behind std::optional).
 static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int max_frames) {
-  node.state = std::monostate{};
-  node.outputs.clear();
+  std::size_t target_outputs = 0;
 
   switch (spec.kind) {
   case NodeKind::SinOsc:
   case NodeKind::SawOsc:
-    node.outputs.resize(1);
+    target_outputs = 1;
     node.state = OscState{};
     break;
 
   case NodeKind::NoiseGen:
-    node.outputs.resize(1);
+    target_outputs = 1;
     node.state = NoiseGenState{};
     break;
 
   case NodeKind::LPF:
-    node.outputs.resize(1);
+    target_outputs = 1;
     node.state = LPFState{};
     break;
 
   case NodeKind::Env:
-    node.outputs.resize(1);
+    target_outputs = 1;
     node.state = EnvState{};
     break;
 
   case NodeKind::Delay:
-    node.outputs.resize(1);
+    target_outputs = 1;
     node.state = DelayState{};
     break;
 
@@ -767,24 +786,41 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
   case NodeKind::Add:
   case NodeKind::BusIn:
   case NodeKind::BusInDelayed:
-    node.outputs.resize(1);
+    target_outputs = 1;
+    node.state = std::monostate{};
     break;
 
   case NodeKind::Out:
   case NodeKind::BusOut:
     // Sinks: no per-node output buffer. Writes go directly into
     // server.output_buses inside the bus-write kernel.
+    target_outputs = 0;
+    node.state = std::monostate{};
     break;
+  }
+
+  // Grow outputs to hold target_outputs without ever shrinking. The
+  // grow path allocates one default-constructed inner vector on first
+  // use; subsequent reuses for the same kind hit the loop below with
+  // size already at target_outputs.
+  while (node.outputs.size() < target_outputs) {
+    node.outputs.emplace_back();
+  }
+
+  // Reset every active output buffer in place. assign(n, v) is
+  // allocation-free when the inner capacity already covers n, which
+  // is the common case once the slot has been used at least once for
+  // this kind.
+  const auto frames = static_cast<std::size_t>(max_frames);
+  for (std::size_t i = 0; i < target_outputs; ++i) {
+    node.outputs[i].assign(frames, 0.0f);
   }
 
   // Per-instance controls take their initial values from the spec's
   // defaults. rt_graph_instance_set_control later writes here,
-  // leaving the spec untouched.
-  node.controls = spec.default_controls;
-
-  for (auto &out : node.outputs) {
-    out.resize(static_cast<std::size_t>(max_frames), 0.0f);
-  }
+  // leaving the spec untouched. assign(begin, end) reuses the
+  // existing buffer when capacity already covers the new size.
+  node.controls.assign(spec.default_controls.begin(), spec.default_controls.end());
 }
 
 /* Note [A.2: realtime control queue]
@@ -2125,22 +2161,23 @@ static void apply_instance_set_control(
 // directly with rt_graph_instance_set_control on the Reserved slot;
 // see the [T:control] exception in rt_graph.h.
 //
-// Allocates. The outer slot.nodes.resize is a no-op once the slot
-// has been used for any template of equal or greater node count,
-// but init_node_state itself is NOT capacity-preserving today: it
-// does node.outputs.clear() + node.outputs.resize(1) (re-default-
-// constructs the inner buffer) and reassigns node.state from a
-// fresh value, so per-node output buffers and kernel state allocate
-// on every reserve even for a pre-warmed slot. A future "reset in
-// place" path on init_node_state would close this gap; in the
-// meantime the producer thread (not the audio thread) absorbs the
-// allocations.
+// Allocation policy: the first time a slot is prepared for a given
+// template shape, three things may allocate: slot.nodes.resize grows
+// the outer vector, init_node_state grows each node's outputs vector
+// and inner buffers, and node.controls is sized to spec. Once the
+// slot has been used at least once for that shape, every subsequent
+// reserve hits the in-place reset paths in init_node_state and is
+// allocation-free. The recommended pre-warm pattern (spawn N
+// instances via _template_instance_add then immediately remove
+// them) drives every slot through that first-use path during
+// construction, so producer-thread reserves under steady state
+// don't allocate.
 //
-// Not noexcept: those allocations can throw bad_alloc.
-// rt_graph_realtime_reserve wraps the call in a try/catch that
-// rolls the slot back to Available so no exception escapes through
-// the extern "C" boundary. See Note [Pool model] and Note [A.2:
-// realtime control queue].
+// Not noexcept: the first-use allocations can still throw
+// bad_alloc. rt_graph_realtime_reserve wraps the call in a try/catch
+// that rolls the slot back to Available so no exception escapes
+// through the extern "C" boundary. See Note [Pool model] and Note
+// [A.2: realtime control queue].
 static void prepare_reserved_slot(
     RTGraph &g, GraphInstance &slot, const MetaDef &def, int template_id
 ) {

@@ -4566,6 +4566,60 @@ TEST_CASE("A.2 allocator failure path: queue-full activate, cancel, drain, retry
     rt_graph_destroy(g);
 }
 
+TEST_CASE("A.2 slot reuse: per-voice state resets across reserve cycles") {
+    // init_node_state's contract is that every reserve produces a
+    // freshly-zeroed slot — no carryover of phase, filter memory,
+    // envelope position, or output buffer contents from the previous
+    // voice that occupied this slot. The SinOsc test below pins it:
+    // each voice's initial phase is 0, so sample 0 of the first block
+    // is sin(0) = 0. After 256 samples at 48 kHz / 440 Hz the phase
+    // ends well past 0; if init_node_state leaked state across cycles,
+    // sample 0 of the second voice would carry the previous voice's
+    // terminal phase and read non-zero.
+    //
+    // This test also exercises the in-place reset path many times in
+    // a row, surfacing any slot-reuse bug that depends on cycle count.
+    constexpr int kBlock = 256;
+    auto *g = rt_graph_create(4, kBlock);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_add_node(g, 0, 0, 1);                 // SinOsc
+    rt_graph_template_set_default(g, 0, 0, 0, 440.0);
+    rt_graph_template_set_default(g, 0, 0, 1, 0.0);         // initial phase = 0
+    rt_graph_template_add_node(g, 0, 1, 2);                 // Out
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+    rt_graph_instance_remove(g, 0);
+
+    constexpr int kCycles = 8;
+    for (int cycle = 0; cycle < kCycles; ++cycle) {
+        int s = rt_graph_realtime_reserve(g, 0);
+        REQUIRE(s >= 0);
+        REQUIRE(rt_graph_realtime_activate(g, s) == 1);
+
+        rt_graph_process(g, kBlock);
+        std::vector<float> bus0(kBlock, 0.0f);
+        rt_graph_read_bus(g, 0, kBlock, bus0.data());
+
+        INFO("cycle=" << cycle);
+        // Phase reset → sample 0 is sin(0) = 0.
+        CHECK(std::abs(bus0[0]) < 1e-5f);
+        // And the oscillator did run — not just silently zeroed by a
+        // bug elsewhere.
+        CHECK(peak_abs(bus0) > 0.5f);
+
+        // No Env on this template, so release falls through to a
+        // hard free — but use queued remove for symmetry with the
+        // realtime ABI surface.
+        REQUIRE(rt_graph_realtime_remove(g, s) == 1);
+        rt_graph_process(g, kBlock);
+        REQUIRE(rt_graph_instance_alive(g, s) == 0);
+    }
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("A.2 reset: rt_graph_clear discards pending queued commands") {
     // Without resetting the queue's read/write indices in the clear
     // path, the next process_graph after rt_graph_clear would replay
