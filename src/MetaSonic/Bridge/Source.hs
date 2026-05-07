@@ -329,11 +329,12 @@ the runtime-side ping-pong implementation.
 -- nodes and explicit connections. This makes 'UGen' a unit-
 -- node DAG representation in the current prototype.
 --
--- Later compilation passes may group several source nodes into
--- regions or fused kernels, so the final runtime unit need not
--- correspond one-to-one with a single 'UGen'. Even so, 'UGen'
--- remains the basic source-level notion of a primitive node in
--- the graph.
+-- Later compilation passes may group source nodes into regions and
+-- may elide some kernels through fusion. That optimization preserves
+-- the dense NodeIndex identity of each source node, so control writes
+-- and diagnostics can still point back to the original 'UGen'. Even
+-- when execution is optimized, 'UGen' remains the source-level notion
+-- of a primitive node in the graph.
 --
 -- See Note [Bus model: SC-style same-cycle audio buses] for how
 -- 'Out', 'BusOut' and 'BusIn' relate.
