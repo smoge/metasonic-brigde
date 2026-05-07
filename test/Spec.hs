@@ -246,6 +246,62 @@ unitTests = testGroup "Unit tests"
                    Nothing -> assertFailure
                               "cc-Smooth's NodeID not in compiled graph"
                    Just ni -> ni @?= NodeIndex 0
+
+      , testCase "cc-allocated node compiles to KSmooth with controls = [20, init]" $
+          -- Pin the kindSpec layout — the runner relies on
+          -- controls[1] being the target. A regression that
+          -- allocated a different kind, or shuffled the controls
+          -- list, would silently break the CC dispatch.
+          let sg = runSynth $ do
+                v <- cc 64 0.42 0.0 1.0
+                _ <- out 0 v
+                pure ()
+          in case lowerGraph sg >>= compileRuntimeGraph of
+               Left err -> assertFailure err
+               Right rt ->
+                 let smooths = [ n | n <- rgNodes rt, rnKind n == KSmooth ]
+                 in case smooths of
+                      [n] -> rnControls n @?= [20.0, 0.42]
+                      _   -> assertFailure $
+                               "expected exactly one KSmooth, got "
+                            <> show (length smooths)
+
+      , testCase "same CC number registered twice records two specs (multi-target)" $
+          -- Multiple mappings sharing a CC number is a deliberate
+          -- feature of the C ABI (see MidiVoiceProcessor docs).
+          -- 'cc' should not deduplicate.
+          let (_, _, specs) = runSynthCCs $ do
+                _ <- cc 7 0.5 0.0 1.0
+                _ <- cc 7 0.0 0.0 0.5  -- second binding to same CC
+                pure ()
+          in do
+            length specs @?= 2
+            map ccsNumber specs @?= [7, 7]
+            -- Each binding gets its own NodeID (own Smooth node).
+            map ccsNode specs @?= [NodeID 0, NodeID 1]
+
+      , testCase "runSynth and runSynthWith still work when cc is used (specs discarded)" $
+          -- Backwards-compat pin: legacy callers that don't care
+          -- about CC bindings can use 'runSynth' / 'runSynthWith'
+          -- and get a well-formed graph with the cc-allocated Smooth
+          -- nodes intact.
+          let body = do
+                v <- cc 1 0.0 0.0 1.0
+                _ <- out 0 v
+                pure v
+              graphRunSynth     = runSynth body
+              (volC, graphRWith) = runSynthWith body
+              sgEqual = graphRunSynth == graphRWith
+          in do
+            assertBool "runSynth and runSynthWith produce the same graph" sgEqual
+            -- The captured Connection still resolves correctly.
+            case lowerGraph graphRunSynth >>= compileRuntimeGraph of
+              Left err -> assertFailure err
+              Right rt -> case connectionNodeID volC of
+                Nothing  -> assertFailure "cc returned a Param connection"
+                Just nid -> case resolveNodeIndex rt nid of
+                  Nothing -> assertFailure "cc-Smooth NodeID missing"
+                  Just _  -> pure ()
       ]
 
   , testCase "checkDependencies rejects missing references" $
