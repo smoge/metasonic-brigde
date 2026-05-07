@@ -2956,6 +2956,12 @@ static void apply_instance_set_control(
 // that rolls the slot back to Available so no exception escapes
 // through the extern "C" boundary. See Note [Pool model] and Note
 // [A.2: realtime control queue].
+// Forward declaration: the helper itself lives next to make_instance
+// so its semantics sit alongside the other instance-init paths, but
+// prepare_reserved_slot needs to call it from earlier in the file.
+static void ensure_fused_scratch(
+    GraphInstance &inst, int slot_count, int max_frames);
+
 static void prepare_reserved_slot(
     RTGraph &g, GraphInstance &slot, const MetaDef &def, int template_id
 ) {
@@ -2966,6 +2972,12 @@ static void prepare_reserved_slot(
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
     init_node_state(slot.nodes[i], def.nodes[i], g.max_frames);
   }
+  // Step C (d): a recycled Available slot may have been created
+  // before fused-scale inputs were registered on this template;
+  // its fused_scratch vector might therefore be shorter than the
+  // template's current slot count. Catch up here, before the
+  // audio callback can read it.
+  ensure_fused_scratch(slot, def.fused_input_count, g.max_frames);
 }
 
 // Producer-side enqueue. Returns true if the command was published,
@@ -3469,6 +3481,36 @@ open_audio_stream(RTGraph &g, int requested_output_channels, int requested_devic
 // per-node state. The bus pool lives on the Server, so a new instance
 // carries no bus state of its own. Sets template_id so process_graph
 // dispatches to the right MetaDef.
+// Step C (d): grow (or reset) an instance's fused-scale scratch
+// vector so it covers every slot the template has registered.
+// Idempotent on a slot count it already covers — newly-appended
+// buffers get max_frames zeros; existing buffers keep their
+// capacity. Called from every code path that prepares a slot for
+// audio scheduling: make_instance, prepare_reserved_slot, and the
+// reuse branch of rt_graph_template_instance_add. Also called by
+// rt_graph_template_connect_fused_scale_input when registering a
+// new slot post-spawn (lockstep with each live instance).
+//
+// The contract is parallel to the per-node init: scratch must be
+// preallocated before the audio callback can read it. Skipping
+// this on a reused Available slot would leave fused_scratch short
+// of the template's slot count, and resolve_input would silently
+// return empty spans for any slot beyond the previous size.
+static void ensure_fused_scratch(
+    GraphInstance &inst, int slot_count, int max_frames
+) {
+  const auto frames = static_cast<std::size_t>(max_frames);
+  const std::size_t target = static_cast<std::size_t>(std::max(0, slot_count));
+  if (inst.fused_scratch.size() < target) {
+    inst.fused_scratch.resize(target);
+  }
+  for (auto &slot : inst.fused_scratch) {
+    if (slot.size() < frames) {
+      slot.assign(frames, 0.0f);
+    }
+  }
+}
+
 static GraphInstance make_instance(const MetaDef &def, int template_id, int max_frames) {
   GraphInstance inst;
   inst.template_id = template_id;
@@ -3479,13 +3521,8 @@ static GraphInstance make_instance(const MetaDef &def, int template_id, int max_
   // Step C (d): one scratch buffer per fused-scale input registered
   // on the spec, sized to max_frames. resolve_input materialises
   // into these and returns a span over them; never resized in the
-  // audio callback. See FusedScaleRef.
-  const std::size_t slot_count = static_cast<std::size_t>(def.fused_input_count);
-  const auto frames = static_cast<std::size_t>(max_frames);
-  inst.fused_scratch.resize(slot_count);
-  for (auto &slot : inst.fused_scratch) {
-    slot.assign(frames, 0.0f);
-  }
+  // audio callback. See FusedScaleRef and ensure_fused_scratch.
+  ensure_fused_scratch(inst, def.fused_input_count, max_frames);
   return inst;
 }
 
@@ -3996,6 +4033,26 @@ void rt_graph_template_connect_fused_scale_input(
     return;
   }
 
+  // Validate src_port against the source kind's output arity and
+  // scale_control_index against the scale kind's control arity
+  // BEFORE claiming a slot. A bad port or control would silently
+  // turn the consumer's input into silence at resolve_input time
+  // (the override takes precedence over the original input_refs);
+  // failing fast keeps construction-time bugs visible instead of
+  // surfacing as muted audio.
+  const NodeSpec &src_spec   = def->nodes[sidx];
+  const NodeSpec &scale_spec = def->nodes[scidx];
+  // All non-sink kinds produce exactly one output port (port 0);
+  // sinks (Out / BusOut) produce zero. See init_node_state.
+  const int src_output_count =
+      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut)
+          ? 0 : 1;
+  if (src_port >= src_output_count) return;
+  if (scale_control_index >=
+      static_cast<int>(scale_spec.default_controls.size())) {
+    return;
+  }
+
   // Claim a fresh scratch slot. Multiple fused inputs must each
   // own a separate slot so a kernel with two fused inputs does not
   // alias them while resolving.
@@ -4012,15 +4069,12 @@ void rt_graph_template_connect_fused_scale_input(
   // Grow every live instance of this template in lockstep so the
   // newly-claimed slot has a backing buffer ready for the next
   // process_instance call. Mirrors rt_graph_template_add_node's
-  // parallel-growth contract.
-  const auto frames = static_cast<std::size_t>(def->max_frames);
+  // parallel-growth contract; uses the shared ensure_fused_scratch
+  // helper so reuse paths and growth paths agree exactly.
   for (auto &inst : g->instances) {
     if (inst.template_id != template_id) continue;
     if (inst.state.load() == SlotState::Available) continue;
-    while (inst.fused_scratch.size() <=
-           static_cast<std::size_t>(slot)) {
-      inst.fused_scratch.emplace_back(frames, 0.0f);
-    }
+    ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
   }
 }
 
@@ -4079,6 +4133,11 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
     for (std::size_t i = 0; i < def->nodes.size(); ++i) {
       init_node_state(slot.nodes[i], def->nodes[i], g->max_frames);
     }
+    // Step C (d): a slot reused after fused inputs were registered
+    // may carry a fused_scratch shorter than the template's slot
+    // count. Catch up before publishing as Active. See
+    // ensure_fused_scratch.
+    ensure_fused_scratch(slot, def->fused_input_count, g->max_frames);
     slot.state.store(SlotState::Active);
     return static_cast<int>(free_slot);
   }

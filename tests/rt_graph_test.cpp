@@ -5913,6 +5913,57 @@ TEST_CASE("Step C (d): set_control on an elided Gain still drives the fused outp
     }
 }
 
+TEST_CASE("Step C (d): recycled instance slot grows fused_scratch on reuse") {
+    // Repro for the P2 reuse hazard: a slot becomes Available
+    // before any fused input is registered, the fused_input_count
+    // grows post-spawn via rt_graph_template_connect_fused_scale_input,
+    // and a later rt_graph_template_instance_add reuses that slot.
+    // Without ensure_fused_scratch on the reuse path, fused_scratch
+    // stays size 0 and resolve_input returns silence — visible as a
+    // muted bus 0.
+    auto *g = rt_graph_create(/*capacity*/ 4, /*max_frames*/ kFrames);
+    REQUIRE(g != nullptr);
+
+    // Auto-created template 0 starts with an instance 0 (also auto-
+    // created). Remove it so the slot enters Available *before* any
+    // fused-scale input has been registered on the template.
+    rt_graph_instance_remove(g, 0);
+
+    // Build the spec.
+    rt_graph_template_add_node(g, 0, 0, 1); // SinOsc
+    rt_graph_template_set_default(g, 0, 0, 0, 440.0);
+    rt_graph_template_set_default(g, 0, 0, 1, 0.0);
+    rt_graph_template_add_node(g, 0, 1, 3); // Gain
+    rt_graph_template_set_default(g, 0, 1, 0, 0.5);
+    rt_graph_template_add_node(g, 0, 2, 2); // Out
+    rt_graph_template_set_default(g, 0, 2, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+    rt_graph_template_connect(g, 0, 1, 0, 2, 0);
+
+    // Register the fused-scale input *while* the prior instance
+    // slot is sitting Available. The growth path inside
+    // _connect_fused_scale_input only walks Active/Releasing slots,
+    // so the Available slot's fused_scratch stays empty until reuse.
+    rt_graph_template_set_node_elided(g, 0, 1);
+    rt_graph_template_connect_fused_scale_input(
+        g, 0,
+        /*dst=*/2, /*dst_port=*/0,
+        /*src=*/0, /*src_port=*/0,
+        /*scale=*/1, /*scale_control_index=*/0);
+
+    // Reuse the slot. ensure_fused_scratch must run on the reuse
+    // path; otherwise resolve_input returns silence on the next
+    // render.
+    const int reused = rt_graph_template_instance_add(g, 0);
+    REQUIRE(reused == 0);
+
+    auto samples = render_bus0(g, kFrames);
+    // 440 Hz × 0.5 gain through fused path: peak ≈ 0.5.
+    CHECK(peak_abs(samples) == doctest::Approx(0.5f).epsilon(0.05));
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("Step C (d): out-of-range fused refs are silent no-ops, render is unaffected") {
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
@@ -5923,10 +5974,29 @@ TEST_CASE("Step C (d): out-of-range fused refs are silent no-ops, render is unaf
     rt_graph_set_control(g, 1, 0, 0.0f);
     rt_graph_connect(g, 0, 0, 1, 0);
 
-    // Each of these should leave fused_inputs untouched.
-    rt_graph_connect_fused_scale_input(g, 1, /*dst_port=*/9, 0, 0, 0, 0); // bad dst_port
-    rt_graph_connect_fused_scale_input(g, 1, 0, /*src_node=*/-1, 0, 0, 0); // bad src_node
+    // Each of these should leave fused_inputs untouched. The
+    // override is rejected before fused_input_count is bumped, so a
+    // resolver call on this graph never sees a stale FusedScaleRef
+    // pointing at an out-of-range source/scale slot — which would
+    // silence a previously-valid direct input, since the fused
+    // override takes precedence inside resolve_input.
+    rt_graph_connect_fused_scale_input(g, 1, /*dst_port=*/9, 0, 0, 0, 0);   // bad dst_port
+    rt_graph_connect_fused_scale_input(g, 1, 0, /*src_node=*/-1, 0, 0, 0);  // bad src_node
     rt_graph_connect_fused_scale_input(g, 1, 0, 0, 0, /*scale_node=*/9, 0); // bad scale_node
+    // Bad src_port: SinOsc only has output port 0; port 1 is out
+    // of range. Without validation this would silently mute the
+    // Out signal because resolve_input would fail the
+    // src_port-vs-arity check on every block.
+    rt_graph_connect_fused_scale_input(
+        g, 1, 0,
+        /*src_node=*/0, /*src_port=*/1,
+        /*scale_node=*/0, /*scale_control_index=*/0);
+    // Bad scale_control_index: SinOsc has 2 controls (0, 1);
+    // index 5 is out of range.
+    rt_graph_connect_fused_scale_input(
+        g, 1, 0,
+        /*src_node=*/0, /*src_port=*/0,
+        /*scale_node=*/0, /*scale_control_index=*/5);
     rt_graph_set_node_elided(g, /*node=*/9); // bad node
     rt_graph_set_node_elided(g, /*node=*/-1);
 
