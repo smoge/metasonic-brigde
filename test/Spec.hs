@@ -1107,7 +1107,7 @@ properties = testGroup "Properties"
   , QC.testProperty "region deps refer only to existing regions, no self-edges" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propRegionDepsWellFormed
 
-  , QC.testProperty "every region's rate matches its member nodes" $
+  , QC.testProperty "every region's rate is compatible with its member nodes" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propRegionRateCompatible
 
   , QC.testProperty "every BusOut precedes every same-bus BusIn in the schedule" $
