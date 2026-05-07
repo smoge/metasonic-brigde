@@ -718,6 +718,27 @@ invalidate any instance — pointers into MetaDef would, instance_id +
 template_id is stable.
 */
 
+// One execution region within a template. Step A of the fusion
+// roadmap: regions are an overlay on the template's nodes vector
+// (a contiguous range, by Haskell's greedy region pass) that
+// process_instance iterates as the unit of dispatch when present.
+//
+// `rate` is the int form of the Haskell Rate lattice
+// (0=CompileRate ... 3=SampleRate). The runtime stores it but does
+// not currently make decisions on it; it becomes load-bearing in
+// Step B (region-local scratch buffers) and Step C (per-op fusion).
+//
+// `first_node + node_count` flatten Haskell's [NodeIndex] membership
+// list back into a contiguous range. The contiguity invariant holds
+// for the current greedy `formRegions`; if a future non-greedy pass
+// produces a non-contiguous region, the C ABI grows a new entry —
+// this struct does not pretend to handle that case.
+struct RegionSpec {
+  int rate       = 0;
+  int first_node = 0;
+  int node_count = 0;
+};
+
 struct MetaDef {
   int max_frames = 0;
   std::vector<NodeSpec> nodes;
@@ -730,6 +751,15 @@ struct MetaDef {
   // that policy lives in the future Phase-3 voice allocator).
   // See Note [Pool model].
   int polyphony = kDefaultPolyphony;
+
+  // Region overlay populated by rt_graph_template_add_region during
+  // construction. When empty, process_instance falls back to a flat
+  // per-node loop (legacy callers that don't emit regions, e.g.
+  // C++ doctests building graphs via rt_graph_add_node directly).
+  // When non-empty, process_instance iterates regions as the unit of
+  // dispatch; behaviour is identical either way for Step A. See
+  // Note [Region fallback].
+  std::vector<RegionSpec> regions;
 };
 
 struct GraphInstance {
@@ -2928,6 +2958,76 @@ static void drain_control_queue(RTGraph &g) noexcept {
   q.read_idx.store(r, std::memory_order_release);
 }
 
+// Dispatch one node by kind. Body extracted from the original flat
+// process_instance loop so the region-iterating and flat-fallback
+// paths share one switch statement. See Note [Region fallback].
+static inline void dispatch_node(
+    RTGraph &g, GraphInstance &inst, std::size_t i, int nframes,
+    const NodeSpec &spec
+) noexcept {
+  switch (spec.kind) {
+  case NodeKind::SinOsc:
+    process_sinosc(g, inst, i, nframes);
+    break;
+  case NodeKind::Out:
+    process_out(g, inst, i, nframes);
+    break;
+  case NodeKind::Gain:
+    process_gain(g, inst, i, nframes);
+    break;
+  case NodeKind::SawOsc:
+    process_sawosc(g, inst, i, nframes);
+    break;
+  case NodeKind::NoiseGen:
+    process_noisegen(g, inst, i, nframes);
+    break;
+  case NodeKind::LPF:
+    process_lpf(g, inst, i, nframes);
+    break;
+  case NodeKind::Add:
+    process_add(g, inst, i, nframes);
+    break;
+  case NodeKind::Env:
+    process_env(g, inst, i, nframes);
+    break;
+  case NodeKind::BusOut:
+    // Out and BusOut share the same bus-write kernel; see
+    // Note [Bus-write kernel: Out and BusOut share this].
+    process_out(g, inst, i, nframes);
+    break;
+  case NodeKind::BusIn:
+    process_busin(g, inst, i, nframes);
+    break;
+  case NodeKind::BusInDelayed:
+    process_busin_delayed(g, inst, i, nframes);
+    break;
+  case NodeKind::Delay:
+    process_delay(g, inst, i, nframes);
+    break;
+  case NodeKind::Smooth:
+    process_smooth(g, inst, i, nframes);
+    break;
+  case NodeKind::PulseOsc:
+    process_pulse_osc(g, inst, i, nframes);
+    break;
+  case NodeKind::TriOsc:
+    process_triosc(g, inst, i, nframes);
+    break;
+  case NodeKind::HPF:
+    process_hpf(g, inst, i, nframes);
+    break;
+  case NodeKind::BPF:
+    process_bpf(g, inst, i, nframes);
+    break;
+  case NodeKind::Notch:
+    process_notch(g, inst, i, nframes);
+    break;
+  default:
+    assert(false && "unhandled NodeKind in process_instance");
+    break;
+  }
+}
+
 static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexcept {
   // Look up the spec via inst.template_id. If the template is gone
   // (shouldn't happen — we never shrink g.defs while instances are
@@ -2944,67 +3044,27 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
   inst.block_sink_peak = 0.0f;
 
   const std::size_t node_count = std::min(def->nodes.size(), inst.nodes.size());
-  for (std::size_t i = 0; i < node_count; ++i) {
-    switch (def->nodes[i].kind) {
-    case NodeKind::SinOsc:
-      process_sinosc(g, inst, i, nframes);
-      break;
-    case NodeKind::Out:
-      process_out(g, inst, i, nframes);
-      break;
-    case NodeKind::Gain:
-      process_gain(g, inst, i, nframes);
-      break;
-    case NodeKind::SawOsc:
-      process_sawosc(g, inst, i, nframes);
-      break;
-    case NodeKind::NoiseGen:
-      process_noisegen(g, inst, i, nframes);
-      break;
-    case NodeKind::LPF:
-      process_lpf(g, inst, i, nframes);
-      break;
-    case NodeKind::Add:
-      process_add(g, inst, i, nframes);
-      break;
-    case NodeKind::Env:
-      process_env(g, inst, i, nframes);
-      break;
-    case NodeKind::BusOut:
-      // Out and BusOut share the same bus-write kernel; see
-      // Note [Bus-write kernel: Out and BusOut share this].
-      process_out(g, inst, i, nframes);
-      break;
-    case NodeKind::BusIn:
-      process_busin(g, inst, i, nframes);
-      break;
-    case NodeKind::BusInDelayed:
-      process_busin_delayed(g, inst, i, nframes);
-      break;
-    case NodeKind::Delay:
-      process_delay(g, inst, i, nframes);
-      break;
-    case NodeKind::Smooth:
-      process_smooth(g, inst, i, nframes);
-      break;
-    case NodeKind::PulseOsc:
-      process_pulse_osc(g, inst, i, nframes);
-      break;
-    case NodeKind::TriOsc:
-      process_triosc(g, inst, i, nframes);
-      break;
-    case NodeKind::HPF:
-      process_hpf(g, inst, i, nframes);
-      break;
-    case NodeKind::BPF:
-      process_bpf(g, inst, i, nframes);
-      break;
-    case NodeKind::Notch:
-      process_notch(g, inst, i, nframes);
-      break;
-    default:
-      assert(false && "unhandled NodeKind in process_instance");
-      break;
+
+  // See Note [Region fallback]: when the template has no registered
+  // regions (typically C++ tests built directly via rt_graph_add_node
+  // without going through the Haskell loaders), iterate nodes flatly.
+  if (def->regions.empty()) {
+    for (std::size_t i = 0; i < node_count; ++i) {
+      dispatch_node(g, inst, i, nframes, def->nodes[i]);
+    }
+    return;
+  }
+
+  // Region path: same kernels in the same order, just iterated as
+  // an overlay. The Haskell precondition is that regions cover every
+  // node exactly once with no overlap; we clamp each region's range
+  // against node_count defensively in case construction was partial.
+  for (const RegionSpec &r : def->regions) {
+    const std::size_t first = static_cast<std::size_t>(r.first_node);
+    const std::size_t end_excl =
+        std::min(node_count, first + static_cast<std::size_t>(r.node_count));
+    for (std::size_t i = first; i < end_excl; ++i) {
+      dispatch_node(g, inst, i, nframes, def->nodes[i]);
     }
   }
 }
@@ -3679,6 +3739,60 @@ void rt_graph_template_connect(
   dst_spec.input_refs[dport] = InputRef{src, sp};
 }
 
+/* Note [Region fallback]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+process_instance has two iteration paths gated on whether the
+MetaDef has any registered regions:
+
+  * Regions registered (Haskell-loaded graphs):
+      iterate def->regions in order; for each region iterate
+      [first_node, first_node + node_count). The dispatch body
+      is identical to the flat path. Step A is structural only —
+      the same kernels run in the same order; we just lift the
+      grouping into the runtime data model so Step B / Step C
+      have something to hang off.
+
+  * No regions registered (C++ doctests, ad-hoc test graphs
+    built via rt_graph_add_node):
+      fall through to the legacy flat per-node loop. This keeps
+      every existing test working without forcing each one to
+      mirror the Haskell-side region pass.
+
+The fallback path is not a deprecated transition strategy — it is
+the contract for any caller that builds a graph through the C ABI
+without Haskell. There is no plan to remove it.
+*/
+
+// Add one region to the named template's MetaDef. The Haskell
+// loaders (loadRuntimeGraph, loadTemplateGraph) emit one call per
+// `RuntimeRegion` after every node and connection has been registered;
+// regions are appended in execution order so def->regions[i] matches
+// the Haskell-side rgRuntimeRegions[i].
+//
+// Validation here is loose: invalid template_id, negative or zero
+// node_count, or a range that would step outside def->nodes are
+// silent no-ops. The Haskell side guarantees the precondition (every
+// node covered exactly once, contiguous, in execution order); the
+// C ABI does not duplicate that check. See Note [Region fallback].
+void rt_graph_template_add_region(
+    RTGraph *g, int template_id,
+    int rate, int first_node, int node_count
+) {
+  if (!g) return;
+
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+
+  if (first_node < 0 || node_count <= 0) return;
+  const std::size_t first = static_cast<std::size_t>(first_node);
+  const std::size_t count = static_cast<std::size_t>(node_count);
+  if (first >= def->nodes.size() || count > def->nodes.size() - first) {
+    return;
+  }
+
+  def->regions.push_back(RegionSpec{rate, first_node, node_count});
+}
+
 // Spawn a fresh instance of the named template. Returns globally-
 // unique instance_id (>= 0) or -1 on failure.
 //
@@ -3782,6 +3896,15 @@ void rt_graph_connect(
     RTGraph *g, int src_index, int src_port, int dst_index, int dst_port
 ) {
   rt_graph_template_connect(g, 0, src_index, src_port, dst_index, dst_port);
+}
+
+// Legacy: add one region to template 0. See Note [Region fallback]
+// — calling this is optional; without any regions, process_instance
+// uses the flat per-node loop.
+void rt_graph_add_region(
+    RTGraph *g, int rate, int first_node, int node_count
+) {
+  rt_graph_template_add_region(g, 0, rate, first_node, node_count);
 }
 
 // Render one block offline; processes every live instance of every

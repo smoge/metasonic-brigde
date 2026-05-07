@@ -450,8 +450,14 @@ data Rate
   | InitRate      -- ^ Computed once at graph initialization
   | BlockRate     -- ^ Recomputed once per audio block
   | SampleRate    -- ^ Recomputed every sample
-  deriving stock    (Eq, Ord, Show, Generic)
+  deriving stock    (Eq, Ord, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
+-- | The derived 'Enum' instance is part of the C ABI for
+-- 'rt_graph_template_add_region': the marshalled int is
+-- @fromEnum :: Rate -> Int@, i.e. constructor declaration order
+-- (0=CompileRate ... 3=SampleRate). Reordering constructors here
+-- would silently break the runtime's RegionSpec.rate field — keep
+-- the order in lockstep with Note [Rate discipline] above.
 
 {- Note [Resource effects]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

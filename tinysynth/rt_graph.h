@@ -143,6 +143,34 @@ void rt_graph_template_connect(RTGraph *g, int template_id,
                                int src_index, int src_port,
                                int dst_index, int dst_port);
 
+// [T:construction] Add one region to the named template's MetaDef.
+// Regions are an execution-order overlay on the template's node array;
+// process_instance iterates them as the unit of dispatch when the
+// template has at least one region registered, and falls back to a
+// flat per-node loop when the regions vector is empty.
+//
+//   rate         : raw int matching the Haskell 'Rate' lattice ordering
+//                  (0=CompileRate, 1=InitRate, 2=BlockRate, 3=SampleRate).
+//                  Stored verbatim; future Step-B / Step-C work consumes
+//                  it. The runtime does not currently make decisions
+//                  based on rate.
+//   first_node   : dense index of the region's first node within the
+//                  template's node array.
+//   node_count   : number of contiguous nodes in this region.
+//
+// Regions are expected to cover every node in the template exactly
+// once with no overlap (the Haskell greedy region pass guarantees
+// this). The C ABI does not currently validate that contract — it is
+// a precondition. Silent no-op if template_id is invalid or if
+// first_node/node_count would step outside the template's node array.
+//
+// NodeIndex remains the addressable identity for every control-write
+// ABI ('rt_graph_template_set_default', 'rt_graph_realtime_set_control',
+// etc.). Future fusion passes that elide nodes must preserve or
+// redirect their control-slot identities.
+void rt_graph_template_add_region(RTGraph *g, int template_id,
+                                  int rate, int first_node, int node_count);
+
 // [T:control] Spawn an instance of the named template. Returns
 // globally-unique instance_id (>= 0) or -1 on failure. Slot reuse: a
 // dead slot is reused before appending. The instance carries its
@@ -174,6 +202,9 @@ void rt_graph_set_control(RTGraph *g, int node_index, int control_index,
 // [T:construction] Template-0 shim for rt_graph_template_connect.
 void rt_graph_connect(RTGraph *g, int src_index, int src_port, int dst_index,
                       int dst_port);
+
+// [T:construction] Template-0 shim for rt_graph_template_add_region.
+void rt_graph_add_region(RTGraph *g, int rate, int first_node, int node_count);
 
 // [T:render] Offline block rendering. Processes every live instance of
 // every template, in template registration (= execution) order.

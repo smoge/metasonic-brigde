@@ -5685,3 +5685,125 @@ TEST_CASE("A.2 reset: rt_graph_clear discards pending queued commands") {
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// Step A region overlay: registering regions must not change the
+// rendered audio. The Haskell loaders always emit them; legacy
+// callers building graphs via rt_graph_add_node directly do not.
+// process_instance must produce sample-identical output along both
+// paths (this is the entire point of Step A — structural plumbing,
+// no behaviour change).
+// ----------------------------------------------------------------
+
+TEST_CASE("regions overlay produces sample-identical output to flat node loop") {
+    // Helper: build SinOsc(440) → Gain(0.5) → Out(0) into a fresh graph.
+    auto build = [](RTGraph *g) {
+        rt_graph_add_node(g, 0, 1); // SinOsc tag = 1
+        rt_graph_set_control(g, 0, 0, 440.0f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+
+        rt_graph_add_node(g, 1, 3); // Gain tag = 3
+        rt_graph_set_control(g, 1, 0, 0.5f);
+
+        rt_graph_add_node(g, 2, 2); // Out tag = 2
+        rt_graph_set_control(g, 2, 0, 0.0f);
+
+        rt_graph_connect(g, 0, 0, 1, 0); // SinOsc.out0 → Gain.in0
+        rt_graph_connect(g, 1, 0, 2, 0); // Gain.out0 → Out.in0
+    };
+
+    // Path 1: no regions registered → flat node loop.
+    auto *g_flat = rt_graph_create(/*capacity*/ 4, /*max_frames*/ kFrames);
+    REQUIRE(g_flat != nullptr);
+    build(g_flat);
+    auto flat_samples = render_bus0(g_flat, kFrames);
+    rt_graph_destroy(g_flat);
+
+    // Path 2: one region covering all 3 nodes → region path.
+    auto *g_regions = rt_graph_create(/*capacity*/ 4, /*max_frames*/ kFrames);
+    REQUIRE(g_regions != nullptr);
+    build(g_regions);
+    // SampleRate = 3 in the Haskell Rate enum (CompileRate=0,
+    // InitRate=1, BlockRate=2, SampleRate=3); first_node=0,
+    // node_count=3 covers the entire chain. See
+    // Note [Region fallback] in rt_graph.cpp.
+    rt_graph_add_region(g_regions, /*rate=*/3, /*first_node=*/0, /*node_count=*/3);
+    auto region_samples = render_bus0(g_regions, kFrames);
+    rt_graph_destroy(g_regions);
+
+    REQUIRE(flat_samples.size() == region_samples.size());
+    for (std::size_t i = 0; i < flat_samples.size(); ++i) {
+        // Bit-identical expected: same kernels in the same order
+        // with no scratch reuse yet (Step A is structural only).
+        CHECK(flat_samples[i] == region_samples[i]);
+    }
+}
+
+TEST_CASE("multiple regions in the overlay still cover every node exactly once") {
+    // Build a 3-node chain and split it across two regions:
+    //   region 0 = [SinOsc] (1 node)
+    //   region 1 = [Gain, Out] (2 nodes)
+    // Output must still match the flat-loop result.
+    auto build = [](RTGraph *g) {
+        rt_graph_add_node(g, 0, 1);
+        rt_graph_set_control(g, 0, 0, 220.0f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+
+        rt_graph_add_node(g, 1, 3);
+        rt_graph_set_control(g, 1, 0, 0.25f);
+
+        rt_graph_add_node(g, 2, 2);
+        rt_graph_set_control(g, 2, 0, 0.0f);
+
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+    };
+
+    auto *g_flat = rt_graph_create(4, kFrames);
+    REQUIRE(g_flat != nullptr);
+    build(g_flat);
+    auto flat_samples = render_bus0(g_flat, kFrames);
+    rt_graph_destroy(g_flat);
+
+    auto *g_split = rt_graph_create(4, kFrames);
+    REQUIRE(g_split != nullptr);
+    build(g_split);
+    rt_graph_add_region(g_split, /*rate=*/3, /*first_node=*/0, /*node_count=*/1);
+    rt_graph_add_region(g_split, /*rate=*/3, /*first_node=*/1, /*node_count=*/2);
+    auto split_samples = render_bus0(g_split, kFrames);
+    rt_graph_destroy(g_split);
+
+    REQUIRE(flat_samples.size() == split_samples.size());
+    for (std::size_t i = 0; i < flat_samples.size(); ++i) {
+        CHECK(flat_samples[i] == split_samples[i]);
+    }
+}
+
+TEST_CASE("rt_graph_template_add_region rejects out-of-range ranges") {
+    // Defensive: the C ABI doc says invalid template_id and ranges
+    // that step outside def->nodes are silent no-ops. Pin that.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    // None of these should land in def->regions; rendering must
+    // therefore still take the flat fallback path.
+    rt_graph_add_region(g, 3, /*first=*/-1, /*count=*/2);  // negative first
+    rt_graph_add_region(g, 3, /*first=*/0,  /*count=*/0);  // zero count
+    rt_graph_add_region(g, 3, /*first=*/0,  /*count=*/-1); // negative count
+    rt_graph_add_region(g, 3, /*first=*/5,  /*count=*/1);  // first out of range
+    rt_graph_add_region(g, 3, /*first=*/1,  /*count=*/5);  // overflow
+
+    auto samples = render_bus0(g, kFrames);
+    CHECK(peak_abs(samples) == doctest::Approx(1.0f).epsilon(0.02));
+
+    rt_graph_destroy(g);
+}

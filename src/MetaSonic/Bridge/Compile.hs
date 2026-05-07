@@ -25,7 +25,9 @@ module MetaSonic.Bridge.Compile
   ( -- * Runtime representation
     RuntimeInput (..)
   , RuntimeNode (..)
+  , RuntimeRegion (..)
   , RuntimeGraph (..)
+  , RegionIndex (..)
   , -- * Compilation
     compileRuntimeGraph
   , resolveNodeIndex
@@ -412,12 +414,73 @@ data RuntimeNode = RuntimeNode
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
--- | The fully compiled runtime graph: a list of dense nodes
--- ready to be transferred across the FFI boundary.
+-- | A region's dense position in the runtime region array.
+-- Distinct from 'RegionID' (the symbolic ID assigned by
+-- 'formRegions') so the Haskell-side Region/regID space cannot
+-- be confused with the runtime-side ordering that crosses the FFI.
 --
--- See Note [Dense lowering].
+-- See Note [Dense lowering] and Note [Runtime regions overlay].
+newtype RegionIndex = RegionIndex Int
+  deriving stock   (Eq, Ord, Show, Generic)
+  deriving newtype (NFData)
+
+{- Note [Runtime regions overlay]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A 'RuntimeRegion' is a structural overlay on top of 'rgNodes': it
+names a contiguous range of nodes in execution order that share a
+compatible rate (see Note [Region rate compatibility]) and were
+grouped by 'formRegions'. Step A of the fusion roadmap simply lifts
+this grouping into the FFI / runtime data model — no kernel-level
+fusion happens yet, no scratch-buffer reuse, no node elision. The
+runtime can still iterate node-by-node inside each region.
+
+NodeIndex remains the addressable identity for every control-write
+ABI ('rt_graph_template_set_default', 'rt_graph_realtime_set_control',
+CC mappings, etc.). Future fusion passes that elide nodes must
+preserve or redirect their control-slot identities; this constraint
+is recorded here because it is the obvious thing to forget once
+fusion starts removing nodes.
+
+The current greedy 'formRegions' produces contiguous regions, but
+'rrNodes' carries an explicit '[NodeIndex]' rather than a
+@(start, count)@ pair so a future non-greedy region pass can drop
+contiguity without changing the FFI shape. The C++ side stores the
+contiguity-flattened @first_node + node_count@ form because today's
+regions are guaranteed contiguous; that contract is a precondition
+the Haskell side must preserve until the C ABI grows a non-contiguous
+form.
+-}
+
+-- | One execution region in the runtime graph: a contiguous block
+-- of nodes (in execution order) that 'formRegions' grouped together.
+--
+-- See Note [Runtime regions overlay].
+data RuntimeRegion = RuntimeRegion
+  { rrIndex :: !RegionIndex
+    -- ^ Dense position of this region in 'rgRegions'.
+  , rrRate  :: !Rate
+    -- ^ Region execution rate (the join of member rates; see
+    -- Note [Region rate compatibility]).
+  , rrNodes :: ![NodeIndex]
+    -- ^ Member nodes in execution order. Currently always contiguous
+    -- (greedy 'formRegions' invariant), but the type does not encode
+    -- that.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | The fully compiled runtime graph: a list of dense nodes
+-- ready to be transferred across the FFI boundary, plus a
+-- region overlay for the runtime to use as the unit of execution.
+--
+-- The 'rgRuntimeRegions' field is named distinctly from
+-- 'RegionGraph.rgRegions' (which holds the compile-time 'Region's)
+-- because both record types share the @rg@ prefix and the field
+-- names would otherwise collide.
+--
+-- See Note [Dense lowering] and Note [Runtime regions overlay].
 data RuntimeGraph = RuntimeGraph
-  { rgNodes :: ![RuntimeNode]
+  { rgNodes          :: ![RuntimeNode]
+  , rgRuntimeRegions :: ![RuntimeRegion]
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -458,7 +521,14 @@ compileRuntimeGraph ir = do
         ]
 
   rtNodes <- mapM (compileNode indexMap) (zip [0..] irNodes)
-  pure $! RuntimeGraph rtNodes
+
+  -- Region overlay: form regions from the IR, then translate the
+  -- per-region NodeID membership into the dense NodeIndex space.
+  -- See Note [Runtime regions overlay].
+  rtRegions <- mapM (compileRegion indexMap)
+                    (zip [0..] (rgRegions (formRegions irNodes)))
+
+  pure $! RuntimeGraph rtNodes rtRegions
 
   where
     compileNode
@@ -486,3 +556,30 @@ compileRuntimeGraph ir = do
       case M.lookup src indexMap of
         Nothing -> Left $ "Missing runtime index for " ++ show src
         Just ix -> Right (RFrom ix port)
+
+    -- Translate a compile-time 'Region' into a dense 'RuntimeRegion'.
+    -- The 'regNodes' field is a list of symbolic 'NodeID's; we look
+    -- each up in the same NodeID → NodeIndex map used by node lowering.
+    -- A miss is the same kind of internal-bug case as in 'compileInput'.
+    -- See Note [Runtime regions overlay].
+    compileRegion
+      :: M.Map NodeID NodeIndex
+      -> (Int, Region)
+      -> Either String RuntimeRegion
+    compileRegion indexMap (i, region) = do
+      members <- mapM (lookupNodeIndex indexMap) (regNodes region)
+      pure $! RuntimeRegion
+        { rrIndex = RegionIndex i
+        , rrRate  = regRate region
+        , rrNodes = members
+        }
+
+    lookupNodeIndex
+      :: M.Map NodeID NodeIndex
+      -> NodeID
+      -> Either String NodeIndex
+    lookupNodeIndex indexMap nid =
+      case M.lookup nid indexMap of
+        Nothing -> Left $ "Missing runtime index for region member "
+                       ++ show nid
+        Just ix -> Right ix

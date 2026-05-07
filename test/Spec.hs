@@ -29,6 +29,7 @@ import qualified Data.Map.Strict           as M
 import qualified Data.Set                  as S
 import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
                                             sortBy)
+import           Data.Maybe                (mapMaybe)
 import           Data.Ord                  (comparing)
 import           Data.Word                 (Word8)
 import           Foreign.C.Types           (CFloat (..))
@@ -1110,6 +1111,12 @@ properties = testGroup "Properties"
   , QC.testProperty "every region's rate is compatible with its member nodes" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propRegionRateCompatible
 
+  , QC.testProperty "RuntimeGraph region overlay round-trips formRegions" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propRuntimeRegionsRoundTrip
+
+  , QC.testProperty "RuntimeGraph regions partition node indices contiguously" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propRuntimeRegionsContiguous
+
   , QC.testProperty "every BusOut precedes every same-bus BusIn in the schedule" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propBusOrdering
 
@@ -1438,6 +1445,67 @@ propRegionRateCompatible g = case lowerGraph g of
          ]
   where
     findNode nid = lookup nid . map (\n -> (irNodeID n, n))
+
+-- | Step A round-trip property: the runtime region overlay produced
+-- by 'compileRuntimeGraph' must agree with 'formRegions (giNodes ir)'
+-- on count, rate, member count, and the per-region NodeID-to-NodeIndex
+-- translation. Pins the contract that loaders use to send regions
+-- across the FFI.
+propRuntimeRegionsRoundTrip :: SynthGraph -> Property
+propRuntimeRegionsRoundTrip g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir -> case compileRuntimeGraph ir of
+    Left err -> counterexample ("compileRuntimeGraph failed: " <> err) False
+    Right rg ->
+      let compileRegions = rgRegions (formRegions (giNodes ir))
+          runtime        = rgRuntimeRegions rg
+          indexMap = M.fromList
+            [ (rnOriginalID n, rnIndex n) | n <- rgNodes rg ]
+          translate nid = M.lookup nid indexMap
+      in conjoin
+           [ counterexample "region count mismatch" $
+               length runtime === length compileRegions
+           , conjoin
+               [ counterexample
+                   (show i <> ": rate mismatch")
+                   (rrRate rr === regRate cr)
+                 .&&.
+                 counterexample
+                   (show i <> ": members differ from translated formRegions output")
+                   (rrNodes rr === mapMaybe translate (regNodes cr))
+               | (i, rr, cr) <- zip3 [(0 :: Int) ..] runtime compileRegions
+               ]
+           ]
+
+-- | Step A structural invariant: every 'RuntimeRegion' covers a
+-- contiguous run of 'NodeIndex' values, regions concatenate in order
+-- to exactly @[0 .. length (rgNodes rg) - 1]@, and no node is in
+-- two regions. This locks the contiguity contract the C++ side
+-- relies on (RegionSpec carries first_node + node_count).
+propRuntimeRegionsContiguous :: SynthGraph -> Property
+propRuntimeRegionsContiguous g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir -> case compileRuntimeGraph ir of
+    Left err -> counterexample ("compileRuntimeGraph failed: " <> err) False
+    Right rg ->
+      let runtime    = rgRuntimeRegions rg
+          unwrap (NodeIndex i) = i
+          flat       = concatMap (map unwrap . rrNodes) runtime
+          totalNodes = length (rgNodes rg)
+          eachContiguous =
+            [ counterexample (show (rrIndex r) <> ": members are not contiguous: " <> show ixs) $
+                property $
+                  let ixs = map unwrap (rrNodes r)
+                  in not (null ixs)
+                       && ixs == [head ixs .. head ixs + length ixs - 1]
+            | r <- runtime
+            , let ixs = map unwrap (rrNodes r)
+            ]
+      in conjoin
+           [ counterexample "regions do not concatenate to [0 .. n-1]" $
+               flat === [0 .. totalNodes - 1]
+           , conjoin eachContiguous
+           ]
 
 ------------------------------------------------------------
 -- Cross-cutting end-to-end tests through the FFI

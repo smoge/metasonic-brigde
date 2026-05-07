@@ -41,6 +41,7 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_ensure_bus
   , c_rt_graph_template_set_default
   , c_rt_graph_template_connect
+  , c_rt_graph_template_add_region
   , c_rt_graph_template_instance_add
   , c_rt_graph_instance_remove
   , c_rt_graph_instance_release
@@ -67,7 +68,8 @@ import           Foreign
 import           Foreign.C.Types
 
 import           MetaSonic.Bridge.Compile   (RuntimeGraph (..), RuntimeInput (..),
-                                             RuntimeNode (..))
+                                             RuntimeNode (..),
+                                             RuntimeRegion (..))
 import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
                                              TemplateID (..))
 import           MetaSonic.Types
@@ -353,6 +355,17 @@ foreign import ccall unsafe "rt_graph_template_connect"
   c_rt_graph_template_connect
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> CInt -> IO ()
 
+-- | Add one execution region to the named template's MetaDef.
+-- @rate@ is the int form of the Haskell 'Rate' lattice
+-- (@fromEnum :: Rate -> Int@); the runtime stores it but does not
+-- currently make decisions on it. @firstNode@ and @nodeCount@ name
+-- a contiguous run within the template's node array. See
+-- @rt_graph.h@'s @rt_graph_template_add_region@ doc and
+-- Note [Region fallback] in @rt_graph.cpp@.
+foreign import ccall unsafe "rt_graph_template_add_region"
+  c_rt_graph_template_add_region
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
+
 -- | Spawn a fresh instance of the named template. Returns globally-
 -- unique instance_id (>= 0) or -1 on failure.
 foreign import ccall unsafe "rt_graph_template_instance_add"
@@ -497,6 +510,26 @@ cPortIndex (PortIndex x) = fromIntegral x
 cControlIndex :: ControlIndex -> CInt
 cControlIndex (ControlIndex x) = fromIntegral x
 
+-- | Send one 'RuntimeRegion' across the FFI as a contiguous range.
+-- Currently the greedy 'formRegions' pass produces only contiguous
+-- regions; this helper flattens 'rrNodes' to (first_node, node_count)
+-- on that assumption. An empty 'rrNodes' is a silent no-op (the
+-- runtime would clamp it anyway).
+--
+-- 'rrRate' marshals via 'fromEnum' to match the Haskell 'Rate'
+-- lattice ordering — see Note [Rate discipline] in MetaSonic.Types.
+-- The runtime stores the int but does not currently key behaviour
+-- on it.
+addRegionTo :: Ptr RTGraph -> CInt -> RuntimeRegion -> IO ()
+addRegionTo g cTid r =
+  case rrNodes r of
+    []                 -> pure ()
+    (NodeIndex h : _)  ->
+      c_rt_graph_template_add_region g cTid
+        (fromIntegral (fromEnum (rrRate r)))
+        (fromIntegral h)
+        (fromIntegral (length (rrNodes r)))
+
 -- | Transfer a compiled 'RuntimeGraph' to the C++ runtime.
 -- Clears any existing graph state first, then adds nodes and
 -- wires connections.
@@ -519,6 +552,11 @@ loadRuntimeGraph g rg = do
   mapM_ addNode (rgNodes rg)
   -- Pass 2: wire connections (all nodes now exist).
   mapM_ wireNode (rgNodes rg)
+  -- Pass 3: register the region overlay on template 0. The C++
+  -- side iterates regions in process_instance when present and
+  -- falls back to a flat node loop when absent. See
+  -- Note [Region fallback] in rt_graph.cpp.
+  mapM_ (addRegion 0) (rgRuntimeRegions rg)
   where
     addNode :: RuntimeNode -> IO ()
     addNode node = do
@@ -549,6 +587,9 @@ loadRuntimeGraph g rg = do
               (cPortIndex (PortIndex i))
           RConst _ ->
             pure ()
+
+    addRegion :: CInt -> RuntimeRegion -> IO ()
+    addRegion = addRegionTo g
 
 {- Note [loadTemplateGraph protocol]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -648,6 +689,9 @@ loadTemplateGraph g tg = do
                 (cPortIndex (PortIndex i))
             RConst _ ->
               pure ()
+      -- Pass 3: register the region overlay for this template.
+      -- See Note [Region fallback] in rt_graph.cpp.
+      mapM_ (addRegionTo g cTid) (rgRuntimeRegions rg)
 
 {- Note [Realtime audio lifecycle]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
