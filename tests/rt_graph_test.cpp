@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <numbers>
 #include <random>
 #include <thread>
@@ -1356,24 +1357,28 @@ TEST_CASE("Smooth: two nodes in one graph hold independent state") {
     rt_graph_destroy(g);
 }
 
-TEST_CASE("Smooth: non-positive base_freq is clamped — no freeze, smoother still tracks target") {
+TEST_CASE("Smooth: pathological base_freq is sanitized — no freeze, no NaN, smoother still tracks target") {
     // q::dynamic_smoother computes g0 = 2*tan(pi*base/sps) /
-    // (1 + tan(...)). base == 0 collapses g0 to 0 and freezes
-    // the smoother at its seed forever; base < 0 produces a
-    // negative g0 which pushes the IIR away from the input. The
-    // kernel clamps base_hz to a small positive epsilon so the
-    // math stays sane regardless of what landed in controls[0]
-    // at runtime.
-    //
-    // Without the clamp, base == 0 would hold output at the seed
-    // (~0) forever; this test pins that the smoother visibly
-    // moves toward the target after a step, AND that every
-    // sample is finite (no NaN / Inf from a malformed coefficient).
-    auto run_with_invalid_base = [](double bad_base) {
+    // (1 + tan(...)). The math falls apart in three regions:
+    //   - base <= 0:          g0 collapses to 0 (freeze) or goes
+    //                         negative (IIR pushed away from input).
+    //   - non-finite base:    tan propagates NaN through low1/low2
+    //                         and the smoother is permanently
+    //                         poisoned.
+    //   - base >= sps/2:      tan(pi*wc) for wc >= 0.5 wraps to
+    //                         negative, same instability as <= 0
+    //                         by a different route.
+    // The kernel sanitizes to [0.001 Hz, 0.49 * sps] with non-
+    // finite values mapped to the lower bound. This test pins
+    // that — across all three failure regions — the smoother
+    // emits finite, bounded samples AND visibly tracks toward
+    // the target after a step.
+    constexpr double kSampleRate = 48000.0;
+    auto run_with_pathological_base = [](double bad_base) {
         auto *g = rt_graph_create(2, kFrames);
         REQUIRE(g != nullptr);
         rt_graph_add_node(g, 0, 14);
-        rt_graph_set_control(g, 0, 0, bad_base);             // invalid
+        rt_graph_set_control(g, 0, 0, bad_base);             // pathological
         rt_graph_set_control(g, 0, 1, 0.0);
         rt_graph_add_node(g, 1, 2);
         rt_graph_set_control(g, 1, 0, 0.0);
@@ -1383,20 +1388,33 @@ TEST_CASE("Smooth: non-positive base_freq is clamped — no freeze, smoother sti
         rt_graph_set_control(g, 0, 1, 0.5);                  // step the target
         auto block2 = render_bus0(g, kFrames);
 
-        for (auto x : block2) CHECK(std::isfinite(x));
+        for (auto x : block2) {
+            CHECK(std::isfinite(x));
+            CHECK(std::abs(x) <= 1.0f);                      // bounded, no explosion
+        }
 
-        // Smoother is alive. Without the clamp this would be ~0
-        // (frozen) for base == 0 or a tiny negative wobble for
-        // base < 0. With the clamp the bandpass adaptation kicks
-        // in and the output tracks toward the target.
+        // Smoother is alive. Without sanitation: base == 0 freezes
+        // at ~0; base < 0 wobbles near zero; non-finite produces
+        // NaN; base >= Nyquist either wraps unstable or also
+        // freezes. With the clamp the bandpass adaptation kicks
+        // in and the output tracks toward the 0.5 target.
         INFO("bad_base=" << bad_base << " final=" << block2[kFrames - 1]);
         CHECK(block2[kFrames - 1] > 0.1f);
         rt_graph_destroy(g);
     };
 
-    run_with_invalid_base(0.0);
-    run_with_invalid_base(-1.0);
-    run_with_invalid_base(-1000.0);
+    // Non-positive: collapses g0.
+    run_with_pathological_base(0.0);
+    run_with_pathological_base(-1.0);
+    run_with_pathological_base(-1000.0);
+    // Non-finite: poisons the IIR with NaN.
+    run_with_pathological_base(std::numeric_limits<double>::quiet_NaN());
+    run_with_pathological_base(std::numeric_limits<double>::infinity());
+    run_with_pathological_base(-std::numeric_limits<double>::infinity());
+    // Above-Nyquist: tan(pi*wc) wraps for wc >= 0.5.
+    run_with_pathological_base(kSampleRate * 0.5);           // exactly Nyquist
+    run_with_pathological_base(kSampleRate);                 // sample rate
+    run_with_pathological_base(kSampleRate * 10.0);          // far above
 }
 
 TEST_CASE("Smooth: connected audio input flows through with no zipper at boundaries") {

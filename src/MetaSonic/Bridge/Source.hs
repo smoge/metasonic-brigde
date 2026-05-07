@@ -404,11 +404,12 @@ data UGen
     -- The output is the envelope amplitude in [0, 1] at sample
     -- rate. Multiply with a signal to apply the envelope.
   | Smooth !Double !Connection
-    -- ^ One-pole-style smoother (Q's @q::dynamic_smoother@):
-    -- @smooth base_freq_hz value@. The first argument is a
-    -- compile-time smoothing speed in Hz (smaller = slower /
-    -- smoother / laggier; ~20 Hz is a typical sweet spot for
-    -- control smoothing). The second argument is the value to
+    -- ^ Cascaded two-pole self-modulating smoother (Q's
+    -- @q::dynamic_smoother@): @smooth base_freq_hz value@. The
+    -- first argument is a compile-time smoothing speed in Hz
+    -- (smaller = slower / smoother / laggier; ~20 Hz is a typical
+    -- sweet spot for control smoothing). The second argument is
+    -- the value to
     -- smooth — usually a 'Param' that the producer thread
     -- updates via the realtime ABI when CC or pitch-bend events
     -- arrive, so that block-rate jumps in the target value land
@@ -668,8 +669,8 @@ delayL
   -> SynthM Connection
 delayL maxT sig time = insertNodeC "delay" (Delay maxT sig time)
 
--- | One-pole-style smoother (Q's @q::dynamic_smoother@) for de-zippering
--- block-rate control updates.
+-- | Cascaded two-pole self-modulating smoother (Q's @q::dynamic_smoother@)
+-- for de-zippering block-rate control updates.
 --
 -- The first argument is a compile-time smoothing speed in Hz: smaller
 -- values mean a slower / smoother / laggier ramp. ~20 Hz is a typical
@@ -679,12 +680,14 @@ delayL maxT sig time = insertNodeC "delay" (Delay maxT sig time)
 -- events arrive, so the smoother turns block-rate jumps in the target
 -- value into continuous ramps in its sample-rate output.
 --
--- Values @<= 0@ are unsafe: the underlying @q::dynamic_smoother@'s
--- @g0@ coefficient is computed from @tan(pi * base_hz / sps)@, which
--- collapses to zero (freezing the smoother at its seed) or goes
--- negative (driving the IIR unstable) at non-positive base. The
--- runtime clamps to a small positive epsilon (0.001 Hz) defensively,
--- but you should pick a real, positive smoothing frequency here.
+-- Pathological values are unsafe: the underlying
+-- @q::dynamic_smoother@'s @g0@ coefficient is computed from
+-- @tan(pi * base_hz / sps)@, which collapses to zero or goes negative
+-- at @base <= 0@, returns @NaN@ at non-finite input, and wraps
+-- negative once @base@ approaches @sample_rate / 2@. The runtime
+-- defensively sanitizes to @[0.001 Hz, 0.49 * sample_rate]@ and
+-- substitutes the lower bound for @NaN@\/@Inf@, but you should pick a
+-- real, finite, sub-Nyquist smoothing frequency here.
 --
 -- > out <- runSynth $ do
 -- >   target <- pure (Param 0.0)         -- producer-thread updated

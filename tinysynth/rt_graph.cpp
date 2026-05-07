@@ -265,6 +265,7 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KBusIn        = 11           BusIn         = 11
   kindTag KBusInDelayed = 12           BusInDelayed  = 12
   kindTag KDelay        = 13           Delay        = 13
+  kindTag KSmooth       = 14           Smooth       = 14
 
   Bus model: Out, BusOut, BusIn, and BusInDelayed all operate on the
   same bus pool, owned by the Server (see Note [§2.C: server-global
@@ -2118,24 +2119,25 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
 
   // q::dynamic_smoother computes its IIR coefficients as
   // wc = base_hz / sps; gc = tan(pi * wc); g0 = 2*gc / (1 + gc).
-  // base_hz <= 0 produces g0 <= 0, which either freezes the
-  // smoother at its seed (g0 == 0) or drives the IIR unstable
-  // (g0 < 0 pushes low1 *away* from the input). Clamp to a small
-  // positive epsilon to keep the math sane while still letting
-  // users pick legitimately slow smoothing speeds. The spec
-  // defaults are guarded too (kindSpec sets 20 Hz), but per-
-  // instance set_control can land any double here at runtime.
-  // q::dynamic_smoother computes its IIR coefficients as
-  // wc = base_hz / sps; gc = tan(pi * wc); g0 = 2*gc / (1 + gc).
-  // base_hz <= 0 produces g0 <= 0, which either freezes the
-  // smoother at its seed (g0 == 0) or drives the IIR away from
-  // the input (g0 < 0). Clamp to a small positive epsilon to keep
-  // the math sane while still letting users pick legitimately
-  // slow smoothing speeds. The spec defaults are guarded too
-  // (kindSpec sets 20 Hz), but per-instance set_control can land
-  // any double here at runtime.
+  // The math falls apart at three input ranges:
+  //   - NaN / non-finite: tan propagates NaN through the IIR state
+  //     and the smoother is permanently poisoned.
+  //   - base_hz <= 0: g0 <= 0, which either freezes the smoother at
+  //     its seed (g0 == 0) or drives low1 *away* from the input
+  //     (g0 < 0).
+  //   - base_hz >= sample_rate / 2: wc >= 0.5, where tan(pi*wc) goes
+  //     to +inf and then wraps negative — same instability as the
+  //     <= 0 case, by a different route.
+  // Sanitize to [kMin, 0.49 * sps]. The spec defaults are already
+  // guarded (kindSpec sets 20 Hz), but per-instance set_control can
+  // land any double here at runtime.
   constexpr double kMinBaseFreqHz = 0.001;
-  const double base_hz = std::max(node.controls[0], kMinBaseFreqHz);
+  const double raw_base = node.controls[0];
+  const double max_base = 0.49 * static_cast<double>(g.sample_rate);
+  const double base_hz =
+      std::isfinite(raw_base)
+          ? std::clamp(raw_base, kMinBaseFreqHz, max_base)
+          : kMinBaseFreqHz;
   const float  target  = static_cast<float>(node.controls[1]);
 
   // Lazy construction on first call or after a sample-rate change.

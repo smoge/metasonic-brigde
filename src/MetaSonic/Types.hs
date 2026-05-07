@@ -186,11 +186,11 @@ data NodeKind
     -- so the delay time can be sub-sample and modulated at audio rate.
     -- See Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
   | KSmooth
-    -- ^ One-pole-style smoother (wraps Q's @q::dynamic_smoother@).
-    -- Audio input port 0 is the value to smooth; controls
-    -- @[base_freq_hz, target_default]@ pick the smoothing speed and
-    -- the steady-state value when the input port is unconnected.
-    -- The headline use is desipping zipper noise on block-rate CC
+    -- ^ Cascaded two-pole self-modulating smoother (wraps Q's
+    -- @q::dynamic_smoother@). Audio input port 0 is the value to
+    -- smooth; controls @[base_freq_hz, target_default]@ pick the
+    -- smoothing speed and the steady-state value when the input port
+    -- is unconnected. The headline use is de-zippering block-rate CC
     -- and pitch-bend updates: producer-thread events update
     -- 'controls[1]' (the target) and downstream consumers read the
     -- smoothed sample-by-sample output. See Note
