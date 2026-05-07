@@ -68,6 +68,30 @@ namespace {
 // TODO: make this configurable
 constexpr float kDefaultSampleRate = 48000.0f;
 
+// §2.E: release-then-free silence detection.
+// kReleaseSilenceThreshold is the absolute peak below which a single
+// block is considered "silent" for the purposes of auto-freeing a
+// Releasing instance. -80 dBFS is well below the noise floor of any
+// realistic signal chain.
+// kReleaseSilenceBlocks is the consecutive-quiet-blocks window the
+// instance must clear before its slot is reclaimed. At 48 kHz with
+// 256-sample blocks this is ~43 ms, comfortably more than typical
+// envelope tails after the released level reaches the threshold.
+// See Note [§2.E: release-then-free instance lifecycle].
+constexpr float kReleaseSilenceThreshold = 1e-4f;
+constexpr int   kReleaseSilenceBlocks    = 8;
+
+// Lifecycle state for a GraphInstance. "Dead" is not represented here
+// — a dead slot is a std::optional<GraphInstance> with no value, which
+// is observably distinct from any InstanceStatus.
+//
+// The integer values are part of the C ABI returned by
+// rt_graph_instance_status; do not renumber.
+enum class InstanceStatus : int {
+  Live      = 0,  // default; gate-on / sustaining
+  Releasing = 1,  // release requested; processing continues until silent
+};
+
 // ----------------------------------------------------------------
 // Strong internal indices
 // ----------------------------------------------------------------
@@ -449,6 +473,29 @@ struct GraphInstance {
   int template_id = 0;
 
   std::vector<NodeInstanceState> nodes;
+
+  // §2.E lifecycle state. Default-constructed instances are Live.
+  // rt_graph_instance_release flips the status to Releasing and the
+  // process_graph loop reclaims the slot once the instance has been
+  // silent (peak < kReleaseSilenceThreshold) for kReleaseSilenceBlocks
+  // consecutive blocks. See Note [§2.E: release-then-free instance
+  // lifecycle].
+  InstanceStatus status = InstanceStatus::Live;
+
+  // Consecutive blocks (while Releasing) the instance has produced a
+  // peak below kReleaseSilenceThreshold. Reset to 0 every time the
+  // instance is *not* quiet for a block, and on transition into
+  // Releasing.
+  int silent_blocks = 0;
+
+  // Per-block peak |input| accumulated by the Out and BusOut kernels
+  // for this instance. Reset to 0 at the top of each block by
+  // process_instance and updated by process_out. Read by process_graph
+  // when status == Releasing to drive the silence counter. The peak is
+  // measured at the *sink* (Out / BusOut) so it captures the instance's
+  // actual contribution to the bus pool rather than internal node
+  // activity that may be silenced downstream.
+  float block_sink_peak = 0.0f;
 };
 
 /* Note [Node configuration: spec vs state]
@@ -1333,10 +1380,21 @@ static void process_out(RTGraph &g, GraphInstance &inst,
   if (bus < 0 || static_cast<std::size_t>(bus) >= g.server.output_buses.size())
     return;
 
+  // Accumulate into the bus and, in the same pass, track the block's
+  // peak |input| for §2.E release-then-free silence detection. The
+  // peak is per-instance (not per-node) — multiple Out/BusOut nodes in
+  // the same instance contribute to the same max. process_instance
+  // resets inst.block_sink_peak to 0 before any node runs this block;
+  // process_graph reads it after the instance finishes.
   auto &dst = g.server.output_buses[static_cast<std::size_t>(bus)];
+  float peak = inst.block_sink_peak;
   for (int i = 0; i < nframes; ++i) {
-    dst[static_cast<std::size_t>(i)] += in[static_cast<std::size_t>(i)];
+    const float s = in[static_cast<std::size_t>(i)];
+    dst[static_cast<std::size_t>(i)] += s;
+    const float a = std::fabs(s);
+    if (a > peak) peak = a;
   }
+  inst.block_sink_peak = peak;
 }
 
 /* Note [BusIn kernel: read live bus contents]
@@ -1565,6 +1623,12 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
     return;
   }
 
+  // §2.E: zero the per-block sink peak before any kernel runs. Out /
+  // BusOut kernels accumulate the block's max |input| into this field;
+  // process_graph reads it after this function returns to decide
+  // whether a Releasing instance has gone silent.
+  inst.block_sink_peak = 0.0f;
+
   const std::size_t node_count = std::min(def->nodes.size(), inst.nodes.size());
   for (std::size_t i = 0; i < node_count; ++i) {
     switch (def->nodes[i].kind) {
@@ -1668,6 +1732,22 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       if (!maybe_inst) continue;
       if (maybe_inst->template_id != tid_i) continue;
       process_instance(g, *maybe_inst, nframes);
+
+      // §2.E: if the instance is Releasing, drive the silence counter
+      // from the peak that process_out just recorded into
+      // block_sink_peak. Reclaim the slot once the counter crosses
+      // kReleaseSilenceBlocks. Live instances bypass this entirely —
+      // the field is consulted only when status == Releasing.
+      // See Note [§2.E: release-then-free instance lifecycle].
+      if (maybe_inst->status == InstanceStatus::Releasing) {
+        if (maybe_inst->block_sink_peak < kReleaseSilenceThreshold) {
+          if (++maybe_inst->silent_blocks >= kReleaseSilenceBlocks) {
+            maybe_inst.reset();
+          }
+        } else {
+          maybe_inst->silent_blocks = 0;
+        }
+      }
     }
   }
 }
@@ -2339,6 +2419,127 @@ void rt_graph_instance_remove(RTGraph *g, int instance_id) {
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return;
   g->instances[idx].reset();
+}
+
+/* Note [§2.E: release-then-free instance lifecycle]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+rt_graph_instance_remove (above) is the hard-free path: the slot is
+cleared on the spot, regardless of whether the instance still has
+audio in flight. That is the right semantics for panic stops and
+voice-stealing under pressure, but it clicks every time a normal
+note-off lands on a sustaining voice — the envelope tail and any
+ringing delay buffer are cut off at the block boundary.
+
+rt_graph_instance_release is the graceful counterpart. It:
+
+  1. Walks the instance's nodes and, for every Env node, sets the
+     gate-default control (controls[0]) to 0.0. The Env kernel
+     reads this on its next process call and, on detecting the
+     falling edge, invokes q::adsr_envelope_gen::release() to ramp
+     down at the configured release rate.
+
+  2. Marks the instance status = Releasing and zeroes silent_blocks.
+     The instance keeps being processed every block exactly as before;
+     only its lifecycle metadata changes.
+
+  3. process_out (used by both Out and BusOut kernels) records the
+     block's peak |input| into inst.block_sink_peak. This is the
+     instance's actual contribution to the bus pool — multiple sinks
+     in the same instance share the field via a max.
+
+  4. After process_instance returns, process_graph checks: if status
+     is Releasing and block_sink_peak < kReleaseSilenceThreshold,
+     bump silent_blocks; once it crosses kReleaseSilenceBlocks, the
+     slot is reset (instance becomes dead and the id may be reused by
+     a future _instance_add). If the instance produces sound again
+     (loud transient during release, ringing delay), the counter
+     resets and the wait restarts.
+
+Special case — instance has no Env node: there is nothing to "release"
+in the audio sense (the envelope is the only mechanism we know how to
+gate-off generically), so release == remove. The slot is reset
+immediately. Callers that want a graceful tail on an envelope-less
+voice should add an Env (gate-driven) to the template.
+
+Edge cases:
+
+  * Releasing an already-Releasing instance is idempotent: the gates
+    are already 0, the status flag is already set; only silent_blocks
+    is re-zeroed which slightly extends the wait. Harmless.
+  * Calling rt_graph_instance_remove on a Releasing instance hard-frees
+    immediately — caller asked for it.
+  * Calling rt_graph_instance_set_control on a Releasing instance
+    works as before; it can re-trigger an envelope by writing 1.0 to
+    the gate control. We do *not* automatically transition back to
+    Live in that case — the caller has explicitly asked for a release
+    and is responsible for any subsequent re-trigger semantics. If
+    the gate ramps the envelope back up, block_sink_peak rises above
+    threshold and silent_blocks stays at 0, so the instance won't be
+    auto-freed for as long as it's audible — but its status remains
+    Releasing.
+
+The thresholds are file-scope constants (kReleaseSilenceThreshold,
+kReleaseSilenceBlocks). They are not exposed through the C ABI
+because the right values depend on hardware noise floor and block
+size, neither of which the caller can usefully tune from the host
+side. If a future caller needs control, the cleanest extension is a
+per-instance override on the GraphInstance, set at release time
+(rt_graph_instance_release_with_window or similar).
+*/
+
+void rt_graph_instance_release(RTGraph *g, int instance_id) {
+  if (!g) return;
+  if (instance_id < 0) return;
+  const std::size_t idx = static_cast<std::size_t>(instance_id);
+  if (idx >= g->instances.size()) return;
+  if (!g->instances[idx]) return;
+
+  GraphInstance &inst = *g->instances[idx];
+  const MetaDef *def = template_at(*g, inst.template_id);
+  if (!def) {
+    // Defensive: template gone — nothing sensible to do but free.
+    g->instances[idx].reset();
+    return;
+  }
+
+  // Walk the spec, gate-off every Env node by overwriting the
+  // instance's control 0 (gate_default). The Env kernel sees the
+  // falling edge on its next process call and triggers q's release().
+  // Audio inputs (an actual gate signal wired to the Env) override
+  // the default at sample 0 of each block, so a gate signal still
+  // takes precedence over our override — but that's a misuse case:
+  // the caller asked for release on a voice whose gate is being
+  // driven externally.
+  bool has_env = false;
+  const std::size_t node_count = std::min(def->nodes.size(), inst.nodes.size());
+  for (std::size_t i = 0; i < node_count; ++i) {
+    if (def->nodes[i].kind == NodeKind::Env) {
+      has_env = true;
+      if (!inst.nodes[i].controls.empty()) {
+        inst.nodes[i].controls[0] = 0.0;
+      }
+    }
+  }
+
+  if (!has_env) {
+    // Nothing to release — fall back to hard-free. See Note above.
+    g->instances[idx].reset();
+    return;
+  }
+
+  inst.status = InstanceStatus::Releasing;
+  inst.silent_blocks = 0;
+  // block_sink_peak is reset by process_instance at the top of each
+  // block; no need to touch it here.
+}
+
+int rt_graph_instance_status(RTGraph *g, int instance_id) {
+  if (!g) return -1;
+  if (instance_id < 0) return -1;
+  const std::size_t idx = static_cast<std::size_t>(instance_id);
+  if (idx >= g->instances.size()) return -1;
+  if (!g->instances[idx]) return -1;
+  return static_cast<int>(g->instances[idx]->status);
 }
 
 int rt_graph_instance_count(RTGraph *g) {

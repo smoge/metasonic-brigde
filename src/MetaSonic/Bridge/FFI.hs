@@ -41,10 +41,15 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_template_connect
   , c_rt_graph_template_instance_add
   , c_rt_graph_instance_remove
+  , c_rt_graph_instance_release
+  , c_rt_graph_instance_status
   , c_rt_graph_instance_count
   , c_rt_graph_instance_alive
   , c_rt_graph_instance_set_control
   , c_rt_graph_instance_read_bus
+  , -- * §2.E lifecycle status values (mirroring rt_graph.h's InstanceStatus)
+    instanceStatusLive
+  , instanceStatusReleasing
   ) where
 
 import           Control.Exception          (bracket)
@@ -315,6 +320,34 @@ foreign import ccall unsafe "rt_graph_template_instance_add"
 
 foreign import ccall unsafe "rt_graph_instance_remove"
   c_rt_graph_instance_remove :: Ptr RTGraph -> CInt -> IO ()
+
+-- | Request graceful tear-down of an instance. Sets the gate of
+-- every Env node to 0 and lets the runtime auto-free the slot once
+-- the instance contributes silence for a small window. If the
+-- instance has no Env node, equivalent to 'c_rt_graph_instance_remove'.
+-- See Note [§2.E: release-then-free instance lifecycle] in
+-- @rt_graph.cpp@.
+foreign import ccall unsafe "rt_graph_instance_release"
+  c_rt_graph_instance_release :: Ptr RTGraph -> CInt -> IO ()
+
+-- | Returns the lifecycle status of an instance:
+--
+--   * @0@ ('instanceStatusLive')      — default; sustaining
+--   * @1@ ('instanceStatusReleasing') — release requested, awaiting silence
+--   * @-1@                            — dead slot, out of range, or null graph
+foreign import ccall unsafe "rt_graph_instance_status"
+  c_rt_graph_instance_status :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | C ABI value for 'InstanceStatus::Live'. Mirrors the integer
+-- assignment in @rt_graph.cpp@; the values are part of the C ABI and
+-- must not change. Pinned in Haskell so test code does not need to
+-- pattern-match on bare integer literals.
+instanceStatusLive :: CInt
+instanceStatusLive = 0
+
+-- | C ABI value for 'InstanceStatus::Releasing'.
+instanceStatusReleasing :: CInt
+instanceStatusReleasing = 1
 
 foreign import ccall unsafe "rt_graph_instance_count"
   c_rt_graph_instance_count :: Ptr RTGraph -> IO CInt

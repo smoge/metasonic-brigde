@@ -42,12 +42,16 @@ import           Test.Tasty.QuickCheck     as QC
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI      (c_rt_graph_instance_alive,
                                             c_rt_graph_instance_count,
+                                            c_rt_graph_instance_release,
                                             c_rt_graph_instance_set_control,
+                                            c_rt_graph_instance_status,
                                             c_rt_graph_kind_supported,
                                             c_rt_graph_process,
                                             c_rt_graph_read_bus,
                                             c_rt_graph_template_count,
                                             c_rt_graph_template_instance_add,
+                                            instanceStatusLive,
+                                            instanceStatusReleasing,
                                             loadRuntimeGraph,
                                             loadTemplateGraph,
                                             withRTGraph)
@@ -1806,6 +1810,63 @@ crossCuttingTests = testGroup "End-to-end FFI"
             ("bus 1 (second instance) should also sing, peak="
               <> show peak1)
             (peak1 > 0.9)
+
+  , testCase "§2.E release-then-free: Live → Releasing → freed slot" $ do
+      -- Smoke test for the §2.E lifecycle FFI surface
+      -- (c_rt_graph_instance_release, c_rt_graph_instance_status):
+      --   1. status is Live after load,
+      --   2. flips to Releasing on release(),
+      --   3. the slot is auto-freed once the envelope tail decays
+      --      below the runtime's silence threshold for a small
+      --      window (status -> -1, alive -> 0).
+      -- See Note [§2.E: release-then-free instance lifecycle] in
+      -- rt_graph.cpp for the design.
+      let voice = runSynth $ do
+            -- Held gate (1.0), short release so the test runs in
+            -- a few dozen blocks rather than seconds.
+            e <- env 1.0 0.0005 0.002 0.5 0.002
+            out 0 e
+
+      let rg = case lowerGraph voice >>= compileRuntimeGraph of
+            Right r  -> r
+            Left err -> error err
+          totalNodes = length (rgNodes rg)
+
+      withRTGraph totalNodes 256 $ \handle -> do
+        loadRuntimeGraph handle rg
+
+        -- Pre-release: the auto-spawned instance 0 is Live.
+        s0 <- c_rt_graph_instance_status handle 0
+        s0 @?= instanceStatusLive
+
+        -- Render one block so the envelope leaves idle and reaches
+        -- sustain. (Releasing an idle envelope is a degenerate case
+        -- — q's release() is a no-op when the gate never opened.)
+        c_rt_graph_process handle 256
+
+        -- Trigger release. Status flips immediately; slot stays
+        -- alive because the tail still has to render.
+        c_rt_graph_instance_release handle 0
+        s1 <- c_rt_graph_instance_status handle 0
+        s1 @?= instanceStatusReleasing
+        a1 <- c_rt_graph_instance_alive handle 0
+        a1 @?= 1
+
+        -- Drive blocks until the runtime auto-frees the slot. With
+        -- R = 2 ms and silence-window = 8 blocks of 256 frames at
+        -- 48 kHz, ~64 blocks is a comfortable upper bound.
+        let drain n
+              | n <= 0    = pure False
+              | otherwise = do
+                  c_rt_graph_process handle 256
+                  alive <- c_rt_graph_instance_alive handle 0
+                  if alive == 0 then pure True else drain (n - 1)
+        freed <- drain 64
+        assertBool "instance should auto-free within 64 blocks" freed
+
+        -- Post-free: status is -1 (dead/invalid).
+        s2 <- c_rt_graph_instance_status handle 0
+        s2 @?= (-1)
   ]
   where
     sizeOfFloat = 4 :: Int

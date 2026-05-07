@@ -171,7 +171,41 @@ int rt_graph_instance_add(RTGraph *g);
 // rt_graph_template_instance_add calls. Removing instance 0 is
 // allowed and disables the back-compatibility single-instance
 // functions until a new instance is added at slot 0.
+//
+// This is the *hard-free* path: the slot is cleared at the next
+// block boundary regardless of whether the instance still has audio
+// in flight, so it clicks if applied to a sustaining voice. Use
+// rt_graph_instance_release for graceful tear-down (envelope tail
+// completes, then slot is reclaimed automatically).
 void rt_graph_instance_remove(RTGraph *g, int instance_id);
+
+// Request graceful tear-down of an instance. Sets the gate control
+// of every Env node in the instance to 0 so envelopes start their
+// release ramp, marks the instance as "Releasing", and lets it keep
+// processing every block. Once the instance contributes silence
+// (per-block peak below an internal threshold) for a small number of
+// consecutive blocks, the slot is reclaimed and the instance_id may
+// be reused by future rt_graph_instance_add / _template_instance_add
+// calls. If the instance has no Env node (no envelope to release),
+// the call is equivalent to rt_graph_instance_remove. Silent no-op
+// on dead/invalid instance_id.
+//
+// Pair this with rt_graph_instance_status to observe the lifecycle
+// transition (Live -> Releasing -> dead). Hard-free remains
+// available via rt_graph_instance_remove for panic stops and voice
+// stealing under pressure.
+void rt_graph_instance_release(RTGraph *g, int instance_id);
+
+// Returns the lifecycle status of an instance:
+//   0  = Live (default after add; the steady-state of a sounding voice)
+//   1  = Releasing (release requested, awaiting silence)
+//  -1  = no such instance (dead slot, out of range, or null graph)
+//
+// "Dead" is reported as -1 (same as out-of-range), not as a separate
+// positive value, because a freed slot is observationally identical to
+// a slot that never existed. Use rt_graph_instance_alive when the
+// distinction the caller cares about is liveness rather than status.
+int rt_graph_instance_status(RTGraph *g, int instance_id);
 
 // Number of instance slots (live + dead). Iterate 0..count-1 to
 // enumerate; check liveness with rt_graph_instance_alive.

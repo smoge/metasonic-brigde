@@ -3625,3 +3625,205 @@ TEST_CASE("Multi-template: removing an instance only stops that voice") {
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// §2.E release-then-free instance lifecycle
+// ----------------------------------------------------------------
+//
+// rt_graph_instance_release is the graceful counterpart to
+// rt_graph_instance_remove: it gates-off any Env nodes, lets the
+// tail render, and reclaims the slot once the instance has been
+// silent for a small window. These tests pin:
+//
+//   * status reporting (Live / Releasing / -1 for dead),
+//   * the no-Env shortcut (release == hard-free),
+//   * the Env path: transition to Releasing, eventual auto-free,
+//   * isolation: releasing one instance does not affect peers.
+//
+// See Note [§2.E: release-then-free instance lifecycle] in
+// rt_graph.cpp for the design.
+
+TEST_CASE("§2.E status: fresh instance reports Live") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Auto-created instance 0 is Live by default.
+    CHECK(rt_graph_instance_status(g, 0) == 0);
+
+    // Out-of-range and never-allocated slots are -1.
+    CHECK(rt_graph_instance_status(g, 99) == -1);
+    CHECK(rt_graph_instance_status(g, -1) == -1);
+    CHECK(rt_graph_instance_status(nullptr, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§2.E release on instance with no Env hard-frees the slot") {
+    // No envelope means there is nothing to "release" — the runtime
+    // falls back to immediate slot reset. Verifies the documented
+    // shortcut path.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                  // SinOsc
+    rt_graph_set_control(g, 0, 0, 220.0);
+    rt_graph_add_node(g, 1, 2);                  // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    REQUIRE(rt_graph_instance_alive(g, 0) == 1);
+    rt_graph_instance_release(g, 0);
+
+    // Slot is dead immediately, not after the next process call.
+    CHECK(rt_graph_instance_alive(g, 0) == 0);
+    CHECK(rt_graph_instance_status(g, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§2.E release on Env-bearing instance transitions to Releasing then auto-frees") {
+    // Held gate (default 1.0) drives the envelope to sustain. After
+    // release, the falling edge fires q's release ramp; the instance
+    // keeps processing every block until block_sink_peak stays below
+    // the silence threshold for kReleaseSilenceBlocks (= 8) blocks
+    // running, at which point the slot is reclaimed.
+    constexpr int kBlock = 256;  // smaller block to make the silence window land in a reasonable test runtime
+    auto *g = rt_graph_create(4, kBlock);
+    REQUIRE(g != nullptr);
+
+    // Env(gate=1, A=0.5ms, D=2ms, S=0.5, R=2ms) → Out(bus 0).
+    // Short release (2 ms) so the tail decays to near-zero quickly
+    // and the silence window starts almost immediately.
+    rt_graph_add_node(g, 0, 9);                  // Env
+    rt_graph_set_control(g, 0, 0, 1.0);          // gate high
+    rt_graph_set_control(g, 0, 1, 0.0005);
+    rt_graph_set_control(g, 0, 2, 0.002);
+    rt_graph_set_control(g, 0, 3, 0.5);
+    rt_graph_set_control(g, 0, 4, 0.002);        // R = 2 ms
+    rt_graph_add_node(g, 1, 2);                  // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    // Block 0: attack and reach sustain. Pre-release status must
+    // still report Live.
+    rt_graph_process(g, kBlock);
+    REQUIRE(rt_graph_instance_status(g, 0) == 0);
+
+    // Trigger release. Status must flip to Releasing immediately;
+    // the slot is still alive because the tail has not rendered yet.
+    rt_graph_instance_release(g, 0);
+    CHECK(rt_graph_instance_status(g, 0) == 1);
+    CHECK(rt_graph_instance_alive(g, 0) == 1);
+
+    // Process up to 64 blocks; somewhere inside that window the tail
+    // should fall below the silence threshold and the silence
+    // counter should cross kReleaseSilenceBlocks. Bound loosely —
+    // the precise count depends on q's release ramp shape.
+    bool freed = false;
+    for (int i = 0; i < 64; ++i) {
+        rt_graph_process(g, kBlock);
+        if (rt_graph_instance_alive(g, 0) == 0) {
+            freed = true;
+            break;
+        }
+    }
+    CHECK(freed);
+    CHECK(rt_graph_instance_status(g, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§2.E release on a dead slot is a no-op") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_instance_alive(g, 0) == 0);
+
+    // Releasing a dead/invalid slot must not crash and must not
+    // resurrect the slot.
+    rt_graph_instance_release(g, 0);
+    rt_graph_instance_release(g, 99);
+    rt_graph_instance_release(g, -1);
+    rt_graph_instance_release(nullptr, 0);
+
+    CHECK(rt_graph_instance_alive(g, 0) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§2.E releasing one voice does not affect peer voices") {
+    // Two voices of the same template, each with its own Env. After
+    // releasing voice A, voice B must remain Live, audible, and
+    // never enter Releasing.
+    constexpr int kBlock = 256;
+    auto *g = rt_graph_create(4, kBlock);
+    REQUIRE(g != nullptr);
+
+    int t0 = 0;
+    rt_graph_template_add_node(g, t0, 0, 9);             // Env
+    rt_graph_template_set_default(g, t0, 0, 0, 1.0);     // gate default 1
+    rt_graph_template_set_default(g, t0, 0, 1, 0.0005);
+    rt_graph_template_set_default(g, t0, 0, 2, 0.002);
+    rt_graph_template_set_default(g, t0, 0, 3, 0.5);
+    rt_graph_template_set_default(g, t0, 0, 4, 0.005);
+    rt_graph_template_add_node(g, t0, 1, 2);             // Out
+    rt_graph_template_set_default(g, t0, 1, 0, 0.0);
+    rt_graph_template_connect(g, t0, 0, 0, 1, 0);
+
+    rt_graph_instance_remove(g, 0);
+    int iA = rt_graph_template_instance_add(g, t0);
+    int iB = rt_graph_template_instance_add(g, t0);
+    REQUIRE(iA >= 0);
+    REQUIRE(iB >= 0);
+
+    // Run a block so both envelopes leave idle.
+    rt_graph_process(g, kBlock);
+
+    rt_graph_instance_release(g, iA);
+    CHECK(rt_graph_instance_status(g, iA) == 1);
+    CHECK(rt_graph_instance_status(g, iB) == 0);
+
+    // Drive enough blocks to free voice A. Voice B must remain Live.
+    for (int i = 0; i < 64; ++i) {
+        rt_graph_process(g, kBlock);
+    }
+    CHECK(rt_graph_instance_alive(g, iA) == 0);
+    CHECK(rt_graph_instance_alive(g, iB) == 1);
+    CHECK(rt_graph_instance_status(g, iB) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§2.E releasing a slot then re-adding reuses the freed id") {
+    // The slot-reuse contract documented for rt_graph_instance_remove
+    // also applies to slots auto-freed by the release pathway: once
+    // the instance is gone, the next add fills the same slot.
+    constexpr int kBlock = 256;
+    auto *g = rt_graph_create(4, kBlock);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 9);
+    rt_graph_set_control(g, 0, 0, 1.0);
+    rt_graph_set_control(g, 0, 4, 0.002);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_process(g, kBlock);
+    rt_graph_instance_release(g, 0);
+
+    bool freed = false;
+    for (int i = 0; i < 64 && !freed; ++i) {
+        rt_graph_process(g, kBlock);
+        if (rt_graph_instance_alive(g, 0) == 0) freed = true;
+    }
+    REQUIRE(freed);
+
+    int reused = rt_graph_instance_add(g);
+    CHECK(reused == 0);
+    CHECK(rt_graph_instance_alive(g, 0) == 1);
+    CHECK(rt_graph_instance_status(g, 0) == 0);
+
+    rt_graph_destroy(g);
+}
