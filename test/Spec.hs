@@ -58,6 +58,7 @@ import           MetaSonic.Bridge.FFI      (c_rt_graph_instance_alive,
                                             loadRuntimeGraph,
                                             loadRuntimeGraphFused,
                                             loadTemplateGraph,
+                                            loadTemplateGraphFused,
                                             withRTGraph)
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
@@ -2378,6 +2379,59 @@ crossCuttingTests = testGroup "End-to-end FFI"
       -- the legacy single-template setup.
       assertBool "single-template ensemble should match legacy load"
                  (legacyBus == tgBus)
+
+  , -- Step C (e) coverage: 'loadTemplateGraphFused' has its own
+    -- lifecycle (remove auto-instance, populate per-template, spawn
+    -- after fused wiring) distinct from the single-template fused
+    -- loader. Pin that a fused single-template ensemble loaded
+    -- through the multi-template fused path renders bit-identically
+    -- to the same fused graph loaded through the single-template
+    -- fused path. This exercises:
+    --   * cTid 0 path for the first (and only) template.
+    --   * Fused-input wiring before instance spawn — make_instance
+    --     picks up the spec's full fused_input_count.
+    --   * Elision marking against template id 0.
+    testCase "loadTemplateGraphFused: single-template ensemble matches loadRuntimeGraphFused" $ do
+      let nframes = 256
+          fusedChain = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            a <- gain o (Param 0.5)
+            out 0 a
+
+      rt <- case lowerGraph fusedChain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      -- Sanity: the fused compile actually produced fused signals
+      -- so the test exercises the new loader passes.
+      assertBool "fused chain produced no RFused inputs"
+        (not (null [() | n <- rgNodes rt, RFused _ <- rnInputs n]))
+      assertBool "fused chain elided no nodes"
+        (any rnElided (rgNodes rt))
+
+      singleBus <- withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraphFused handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          pure (map (\(CFloat x) -> x) cs)
+
+      tg <- case compileTemplateGraph [("solo", fusedChain)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      tgBus <- withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadTemplateGraphFused handle tg
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          pure (map (\(CFloat x) -> x) cs)
+
+      assertBool "fused single-template ensemble should match fused single load"
+                 (singleBus == tgBus)
 
   , testCase "loadTemplateGraph: registers N templates with N instances" $ do
       -- A two-template ensemble. Both produce independent SinOsc
