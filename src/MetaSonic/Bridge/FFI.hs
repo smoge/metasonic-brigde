@@ -588,14 +588,18 @@ loadRuntimeGraph g rg = do
           RConst _ ->
             pure ()
           RFused _ ->
-            -- Step C: 'fuseRuntimeGraph' produces RFused; the legacy
-            -- single-template loader does not yet teach the C++ side
-            -- about it. A future Step C (d) commit will add an FFI
-            -- entry that ships fused inputs across; until then,
-            -- callers wanting fusion must use the dedicated fused
-            -- loader path. Treating RFused as a no-op here keeps
-            -- 'compileRuntimeGraph' (unfused) safe for this loader.
-            pure ()
+            -- Step C: 'fuseRuntimeGraph' is the only source of
+            -- RFused, and the legacy single-template loader does not
+            -- yet teach the C++ side about it (Step C (d/e) will add
+            -- a dedicated fused loader path). Failing fast here is
+            -- deliberate: silently dropping the fused input would
+            -- leave the consumer's port unwired, miswiring the
+            -- runtime graph in a way that produces wrong audio with
+            -- no obvious failure. Until the fused loader lands,
+            -- callers must hand fused graphs to that path explicitly.
+            fail "loadRuntimeGraph: RFused input requires the fused \
+                 \loader (not yet implemented); pass an unfused \
+                 \RuntimeGraph or wait for Step C (e)."
 
     addRegion :: CInt -> RuntimeRegion -> IO ()
     addRegion = addRegionTo g
@@ -699,11 +703,13 @@ loadTemplateGraph g tg = do
             RConst _ ->
               pure ()
             RFused _ ->
-              -- See the matching no-op note in 'loadRuntimeGraph'.
-              -- Step C's fused inputs will get a dedicated FFI entry;
-              -- the unfused loader treats them as silent so it stays
-              -- robust if a fused graph is ever fed through it.
-              pure ()
+              -- See the matching note in 'loadRuntimeGraph': fail
+              -- fast rather than miswire. Step C (e) will add a
+              -- fused-aware loader path; until then the multi-
+              -- template loader rejects fused inputs explicitly.
+              fail "loadTemplateGraph: RFused input requires the \
+                   \fused loader (not yet implemented); pass an \
+                   \unfused RuntimeGraph or wait for Step C (e)."
       -- Pass 3: register the region overlay for this template.
       -- See Note [Region fallback] in rt_graph.cpp.
       mapM_ (addRegionTo g cTid) (rgRuntimeRegions rg)
