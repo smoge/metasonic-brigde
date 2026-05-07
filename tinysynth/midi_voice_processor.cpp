@@ -16,8 +16,9 @@ namespace metasonic {
 namespace midi = cycfi::q::midi_1_0;
 
 MidiVoiceProcessor::MidiVoiceProcessor(VoiceAllocator &alloc,
-                                       std::uint16_t channel_mask) noexcept
+                                       std::uint16_t channel_mask)
     : alloc_(alloc), channel_mask_(channel_mask) {
+  // voice_tracks_.resize can throw bad_alloc; not noexcept.
   voice_tracks_.resize(static_cast<std::size_t>(alloc.voice_count()));
 }
 

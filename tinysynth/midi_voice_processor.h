@@ -54,10 +54,10 @@
 //     don't have an obvious universal mapping. Wire them via a
 //     custom processor subclass if needed.
 //
-// Known limitation (Phase 3.3a): CC and pitch-bend updates land at
-// the next process_graph block boundary, not per-sample. Rapid
+// Known limitation (Phase 3.3a/b): CC and pitch-bend updates land
+// at the next process_graph block boundary, not per-sample. Rapid
 // sweeps (e.g. mod-wheel ramps, pitch-bend trills) may produce
-// audible zippering. Phase 3.3b adds q::dynamic_smoother to the
+// audible zippering. Phase 3.3c adds q::dynamic_smoother to the
 // runtime to fix this without changing the API surface.
 
 #pragma once
@@ -79,8 +79,13 @@ public:
 
   // channel_mask: bit i (0-15) set means "listen on MIDI channel i".
   // Default 0xFFFF listens to all 16 channels.
+  //
+  // Not noexcept: the constructor sizes voice_tracks_ to
+  // alloc.voice_count() and that allocation can throw bad_alloc.
+  // Construction is offline / setup-time, never on the producer's
+  // hot path, so allocation here is fine.
   explicit MidiVoiceProcessor(VoiceAllocator &alloc,
-                              std::uint16_t channel_mask = 0xFFFFu) noexcept;
+                              std::uint16_t channel_mask = 0xFFFFu);
 
   // q::midi_1_0::Processor overloads. Time is unused for now (the
   // allocator has no notion of sub-block scheduling).
