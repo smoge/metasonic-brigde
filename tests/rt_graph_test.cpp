@@ -4114,3 +4114,435 @@ TEST_CASE("A.1 polyphony: removing a slot frees up a cap unit") {
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// A.2: realtime control queue
+// ----------------------------------------------------------------
+//
+// These tests cover the lock-free SPSC control queue and the six
+// rt_graph_realtime_* entries layered over it. The contract under
+// test:
+//
+//   * reserve synchronously CAS-claims an Available slot, prepares
+//     it (template_id, nodes, default controls), and returns it in
+//     Reserved state. Reserved counts toward the polyphony cap and
+//     surfaces as -1 / not-alive through the inspection ABI.
+//   * cancel rolls back a Reserved slot to Available; no audio-
+//     thread side effects.
+//   * activate / release / remove / set_control enqueue work that
+//     the audio thread applies at the top of the next process_graph
+//     block, in FIFO order. Each enqueue returns 1 on success or 0
+//     when the ring (capacity 256) is full.
+//   * Reserved slots are excluded from the audio schedule until
+//     Activate flips them to Active; SetControl on a Reserved slot
+//     is dropped by the drain (controls flow through the producer's
+//     pre-enqueue path instead).
+//   * rt_graph_clear discards any pending queued commands so a
+//     reloaded graph never replays stale work.
+//
+// Pool pre-warming: realtime_reserve never grows the pool. Tests
+// that need a Reserved slot first ensure an Available slot exists,
+// either by removing the auto-spawned instance 0 or by spawning
+// extra instances via rt_graph_template_instance_add and removing
+// them. Both leave Available-shaped slots that reserve can recycle.
+
+namespace {
+
+// Build a minimal "constant on bus 0" template: Add(node 0) → Out(node 1).
+// Add's control[0] / control[1] are the two summed constants (default 0);
+// Out's control[0] is the bus index (default 0). The caller can override
+// per-instance via rt_graph_realtime_set_control on Add's control 0 to
+// steer bus 0 to a known value, which makes assertions cheap.
+void build_constant_template(RTGraph *g) {
+    rt_graph_template_add_node(g, 0, 0, 8);                 // Add
+    rt_graph_template_add_node(g, 0, 1, 2);                 // Out
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+}
+
+} // namespace
+
+TEST_CASE("A.2 reserve: status surfaces Reserved as -1, alive as 0") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    // Free the auto-spawned instance 0 so an Available slot exists.
+    rt_graph_instance_remove(g, 0);
+
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+    // Reserved is the producer's private claim: the inspection ABI
+    // hides it, even though the slot is not Available either.
+    CHECK(rt_graph_instance_status(g, s) == -1);
+    CHECK(rt_graph_instance_alive(g, s) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 reserve: -1 when the pool has no Available slot") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Auto-spawned instance 0 is Active and is the only slot. Realtime
+    // reserve must refuse to grow the pool — pre-warming is the
+    // caller's responsibility.
+    CHECK(rt_graph_realtime_reserve(g, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 reserve: Reserved slots count toward the polyphony cap") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    rt_graph_template_set_polyphony(g, 0, 3);
+
+    // Pre-warm three Available slots: spawn three (which grows the
+    // pool past the auto-instance) then remove all four so the
+    // pool holds three Available slots of the right shape. We
+    // intentionally exceed the cap during pre-warm — the cap is on
+    // the live state at spawn time, not on the pool size.
+    int a = rt_graph_template_instance_add(g, 0);
+    int b = rt_graph_template_instance_add(g, 0);
+    REQUIRE(a >= 0); REQUIRE(b >= 0);
+    // a and b plus auto-instance 0 = 3 live; cap is 3 so a fourth
+    // spawn would fail. Remove all to free three Available slots.
+    rt_graph_instance_remove(g, 0);
+    rt_graph_instance_remove(g, a);
+    rt_graph_instance_remove(g, b);
+
+    int r0 = rt_graph_realtime_reserve(g, 0);
+    int r1 = rt_graph_realtime_reserve(g, 0);
+    int r2 = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(r0 >= 0); REQUIRE(r1 >= 0); REQUIRE(r2 >= 0);
+    // Three Reserved slots fill the cap of 3. The fourth reserve
+    // must fail — even though there might be Available capacity in
+    // the pool, the polyphony counter rejects it.
+    CHECK(rt_graph_realtime_reserve(g, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 cancel: returns slot to Available; another reserve picks the same slot") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    rt_graph_template_set_polyphony(g, 0, 1);
+    rt_graph_instance_remove(g, 0);
+
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+    // Cap is 1; the Reserved slot occupies it.
+    CHECK(rt_graph_realtime_reserve(g, 0) == -1);
+
+    rt_graph_realtime_cancel(g, s);
+    int s2 = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s2 >= 0);
+    CHECK(s2 == s);  // same slot — cancel returned it to Available
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 cancel: silent no-op on Active / out-of-range / null") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Auto-instance 0 is Active. Cancel must not flip Active to
+    // Available (only Reserved → Available is allowed).
+    rt_graph_realtime_cancel(g, 0);
+    CHECK(rt_graph_instance_alive(g, 0) == 1);
+    CHECK(rt_graph_instance_status(g, 0) == 0);
+
+    // Out-of-range / negative / null — must not crash.
+    rt_graph_realtime_cancel(g, 99);
+    rt_graph_realtime_cancel(g, -1);
+    rt_graph_realtime_cancel(nullptr, 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 reserved slot is not processed by the audio thread") {
+    // The Reserved slot is the only potential writer of bus 0 in this
+    // graph (we drop the auto-instance and never activate). If the
+    // audio thread mistakenly processed Reserved slots, bus 0 would
+    // carry the slot's Add(0.5, 0.0) constant. Bus 0 must stay silent.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    rt_graph_template_set_default(g, 0, 0, 0, 0.5);  // Add a-default = 0.5
+
+    rt_graph_instance_remove(g, 0);
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+
+    CHECK(peak_abs(bus0) == doctest::Approx(0.0f));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 reserve + activate publishes the slot in the same block") {
+    // Activate is enqueued before the next process_graph runs; the
+    // drain at the top of process_graph CAS-flips Reserved → Active,
+    // so the slot's contribution lands in this very block. This is
+    // the latency property the realtime API promises: at most one
+    // block of delay between enqueue and audible effect.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    rt_graph_template_set_default(g, 0, 0, 0, 0.5);  // Add a-default = 0.5
+
+    rt_graph_instance_remove(g, 0);
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+    REQUIRE(rt_graph_realtime_activate(g, s) == 1);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.5f).epsilon(1e-6));
+    CHECK(rt_graph_instance_alive(g, s) == 1);
+    CHECK(rt_graph_instance_status(g, s) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 FIFO: SetControl after Activate applies; same-slot order matters") {
+    // The drain order for commands targeting one slot is observable:
+    //   FIFO:    [Activate, SetControl(0.5), SetControl(1.0)] →
+    //            Activate flips Reserved → Active first, both
+    //            SetControls then land on the Active slot (gate is
+    //            Active or Releasing); final Add a_const = 1.0.
+    //   non-FIFO (e.g. reverse): SetControls drain first against a
+    //            Reserved slot (drain gate drops them), then Activate
+    //            runs; final Add a_const stays at the spec default 0.
+    //
+    // Asserting 1.0 vs 0.0 on bus 0 distinguishes the two.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    // Spec defaults already give Add(0, 0) → silence; SetControls
+    // are what raise it to 1.0.
+
+    rt_graph_instance_remove(g, 0);
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+
+    REQUIRE(rt_graph_realtime_activate(g, s) == 1);
+    REQUIRE(rt_graph_realtime_set_control(g, s, /*node*/0, /*ctl*/0, 0.5) == 1);
+    REQUIRE(rt_graph_realtime_set_control(g, s, /*node*/0, /*ctl*/0, 1.0) == 1);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+
+    for (auto x : bus0) CHECK(x == doctest::Approx(1.0f).epsilon(1e-6));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 queue: enqueue returns 0 once the ring is full; drain reopens it") {
+    // The producer fills the queue without any drain (no
+    // rt_graph_process) running between enqueues. Capacity is 256;
+    // the 257th enqueue must return 0. After a process call drains
+    // the queue, the producer can enqueue again.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    int ok = 0;
+    for (int i = 0; i < 256; ++i) {
+        ok += rt_graph_realtime_set_control(g, 0, 0, 0, static_cast<double>(i));
+    }
+    CHECK(ok == 256);
+    CHECK(rt_graph_realtime_set_control(g, 0, 0, 0, 0.0) == 0);  // ring full
+
+    // Drain — every command is consumed (slot 0 has no nodes here, so
+    // the SetControls silently no-op once they reach apply_control_-
+    // command, but the queue mechanics still advance read_idx).
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_realtime_set_control(g, 0, 0, 0, 0.0) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 queue: wraparound with intermediate drain applies commands across batches") {
+    // Two batches of 200 enqueues separated by a drain push the
+    // producer's write_idx 0 → 200 → 400, well past the ring's
+    // capacity of 256. Batch 2's writes wrap from ring[200] back
+    // through ring[0..]. The test checks the ring index math + the
+    // memory-order pair stay correct: each batch's last SetControl
+    // is what bus 0 reflects after the next drain.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    // Auto-instance 0 is Active and has both nodes; slot 0 is the
+    // SetControl target. No reserve needed for this test — the
+    // queue mechanics are independent of slot lifecycle.
+
+    constexpr int kBatch = 200;
+
+    // Batch 1: 199 zero writes followed by 0.25.
+    for (int i = 0; i < kBatch - 1; ++i) {
+        REQUIRE(rt_graph_realtime_set_control(g, 0, 0, 0, 0.0) == 1);
+    }
+    REQUIRE(rt_graph_realtime_set_control(g, 0, 0, 0, 0.25) == 1);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.25f).epsilon(1e-6));
+
+    // Batch 2: 199 zero writes followed by 0.75. write_idx now passes
+    // 256 and wraps; read_idx tracks behind it.
+    for (int i = 0; i < kBatch - 1; ++i) {
+        REQUIRE(rt_graph_realtime_set_control(g, 0, 0, 0, 0.0) == 1);
+    }
+    REQUIRE(rt_graph_realtime_set_control(g, 0, 0, 0, 0.75) == 1);
+
+    rt_graph_process(g, kFrames);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.75f).epsilon(1e-6));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 queued release: env-bearing slot transitions to Releasing then auto-frees") {
+    constexpr int kBlock = 256;
+    auto *g = rt_graph_create(8, kBlock);
+    REQUIRE(g != nullptr);
+
+    // Env (gate held high) → Out(bus 0). Same shape as the §2.E
+    // direct-API release test, but the release goes through the
+    // queue this time.
+    rt_graph_template_add_node(g, 0, 0, 9);                 // Env
+    rt_graph_template_set_default(g, 0, 0, 0, 1.0);
+    rt_graph_template_set_default(g, 0, 0, 1, 0.0005);
+    rt_graph_template_set_default(g, 0, 0, 2, 0.002);
+    rt_graph_template_set_default(g, 0, 0, 3, 0.5);
+    rt_graph_template_set_default(g, 0, 0, 4, 0.002);
+    rt_graph_template_add_node(g, 0, 1, 2);                 // Out
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+    rt_graph_instance_remove(g, 0);
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+    REQUIRE(rt_graph_realtime_activate(g, s) == 1);
+
+    rt_graph_process(g, kBlock);
+    REQUIRE(rt_graph_instance_status(g, s) == 0);  // Active
+
+    REQUIRE(rt_graph_realtime_release(g, s) == 1);
+    rt_graph_process(g, kBlock);
+    CHECK(rt_graph_instance_status(g, s) == 1);    // drain flipped to Releasing
+
+    bool freed = false;
+    for (int i = 0; i < 64 && !freed; ++i) {
+        rt_graph_process(g, kBlock);
+        if (rt_graph_instance_alive(g, s) == 0) freed = true;
+    }
+    CHECK(freed);
+    CHECK(rt_graph_instance_status(g, s) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 queued remove: hard-frees the slot at the next block boundary") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    rt_graph_template_set_default(g, 0, 0, 0, 0.5);  // Add a-default = 0.5
+
+    rt_graph_instance_remove(g, 0);
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+    REQUIRE(rt_graph_realtime_activate(g, s) == 1);
+
+    rt_graph_process(g, kFrames);
+    REQUIRE(rt_graph_instance_alive(g, s) == 1);
+
+    REQUIRE(rt_graph_realtime_remove(g, s) == 1);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_instance_alive(g, s) == 0);
+
+    // Slot is hard-freed; bus 0 reverts to silence (no live writers).
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    CHECK(peak_abs(bus0) == doctest::Approx(0.0f));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 queued set_control: takes effect on the block following the enqueue") {
+    // Block A renders with the spec default (Add a_const = 0.25).
+    // Between blocks the producer enqueues SetControl(a_const = 0.875).
+    // Block B's drain applies the new value; bus 0 reflects it. (We
+    // do NOT claim the change misses the in-progress block — the
+    // offline harness can't observe sub-block timing.)
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    rt_graph_template_set_default(g, 0, 0, 0, 0.25);
+
+    rt_graph_instance_remove(g, 0);
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);
+    REQUIRE(rt_graph_realtime_activate(g, s) == 1);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.25f).epsilon(1e-6));
+
+    REQUIRE(rt_graph_realtime_set_control(g, s, /*node*/0, /*ctl*/0, 0.875) == 1);
+    rt_graph_process(g, kFrames);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.875f).epsilon(1e-6));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.2 reset: rt_graph_clear discards pending queued commands") {
+    // Without resetting the queue's read/write indices in the clear
+    // path, the next process_graph after rt_graph_clear would replay
+    // any commands the producer enqueued before the clear. The fix
+    // resets both indices in reset_to_default_state; this test pins
+    // it down — enqueue a SetControl that, if replayed, would write
+    // 0.99 onto the rebuilt instance 0; assert bus 0 stays at the
+    // spec default 0.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    REQUIRE(rt_graph_realtime_set_control(g, 0, 0, 0, 0.99) == 1);
+
+    rt_graph_clear(g);
+
+    // Rebuild a fresh constant graph after clear. The auto-instance
+    // 0 reappears with the new template's spec defaults (a_const = 0).
+    build_constant_template(g);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.0f));
+
+    // The queue should still be usable after clear.
+    CHECK(rt_graph_realtime_set_control(g, 0, 0, 0, 0.5) == 1);
+
+    rt_graph_destroy(g);
+}

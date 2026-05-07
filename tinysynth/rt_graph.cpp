@@ -2624,6 +2624,16 @@ static void reset_to_default_state(RTGraph &g) {
   g.server.output_buses.clear();
   g.server.output_buses_prev.clear();
 
+  // Discard any control commands that were enqueued before the
+  // reload. Without this, drain_control_queue would replay stale
+  // commands against the freshly-rebuilt template / instance pool
+  // on the next process call. rt_graph_clear stops audio first, so
+  // there is no concurrent producer or consumer here — relaxed is
+  // sufficient. The ring contents need not be zeroed: enqueue
+  // overwrites each slot before the next drain reads it.
+  g.control_queue.write_idx.store(0, std::memory_order_relaxed);
+  g.control_queue.read_idx.store(0, std::memory_order_relaxed);
+
   // Push template 0 (empty MetaDef).
   MetaDef def;
   def.max_frames = g.max_frames;
