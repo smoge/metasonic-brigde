@@ -30,6 +30,7 @@ import qualified Data.Set                  as S
 import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
                                             sortBy)
 import           Data.Ord                  (comparing)
+import           Data.Word                 (Word8)
 import           Foreign.C.Types           (CFloat (..))
 import           Foreign.Marshal.Alloc     (allocaBytes)
 import           Foreign.Marshal.Array     (peekArray)
@@ -195,6 +196,56 @@ unitTests = testGroup "Unit tests"
           in case lowerGraph sg >>= compileRuntimeGraph of
                Left err -> assertFailure err
                Right rt -> resolveNodeIndex rt (NodeID 999) @?= Nothing
+      ]
+
+  , testGroup "cc builder: auto-records CCSpec + auto-inserts Smooth"
+      [ testCase "cc inserts a Smooth node and records the binding" $
+          let ((vol, target), _, specs) = runSynthCCs $ do
+                v <- cc 7 0.3 0.0 1.0
+                t <- gain v 0.5
+                _ <- out 0 t
+                pure (v, t)
+          in do
+            -- The Connection returned by 'cc' points at a real
+            -- audio-rate node (the inserted Smooth).
+            connectionNodeID vol @?= Just (NodeID 0)
+            -- Exactly one CC binding was registered, pointing at the
+            -- Smooth node's control[1] (target) with the declared
+            -- range.
+            length specs @?= 1
+            case specs of
+              [s] -> do
+                ccsNumber s @?= (7 :: Word8)
+                ccsNode   s @?= NodeID 0
+                ccsCtl    s @?= 1
+                ccsMin    s @?= 0.0
+                ccsMax    s @?= 1.0
+              _   -> assertFailure "expected one CC spec"
+            -- Sanity: the Smooth node is wired into the downstream
+            -- gain — i.e. 'cc' didn't accidentally produce an orphan.
+            connectionNodeID target @?= Just (NodeID 1)
+
+      , testCase "multiple cc calls preserve declaration order" $
+          let (_, _, specs) = runSynthCCs $ do
+                _ <- cc 7  0.5 0.0 1.0
+                _ <- cc 74 0.3 0.0 1.0
+                _ <- cc 11 0.0 0.0 1.0
+                pure ()
+          in map ccsNumber specs @?= [7, 74, 11]
+
+      , testCase "cc-allocated Smooth resolves to a dense NodeIndex post-compile" $
+          let ((volConn, _), sg, _) = runSynthCCs $ do
+                v <- cc 1 0.0 0.0 1.0
+                _ <- out 0 v
+                pure (v, ())
+          in case lowerGraph sg >>= compileRuntimeGraph of
+               Left err -> assertFailure err
+               Right rt -> case connectionNodeID volConn of
+                 Nothing  -> assertFailure "cc returned a Param connection"
+                 Just nid -> case resolveNodeIndex rt nid of
+                   Nothing -> assertFailure
+                              "cc-Smooth's NodeID not in compiled graph"
+                   Just ni -> ni @?= NodeIndex 0
       ]
 
   , testCase "checkDependencies rejects missing references" $

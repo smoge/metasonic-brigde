@@ -141,21 +141,27 @@ data PolyMidiBindings = PolyMidiBindings
 -- A poly synth template for the live-MIDI demo. The producer thread
 -- (driven by tinysynth/midi_demo.cpp) writes per-voice freq into the
 -- sine's freq control on note-on, gate=1 into the env's gate control,
--- and CC 7 into the master gain's amount. Pitch-bend rewrites the
--- sine's freq control. Note-offs trigger the env's release segment
--- via VoiceAllocator, which delivers a click-free fade.
+-- and CC 7 into a smoothed master-volume parameter. Pitch-bend
+-- rewrites the sine's freq control. Note-offs trigger the env's
+-- release segment via VoiceAllocator, which delivers a click-free
+-- fade.
+--
+-- The 'cc' builder auto-inserts a Smooth at control ingress and
+-- records the binding internally — see §1.7 — so we don't need a
+-- parallel manual entry in 'pmbCCs'.
 midiPolySynth :: SynthM PolyMidiBindings
 midiPolySynth = do
   osc    <- sinOsc 220.0 0.0
   e      <- env 0.0 0.005 0.2 0.5 0.1
   amped  <- gain osc e
-  master <- gain amped 0.3
+  vol    <- cc 7 0.3 0.0 1.0                -- CC 7 -> smoothed [0, 1]
+  master <- gain amped vol
   _      <- out 0 master
   pure PolyMidiBindings
     { pmbFreq      = (osc, 0)
     , pmbGate      = (e,   0)
     , pmbVelocity  = Nothing
-    , pmbCCs       = [(7, master, 0, 0.0, 1.0)]
+    , pmbCCs       = []                     -- 'cc' handled CC 7
     , pmbPitchBend = Just (osc, 0, 2.0)
     }
 
@@ -518,13 +524,13 @@ runMidiPolyDemo opts demo poly build = do
               <> "ships an audio runner."
       putStrLn ""
     _ -> do
-      let (bindings, sg) = runSynthWith build
+      let (bindings, sg, ccSpecs) = runSynthCCs build
       case compileTemplateGraph [(demoKey demo, sg)] of
         Left err -> do
           putStrLn $ "  Compilation error: " <> err
           putStrLn ""
         Right tg -> case tgTemplates tg of
-          [tpl] -> case resolveBindings (tplGraph tpl) bindings of
+          [tpl] -> case resolveBindings (tplGraph tpl) bindings ccSpecs of
             Left err -> do
               putStrLn $ "  Binding resolution failed: " <> err
               putStrLn ""
@@ -545,12 +551,14 @@ runMidiPolyDemo opts demo poly build = do
 resolveBindings
   :: RuntimeGraph
   -> PolyMidiBindings
+  -> [CCSpec]
   -> Either String (VoiceMapping, [CCMapping], Maybe PitchBendBinding)
-resolveBindings rg b = do
+resolveBindings rg b autoCCs = do
   (fnode, fctl) <- resolvePair "freq"     (pmbFreq b)
   (gnode, gctl) <- resolvePair "gate"     (pmbGate b)
   velMaybe <- traverse (resolvePair "velocity") (pmbVelocity b)
-  ccs <- traverse resolveCC (pmbCCs b)
+  manualCCs <- traverse resolveCC (pmbCCs b)
+  autoMappings <- traverse resolveAutoCC autoCCs
   mpb <- traverse resolvePB (pmbPitchBend b)
   pure ( VoiceMapping
            { vmFreqNode = fnode
@@ -559,7 +567,7 @@ resolveBindings rg b = do
            , vmGateCtl  = gctl
            , vmVelocity = velMaybe
            }
-       , ccs
+       , autoMappings <> manualCCs
        , mpb
        )
   where
@@ -573,14 +581,29 @@ resolveBindings rg b = do
 
     resolveCC :: (Word8, Connection, Int, Float, Float)
               -> Either String CCMapping
-    resolveCC (cc, c, ctl, mn, mx) = do
-      (ni, _) <- resolvePair ("CC " <> show cc) (c, ctl)
+    resolveCC (n, c, ctl, mn, mx) = do
+      (ni, _) <- resolvePair ("CC " <> show n) (c, ctl)
       pure CCMapping
-        { ccNumber = cc
+        { ccNumber = n
         , ccNode   = ni
         , ccCtl    = ctl
         , ccMin    = mn
         , ccMax    = mx
+        }
+
+    -- Auto-discovered CC bindings carry NodeID directly (registered
+    -- by 'cc' in the SynthM state), so resolution is one step shorter.
+    resolveAutoCC :: CCSpec -> Either String CCMapping
+    resolveAutoCC spec = case resolveNodeIndex rg (ccsNode spec) of
+      Nothing -> Left $ "auto-CC " <> show (ccsNumber spec)
+                     <> " node " <> show (ccsNode spec)
+                     <> " not found in compiled template"
+      Just ni -> Right CCMapping
+        { ccNumber = ccsNumber spec
+        , ccNode   = ni
+        , ccCtl    = ccsCtl spec
+        , ccMin    = realToFrac (ccsMin spec)
+        , ccMax    = realToFrac (ccsMax spec)
         }
 
     resolvePB :: (Connection, Int, Float)

@@ -29,6 +29,9 @@ module MetaSonic.Bridge.Source
     SynthM
   , runSynth
   , runSynthWith
+  , runSynthCCs
+  , -- * CC binding records (auto-discovered by 'cc')
+    CCSpec (..)
   , -- * DSL combinators
     --
     -- $combinators
@@ -45,6 +48,7 @@ module MetaSonic.Bridge.Source
   , busInDelayed
   , delayL
   , smooth
+  , cc
   , -- * Connection helpers
     audio
   , connectionNodeID
@@ -63,6 +67,7 @@ import           Control.DeepSeq            (NFData)
 import           Control.Monad              (void)
 import           Control.Monad.State.Strict
 import qualified Data.Map.Strict            as M
+import           Data.Word                  (Word8)
 import           GHC.Generics               (Generic)
 
 import           MetaSonic.Types
@@ -482,6 +487,26 @@ parallel, mix) would elaborate down to this level.
 data SynthState = SynthState
   { ssNextID :: !Int
   , ssGraph  :: !SynthGraph
+  , ssCCs    :: ![CCSpec]
+    -- ^ CC bindings accumulated by 'cc' (and any future CC-aware
+    -- combinator). Stored in reverse-registration order; the public
+    -- runner reverses to give callers a stable left-to-right view.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | A CC-binding declaration: when a 'control_change' on
+-- @ccsNumber@ arrives, the producer thread should write
+-- @ccsMin + (cc_value / 127) * (ccsMax - ccsMin)@ to the control
+-- at @(ccsNode, ccsCtl)@. The Source layer stays MIDI-agnostic —
+-- it just records the binding; the live-MIDI runner in
+-- "MetaSonic.Bridge.MidiDemo" resolves @ccsNode@ to a dense
+-- 'NodeIndex' and converts to 'CCMapping'.
+data CCSpec = CCSpec
+  { ccsNumber :: !Word8
+  , ccsNode   :: !NodeID
+  , ccsCtl    :: !Int
+  , ccsMin    :: !Double
+  , ccsMax    :: !Double
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -495,7 +520,7 @@ type SynthM a = State SynthState a
 -- 'SynthGraph'. The builder's return value is discarded;
 -- the graph is the product.
 runSynth :: SynthM a -> SynthGraph
-runSynth m = ssGraph (execState m (SynthState 0 emptyGraph))
+runSynth m = ssGraph (execState m (SynthState 0 emptyGraph []))
 
 -- | Run a graph builder and return both the builder's value and
 -- the resulting 'SynthGraph'. Use this when you need to thread
@@ -504,8 +529,18 @@ runSynth m = ssGraph (execState m (SynthState 0 emptyGraph))
 -- gain control that a CC will drive).
 runSynthWith :: SynthM a -> (a, SynthGraph)
 runSynthWith m =
-  let (a, st) = runState m (SynthState 0 emptyGraph)
+  let (a, st) = runState m (SynthState 0 emptyGraph [])
   in (a, ssGraph st)
+
+-- | Run a graph builder and return the value, the 'SynthGraph',
+-- AND the list of CC bindings declared via 'cc' (in declaration
+-- order). The live-MIDI demo runner uses this to auto-wire CC
+-- mappings without the caller having to maintain a parallel
+-- binding list.
+runSynthCCs :: SynthM a -> (a, SynthGraph, [CCSpec])
+runSynthCCs m =
+  let (a, st) = runState m (SynthState 0 emptyGraph [])
+  in (a, ssGraph st, reverse (ssCCs st))
 
 -- | Allocate a fresh 'NodeID'. Strict in the counter to
 -- avoid thunk accumulation.
@@ -727,6 +762,51 @@ smooth
   -> Connection  -- ^ value to smooth (often a 'Param')
   -> SynthM Connection
 smooth baseHz v = insertNodeC "smooth" (Smooth baseHz v)
+
+-- | Declare a CC-bound smoothed control input. Allocates a 'Smooth'
+-- node fed by an initially-constant target, records the
+-- @(cc_number, smooth_node, ctl=1, min, max)@ binding in the
+-- builder state, and returns the smoothed audio-rate 'Connection'
+-- for downstream wiring.
+--
+-- The live-MIDI runner ('MetaSonic.Bridge.MidiDemo') consumes the
+-- recorded bindings via 'runSynthCCs' and auto-wires them at session
+-- open, so users no longer need to:
+--
+--   * Manually pair @smooth 20.0 (Param x)@ with a hand-maintained
+--     @CCMapping@ pointing at the smooth node's @control[1]@.
+--   * Track which dense @NodeIndex@ corresponds to which CC.
+--
+-- The smoothing speed is fixed at 20 Hz (~50 ms time constant), the
+-- typical sweet spot for de-zippering CC updates. Callers who need
+-- a different speed can drop down to @smooth + recordCCBinding@ or
+-- (if exposed in a future iteration) a variant that takes the speed
+-- explicitly. See §1.7 in the roadmap for the design intent.
+--
+-- > polySynth = do
+-- >   osc    <- sinOsc 220 0
+-- >   vol    <- cc 7 0.3 0.0 1.0     -- CC 7 -> smoothed [0, 1]
+-- >   master <- gain osc vol
+-- >   out 0 master
+cc
+  :: Word8        -- ^ MIDI CC number (0..127)
+  -> Double       -- ^ initial \/ fallback target (used until the first
+                  --   matching CC arrives)
+  -> Double       -- ^ scale minimum (cc value 0   maps here)
+  -> Double       -- ^ scale maximum (cc value 127 maps here)
+  -> SynthM Connection
+cc num initial mn mx = do
+  nid <- insertNode "cc" (Smooth 20.0 (Param initial))
+  modify $ \st -> st
+    { ssCCs = CCSpec
+        { ccsNumber = num
+        , ccsNode   = nid
+        , ccsCtl    = 1
+        , ccsMin    = mn
+        , ccsMax    = mx
+        } : ssCCs st
+    }
+  pure (audio nid)
 
 -- | Read the previous block's accumulated contents of a shared audio
 -- bus. The feedback primitive: unlike 'busIn', a 'busInDelayed' creates
