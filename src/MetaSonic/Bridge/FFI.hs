@@ -48,6 +48,13 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_instance_count
   , c_rt_graph_instance_alive
   , c_rt_graph_instance_set_control
+  , -- * A.2 realtime control queue ABI (single-producer; safe while audio runs)
+    c_rt_graph_realtime_reserve
+  , c_rt_graph_realtime_cancel
+  , c_rt_graph_realtime_activate
+  , c_rt_graph_realtime_release
+  , c_rt_graph_realtime_remove
+  , c_rt_graph_realtime_set_control
   , -- * §2.E lifecycle status values (mirroring rt_graph.h's InstanceStatus)
     instanceStatusLive
   , instanceStatusReleasing
@@ -395,6 +402,48 @@ foreign import ccall unsafe "rt_graph_instance_alive"
 foreign import ccall unsafe "rt_graph_instance_set_control"
   c_rt_graph_instance_set_control
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO ()
+
+-- ----------------------------------------------------------------
+-- A.2 realtime ABI bindings
+--
+-- Single-producer contract: only one Haskell thread (typically the
+-- voice allocator's input handler) may call this group. Concurrent
+-- calls from multiple threads will corrupt the SPSC queue. See
+-- Note [A.2: realtime control queue] in @rt_graph.cpp@.
+-- ----------------------------------------------------------------
+
+-- | Reserve and prepare a slot for the named template. Returns
+-- @slot_id >= 0@ on success, @-1@ on any failure (null graph,
+-- invalid template_id, polyphony cap reached, no Available slot
+-- in the pool to recycle). Realtime reserve never grows the pool;
+-- callers must pre-warm it during construction.
+foreign import ccall unsafe "rt_graph_realtime_reserve"
+  c_rt_graph_realtime_reserve :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | Cancel a reservation, returning the slot to Available without
+-- ever publishing it. Silent no-op if the slot isn't Reserved.
+foreign import ccall unsafe "rt_graph_realtime_cancel"
+  c_rt_graph_realtime_cancel :: Ptr RTGraph -> CInt -> IO ()
+
+-- | Enqueue Activate(slot_id) for the audio thread to publish at
+-- the next block boundary. Returns 1 on success, 0 if the queue
+-- is full — on full queue, the producer should
+-- 'c_rt_graph_realtime_cancel' the slot.
+foreign import ccall unsafe "rt_graph_realtime_activate"
+  c_rt_graph_realtime_activate :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | Enqueue Release(slot_id). Returns 1 on success, 0 if full.
+foreign import ccall unsafe "rt_graph_realtime_release"
+  c_rt_graph_realtime_release :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | Enqueue Remove(slot_id). Returns 1 on success, 0 if full.
+foreign import ccall unsafe "rt_graph_realtime_remove"
+  c_rt_graph_realtime_remove :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | Enqueue SetControl. Returns 1 on success, 0 if full.
+foreign import ccall unsafe "rt_graph_realtime_set_control"
+  c_rt_graph_realtime_set_control
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO CInt
 
 -- (c_rt_graph_instance_read_bus was removed in the post-§2.E ABI
 -- cleanup. The C entry was a thin liveness-gated alias for

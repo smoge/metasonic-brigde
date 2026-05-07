@@ -962,10 +962,12 @@ not arise.
 
 The voice allocator (Phase 3.1) and Q MIDI input (Phase 3.2) will
 break the convention: they need to spawn, release, and set-control
-on instances while audio is live. That requires a new mechanism
-(see Note [Thread safety: Phase 3 gap]). Until that mechanism lands,
-*none of the construction or control-thread entries below are safe
-to call concurrently with rt_graph_start_audio's callback*.
+on instances while audio is live. A.2 introduces the mechanism
+that makes this safe — the realtime-producer entries below mediate
+mutation through an SPSC lock-free command queue drained at the
+top of every process_graph block. Construction-only and control-
+thread entries remain audio-stopped-only; the realtime-producer
+entries are the audio-running path.
 
 Per-entry classification — each ABI function falls into exactly
 one of these categories:
@@ -981,28 +983,44 @@ one of these categories:
       rt_graph_set_control       (template-0 shim — see note below)
       rt_graph_connect           (template-0 shim)
 
-  Control-thread (realtime-unsafe today) — mutates per-instance
+  Control-thread (audio-stopped only) — mutates per-instance
     state and/or the instance vector. Audio thread reads and writes
-    the same data structures from the callback. Today: call only
-    when audio is stopped. Phase 3: must become callable concurrently
-    with the callback via the deferred mechanism.
+    the same data structures from the callback. Call only when
+    audio is stopped, OR via the realtime-producer entries below
+    (which queue the same operations behind the audio thread's
+    drain).
       rt_graph_instance_add
       rt_graph_template_instance_add
       rt_graph_instance_remove
       rt_graph_instance_release
-      rt_graph_instance_set_control
+      rt_graph_instance_set_control          [+ Reserved exception]
       rt_graph_set_control       (legacy: same posture; see below)
 
-  Note: rt_graph_set_control is a template-0 shim that *during
-  construction* writes a NodeSpec field (the spec.default_controls
-  values referenced through the instance, on first set), and
-  *afterwards* writes per-instance controls. The current code path
-  (rt_graph_instance_set_control) does only the per-instance write
-  and may grow the bus pool as a side effect on Out/BusOut/BusIn/
-  BusInDelayed control 0. Pool growth is the truly racy step — the
-  bus vectors are read by the audio callback. Today this is safe
-  only because every existing caller sets bus controls during
-  construction.
+  Note: rt_graph_instance_set_control has one narrow exception to
+  the audio-stopped rule — direct write on a Reserved slot is
+  permitted *for the producer that owns the reservation*, between
+  rt_graph_realtime_reserve and rt_graph_realtime_activate. Reserved
+  slots are skipped by process_graph, so the audio thread never
+  reads the slot's nodes/controls in that window; the producer's
+  writes are published to the audio thread later via the queue's
+  release/acquire pair on enqueue/drain of Activate (see Note [A.2:
+  realtime control queue]). Outside that window, the
+  audio-stopped-only rule applies.
+
+  Realtime-producer (single-producer, audio-running safe) — A.2
+    additions. Mediate mutation through the SPSC command queue
+    that drain_control_queue applies at the top of every
+    process_graph block. Single-producer contract: only ONE thread
+    may call this group; UI / OSC / MIDI ingress should feed a
+    single producer thread (typically the voice allocator's input
+    handler). Concurrent calls from multiple threads will corrupt
+    the queue; the C ABI cannot enforce the single-producer rule.
+      rt_graph_realtime_reserve
+      rt_graph_realtime_cancel
+      rt_graph_realtime_activate
+      rt_graph_realtime_release
+      rt_graph_realtime_remove
+      rt_graph_realtime_set_control
 
   Read-only introspection — reads small scalar or std::optional
     fields. Safe to call concurrently with the callback in the
@@ -1022,7 +1040,6 @@ one of these categories:
     for tests and offline rendering; not for sample-accurate
     sampling alongside live audio.
       rt_graph_read_bus
-      rt_graph_instance_read_bus
 
   Audio lifecycle — open and close the realtime stream. Each is
     expected to be called once per session and never concurrently
@@ -2095,6 +2112,58 @@ static void apply_instance_set_control(
   if (cidx == 1 && (spec.kind == NodeKind::SinOsc || spec.kind == NodeKind::SawOsc)) {
     set_osc_initial_phase(node, value);
   }
+}
+
+// Prepare a freshly-CAS-Reserved slot for a given template. Sets
+// template_id, resizes the per-node state vector to match the
+// template's spec, and re-initialises every node's kernel state via
+// init_node_state. The slot's SlotState stays at Reserved — only
+// rt_graph_realtime_activate (via the queued drain) flips it to
+// Active. After this call the producer may apply per-note overrides
+// directly with rt_graph_instance_set_control on the Reserved slot;
+// see the [T:control] exception in rt_graph.h.
+//
+// May allocate (vector resize) on the *first* time a slot is used
+// for a template whose node count exceeds the slot's current vector
+// capacity. To keep the steady state allocation-free, callers should
+// pre-warm the pool during construction (the established pattern is
+// to spawn N instances via _template_instance_add and immediately
+// remove them — the slots stay Available with their vector capacity
+// preserved). See Note [Pool model] and Note [A.2: realtime control
+// queue].
+static void prepare_reserved_slot(
+    RTGraph &g, GraphInstance &slot, const MetaDef &def, int template_id
+) noexcept {
+  slot.template_id    = template_id;
+  slot.silent_blocks  = 0;
+  slot.block_sink_peak = 0.0f;
+  slot.nodes.resize(def.nodes.size());
+  for (std::size_t i = 0; i < def.nodes.size(); ++i) {
+    init_node_state(slot.nodes[i], def.nodes[i], g.max_frames);
+  }
+}
+
+// Producer-side enqueue. Returns true if the command was published,
+// false if the queue is full (caller is responsible for handling
+// the failure — typically by rolling back any reservation). The
+// release-store on write_idx is THE publication point for both the
+// command payload and any prior producer prep work; see Note [A.2:
+// realtime control queue].
+static bool enqueue_command(ControlQueue &q, const ControlCommand &cmd) noexcept {
+  // Producer-only access on write_idx — relaxed load is enough.
+  const std::uint32_t w = q.write_idx.load(std::memory_order_relaxed);
+  // Acquire on read_idx synchronizes-with the audio thread's
+  // release-store at the bottom of drain_control_queue, so we see
+  // freed slots once the audio thread has consumed them.
+  const std::uint32_t r = q.read_idx.load(std::memory_order_acquire);
+  if (w - r >= kControlQueueCapacity) return false;
+  q.ring[w % kControlQueueCapacity] = cmd;
+  // Release publish. After this store, the audio drain's acquire-
+  // load on write_idx will see ring[w%cap] AND every write the
+  // producer made before this point (including the slot's
+  // template_id, nodes, controls, etc. for an Activate).
+  q.write_idx.store(w + 1, std::memory_order_release);
+  return true;
 }
 
 // ----------------------------------------------------------------
@@ -3357,5 +3426,164 @@ void rt_graph_instance_set_control(
 // liveness gate that the caller can do explicitly. The function name
 // is preserved here as a comment so anyone bisecting an old test
 // failure to the cleanup commit can find the rationale.)
+
+// ----------------------------------------------------------------
+// A.2: realtime ABI — single-producer entries safe to call from a
+// non-audio thread while the audio callback is running
+// ----------------------------------------------------------------
+//
+// These entries route mutation through the lock-free SPSC control
+// queue that drain_control_queue applies at the top of each
+// process_graph block. Single-producer contract: only ONE thread
+// may call this group of entries (UI / OSC / MIDI ingress all feed
+// *into* the producer thread, not the queue directly). Concurrent
+// calls from multiple threads will corrupt the queue.
+//
+// rt_graph_realtime_reserve does its work synchronously on the
+// caller's thread (CAS Available → Reserved + slot prep). The
+// other entries enqueue a ControlCommand and return — the work
+// happens on the audio thread at the next block boundary.
+//
+// See Note [A.2: realtime control queue] for the design and memory
+// model.
+
+// Reserve and prepare a slot for the named template. Returns the
+// slot_id (>= 0) on success, -1 on any failure: null graph, invalid
+// template_id, polyphony cap reached, or no Available slot in the
+// pool to recycle. Realtime reserve never grows the slot pool —
+// growth is construction-only — so callers must ensure the pool is
+// pre-warmed during construction (call _template_instance_add N
+// times then _instance_remove on each, leaving N Available slots
+// of the right shape ready to be reused). Reserved slots count
+// toward the polyphony cap.
+//
+// On success the slot is fully prepared (template_id set, nodes
+// vector sized to spec, kernel state freshly initialised, default
+// controls inherited from spec) and in Reserved state. The
+// producer may then write per-note overrides directly via
+// rt_graph_instance_set_control on the Reserved slot, and finally
+// publish it into the audio schedule via rt_graph_realtime_activate.
+int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
+  if (!g) return -1;
+  const MetaDef *def = template_at(*g, template_id);
+  if (!def) return -1;
+
+  // Single-pass scan: count Active+Releasing+Reserved instances of
+  // this template (cap check) and remember the first Available slot.
+  // In SPSC the Available slot we observe cannot disappear under us
+  // (the audio thread only ever transitions Releasing→Available and
+  // Active→Available — both increase the Available count, never
+  // decrease it). We can therefore CAS without retries.
+  int live_count = 0;
+  std::size_t free_slot = g->instances.size();  // sentinel
+  for (std::size_t i = 0; i < g->instances.size(); ++i) {
+    const SlotState s = g->instances[i].state.load();
+    if (s == SlotState::Available) {
+      if (free_slot == g->instances.size()) free_slot = i;
+    } else if (g->instances[i].template_id == template_id) {
+      ++live_count;  // Active, Releasing, or Reserved for this template
+    }
+  }
+  if (live_count >= def->polyphony) return -1;
+  if (free_slot >= g->instances.size()) return -1;  // pool not pre-warmed
+
+  // CAS Available → Reserved. Acquire on success synchronizes-with
+  // the audio thread's release-store that flipped this slot to
+  // Available previously (auto-free or remove). Relaxed on failure
+  // means we won't re-load on a contended slot — but in SPSC the
+  // CAS can't legitimately fail. If it does, treat it as the
+  // contract being violated and silently return -1.
+  SlotState expected = SlotState::Available;
+  if (!g->instances[free_slot].state.compare_exchange_strong(
+          expected, SlotState::Reserved,
+          std::memory_order_acquire,
+          std::memory_order_relaxed)) {
+    return -1;
+  }
+
+  prepare_reserved_slot(*g, g->instances[free_slot], *def, template_id);
+  return static_cast<int>(free_slot);
+}
+
+// Cancel a reservation, returning the slot to Available without
+// publishing it. Guarded CAS Reserved → Available; silent no-op on
+// any other state (caller bug or already activated). Used by the
+// producer to roll back if rt_graph_realtime_activate's enqueue
+// fails. Release on success so a subsequent reserve sees the slot
+// in a clean state.
+void rt_graph_realtime_cancel(RTGraph *g, int slot_id) {
+  if (!g) return;
+  if (slot_id < 0) return;
+  const std::size_t idx = static_cast<std::size_t>(slot_id);
+  if (idx >= g->instances.size()) return;
+  SlotState expected = SlotState::Reserved;
+  // Failure is silent — Available means already cancelled, Active
+  // means the queue already activated us, Releasing means the
+  // queue activated then released. None of these are recoverable
+  // by cancel; the producer must handle that path differently.
+  (void) g->instances[idx].state.compare_exchange_strong(
+      expected, SlotState::Available,
+      std::memory_order_release,
+      std::memory_order_relaxed);
+}
+
+// Enqueue Activate(slot_id) for the audio thread to publish at the
+// next block. The release-store on write_idx inside enqueue_command
+// publishes both this command AND the producer's prior preparation
+// of the slot (template_id, nodes, controls, etc.) to the audio
+// thread. Returns 1 on success, 0 if the queue is full — on full
+// queue the producer should rt_graph_realtime_cancel the slot.
+int rt_graph_realtime_activate(RTGraph *g, int slot_id) {
+  if (!g) return 0;
+  if (slot_id < 0) return 0;
+  ControlCommand cmd;
+  cmd.kind    = ControlCommand::Kind::Activate;
+  cmd.slot_id = slot_id;
+  return enqueue_command(g->control_queue, cmd) ? 1 : 0;
+}
+
+// Enqueue Release(slot_id). The audio drain gates to Active only;
+// Reserved is producer-private and Releasing is already in flight.
+// Returns 1/0 as for activate.
+int rt_graph_realtime_release(RTGraph *g, int slot_id) {
+  if (!g) return 0;
+  if (slot_id < 0) return 0;
+  ControlCommand cmd;
+  cmd.kind    = ControlCommand::Kind::Release;
+  cmd.slot_id = slot_id;
+  return enqueue_command(g->control_queue, cmd) ? 1 : 0;
+}
+
+// Enqueue Remove(slot_id) — hard-free at the next block boundary.
+// The audio drain gates to Active or Releasing; Reserved is
+// producer-private (the producer should cancel rather than enqueue
+// remove on its own reservation). Returns 1/0 as for activate.
+int rt_graph_realtime_remove(RTGraph *g, int slot_id) {
+  if (!g) return 0;
+  if (slot_id < 0) return 0;
+  ControlCommand cmd;
+  cmd.kind    = ControlCommand::Kind::Remove;
+  cmd.slot_id = slot_id;
+  return enqueue_command(g->control_queue, cmd) ? 1 : 0;
+}
+
+// Enqueue SetControl. The audio drain applies it only to Active or
+// Releasing slots — Reserved slots receive their initial controls
+// from the producer's pre-enqueue path (direct rt_graph_instance_-
+// set_control on the Reserved slot, see the [T:control] exception).
+// Returns 1/0 as for activate.
+int rt_graph_realtime_set_control(
+    RTGraph *g, int slot_id, int node_index, int control_index, double value
+) {
+  if (!g) return 0;
+  if (slot_id < 0) return 0;
+  ControlCommand cmd;
+  cmd.kind        = ControlCommand::Kind::SetControl;
+  cmd.slot_id     = slot_id;
+  cmd.node_idx    = node_index;
+  cmd.control_idx = control_index;
+  cmd.value       = value;
+  return enqueue_command(g->control_queue, cmd) ? 1 : 0;
+}
 
 } // extern "C"
