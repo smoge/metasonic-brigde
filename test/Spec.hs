@@ -952,6 +952,49 @@ unitTests = testGroup "Unit tests"
                   regRate r   @?= SampleRate
                   length (regNodes r) @?= length (giNodes ir)
                 _   -> assertFailure "unreachable: length checked above"
+
+      , -- Step B-Light: pinned output-use counts on a known graph.
+        -- Linear chain SinOsc → Gain → Out: the SinOsc output flows
+        -- only into the Gain (same region), the Gain output flows only
+        -- into the Out (same region), Out is a sink. Expect:
+        --   NoOutput      = 1  (the Out)
+        --   RegionLocal   = 2  (SinOsc, Gain)
+        --   RegionEscapes = 0
+        -- See Note [Output-use classification] in MetaSonic.Bridge.Compile.
+        testCase "rnOutputUse on a linear SinOsc → Gain → Out chain" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let uses = map rnOutputUse (rgNodes rg)
+              length [() | NoOutput      <- uses] @?= 1
+              length [() | RegionLocal   <- uses] @?= 2
+              length [() | RegionEscapes <- uses] @?= 0
+
+      , -- Bus routing keeps every transform RegionLocal too: BusOut
+        -- and Out are NoOutput sinks; SinOsc's output is consumed by
+        -- BusOut in the same region; BusIn's output is consumed by
+        -- Out in the same region. The same-bus dataflow doesn't go
+        -- through the rnInputs graph (it goes through the server bus
+        -- pool), so BusIn has no FromNode consumer beyond Out and
+        -- SinOsc has no FromNode consumer beyond BusOut.
+        testCase "rnOutputUse on a BusOut → BusIn round-trip" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                busOut 5 o
+                v <- busIn 5
+                out 0 v
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let uses = map rnOutputUse (rgNodes rg)
+              -- 2 sinks (BusOut + Out), 2 producers (SinOsc + BusIn).
+              length [() | NoOutput      <- uses] @?= 2
+              length [() | RegionLocal   <- uses] @?= 2
+              length [() | RegionEscapes <- uses] @?= 0
       ]
 
   , testCase "kindTag is injective" $
@@ -1116,6 +1159,9 @@ properties = testGroup "Properties"
 
   , QC.testProperty "RuntimeGraph regions partition node indices contiguously" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propRuntimeRegionsContiguous
+
+  , QC.testProperty "rnOutputUse classification matches consumer-region membership" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propOutputUseConsistent
 
   , QC.testProperty "every BusOut precedes every same-bus BusIn in the schedule" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propBusOrdering
@@ -1505,6 +1551,49 @@ propRuntimeRegionsContiguous g = case lowerGraph g of
            [ counterexample "regions do not concatenate to [0 .. n-1]" $
                flat === [0 .. totalNodes - 1]
            , conjoin eachContiguous
+           ]
+
+-- | Step B-Light: 'rnOutputUse' must agree with the actual consumer /
+-- region structure. Three invariants:
+--
+--   1. 'NoOutput' iff the node's kind is a sink ('KOut' / 'KBusOut').
+--   2. 'RegionLocal' iff the node has output AND every consumer is in
+--      the same region (vacuously true when there are no consumers).
+--   3. 'RegionEscapes' iff the node has output AND at least one
+--      consumer is in a different region.
+--
+-- See Note [Output-use classification] in MetaSonic.Bridge.Compile.
+propOutputUseConsistent :: SynthGraph -> Property
+propOutputUseConsistent g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir -> case compileRuntimeGraph ir of
+    Left err -> counterexample ("compileRuntimeGraph failed: " <> err) False
+    Right rg ->
+      let nodeRegion = M.fromList
+            [ (ix, rrIndex r)
+            | r <- rgRuntimeRegions rg, ix <- rrNodes r
+            ]
+          consumersOf ix =
+            [ rnIndex c
+            | c <- rgNodes rg
+            , RFrom src _ <- rnInputs c
+            , src == ix
+            ]
+          isSink k = k == KOut || k == KBusOut
+          expected n
+            | isSink (rnKind n) = NoOutput
+            | otherwise =
+                let myReg = M.lookup (rnIndex n) nodeRegion
+                    cs    = consumersOf (rnIndex n)
+                    same  = all (\c -> M.lookup c nodeRegion == myReg) cs
+                in if same then RegionLocal else RegionEscapes
+      in conjoin
+           [ counterexample
+               (show (rnIndex n) <> " (" <> show (rnKind n)
+                  <> "): rnOutputUse = " <> show (rnOutputUse n)
+                  <> ", expected " <> show (expected n))
+               (rnOutputUse n === expected n)
+           | n <- rgNodes rg
            ]
 
 ------------------------------------------------------------

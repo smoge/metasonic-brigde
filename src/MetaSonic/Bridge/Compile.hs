@@ -28,6 +28,7 @@ module MetaSonic.Bridge.Compile
   , RuntimeRegion (..)
   , RuntimeGraph (..)
   , RegionIndex (..)
+  , NodeOutputUse (..)
   , -- * Compilation
     compileRuntimeGraph
   , resolveNodeIndex
@@ -411,8 +412,76 @@ data RuntimeNode = RuntimeNode
     -- by topological ordering).
   , rnControls   :: ![Double]
     -- ^ Default control values, sent to C++ at load time.
+  , rnOutputUse  :: !NodeOutputUse
+    -- ^ How this node's output buffer is consumed across the
+    -- region overlay (Step B-Light). Computed by
+    -- 'compileRuntimeGraph' from the consumer set after regions
+    -- are formed; pure analysis, never crosses the FFI.
+    -- See Note [Output-use classification].
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+{- Note [Output-use classification]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Step B-Light is an analysis layer that fusion (Step C) will consume.
+For each 'RuntimeNode' we classify how its single output buffer is
+used downstream:
+
+  * 'NoOutput'      — the kind has no output buffer at all (currently
+                      'KOut' and 'KBusOut'; both write directly to
+                      'g.server.output_buses' without populating
+                      'NodeInstanceState.outputs'). Distinguished from
+                      'RegionLocal' / 'RegionEscapes' because there
+                      is no buffer to reuse, fuse, or dissolve.
+
+  * 'RegionLocal'   — the kind has an output buffer AND every direct
+                      'FromNode' consumer is in the same region. A node
+                      with no consumers also lands here (the universal
+                      "all in same region" is vacuously true). These
+                      are the candidates for scratch-pool reuse and
+                      kernel fusion.
+
+  * 'RegionEscapes' — the kind has an output buffer AND at least one
+                      direct 'FromNode' consumer is in a different
+                      region. Its output must outlive its region's
+                      execution; it cannot share scratch with a
+                      sibling region's intermediates.
+
+The classification is intentionally per-node, not per-region: fusion
+will ask "can I fuse node A into node B" and that requires knowing
+A's output discipline and B's input set, not just aggregate counts.
+
+Under the current 'formRegions' (greedy, with the Step-A CompileRate
+absorption), almost every realistic graph collapses to a single
+region; 'RegionEscapes' is a future-proofing classification that
+becomes load-bearing once a kind with a non-SampleRate floor lands,
+or once a non-greedy region pass starts splitting. The property test
+in Spec.hs cross-checks the classification against the actual region
+membership map for whatever regions 'formRegions' produces, so the
+analysis stays correct as the region-formation algorithm evolves.
+
+Sinks ('KOut', 'KBusOut') write to the server bus pool, not to a node
+output buffer. The Haskell side does not currently track who reads
+the bus pool — that is a global, per-block concept handled in C++.
+So sinks are 'NoOutput' even though they do produce externally-
+visible side effects; "output use" here refers strictly to the node's
+NodeInstanceState.outputs slot.
+-}
+
+-- | How a 'RuntimeNode'\'s output buffer is consumed.
+-- See Note [Output-use classification].
+data NodeOutputUse
+  = NoOutput
+    -- ^ Kind has no per-node output buffer; the kernel writes
+    -- elsewhere (currently: directly to 'g.server.output_buses').
+  | RegionLocal
+    -- ^ Kind has an output buffer and every consumer (if any) is
+    -- in the same region as the producer.
+  | RegionEscapes
+    -- ^ Kind has an output buffer and at least one consumer is in
+    -- a different region.
+  deriving stock    (Eq, Ord, Show, Generic, Enum, Bounded)
+  deriving anyclass (NFData)
 
 -- | A region's dense position in the runtime region array.
 -- Distinct from 'RegionID' (the symbolic ID assigned by
@@ -520,29 +589,65 @@ compileRuntimeGraph ir = do
         | (i, n) <- zip [0..] irNodes
         ]
 
-  rtNodes <- mapM (compileNode indexMap) (zip [0..] irNodes)
-
   -- Region overlay: form regions from the IR, then translate the
   -- per-region NodeID membership into the dense NodeIndex space.
   -- See Note [Runtime regions overlay].
   rtRegions <- mapM (compileRegion indexMap)
                     (zip [0..] (rgRegions (formRegions irNodes)))
 
+  -- Output-use classification (Step B-Light): for each NodeIndex, look
+  -- up the region it belongs to, then check whether every consumer
+  -- lives in that same region. Sinks ('KOut'/'KBusOut') skip the check
+  -- entirely and land in 'NoOutput'.
+  -- See Note [Output-use classification].
+  let !nodeRegion = M.fromList
+        [ (ix, rrIndex r)
+        | r <- rtRegions, ix <- rrNodes r
+        ]
+
+      -- Consumer map built from the (still-symbolic) IR inputs:
+      -- for each consumer node, every 'FromNode src _' contributes a
+      -- (src, consumer) edge. We translate via indexMap to NodeIndex
+      -- so the keys and values live in the same dense space as
+      -- 'nodeRegion'.
+      !consumerMap = M.fromListWith (++)
+        [ (srcIx, [consumerIx])
+        | n <- irNodes
+        , let consumerIx = indexMap M.! irNodeID n
+        , FromNode srcID _ <- irInputs n
+        , Just srcIx <- [M.lookup srcID indexMap]
+        ]
+
+      classify :: NodeIndex -> NodeKind -> NodeOutputUse
+      classify _   KOut    = NoOutput
+      classify _   KBusOut = NoOutput
+      classify ix _        =
+        let myRegion = M.lookup ix nodeRegion
+            consumers = M.findWithDefault [] ix consumerMap
+            allLocal  = all (\c -> M.lookup c nodeRegion == myRegion) consumers
+        in if allLocal then RegionLocal else RegionEscapes
+
+  rtNodes <- mapM (compileNode indexMap classify) (zip [0..] irNodes)
+
   pure $! RuntimeGraph rtNodes rtRegions
 
   where
     compileNode
       :: M.Map NodeID NodeIndex
+      -> (NodeIndex -> NodeKind -> NodeOutputUse)
       -> (Int, NodeIR)
       -> Either String RuntimeNode
-    compileNode indexMap (i, node) = do
+    compileNode indexMap classify (i, node) = do
       inputs <- mapM (compileInput indexMap) (irInputs node)
+      let !ix   = NodeIndex i
+          !kind = irKind node
       pure $! RuntimeNode
-        { rnIndex      = NodeIndex i
+        { rnIndex      = ix
         , rnOriginalID = irNodeID node
-        , rnKind       = irKind node
+        , rnKind       = kind
         , rnInputs     = inputs
         , rnControls   = irControls node
+        , rnOutputUse  = classify ix kind
         }
 
     -- Rewrite a symbolic InputConn to a dense RuntimeInput.
