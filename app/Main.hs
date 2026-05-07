@@ -130,9 +130,12 @@ envPluckGraph = runSynth $ do
 -- 'pulseOsc' takes truly audio-rate width input (per-sample
 -- @osc.width(...)@ inside the kernel); 'bpf' takes block-latched
 -- cutoff input (mirrors 'lpf') — the LFO at 0.3 Hz produces sub-Hz
--- step changes per 256-sample block, so the audible result is
--- effectively continuous, but a faster modulator would need
--- 'smooth' between the LFO and the cutoff input to avoid stepping.
+-- step changes per 256-sample block, so the cutoff at sample 0 of
+-- each block follows the LFO smoothly enough to be audibly
+-- continuous. Faster control-rate modulators (e.g. a CC sweep
+-- updating once per block) would still step at block boundaries;
+-- inserting 'smooth' between the modulator and the cutoff softens
+-- those block-to-block jumps but does not give within-block sweeps.
 intermodGraph :: SynthGraph
 intermodGraph = runSynth $ do
   -- LFO 1 (PWM): triangle at 0.7 Hz, scaled+offset to [0.15, 0.85]

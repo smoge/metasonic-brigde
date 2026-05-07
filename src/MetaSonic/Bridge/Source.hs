@@ -677,9 +677,11 @@ triOsc freq phase = insertNodeC "triOsc" (TriOsc freq phase)
 
 -- | High-pass biquad: signal, cutoff frequency, Q factor. Mirrors
 -- 'lpf'. Cutoff and Q are __block-latched__ — the kernel reads
--- sample 0 of each input port once per block. For smooth audio-rate
--- cutoff sweeps, put a 'smooth' between the modulator and the cutoff
--- input.
+-- sample 0 of each input port once per block. An upstream 'smooth'
+-- softens block-to-block / control-rate jumps in the cutoff
+-- trajectory (e.g. CC-driven cutoff that updates between blocks),
+-- but cannot give true within-block sweeps; for that, the kernel
+-- would need a sample-accurate path that doesn't exist today.
 hpf :: Connection -> Connection -> Connection -> SynthM Connection
 hpf sig freq q = insertNodeC "hpf" (HPF sig freq q)
 

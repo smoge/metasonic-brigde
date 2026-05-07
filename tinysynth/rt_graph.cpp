@@ -1903,9 +1903,13 @@ q::biquad alternative:
           is roughly Q-independent, the musical / wah variant).
   * Notch uses q::notch (band-reject).
 
-Audio-rate cutoff isn't truly sample-accurate here — the kernel
-samples freq_in[0] once per block. Users who need a glitch-free
-sweep should put a Smooth between the modulator and the cutoff input.
+Cutoff and q are block-rate, not sample-accurate: the kernel samples
+freq_in[0] / q_in[0] once per block. An upstream Smooth softens
+block-to-block jumps in the cutoff trajectory (a CC value that
+updates once per block, for example) but is itself only observed at
+sample 0 of each block, so it doesn't give within-block sweeps. True
+sample-accurate filter FM would need a per-sample biquad reconfigure
+loop here, which doesn't exist today.
 */
 
 static void process_hpf(const RTGraph &g, GraphInstance &inst,
