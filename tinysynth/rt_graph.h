@@ -153,6 +153,18 @@ void rt_graph_connect(RTGraph *g, int src_index, int src_port, int dst_index,
 // its own thread; concurrent calls from any other thread are UB.
 void rt_graph_process(RTGraph *g, int nframes);
 
+// [T:construction] Grow the shared Server bus pool to cover bus_index.
+// No-op if the pool already covers that bus. This is the only
+// caller-facing way to size the pool — rt_graph_template_set_default
+// and rt_graph_instance_set_control never resize as a side effect of
+// writing a control. Construction-only: must run before
+// rt_graph_start_audio.
+//
+// See Note [Explicit bus-pool sizing] in rt_graph.cpp for why the
+// implicit-growth path was removed and how the audio thread depends
+// on this contract.
+void rt_graph_ensure_bus(RTGraph *g, int bus_index);
+
 // [T:bus-read] Copy nframes samples from one server bus into out.
 // Returns the number of samples written, or 0 on bad arguments. Reads
 // directly from the shared Server bus pool — under §2.C+§2.D.3 the

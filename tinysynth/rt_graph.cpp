@@ -2283,18 +2283,10 @@ void rt_graph_template_set_default(
   if (cidx >= spec.default_controls.size()) return;
 
   spec.default_controls[cidx] = value;
-
-  // For Out / BusOut / BusIn / BusInDelayed, control 0 is the bus
-  // index. Grow the shared pool here so the kernel never has to.
-  const bool kind_uses_bus_slot =
-      spec.kind == NodeKind::Out
-      || spec.kind == NodeKind::BusOut
-      || spec.kind == NodeKind::BusIn
-      || spec.kind == NodeKind::BusInDelayed;
-  if (kind_uses_bus_slot && cidx == 0 && value >= 0.0) {
-    const auto bus = static_cast<std::size_t>(static_cast<int>(value));
-    ensure_output_bus_count(g->server, bus + 1, g->max_frames);
-  }
+  // Bus-pool sizing is no longer a side effect of writing this
+  // control. Callers that need bus N to exist must call
+  // rt_graph_ensure_bus(g, N) explicitly during graph construction.
+  // See Note [Explicit bus-pool sizing] below.
 }
 
 // Connect one source output port to one destination input port in the
@@ -2423,6 +2415,54 @@ void rt_graph_process(RTGraph *g, int nframes) {
   }
 
   process_graph(*g, nframes);
+}
+
+/* Note [Explicit bus-pool sizing]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Until §2.E the bus pool grew implicitly as a side effect of
+rt_graph_template_set_default and rt_graph_instance_set_control:
+when control 0 of an Out / BusOut / BusIn / BusInDelayed node was
+written with a non-negative value, the runtime quietly resized
+g.server.output_buses to cover that bus index.
+
+This was convenient for callers (no extra API to learn) but
+architecturally messy: a function whose nominal job is "write a
+control value" was also resizing a vector that the audio callback
+iterates. The Phase 3 control queue — which will ferry per-block
+control writes from the voice allocator and MIDI handler — would
+otherwise have to either run the resize on the audio thread (a
+malloc on the realtime path) or detect-and-defer "growing" writes
+(complex). Splitting the responsibility eliminates the question.
+
+Today:
+  * rt_graph_ensure_bus(g, bus_index) is the *only* caller-facing
+    way to grow the shared pool. Construction-only — must run
+    before audio starts.
+  * rt_graph_template_set_default and rt_graph_instance_set_control
+    purely write the control value. They never resize.
+  * The defensive ensures inside rt_graph_process and
+    rt_graph_start_audio (size 1 if pool is empty) are kept as
+    backstops for the trivial case "single Out, never explicitly
+    routed to any bus" so the shortest demo still works.
+  * rt_graph_template_add_node retains an auto-ensure for Out: the
+    semantic "this template emits to a hardware bus" implies bus 0
+    will exist, and the resize is tied to *node-kind addition*, not
+    to value writes — so the queue never sees this path.
+
+Callers that route a node to a non-default bus must call
+rt_graph_ensure_bus before setting control 0:
+
+    rt_graph_ensure_bus(g, 5);
+    rt_graph_template_set_default(g, t, out_idx, 0, 5.0);  // route to bus 5
+
+Tests and Haskell's loadRuntimeGraph / loadTemplateGraph migrated
+to this pattern when the implicit growth was removed.
+*/
+
+void rt_graph_ensure_bus(RTGraph *g, int bus_index) {
+  if (!g || bus_index < 0) return;
+  const auto bus = static_cast<std::size_t>(bus_index);
+  ensure_output_bus_count(g->server, bus + 1, g->max_frames);
 }
 
 // Read one bus from the shared server pool. Under §2.C+§2.D.3 the
@@ -2705,23 +2745,11 @@ void rt_graph_instance_set_control(
   }
 
   node.controls[cidx] = value;
-
-  // For Out / BusOut / BusIn / BusInDelayed nodes, control 0 is the
-  // bus index. All four reference the shared Server bus pool;
-  // growing the pool here ensures the DSP loop never has to. The
-  // pool grows once globally even if only one instance touches that
-  // bus index — every other instance (across every template) can
-  // then read or write the same bus without further setup. See Note
-  // [§2.C: server-global buses].
-  const bool kind_uses_bus_slot =
-      spec.kind == NodeKind::Out
-      || spec.kind == NodeKind::BusOut
-      || spec.kind == NodeKind::BusIn
-      || spec.kind == NodeKind::BusInDelayed;
-  if (kind_uses_bus_slot && cidx == 0 && value >= 0.0) {
-    const auto bus = static_cast<std::size_t>(static_cast<int>(value));
-    ensure_output_bus_count(g->server, bus + 1, g->max_frames);
-  }
+  // Bus-pool sizing is no longer a side effect of writing this
+  // control — see rt_graph_ensure_bus and Note [Explicit bus-pool
+  // sizing]. The audio thread still must never grow the pool, so
+  // when this entry becomes realtime-callable in Phase 3 the value
+  // write is the only thing the queue ferries.
 
   if (cidx == 1 && (spec.kind == NodeKind::SinOsc || spec.kind == NodeKind::SawOsc)) {
     set_osc_initial_phase(node, value);

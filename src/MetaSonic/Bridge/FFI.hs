@@ -37,6 +37,7 @@ module MetaSonic.Bridge.FFI
     c_rt_graph_template_add
   , c_rt_graph_template_count
   , c_rt_graph_template_add_node
+  , c_rt_graph_ensure_bus
   , c_rt_graph_template_set_default
   , c_rt_graph_template_connect
   , c_rt_graph_template_instance_add
@@ -238,6 +239,31 @@ foreign import ccall unsafe "rt_graph_add_node"
 foreign import ccall unsafe "rt_graph_set_control"
   c_rt_graph_set_control :: Ptr RTGraph -> CInt -> CInt -> CDouble -> IO ()
 
+-- | Grow the shared Server bus pool to cover @bus_index@. Construction-
+-- only — must run before audio starts. The Haskell loaders
+-- ('loadRuntimeGraph', 'loadTemplateGraph') call this for every
+-- bus-using node before configuring controls.
+foreign import ccall unsafe "rt_graph_ensure_bus"
+  c_rt_graph_ensure_bus :: Ptr RTGraph -> CInt -> IO ()
+
+-- | If @node@ is a bus-using kind (Out / BusOut / BusIn / BusInDelayed),
+-- return the bus index taken from control 0. Otherwise 'Nothing'.
+-- Used by the loaders to size the bus pool before any control writes.
+busIndexOf :: RuntimeNode -> Maybe Int
+busIndexOf node
+  | kindUsesBus (rnKind node)
+  , (v : _) <- rnControls node
+  , v >= 0
+  = Just (truncate v)
+  | otherwise
+  = Nothing
+  where
+    kindUsesBus KOut          = True
+    kindUsesBus KBusOut       = True
+    kindUsesBus KBusIn        = True
+    kindUsesBus KBusInDelayed = True
+    kindUsesBus _             = False
+
 foreign import ccall unsafe "rt_graph_connect"
   c_rt_graph_connect :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
 
@@ -420,6 +446,10 @@ cControlIndex (ControlIndex x) = fromIntegral x
 loadRuntimeGraph :: Ptr RTGraph -> RuntimeGraph -> IO ()
 loadRuntimeGraph g rg = do
   c_rt_graph_clear g
+  -- Pass 0: size the shared bus pool to cover every bus this graph
+  -- references. Construction-only; must run before audio starts.
+  -- See Note [Explicit bus-pool sizing] in rt_graph.cpp.
+  mapM_ ensureBusForNode (rgNodes rg)
   -- Pass 1: add nodes and set control values.
   -- See Note [Two-pass loading].
   mapM_ addNode (rgNodes rg)
@@ -436,6 +466,12 @@ loadRuntimeGraph g rg = do
           (cNodeIndex    (rnIndex node))
           (cControlIndex (ControlIndex i))
           (CDouble v)
+
+    ensureBusForNode :: RuntimeNode -> IO ()
+    ensureBusForNode node =
+      case busIndexOf node of
+        Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
+        Nothing  -> pure ()
 
     wireNode :: RuntimeNode -> IO ()
     wireNode node =
@@ -518,6 +554,14 @@ loadTemplateGraph g tg = do
   where
     populateTemplate :: CInt -> RuntimeGraph -> IO ()
     populateTemplate cTid rg = do
+      -- Pass 0: ensure every referenced bus exists on the shared
+      -- pool before any control write. Construction-only; same
+      -- contract as in loadRuntimeGraph. See Note [Explicit
+      -- bus-pool sizing] in rt_graph.cpp.
+      forM_ (rgNodes rg) $ \node ->
+        case busIndexOf node of
+          Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
+          Nothing  -> pure ()
       -- Pass 1: nodes + per-spec control defaults.
       forM_ (rgNodes rg) $ \node -> do
         c_rt_graph_template_add_node g cTid

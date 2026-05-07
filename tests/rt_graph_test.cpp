@@ -562,6 +562,7 @@ TEST_CASE("BusOut(5) writes a constant to bus 5; BusIn(5) reads it back") {
     constexpr int kBus = 5;
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, kBus);
 
     rt_graph_add_node(g, 0, 1);                       // SinOsc
     rt_graph_set_control(g, 0, 0, 440.0);             // freq
@@ -590,6 +591,7 @@ TEST_CASE("BusOut: multiple writers to the same bus sum") {
     constexpr int kBus = 5;
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, kBus);
 
     rt_graph_add_node(g, 0, 1);              // SinOsc A
     rt_graph_set_control(g, 0, 0, 440.0);
@@ -658,6 +660,7 @@ TEST_CASE("BusInDelayed reads the previous block's BusOut contents") {
     constexpr int kBus = 5;
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, kBus);
 
     rt_graph_add_node(g, 0, 1);                          // SinOsc
     rt_graph_set_control(g, 0, 0, 440.0);
@@ -718,6 +721,7 @@ TEST_CASE("BusInDelayed snapshot is one-block-old across many blocks") {
     constexpr int kBlocks = 5;
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, kBus);
 
     rt_graph_add_node(g, 0, 1);                          // SinOsc
     rt_graph_set_control(g, 0, 0, 440.0);
@@ -796,6 +800,8 @@ TEST_CASE("BusIn (live) and BusInDelayed (prev) coexist on the same bus") {
     constexpr int kBus = 5;
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, kBus);
+    rt_graph_ensure_bus(g, 1);  // BusInDelayed routes to bus 1
 
     rt_graph_add_node(g, 0, 1);                          // SinOsc
     rt_graph_set_control(g, 0, 0, 440.0);
@@ -1024,6 +1030,7 @@ TEST_CASE("BusInDelayed feedback path: stable attenuated loop") {
     constexpr int kBus = 5;
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, kBus);
 
     rt_graph_add_node(g, 0, 6);                          // NoiseGen
     rt_graph_add_node(g, 1, 3);                          // Gain(0.1)
@@ -1152,6 +1159,7 @@ TEST_CASE("Two Delay nodes in one graph keep independent ring-buffer state") {
 
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);  // long-delay Out routes to bus 1
 
     rt_graph_add_node(g, 0, 8);                          // Add — constant 1.0 source
     rt_graph_set_control(g, 0, 0, 1.0);
@@ -1226,6 +1234,7 @@ TEST_CASE("Two LPF nodes in one graph hold independent biquad state") {
 
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);  // second chain routes to bus 1
     build_chain(g, 0, 1, 2, /*cutoff*/ 200.0,  /*bus*/ 0.0);  // far below carrier — heavy attenuation
     build_chain(g, 3, 4, 5, /*cutoff*/ 8000.0, /*bus*/ 1.0);  // well above carrier — pass-through
 
@@ -2285,6 +2294,7 @@ TEST_CASE("rt_graph_create with invalid args returns nullptr or a safe handle") 
 TEST_CASE("Out nodes route to the bus indicated by control 0") {
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);  // second Out routes to bus 1
 
     rt_graph_add_node(g, 0, 1); // SinOsc 200 → bus 0
     rt_graph_set_control(g, 0, 0, 200.0f);
@@ -2327,6 +2337,7 @@ TEST_CASE("Out nodes route to the bus indicated by control 0") {
 TEST_CASE("writing to bus 1 leaves bus 0 silent") {
     auto *g = rt_graph_create(2, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);
 
     rt_graph_add_node(g, 0, 1); // SinOsc 440
     rt_graph_set_control(g, 0, 0, 440.0f);
@@ -2945,6 +2956,7 @@ TEST_CASE("Multi-instance: two SinOsc instances at different frequencies") {
     // instance controls and per-instance kernel state).
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);  // inst1 routes to bus 1
 
     rt_graph_add_node(g, 0, 1);                          // SinOsc
     rt_graph_set_control(g, 0, 0, 440.0);                // instance 0 freq
@@ -2989,6 +3001,7 @@ TEST_CASE("Multi-instance: per-instance Delay state is independent") {
     // (independent ring buffers, no cross-instance pollution).
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);  // inst1 routes to bus 1
 
     rt_graph_add_node(g, 0, 8);                          // Add
     rt_graph_add_node(g, 1, 13);                         // Delay
@@ -3041,6 +3054,7 @@ TEST_CASE("Multi-instance: per-instance Delay state is independent") {
 TEST_CASE("Multi-instance: lifecycle (add, remove, re-add reuses slot)") {
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);  // id_a routes to bus 1
     rt_graph_add_node(g, 0, 1);                          // SinOsc
     rt_graph_set_control(g, 0, 0, 440.0);
     rt_graph_add_node(g, 1, 2);                          // Out
@@ -3285,6 +3299,8 @@ TEST_CASE("Server buses §2.C: cross-instance routing through a shared bus") {
     // at junk-bus 99.
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 5);   // shared cross-voice bus
+    rt_graph_ensure_bus(g, 99);  // junk bus used by the unused paths
     rt_graph_add_node(g, 0, 1);                          // SinOsc
     rt_graph_add_node(g, 1, 10);                         // BusOut
     rt_graph_connect(g, 0, 0, 1, 0);
@@ -3366,6 +3382,7 @@ TEST_CASE("Multi-template: per-template node spaces are independent") {
     // vectors.
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);  // template 1 routes to bus 1
 
     int t0 = 0;                                // auto-created
     int t1 = rt_graph_template_add(g);
@@ -3422,6 +3439,8 @@ TEST_CASE("Multi-template: template_set_default propagates to future instances")
     // the per-instance setter's job).
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 5);  // instA routes to bus 5
+    rt_graph_ensure_bus(g, 6);  // instB routes to bus 6
 
     int t0 = 0;
     rt_graph_template_add_node(g, t0, 0, 1);    // SinOsc
@@ -3478,6 +3497,7 @@ TEST_CASE("Multi-template: cross-template routing through the shared bus pool") 
     // footprints intersect).
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 7);  // cross-template send/return
 
     int producer = 0;                           // auto-created template 0
     int consumer = rt_graph_template_add(g);
