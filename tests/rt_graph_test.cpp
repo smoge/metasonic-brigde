@@ -584,14 +584,10 @@ TEST_CASE("PulseOsc takes audio-rate width modulation (PWM) without zippering") 
     rt_graph_destroy(g);
 }
 
-TEST_CASE("PulseOsc: pathological width is sanitized — no UB, output stays bounded") {
-    // q::frac_to_phase asserts frac >= 0.0 (debug-only) and would
-    // convert NaN / -Inf / negative finite to uint32_t in release —
-    // unspecified per the C++ standard. The kernel sanitizer should
-    // clamp finite values to [0, 1] and substitute 0.5 for non-finite,
-    // so every reachable sample stays finite and within the pulse
-    // oscillator's [-1, 1] output range regardless of the control
-    // input.
+TEST_CASE("PulseOsc clamps invalid width controls and stays bounded") {
+    // q::pulse_osc expects width in [0, 1]. Bad control values should
+    // be cleaned at the kernel boundary so the oscillator never sees
+    // NaN, infinities, or negative phase fractions.
     auto run_with_bad_width = [](double bad_w) {
         auto *g = rt_graph_create(2, kFrames);
         REQUIRE(g != nullptr);
@@ -599,7 +595,7 @@ TEST_CASE("PulseOsc: pathological width is sanitized — no UB, output stays bou
         rt_graph_add_node(g, 0, 15);                  // PulseOsc
         rt_graph_set_control(g, 0, 0, 440.0f);
         rt_graph_set_control(g, 0, 1, 0.0f);
-        rt_graph_set_control(g, 0, 2, bad_w);         // pathological
+        rt_graph_set_control(g, 0, 2, bad_w);         // invalid width
 
         rt_graph_add_node(g, 1, 2);
         rt_graph_set_control(g, 1, 0, 0.0f);
@@ -614,26 +610,22 @@ TEST_CASE("PulseOsc: pathological width is sanitized — no UB, output stays bou
         rt_graph_destroy(g);
     };
 
-    // Non-finite: NaN / +/-Inf would propagate through frac_to_phase.
+    // Non-finite values fall back to the square-wave default.
     run_with_bad_width(std::numeric_limits<double>::quiet_NaN());
     run_with_bad_width(std::numeric_limits<double>::infinity());
     run_with_bad_width(-std::numeric_limits<double>::infinity());
-    // Negative finite: trips the debug assert; in release wraps the
-    // float→uint32_t conversion.
+    // Negative values used to trip Q's debug assert.
     run_with_bad_width(-1.0);
     run_with_bad_width(-1000.0);
-    // Above 1: frac_to_phase clamps internally, but we still want
-    // bounded output in the kernel as a defence-in-depth check.
+    // Values above 1 clamp to the wide end of the pulse domain.
     run_with_bad_width(2.5);
     run_with_bad_width(1e9);
 }
 
-TEST_CASE("PulseOsc: pathological audio-rate width modulator is sanitized") {
-    // Same contract for the sample-accurate path: feed a SinOsc
-    // multiplied by a huge gain so the width input contains values
-    // far outside [0, 1] (and the BLEP can drive sub-sample-accurate
-    // values into NaN if multiplied with q::pulse_osc internals
-    // without sanitisation). Verifies the inner-loop sanitiser fires.
+TEST_CASE("PulseOsc clamps audio-rate width modulation") {
+    // Same contract for the sample-accurate path: an exaggerated LFO
+    // drives the width input far outside [0, 1], and the inner loop
+    // keeps every sample finite and bounded.
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
 
@@ -3509,6 +3501,166 @@ TEST_CASE("SinOsc edge frequencies stay finite") {
         for (auto s : samples) {
             CHECK(std::isfinite(s));
             CHECK(std::abs(s) <= 1.5f);
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Pathological-control sanitation across every parameter kernel
+// ----------------------------------------------------------------
+//
+// Single battery covering the canonical set of pathological control
+// values ({NaN, +Inf, -Inf, large finite} and where sensible {0,
+// negative}) for every kernel that has a non-trivial parameter
+// math path. Each subcase wires a fresh graph, drives the chosen
+// control with each pathological value, renders multiple blocks,
+// and asserts every output sample is finite and bounded.
+//
+// Rationale: q's primitives propagate NaN/Inf or assert/UB on
+// non-finite parameters (frac_to_phase, biquad config, q::duration).
+// The kernel boundary in rt_graph.cpp is where we stamp out the
+// whole class.
+
+namespace {
+constexpr double kPathNaN     = std::numeric_limits<double>::quiet_NaN();
+constexpr double kPathPosInf  = std::numeric_limits<double>::infinity();
+constexpr double kPathNegInf  = -std::numeric_limits<double>::infinity();
+
+void check_block_finite_bounded(const std::vector<float> &samples, float max_abs) {
+    for (auto s : samples) {
+        CHECK(std::isfinite(s));
+        CHECK(std::abs(s) <= max_abs);
+    }
+}
+
+// Battery of pathological doubles. NaN + non-finite is the load-
+// bearing class we just stamped out; >Nyquist / negative finite are
+// already exercised elsewhere but doubling-up is cheap and pins the
+// new sanitizer's "finite passes through" behaviour for those.
+const std::vector<double> kPathologicalParams = {
+    kPathNaN, kPathPosInf, kPathNegInf, -1e9, 1e9
+};
+} // namespace
+
+TEST_CASE("oscillator freq sanitized: SinOsc/SawOsc/PulseOsc/TriOsc accept any double on controls[0]") {
+    // Each oscillator kind, each pathological control[0] value.
+    // Output must be finite and bounded for every block.
+    const int osc_kinds[] = {1, 5, 15, 16}; // SinOsc, SawOsc, PulseOsc, TriOsc
+    for (int kind : osc_kinds) {
+        for (double bad : kPathologicalParams) {
+            CAPTURE(kind);
+            CAPTURE(bad);
+            auto *g = rt_graph_create(2, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, kind);
+            rt_graph_set_control(g, 0, 0, bad);   // freq
+            rt_graph_set_control(g, 0, 1, 0.0f);  // phase
+            if (kind == 15) {                     // PulseOsc has width
+                rt_graph_set_control(g, 0, 2, 0.5);
+            }
+            rt_graph_add_node(g, 1, 2);
+            rt_graph_set_control(g, 1, 0, 0.0f);
+            rt_graph_connect(g, 0, 0, 1, 0);
+            for (int b = 0; b < 4; ++b) {
+                auto samples = render_bus0(g, kFrames);
+                check_block_finite_bounded(samples, 4.0f);
+            }
+            rt_graph_destroy(g);
+        }
+    }
+}
+
+TEST_CASE("biquad freq sanitized: LPF/HPF/BPF/Notch accept any double on cutoff/q") {
+    // Drive a 440 Hz sine through the filter; sweep one control at
+    // a time through the pathological set. Both freq (control 0)
+    // and q (control 1) must be sanitized -- non-finite freq -> NaN
+    // coefficients, q ~= 0 -> divide-by-zero.
+    const int biquad_kinds[] = {7, 17, 18, 19}; // LPF, HPF, BPF, Notch
+    for (int kind : biquad_kinds) {
+        for (double bad : kPathologicalParams) {
+            for (int which_ctl : {0, 1}) {        // freq or q
+                CAPTURE(kind);
+                CAPTURE(bad);
+                CAPTURE(which_ctl);
+                auto *g = rt_graph_create(4, kFrames);
+                REQUIRE(g != nullptr);
+                rt_graph_add_node(g, 0, 1);                 // SinOsc src
+                rt_graph_set_control(g, 0, 0, 440.0f);
+                rt_graph_add_node(g, 1, kind);              // filter
+                rt_graph_set_control(g, 1, 0, 1000.0);      // freq
+                rt_graph_set_control(g, 1, 1, 0.707);       // q
+                rt_graph_set_control(g, 1, which_ctl, bad); // pathological
+                rt_graph_add_node(g, 2, 2);
+                rt_graph_set_control(g, 2, 0, 0.0f);
+                rt_graph_connect(g, 0, 0, 1, 0);
+                rt_graph_connect(g, 1, 0, 2, 0);
+                for (int b = 0; b < 4; ++b) {
+                    auto samples = render_bus0(g, kFrames);
+                    check_block_finite_bounded(samples, 8.0f);
+                }
+                rt_graph_destroy(g);
+            }
+        }
+    }
+}
+
+TEST_CASE("Env A/D/S/R sanitized: pathological ramp params still produce a bounded envelope") {
+    // Env has 5 controls: gate_default, A, D, S, R. Drive each of
+    // A/D/R/S in turn with each pathological value and ensure the
+    // generated envelope stays finite + bounded.
+    for (double bad : kPathologicalParams) {
+        for (int which_ctl : {1, 2, 3, 4}) {  // skip 0 (gate)
+            CAPTURE(bad);
+            CAPTURE(which_ctl);
+            auto *g = rt_graph_create(2, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, 9);                       // Env
+            rt_graph_set_control(g, 0, 0, 1.0);               // gate held
+            rt_graph_set_control(g, 0, 1, 0.005);             // A
+            rt_graph_set_control(g, 0, 2, 0.05);              // D
+            rt_graph_set_control(g, 0, 3, 0.5);               // S
+            rt_graph_set_control(g, 0, 4, 0.1);               // R
+            rt_graph_set_control(g, 0, which_ctl, bad);       // pathological
+            rt_graph_add_node(g, 1, 2);
+            rt_graph_set_control(g, 1, 0, 0.0f);
+            rt_graph_connect(g, 0, 0, 1, 0);
+            for (int b = 0; b < 4; ++b) {
+                auto samples = render_bus0(g, kFrames);
+                // Env amplitude is in [0, 1] in steady state; allow
+                // slack for ramp transients.
+                check_block_finite_bounded(samples, 2.0f);
+            }
+            rt_graph_destroy(g);
+        }
+    }
+}
+
+TEST_CASE("Delay max_time + time sanitized: pathological values stay finite + bounded") {
+    // Delay has controls[0]=max_time, controls[1]=delay_time. The
+    // ring buffer is sized from max_time at first process(), so a
+    // non-finite max_time would crash q::delay's ctor; non-finite
+    // delay_time would index the buffer with NaN.
+    for (double bad : kPathologicalParams) {
+        for (int which_ctl : {0, 1}) {  // max_time or delay_time
+            CAPTURE(bad);
+            CAPTURE(which_ctl);
+            auto *g = rt_graph_create(4, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, 1);                 // SinOsc src
+            rt_graph_set_control(g, 0, 0, 440.0f);
+            rt_graph_add_node(g, 1, 13);                // Delay
+            rt_graph_set_control(g, 1, 0, 0.05);        // max_time
+            rt_graph_set_control(g, 1, 1, 0.01);        // delay_time
+            rt_graph_set_control(g, 1, which_ctl, bad); // pathological
+            rt_graph_add_node(g, 2, 2);
+            rt_graph_set_control(g, 2, 0, 0.0f);
+            rt_graph_connect(g, 0, 0, 1, 0);
+            rt_graph_connect(g, 1, 0, 2, 0);
+            for (int b = 0; b < 4; ++b) {
+                auto samples = render_bus0(g, kFrames);
+                check_block_finite_bounded(samples, 4.0f);
+            }
+            rt_graph_destroy(g);
         }
     }
 }

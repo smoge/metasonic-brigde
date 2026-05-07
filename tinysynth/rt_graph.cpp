@@ -73,6 +73,57 @@ namespace {
 // TODO: make this configurable
 constexpr float kDefaultSampleRate = 48000.0f;
 
+/* Note [Pathological-input sanitation]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Several Q primitives have undefined behaviour on non-finite inputs:
+
+  * q::phase::phase(frequency, sps) computes (2^31 * freq) / sps and
+    stores the double as a uint32_t. NaN/Inf -> impl-defined / unspec.
+  * q::frac_to_phase(frac) asserts frac >= 0.0 (debug) and converts a
+    NaN/negative product to uint32_t (release). Either way, broken.
+  * q::biquad::config computes omega = 2π·f/sps and alpha = sin(ω)/(2Q),
+    so q=0 -> div by 0; non-finite f -> NaN coefficients -> NaN output.
+  * q::adsr_envelope_gen::attack_rate(duration{t}) with t<=0 or
+    non-finite produces unstable ramp slopes.
+  * q::delay's fractional read assumes the index is finite and
+    in-range; NaN survives std::clamp (NaN comparisons are always
+    false), so the buffer math then dereferences with NaN.
+
+These helpers stamp out the entire class of bug at the kernel
+boundary. Each call site picks a sensible domain ([lo, hi]) and a
+fallback for non-finite. The fallback is the value the kernel would
+use if the parameter were absent ("kindSpec default" or the q
+default), so a non-finite spike never aliases into a different
+musical meaning than "no parameter writeable here right now."
+*/
+
+template <typename T>
+static inline T sanitize_finite(T v, T fallback) noexcept {
+  return std::isfinite(v) ? v : fallback;
+}
+
+template <typename T>
+static inline T sanitize_finite_clamp(T v, T lo, T hi, T fallback) noexcept {
+  return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+}
+
+// Domain bounds. Centralised so a future policy change touches one place.
+constexpr double kFreqFallbackHz   = 440.0;
+constexpr double kQMin             = 0.05;
+constexpr double kQMax             = 100.0;
+constexpr double kQFallback        = 0.707;
+constexpr double kEnvTimeMin       = 0.0001;   // 0.1 ms
+constexpr double kEnvTimeMax       = 60.0;     // 1 minute
+constexpr double kEnvTimeFallback  = 0.01;     // 10 ms
+constexpr double kEnvSustainMin    = 0.0;
+constexpr double kEnvSustainMax    = 1.0;
+constexpr double kEnvSustainFallback = 0.0;
+constexpr double kDelayTimeMin     = 0.0;      // 0 = read freshly-pushed sample
+constexpr double kDelayMaxTimeMin  = 0.0001;   // ring buffer needs >=1 sample
+constexpr double kDelayMaxTimeMax  = 60.0;
+constexpr double kDelayMaxFallback = 0.2;
+
 // §2.E: release-then-free silence detection.
 // kReleaseSilenceThreshold is the absolute peak below which a single
 // block is considered "silent" for the purposes of auto-freeing a
@@ -1660,15 +1711,19 @@ static void process_sinosc(const RTGraph &g, GraphInstance &inst,
 
   if (!freq_in.empty()) {
     // Sample-accurate FM: update the phase increment per sample.
+    // Sanitize NaN/Inf -> 0 Hz (DC); finite negative + above-Nyquist
+    // pass through unchanged — they have documented behaviour
+    // (existing tests pin negative-freq oscillation and above-Nyquist
+    // aliasing). See Note [Pathological-input sanitation].
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
-      osc->phase_iter.set(
-          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
+      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
       out[fi] = q::sin(osc->phase_iter++);
     }
   } else {
     // Constant frequency: set the increment once per block.
-    const double freq = node.controls[0];
+    const double freq = sanitize_finite(node.controls[0], 0.0);
     osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       out[static_cast<std::size_t>(i)] = q::sin(osc->phase_iter++);
@@ -1706,16 +1761,17 @@ static void process_sawosc(const RTGraph &g, GraphInstance &inst,
   }
 
   if (!freq_in.empty()) {
-    // Sample-accurate FM: update the phase increment per sample.
+    // Sample-accurate FM. Sanitize per sample; see process_sinosc for
+    // the policy rationale.
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
-      osc->phase_iter.set(
-          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
+      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
       out[fi] = q::saw(osc->phase_iter++);
     }
   } else {
     // Constant frequency: set the increment once per block.
-    const double freq = node.controls[0];
+    const double freq = sanitize_finite(node.controls[0], 0.0);
     osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       out[static_cast<std::size_t>(i)] = q::saw(osc->phase_iter++);
@@ -1740,15 +1796,11 @@ follows the new shift on the next sample, so width modulation is
 glitch-free as long as the modulator stays within [0, 1].
 */
 
-// Sanitize a width sample before handing it to q::pulse_osc::width().
-// q::frac_to_phase asserts (debug) on negative input, and on
-// non-finite input would multiply by NaN/Inf and convert the result
-// to uint32_t — undefined per the C++ standard. Clamp finite values
-// to [0, 1] and substitute the kindSpec default (0.5 = square) for
-// NaN / +/-Inf. Width 1.0 is handled internally by frac_to_phase
-// (returns phase::end), so [0, 1] is the safe domain.
+// Keep q::pulse_osc in its valid width domain. Q stores width as a
+// fractional phase threshold, so clean the value before it reaches
+// osc.width().
 static inline float sanitize_pulse_width(float w) noexcept {
-  return std::isfinite(w) ? std::clamp(w, 0.0f, 1.0f) : 0.5f;
+  return sanitize_finite_clamp(w, 0.0f, 1.0f, 0.5f);
 }
 
 static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
@@ -1767,9 +1819,8 @@ static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
 
   // Width: sample-accurate modulation when port 2 is wired; otherwise
   // memoize against last_width and update once per block on change.
-  // Block-rate path: sanitize the *raw* control value before
-  // comparing against last_width so a single non-finite write
-  // doesn't lock the memo into a poison state.
+  // Sanitize before the memo check so a bad control write cannot
+  // stick in last_width.
   if (width_in.empty()) {
     const float w = sanitize_pulse_width(static_cast<float>(node.controls[2]));
     if (w != st->last_width) {
@@ -1780,10 +1831,11 @@ static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
 
   if (!freq_in.empty()) {
     // Sample-accurate FM (and PWM, if width_in is also wired).
+    // Sanitize freq same as SinOsc/SawOsc.
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
-      st->phase_iter.set(
-          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
+      st->phase_iter.set(q::frequency{freq}, g.sample_rate);
       if (!width_in.empty()) {
         st->osc.width(sanitize_pulse_width(width_in[fi]));
       }
@@ -1792,7 +1844,7 @@ static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
   } else {
     // Constant frequency: set the increment once per block. Width
     // may still be sample-accurate.
-    const double freq = node.controls[0];
+    const double freq = sanitize_finite(node.controls[0], 0.0);
     st->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
@@ -1865,8 +1917,17 @@ static void process_lpf(const RTGraph &g, GraphInstance &inst,
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
   const auto q_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
 
-  const double freq = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
-  const double q_val = !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1];
+  // Sanitize freq + q before they cross into the biquad's coefficient
+  // math (omega = 2π·f/sps; alpha = sin(ω)/(2Q)). Non-finite freq ->
+  // NaN coefficients; q near 0 -> divide-by-zero. See
+  // Note [Pathological-input sanitation].
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double freq = sanitize_finite_clamp(
+      !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double q_val = sanitize_finite_clamp(
+      !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
+      kQMin, kQMax, kQFallback);
 
   auto *lpf = std::get_if<LPFState>(&node.state);
   assert(lpf && "LPF node has non-LPF state");
@@ -1903,13 +1964,11 @@ q::biquad alternative:
           is roughly Q-independent, the musical / wah variant).
   * Notch uses q::notch (band-reject).
 
-Cutoff and q are block-rate, not sample-accurate: the kernel samples
-freq_in[0] / q_in[0] once per block. An upstream Smooth softens
-block-to-block jumps in the cutoff trajectory (a CC value that
-updates once per block, for example) but is itself only observed at
-sample 0 of each block, so it doesn't give within-block sweeps. True
-sample-accurate filter FM would need a per-sample biquad reconfigure
-loop here, which doesn't exist today.
+Cutoff and q are read once at the start of each block. An upstream
+Smooth can turn control jumps into block-to-block glides, but this
+kernel still observes only one cutoff value per block. True
+within-block filter sweeps would need a sample-accurate biquad update
+path.
 */
 
 static void process_hpf(const RTGraph &g, GraphInstance &inst,
@@ -1923,8 +1982,15 @@ static void process_hpf(const RTGraph &g, GraphInstance &inst,
   }
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
   const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
-  const double freq  = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
-  const double q_val = !q_in.empty()    ? static_cast<double>(q_in[0])    : node.controls[1];
+  // Sanitize freq + q -- see process_lpf comment + Note
+  // [Pathological-input sanitation].
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double freq = sanitize_finite_clamp(
+      !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double q_val = sanitize_finite_clamp(
+      !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
+      kQMin, kQMax, kQFallback);
 
   auto *st = std::get_if<HPFState>(&node.state);
   assert(st && "HPF node has non-HPF state");
@@ -1954,8 +2020,15 @@ static void process_bpf(const RTGraph &g, GraphInstance &inst,
   }
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
   const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
-  const double freq  = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
-  const double q_val = !q_in.empty()    ? static_cast<double>(q_in[0])    : node.controls[1];
+  // Sanitize freq + q -- see process_lpf comment + Note
+  // [Pathological-input sanitation].
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double freq = sanitize_finite_clamp(
+      !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double q_val = sanitize_finite_clamp(
+      !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
+      kQMin, kQMax, kQFallback);
 
   auto *st = std::get_if<BPFState>(&node.state);
   assert(st && "BPF node has non-BPF state");
@@ -1985,8 +2058,15 @@ static void process_notch(const RTGraph &g, GraphInstance &inst,
   }
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
   const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
-  const double freq  = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
-  const double q_val = !q_in.empty()    ? static_cast<double>(q_in[0])    : node.controls[1];
+  // Sanitize freq + q -- see process_lpf comment + Note
+  // [Pathological-input sanitation].
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double freq = sanitize_finite_clamp(
+      !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double q_val = sanitize_finite_clamp(
+      !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
+      kQMin, kQMax, kQFallback);
 
   auto *st = std::get_if<NotchState>(&node.state);
   assert(st && "Notch node has non-Notch state");
@@ -2027,14 +2107,15 @@ static void process_triosc(const RTGraph &g, GraphInstance &inst,
   }
 
   if (!freq_in.empty()) {
+    // Sample-accurate FM. Sanitize per sample, see process_sinosc.
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
-      osc->phase_iter.set(
-          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
+      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
       out[fi] = q::triangle(osc->phase_iter++);
     }
   } else {
-    const double freq = node.controls[0];
+    const double freq = sanitize_finite(node.controls[0], 0.0);
     osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
       out[static_cast<std::size_t>(i)] = q::triangle(osc->phase_iter++);
@@ -2141,10 +2222,18 @@ static void process_env(const RTGraph &g, GraphInstance &inst,
 
   const auto gate_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
   const float gate_default = static_cast<float>(node.controls[0]);
-  const double a_sec = node.controls[1];
-  const double d_sec = node.controls[2];
-  const double s_lin = node.controls[3];
-  const double r_sec = node.controls[4];
+  // A/D/R must be > 0 — q::duration{t} with t<=0 or non-finite yields
+  // unstable ramp slopes that propagate NaN through the envelope's
+  // segment outputs. Clamp to a musically sensible range with a
+  // safe fallback. See Note [Pathological-input sanitation].
+  const double a_sec = sanitize_finite_clamp(
+      node.controls[1], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
+  const double d_sec = sanitize_finite_clamp(
+      node.controls[2], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
+  const double s_lin = sanitize_finite_clamp(
+      node.controls[3], kEnvSustainMin, kEnvSustainMax, kEnvSustainFallback);
+  const double r_sec = sanitize_finite_clamp(
+      node.controls[4], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
 
   // (Re)build the envelope_gen against the active sample rate on first
   // call or after a sample-rate change.
@@ -2393,7 +2482,12 @@ static void process_delay(const RTGraph &g, GraphInstance &inst,
   }
 
   // controls[0] = max_time_s, controls[1] = delay_time_s default.
-  const double max_time = node.controls[0];
+  // Sanitize max_time before it sizes the ring buffer — q::delay's
+  // constructor does ceil(max_time * sps) samples; a non-finite or
+  // negative value would crash the allocation. See
+  // Note [Pathological-input sanitation].
+  const double max_time = sanitize_finite_clamp(
+      node.controls[0], kDelayMaxTimeMin, kDelayMaxTimeMax, kDelayMaxFallback);
 
   // (Re)build the ring buffer on first call or after a sample-rate /
   // max-time change. q::delay's constructor sizes the buffer to
@@ -2412,17 +2506,22 @@ static void process_delay(const RTGraph &g, GraphInstance &inst,
   const float max_idx = std::max(0.0f, buf_size - 1.0f);
 
   if (!time_in.empty()) {
-    // Sample-accurate delay-time modulation.
+    // Sample-accurate delay-time modulation. Sanitize before the
+    // existing clamp: NaN survives std::clamp (NaN comparisons are
+    // always false) and would then index the buffer with NaN.
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
+      const float t_in = sanitize_finite(time_in[fi], 0.0f);
       const float t_samples = std::clamp(
-        static_cast<float>(time_in[fi]) * g.sample_rate, 0.0f, max_idx);
+        t_in * g.sample_rate, 0.0f, max_idx);
       out[fi] = (*st->line)(sig_in[fi], t_samples);
     }
   } else {
     // Constant delay time from the control default.
+    const float t_in = sanitize_finite(
+        static_cast<float>(node.controls[1]), 0.0f);
     const float t_samples = std::clamp(
-      static_cast<float>(node.controls[1]) * g.sample_rate, 0.0f, max_idx);
+      t_in * g.sample_rate, 0.0f, max_idx);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       out[fi] = (*st->line)(sig_in[fi], t_samples);
