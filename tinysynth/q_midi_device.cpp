@@ -24,7 +24,25 @@
 // q::midi_input_stream(device), trigger Pm_OpenInput failure on the
 // gone hardware, and the resulting _impl == nullptr would later
 // crash in the (also-patched) ~midi_input_stream Pm_Close call.
-// Switching to a local std::vector clears that whole chain.
+//
+// We keep `devices` static but clear() it at the top of every call,
+// then reserve() and repopulate. We can NOT switch to a local vector
+// because midi_device stores `impl const& _impl` (header line ~35),
+// not by value -- a local accumulator dies on return and leaves
+// every returned midi_device with a dangling reference.
+//
+// CONTRACT CHANGE: a midi_device instance retained across two list()
+// calls becomes invalidated by the second call's clear() +
+// push_back(). Callers (including rt_midi_demo) must use the
+// returned vector before the next list() call. The original
+// buggy Q version silently kept stale entries valid; that
+// behaviour was load-bearing for *no one*, since stale entries
+// crash the stream constructor for any device that was actually
+// removed.
+//
+// The cleaner fix would be patching the vendor header to make
+// midi_device own impl by value -- deferred since it widens the
+// blast radius to every Q consumer.
 //
 // Upstream copyright preserved verbatim:
 
@@ -98,14 +116,16 @@ namespace cycfi::q
       // Make sure we're initialized
       detail::portmidi_init();
 
+      // PATCH: keep the accumulator static because midi_device stores
+      // `impl const&`, but clear it on every call so stale / duplicate
+      // entries cannot survive from an earlier enumeration.
+      static std::vector<midi_device::impl> devices;
+      devices.clear();
+
       int num_devices = Pm_CountDevices();
       if (num_devices < 0)
          return {};
 
-      // PATCH: local (non-static) accumulator. The upstream version
-      // declared this `static` and never cleared it; see the file
-      // header for why that's a load-bearing bug for our use.
-      std::vector<midi_device::impl> devices;
       devices.reserve(static_cast<std::size_t>(num_devices));
       PmDeviceInfo const* info;
       for (auto i = 0; i < num_devices; ++i)
