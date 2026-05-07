@@ -232,6 +232,52 @@ void rt_graph_template_connect_fused_scale_chain_input(
     const int *scale_nodes,
     const int *scale_controls);
 
+// [T:construction] Phase 4.C.2: wire one input port through an
+// affine chain — a run of scalar Gain (multiply) and scalar Add
+// (bias) operations applied in source-to-sink order. Generalises
+// rt_graph_template_connect_fused_scale_input and the chain entry:
+// every fused input that contains at least one bias step takes
+// this entry; pure-scale chains stay on the older entries to keep
+// existing callers and tests bit-identical.
+//
+//   step_kinds[k]:    0 = Scale (multiply), 1 = Bias (add)
+//   step_nodes[k]:    NodeIndex of the elided producer (kept
+//                     addressable for set_control / realtime
+//                     control writes)
+//   step_controls[k]: control slot on that node — 0 for Gain;
+//                     0 or 1 for Add, depending on which port
+//                     held the bias literal.
+//
+// Per-block resolver materialises:
+//
+//   scratch[i] = src[i]
+//   for k in 0 .. step_count-1:
+//     v = sanitize_finite(static_cast<float>(step_nodes[k]
+//                          .controls[step_controls[k]]),
+//                         step_kinds[k] == 0 ? 1.0f : 0.0f)
+//     if step_kinds[k] == 0: for i in 0..nframes-1: scratch[i] *= v
+//     if step_kinds[k] == 1: for i in 0..nframes-1: scratch[i] += v
+//
+// Float arithmetic is non-associative so step order is preserved;
+// scales are *not* pre-multiplied and biases are *not* pre-summed.
+// Each control is read live every block, so set_control on any
+// elided Gain or Add still drives the consumer's input.
+//
+// Validation: every step (kind ∈ {0,1}, node + control range) is
+// checked before the scratch slot is claimed. Any failure or null
+// arrays / zero count is a silent no-op. step_count must be ≥ 1.
+// One scratch slot per fused input regardless of chain length.
+// Construction-only; walks every live instance to grow scratch in
+// lockstep, mirroring the parallel-growth contract.
+void rt_graph_template_connect_fused_affine_input(
+    RTGraph *g, int template_id,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int step_count,
+    const int *step_kinds,
+    const int *step_nodes,
+    const int *step_controls);
+
 // [T:construction] Add one region to the named template's MetaDef.
 // Regions are an execution-order overlay on the template's node array;
 // process_instance iterates them as the unit of dispatch when the

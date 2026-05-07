@@ -305,6 +305,17 @@ fmtRtInput (RFused (FScaleChainFrom s (PortIndex p) scales)) =
   where
     fmtScale (ScaleRef g (ControlIndex c)) =
       " × [" <> showNodeIndex g <> "].c[" <> show c <> "]"
+fmtRtInput (RFused (FAffineFrom s (PortIndex p) steps)) =
+  -- 4.C.2 affine fusion: same source, but each step is either a
+  -- multiply (× from an elided Gain) or an add (+ from an elided
+  -- Add), in source-to-sink order.
+  "[" <> showNodeIndex s <> "]:" <> show p
+    <> concatMap fmtStep steps
+  where
+    fmtStep (AffScale n (ControlIndex c)) =
+      " × [" <> showNodeIndex n <> "].c[" <> show c <> "]"
+    fmtStep (AffBias n (ControlIndex c)) =
+      " + [" <> showNodeIndex n <> "].c[" <> show c <> "]"
 
 drawDetailPanel :: AppState -> Widget Name
 drawDetailPanel st =

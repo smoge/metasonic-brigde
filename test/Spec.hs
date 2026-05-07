@@ -1288,6 +1288,173 @@ unitTests = testGroup "Unit tests"
             Right rg ->
               fuseRuntimeGraph (fuseRuntimeGraph rg) @?= fuseRuntimeGraph rg
 
+      , -- Phase 4.C.2: a single scalar Add with a constant bias on
+        -- port 1 elides the Add and rewrites Out's input to
+        -- 'FAffineFrom' with one 'AffBias' step. The pure-scale
+        -- 'FScaleFrom' / 'FScaleChainFrom' shapes are reserved for
+        -- chains that are entirely Gains, so any presence of a bias
+        -- step lands in 'FAffineFrom'.
+        testCase "fuseRuntimeGraph: scalar Add (bias on port 1) fuses into FAffineFrom" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                b <- add o (Param 0.1)   -- bias on port 1
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  sinNode = head [n | n <- nodes, rnKind n == KSinOsc]
+                  addNode = head [n | n <- nodes, rnKind n == KAdd]
+                  outNode = head [n | n <- nodes, rnKind n == KOut]
+              rnElided addNode @?= True
+              rnInputs outNode @?=
+                [ RFused (FAffineFrom (rnIndex sinNode) (PortIndex 0)
+                            [ AffBias (rnIndex addNode) (ControlIndex 1) ])
+                ]
+
+      , -- Bias on port 0: 'add (Param 0.1) signal' lowers to
+        -- @rnInputs == [RConst 0.1, RFrom signal 0]@, signal port
+        -- is 1, bias control slot is 0. The candidate predicate
+        -- accepts both shapes; the AffBias must record control 0
+        -- in this case so the runtime reads the right slot.
+        testCase "fuseRuntimeGraph: scalar Add (bias on port 0) fuses with control 0" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                b <- add (Param 0.1) o   -- bias on port 0
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  sinNode = head [n | n <- nodes, rnKind n == KSinOsc]
+                  addNode = head [n | n <- nodes, rnKind n == KAdd]
+                  outNode = head [n | n <- nodes, rnKind n == KOut]
+              rnElided addNode @?= True
+              -- Source signal port from the Add's input[1]; bias
+              -- control is slot 0 (where the Param literal landed).
+              rnInputs outNode @?=
+                [ RFused (FAffineFrom (rnIndex sinNode) (PortIndex 0)
+                            [ AffBias (rnIndex addNode) (ControlIndex 0) ])
+                ]
+
+      , -- Audio-rate Add (signal + signal) is not a candidate. The
+        -- gate enforces "exactly one signal input, the other slot a
+        -- constant"; @add c m@ with both audio sources fails it,
+        -- exactly like audio-modulated Gain stays dispatched.
+        testCase "fuseRuntimeGraph: audio-rate Add stays dispatched" $ do
+          let g = runSynth $ do
+                c <- sinOsc 440.0 0.0
+                m <- sinOsc  73.0 0.0
+                s <- add c m            -- audio + audio: not fusable
+                out 0 s
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  addNode = head [n | n <- nodes, rnKind n == KAdd]
+              rnElided addNode @?= False
+              -- No RFused inputs introduced.
+              null [() | n <- nodes, RFused _ <- rnInputs n] @?= True
+
+      , -- Composition order 1: SinOsc → Gain(k) → Add(b) → Out
+        -- collapses both into one FAffineFrom with [AffScale k,
+        -- AffBias b] in source-to-sink order. The resolver applies
+        -- src*k first, then +b, mirroring the unfused kernel chain.
+        testCase "fuseRuntimeGraph: Gain → Add composes into AffineFrom [scale, bias]" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                b <- add  a (Param 0.1)
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  sinNode  = head [n | n <- nodes, rnKind n == KSinOsc]
+                  gainNode = head [n | n <- nodes, rnKind n == KGain]
+                  addNode  = head [n | n <- nodes, rnKind n == KAdd]
+                  outNode  = head [n | n <- nodes, rnKind n == KOut]
+              rnElided gainNode @?= True
+              rnElided addNode  @?= True
+              rnInputs outNode @?=
+                [ RFused (FAffineFrom (rnIndex sinNode) (PortIndex 0)
+                            [ AffScale (rnIndex gainNode) (ControlIndex 0)
+                            , AffBias  (rnIndex addNode)  (ControlIndex 1)
+                            ])
+                ]
+
+      , -- Composition order 2: SinOsc → Add(b) → Gain(k) → Out
+        -- collapses to FAffineFrom [AffBias b, AffScale k]. The
+        -- resolver applies +b first, then *k, matching the unfused
+        -- chain's float arithmetic. Pinning both orderings catches
+        -- any "scales always come before biases" sorting bug.
+        testCase "fuseRuntimeGraph: Add → Gain composes into AffineFrom [bias, scale]" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                b <- add  o (Param 0.1)
+                a <- gain b (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  sinNode  = head [n | n <- nodes, rnKind n == KSinOsc]
+                  gainNode = head [n | n <- nodes, rnKind n == KGain]
+                  addNode  = head [n | n <- nodes, rnKind n == KAdd]
+                  outNode  = head [n | n <- nodes, rnKind n == KOut]
+              rnElided gainNode @?= True
+              rnElided addNode  @?= True
+              rnInputs outNode @?=
+                [ RFused (FAffineFrom (rnIndex sinNode) (PortIndex 0)
+                            [ AffBias  (rnIndex addNode)  (ControlIndex 1)
+                            , AffScale (rnIndex gainNode) (ControlIndex 0)
+                            ])
+                ]
+
+      , -- Mid-chain multi-consumer Add: an Add in the middle of
+        -- what would be a chain fails gate 3 (rnConsumerCount > 1)
+        -- and stays dispatched. The downstream chain segments still
+        -- fuse independently.
+        testCase "fuseRuntimeGraph: chain stops at multi-consumer mid-chain Add" $ do
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                b  <- add o (Param 0.1)        -- shared by both branches
+                g1 <- gain b (Param 0.5)
+                g2 <- gain b (Param 0.25)
+                out 0 g1
+                out 1 g2
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  addNode = head [n | n <- nodes, rnKind n == KAdd]
+              -- Add stays dispatched (consumer count 2).
+              rnElided addNode @?= False
+              -- Both Gains elided; both Outs read through FScaleFrom
+              -- (length-1 scale-only chain stops at the dispatched Add).
+              let gains = [n | n <- nodes, rnKind n == KGain]
+              length [() | n <- gains, rnElided n] @?= 2
+              let outs = [n | n <- nodes, rnKind n == KOut]
+                  isFScaleFrom (RFused FScaleFrom{}) = True
+                  isFScaleFrom _                      = False
+              all isFScaleFrom (concatMap rnInputs outs) @?= True
+
+      , -- Affine idempotence: a second pass over an already-fused
+        -- mixed Gain/Add chain must be a no-op. Same gate-9 check
+        -- as the chain-idempotence pin from §4.C.1, but on a chain
+        -- that exercises the FAffineFrom path.
+        testCase "fuseRuntimeGraph is idempotent on affine chains" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                b <- add  a (Param 0.1)
+                k <- gain b (Param 0.25)
+                out 0 k
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              fuseRuntimeGraph (fuseRuntimeGraph rg) @?= fuseRuntimeGraph rg
+
       , -- Step C precondition: pin Gain's compiled shape so the
         -- single-edge fusion rewrite has something stable to match
         -- against. For 'gain o (Param k)':
@@ -2319,6 +2486,85 @@ crossCuttingTests = testGroup "End-to-end FFI"
       assertBool ("expected peak ≈ 0.42 after chain set_control, got " <> show peak)
                  (peak > 0.36 && peak < 0.48)
 
+  , -- Phase 4.C.2: control identity on a mixed Gain/Add chain. With
+    -- both nodes elided into one FAffineFrom on Out's input, live
+    -- set_control on the Gain's scale AND on the Add's bias must
+    -- steer the fused output exactly as the unfused chain. This
+    -- pins (a) that the affine resolver reads each step's control
+    -- live every block and (b) that the bias control slot (1 in
+    -- this test) is wired correctly from the Haskell IR through to
+    -- the FFI marshalling and the C++ resolver.
+    testCase "Phase 4.C.2: set_control on elided Gain and Add in a mixed chain matches unfused" $ do
+      let nframes = 256
+          chain = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            a <- gain o (Param 0.5)
+            b <- add  a (Param 0.1)
+            out 0 b
+          newGain = 0.7  :: Double
+          newBias = 0.05 :: Double
+
+      rtUn <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- Sanity: the fused compile actually emitted FAffineFrom (not
+      -- two separate fused inputs). Regression catch if the affine
+      -- composition rule ever changes shape.
+      assertBool "expected FAffineFrom on Out's input"
+        (not (null
+          [ ()
+          | n <- rgNodes rtF
+          , rnKind n == KOut
+          , RFused FAffineFrom{} <- rnInputs n
+          ]))
+
+      let gainIxOf rg =
+            case [rnIndex n | n <- rgNodes rg, rnKind n == KGain] of
+              [NodeIndex i] -> i
+              other -> error $ "expected one Gain, got " <> show other
+          addIxOf rg =
+            case [rnIndex n | n <- rgNodes rg, rnKind n == KAdd] of
+              [NodeIndex i] -> i
+              other -> error $ "expected one Add, got " <> show other
+      gainIxOf rtUn @?= gainIxOf rtF
+      addIxOf  rtUn @?= addIxOf  rtF
+      let gainIx = gainIxOf rtF
+          addIx  = addIxOf  rtF
+
+      let renderWith loader rt = withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+            loader handle rt
+            -- Mutate the Gain's scale (slot 0) and the Add's bias
+            -- (slot 1, since 'add a (Param k)' lowers with the bias
+            -- on port 1 → control 1). Both must take effect through
+            -- the affine resolver every block.
+            c_rt_graph_instance_set_control handle 0
+              (fromIntegral gainIx) 0 (CDouble newGain)
+            c_rt_graph_instance_set_control handle 0
+              (fromIntegral addIx)  1 (CDouble newBias)
+            c_rt_graph_process handle (fromIntegral nframes)
+            allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+              _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                       (castPtr buf)
+              cs <- peekArray nframes (buf :: PtrCFloat)
+              pure (map (\(CFloat x) -> x) cs)
+
+      unfusedSamples <- renderWith loadRuntimeGraph      rtUn
+      fusedSamples   <- renderWith loadRuntimeGraphFused rtF
+
+      length unfusedSamples @?= length fusedSamples
+      assertBool "affine fused/unfused samples differ after live set_control on Gain + Add"
+        (unfusedSamples == fusedSamples)
+      -- Sanity: amplitude oscillates between 0.05 - 0.7 = -0.65 and
+      -- 0.05 + 0.7 = 0.75, so the peak magnitude should be ≈ 0.75
+      -- (the bias is constant DC, the sine oscillates around it).
+      let peak = maximum (map abs unfusedSamples)
+      assertBool ("expected peak ≈ 0.75 after set_control on scale+bias, got " <> show peak)
+                 (peak > 0.7 && peak < 0.78)
+
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
       -- read is gain-attenuated and sent to hardware bus 0. We then
@@ -2974,6 +3220,40 @@ fusedEquivalenceCases =
        a2 <- gain a1 (Param 0.25)
        a3 <- gain a2 (Param 0.125)
        out 0 a3)
+
+  -- Phase 4.C.2 affine cases. A single Add elides into FAffineFrom
+  -- [AffBias _ _]; mixed Gain/Add chains compose end-to-end through
+  -- one FAffineFrom on Out's input. The fused resolver applies each
+  -- step in source-to-sink order with the same NaN sanitisation as
+  -- the unfused kernels, so output must be bit-identical.
+  , ("scalar Add bias", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       b <- add o (Param 0.1)
+       out 0 b)
+
+  , ("Add (bias on port 0)", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       b <- add (Param 0.1) o
+       out 0 b)
+
+  , ("Gain → Add composition", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       a <- gain o (Param 0.5)
+       b <- add  a (Param 0.1)
+       out 0 b)
+
+  , ("Add → Gain composition", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       b <- add  o (Param 0.1)
+       a <- gain b (Param 0.5)
+       out 0 a)
+
+  , ("Gain → Add → Gain mixed chain", runSynth $ do
+       o  <- sinOsc 440.0 0.0
+       a1 <- gain o  (Param 0.5)
+       b  <- add  a1 (Param 0.1)
+       a2 <- gain b  (Param 0.25)
+       out 0 a2)
   ]
 
 -- | Render @graph@ through the unfused and fused loaders and assert

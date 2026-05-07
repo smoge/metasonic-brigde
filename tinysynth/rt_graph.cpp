@@ -438,38 +438,50 @@ struct InputRef {
   PortIndex src_port{};
 };
 
-// Step C (d): per-input override that turns a kernel's input read
-// into an inline scaled-source materialisation. When NodeSpec's
+// Step C: per-input override that turns a kernel's input read into
+// an inline affine-chain materialisation. When NodeSpec's
 // fused_inputs[port] holds one of these, resolve_input writes
-// scratch[i] = source.outputs[port][i] then folds in each scale
-// in source-to-sink order:
+// scratch[i] = source.outputs[port][i] then folds in each step
+// (scale or bias) in source-to-sink order:
 //
-//   for each (scale_node, scale_control) in scales:
-//     k = sanitize_finite(float(scale_node.controls[scale_control]), 1)
-//     for i in [0, nframes): scratch[i] *= k
+//   for each FusedAffineStep (kind, node, control) in steps:
+//     v = sanitize_finite(float(node.controls[control]),
+//                         kind == Scale ? 1.0f : 0.0f)
+//     if kind == Scale:  for i in [0, nframes): scratch[i] *= v
+//     if kind == Bias:   for i in [0, nframes): scratch[i] += v
 //
 // into the consuming GraphInstance's fused_scratch[scratch_slot]
-// and returns a span over it. Each scale's control is read live so
-// rt_graph_instance_set_control on any elided Gain still drives
-// the consumer's input. Scales are *not* pre-multiplied (float
-// multiplication is non-associative), so chained-fused output is
-// bit-identical to chained-unfused output.
+// and returns a span over it. Each control is read live so
+// rt_graph_instance_set_control on any elided Gain or Add still
+// drives the consumer's input. Scales are *not* pre-multiplied and
+// biases are *not* pre-summed (float arithmetic is non-associative),
+// so chained-fused output is bit-identical to chained-unfused
+// output.
 //
 // scratch_slot is dense across the template: every fused input
-// (single-scale or chain) claims one slot regardless of chain
-// length, sized to one max_frames buffer. See
-// rt_graph_template_connect_fused_scale_input (single scale) and
-// rt_graph_template_connect_fused_scale_chain_input (chain ≥ 1).
+// (single-scale, scale chain, or affine chain) claims one slot
+// regardless of length, sized to one max_frames buffer. See
+// rt_graph_template_connect_fused_scale_input (length-1 pure
+// scale), rt_graph_template_connect_fused_scale_chain_input (pure-
+// scale chain), and rt_graph_template_connect_fused_affine_input
+// (mixed scale/bias chain).
+struct FusedAffineStep {
+  enum class Kind : uint8_t { Scale = 0, Bias = 1 };
+  Kind kind = Kind::Scale;
+  NodeIndex node{};
+  ControlIndex control{};
+};
+
 struct FusedScaleRef {
   NodeIndex source_node{};
   PortIndex source_port{};
-  // Length ≥ 1. The single-scale ABI pushes one entry; the chain
-  // ABI pushes count entries. Resolver iterates in stored order
-  // (= source-to-sink). Stored inline as a small vector of pairs
-  // because the chain is read once per block per input, never on
-  // the inner sample loop, so heap traffic at chain construction
-  // does not affect realtime cost.
-  std::vector<std::pair<NodeIndex, ControlIndex>> scales;
+  // Length ≥ 1. The pure-scale ABIs push only Scale-kinded steps;
+  // the affine ABI pushes whatever mix is asked for. Resolver
+  // iterates in stored order (= source-to-sink). Stored inline as
+  // a small vector because the chain is read once per block per
+  // input, never on the inner sample loop, so heap traffic at
+  // chain construction does not affect realtime cost.
+  std::vector<FusedAffineStep> steps;
   int scratch_slot = -1;
 };
 
@@ -1657,7 +1669,7 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
       if (!valid(fr.source_node) || !valid(fr.source_port)) {
         return {};
       }
-      if (fr.scales.empty()) {
+      if (fr.steps.empty()) {
         return {};
       }
       const std::size_t src_index = to_size(fr.source_node);
@@ -1678,38 +1690,52 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
         return {};
       }
 
-      // Pre-validate every scale ref before writing the scratch:
-      // a single bad ref must not leave a partial materialisation
+      // Pre-validate every step before writing the scratch: a
+      // single bad ref must not leave a partial materialisation
       // visible to the consumer.
-      for (const auto &[scale_node, scale_control] : fr.scales) {
-        if (!valid(scale_node) || !valid(scale_control)) return {};
-        const std::size_t scale_idx = to_size(scale_node);
+      for (const auto &step : fr.steps) {
+        if (!valid(step.node) || !valid(step.control)) return {};
+        const std::size_t scale_idx = to_size(step.node);
         if (scale_idx >= inst.nodes.size()) return {};
-        const NodeInstanceState &scale = inst.nodes[scale_idx];
-        const std::size_t cidx = to_size(scale_control);
-        if (cidx >= scale.controls.size()) return {};
+        const NodeInstanceState &scale_or_bias = inst.nodes[scale_idx];
+        const std::size_t cidx = to_size(step.control);
+        if (cidx >= scale_or_bias.controls.size()) return {};
       }
 
-      // Materialise: scratch = src, then apply each scale in
+      // Materialise: scratch = src, then apply each step in
       // source-to-sink order. Same NaN discipline as
-      // process_gain's scalar branch — a NaN control falls back
-      // to unity so chained smoothing/IIR state downstream is
-      // never poisoned by a single bad write. Float multiplies
-      // are non-associative, so ordering matters: this loop
-      // produces ((src * k1) * k2) * … per sample, which is what
-      // chained process_gain kernels also produce.
+      // process_gain / process_add scalar branches — a NaN scale
+      // falls back to unity, a NaN bias falls back to zero, so
+      // chained smoothing/IIR state downstream is never poisoned
+      // by a single bad write. Float arithmetic is non-associative,
+      // so ordering matters: this loop produces (((src * k1) + b1)
+      // * k2) + … per sample, exactly what the chained kernels
+      // produce.
       const auto src_span = output_span(src, fr.source_port, nframes);
       for (int i = 0; i < nframes; ++i) {
         const std::size_t fi = static_cast<std::size_t>(i);
         scratch[fi] = src_span[fi];
       }
-      for (const auto &[scale_node, scale_control] : fr.scales) {
-        const NodeInstanceState &scale = inst.nodes[to_size(scale_node)];
-        const float scale_f = sanitize_finite(
-            static_cast<float>(scale.controls[to_size(scale_control)]), 1.0f);
-        for (int i = 0; i < nframes; ++i) {
-          const std::size_t fi = static_cast<std::size_t>(i);
-          scratch[fi] *= scale_f;
+      for (const auto &step : fr.steps) {
+        const NodeInstanceState &n = inst.nodes[to_size(step.node)];
+        const double raw = n.controls[to_size(step.control)];
+        switch (step.kind) {
+          case FusedAffineStep::Kind::Scale: {
+            const float k = sanitize_finite(static_cast<float>(raw), 1.0f);
+            for (int i = 0; i < nframes; ++i) {
+              const std::size_t fi = static_cast<std::size_t>(i);
+              scratch[fi] *= k;
+            }
+            break;
+          }
+          case FusedAffineStep::Kind::Bias: {
+            const float b = sanitize_finite(static_cast<float>(raw), 0.0f);
+            for (int i = 0; i < nframes; ++i) {
+              const std::size_t fi = static_cast<std::size_t>(i);
+              scratch[fi] += b;
+            }
+            break;
+          }
         }
       }
       return std::span<const float>(scratch.data(),
@@ -4094,8 +4120,10 @@ void rt_graph_template_connect_fused_scale_input(
   FusedScaleRef ref;
   ref.source_node  = NodeIndex{src_node};
   ref.source_port  = PortIndex{src_port};
-  ref.scales.emplace_back(NodeIndex{scale_node},
-                          ControlIndex{scale_control_index});
+  ref.steps.push_back(FusedAffineStep{
+      FusedAffineStep::Kind::Scale,
+      NodeIndex{scale_node},
+      ControlIndex{scale_control_index}});
   ref.scratch_slot = slot;
   dst_spec.fused_inputs[dport] = std::move(ref);
 
@@ -4117,7 +4145,7 @@ void rt_graph_template_connect_fused_scale_input(
 // would leak the slot and wedge fused_input_count above what the
 // resolver can actually use. One slot per fused input regardless of
 // chain length; per-block resolver folds the chain into the slot in
-// source-to-sink order. See FusedScaleRef::scales and resolve_input.
+// source-to-sink order. See FusedScaleRef::steps and resolve_input.
 void rt_graph_template_connect_fused_scale_chain_input(
     RTGraph *g, int template_id,
     int dst_node, int dst_port,
@@ -4175,10 +4203,101 @@ void rt_graph_template_connect_fused_scale_chain_input(
   FusedScaleRef ref;
   ref.source_node  = NodeIndex{src_node};
   ref.source_port  = PortIndex{src_port};
-  ref.scales.reserve(static_cast<std::size_t>(scale_count));
+  ref.steps.reserve(static_cast<std::size_t>(scale_count));
   for (int k = 0; k < scale_count; ++k) {
-    ref.scales.emplace_back(NodeIndex{scale_nodes[k]},
-                            ControlIndex{scale_controls[k]});
+    ref.steps.push_back(FusedAffineStep{
+        FusedAffineStep::Kind::Scale,
+        NodeIndex{scale_nodes[k]},
+        ControlIndex{scale_controls[k]}});
+  }
+  ref.scratch_slot = slot;
+  dst_spec.fused_inputs[dport] = std::move(ref);
+
+  for (auto &inst : g->instances) {
+    if (inst.template_id != template_id) continue;
+    if (inst.state.load() == SlotState::Available) continue;
+    ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
+  }
+}
+
+// Phase 4.C.2: wire one input port through an affine chain — a
+// run of scalar Gain (multiply by control) and scalar Add (bias by
+// control) operations, in source-to-sink order. Mirrors the chain-
+// scale entry but takes a per-step kind tag so heterogeneous Gain
+// + Add chains compose into one fused input.
+//
+//   step_kinds[k]:    0 = Scale, 1 = Bias
+//   step_nodes[k]:    NodeIndex of the elided producer
+//   step_controls[k]: control slot on that node (0 for Gain;
+//                     0 or 1 for Add depending on which port
+//                     held the bias)
+//
+// Validates every step ref before claiming a scratch slot so a
+// bad mid-chain entry never inflates fused_input_count past what
+// is actually wired. One slot per fused input regardless of length.
+void rt_graph_template_connect_fused_affine_input(
+    RTGraph *g, int template_id,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int step_count,
+    const int *step_kinds,
+    const int *step_nodes,
+    const int *step_controls
+) {
+  if (!g) return;
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+
+  if (step_count <= 0) return;
+  if (!step_kinds || !step_nodes || !step_controls) return;
+
+  if (dst_node < 0 || dst_port < 0 ||
+      src_node < 0 || src_port < 0) {
+    return;
+  }
+  const std::size_t didx = static_cast<std::size_t>(dst_node);
+  const std::size_t sidx = static_cast<std::size_t>(src_node);
+  if (didx >= def->nodes.size() || sidx >= def->nodes.size()) {
+    return;
+  }
+
+  NodeSpec &dst_spec = def->nodes[didx];
+  const std::size_t dport = static_cast<std::size_t>(dst_port);
+  if (dport >= dst_spec.fused_inputs.size()) return;
+
+  const NodeSpec &src_spec = def->nodes[sidx];
+  const int src_output_count =
+      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut)
+          ? 0 : 1;
+  if (src_port >= src_output_count) return;
+
+  // Pre-validate every step. Step kinds are restricted to the two
+  // declared ABI tags; a value outside that range is a contract
+  // violation and bails out before we claim a slot.
+  for (int k = 0; k < step_count; ++k) {
+    const int kind = step_kinds[k];
+    const int sn   = step_nodes[k];
+    const int sc   = step_controls[k];
+    if (kind != 0 && kind != 1) return;
+    if (sn < 0 || sc < 0) return;
+    const std::size_t snidx = static_cast<std::size_t>(sn);
+    if (snidx >= def->nodes.size()) return;
+    const NodeSpec &spec = def->nodes[snidx];
+    if (sc >= static_cast<int>(spec.default_controls.size())) return;
+  }
+
+  const int slot = def->fused_input_count++;
+
+  FusedScaleRef ref;
+  ref.source_node = NodeIndex{src_node};
+  ref.source_port = PortIndex{src_port};
+  ref.steps.reserve(static_cast<std::size_t>(step_count));
+  for (int k = 0; k < step_count; ++k) {
+    ref.steps.push_back(FusedAffineStep{
+        step_kinds[k] == 0 ? FusedAffineStep::Kind::Scale
+                           : FusedAffineStep::Kind::Bias,
+        NodeIndex{step_nodes[k]},
+        ControlIndex{step_controls[k]}});
   }
   ref.scratch_slot = slot;
   dst_spec.fused_inputs[dport] = std::move(ref);
@@ -4672,7 +4791,7 @@ void rt_graph_instance_set_control(
 // queue that drain_control_queue applies at the top of each
 // process_graph block. Single-producer contract: only ONE thread
 // may call this group of entries (UI / OSC / MIDI ingress all feed
-// *into* the producer thread, not the queue directly). Concurrent
+// *into* the producer thread, not the queue directly). Cooncurrent
 // calls from multiple threads will corrupt the queue.
 //
 // rt_graph_realtime_reserve does its work synchronously on the

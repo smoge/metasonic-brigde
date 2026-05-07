@@ -47,6 +47,7 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_template_set_node_elided
   , c_rt_graph_template_connect_fused_scale_input
   , c_rt_graph_template_connect_fused_scale_chain_input
+  , c_rt_graph_template_connect_fused_affine_input
   , c_rt_graph_template_instance_add
   , c_rt_graph_instance_remove
   , c_rt_graph_instance_release
@@ -72,7 +73,8 @@ import           Control.Monad              (forM_, when)
 import           Foreign
 import           Foreign.C.Types
 
-import           MetaSonic.Bridge.Compile   (FusedInput (..), RuntimeGraph (..),
+import           MetaSonic.Bridge.Compile   (AffineStep (..),
+                                             FusedInput (..), RuntimeGraph (..),
                                              RuntimeInput (..),
                                              RuntimeNode (..),
                                              RuntimeRegion (..),
@@ -412,6 +414,22 @@ foreign import ccall unsafe "rt_graph_template_connect_fused_scale_chain_input"
     -> Ptr CInt
     -> IO ()
 
+-- | Phase 4.C.2: wire one input port through an affine chain
+-- (mixed Gain × scale and Add + bias steps). The runtime applies
+-- each step in source-to-sink order, casting controls to 'float'
+-- once per step. See
+-- 'rt_graph_template_connect_fused_affine_input' in @rt_graph.h@.
+foreign import ccall unsafe "rt_graph_template_connect_fused_affine_input"
+  c_rt_graph_template_connect_fused_affine_input
+    :: Ptr RTGraph -> CInt
+    -> CInt -> CInt
+    -> CInt -> CInt
+    -> CInt
+    -> Ptr CInt
+    -> Ptr CInt
+    -> Ptr CInt
+    -> IO ()
+
 -- | Spawn a fresh instance of the named template. Returns globally-
 -- unique instance_id (>= 0) or -1 on failure.
 foreign import ccall unsafe "rt_graph_template_instance_add"
@@ -608,6 +626,28 @@ wireFusedScale g cTid dstNode dstPort fused = case fused of
            (cNodeIndex srcN)
            (cPortIndex srcP)
            n pNodes pCtls
+  FAffineFrom srcN srcP steps ->
+    -- ABI tag values mirror FusedAffineStep::Kind in rt_graph.cpp:
+    -- 0 = Scale, 1 = Bias. Three parallel arrays, all CInt.
+    let kinds = [stepKind s    | s <- steps]
+        nodes = [cNodeIndex (stepNode s)    | s <- steps]
+        ctls  = [cControlIndex (stepCtl s)  | s <- steps]
+        n     = fromIntegral (length steps)
+    in withArray kinds $ \pKinds ->
+       withArray nodes $ \pNodes ->
+       withArray ctls  $ \pCtls  ->
+         c_rt_graph_template_connect_fused_affine_input g cTid
+           dstNode dstPort
+           (cNodeIndex srcN)
+           (cPortIndex srcP)
+           n pKinds pNodes pCtls
+  where
+    stepKind (AffScale _ _) = 0 :: CInt
+    stepKind (AffBias  _ _) = 1
+    stepNode (AffScale n _) = n
+    stepNode (AffBias  n _) = n
+    stepCtl  (AffScale _ c) = c
+    stepCtl  (AffBias  _ c) = c
 
 -- | Transfer a compiled 'RuntimeGraph' to the C++ runtime.
 -- Clears any existing graph state first, then adds nodes and
