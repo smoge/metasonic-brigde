@@ -679,6 +679,13 @@ delayL maxT sig time = insertNodeC "delay" (Delay maxT sig time)
 -- events arrive, so the smoother turns block-rate jumps in the target
 -- value into continuous ramps in its sample-rate output.
 --
+-- Values @<= 0@ are unsafe: the underlying @q::dynamic_smoother@'s
+-- @g0@ coefficient is computed from @tan(pi * base_hz / sps)@, which
+-- collapses to zero (freezing the smoother at its seed) or goes
+-- negative (driving the IIR unstable) at non-positive base. The
+-- runtime clamps to a small positive epsilon (0.001 Hz) defensively,
+-- but you should pick a real, positive smoothing frequency here.
+--
 -- > out <- runSynth $ do
 -- >   target <- pure (Param 0.0)         -- producer-thread updated
 -- >   amount <- smooth 20.0 target       -- de-zipper

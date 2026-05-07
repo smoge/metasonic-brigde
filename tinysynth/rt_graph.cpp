@@ -2116,7 +2116,26 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
     return;
   }
 
-  const double base_hz = node.controls[0];
+  // q::dynamic_smoother computes its IIR coefficients as
+  // wc = base_hz / sps; gc = tan(pi * wc); g0 = 2*gc / (1 + gc).
+  // base_hz <= 0 produces g0 <= 0, which either freezes the
+  // smoother at its seed (g0 == 0) or drives the IIR unstable
+  // (g0 < 0 pushes low1 *away* from the input). Clamp to a small
+  // positive epsilon to keep the math sane while still letting
+  // users pick legitimately slow smoothing speeds. The spec
+  // defaults are guarded too (kindSpec sets 20 Hz), but per-
+  // instance set_control can land any double here at runtime.
+  // q::dynamic_smoother computes its IIR coefficients as
+  // wc = base_hz / sps; gc = tan(pi * wc); g0 = 2*gc / (1 + gc).
+  // base_hz <= 0 produces g0 <= 0, which either freezes the
+  // smoother at its seed (g0 == 0) or drives the IIR away from
+  // the input (g0 < 0). Clamp to a small positive epsilon to keep
+  // the math sane while still letting users pick legitimately
+  // slow smoothing speeds. The spec defaults are guarded too
+  // (kindSpec sets 20 Hz), but per-instance set_control can land
+  // any double here at runtime.
+  constexpr double kMinBaseFreqHz = 0.001;
+  const double base_hz = std::max(node.controls[0], kMinBaseFreqHz);
   const float  target  = static_cast<float>(node.controls[1]);
 
   // Lazy construction on first call or after a sample-rate change.
