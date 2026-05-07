@@ -2496,9 +2496,18 @@ crossCuttingTests = testGroup "End-to-end FFI"
           cs <- peekArray nframes (buf :: PtrCFloat)
           pure (map (\(CFloat x) -> x) cs)
 
-      tg <- case compileTemplateGraph [("solo", fusedChain)] of
+      tg <- case compileTemplateGraphFused [("solo", fusedChain)] of
         Right t  -> pure t
         Left err -> assertFailure err >> error "unreachable"
+
+      -- The fused TemplateGraph must actually carry RFused inputs
+      -- and elided nodes; otherwise loadTemplateGraphFused's new
+      -- passes never run and a regression in them slips past.
+      let tgRg = tplGraph (head (tgTemplates tg))
+      assertBool "fused TemplateGraph carried no RFused inputs"
+        (not (null [() | n <- rgNodes tgRg, RFused _ <- rnInputs n]))
+      assertBool "fused TemplateGraph elided no nodes"
+        (any rnElided (rgNodes tgRg))
 
       tgBus <- withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
         loadTemplateGraphFused handle tg
@@ -2768,9 +2777,12 @@ fusedEquivalenceCases =
   ]
 
 -- | Render @graph@ through the unfused and fused loaders and assert
--- the two outputs are bit-identical. Also verifies that the fused
--- compile actually triggered fusion (≥1 RFused input + ≥1 elided
--- node) so the test isn't degenerate.
+-- their outputs are bit-identical on every bus the graph writes
+-- (not only bus 0). Comparing every output bus catches the case
+-- where a fanout's second fused branch is miswired but its sibling
+-- on bus 0 happens to match. Also verifies that the fused compile
+-- actually triggered fusion (≥1 RFused input + ≥1 elided node) so
+-- the test isn't degenerate.
 assertFusedEquivalent :: String -> SynthGraph -> Assertion
 assertFusedEquivalent name graph = do
   let nframes = 256
@@ -2788,20 +2800,42 @@ assertFusedEquivalent name graph = do
   assertBool (name <> ": fused compile elided no nodes")
     (any rnElided (rgNodes rtF))
 
+  -- Walk the (unfused) graph to collect every bus index that an Out
+  -- or BusOut node writes to. rnControls[0] holds the bus id by
+  -- convention (see kindSpec for KOut / KBusOut). Bus indices that
+  -- both graphs write to are compared sample-for-sample; if either
+  -- side renders silence on a bus the other one drives, the test
+  -- fails.
+  let busesWritten rg =
+        nub
+          [ truncate v
+          | n <- rgNodes rg
+          , rnKind n == KOut || rnKind n == KBusOut
+          , v : _ <- [rnControls n]
+          , v >= 0
+          ]
+      buses = busesWritten rtUn
+  assertBool (name <> ": graph writes no output buses to compare")
+             (not (null buses))
+
   let render loader rt =
         withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
           loader handle rt
           c_rt_graph_process handle (fromIntegral nframes)
-          allocaBytes (nframes * sizeOfFloat) $ \buf -> do
-            _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
-                                     (castPtr buf)
-            cs <- peekArray nframes (buf :: PtrCFloat)
-            pure (map (\(CFloat x) -> x) cs)
+          allocaBytes (nframes * sizeOfFloat) $ \buf ->
+            traverse (\bus -> readBus handle bus buf) buses
+      readBus handle bus buf = do
+        _ <- c_rt_graph_read_bus handle (fromIntegral bus)
+                                 (fromIntegral nframes) (castPtr buf)
+        cs <- peekArray nframes (buf :: PtrCFloat)
+        pure (bus, map (\(CFloat x) -> x) cs)
 
   unfused <- render loadRuntimeGraph      rtUn
   fused   <- render loadRuntimeGraphFused rtF
-  assertBool (name <> ": fused render must match unfused render")
-             (unfused == fused)
+  assertBool
+    (name <> ": fused render must match unfused render on every bus "
+       <> show buses)
+    (unfused == fused)
   where
     -- Mirrors the local sizeOfFloat in crossCuttingTests' where-clause.
     sizeOfFloat = 4 :: Int

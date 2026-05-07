@@ -36,6 +36,7 @@ module MetaSonic.Bridge.Templates
   , -- * Compile-decreed plan
     TemplateGraph (..)
   , compileTemplateGraph
+  , compileTemplateGraphFused
   ) where
 
 import           Control.DeepSeq             (NFData)
@@ -243,6 +244,45 @@ compileTemplateGraph entries = do
     compileOne (i, (name, sg)) = do
       ir <- prefixError name (lowerGraph sg)
       rg <- prefixError name (compileRuntimeGraph ir)
+      let !fp = busFootprint ir
+      pure Template
+        { tplID        = TemplateID i
+        , tplName      = name
+        , tplGraph     = rg
+        , tplFootprint = fp
+        }
+
+    prefixError :: String -> Either String a -> Either String a
+    prefixError name (Left err) = Left $ "template " <> show name <> ": " <> err
+    prefixError _    (Right x)  = Right x
+
+-- | Step C sibling of 'compileTemplateGraph'. Each template's
+-- 'tplGraph' is produced by 'compileRuntimeGraphFused', so the
+-- resulting 'TemplateGraph' carries 'RFused' inputs and 'rnElided'
+-- nodes wherever the single-edge Gain rewrite applies. Stages
+-- 2–4 (name uniqueness, precedence DAG, topo sort) are unchanged
+-- — fusion does not touch effect annotations or bus footprints.
+--
+-- This is the constructor that 'loadTemplateGraphFused' is
+-- designed to consume; passing it to 'loadTemplateGraph' (the
+-- unfused loader) raises the documented fail-fast error.
+compileTemplateGraphFused
+  :: [(String, SynthGraph)]
+  -> Either String TemplateGraph
+compileTemplateGraphFused entries = do
+  templates <- mapM compileOneFused (zip [0..] entries)
+  checkUniqueNames templates
+  let !precedence = computePrecedence templates
+  ordered <- topoSortTemplates templates precedence
+  pure TemplateGraph
+    { tgTemplates  = ordered
+    , tgPrecedence = precedence
+    }
+  where
+    compileOneFused :: (Int, (String, SynthGraph)) -> Either String Template
+    compileOneFused (i, (name, sg)) = do
+      ir <- prefixError name (lowerGraph sg)
+      rg <- prefixError name (compileRuntimeGraphFused ir)
       let !fp = busFootprint ir
       pure Template
         { tplID        = TemplateID i
