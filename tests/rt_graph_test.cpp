@@ -3827,3 +3827,162 @@ TEST_CASE("§2.E releasing a slot then re-adding reuses the freed id") {
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// §2.E polyphonic stress: many voices, staggered release
+// ----------------------------------------------------------------
+//
+// The earlier §2.E tests exercise lifecycle on at most two instances.
+// A future voice allocator (Phase 3.1) will routinely run with eight
+// to a few dozen concurrent voices, with new voices spawning while
+// older ones are mid-release and slot reuse cycling continuously.
+// This test pins the concurrent behaviour:
+//
+//   * many voices Live + Releasing in the same template,
+//   * staggered release so per-instance silence counters are at
+//     different points across the population,
+//   * slot reuse: spawning during an active release wave fills slots
+//     freed by prior auto-frees, exercising the rt_graph_template_-
+//     instance_add scan path,
+//   * peer isolation: surviving Live voices keep singing while
+//     released peers around them flicker through Releasing → dead,
+//   * eventual full drain: once everyone is released, the population
+//     reaches alive == 0 and stays there.
+//
+// The template is a minimal ADSR-shaped sine: one Env (gate held high
+// by spec default), one SinOsc, one Gain (modulated by the Env),
+// one Out routing to bus 0. Per-instance freq is set after spawn.
+//
+// Tunables match Phase 3 expectations: kVoices is small enough that
+// dead-slot scan in rt_graph_template_instance_add is irrelevant
+// (linear scan is fine here), large enough that "many voices at once"
+// is a real condition rather than a special case.
+TEST_CASE("§2.E polyphonic stress: staggered release, slot reuse, full drain") {
+    constexpr int kBlock  = 256;
+    constexpr int kVoices = 8;
+    constexpr float kFreqs[kVoices] = {
+        110.0f, 138.59f, 165.0f, 220.0f,
+        261.63f, 329.63f, 392.0f, 523.25f,
+    };
+
+    auto *g = rt_graph_create(/*capacity*/ 16, kBlock);
+    REQUIRE(g != nullptr);
+
+    int t0 = 0;
+    // Env: gate default 1, A=1ms, D=2ms, S=0.7, R=5ms.
+    rt_graph_template_add_node(g, t0, 0, 9);
+    rt_graph_template_set_default(g, t0, 0, 0, 1.0);
+    rt_graph_template_set_default(g, t0, 0, 1, 0.001);
+    rt_graph_template_set_default(g, t0, 0, 2, 0.002);
+    rt_graph_template_set_default(g, t0, 0, 3, 0.7);
+    rt_graph_template_set_default(g, t0, 0, 4, 0.005);
+    // SinOsc: freq default 440 (overridden per-instance after spawn).
+    rt_graph_template_add_node(g, t0, 1, 1);
+    rt_graph_template_set_default(g, t0, 1, 0, 440.0);
+    // Gain: signal_in <- SinOsc, gain_in <- Env.
+    rt_graph_template_add_node(g, t0, 2, 3);
+    // Out: bus 0.
+    rt_graph_template_add_node(g, t0, 3, 2);
+    rt_graph_template_set_default(g, t0, 3, 0, 0.0);
+    rt_graph_template_connect(g, t0, 1, 0, 2, 0);  // SinOsc → Gain.signal
+    rt_graph_template_connect(g, t0, 0, 0, 2, 1);  // Env → Gain.gain
+    rt_graph_template_connect(g, t0, 2, 0, 3, 0);  // Gain → Out
+
+    // Drop the auto-spawned instance 0 — we want a clean population
+    // we built ourselves so id assignments are predictable.
+    rt_graph_instance_remove(g, 0);
+
+    int ids[kVoices] = {};
+    for (int v = 0; v < kVoices; ++v) {
+        ids[v] = rt_graph_template_instance_add(g, t0);
+        REQUIRE(ids[v] >= 0);
+        rt_graph_instance_set_control(g, ids[v], 1, 0,
+                                       static_cast<double>(kFreqs[v]));
+        // Sanity: each voice spawns Live.
+        REQUIRE(rt_graph_instance_status(g, ids[v]) == 0);
+    }
+
+    // Warm-up: a few blocks so every envelope leaves idle and reaches
+    // sustain. Without this, releasing in the next phase would race
+    // the attack ramp and confuse the silence counter on voices whose
+    // attacks haven't completed.
+    for (int b = 0; b < 4; ++b) rt_graph_process(g, kBlock);
+
+    for (int v = 0; v < kVoices; ++v) {
+        CHECK(rt_graph_instance_alive(g, ids[v]) == 1);
+        CHECK(rt_graph_instance_status(g, ids[v]) == 0);
+    }
+
+    // Phase 1: stagger release of the lower half (voices 0..3), one
+    // per block. This puts the silence counters at four different
+    // offsets, so when we later check "all released voices are gone"
+    // we know the runtime tolerated overlapping Releasing populations
+    // rather than only the simple "all release at once" case.
+    constexpr int kReleased = kVoices / 2;
+    for (int v = 0; v < kReleased; ++v) {
+        rt_graph_instance_release(g, ids[v]);
+        CHECK(rt_graph_instance_status(g, ids[v]) == 1);
+        CHECK(rt_graph_instance_alive(g, ids[v]) == 1);  // tail still rendering
+        rt_graph_process(g, kBlock);
+    }
+
+    // Mid-release sanity: lower-half is Releasing, upper-half is
+    // still Live, exactly. No Releasing voice should have flipped
+    // back to Live; no Live voice should have drifted to Releasing.
+    for (int v = 0; v < kReleased; ++v) {
+        const int s = rt_graph_instance_status(g, ids[v]);
+        // Either still Releasing or already auto-freed (if R + window
+        // elapsed for the earliest releases). Definitely not Live.
+        CHECK((s == 1 || s == -1));
+    }
+    for (int v = kReleased; v < kVoices; ++v) {
+        CHECK(rt_graph_instance_status(g, ids[v]) == 0);
+        CHECK(rt_graph_instance_alive(g, ids[v]) == 1);
+    }
+
+    // Phase 2: drain the released voices. Run enough blocks for the
+    // longest-tail voice to clear the silence window comfortably.
+    for (int b = 0; b < 64; ++b) rt_graph_process(g, kBlock);
+
+    int alive_lower = 0;
+    int alive_upper = 0;
+    for (int v = 0; v < kVoices; ++v) {
+        const int alive = rt_graph_instance_alive(g, ids[v]);
+        (v < kReleased ? alive_lower : alive_upper) += alive;
+    }
+    CHECK(alive_lower == 0);              // released voices freed
+    CHECK(alive_upper == kVoices - kReleased);  // survivors still alive
+
+    // Phase 3: spawn fresh voices into the freed slots. Slot-reuse
+    // contract: rt_graph_template_instance_add scans for empty
+    // optionals first. Order of reuse is implementation-defined
+    // (today: ascending slot index), but every new id MUST land in
+    // the [0, kVoices) range — no growth past the original
+    // population — because there are exactly kReleased free slots.
+    int reused_ids[kReleased] = {};
+    for (int v = 0; v < kReleased; ++v) {
+        reused_ids[v] = rt_graph_template_instance_add(g, t0);
+        REQUIRE(reused_ids[v] >= 0);
+        REQUIRE(reused_ids[v] < kVoices);
+        rt_graph_instance_set_control(g, reused_ids[v], 1, 0, 880.0);
+    }
+    CHECK(rt_graph_instance_count(g) == kVoices);
+
+    // Phase 4: release everyone, drain, verify final population is
+    // empty across the board (alive count zero for every slot).
+    for (int v = kReleased; v < kVoices; ++v) {
+        rt_graph_instance_release(g, ids[v]);
+    }
+    for (int v = 0; v < kReleased; ++v) {
+        rt_graph_instance_release(g, reused_ids[v]);
+    }
+    for (int b = 0; b < 64; ++b) rt_graph_process(g, kBlock);
+
+    int final_alive = 0;
+    for (int slot = 0; slot < rt_graph_instance_count(g); ++slot) {
+        final_alive += rt_graph_instance_alive(g, slot);
+    }
+    CHECK(final_alive == 0);
+
+    rt_graph_destroy(g);
+}
