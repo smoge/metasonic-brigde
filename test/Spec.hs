@@ -1128,6 +1128,51 @@ unitTests = testGroup "Unit tests"
               map rnKind       (rgNodes fused)
                 @?= map rnKind       (rgNodes unfused)
 
+      , -- Step C (c) gate 5: chained Gains. SinOsc → Gain₁(0.5) →
+        -- Gain₂(0.25) → Out. First-pass fusion only elides the
+        -- upstream Gain because Gain₂'s signal source (Gain₁) is
+        -- itself a candidate; chained-fusion deferred. After the
+        -- pass:
+        --   * Gain₁ is elided.
+        --   * Gain₂ stays dispatched and its signal input is
+        --     RFused (FScaleFrom SinOsc 0 Gain₁ 0).
+        --   * Out's input remains RFrom Gain₂ 0 (unchanged).
+        --
+        -- The dispatched Gain₂ then reads from a fused source at
+        -- run time, which is exactly the case Step C (d) needs to
+        -- handle in resolve_input — this test pins the IR shape
+        -- it must consume.
+        testCase "fuseRuntimeGraph: chain elides only upstream Gain (gate 5)" $ do
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                a1 <- gain o  (Param 0.5)
+                a2 <- gain a1 (Param 0.25)
+                out 0 a2
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              length (rgNodes rg) @?= 4
+              let nodes = rgNodes rg
+                  sinNode  = head [n | n <- nodes, rnKind n == KSinOsc]
+                  gainsExec = [n | n <- nodes, rnKind n == KGain]
+                  outNode  = head [n | n <- nodes, rnKind n == KOut]
+              -- Two Gains in execution order: upstream then downstream.
+              length gainsExec @?= 2
+              let [gUpstream, gDownstream] = gainsExec
+              rnElided gUpstream   @?= True
+              rnElided gDownstream @?= False
+              -- Gain₂'s signal input now reads through the fused
+              -- form, scaled by the elided Gain₁'s control 0.
+              rnInputs gDownstream @?=
+                [ RFused (FScaleFrom (rnIndex sinNode)   (PortIndex 0)
+                                     (rnIndex gUpstream) (ControlIndex 0))
+                , RConst 0.25
+                ]
+              -- Out is untouched by the rewrite — its input still
+              -- targets the dispatched downstream Gain.
+              rnInputs outNode @?=
+                [ RFrom (rnIndex gDownstream) (PortIndex 0) ]
+
       , -- Idempotence: applying the rewrite twice must equal applying
         -- it once. Elided Gains fail the candidate predicate
         -- (rnElided check) on the second pass, so nothing changes.
