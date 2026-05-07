@@ -16,9 +16,15 @@
 //   q::midi_input_stream stream;
 //   while (running) {
 //     stream.process(proc);   // consumes 0 or 1 event (non-blocking)
-//     alloc.tick();           // retry pending steals, reap auto-frees
+//     proc.tick();            // alloc.tick + state inheritance
 //     // sleep / yield to avoid busy-spinning
 //   }
+//
+// The processor's tick() supersedes alloc.tick() in 3.3b: it calls
+// alloc.tick() internally and then replays cached CC / pitch-bend
+// values onto voices that just became Active, so a stolen note
+// does not start at a stale control value. Calling alloc.tick()
+// directly still works but skips state inheritance.
 //
 // Threading: same single-producer contract as VoiceAllocator. The
 // thread driving stream.process() and alloc.tick() must be the
@@ -63,6 +69,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace metasonic {
 
@@ -96,6 +103,26 @@ public:
   // Drop every CC mapping. Useful for tests and for runtime
   // re-binding when a UI swaps presets.
   void clear_cc_mappings() noexcept;
+
+  // Phase 3.3b: producer-thread tick. Calls alloc.tick() (retry
+  // pending steals, reap auto-frees) and then walks the voice
+  // table, replaying cached CC and pitch-bend values onto any
+  // voice that just transitioned to Active. The recommended
+  // wiring loop is:
+  //
+  //   stream.process(proc);   // 0 or 1 MIDI event
+  //   proc.tick();            // alloc.tick + state inheritance
+  //
+  // Replay for a given voice fires once per (voice_index,
+  // generation) pair: idempotent across multiple tick() calls
+  // while the voice stays Active. CC mappings replay only after
+  // they have observed at least one CC event (no fabricated
+  // defaults); pitch-bend replays the centred default (factor
+  // 1.0) once set_pitch_bend has been called, even before the
+  // first pitch-bend message — that centred default IS the
+  // inherited value, since binding pitch-bend to a control
+  // declares pitch-bend ownership of it.
+  void tick();
 
   // Bind pitch-bend to a per-voice frequency control. Each
   // Active / Releasing voice's (node_index, control_index) is
@@ -134,18 +161,49 @@ private:
     return ((channel_mask_ >> channel) & 1u) != 0u;
   }
 
+  // Apply every inherited (CC + pitch-bend) cached value to one
+  // voice. Called by tick() for voices that just became Active.
+  void apply_inherited_state_to_voice(int voice_index, VoiceHandle handle);
+
   struct CCMapping {
-    std::uint8_t cc_number     = 0;
-    int          node_index    = 0;
-    int          control_index = 0;
-    float        min_value     = 0.0f;
-    float        max_value     = 1.0f;
+    std::uint8_t cc_number      = 0;
+    int          node_index     = 0;
+    int          control_index  = 0;
+    float        min_value      = 0.0f;
+    float        max_value      = 1.0f;
+    // Per-mapping cache for state inheritance (3.3b). last_value
+    // holds the already-scaled value that the next replay would
+    // write. has_last_value is false until the first matching
+    // CC has been observed; until then a newly-activated voice
+    // does NOT inherit anything from this entry. Caching the
+    // scaled value (rather than the raw 0..127) means replay is
+    // independent of any later add/remove of mappings on the
+    // same CC number.
+    bool         has_last_value = false;
+    float        last_value     = 0.0f;
   };
 
   struct PitchBendBinding {
-    int   node_index     = 0;
-    int   control_index  = 0;
-    float semitone_range = 2.0f;
+    int           node_index     = 0;
+    int           control_index  = 0;
+    float         semitone_range = 2.0f;
+    // 14-bit last raw value (0..16383). Defaults to 8192 (centred)
+    // when set_pitch_bend is called, so a newly-activated voice
+    // receives its base frequency on its bound control even before
+    // the first pitch-bend message arrives. This is intentional:
+    // binding pitch-bend to a control declares "this control is
+    // owned by pitch-bend"; the centred default is the only sane
+    // pre-event value.
+    std::uint16_t last_raw       = 8192;
+  };
+
+  // Per-voice activation tracking for state inheritance. Replay of
+  // cached CC + pitch-bend values fires when a voice transitions
+  // from "not Active" to Active OR when its generation differs
+  // from the last seen value (covers same-index re-activation).
+  struct VoiceTrack {
+    std::uint32_t last_generation = 0;
+    bool          was_active      = false;
   };
 
   static constexpr std::size_t kMaxCCMappings = 32;
@@ -159,10 +217,11 @@ private:
   int             cc_events_           = 0;
   int             pb_events_           = 0;
 
-  std::size_t      cc_mapping_count_ = 0;
-  CCMapping        cc_mappings_[kMaxCCMappings];
-  bool             pitch_bend_bound_ = false;
-  PitchBendBinding pitch_bend_;
+  std::size_t             cc_mapping_count_ = 0;
+  CCMapping               cc_mappings_[kMaxCCMappings];
+  bool                    pitch_bend_bound_ = false;
+  PitchBendBinding        pitch_bend_;
+  std::vector<VoiceTrack> voice_tracks_;
 };
 
 } // namespace metasonic

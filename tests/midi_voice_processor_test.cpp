@@ -649,6 +649,257 @@ TEST_CASE("MidiVoiceProcessor PB: applies independently to every voice's own not
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase 3.3b: state inheritance via proc.tick()
+// ----------------------------------------------------------------
+
+TEST_CASE("MidiVoiceProcessor 3.3b: synchronous note_on inherits cached CC value") {
+    // Setup: CC binding + a CC observed BEFORE any voice is alive.
+    // The next note_on activates a voice synchronously; proc.tick()
+    // walks newly-Active voices and replays the cached CC value,
+    // overwriting whatever the map callback wrote.
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+
+    // CC arrives with no voice active. No per-voice writes happen,
+    // but the mapping caches last_value.
+    proc(midi::control_change{0, midi::cc::channel_volume, 64}, 0);
+
+    // Note on: map callback writes velocity = 100/127 to control 0.
+    proc(midi::note_on{0, 60, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+
+    // Without proc.tick() the cached value would not have landed yet.
+    // tick() inherits — control 0 is overwritten with 64/127.
+    proc.tick();
+
+    CHECK(bus0_first_sample(g) == doctest::Approx(64.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: pending-steal voice inherits cached CC at activation") {
+    // The headline scenario: a CC arrives, a note steals an active
+    // voice, and the new voice activates one block later. tick()
+    // replays the cached CC onto the newly-active voice — no need
+    // for a fresh CC message after activation.
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+
+    // CC dispatched to the live voice. Cached value also stored.
+    proc(midi::control_change{0, midi::cc::channel_volume, 64}, 0);
+
+    // Steal: voice 0 transitions to PendingSteal.
+    proc(midi::note_on{0, 62, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::PendingSteal);
+
+    // Drain so the runtime processes Remove(victim) and frees the
+    // slot for the pending reservation. proc.tick() then activates
+    // the new voice AND replays the cached CC value.
+    rt_graph_process(g, kFrames);
+    proc.tick();
+
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+    // Bus 0 reflects the inherited CC value, not the velocity that
+    // the map callback wrote.
+    CHECK(bus0_first_sample(g) == doctest::Approx(64.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: no CC observed -> map callback's value stands") {
+    // Inheritance only fires for mappings that have observed at
+    // least one CC event. Without a prior CC, the map callback's
+    // initial control value (velocity here) is what plays.
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+
+    // No CC dispatched.
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc.tick();
+
+    // Velocity 100/127 from the map callback.
+    CHECK(bus0_first_sample(g) == doctest::Approx(100.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: pitch-bend bound -> centred default is the inherited value") {
+    // Binding pitch-bend to a control implies pitch-bend ownership.
+    // A newly-activated voice gets its base frequency on that
+    // control even before the first pitch-bend event — the centred
+    // default factor (1.0) IS the inherited value.
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc.tick();
+
+    // No pitch-bend message was sent. The voice's control 0 was
+    // first written to velocity by the map callback, then
+    // overwritten by inheritance to base freq (~261.6 Hz for C4).
+    CHECK(bus0_first_sample(g) == doctest::Approx(261.6f).epsilon(0.01));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: pitch-bend last value is inherited at activation") {
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+
+    // First voice + a +1 semitone bend (raw 12288 ~ +0.5 of range).
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc.tick();   // initial inheritance: centred → base freq.
+    proc(midi::pitch_bend{0, 12288}, 0);  // ~+1 semitone
+
+    // Steal: voice 0 PendingSteal.
+    proc(midi::note_on{0, 72, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::PendingSteal);
+
+    rt_graph_process(g, kFrames);
+    proc.tick();
+
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+    REQUIRE(alloc.voice_note(0) == 72);
+
+    // The new voice's note is 72 (C5, ~523.25 Hz). The held bend
+    // factor is 2^((bend * 2) / 12) for bend = (12288 - 8192)/8192 = 0.5,
+    // so factor = 2^(1/12) ≈ 1.0595. Expected freq ≈ 554.4 Hz.
+    constexpr float base_72 = 523.2511f;
+    const float bend = (12288.0f - 8192.0f) / 8192.0f;
+    const float factor = std::pow(2.0f, (bend * 2.0f) / 12.0f);
+    CHECK(bus0_first_sample(g) == doctest::Approx(base_72 * factor).epsilon(0.02));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: re-trigger on same voice index re-fires inheritance") {
+    // After auto-free + a fresh note_on, the same voice index hosts
+    // a different generation. Inheritance must fire again — the
+    // (voice_index, generation) gate is what makes replay correct.
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+
+    // Round 1: dispatch CC, activate, tick.
+    proc(midi::control_change{0, midi::cc::channel_volume, 32}, 0);
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc.tick();
+    REQUIRE(bus0_first_sample(g) == doctest::Approx(32.0f / 127.0f).epsilon(1e-5));
+
+    // Round 2: free the voice, re-trigger. (Use realtime_remove via
+    // note_off since there's no Env on this template.)
+    proc(midi::note_off{0, 60, 0}, 0);
+    rt_graph_process(g, kFrames);  // drain release → auto-free
+    proc.tick();                   // reaps Releasing → Free
+
+    // Update cached CC, then re-trigger.
+    proc(midi::control_change{0, midi::cc::channel_volume, 96}, 0);
+    proc(midi::note_on{0, 64, 100}, 0);
+    proc.tick();   // newly-activated voice picks up the new cache
+
+    CHECK(bus0_first_sample(g) == doctest::Approx(96.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: tick() is idempotent on a stable Active voice") {
+    // The inheritance gate is (voice_index, generation): once
+    // applied for a given activation, subsequent ticks must not
+    // re-fire. We verify by writing a sentinel value directly to
+    // the voice's control between ticks; if tick re-applied
+    // inheritance, the sentinel would be overwritten.
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+    proc(midi::control_change{0, midi::cc::channel_volume, 64}, 0);
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc.tick();
+    REQUIRE(bus0_first_sample(g) == doctest::Approx(64.0f / 127.0f).epsilon(1e-5));
+
+    // Direct sentinel write on the live slot (bypasses the queue).
+    // This is a [T:control] entry — safe in offline tests where
+    // no audio thread is racing.
+    const int slot_id = alloc.voice_handle(0).slot_id;
+    REQUIRE(slot_id >= 0);
+    rt_graph_instance_set_control(g, slot_id, 0, 0, 0.99);
+    REQUIRE(bus0_first_sample(g) == doctest::Approx(0.99f).epsilon(1e-5));
+
+    // Three consecutive ticks. If inheritance re-fired on any of
+    // them, the queued SetControl would overwrite 0.99 with the
+    // cached 64/127.
+    proc.tick();
+    proc.tick();
+    proc.tick();
+
+    CHECK(bus0_first_sample(g) == doctest::Approx(0.99f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: clear_cc_mappings drops the inheritance cache") {
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+    proc(midi::control_change{0, midi::cc::channel_volume, 32}, 0);
+
+    // Clear before the next note_on. The cache is dropped along
+    // with the mapping (the new mapping starts with no cache).
+    proc.clear_cc_mappings();
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc.tick();
+
+    // No CC observed since rebind → no inheritance → bus reflects
+    // velocity (100/127), not the pre-clear cached value.
+    CHECK(bus0_first_sample(g) == doctest::Approx(100.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor 3.3b: clear_pitch_bend disables the inheritance default") {
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+    proc.clear_pitch_bend();
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc.tick();
+
+    // No PB binding → no centred default applied. Velocity from
+    // the map callback stands.
+    CHECK(bus0_first_sample(g) == doctest::Approx(100.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("MidiVoiceProcessor PB: channel mask filters pitch-bend events") {
     auto *g = make_graph_with_polyphony(2);
     VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
