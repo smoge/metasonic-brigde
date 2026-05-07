@@ -28,6 +28,7 @@ module MetaSonic.Bridge.Source
   , -- * Builder monad
     SynthM
   , runSynth
+  , runSynthWith
   , -- * DSL combinators
     --
     -- $combinators
@@ -46,6 +47,7 @@ module MetaSonic.Bridge.Source
   , smooth
   , -- * Connection helpers
     audio
+  , connectionNodeID
   , -- * Uniform UGen view
     UGenView (..)
   , ugenView
@@ -495,6 +497,16 @@ type SynthM a = State SynthState a
 runSynth :: SynthM a -> SynthGraph
 runSynth m = ssGraph (execState m (SynthState 0 emptyGraph))
 
+-- | Run a graph builder and return both the builder's value and
+-- the resulting 'SynthGraph'. Use this when you need to thread
+-- captured 'Connection' / 'NodeID' values out of the builder for
+-- post-compile binding (e.g. recording which node carries the
+-- gain control that a CC will drive).
+runSynthWith :: SynthM a -> (a, SynthGraph)
+runSynthWith m =
+  let (a, st) = runState m (SynthState 0 emptyGraph)
+  in (a, ssGraph st)
+
 -- | Allocate a fresh 'NodeID'. Strict in the counter to
 -- avoid thunk accumulation.
 freshNodeID :: SynthM NodeID
@@ -563,6 +575,19 @@ rather than identity.
 -- output as a 'Connection'. Useful for hand-built graphs.
 audio :: NodeID -> Connection
 audio n = Audio n (PortIndex 0)
+
+-- | Recover the symbolic 'NodeID' that produced an audio-rate
+-- 'Connection'. Returns 'Nothing' for 'Param' connections (literal
+-- constants own no node).
+--
+-- This is the bridge between graph construction and post-compile
+-- index resolution: combinators return 'Connection', but downstream
+-- consumers (CC binding, pitch-bend binding, observability) need a
+-- stable symbolic handle they can later look up against a compiled
+-- 'RuntimeGraph' via 'MetaSonic.Bridge.Compile.resolveNodeIndex'.
+connectionNodeID :: Connection -> Maybe NodeID
+connectionNodeID (Audio nid _) = Just nid
+connectionNodeID (Param _)     = Nothing
 
 -- Internal helper: register a node and return its output as a
 -- 'Connection' on port 0.

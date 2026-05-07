@@ -28,6 +28,7 @@ module MetaSonic.Bridge.Compile
   , RuntimeGraph (..)
   , -- * Compilation
     compileRuntimeGraph
+  , resolveNodeIndex
   , -- * Region formation
     RegionID (..)
   , Region (..)
@@ -396,6 +397,24 @@ data RuntimeGraph = RuntimeGraph
   { rgNodes :: ![RuntimeNode]
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+-- | Look up the dense 'NodeIndex' that a given symbolic 'NodeID'
+-- compiled to. Returns 'Nothing' if the 'NodeID' isn't present in
+-- the graph (e.g. a stray ID from a different graph, or one that
+-- was elided by a future fusion pass).
+--
+-- The intended use is post-compile binding: the source DSL
+-- accumulates symbolic 'NodeID's; the runtime ABI takes dense
+-- 'NodeIndex'es; this resolver bridges the two so MIDI/CC/observability
+-- code can target a specific compiled node.
+resolveNodeIndex :: RuntimeGraph -> NodeID -> Maybe NodeIndex
+resolveNodeIndex rg nid =
+  rnIndex <$> lookupNode (rgNodes rg)
+  where
+    lookupNode []                       = Nothing
+    lookupNode (n:ns)
+      | rnOriginalID n == nid           = Just n
+      | otherwise                       = lookupNode ns
 
 -- | Compile a 'GraphIR' into a dense 'RuntimeGraph'.
 --
