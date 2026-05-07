@@ -1,0 +1,25 @@
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+ColumnLimit: 90
+
+BinPackArguments: false
+BinPackParameters: false
+AlignAfterOpenBracket: BlockIndent
+BreakStringLiterals: false
+InsertNewlineAtEOF: true
+
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: "^\""
+    Priority: 1
+  - Regex: "^<q"
+    Priority: 2
+  - Regex: "^<portaudio\\.h>"
+    Priority: 3
+  - Regex: "^<[[:alnum:]_]+>$"
+    Priority: 4
+  - Regex: "^<.*>$"
+    Priority: 5
+
+IndentWidth: 2

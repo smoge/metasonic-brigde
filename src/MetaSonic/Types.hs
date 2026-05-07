@@ -13,13 +13,13 @@ MetaSonic.Types
   It defines every type name that appears in the other modules:
   NodeID, NodeIndex, Rate, Eff, NodeKind.
 
-MetaSonic.Source
+MetaSonic.Bridge.Source
   This is where graphs are written.
 
 MetaSonic.Validate
   The gate between construction and compilation.
 
-MetaSonic.IR
+MetaSonic.Bridge.IR
   The first real compilation pass. This is where the source
   vocabulary (UGen, Connection) is stripped and replaced with
   the compiler's vocabulary (NodeIR, InputConn) plus semantic
@@ -28,13 +28,13 @@ MetaSonic.IR
   is the module where the argument about surface syntax
   vs semantic syntax becomes concrete.
 
-MetaSonic.Compile
+MetaSonic.Bridge.Compile
   Read formRegions (region formation), then compileRuntimeGraph (the decisive
   NodeID → NodeIndex transformation). The Region and RegionGraph types are where
   scheduling logic lives. See Note [Region formation] and Note [Dense lowering]
   in MetaSonic.Compile.
 
-MetaSonic.FFI
+MetaSonic.Bridge.FFI
   loadRuntimeGraph is the marshaling function that walks the
   dense RuntimeGraph and emits FFI calls. After reading this,
   you know exactly what crosses to C++ and in what form.

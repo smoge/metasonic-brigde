@@ -1,0 +1,15 @@
+CompileFlags:
+  CompilationDatabase: build-cpp
+
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
+
+Completion:
+  HeaderInsertion: IWYU
+
+InlayHints:
+  Enabled: true

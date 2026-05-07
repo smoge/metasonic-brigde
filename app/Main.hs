@@ -11,10 +11,10 @@ import           Data.List                 (find, intercalate)
 import           System.Environment        (getArgs, getProgName)
 import           System.Exit               (die)
 
-import           MetaSonic.Compile
-import           MetaSonic.FFI
-import           MetaSonic.IR
-import           MetaSonic.Source
+import           MetaSonic.Bridge.Compile
+import           MetaSonic.Bridge.FFI
+import           MetaSonic.Bridge.IR
+import           MetaSonic.Bridge.Source
 import           MetaSonic.Visualize.Trace (CompileTrace (..), traceCompile)
 
 import           MetaSonic.Visualize.TUI   (launchInspector)

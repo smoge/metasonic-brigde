@@ -17,15 +17,15 @@ module MetaSonic.Visualize.Trace
   , traceSourceNodes
   ) where
 
-import qualified Data.Map.Strict    as M
-import           Data.Maybe         (fromMaybe)
+import qualified Data.Map.Strict           as M
+import           Data.Maybe                (fromMaybe)
 
-import           MetaSonic.Compile  (RegionGraph, RuntimeGraph,
-                                     compileRuntimeGraph, formRegions)
-import           MetaSonic.IR       (GraphIR (..), lowerGraph)
-import           MetaSonic.Source   (NodeSpec, SynthGraph (..))
-import           MetaSonic.Types    (NodeID)
-import           MetaSonic.Validate (validateAndSort)
+import           MetaSonic.Bridge.Compile  (RegionGraph, RuntimeGraph,
+                                            compileRuntimeGraph, formRegions)
+import           MetaSonic.Bridge.IR       (GraphIR (..), lowerGraph)
+import           MetaSonic.Bridge.Source   (NodeSpec, SynthGraph (..))
+import           MetaSonic.Bridge.Validate (validateAndSort)
+import           MetaSonic.Types           (NodeID)
 
 -- | Stages as seen by the visualizer
 data TraceStage

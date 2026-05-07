@@ -12,7 +12,7 @@
 -- See Note [Realtime audio lifecycle] for how q_io / PortAudio
 -- startup is exposed on the Haskell side.
 
-module MetaSonic.FFI
+module MetaSonic.Bridge.FFI
   ( -- * Opaque handle
     RTGraph
   , -- * Lifecycle
@@ -30,13 +30,13 @@ module MetaSonic.FFI
   , c_rt_graph_stop_audio
   ) where
 
-import           Control.Exception (bracket)
-import           Control.Monad     (forM_)
+import           Control.Exception        (bracket)
+import           Control.Monad            (forM_)
 import           Foreign
 import           Foreign.C.Types
 
-import           MetaSonic.Compile (RuntimeGraph (..), RuntimeInput (..),
-                                    RuntimeNode (..))
+import           MetaSonic.Bridge.Compile (RuntimeGraph (..), RuntimeInput (..),
+                                           RuntimeNode (..))
 import           MetaSonic.Types
 
 {- Note [FFI boundary design]

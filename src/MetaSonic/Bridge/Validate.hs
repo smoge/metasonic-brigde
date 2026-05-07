@@ -17,7 +17,7 @@
 -- sort computed here becomes the storage order of the C++
 -- runtime.
 
-module MetaSonic.Validate
+module MetaSonic.Bridge.Validate
   ( -- * Combined validation + ordering
     validateAndSort
   , -- * Individual passes (useful for testing)
@@ -25,12 +25,12 @@ module MetaSonic.Validate
   , topoSort
   ) where
 
-import           Control.Monad    (mapM_)
-import           Data.Foldable    (foldlM)
-import qualified Data.Map.Strict  as M
-import qualified Data.Set         as S
+import           Control.Monad           (mapM_)
+import           Data.Foldable           (foldlM)
+import qualified Data.Map.Strict         as M
+import qualified Data.Set                as S
 
-import           MetaSonic.Source
+import           MetaSonic.Bridge.Source
 import           MetaSonic.Types
 
 {- Note [Structural vs semantic well-formedness]

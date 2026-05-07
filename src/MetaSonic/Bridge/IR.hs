@@ -17,7 +17,7 @@
 -- See Note [Surface syntax vs semantic syntax] in MetaSonic.Source for how this
 -- module relates to the source DSL.
 
-module MetaSonic.IR
+module MetaSonic.Bridge.IR
   ( -- * Symbolic IR types
     InputConn (..)
   , NodeIR (..)
@@ -31,13 +31,13 @@ module MetaSonic.IR
     checkRateEdges
   ) where
 
-import           Control.DeepSeq    (NFData)
-import qualified Data.Map.Strict    as M
-import           GHC.Generics       (Generic)
+import           Control.DeepSeq           (NFData)
+import qualified Data.Map.Strict           as M
+import           GHC.Generics              (Generic)
 
-import           MetaSonic.Source
+import           MetaSonic.Bridge.Source
+import           MetaSonic.Bridge.Validate
 import           MetaSonic.Types
-import           MetaSonic.Validate
 
 {- Note [IR vocabulary stripping]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

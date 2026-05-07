@@ -9,16 +9,9 @@ description: >
 ---
 
 In practice, bugs rarely show up as “the whole thing is wrong.” They usually
-show up as something local:
-
-- a dependency order that looks off
-- a node annotated at the wrong rate
-- a region split that feels suspicious
-- a dense input reference that no longer resembles the source graph that produced it 
-
-The simpler fallback was scattered `print` output. That works, but it does not
-give me a stable way to move between stages — or to keep one node in view across
-transformations.
+show up as something local. The simpler fallback was scattered `print` output.
+That works, but it does not give me a stable way to move between stages — or to
+keep one node in view across transformations.
 
 A browser UI, perhaps with `threepenny-gui`, would have worked, but it felt like
 too much machinery for a tool whose data is mostly structural. Right now, a
@@ -26,7 +19,7 @@ terminal is a better fit, and `brick` keeps the inspector in the same executable
 and the same development loop. If more is needed, we can switch to something
 else. 
 
-Presently, the demo executable supports a few modes. For example:
+Presently, the demo executable supports a few modes:
 
 ```sh
 stack exec -- metasonic-bridge 
@@ -43,7 +36,7 @@ summary and then starts audio. In `--inspect-only` mode, it stops after
 inspection. An explicit `--audio-only` flag is also accepted, though that is
 just the default behavior spelled out.
 
-![TUI Inspector](https://raw.githubusercontent.com/smoge/metasonic-bridge/refs/heads/main/img/tui%3Dinspector.png)
+![TUI Inspector](https://raw.githubusercontent.com/smoge/metasonic-bridge/refs/heads/main/img/tui-inspector.png)
 
 The current interface is dead-simple: a stage-specific list on the left
 and a detail view for the selected item on the right. Navigation is

@@ -18,7 +18,7 @@
 -- See Note [Builder monad design] for why graph construction
 -- uses strict State rather than a free monad.
 
-module MetaSonic.Source
+module MetaSonic.Bridge.Source
   ( -- * Source-level types
     Connection (..)
   , UGen (..)

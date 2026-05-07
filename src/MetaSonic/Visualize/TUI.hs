@@ -32,9 +32,9 @@ import           Lens.Micro
 import           Lens.Micro.Mtl
 import           Lens.Micro.TH
 
-import           MetaSonic.Compile
-import           MetaSonic.IR
-import           MetaSonic.Source
+import           MetaSonic.Bridge.Compile
+import           MetaSonic.Bridge.IR
+import           MetaSonic.Bridge.Source
 import           MetaSonic.Types
 import           MetaSonic.Visualize.Trace
 

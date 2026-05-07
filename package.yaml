@@ -31,16 +31,16 @@ library:
   source-dirs: src
   exposed-modules:
     - MetaSonic.Types
-    - MetaSonic.Source
-    - MetaSonic.Validate
-    - MetaSonic.IR
-    - MetaSonic.Compile
-    - MetaSonic.FFI
+    - MetaSonic.Bridge.Source
+    - MetaSonic.Bridge.Validate
+    - MetaSonic.Bridge.IR
+    - MetaSonic.Bridge.Compile
+    - MetaSonic.Bridge.FFI
     - MetaSonic.Visualize.Trace
     - MetaSonic.Visualize.TUI
 
   cxx-sources:
-    - cbits/rt_graph.cpp
+    - tinysynth/rt_graph.cpp
     - vendor/q/q_io/src/audio_device.cpp
     - vendor/q/q_io/src/audio_stream.cpp
 
@@ -48,7 +48,7 @@ library:
     - -std=c++20
 
   include-dirs:
-    - cbits
+    - tinysynth
     - vendor/q
     - vendor/q/q_lib/include
     - vendor/q/q_io/include

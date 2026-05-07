@@ -1,0 +1,12 @@
+Checks: >-
+  -*, clang-analyzer-*, bugprone-*, performance-*, modernize-*, readability-*,
+  -modernize-use-trailing-return-type, -modernize-use-nodiscard,
+  -readability-magic-numbers, -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -bugprone-easily-swappable-parameters, -readability-implicit-bool-conversion
+
+WarningsAsErrors: ""
+
+HeaderFilterRegex: "^(tinysynth|src|tools)/"
+
+FormatStyle: none

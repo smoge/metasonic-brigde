@@ -21,7 +21,7 @@
 --      or symbolic lookup.
 --      See Note [Dense lowering].
 
-module MetaSonic.Compile
+module MetaSonic.Bridge.Compile
   ( -- * Runtime representation
     RuntimeInput (..)
   , RuntimeNode (..)
@@ -35,12 +35,12 @@ module MetaSonic.Compile
   , formRegions
   ) where
 
-import           Control.DeepSeq (NFData)
-import qualified Data.Map.Strict as M
-import qualified Data.Set        as S
-import           GHC.Generics    (Generic)
+import           Control.DeepSeq     (NFData)
+import qualified Data.Map.Strict     as M
+import qualified Data.Set            as S
+import           GHC.Generics        (Generic)
 
-import           MetaSonic.IR
+import           MetaSonic.Bridge.IR
 import           MetaSonic.Types
 
 {- Note [Region formation]
