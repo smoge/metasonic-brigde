@@ -56,6 +56,7 @@ import           MetaSonic.Bridge.FFI      (c_rt_graph_instance_alive,
                                             instanceStatusLive,
                                             instanceStatusReleasing,
                                             loadRuntimeGraph,
+                                            loadRuntimeGraphFused,
                                             loadTemplateGraph,
                                             withRTGraph)
 import           MetaSonic.Bridge.IR
@@ -2019,6 +2020,43 @@ crossCuttingTests = testGroup "End-to-end FFI"
           assertBool
             ("error message did not mention the fused loader: " <> show e)
             ("RFused input requires the fused loader" `isInfixOf` show e)
+
+  , -- Step C (e) smoke test: 'loadRuntimeGraphFused' loads a graph
+    -- containing 'RFused' and 'rnElided' without throwing, and the
+    -- audio path produces non-silent output. Bit-identical
+    -- equivalence with the unfused render is pinned in Step C (f).
+    testCase "loadRuntimeGraphFused: fused graph renders non-silent audio" $ do
+      let nframes = 256
+          graph = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            a <- gain o (Param 0.5)
+            out 0 a
+      rt <- case lowerGraph graph >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      -- Confirm the fused compile produced both signals: an RFused
+      -- input on Out and an elided Gain. Without these the test
+      -- would not exercise the new loader passes.
+      assertBool "fused compile produced no RFused inputs"
+        (not (null [() | n <- rgNodes rt, RFused _ <- rnInputs n]))
+      assertBool "fused compile elided no nodes"
+        (any rnElided (rgNodes rt))
+
+      samples <- withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraphFused handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _  <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                    (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          pure (map (\(CFloat x) -> x) cs)
+
+      let peak = maximum (map abs samples)
+      -- 440 Hz at 0.5 gain ⇒ peak ≈ 0.5. Non-silent confirms the
+      -- fused-input scratch materialisation reached the consumer
+      -- and the elided Gain didn't break dispatch.
+      assertBool ("expected non-silent fused render, peak = " <> show peak)
+                 (peak > 0.4 && peak < 0.55)
 
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that

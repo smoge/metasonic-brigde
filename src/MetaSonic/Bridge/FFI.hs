@@ -19,8 +19,10 @@ module MetaSonic.Bridge.FFI
     withRTGraph
   , -- * Loading a compiled graph (single-template, legacy)
     loadRuntimeGraph
+  , loadRuntimeGraphFused
   , -- * Loading a compiled template graph (multi-template, §2.D.3)
     loadTemplateGraph
+  , loadTemplateGraphFused
   , -- * Realtime audio lifecycle
     startAudio
   , waitAudioStarted
@@ -42,6 +44,8 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_template_set_default
   , c_rt_graph_template_connect
   , c_rt_graph_template_add_region
+  , c_rt_graph_template_set_node_elided
+  , c_rt_graph_template_connect_fused_scale_input
   , c_rt_graph_template_instance_add
   , c_rt_graph_instance_remove
   , c_rt_graph_instance_release
@@ -63,11 +67,12 @@ module MetaSonic.Bridge.FFI
 
 import           Control.Exception          (bracket)
 import qualified Control.Monad              as M (void)
-import           Control.Monad              (forM_)
+import           Control.Monad              (forM_, when)
 import           Foreign
 import           Foreign.C.Types
 
-import           MetaSonic.Bridge.Compile   (RuntimeGraph (..), RuntimeInput (..),
+import           MetaSonic.Bridge.Compile   (FusedInput (..), RuntimeGraph (..),
+                                             RuntimeInput (..),
                                              RuntimeNode (..),
                                              RuntimeRegion (..))
 import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
@@ -366,6 +371,27 @@ foreign import ccall unsafe "rt_graph_template_add_region"
   c_rt_graph_template_add_region
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
 
+-- | Step C (e): mark a node in the named template as elided. The
+-- node's kernel is skipped during dispatch but its 'NodeIndex' and
+-- controls remain addressable. See 'rt_graph_template_set_node_elided'
+-- in @rt_graph.h@.
+foreign import ccall unsafe "rt_graph_template_set_node_elided"
+  c_rt_graph_template_set_node_elided
+    :: Ptr RTGraph -> CInt -> CInt -> IO ()
+
+-- | Step C (e): wire one input port through a fused scaled-source
+-- form. The runtime materialises the value as
+-- @src[i] * float(scale_node.controls[scale_control_index])@ into a
+-- per-instance scratch slot at resolve time. See
+-- 'rt_graph_template_connect_fused_scale_input' in @rt_graph.h@.
+foreign import ccall unsafe "rt_graph_template_connect_fused_scale_input"
+  c_rt_graph_template_connect_fused_scale_input
+    :: Ptr RTGraph -> CInt
+    -> CInt -> CInt
+    -> CInt -> CInt
+    -> CInt -> CInt
+    -> IO ()
+
 -- | Spawn a fresh instance of the named template. Returns globally-
 -- unique instance_id (>= 0) or -1 on failure.
 foreign import ccall unsafe "rt_graph_template_instance_add"
@@ -588,21 +614,121 @@ loadRuntimeGraph g rg = do
           RConst _ ->
             pure ()
           RFused _ ->
-            -- Step C: 'fuseRuntimeGraph' is the only source of
-            -- RFused, and the legacy single-template loader does not
-            -- yet teach the C++ side about it (Step C (d/e) will add
-            -- a dedicated fused loader path). Failing fast here is
-            -- deliberate: silently dropping the fused input would
-            -- leave the consumer's port unwired, miswiring the
-            -- runtime graph in a way that produces wrong audio with
-            -- no obvious failure. Until the fused loader lands,
-            -- callers must hand fused graphs to that path explicitly.
+            -- 'fuseRuntimeGraph' is the only source of RFused. The
+            -- unfused single-template loader rejects it explicitly:
+            -- silently dropping the fused input would leave the
+            -- consumer's port unwired, miswiring the runtime graph
+            -- in a way that produces wrong audio with no obvious
+            -- failure. Use 'loadRuntimeGraphFused' for fused graphs.
             fail "loadRuntimeGraph: RFused input requires the fused \
-                 \loader (not yet implemented); pass an unfused \
-                 \RuntimeGraph or wait for Step C (e)."
+                 \loader; use loadRuntimeGraphFused or pass an \
+                 \unfused RuntimeGraph."
 
     addRegion :: CInt -> RuntimeRegion -> IO ()
     addRegion = addRegionTo g
+
+{- Note [loadRuntimeGraphFused protocol]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Step C (e) sibling of 'loadRuntimeGraph'. Accepts both fused and
+unfused 'RuntimeGraph' values; on a graph that contains no 'RFused'
+inputs and no 'rnElided' nodes, the wire-level effect is identical
+to 'loadRuntimeGraph'. On a fused graph it additionally:
+
+  Pass 2b — emits 'rt_graph_template_connect_fused_scale_input' for
+            every 'RFused' input. Must follow Pass 2 (regular wires)
+            so the override lands on a fully-wired spec, and must
+            precede the region pass so the FusedScaleRef is in place
+            before any later instance spawn allocates scratch.
+  Pass 2c — emits 'rt_graph_template_set_node_elided' for every
+            elided node. Order vs. 2b doesn't matter — the dispatch
+            skip and the resolver redirection are independent —
+            but doing it last keeps the audit trail
+            "wire everything, then mark nodes that get skipped."
+
+The single-template auto-spawn ('rt_graph_clear' creates instance 0)
+runs before any of these passes. The fused-connect helper grows
+that pre-existing instance's 'fused_scratch' in lockstep, so by the
+time the audio callback can fire, every live instance has the
+right slot count.
+-}
+
+-- | Step C (e): fused-aware single-template loader. Equivalent to
+-- 'loadRuntimeGraph' on graphs from 'compileRuntimeGraph' (no
+-- 'RFused' / no 'rnElided'); on graphs from
+-- 'compileRuntimeGraphFused' it additionally wires fused-scale
+-- inputs and marks elided nodes via the dedicated ABI entries.
+--
+-- See Note [loadRuntimeGraphFused protocol].
+loadRuntimeGraphFused :: Ptr RTGraph -> RuntimeGraph -> IO ()
+loadRuntimeGraphFused g rg = do
+  c_rt_graph_clear g
+  mapM_ ensureBusForNode (rgNodes rg)
+  mapM_ addNode (rgNodes rg)
+  -- Pass 2: regular RFrom wiring. RFused / RConst are no-ops here;
+  -- the fused inputs land in pass 2b instead of failing.
+  mapM_ wireNode (rgNodes rg)
+  -- Pass 2b: register fused-scale overrides. Each RFused input
+  -- becomes one 'rt_graph_template_connect_fused_scale_input' call
+  -- on template 0.
+  mapM_ wireFusedNode (rgNodes rg)
+  -- Pass 2c: mark elided nodes so dispatch skips them. Must run
+  -- after fused inputs are registered (the resolver redirects via
+  -- the fused override regardless of the elided bit, but a node
+  -- left elided without a fused override on every consumer would
+  -- still be skipped and produce silence).
+  mapM_ markElided (rgNodes rg)
+  -- Pass 3: region overlay (same as the unfused loader).
+  mapM_ (addRegionTo g 0) (rgRuntimeRegions rg)
+  where
+    addNode :: RuntimeNode -> IO ()
+    addNode node = do
+      c_rt_graph_add_node g
+        (cNodeIndex (rnIndex node))
+        (kindTag    (rnKind  node))
+      forM_ (zip [0 ..] (rnControls node)) $ \(i, v) ->
+        c_rt_graph_set_control g
+          (cNodeIndex    (rnIndex node))
+          (cControlIndex (ControlIndex i))
+          (CDouble v)
+
+    ensureBusForNode :: RuntimeNode -> IO ()
+    ensureBusForNode node =
+      case busIndexOf node of
+        Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
+        Nothing  -> pure ()
+
+    wireNode :: RuntimeNode -> IO ()
+    wireNode node =
+      forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+        case inp of
+          RFrom src srcPort ->
+            c_rt_graph_connect g
+              (cNodeIndex src)
+              (cPortIndex srcPort)
+              (cNodeIndex (rnIndex node))
+              (cPortIndex (PortIndex i))
+          RConst _ -> pure ()
+          RFused _ -> pure ()  -- handled in wireFusedNode
+
+    wireFusedNode :: RuntimeNode -> IO ()
+    wireFusedNode node =
+      forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+        case inp of
+          RFused (FScaleFrom srcN srcP scaleN scaleC) ->
+            c_rt_graph_template_connect_fused_scale_input g 0
+              (cNodeIndex (rnIndex node))
+              (cPortIndex (PortIndex i))
+              (cNodeIndex srcN)
+              (cPortIndex srcP)
+              (cNodeIndex scaleN)
+              (cControlIndex scaleC)
+          _ -> pure ()
+
+    markElided :: RuntimeNode -> IO ()
+    markElided node =
+      when (rnElided node) $
+        c_rt_graph_template_set_node_elided g 0
+          (cNodeIndex (rnIndex node))
 
 {- Note [loadTemplateGraph protocol]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -704,14 +830,84 @@ loadTemplateGraph g tg = do
               pure ()
             RFused _ ->
               -- See the matching note in 'loadRuntimeGraph': fail
-              -- fast rather than miswire. Step C (e) will add a
-              -- fused-aware loader path; until then the multi-
-              -- template loader rejects fused inputs explicitly.
+              -- fast rather than miswire. Use 'loadTemplateGraphFused'
+              -- to ship fused inputs across the FFI.
               fail "loadTemplateGraph: RFused input requires the \
-                   \fused loader (not yet implemented); pass an \
-                   \unfused RuntimeGraph or wait for Step C (e)."
+                   \fused loader; use loadTemplateGraphFused or \
+                   \pass an unfused TemplateGraph."
       -- Pass 3: register the region overlay for this template.
       -- See Note [Region fallback] in rt_graph.cpp.
+      mapM_ (addRegionTo g cTid) (rgRuntimeRegions rg)
+
+-- | Step C (e): fused-aware multi-template loader. Sibling of
+-- 'loadTemplateGraph' that handles 'RFused' inputs and 'rnElided'
+-- nodes via the fused-scale ABI. Each template's per-spec passes
+-- run in the same order as 'loadRuntimeGraphFused':
+--
+--   1. ensure-bus
+--   2. add-node + set-default
+--   3. wire RFrom connections
+--   3b. wire RFused inputs (template-aware fused-scale ABI)
+--   3c. mark elided nodes
+--   4. region overlay
+--
+-- The per-template instance spawn happens after all of these so
+-- 'make_instance' picks up the spec's full @fused_input_count@ and
+-- allocates scratch in one shot. See
+-- Note [loadRuntimeGraphFused protocol] for the rationale on order.
+loadTemplateGraphFused :: Ptr RTGraph -> TemplateGraph -> IO ()
+loadTemplateGraphFused g tg = do
+  c_rt_graph_clear g
+  c_rt_graph_instance_remove g 0
+  forM_ (zip [0 ..] (tgTemplates tg)) $ \(i, tpl) -> do
+    cTid <- if i == (0 :: Int)
+              then pure 0
+              else c_rt_graph_template_add g
+    populateTemplate cTid (tplGraph tpl)
+    M.void $ c_rt_graph_template_instance_add g cTid
+  where
+    populateTemplate :: CInt -> RuntimeGraph -> IO ()
+    populateTemplate cTid rg = do
+      forM_ (rgNodes rg) $ \node ->
+        case busIndexOf node of
+          Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
+          Nothing  -> pure ()
+      forM_ (rgNodes rg) $ \node -> do
+        c_rt_graph_template_add_node g cTid
+          (cNodeIndex (rnIndex node))
+          (kindTag    (rnKind  node))
+        forM_ (zip [0 ..] (rnControls node)) $ \(ci, v) ->
+          c_rt_graph_template_set_default g cTid
+            (cNodeIndex    (rnIndex node))
+            (cControlIndex (ControlIndex ci))
+            (CDouble v)
+      forM_ (rgNodes rg) $ \node ->
+        forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+          case inp of
+            RFrom src srcPort ->
+              c_rt_graph_template_connect g cTid
+                (cNodeIndex src)
+                (cPortIndex srcPort)
+                (cNodeIndex (rnIndex node))
+                (cPortIndex (PortIndex i))
+            RConst _ -> pure ()
+            RFused _ -> pure ()  -- handled in the fused-input pass
+      forM_ (rgNodes rg) $ \node ->
+        forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+          case inp of
+            RFused (FScaleFrom srcN srcP scaleN scaleC) ->
+              c_rt_graph_template_connect_fused_scale_input g cTid
+                (cNodeIndex (rnIndex node))
+                (cPortIndex (PortIndex i))
+                (cNodeIndex srcN)
+                (cPortIndex srcP)
+                (cNodeIndex scaleN)
+                (cControlIndex scaleC)
+            _ -> pure ()
+      forM_ (rgNodes rg) $ \node ->
+        when (rnElided node) $
+          c_rt_graph_template_set_node_elided g cTid
+            (cNodeIndex (rnIndex node))
       mapM_ (addRegionTo g cTid) (rgRuntimeRegions rg)
 
 {- Note [Realtime audio lifecycle]
