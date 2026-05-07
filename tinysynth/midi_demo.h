@@ -103,12 +103,15 @@ struct rt_midi_pitch_bend_binding {
 //                      pool with that many spawn-then-remove cycles
 //                      so that VoiceAllocator can find Available
 //                      slots on its first reserve.
-// midi_device_index  : -1 selects Q's hardcoded default (device 0,
-//                      explicitly reset on every -1 call so prior
-//                      explicit opens don't leave a sticky default).
-//                      Out-of-range or missing-device cases yield a
-//                      handle whose worker thread observes no device
-//                      and stays idle.
+// midi_device_index  : -1 selects device 0 (Q's canonical default).
+//                      The worker resolves this by walking
+//                      q::midi_device::list() and matching by id; we
+//                      never touch Q's process-global default_device_id,
+//                      so -1 is stable across calls regardless of
+//                      earlier explicit-device opens elsewhere in the
+//                      process. Out-of-range or no-input-device cases
+//                      yield a handle whose worker observes no usable
+//                      device and stays idle (has_device == 0).
 // voice_mapping      : required.
 // cc_mappings        : may be null when count == 0.
 // cc_mapping_count   : 0..32 (capped at MidiVoiceProcessor's

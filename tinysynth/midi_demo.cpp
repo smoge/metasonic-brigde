@@ -67,21 +67,28 @@ struct rt_midi_demo {
   rt_midi_voice_mapping             voice_mapping;
   metasonic::VoiceAllocator         alloc;
   metasonic::MidiVoiceProcessor     proc;
-  // Held in std::optional and only emplaced when q::midi_device::list()
-  // reports at least one device. On hosts without /dev/snd/seq access
-  // (no ALSA seq, sandboxed CI, headless Docker), Q's
-  // q::midi_input_stream() default-ctor calls Pm_OpenInput on device 0
-  // unconditionally, prints "open /dev/snd/seq failed", and the dtor's
-  // Pm_Close(nullptr) can crash on some PortMIDI builds. Keeping the
-  // stream optional means we never construct it (and never run its
-  // dtor) on no-device hosts.
+  // Held in std::optional so we can skip emplace entirely when the
+  // device list doesn't include a valid input device at the requested
+  // id. Q's q::midi_input_stream dtor calls Pm_Close(_impl)
+  // unconditionally; on some PortMIDI builds Pm_Close(nullptr) crashes,
+  // so any code path that constructs the stream with _impl == nullptr
+  // (output-only device, missing /dev/snd/seq, busy device, ...)
+  // becomes a latent crash. The worker's probe below narrows
+  // construction to "id matches a device with num_inputs() > 0";
+  // the residual rare path (probe says OK, Pm_OpenInput races with a
+  // hot-unplug) still hits the same dtor and needs a vendor patch.
   std::optional<cycfi::q::midi_input_stream> stream;
   std::atomic<bool>                 stop;
   std::atomic<int>                  has_device;  // 0 / 1, set by worker
+  // Caller-supplied device index. -1 means "Q's canonical default
+  // (device 0)" — resolved by the worker so we don't have to touch
+  // Q's process-global default_device_id at all.
+  int                               midi_device_index;
   std::thread                       worker;
 
   rt_midi_demo(RTGraph *g, int tid, int polyphony,
                const rt_midi_voice_mapping &mapping,
+               int dev_idx,
                std::uint16_t channel_mask)
     : graph(g),
       voice_mapping(mapping),
@@ -89,31 +96,49 @@ struct rt_midi_demo {
       proc(alloc, channel_mask),
       stream(std::nullopt),
       stop(false),
-      has_device(0) {}
+      has_device(0),
+      midi_device_index(dev_idx) {}
 
   void run() noexcept {
-    // Probe device availability before constructing the stream.
-    // q::midi_device::list() calls Pm_Initialize and Pm_CountDevices,
-    // both of which return error codes rather than crashing on hosts
-    // that lack ALSA seq access. Only emplace the stream if at least
-    // one device is reported AND construction succeeds with
-    // is_valid() == true; otherwise the worker idles.
+    // Walk q::midi_device::list() and only construct the stream
+    // when we find a device whose id matches our target AND that
+    // reports num_inputs() > 0. This rules out three crash classes
+    // up front:
+    //   * No-device host (list is empty -> no emplace).
+    //   * Output-only device at the target id (num_inputs == 0 ->
+    //     no emplace; Pm_OpenInput would have set _impl to null).
+    //   * Out-of-range id (no match -> no emplace).
+    // q::midi_device::list() calls Pm_Initialize + Pm_CountDevices,
+    // both of which return error codes on no-/dev/snd/seq hosts
+    // rather than crashing.
     bool ok = false;
     try {
-      if (!cycfi::q::midi_device::list().empty()) {
-        stream.emplace();
-        ok = stream->is_valid();
-        if (!ok) stream.reset();  // skip the Pm_Close(nullptr) dtor path
+      const auto devices = cycfi::q::midi_device::list();
+      const int target =
+          midi_device_index < 0 ? 0 : midi_device_index;
+      for (const auto &d : devices) {
+        if (static_cast<int>(d.id()) == target && d.num_inputs() > 0) {
+          stream.emplace(d);
+          ok = stream->is_valid();
+          // If is_valid() is false here, Pm_OpenInput failed
+          // despite the probe — typically a hot-unplug racing with
+          // open. We deliberately do NOT call stream.reset(): that
+          // would invoke ~midi_input_stream() right now, and on some
+          // PortMIDI builds Pm_Close(nullptr) crashes. Leaving the
+          // optional engaged means the same dtor still runs at
+          // ~rt_midi_demo, but at least we don't double-trigger it
+          // and the worker's `if (ok)` below skips processing.
+          break;
+        }
       }
     } catch (...) {
-      // PortMIDI / ALSA enumeration failed catastrophically; stay idle.
-      stream.reset();
+      // PortMIDI / ALSA enumeration crashed; stay idle.
       ok = false;
     }
     has_device.store(ok ? 1 : 0, std::memory_order_release);
 
     while (!stop.load(std::memory_order_acquire)) {
-      if (stream) {
+      if (stream && ok) {
         for (int i = 0; i < kEventsPerPass; ++i) {
           stream->process(proc);
         }
@@ -138,20 +163,22 @@ rt_midi_demo_open(RTGraph                            *graph,
                   std::uint16_t                       channel_mask) {
   if (!graph || !voice_mapping) return nullptr;
 
-  // Q's set_default_device is a static module-level setting consulted
-  // by the next midi_input_stream() default-ctor invocation. The
-  // initial value (before any set_default_device call in this process)
-  // is 0 = first enumerated device. To keep -1 idempotent regardless
-  // of earlier opens that may have left a non-zero default behind, we
-  // explicitly reset to 0 on -1; otherwise honour the requested index.
-  cycfi::q::midi_input_stream::set_default_device(
-      midi_device_index >= 0 ? midi_device_index : 0);
+  // Note: we deliberately do NOT call
+  // cycfi::q::midi_input_stream::set_default_device here. The worker
+  // resolves midi_device_index itself (via q::midi_device::list() and
+  // the device-aware ctor), so Q's process-global default never
+  // matters. This makes -1 stable across calls regardless of earlier
+  // explicit-device opens elsewhere in the process.
 
   rt_midi_demo *h = nullptr;
   try {
     h = new rt_midi_demo(graph, template_id, polyphony, *voice_mapping,
-                          channel_mask);
-  } catch (const std::bad_alloc &) {
+                          midi_device_index, channel_mask);
+  } catch (...) {
+    // Any standard exception (bad_alloc, length_error from
+    // VoiceAllocator's vector resize on pathological polyphony,
+    // bad_array_new_length, ...) must not cross extern "C". Anything
+    // non-standard would also UB on Haskell side, so swallow all.
     return nullptr;
   }
 
@@ -173,7 +200,9 @@ rt_midi_demo_open(RTGraph                            *graph,
 
   try {
     h->worker = std::thread([h]() { h->run(); });
-  } catch (const std::system_error &) {
+  } catch (...) {
+    // Same blanket catch as construction: thread spawn can throw
+    // std::system_error (resource exhaustion) or std::bad_alloc.
     delete h;
     return nullptr;
   }
