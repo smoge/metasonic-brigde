@@ -805,6 +805,7 @@ ugenKind = \case
   BusIn{}         -> KBusIn
   BusInDelayed{}  -> KBusInDelayed
   Delay{}         -> KDelay
+  Smooth{}        -> KSmooth
 
 -- The empty graph: no nodes at all.
 emptyGraph_ :: SynthGraph
@@ -1599,6 +1600,36 @@ crossCuttingTests = testGroup "End-to-end FFI"
             ("expected post-delay peak ≈ 1.0, got " <> show peakPost)
             (abs (peakPost - 1.0) < 0.05)
 
+  , testCase "smooth: Param target seeds the smoother to steady state" $ do
+      -- End-to-end FFI proof for Phase 3.3c. Smooth wraps
+      -- q::dynamic_smoother and seeds its IIR state to the first
+      -- input sample on the first process call, so a fresh graph
+      -- with a constant Param target should emit that target value
+      -- across the entire first block — no "ramp from zero" attack.
+      let nframes = 256
+          target  = 0.5 :: Float
+          graph   = runSynth $ do
+            s <- smooth 20.0 (Param (realToFrac target))
+            out 0 s
+
+      rt <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          let samples = map (\(CFloat x) -> x) cs
+              maxDev  = maximum (map (\x -> abs (x - target)) samples)
+          assertBool
+            ("smooth seeded steady-state should hold target " <> show target
+              <> " across the whole block, got max deviation " <> show maxDev)
+            (maxDev < 1e-4)
+
   , testCase "Env(gate=0) idle stays silent" $ do
       let nframes = 256
           graph = runSynth $ do
@@ -1915,6 +1946,8 @@ data Op
   | ODelay          Double Double Int
                                      -- max-time (s), time const (s), signal-idx
   | ODelayMod       Double Int Int   -- max-time (s), signal-idx, time-source-idx
+  | OSmooth         Double Double    -- base-freq (Hz), constant target value
+  | OSmoothMod      Double Int       -- base-freq (Hz), audio-source-idx
   | OOut            Int Int          -- channel, source-index
   deriving (Eq, Show)
 
@@ -1945,6 +1978,8 @@ genOp = oneof
                   <*> nonNegInt
   , ODelayMod     <$> choose (0.001, 0.05)
                   <*> nonNegInt <*> nonNegInt
+  , OSmooth       <$> choose (5.0, 500.0)  <*> choose (-1.0, 1.0)
+  , OSmoothMod    <$> choose (5.0, 500.0)  <*> nonNegInt
   , OOut          <$> choose (0, 1) <*> nonNegInt
   ]
   where
@@ -2112,6 +2147,20 @@ interpret = go [] S.empty
               sig = xs !! (i `mod` m)
               tin = xs !! (j `mod` m)
           c <- delayL maxT sig tin
+          go (xs <> [c]) r rest
+
+    -- Smooth on a Param target — the typical CC-update use case.
+    go xs r (OSmooth baseHz t : rest) = do
+      c <- smooth baseHz (Param t)
+      go (xs <> [c]) r rest
+
+    -- Smooth on an audio source — exercises the connected-input path
+    -- of the kernel.
+    go xs r (OSmoothMod baseHz i : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let src = xs !! (i `mod` length xs)
+          c <- smooth baseHz src
           go (xs <> [c]) r rest
 
     go xs r (OOut ch i : rest)

@@ -43,6 +43,7 @@ module MetaSonic.Bridge.Source
   , busIn
   , busInDelayed
   , delayL
+  , smooth
   , -- * Connection helpers
     audio
   , -- * Uniform UGen view
@@ -402,6 +403,21 @@ data UGen
     --
     -- The output is the envelope amplitude in [0, 1] at sample
     -- rate. Multiply with a signal to apply the envelope.
+  | Smooth !Double !Connection
+    -- ^ One-pole-style smoother (Q's @q::dynamic_smoother@):
+    -- @smooth base_freq_hz value@. The first argument is a
+    -- compile-time smoothing speed in Hz (smaller = slower /
+    -- smoother / laggier; ~20 Hz is a typical sweet spot for
+    -- control smoothing). The second argument is the value to
+    -- smooth — usually a 'Param' that the producer thread
+    -- updates via the realtime ABI when CC or pitch-bend events
+    -- arrive, so that block-rate jumps in the target value land
+    -- as continuous ramps in the smoothed output.
+    --
+    -- Stateful: the smoother carries internal IIR history across
+    -- blocks. Per-instance state (no shared resource), so 'Eff'
+    -- is 'Pure'; rate is 'SampleRate'. See Note [Per-node smooth
+    -- state] in @tinysynth/rt_graph.cpp@.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -652,6 +668,31 @@ delayL
   -> SynthM Connection
 delayL maxT sig time = insertNodeC "delay" (Delay maxT sig time)
 
+-- | One-pole-style smoother (Q's @q::dynamic_smoother@) for de-zippering
+-- block-rate control updates.
+--
+-- The first argument is a compile-time smoothing speed in Hz: smaller
+-- values mean a slower / smoother / laggier ramp. ~20 Hz is a typical
+-- sweet spot for control smoothing (~50ms time constant). The second
+-- argument is the value to smooth — usually a 'Param' that the
+-- producer thread updates via the realtime ABI when CC or pitch-bend
+-- events arrive, so the smoother turns block-rate jumps in the target
+-- value into continuous ramps in its sample-rate output.
+--
+-- > out <- runSynth $ do
+-- >   target <- pure (Param 0.0)         -- producer-thread updated
+-- >   amount <- smooth 20.0 target       -- de-zipper
+-- >   sig    <- sinOsc (Param 440.0) (Param 0.0)
+-- >   amped  <- gain sig amount
+-- >   out 0 amped
+--
+-- See Note [Per-node smooth state] in @tinysynth/rt_graph.cpp@.
+smooth
+  :: Double      -- ^ base smoothing frequency in Hz (compile-time)
+  -> Connection  -- ^ value to smooth (often a 'Param')
+  -> SynthM Connection
+smooth baseHz v = insertNodeC "smooth" (Smooth baseHz v)
+
 -- | Read the previous block's accumulated contents of a shared audio
 -- bus. The feedback primitive: unlike 'busIn', a 'busInDelayed' creates
 -- *no* ordering constraint with a same-bus 'busOut', so a graph that
@@ -747,6 +788,7 @@ ugenView = \case
   BusIn bus         -> UGenView KBusIn        []     [fromIntegral bus]
   BusInDelayed bus  -> UGenView KBusInDelayed []     [fromIntegral bus]
   Delay maxT s t    -> UGenView KDelay        [s, t] [maxT, connDefault t]
+  Smooth baseHz v   -> UGenView KSmooth       [v]    [baseHz, connDefault v]
 
 {- Note [Per-UGen projections]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -870,6 +912,7 @@ dependencies = \case
   Gain a b         -> deps [a, b]
   Add a b          -> deps [a, b]
   Env g _ _ _ _    -> deps [g]
+  Smooth _ v       -> deps [v]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

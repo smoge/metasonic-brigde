@@ -185,6 +185,16 @@ data NodeKind
     -- @q::delay@ (a 'fractional_ring_buffer' with linear interpolation),
     -- so the delay time can be sub-sample and modulated at audio rate.
     -- See Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
+  | KSmooth
+    -- ^ One-pole-style smoother (wraps Q's @q::dynamic_smoother@).
+    -- Audio input port 0 is the value to smooth; controls
+    -- @[base_freq_hz, target_default]@ pick the smoothing speed and
+    -- the steady-state value when the input port is unconnected.
+    -- The headline use is desipping zipper noise on block-rate CC
+    -- and pitch-bend updates: producer-thread events update
+    -- 'controls[1]' (the target) and downstream consumers read the
+    -- smoothed sample-by-sample output. See Note
+    -- [Per-node smooth state] in @tinysynth/rt_graph.cpp@.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -298,6 +308,12 @@ kindSpec = \case
   -- [max_delay_seconds, delay_time_default]. The runtime allocates
   -- the buffer lazily at first process() using control 0.
   KDelay        -> KindSpec 13 SampleRate  2 2 "delay"
+  -- Smoother: per-node q::dynamic_smoother. 1 audio input (the
+  -- value to smooth, often a Param the producer thread updates via
+  -- the realtime ABI), 2 controls [base_freq_hz, target_default].
+  -- Stateful (the smoother carries low1/low2 history across blocks)
+  -- so the floor is SampleRate.
+  KSmooth       -> KindSpec 14 SampleRate  1 2 "smooth"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to the

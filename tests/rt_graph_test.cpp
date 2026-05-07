@@ -75,12 +75,13 @@ TEST_CASE("kind_from_tag accepts every defined tag") {
     CHECK(rt_graph_kind_supported(11) == 1); // BusIn
     CHECK(rt_graph_kind_supported(12) == 1); // BusInDelayed
     CHECK(rt_graph_kind_supported(13) == 1); // Delay
+    CHECK(rt_graph_kind_supported(14) == 1); // Smooth
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
     CHECK(rt_graph_kind_supported(4) == 0);  // intentional gap
-    CHECK(rt_graph_kind_supported(14) == 0); // first unallocated past KDelay
+    CHECK(rt_graph_kind_supported(15) == 0); // first unallocated past KSmooth
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
 }
@@ -1209,6 +1210,182 @@ TEST_CASE("Two Delay nodes in one graph keep independent ring-buffer state") {
     // The two transition points must be far apart — independent state,
     // not a shared buffer that splits the difference.
     CHECK((long_at - short_at) > 100);
+}
+
+// ----------------------------------------------------------------
+// Smooth: per-node q::dynamic_smoother kernel (Phase 3.3c)
+// ----------------------------------------------------------------
+
+TEST_CASE("Smooth: seeds to the target on first block (no ramp from zero)") {
+    // Smooth wraps q::dynamic_smoother. First call seeds the IIR
+    // state to the first input sample so the kernel does not
+    // produce a "ramp from zero" attack on the very first block.
+    // With the audio input unconnected the target comes from
+    // controls[1]; the smoother should emit that target throughout
+    // the block.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 14);                         // Smooth
+    rt_graph_set_control(g, 0, 0, 20.0);                 // base_freq
+    rt_graph_set_control(g, 0, 1, 0.5);                  // target
+    rt_graph_add_node(g, 1, 2);                          // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    for (auto x : samples) {
+        CHECK(x == doctest::Approx(0.5f).epsilon(1e-4));
+    }
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Smooth: small target change ramps without zipper") {
+    // q::dynamic_smoother is adaptive: a *large* step triggers
+    // bandpass-driven cutoff boost and tracks it quickly. A
+    // *small* CC-sized change (the realistic Phase 3.3 use case)
+    // produces a smooth ramp without aggressive adaptation. This
+    // test verifies the smooth case: target steps from 0 → 0.05
+    // and the per-sample delta stays well below the step.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 14);
+    rt_graph_set_control(g, 0, 0, 20.0);                 // typical CC base
+    rt_graph_set_control(g, 0, 1, 0.0);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto block1 = render_bus0(g, kFrames);
+    REQUIRE(block1[kFrames-1] == doctest::Approx(0.0f).epsilon(1e-4));
+
+    rt_graph_set_control(g, 0, 1, 0.05);                 // small CC-sized step
+    auto block2 = render_bus0(g, kFrames);
+
+    // The first sample of block 2 is essentially at the previous
+    // block's last value — no instantaneous jump.
+    CHECK(std::abs(block2[0] - block1[kFrames-1]) < 0.005f);
+    // Some progress made within the block (smoothing is happening,
+    // not frozen).
+    CHECK(block2[kFrames-1] > 0.0f);
+    // Per-sample deltas stay well below the step magnitude (0.05).
+    // A non-smoothing kernel would emit one big jump and zeros.
+    for (std::size_t i = 1; i < block2.size(); ++i) {
+        CHECK(std::abs(block2[i] - block2[i-1]) < 0.005f);
+    }
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Smooth: smaller base_freq has a smaller initial response than larger") {
+    // q::dynamic_smoother is adaptive — over a 1024-sample window
+    // even base_freq=2 Hz ramps most of the way to target. The
+    // base_freq difference is sharpest at the FIRST post-step
+    // sample, where the smoother has not yet had time for the
+    // bandpass to lift the cutoff. The slow smoother emits a
+    // negligible response on sample 0; the fast one moves
+    // measurably.
+    auto first_sample = [](float freq) -> float {
+        auto *g = rt_graph_create(2, kFrames);
+        REQUIRE(g != nullptr);
+        rt_graph_add_node(g, 0, 14);
+        rt_graph_set_control(g, 0, 0, freq);
+        rt_graph_set_control(g, 0, 1, 0.0);
+        rt_graph_add_node(g, 1, 2);
+        rt_graph_set_control(g, 1, 0, 0.0);
+        rt_graph_connect(g, 0, 0, 1, 0);
+
+        rt_graph_process(g, kFrames);                    // settle at 0
+        rt_graph_set_control(g, 0, 1, 0.05);             // small step
+        auto block = render_bus0(g, kFrames);
+        const float result = block[0];
+        rt_graph_destroy(g);
+        return result;
+    };
+
+    const float slow = first_sample(2.0f);
+    const float fast = first_sample(2000.0f);
+    INFO("slow=" << slow << " fast=" << fast);
+    // Both produce a positive response (smoothing isn't broken).
+    CHECK(fast > 0.0f);
+    CHECK(slow >= 0.0f);
+    // Fast initial response is orders of magnitude larger than
+    // slow. (Concrete numbers from q::dynamic_smoother on a small
+    // step at sample 0: slow ≈ 1e-9, fast ≈ 1e-3.)
+    CHECK(fast > slow * 1000.0f);
+}
+
+TEST_CASE("Smooth: two nodes in one graph hold independent state") {
+    // Same small step, different base_freq → different first-
+    // sample responses. Confirms each Smooth carries its own
+    // q::dynamic_smoother (no shared coefficients across the
+    // variant-wrapped state).
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);                           // Out node 3 writes here
+
+    rt_graph_add_node(g, 0, 14);                         // Smooth A (slow)
+    rt_graph_set_control(g, 0, 0, 2.0);
+    rt_graph_set_control(g, 0, 1, 0.0);
+    rt_graph_add_node(g, 1, 14);                         // Smooth B (fast)
+    rt_graph_set_control(g, 1, 0, 2000.0);
+    rt_graph_set_control(g, 1, 1, 0.0);
+
+    rt_graph_add_node(g, 2, 2);                          // Out → bus 0
+    rt_graph_set_control(g, 2, 0, 0.0);
+    rt_graph_add_node(g, 3, 2);                          // Out → bus 1
+    rt_graph_set_control(g, 3, 0, 1.0);
+    rt_graph_connect(g, 0, 0, 2, 0);
+    rt_graph_connect(g, 1, 0, 3, 0);
+
+    rt_graph_process(g, kFrames);                        // settle
+    rt_graph_set_control(g, 0, 1, 0.05);                 // small step (slow)
+    rt_graph_set_control(g, 1, 1, 0.05);                 // small step (fast)
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0(kFrames, 0.0f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
+
+    INFO("bus0[0]=" << bus0[0] << " bus1[0]=" << bus1[0]);
+    // Independent state shows up cleanly at sample 0 of the post-
+    // step block: fast smoother responds, slow smoother barely
+    // does.
+    CHECK(bus1[0] > bus0[0] * 1000.0f);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Smooth: connected audio input flows through with no zipper at boundaries") {
+    // When port 0 is connected, the kernel runs the smoother over
+    // the audio input. Feed a SinOsc at 100 Hz; the output should
+    // closely track the input (the smoother is wide-cutoff at
+    // 5 kHz here, well above the carrier) without any block-
+    // boundary glitch.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                          // SinOsc
+    rt_graph_set_control(g, 0, 0, 100.0);
+    rt_graph_add_node(g, 1, 14);                         // Smooth
+    rt_graph_set_control(g, 1, 0, 5000.0);               // wide cutoff
+    rt_graph_set_control(g, 1, 1, 0.0);
+    rt_graph_add_node(g, 2, 2);                          // Out
+    rt_graph_set_control(g, 2, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    auto block1 = render_bus0(g, kFrames);
+    auto block2 = render_bus0(g, kFrames);
+    // Output is bounded and oscillating (passed through, not
+    // squashed to silence).
+    CHECK(peak_abs(block1) > 0.5f);
+    CHECK(peak_abs(block2) > 0.5f);
+    // Block boundary is continuous: |block2[0] - block1[end]| is
+    // small relative to the carrier amplitude (~1.0).
+    CHECK(std::abs(block2[0] - block1[kFrames - 1]) < 0.3f);
+
+    rt_graph_destroy(g);
 }
 
 TEST_CASE("Two LPF nodes in one graph hold independent biquad state") {

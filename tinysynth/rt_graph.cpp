@@ -14,6 +14,7 @@
 
 #include <q/fx/biquad.hpp>
 #include <q/fx/delay.hpp>
+#include <q/fx/lowpass.hpp>
 #include <q/support/duration.hpp>
 #include <q/support/phase.hpp>
 #include <q/synth/envelope_gen.hpp>
@@ -316,6 +317,7 @@ enum class NodeKind : int {
   BusIn        = 11,
   BusInDelayed = 12,
   Delay        = 13,
+  Smooth       = 14,
 };
 
 // Single source of truth for the integer-tag → NodeKind mapping.
@@ -337,6 +339,7 @@ kind_from_tag(int node_kind) noexcept {
   case 11: return NodeKind::BusIn;
   case 12: return NodeKind::BusInDelayed;
   case 13: return NodeKind::Delay;
+  case 14: return NodeKind::Smooth;
   default: return std::nullopt;
   }
 }
@@ -451,10 +454,30 @@ struct DelayState {
   float  last_sps      = -1.0f;
 };
 
+/* Note [Per-node smooth state]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Smooth nodes wrap Q's q::dynamic_smoother (a 2-pole self-modulating
+smoother). The smoother is constructed lazily on first process() so
+we can hand it the active sample rate (kDefaultSampleRate is a
+placeholder until rt_graph_start_audio installs the real one).
+last_base_freq / last_sps drive a reconfigure-on-change exactly as
+LPF and Env do, so a runtime change to control[0] (the smoother's
+base frequency) updates the internal cutoff at the next block
+boundary. Initial seeding (low1 = low2 = first input) prevents a
+"ramp from zero" attack on the very first block; subsequent blocks
+let the smoother track normally.
+*/
+struct SmoothState {
+  std::optional<q::dynamic_smoother> smoother;
+  double last_base_freq = -1.0;
+  float  last_sps       = -1.0f;
+};
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
 using NodeState =
-    std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState, DelayState>;
+    std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState,
+                 DelayState, SmoothState>;
 
 /* Note [Spec/state split: NodeSpec vs NodeInstanceState]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -729,6 +752,17 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.default_controls = {0.2, 0.0};   // [max_time_s, delay_time_s]
     spec.input_refs.resize(2);            // [signal_in, time_in]
     break;
+
+  case NodeKind::Smooth:
+    // Per-node q::dynamic_smoother. controls[0] is the smoother's
+    // base cutoff frequency in Hz (smaller = slower / smoother /
+    // laggier); controls[1] is the steady-state target value used
+    // when the audio input is unconnected. One audio input
+    // (signal_in) and one output. State is allocated lazily on
+    // first process() so we can hand it the active sample rate.
+    spec.default_controls = {20.0, 0.0};  // [base_freq_hz, target_default]
+    spec.input_refs.resize(1);            // [signal_in]
+    break;
   }
 }
 
@@ -780,6 +814,11 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
   case NodeKind::Delay:
     target_outputs = 1;
     node.state = DelayState{};
+    break;
+
+  case NodeKind::Smooth:
+    target_outputs = 1;
+    node.state = SmoothState{};
     break;
 
   case NodeKind::Gain:
@@ -2042,6 +2081,74 @@ static void process_delay(const RTGraph &g, GraphInstance &inst,
   }
 }
 
+/* Note [Smooth processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Smooth wraps q::dynamic_smoother and runs it sample-by-sample over
+its audio input. When the input is unconnected, controls[1] is
+read as a block-rate constant target — that is the typical
+Phase 3.3c use case: a Param connected through a Smooth, with
+the producer thread updating the Param via the realtime ABI when
+CC or pitch-bend events arrive. Block-rate jumps in the target
+become continuous ramps in the smoother's output, which the
+downstream consumer reads at audio rate.
+
+Reconfigure-on-change discipline: changes to controls[0] (base
+frequency) update the smoother's internal cutoff at the next block
+boundary (same idiom as LPF and Env). The smoother is constructed
+lazily on first process so we have the active sample rate; on
+construction the internal IIR state is seeded to the first input
+sample, avoiding a "ramp from zero" attack on the first block.
+
+Stateful (the IIR carries low1/low2 history across blocks). The
+state is per-instance with no shared resource, so Eff is Pure and
+rate is SampleRate. See Note [Per-node smooth state].
+*/
+static void process_smooth(const RTGraph &g, GraphInstance &inst,
+                           std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+
+  auto *st = std::get_if<SmoothState>(&node.state);
+  assert(st && "Smooth node has non-Smooth state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  const double base_hz = node.controls[0];
+  const float  target  = static_cast<float>(node.controls[1]);
+
+  // Lazy construction on first call or after a sample-rate change.
+  // Seed the IIR state to the first input sample so the smoother
+  // starts at steady state instead of ramping from zero.
+  if (!st->smoother || st->last_sps != g.sample_rate) {
+    st->smoother.emplace(q::frequency{base_hz}, g.sample_rate);
+    const float seed = sig_in.empty() ? target : sig_in[0];
+    *st->smoother    = seed;
+    st->last_sps       = g.sample_rate;
+    st->last_base_freq = base_hz;
+  } else if (base_hz != st->last_base_freq) {
+    st->smoother->base_frequency(q::frequency{base_hz}, g.sample_rate);
+    st->last_base_freq = base_hz;
+  }
+
+  if (!sig_in.empty()) {
+    // Sample-accurate input.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      out[fi] = (*st->smoother)(sig_in[fi]);
+    }
+  } else {
+    // Block-rate target from controls[1]; the producer updates this
+    // between blocks via the realtime ABI.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      out[fi] = (*st->smoother)(target);
+    }
+  }
+}
+
 /* Note [Execution order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Inside one instance the runtime processes nodes in storage order.
@@ -2377,6 +2484,9 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
       break;
     case NodeKind::Delay:
       process_delay(g, inst, i, nframes);
+      break;
+    case NodeKind::Smooth:
+      process_smooth(g, inst, i, nframes);
       break;
     default:
       assert(false && "unhandled NodeKind in process_instance");
