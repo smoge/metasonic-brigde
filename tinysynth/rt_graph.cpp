@@ -3,9 +3,12 @@
 // Description : runtime DSP engine and realtime audio backend
 // ================================================================
 //
-// On the Haskell side, compilation ends at RuntimeGraph. On the C++ side, this
-// file turns that dense structure into preallocated node state, block
-// processors, output buses, and realtime audio stream.
+// On the Haskell side, compilation ends at TemplateGraph (an ordered
+// ensemble of per-template RuntimeGraphs). On the C++ side, this file
+// turns each template into preallocated NodeSpec state, hosts a vector
+// of GraphInstances (running copies of each template) sharing a single
+// Server bus pool, and runs them in compile-decreed template order
+// every block.
 
 #include "rt_graph.h"
 
@@ -40,7 +43,7 @@ namespace q = cycfi::q;
 
 struct RTGraph;
 
-/* Note [Dense runtime model
+/* Note [Dense runtime model]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The runtime operates entirely on dense indices.
 
@@ -125,7 +128,7 @@ NodeKind must align with the integer tags emitted by the compiler.
   them. BusIn reads from the live output_buses; BusInDelayed reads
   from the frozen output_buses_prev snapshot.
 
-  Same-cycle ordering between BusOut and BusIn within one instance
+  Same-cycle ordering between BusOut/Out and BusIn within one instance
   is enforced on the Haskell side via E_r edges in effectiveDeps;
   BusInDelayed deliberately produces no E_r edge so feedback loops
   are schedulable. See Note [Effect-induced edges (E_r)] in
@@ -135,9 +138,17 @@ NodeKind must align with the integer tags emitted by the compiler.
   Cross-instance routing (§2.C): because the bus pool is shared,
   voice A writing bus 5 is visible to voice B's BusIn(5) within the
   same block (assuming A's Out runs before B's BusIn — which holds
-  if A precedes B in the instance vector and the per-instance
-  topological order respects bus E_r edges). For deterministic
-  cross-block feedback, B uses BusInDelayed(5).
+  if A's template precedes B's in g.defs ordering and the per-instance
+  topological order respects bus E_r edges).
+
+  Cross-template ordering (§2.D.3): the template execution order in
+  g.defs is the order produced by Haskell's compileTemplateGraph,
+  which topologically sorts templates by inter-template bus precedence
+  (T_a precedes T_b iff bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅). The runtime
+  has no scheduling logic of its own — it just iterates g.defs in
+  registration order, and registration order equals execution order
+  by Haskell-side construction. See Note [Multi-template execution
+  loop] below.
 
   Delay model: Delay nodes own per-instance fractional ring buffers
   (q::delay). No shared resource, no Eff annotation beyond Pure. See
@@ -166,14 +177,14 @@ enum class NodeKind : int {
 [[nodiscard]] constexpr std::optional<NodeKind>
 kind_from_tag(int node_kind) noexcept {
   switch (node_kind) {
-  case 1: return NodeKind::SinOsc;
-  case 2: return NodeKind::Out;
-  case 3: return NodeKind::Gain;
-  case 5: return NodeKind::SawOsc;
-  case 6: return NodeKind::NoiseGen;
-  case 7: return NodeKind::LPF;
-  case 8: return NodeKind::Add;
-  case 9: return NodeKind::Env;
+  case 1:  return NodeKind::SinOsc;
+  case 2:  return NodeKind::Out;
+  case 3:  return NodeKind::Gain;
+  case 5:  return NodeKind::SawOsc;
+  case 6:  return NodeKind::NoiseGen;
+  case 7:  return NodeKind::LPF;
+  case 8:  return NodeKind::Add;
+  case 9:  return NodeKind::Env;
   case 10: return NodeKind::BusOut;
   case 11: return NodeKind::BusIn;
   case 12: return NodeKind::BusInDelayed;
@@ -282,9 +293,9 @@ happens when the delay's geometry changes, which is at graph load.
 
 Per-instance buffer means there's no shared resource: Eff is Pure on
 the Haskell side, no E_r edges, scheduling is pure-data-dependency.
-Multi-instance: each GraphInstance has its own DelayState, so voices
-with the same MetaDef-template Delay maintain independent ring
-buffers — the per-node state vector survived the §2.C bus split.
+Multi-instance and multi-template both preserve this — each
+GraphInstance has its own DelayState regardless of which template it
+belongs to.
 */
 struct DelayState {
   std::optional<q::delay> line;
@@ -304,9 +315,10 @@ Each node's *spec* (immutable per template) is separated from its
 
   * NodeSpec — the parts that don't change as the graph runs: the
     kind tag, the input-port wiring (input_refs) set by
-    rt_graph_connect, and the control defaults inherited from
-    configure_spec. One NodeSpec is shared across every
-    GraphInstance of the same MetaDef.
+    rt_graph_connect / rt_graph_template_connect, and the control
+    defaults inherited from configure_spec (and optionally overridden
+    by rt_graph_template_set_default). One NodeSpec is shared across
+    every GraphInstance of the same MetaDef.
 
   * NodeInstanceState — the parts each instance owns: its current
     control values (initialised from the spec's defaults; mutable
@@ -318,17 +330,23 @@ Each node's *spec* (immutable per template) is separated from its
 a vector of GraphInstances. §2.C moved the bus pool out of the
 GraphInstance into a Server shared by all instances of an RTGraph,
 enabling cross-voice routing (voice A writes bus 5; voice B's
-BusIn(5) reads it within the same block).
+BusIn(5) reads it within the same block). §2.D.3 takes the next step:
+RTGraph holds a *vector* of MetaDefs (templates), and each
+GraphInstance carries a template_id naming the MetaDef it was created
+from. The bus pool stays at the Server level — it's shared across all
+instances of all templates, which is what makes cross-template routing
+work the same way cross-instance routing does within a single template.
 
 Convention used throughout the kernels:
 
     auto &node = inst.nodes[node_idx];
 
-destructures the per-instance node state at the top. spec.input_refs
-is read indirectly via resolve_input(g, inst, node_idx, …); node.
-controls / node.outputs / node.state are read and written directly.
-g.server.output_buses / g.server.output_buses_prev are accessed by
-the bus-write/bus-read kernels.
+destructures the per-instance node state at the top. The NodeSpec is
+read indirectly via resolve_input(g, inst, node_idx, …) which looks
+up the right MetaDef from inst.template_id; node.controls /
+node.outputs / node.state are read and written directly.
+g.server.output_buses / g.server.output_buses_prev are accessed by the
+bus-write/bus-read kernels.
 */
 
 struct NodeSpec {
@@ -369,11 +387,19 @@ same block) reads it back. For cross-block feedback or "send
 return" patterns where A and B run in any order, B uses
 BusInDelayed(5) and reads from output_buses_prev[5].
 
+§2.D.3 multi-template extension: the Server is *also* shared across
+templates. A template T_a's BusOut(5) and a peer template T_b's
+BusIn(5) hit the same server.output_buses[5] just as if the writes
+came from sibling instances of the same template. The Haskell side's
+compileTemplateGraph guarantees T_a precedes T_b in the execution
+order whenever T_b reads what T_a writes (live), so the writes are
+visible by the time the reads run. Cross-template feedback (cycles in
+the precedence DAG) is rejected at compile time; the user's remedy is
+to switch one of the live reads to BusInDelayed, which reads from
+output_buses_prev and breaks the cycle across the block boundary.
+
 In SuperCollider terms, the Server's output_buses corresponds to the
-private/output bus space that all Synths share. Future §2.D groups
-will let users constrain ordering between instances within a group;
-right now instances run in vector-index order, which the user
-controls via rt_graph_instance_add ordering.
+private/output bus space that all Synths share.
 */
 
 struct Server {
@@ -393,13 +419,23 @@ MetaDef is the immutable template:
 
 GraphInstance is one running copy:
 
-  * def — non-owning pointer back to the MetaDef this instance was
-    created from. Today set to &g->def at create time.
+  * template_id — dense index into RTGraph::defs naming which MetaDef
+    this instance was created from. Set at make_instance time and
+    never changes for the life of the instance. Drives the dispatch
+    in process_instance and the spec lookup in resolve_input.
   * nodes — parallel-by-index vector of per-node mutable state.
 
-The bus pool is *not* on GraphInstance any more — it lives on the
-Server, shared across instances. See Note [§2.C: server-global
-buses].
+The bus pool is *not* on GraphInstance — it lives on the Server,
+shared across instances regardless of template. See Note [§2.C:
+server-global buses].
+
+§2.D.3: the (template_id, GraphInstance) pair lets the runtime's
+process_graph iterate templates in execution order outer × instances
+inner. A GraphInstance never references the MetaDef directly; it goes
+through g.defs[template_id] every time, so reallocating g.defs
+(growing the vector when more templates are registered) doesn't
+invalidate any instance — pointers into MetaDef would, instance_id +
+template_id is stable.
 */
 
 struct MetaDef {
@@ -408,7 +444,10 @@ struct MetaDef {
 };
 
 struct GraphInstance {
-  const MetaDef *def = nullptr;
+  // Template this instance was created from. Indexes into
+  // RTGraph::defs. Set by make_instance and immutable thereafter.
+  int template_id = 0;
+
   std::vector<NodeInstanceState> nodes;
 };
 
@@ -604,29 +643,34 @@ struct GraphAudioStream : q::audio_stream {
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 RTGraph is the sole owner of runtime state.
 
-Today it owns:
+Today (§2.D.3) it owns:
 
-  * one MetaDef (the immutable template)
-  * a vector of GraphInstances (each a running copy with per-node
-    state but no bus pool)
-  * one Server that holds the shared bus pool
-
-A default GraphInstance is created at index 0 by rt_graph_create so
-the back-compatibility single-instance API (rt_graph_set_control,
-rt_graph_read_bus) can operate without an explicit instance argument.
-
-Contains:
-
-  * the dense def (NodeSpec vector, max_frames)
-  * the instance vector (live + dead slots; dead slots reused by
-    rt_graph_instance_add)
-  * the Server bus pool (shared across instances)
-  * the maximum frame size used for all preallocations
-  * the currently active sample rate
-  * an optional realtime audio stream
+  * a vector of MetaDefs — one per registered template, in execution
+    order. Templates are appended via rt_graph_template_add (or
+    auto-created at index 0 by the legacy single-template ABI). The
+    Haskell side guarantees registration order equals execution order
+    by feeding templates to the FFI in the order produced by
+    compileTemplateGraph. The runtime never reorders.
+  * a vector of GraphInstances — running copies of any template,
+    each carrying its template_id. The slot index is the instance_id
+    exposed to the Haskell side; freed slots are reused. Live and
+    dead slots coexist (std::optional).
+  * one Server holding the shared bus pool (output_buses +
+    output_buses_prev), used by every instance of every template.
+  * the maximum frame size used for all preallocations.
+  * the currently active sample rate.
+  * an optional realtime audio stream.
 
 The Haskell side sees RTGraph only as an opaque pointer.
 All ownership, lifetime, and mutation live here.
+
+Legacy single-template back-compat: the existing ABI surface
+(rt_graph_add_node, rt_graph_set_control, rt_graph_connect,
+rt_graph_instance_add without a template argument) operates on
+template 0, which rt_graph_create / rt_graph_clear materialise as an
+empty MetaDef so legacy callers don't need to issue an explicit
+rt_graph_template_add. See Note [Legacy single-template ABI as
+template-0 shim].
 */
 
 /* Note [Bus pool double-buffering]
@@ -650,8 +694,10 @@ At the start of every block (in process_graph) we:
 
 The swap runs *once per block* at the Server level — every instance
 processed in this block sees the same prev snapshot and writes into
-the same live buffer. Cross-instance routing follows directly: A's
-BusOut(5) and B's BusIn(5) hit the same server.output_buses[5].
+the same live buffer. Cross-instance and cross-template routing
+follow directly: A's BusOut(5) and B's BusIn(5) hit the same
+server.output_buses[5] regardless of whether A and B are sibling
+instances of one template or instances of different templates.
 
 Within a block, reads and writes have well-defined origins:
 
@@ -660,14 +706,16 @@ Within a block, reads and writes have well-defined origins:
     the Haskell scheduler's E_r edges force every same-bus
     BusOut/Out to execute before BusIn, so by the time an
     intra-instance BusIn runs the live buffer holds this block's
-    accumulated value. Cross-instance, ordering depends on instance
-    iteration order (instance vector index, today).
+    accumulated value. Cross-instance, ordering depends on the
+    enclosing template's position in g.defs (templates execute in
+    registration order, and Haskell's compileTemplateGraph put
+    writers before readers).
   - BusInDelayed reads from server.output_buses_prev[bus]. No E_r
     edge relates BusInDelayed to BusOut: the snapshot is immutable
     for the duration of the block. BusInDelayed can therefore appear
     *before* same-bus BusOut in the topological order, which is
     exactly what makes feedback loops schedulable across blocks
-    (and across instances).
+    (and across instances, and across templates).
 
 On the very first block, output_buses_prev contains the
 zero-initialised state assigned by ensure_output_bus_count, so a
@@ -675,8 +723,8 @@ first-block BusInDelayed produces silence. After block N completes,
 its writes become block N+1's "prev" snapshot.
 
 Memory cost: 2× the bus pool, total. With 64 buses × 1024 frames ×
-4 bytes that's 512 KB regardless of how many instances run — instances
-are stateful but bus-pool-free.
+4 bytes that's 512 KB regardless of how many instances or templates
+run — instances and templates are stateful but bus-pool-free.
 
 ensure_output_bus_count grows both vectors in lockstep so the swap
 never needs to reconcile sizes. rt_graph_clear empties both.
@@ -689,13 +737,40 @@ struct RTGraph {
   int capacity = 0;
   int max_frames = 0;
   float sample_rate = kDefaultSampleRate;
-  MetaDef def;
+  // §2.D.3: vector of MetaDefs (templates). Index i is template_id i,
+  // and the iteration order in process_graph is i ascending — i.e.
+  // registration order is execution order. The Haskell side
+  // (compileTemplateGraph) picks registration order to match the
+  // topo-sort over template precedence.
+  std::vector<MetaDef> defs;
+  // GraphInstances live in a flat vector regardless of template.
+  // Each GraphInstance carries its template_id; process_graph filters
+  // by it to group instances per template. Slot index is the
+  // instance_id exposed at the C ABI; std::optional models live/dead.
   std::vector<std::optional<GraphInstance>> instances;
   Server server;
   std::unique_ptr<GraphAudioStream> audio;
 };
 
 namespace {
+
+// Lookup a template's MetaDef by id. Returns nullptr for negative /
+// out-of-range ids.
+[[nodiscard]] static MetaDef *
+template_at(RTGraph &g, int template_id) noexcept {
+  if (template_id < 0) return nullptr;
+  const std::size_t idx = static_cast<std::size_t>(template_id);
+  if (idx >= g.defs.size()) return nullptr;
+  return &g.defs[idx];
+}
+
+[[nodiscard]] static const MetaDef *
+template_at(const RTGraph &g, int template_id) noexcept {
+  if (template_id < 0) return nullptr;
+  const std::size_t idx = static_cast<std::size_t>(template_id);
+  if (idx >= g.defs.size()) return nullptr;
+  return &g.defs[idx];
+}
 
 // Lookup an instance by id. Returns nullptr for negative / out-of-range
 // / dead-slot ids.
@@ -721,12 +796,12 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
 // An empty span means the input is unavailable and the caller should
 // fall back to the corresponding control value or silence.
 //
-// Reads dst's input_refs from the spec side (g.def.nodes) and the
-// source node's outputs from the instance side (inst.nodes). The
-// instance argument tells us *which* instance's outputs to read —
-// every kernel reads sources from its own instance, never from a
-// sibling's. (Cross-instance signal flow goes through the server bus
-// pool via BusOut/BusIn, not via direct port wiring.)
+// §2.D.3: the spec lookup goes through inst.template_id rather than a
+// fixed g.def. Each kernel reads sources from its own instance's
+// nodes (cross-instance signal flow goes through the server bus pool
+// via BusOut/BusIn, not through direct port wiring) and reads the
+// wiring from the *template* that instance belongs to. Wiring is
+// per-template, state is per-instance.
 [[nodiscard]] static std::span<const float> resolve_input(
     const RTGraph &g,
     const GraphInstance &inst,
@@ -738,11 +813,16 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
     return {};
   }
 
-  if (dst_idx >= g.def.nodes.size()) {
+  const MetaDef *def = template_at(g, inst.template_id);
+  if (!def) {
     return {};
   }
 
-  const NodeSpec &dst_spec = g.def.nodes[dst_idx];
+  if (dst_idx >= def->nodes.size()) {
+    return {};
+  }
+
+  const NodeSpec &dst_spec = def->nodes[dst_idx];
   const std::size_t idx = to_size(input_index);
   if (idx >= dst_spec.input_refs.size()) {
     return {};
@@ -774,21 +854,32 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
 // Forward decl so add_node helpers can grow the server's bus pool.
 static void ensure_output_bus_count(Server &server, std::size_t count, int max_frames);
 
-// Ensure the dense def vector and every live instance's nodes vector
-// are large enough to hold node_index. Both halves are grown in
-// lockstep so the parallel-by-index invariant (def.nodes[i] describes
-// the spec, every instance's nodes[i] holds its state) is preserved.
-static void ensure_node_slot(RTGraph &g, NodeIndex node_index) {
+// Ensure template `template_id`'s spec vector and every live instance
+// of that template have a state slot at node_index. Both halves are
+// grown in lockstep so the parallel-by-index invariant
+// (def.nodes[i] describes the spec, every instance's nodes[i] holds
+// its state) is preserved per-template.
+//
+// Instances of *other* templates are left alone — node_index N in
+// template A is unrelated to node_index N in template B; each
+// template has its own dense node space.
+static void ensure_node_slot(RTGraph &g, int template_id, NodeIndex node_index) {
   if (!valid(node_index)) {
+    return;
+  }
+  MetaDef *def = template_at(g, template_id);
+  if (!def) {
     return;
   }
 
   const std::size_t idx = to_size(node_index);
-  if (g.def.nodes.size() <= idx) {
-    g.def.nodes.resize(idx + 1);
+  if (def->nodes.size() <= idx) {
+    def->nodes.resize(idx + 1);
   }
   for (auto &maybe_inst : g.instances) {
-    if (maybe_inst && maybe_inst->nodes.size() <= idx) {
+    if (!maybe_inst) continue;
+    if (maybe_inst->template_id != template_id) continue;
+    if (maybe_inst->nodes.size() <= idx) {
       maybe_inst->nodes.resize(idx + 1);
     }
   }
@@ -803,8 +894,9 @@ output bus, selected by control slot 0.
 
 This gives the runtime a useful intermediate abstraction:
 
-  * multiple Out nodes (within one instance or across many instances)
-    may sum onto the same bus
+  * multiple Out nodes (within one instance, across many instances of
+    one template, or across instances of different templates) may sum
+    onto the same bus
   * offline processing can inspect buses without opening audio
   * realtime output can map buses to device channels in a separate step
 
@@ -1221,10 +1313,11 @@ load via 'ensure_output_bus_count' inside
 BusOut and BusIn within an instance (a BusIn always sees the live,
 accumulated value) is enforced on the Haskell side via E_r edges in
 'effectiveDeps'; the runtime simply iterates nodes in the resulting
-topological order. Cross-instance accumulation happens because all
-instances write to the same shared pool; the bus contents at any
-given moment reflect every BusOut/Out that has run so far in this
-block (in instance-iteration × per-instance topo-order).
+topological order. Cross-instance and cross-template accumulation
+happens because all instances of all templates write to the same
+shared pool; the bus contents at any given moment reflect every
+BusOut/Out that has run so far in this block (in template-order ×
+instance-iteration × per-instance topo-order).
 
 If the input is unconnected or the bus index is invalid, the node
 contributes nothing. Multiple writers to the same bus sum.
@@ -1256,9 +1349,13 @@ Same-cycle semantics within an instance: by the time a BusIn runs,
 every BusOut/Out on the same bus *within the same instance* has
 already accumulated this block's contributions, because the topological
 sort on the Haskell side put writers before readers via the E_r edges
-derived from BusWrite/BusRead effects. Across instances, ordering
-depends on the iteration order of g.instances — for deterministic
-cross-instance feedback, use BusInDelayed instead.
+derived from BusWrite/BusRead effects. Across instances of the same
+template, ordering depends on the iteration order of g.instances.
+Across templates, ordering follows g.defs registration order — which
+the Haskell side picks to match the topo sort over template
+precedence (writers' templates precede readers' templates whenever
+a live read intersects a write). For deterministic feedback that
+doesn't depend on this ordering, use BusInDelayed instead.
 
 If the bus index is out of range, the kernel emits silence. Reading a
 bus that no node wrote in this block is well-defined:
@@ -1294,15 +1391,17 @@ guarantees that:
     or the initial zero state on the very first block);
   * output_buses_prev is *not* mutated during the current block;
   * BusInDelayed therefore returns a stable, deterministic value
-    regardless of where it sits in the topological order or which
-    instance reads it.
+    regardless of where it sits in the topological order, which
+    instance reads it, or which template it belongs to.
 
 The third point is the design's payoff. On the Haskell side
-'BusReadDelayed' is excluded from E_r edges, so a BusInDelayed n can
-appear *before* a same-bus BusOut n in the schedule — closing a
+'BusReadDelayed' is excluded from E_r edges (intra-graph) and from
+inter-template precedence (compileTemplateGraph), so a BusInDelayed n
+can appear *before* a same-bus BusOut n in any schedule — closing a
 feedback loop whose only true cycle is across the block boundary,
 where the swap breaks it. With server-global buses, this also closes
-*cross-instance* feedback loops without ordering hazards.
+*cross-instance* and *cross-template* feedback loops without ordering
+hazards.
 
 Out-of-range bus indices emit silence (same as BusIn). Reading a bus
 that no node ever wrote — including on the first block, before any
@@ -1430,26 +1529,45 @@ Inside one instance the runtime processes nodes in storage order.
 
 This is correct because the compiler adds nodes in dense execution
 order, which itself comes from the validated topological order
-computed on the Haskell side. There is therefore no separate
+computed on the Haskell side. There is therefore no per-instance
 scheduler in this file. The dense node vector is already the
-"schedule". That simplicity is by design. Thus the name "tinysynth".
+"intra-instance schedule".
 
-Across instances, the order is the order of g.instances (vector
-index). Server-global buses (§2.C) make cross-instance ordering
-visible: instance A writing bus N before instance B reading bus N
-is observable. For deterministic feedback that doesn't depend on
-this ordering, use BusInDelayed which reads from the
-previous-block snapshot.
+Across instances of the same template, the order is the order of
+g.instances (vector slot index). Server-global buses (§2.C) make
+cross-instance ordering visible: instance A writing bus N before
+instance B reading bus N is observable. For deterministic feedback
+that doesn't depend on this ordering, use BusInDelayed which reads
+from the previous-block snapshot.
 
-§2.D groups will let users constrain inter-instance ordering
-explicitly; today instance ordering is implicit in the
-rt_graph_instance_add call sequence.
+Across templates (§2.D.3), the order is g.defs registration order.
+The Haskell side (compileTemplateGraph) assigns registration order
+to match the topological sort over the inter-template precedence DAG
+(T_a precedes T_b iff bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅; BusInDelayed
+reads do not contribute, exactly as within a single graph). Cycles
+in the precedence DAG are rejected at compile time. The runtime is a
+dumb executor — it iterates g.defs in order and never inspects the
+precedence relation; the schedule is the compiler's responsibility.
+
+There is no runtime-side knob for reordering. Users who need a
+different order edit their bus connectivity (or split into more
+templates) and recompile, exactly the way they would edit a node
+graph and recompile to change intra-graph order. See "Compile-time
+vs runtime ordering" in CLAUDE.md.
 */
 
 static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexcept {
-  const std::size_t node_count = std::min(g.def.nodes.size(), inst.nodes.size());
+  // Look up the spec via inst.template_id. If the template is gone
+  // (shouldn't happen — we never shrink g.defs while instances are
+  // live — but be defensive), skip the instance.
+  const MetaDef *def = template_at(g, inst.template_id);
+  if (!def) {
+    return;
+  }
+
+  const std::size_t node_count = std::min(def->nodes.size(), inst.nodes.size());
   for (std::size_t i = 0; i < node_count; ++i) {
-    switch (g.def.nodes[i].kind) {
+    switch (def->nodes[i].kind) {
     case NodeKind::SinOsc:
       process_sinosc(g, inst, i, nframes);
       break;
@@ -1495,6 +1613,41 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
   }
 }
 
+/* Note [Multi-template execution loop]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+process_graph runs one block of audio. Its job after §2.D.3:
+
+  1. Once per block, swap the bus pool's live and prev vectors and
+     zero the new live buffer. This runs at the Server level, before
+     any template or instance executes; every instance in this block
+     sees the same prev snapshot and writes into the same live pool.
+
+  2. Iterate templates in registration order (== execution order):
+     for each template_id in [0, g.defs.size()), find every live
+     instance with that template_id and process it.
+
+The outer-by-template, inner-by-instance ordering matters for
+cross-template routing. If template T_a writes bus 5 and template
+T_b reads bus 5 live, compileTemplateGraph guarantees T_a was
+registered before T_b — so all of T_a's instances run (and
+accumulate into output_buses[5]) before any of T_b's instances'
+BusIn(5) reads.
+
+The current implementation is O(T × I) per block where T = template
+count and I = instance count. For typical ensembles (T < 10, I <
+1000), the scan cost is negligible compared to per-sample DSP work.
+A future optimization would maintain a per-template instance bucket
+to make the inner loop O(I_t) instead of O(I), but the speedup is
+not measurable today.
+
+Within a template, instances run in slot order (the index in
+g.instances). Slot order is implicit in rt_graph_template_instance_add
+calls; the runtime does not expose any way to reorder. If a user
+needs a specific cross-instance order they can either rely on
+template-level precedence (split into multiple templates) or use
+BusInDelayed to break the cross-instance dependency.
+*/
+
 static void process_graph(RTGraph &g, int nframes) noexcept {
   // Ping-pong the server bus pool, then zero the new live buffer.
   // This runs ONCE per block, before any instance executes — every
@@ -1503,8 +1656,17 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   std::swap(g.server.output_buses, g.server.output_buses_prev);
   clear_output_buses(g.server, nframes);
 
-  for (auto &maybe_inst : g.instances) {
-    if (maybe_inst) {
+  // Iterate templates in registration order. The Haskell side picks
+  // registration order to match the topological sort over template
+  // precedence, so this loop respects all bus-induced ordering
+  // constraints between templates. See Note [Multi-template
+  // execution loop].
+  const std::size_t template_count = g.defs.size();
+  for (std::size_t tid = 0; tid < template_count; ++tid) {
+    const int tid_i = static_cast<int>(tid);
+    for (auto &maybe_inst : g.instances) {
+      if (!maybe_inst) continue;
+      if (maybe_inst->template_id != tid_i) continue;
       process_instance(g, *maybe_inst, nframes);
     }
   }
@@ -1523,10 +1685,11 @@ GraphAudioStream::GraphAudioStream(
 The q_io callback receives one non-interleaved output span per hardware
 channel.
 
-§2.C: the server bus pool is shared across all instances, so the
-callback can copy each bus directly to the matching hardware channel
-without per-instance summing — mixing already happened at the bus
-level when each instance's BusOut/Out wrote into server.output_buses.
+§2.C: the server bus pool is shared across all instances of all
+templates, so the callback can copy each bus directly to the matching
+hardware channel without per-instance or per-template summing —
+mixing already happened at the bus level when each instance's
+BusOut/Out wrote into server.output_buses.
 
 The runtime maps output buses to channels as follows:
 
@@ -1675,18 +1838,91 @@ open_audio_stream(RTGraph &g, int requested_output_channels, int requested_devic
   return {};
 }
 
-// Build a fresh GraphInstance for the given def, with its own per-node
-// state. The bus pool lives on the Server, so a new instance carries
-// no bus state of its own.
-static GraphInstance make_instance(const MetaDef &def, int max_frames) {
+// Build a fresh GraphInstance for the given template, with its own
+// per-node state. The bus pool lives on the Server, so a new instance
+// carries no bus state of its own. Sets template_id so process_graph
+// dispatches to the right MetaDef.
+static GraphInstance make_instance(const MetaDef &def, int template_id, int max_frames) {
   GraphInstance inst;
-  inst.def = &def;
+  inst.template_id = template_id;
   inst.nodes.resize(def.nodes.size());
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
     init_node_state(inst.nodes[i], def.nodes[i], max_frames);
   }
   return inst;
 }
+
+// Reset the graph to the initial single-template state: one empty
+// MetaDef at index 0, one empty GraphInstance at slot 0 belonging to
+// template 0, and an empty Server bus pool. Used by both
+// rt_graph_create (initial setup) and rt_graph_clear (graph reload).
+//
+// The "auto-create template 0 + instance 0" shape is what makes the
+// legacy single-template ABI work without explicit
+// rt_graph_template_add / rt_graph_template_instance_add calls. New
+// callers using the multi-template flow can either:
+//   - keep the auto-created template 0 and use it (then add more via
+//     rt_graph_template_add for additional templates), or
+//   - remove the auto-created instance 0 first via
+//     rt_graph_instance_remove and then build up the world they want.
+//
+// See Note [Legacy single-template ABI as template-0 shim].
+static void reset_to_default_state(RTGraph &g) {
+  g.sample_rate = kDefaultSampleRate;
+  g.defs.clear();
+  g.instances.clear();
+  g.server.output_buses.clear();
+  g.server.output_buses_prev.clear();
+
+  // Push template 0 (empty MetaDef).
+  MetaDef def;
+  def.max_frames = g.max_frames;
+  if (g.capacity > 0) {
+    def.nodes.reserve(static_cast<std::size_t>(g.capacity));
+  }
+  g.defs.push_back(std::move(def));
+
+  // Push instance 0 (empty GraphInstance, template_id = 0).
+  GraphInstance inst;
+  inst.template_id = 0;
+  if (g.capacity > 0) {
+    inst.nodes.reserve(static_cast<std::size_t>(g.capacity));
+  }
+  g.instances.push_back(std::move(inst));
+}
+
+/* Note [Legacy single-template ABI as template-0 shim]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Before §2.D.3, the ABI assumed exactly one MetaDef per RTGraph.
+After §2.D.3, an RTGraph holds a vector of MetaDefs. To avoid
+churning every existing caller (the C++ doctest suite, Haskell's
+loadRuntimeGraph, the demos in app/Main.hs), the legacy single-
+template entry points are preserved as thin wrappers that target
+template 0:
+
+  rt_graph_add_node      -> _template_add_node(g, 0, …)
+  rt_graph_set_control   -> _instance_set_control(g, 0, …)   [instance 0]
+  rt_graph_connect       -> _template_connect(g, 0, …)
+  rt_graph_instance_add  -> _template_instance_add(g, 0)
+  rt_graph_read_bus      -> reads server.output_buses directly
+  rt_graph_instance_*    -> unchanged signatures, instance_id is
+                            globally unique across templates
+
+The auto-created template 0 + instance 0 in rt_graph_create /
+rt_graph_clear (see reset_to_default_state) materialises the
+"single-template world" so legacy callers don't see any difference.
+
+New multi-template callers register additional templates via
+rt_graph_template_add and use the explicit *_template_* /
+*_template_instance_* entry points. The two surfaces coexist
+unchanged; the legacy surface IS the multi-template surface with
+template_id pinned to 0.
+
+This is not a deprecated shim — both surfaces are first-class. The
+single-template surface is the natural shape for the typical case
+(one synth voice template); the multi-template surface lights up
+inter-template ordering and shared bus routing.
+*/
 
 } // namespace
 
@@ -1698,26 +1934,17 @@ extern "C" {
 
 // Allocate one runtime graph handle. No nodes are configured yet.
 //
-// Initialises one MetaDef (the immutable template), pushes a default
-// GraphInstance at index 0, and starts with an empty Server bus pool
-// (grown lazily by add_node and set_control). Back-compat
-// single-instance callers (rt_graph_set_control, rt_graph_read_bus)
-// operate on the default instance until it is removed.
+// Initialises template 0 (an empty MetaDef) and instance 0 (an empty
+// GraphInstance belonging to template 0), and starts with an empty
+// Server bus pool (grown lazily by add_node and set_control). Legacy
+// single-template callers operate transparently on template 0; new
+// multi-template callers can either keep template 0 and add more via
+// rt_graph_template_add, or remove instance 0 and start fresh.
 RTGraph *rt_graph_create(int capacity, int max_frames) {
   auto *g = new RTGraph{};
   g->capacity = std::max(0, capacity);
   g->max_frames = std::max(0, max_frames);
-  g->def.max_frames = g->max_frames;
-  if (g->capacity > 0) {
-    g->def.nodes.reserve(static_cast<std::size_t>(g->capacity));
-  }
-  // Push the default instance 0.
-  GraphInstance default_inst;
-  default_inst.def = &g->def;
-  if (g->capacity > 0) {
-    default_inst.nodes.reserve(static_cast<std::size_t>(g->capacity));
-  }
-  g->instances.push_back(std::move(default_inst));
+  reset_to_default_state(*g);
   return g;
 }
 
@@ -1734,9 +1961,15 @@ void rt_graph_destroy(RTGraph *g) {
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 rt_graph_clear is the graph-reload entry point.
 
-It stops active audio, resets the sample rate to the default placeholder value,
-removes all nodes (def + every instance) and the server bus pool, and reinstates
-a fresh default instance at index 0. The graph handle is preserved for reuse.
+It stops active audio, resets the sample rate to the default
+placeholder value, removes all templates (defs + every instance) and
+the server bus pool, and reinstates a fresh template 0 + instance 0
+via reset_to_default_state. The graph handle is preserved for reuse.
+
+Multi-template callers: clear before loading a new TemplateGraph, then
+use rt_graph_template_add for additional templates and
+rt_graph_template_instance_add for explicit voice spawning. The
+auto-created instance 0 is yours to reuse, repurpose, or remove.
 */
 
 void rt_graph_clear(RTGraph *g) {
@@ -1745,34 +1978,52 @@ void rt_graph_clear(RTGraph *g) {
   }
 
   stop_audio_stream(*g);
-  g->sample_rate = kDefaultSampleRate;
-  g->def.nodes.clear();
-  g->instances.clear();
-  g->server.output_buses.clear();
-  g->server.output_buses_prev.clear();
-  if (g->capacity > 0) {
-    g->def.nodes.reserve(static_cast<std::size_t>(g->capacity));
-  }
-
-  GraphInstance default_inst;
-  default_inst.def = &g->def;
-  if (g->capacity > 0) {
-    default_inst.nodes.reserve(static_cast<std::size_t>(g->capacity));
-  }
-  g->instances.push_back(std::move(default_inst));
+  reset_to_default_state(*g);
 }
 
-// Add or reconfigure one node at its dense runtime index.
+// ----------------------------------------------------------------
+// Multi-template C ABI
+// ----------------------------------------------------------------
+
+// Add a fresh, empty MetaDef and return its dense template_id.
 //
-// Updates the spec once and walks every live instance to install
-// freshly-initialised state at the same index. Adding a node "early"
-// (before any extra instances) and "late" (after rt_graph_instance_add)
-// produce the same final layout — every live instance ends up with a
-// state slot for the new node.
-void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
-  if (!g) {
-    return;
+// Registration order is execution order: every template processed
+// after this call sits at a higher-numbered template_id and will be
+// processed by process_graph after all previously-registered
+// templates. The Haskell side (compileTemplateGraph) picks
+// registration order to match the topo sort over the inter-template
+// precedence DAG, so this single ordering invariant captures both
+// the user's intent and the scheduler's guarantee.
+int rt_graph_template_add(RTGraph *g) {
+  if (!g) return -1;
+
+  MetaDef def;
+  def.max_frames = g->max_frames;
+  if (g->capacity > 0) {
+    def.nodes.reserve(static_cast<std::size_t>(g->capacity));
   }
+  g->defs.push_back(std::move(def));
+  return static_cast<int>(g->defs.size() - 1);
+}
+
+// Number of registered templates. Iterate 0..count-1 to enumerate.
+int rt_graph_template_count(RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->defs.size());
+}
+
+// Add or reconfigure one node at its dense runtime index in the named
+// template.
+//
+// Updates template_id's spec once and walks every live instance *of
+// this template* to install freshly-initialised state at the same
+// index. Adding a node "early" (before any extra instances) and
+// "late" (after rt_graph_template_instance_add) produce the same
+// final layout — every live instance of this template ends up with a
+// state slot for the new node. Instances of *other* templates are
+// untouched.
+void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int node_kind) {
+  if (!g) return;
 
   const auto maybe_kind = kind_from_tag(node_kind);
   if (!maybe_kind) {
@@ -1786,21 +2037,151 @@ void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
     return;
   }
 
-  ensure_node_slot(*g, idx);
-  configure_spec(g->def.nodes[to_size(idx)], kind);
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) {
+    return;
+  }
+
+  ensure_node_slot(*g, template_id, idx);
+  configure_spec(def->nodes[to_size(idx)], kind);
   for (auto &maybe_inst : g->instances) {
     if (!maybe_inst) continue;
+    if (maybe_inst->template_id != template_id) continue;
     init_node_state(
         maybe_inst->nodes[to_size(idx)],
-        g->def.nodes[to_size(idx)],
+        def->nodes[to_size(idx)],
         g->max_frames);
   }
 
   // Out nodes imply at least one runtime output bus exists, on the
-  // shared server pool.
+  // shared server pool. Growing here is fine — every other template
+  // can read or write the same bus once it's allocated.
   if (kind == NodeKind::Out) {
     ensure_output_bus_count(g->server, 1, g->max_frames);
   }
+}
+
+// Set one entry of a template's spec.default_controls. New instances
+// of this template (created later via rt_graph_template_instance_add)
+// will inherit the value. *Existing* instances are not mutated — use
+// rt_graph_instance_set_control to update a specific live instance.
+//
+// The split exists because user-supplied control defaults belong on
+// the spec (so every voice spawned afterward uses them), while live
+// per-voice changes belong on the instance (so a voice can be
+// modulated independently of its siblings). The legacy
+// rt_graph_set_control mutates instance 0 only — it predates the
+// spec/instance split and is preserved unchanged.
+void rt_graph_template_set_default(
+    RTGraph *g, int template_id, int node_index, int control_index, double value
+) {
+  if (!g) return;
+
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+
+  const NodeIndex ni{node_index};
+  const ControlIndex ci{control_index};
+  if (!valid(ni) || !valid(ci)) return;
+
+  const std::size_t nidx = to_size(ni);
+  if (nidx >= def->nodes.size()) return;
+
+  NodeSpec &spec = def->nodes[nidx];
+  const std::size_t cidx = to_size(ci);
+  if (cidx >= spec.default_controls.size()) return;
+
+  spec.default_controls[cidx] = value;
+
+  // For Out / BusOut / BusIn / BusInDelayed, control 0 is the bus
+  // index. Grow the shared pool here so the kernel never has to.
+  const bool kind_uses_bus_slot =
+      spec.kind == NodeKind::Out
+      || spec.kind == NodeKind::BusOut
+      || spec.kind == NodeKind::BusIn
+      || spec.kind == NodeKind::BusInDelayed;
+  if (kind_uses_bus_slot && cidx == 0 && value >= 0.0) {
+    const auto bus = static_cast<std::size_t>(static_cast<int>(value));
+    ensure_output_bus_count(g->server, bus + 1, g->max_frames);
+  }
+}
+
+// Connect one source output port to one destination input port in the
+// named template.
+//
+// Wiring lives on the spec side (NodeSpec::input_refs), so all
+// instances of the template share the same connectivity. The Haskell
+// side guarantees src and dst both belong to the same template
+// (cross-template signal flow goes through the bus pool, not direct
+// port wiring); this function does not validate that.
+void rt_graph_template_connect(
+    RTGraph *g, int template_id,
+    int src_index, int src_port, int dst_index, int dst_port
+) {
+  if (!g) return;
+
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+
+  const NodeIndex src{src_index};
+  const PortIndex sp{src_port};
+  const NodeIndex dst{dst_index};
+  const PortIndex dp{dst_port};
+  if (!valid(src) || !valid(sp) || !valid(dst) || !valid(dp)) {
+    return;
+  }
+
+  const std::size_t sidx = to_size(src);
+  const std::size_t didx = to_size(dst);
+  const std::size_t dport = to_size(dp);
+
+  if (sidx >= def->nodes.size() || didx >= def->nodes.size()) {
+    return;
+  }
+
+  NodeSpec &dst_spec = def->nodes[didx];
+  if (dport >= dst_spec.input_refs.size()) {
+    return;
+  }
+
+  dst_spec.input_refs[dport] = InputRef{src, sp};
+}
+
+// Spawn a fresh instance of the named template. Returns globally-
+// unique instance_id (>= 0) or -1 on failure.
+//
+// Slot reuse: scans for the first free std::optional in g.instances
+// and overwrites it; only appends if no free slot exists. So an
+// instance_id may be returned twice over the life of the RTGraph (the
+// dead slot is reused after rt_graph_instance_remove), but never
+// concurrently.
+int rt_graph_template_instance_add(RTGraph *g, int template_id) {
+  if (!g) return -1;
+
+  const MetaDef *def = template_at(*g, template_id);
+  if (!def) return -1;
+
+  GraphInstance inst = make_instance(*def, template_id, g->max_frames);
+
+  // Reuse a free slot if any, otherwise append.
+  for (std::size_t i = 0; i < g->instances.size(); ++i) {
+    if (!g->instances[i].has_value()) {
+      g->instances[i] = std::move(inst);
+      return static_cast<int>(i);
+    }
+  }
+  g->instances.push_back(std::move(inst));
+  return static_cast<int>(g->instances.size() - 1);
+}
+
+// ----------------------------------------------------------------
+// Legacy single-template ABI (template 0 shim)
+// ----------------------------------------------------------------
+
+// Legacy: add a node to template 0. See Note [Legacy single-template
+// ABI as template-0 shim].
+void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
+  rt_graph_template_add_node(g, 0, node_index, node_kind);
 }
 
 /* Note [Kind-tag introspection]
@@ -1817,48 +2198,23 @@ int rt_graph_kind_supported(int node_kind) {
   return kind_from_tag(node_kind).has_value() ? 1 : 0;
 }
 
-// Set one control slot on instance 0 (back-compat). Delegates to
-// rt_graph_instance_set_control with instance_id=0.
+// Legacy: set one control slot on instance 0. Mutates the *instance*,
+// not the spec — preserves the pre-§2.D.3 semantics exactly. New
+// instances spawned later get spec defaults, not instance 0's values.
+// To set spec defaults, use rt_graph_template_set_default.
 void rt_graph_set_control(RTGraph *g, int node_index, int control_index, double value) {
   rt_graph_instance_set_control(g, 0, node_index, control_index, value);
 }
 
-// Connect one source output port to one destination input port.
-//
-// Wiring lives on the spec side (NodeSpec::input_refs), so all
-// instances of a MetaDef share the same connectivity.
+// Legacy: connect ports in template 0.
 void rt_graph_connect(
     RTGraph *g, int src_index, int src_port, int dst_index, int dst_port
 ) {
-  if (!g) {
-    return;
-  }
-
-  const NodeIndex src{src_index};
-  const PortIndex sp{src_port};
-  const NodeIndex dst{dst_index};
-  const PortIndex dp{dst_port};
-  if (!valid(src) || !valid(sp) || !valid(dst) || !valid(dp)) {
-    return;
-  }
-
-  const std::size_t sidx = to_size(src);
-  const std::size_t didx = to_size(dst);
-  const std::size_t dport = to_size(dp);
-
-  if (sidx >= g->def.nodes.size() || didx >= g->def.nodes.size()) {
-    return;
-  }
-
-  NodeSpec &dst_spec = g->def.nodes[didx];
-  if (dport >= dst_spec.input_refs.size()) {
-    return;
-  }
-
-  dst_spec.input_refs[dport] = InputRef{src, sp};
+  rt_graph_template_connect(g, 0, src_index, src_port, dst_index, dst_port);
 }
 
-// Render one block offline; processes every live instance.
+// Render one block offline; processes every live instance of every
+// template, in template registration order.
 void rt_graph_process(RTGraph *g, int nframes) {
   if (!g) {
     return;
@@ -1878,10 +2234,25 @@ void rt_graph_process(RTGraph *g, int nframes) {
   process_graph(*g, nframes);
 }
 
-// Read one bus from instance 0 (back-compat). Delegates to
-// rt_graph_instance_read_bus with instance_id=0.
+// Read one bus from the shared server pool. Under §2.C+§2.D.3 the
+// bus pool is shared across all instances of all templates, so this
+// is a direct pool read with no instance/template scope. Returns
+// number of samples written, or 0 on bad arguments.
 int rt_graph_read_bus(RTGraph *g, int bus_index, int nframes, float *out) {
-  return rt_graph_instance_read_bus(g, 0, bus_index, nframes, out);
+  if (!g || !out || bus_index < 0 || nframes <= 0) {
+    return 0;
+  }
+
+  const std::size_t bus = static_cast<std::size_t>(bus_index);
+  if (bus >= g->server.output_buses.size()) {
+    return 0;
+  }
+
+  const auto &src = g->server.output_buses[bus];
+  const std::size_t to_copy =
+      std::min(static_cast<std::size_t>(nframes), src.size());
+  std::copy_n(src.begin(), to_copy, out);
+  return static_cast<int>(to_copy);
 }
 
 /* Note [Realtime startup]
@@ -1952,23 +2323,14 @@ void rt_graph_stop_audio(RTGraph *g) {
 }
 
 // ----------------------------------------------------------------
-// Multi-instance FFI
+// Multi-instance FFI (template-aware variants live above; the
+// no-template-id functions here are the legacy "instance of template
+// 0" shorthand kept for back-compat with §2.B-era callers)
 // ----------------------------------------------------------------
 
+// Legacy: spawn an instance of template 0.
 int rt_graph_instance_add(RTGraph *g) {
-  if (!g) return -1;
-
-  GraphInstance inst = make_instance(g->def, g->max_frames);
-
-  // Reuse a free slot if any, otherwise append.
-  for (std::size_t i = 0; i < g->instances.size(); ++i) {
-    if (!g->instances[i].has_value()) {
-      g->instances[i] = std::move(inst);
-      return static_cast<int>(i);
-    }
-  }
-  g->instances.push_back(std::move(inst));
-  return static_cast<int>(g->instances.size() - 1);
+  return rt_graph_template_instance_add(g, 0);
 }
 
 void rt_graph_instance_remove(RTGraph *g, int instance_id) {
@@ -2004,6 +2366,13 @@ void rt_graph_instance_set_control(
     return;
   }
 
+  // Spec lookup goes through inst.template_id — each instance carries
+  // its own template assignment.
+  const MetaDef *def = template_at(*g, inst->template_id);
+  if (!def) {
+    return;
+  }
+
   const NodeIndex ni{node_index};
   const ControlIndex ci{control_index};
   if (!valid(ni) || !valid(ci)) {
@@ -2011,12 +2380,12 @@ void rt_graph_instance_set_control(
   }
 
   const std::size_t nidx = to_size(ni);
-  if (nidx >= g->def.nodes.size() || nidx >= inst->nodes.size()) {
+  if (nidx >= def->nodes.size() || nidx >= inst->nodes.size()) {
     return;
   }
 
   // kind comes from the spec; the value we mutate lives on the instance.
-  const NodeSpec &spec = g->def.nodes[nidx];
+  const NodeSpec &spec = def->nodes[nidx];
   NodeInstanceState &node = inst->nodes[nidx];
   const std::size_t cidx = to_size(ci);
   if (cidx >= node.controls.size()) {
@@ -2029,8 +2398,9 @@ void rt_graph_instance_set_control(
   // bus index. All four reference the shared Server bus pool;
   // growing the pool here ensures the DSP loop never has to. The
   // pool grows once globally even if only one instance touches that
-  // bus index — every other instance can then read or write the same
-  // bus without further setup. See Note [§2.C: server-global buses].
+  // bus index — every other instance (across every template) can
+  // then read or write the same bus without further setup. See Note
+  // [§2.C: server-global buses].
   const bool kind_uses_bus_slot =
       spec.kind == NodeKind::Out
       || spec.kind == NodeKind::BusOut
@@ -2048,8 +2418,9 @@ void rt_graph_instance_set_control(
 
 // Read one bus from the server pool. The instance_id argument acts as
 // a scope check (must reference a live instance) but the data comes
-// from the shared pool — under §2.C, "instance K's view of bus N" is
-// just bus N. A dead instance returns 0 with the buffer untouched.
+// from the shared pool — under §2.C+§2.D.3, "instance K's view of bus
+// N" is just bus N, regardless of which template K belongs to. A dead
+// instance returns 0 with the buffer untouched.
 int rt_graph_instance_read_bus(
     RTGraph *g, int instance_id, int bus_index, int nframes, float *out
 ) {

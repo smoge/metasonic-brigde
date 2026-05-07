@@ -40,10 +40,16 @@ import           Test.Tasty.HUnit
 import           Test.Tasty.QuickCheck     as QC
 
 import           MetaSonic.Bridge.Compile
-import           MetaSonic.Bridge.FFI      (c_rt_graph_kind_supported,
+import           MetaSonic.Bridge.FFI      (c_rt_graph_instance_alive,
+                                            c_rt_graph_instance_count,
+                                            c_rt_graph_instance_set_control,
+                                            c_rt_graph_kind_supported,
                                             c_rt_graph_process,
                                             c_rt_graph_read_bus,
+                                            c_rt_graph_template_count,
+                                            c_rt_graph_template_instance_add,
                                             loadRuntimeGraph,
+                                            loadTemplateGraph,
                                             withRTGraph)
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
@@ -1609,6 +1615,197 @@ crossCuttingTests = testGroup "End-to-end FFI"
           let peak = maximum (map (\(CFloat x) -> abs x) cs)
           assertBool ("idle envelope should be silent, got peak " <> show peak)
                      (peak < 1e-6)
+
+  -- ----------------------------------------------------------------
+  -- Multi-template loading (§2.D.3)
+  -- ----------------------------------------------------------------
+  --
+  -- These tests exercise loadTemplateGraph end-to-end: a
+  -- TemplateGraph compiled by compileTemplateGraph is transferred
+  -- across the FFI, the C-side process_graph runs templates in
+  -- registration order with one auto-spawned instance per template,
+  -- and bus reads confirm both per-template independence and
+  -- cross-template routing through the shared bus pool.
+
+  , testCase "loadTemplateGraph: single-template ensemble runs identically to loadRuntimeGraph" $ do
+      let nframes = 256
+          single  = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            out 0 o
+
+      -- Reference: legacy loadRuntimeGraph path.
+      rt <- case lowerGraph single >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      legacyBus <- withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          pure (map (\(CFloat x) -> x) cs)
+
+      -- Multi-template path with a one-template ensemble.
+      tg <- case compileTemplateGraph [("solo", single)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      tgBus <- withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadTemplateGraph handle tg
+        c_rt_graph_process handle (fromIntegral nframes)
+        allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                   (castPtr buf)
+          cs <- peekArray nframes (buf :: PtrCFloat)
+          pure (map (\(CFloat x) -> x) cs)
+
+      -- Both paths must produce bit-identical samples: the spec
+      -- defaults loadTemplateGraph writes via
+      -- rt_graph_template_set_default propagate to the auto-spawned
+      -- instance, so the resulting RTGraph state is equivalent to
+      -- the legacy single-template setup.
+      assertBool "single-template ensemble should match legacy load"
+                 (legacyBus == tgBus)
+
+  , testCase "loadTemplateGraph: registers N templates with N instances" $ do
+      -- A two-template ensemble. Both produce independent SinOsc
+      -- voices on different hardware buses.
+      let voiceA = runSynth $ do
+            o <- sinOsc 220.0 0.0
+            out 0 o
+          voiceB = runSynth $ do
+            o <- sinOsc 660.0 0.0
+            out 1 o
+
+      tg <- case compileTemplateGraph [("a", voiceA), ("b", voiceB)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes = sum (map (length . rgNodes . tplGraph)
+                                (tgTemplates tg))
+
+      withRTGraph totalNodes 256 $ \handle -> do
+        loadTemplateGraph handle tg
+
+        -- After loading: two templates, two live instances (one per
+        -- template). The auto-created instance 0 from rt_graph_clear
+        -- was removed by loadTemplateGraph, so instance ids are 0
+        -- and 1, both alive.
+        nT <- c_rt_graph_template_count handle
+        nT @?= 2
+        nI <- c_rt_graph_instance_count handle
+        nI @?= 2
+        a0 <- c_rt_graph_instance_alive handle 0
+        a1 <- c_rt_graph_instance_alive handle 1
+        a0 @?= 1
+        a1 @?= 1
+
+        c_rt_graph_process handle 256
+        allocaBytes (256 * sizeOfFloat) $ \buf -> do
+          -- Bus 0: voice A's 220 Hz sine.
+          _ <- c_rt_graph_read_bus handle 0 256 (castPtr buf)
+          cs0 <- peekArray 256 (buf :: PtrCFloat)
+          let peak0 = maximum (map (\(CFloat x) -> abs x) cs0)
+          assertBool ("bus 0 (voice A) should sing, peak=" <> show peak0)
+                     (peak0 > 0.9)
+
+          -- Bus 1: voice B's 660 Hz sine.
+          _ <- c_rt_graph_read_bus handle 1 256 (castPtr buf)
+          cs1 <- peekArray 256 (buf :: PtrCFloat)
+          let peak1 = maximum (map (\(CFloat x) -> abs x) cs1)
+          assertBool ("bus 1 (voice B) should sing, peak=" <> show peak1)
+                     (peak1 > 0.9)
+
+  , testCase "loadTemplateGraph: cross-template routing (BusOut → BusIn through shared pool)" $ do
+      -- Producer template writes a SinOsc to bus 5; consumer
+      -- template reads bus 5 and routes to hardware bus 0. This is
+      -- the headline §2.D.3 use case: two MetaDefs, server-global
+      -- bus pool, compileTemplateGraph orders producer before
+      -- consumer because consumer's read-set intersects producer's
+      -- write-set.
+      let producer = runSynth $ do
+            o <- sinOsc 330.0 0.0
+            busOut 5 o
+          consumer = runSynth $ do
+            t <- busIn 5
+            out 0 t
+
+      tg <- case compileTemplateGraph
+                   [("consumer", consumer), ("producer", producer)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- compileTemplateGraph should have re-ordered: producer
+      -- before consumer, regardless of input order.
+      map tplName (tgTemplates tg) @?= ["producer", "consumer"]
+
+      let totalNodes = sum (map (length . rgNodes . tplGraph)
+                                (tgTemplates tg))
+
+      withRTGraph totalNodes 256 $ \handle -> do
+        loadTemplateGraph handle tg
+        c_rt_graph_process handle 256
+
+        allocaBytes (256 * sizeOfFloat) $ \buf -> do
+          _ <- c_rt_graph_read_bus handle 0 256 (castPtr buf)
+          cs <- peekArray 256 (buf :: PtrCFloat)
+          let peak = maximum (map (\(CFloat x) -> abs x) cs)
+          assertBool
+            ("hardware bus 0 should carry the routed signal, peak="
+              <> show peak)
+            (peak > 0.9)
+
+  , testCase "loadTemplateGraph: extra instances spawned post-load share the spec defaults" $ do
+      -- After loadTemplateGraph spawns the initial instance per
+      -- template, the user can call c_rt_graph_template_instance_add
+      -- to spawn more instances of the same template. Those new
+      -- instances inherit the spec defaults that
+      -- rt_graph_template_set_default wrote during loading.
+      let voice = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            out 0 o
+
+      tg <- case compileTemplateGraph [("voice", voice)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes = length (rgNodes (tplGraph (head (tgTemplates tg))))
+
+      withRTGraph totalNodes 256 $ \handle -> do
+        loadTemplateGraph handle tg
+
+        -- Spawn a second instance of template 0. Should land at
+        -- slot 1 (slot 0 is the auto-spawned one).
+        i2 <- c_rt_graph_template_instance_add handle 0
+        i2 @?= 1
+
+        -- Reroute the second instance to bus 1 so its contribution
+        -- is observable on its own. (Both instances default to
+        -- bus 0, so they would otherwise sum.)
+        --
+        -- Out node is at index 1; control 0 is the bus index.
+        c_rt_graph_instance_set_control handle 1 1 0 1.0
+
+        c_rt_graph_process handle 256
+        allocaBytes (256 * sizeOfFloat) $ \buf -> do
+          -- Bus 0: original instance's 440 Hz sine.
+          _ <- c_rt_graph_read_bus handle 0 256 (castPtr buf)
+          cs0 <- peekArray 256 (buf :: PtrCFloat)
+          let peak0 = maximum (map (\(CFloat x) -> abs x) cs0)
+          assertBool ("bus 0 should sing, peak=" <> show peak0)
+                     (peak0 > 0.9)
+
+          -- Bus 1: second instance's 440 Hz sine (same spec
+          -- default, different output bus).
+          _ <- c_rt_graph_read_bus handle 1 256 (castPtr buf)
+          cs1 <- peekArray 256 (buf :: PtrCFloat)
+          let peak1 = maximum (map (\(CFloat x) -> abs x) cs1)
+          assertBool
+            ("bus 1 (second instance) should also sing, peak="
+              <> show peak1)
+            (peak1 > 0.9)
   ]
   where
     sizeOfFloat = 4 :: Int

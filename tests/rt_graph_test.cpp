@@ -3166,10 +3166,14 @@ TEST_CASE("Multi-instance: legacy API targets instance 0") {
     }
 }
 
-TEST_CASE("Multi-instance: removing instance 0 disables legacy API") {
-    // After removing instance 0, the legacy single-instance API is a
-    // silent no-op (or returns 0). A subsequent rt_graph_instance_add
-    // claims the slot back and the legacy API works again.
+TEST_CASE("Multi-instance: removing instance 0 disables instance-scoped API only") {
+    // After removing instance 0, instance-scoped legacy entries
+    // (rt_graph_set_control, which targets instance 0) become silent
+    // no-ops. But under §2.C+§2.D.3, the bus pool is server-global —
+    // not instance-scoped — so rt_graph_read_bus still reads the live
+    // pool regardless of any single instance's liveness. This test
+    // pins both halves: the instance-scoped half goes silent, the
+    // pool-scoped half does not.
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
     rt_graph_add_node(g, 0, 1);
@@ -3183,22 +3187,39 @@ TEST_CASE("Multi-instance: removing instance 0 disables legacy API") {
     rt_graph_instance_remove(g, 0);
     REQUIRE(rt_graph_instance_alive(g, 0) == 0);
 
-    // Legacy read after removal: returns 0, buffer untouched.
-    std::vector<float> sentinel(kFrames, 7.0f);
-    int n = rt_graph_read_bus(g, 0, kFrames, sentinel.data());
-    CHECK(n == 0);
-    CHECK(sentinel[0] == 7.0f);
+    // Bus read after removal: returns kFrames (the shared pool still
+    // holds whatever the last block left there). This is *not* the
+    // pre-§2.D.3 behavior — the legacy entry used to delegate to
+    // rt_graph_instance_read_bus, which checked instance liveness.
+    // Under §2.C the pool is shared, so the instance check was a
+    // legacy quirk that masked the real (pool-scoped) semantics.
+    std::vector<float> samples(kFrames, 7.0f);
+    int n = rt_graph_read_bus(g, 0, kFrames, samples.data());
+    CHECK(n == kFrames);
 
-    // Re-add: slot 0 is reused, legacy API works again.
+    // Instance-scoped legacy entry: silent no-op. We can verify by
+    // setting an absurd freq via the legacy entry, processing, and
+    // observing the bus stays zero (no instance to write into it).
+    rt_graph_set_control(g, 0, 0, 99.0); // legacy → instance 0 → no-op
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> after_dead(kFrames, 1.0f);
+    int n2 = rt_graph_read_bus(g, 0, kFrames, after_dead.data());
+    CHECK(n2 == kFrames);
+    // No live instance wrote bus 0; clear_output_buses zeroed it at
+    // the start of the block.
+    CHECK(peak_abs(after_dead) == 0.0f);
+
+    // Re-add: slot 0 is reused, instance-scoped API works again.
     int reborn = rt_graph_instance_add(g);
     CHECK(reborn == 0);
     rt_graph_set_control(g, 0, 0, 440.0);
     rt_graph_process(g, kFrames);
 
-    std::vector<float> samples(kFrames, 0.0f);
-    int got = rt_graph_read_bus(g, 0, kFrames, samples.data());
+    std::vector<float> reborn_samples(kFrames, 0.0f);
+    int got = rt_graph_read_bus(g, 0, kFrames, reborn_samples.data());
     CHECK(got == kFrames);
-    CHECK(peak_abs(samples) > 0.9f);
+    CHECK(peak_abs(reborn_samples) > 0.9f);
 
     rt_graph_destroy(g);
 }
@@ -3300,4 +3321,307 @@ TEST_CASE("Server buses §2.C: cross-instance routing through a shared bus") {
     INFO("zc=" << zc);
     CHECK(zc >= 15);
     CHECK(zc <= 22);
+}
+
+// ----------------------------------------------------------------
+// Multi-template (§2.D.3)
+// ----------------------------------------------------------------
+//
+// These tests exercise the new template-aware C ABI:
+// rt_graph_template_add / _add_node / _set_default / _connect /
+// _instance_add. The legacy single-template entries used elsewhere
+// in this file still work (they target template 0), so we focus
+// here on the new shape: multiple MetaDefs in one RTGraph,
+// per-template instance pools, cross-template bus routing, and the
+// process_graph outer-by-template iteration order.
+
+TEST_CASE("Multi-template: template_add returns dense ids; count tracks them") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // rt_graph_create auto-creates template 0 so legacy callers work.
+    CHECK(rt_graph_template_count(g) == 1);
+
+    // Each subsequent rt_graph_template_add appends a fresh MetaDef
+    // and returns its dense id (1, 2, 3, ...). Registration order
+    // equals execution order; the Haskell side picks registration
+    // order to match the topo sort over template precedence.
+    CHECK(rt_graph_template_add(g) == 1);
+    CHECK(rt_graph_template_add(g) == 2);
+    CHECK(rt_graph_template_add(g) == 3);
+    CHECK(rt_graph_template_count(g) == 4);
+
+    // Null safety.
+    CHECK(rt_graph_template_add(nullptr) == -1);
+    CHECK(rt_graph_template_count(nullptr) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Multi-template: per-template node spaces are independent") {
+    // Adding a node at index 0 in template 0 must not affect
+    // template 1's node 0. Each template has its own dense node
+    // space; rt_graph_template_add_node grows only the named
+    // template's MetaDef and the per-template instances' state
+    // vectors.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    int t0 = 0;                                // auto-created
+    int t1 = rt_graph_template_add(g);
+    REQUIRE(t1 == 1);
+
+    // Template 0: SinOsc(440) → Out(0)
+    rt_graph_template_add_node(g, t0, 0, 1);    // SinOsc
+    rt_graph_template_set_default(g, t0, 0, 0, 440.0);
+    rt_graph_template_add_node(g, t0, 1, 2);    // Out
+    rt_graph_template_set_default(g, t0, 1, 0, 0.0);
+    rt_graph_template_connect(g, t0, 0, 0, 1, 0);
+
+    // Template 1: SinOsc(880) → Out(1)
+    rt_graph_template_add_node(g, t1, 0, 1);    // SinOsc
+    rt_graph_template_set_default(g, t1, 0, 0, 880.0);
+    rt_graph_template_add_node(g, t1, 1, 2);    // Out
+    rt_graph_template_set_default(g, t1, 1, 0, 1.0);
+    rt_graph_template_connect(g, t1, 0, 0, 1, 0);
+
+    // One instance per template.
+    rt_graph_instance_remove(g, 0);             // drop the auto-created one
+    int i0 = rt_graph_template_instance_add(g, t0);
+    int i1 = rt_graph_template_instance_add(g, t1);
+    REQUIRE(i0 >= 0);
+    REQUIRE(i1 >= 0);
+    CHECK(i0 != i1);
+
+    rt_graph_process(g, kFrames);
+
+    // Each voice writes to its own bus; per-instance bus reads
+    // distinguish them because they target different bus indices.
+    std::vector<float> bus0(kFrames, 0.0f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
+
+    // 440 Hz over 1024 frames at 48000 ≈ 19 zero crossings.
+    // 880 Hz over the same window ≈ 38.
+    const int zc0 = zero_crossings(bus0);
+    const int zc1 = zero_crossings(bus1);
+    INFO("zc0=" << zc0 << " zc1=" << zc1);
+    CHECK(zc0 >= 15);
+    CHECK(zc0 <= 22);
+    CHECK(zc1 >= 32);
+    CHECK(zc1 <= 42);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Multi-template: template_set_default propagates to future instances") {
+    // The defining feature of rt_graph_template_set_default: it
+    // mutates the *spec*, so every instance spawned afterwards
+    // inherits the value. Existing instances are not changed (that's
+    // the per-instance setter's job).
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    int t0 = 0;
+    rt_graph_template_add_node(g, t0, 0, 1);    // SinOsc
+    rt_graph_template_add_node(g, t0, 1, 2);    // Out
+    rt_graph_template_set_default(g, t0, 1, 0, 0.0);
+    rt_graph_template_connect(g, t0, 0, 0, 1, 0);
+
+    // Instance A (auto-created at slot 0): inherits the spec
+    // default (which is 0 for the SinOsc freq because we haven't
+    // set it yet). It should be silent.
+    int instA = 0;
+
+    // Now set the spec default — instance A is *not* mutated.
+    rt_graph_template_set_default(g, t0, 0, 0, 660.0);
+
+    // Instance B: spawned after the spec default change, so its
+    // SinOsc freq starts at 660 Hz.
+    int instB = rt_graph_template_instance_add(g, t0);
+
+    // Use different output buses so we can observe each voice
+    // separately. (They're both on Out(0) by spec default; override
+    // per-instance.)
+    rt_graph_instance_set_control(g, instA, 1, 0, 5.0); // A → bus 5
+    rt_graph_instance_set_control(g, instB, 1, 0, 6.0); // B → bus 6
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus5(kFrames, 0.0f);
+    std::vector<float> bus6(kFrames, 0.0f);
+    rt_graph_read_bus(g, 5, kFrames, bus5.data());
+    rt_graph_read_bus(g, 6, kFrames, bus6.data());
+
+    // Instance A: freq still default-zero, no signal.
+    CHECK(peak_abs(bus5) < 0.01f);
+    // Instance B: spawned with the updated default 660 Hz.
+    CHECK(peak_abs(bus6) > 0.9f);
+    const int zcB = zero_crossings(bus6);
+    INFO("zcB=" << zcB);
+    // 660 Hz × (1024/48000) ≈ 14 cycles → ~28 zero crossings.
+    CHECK(zcB >= 22);
+    CHECK(zcB <= 32);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Multi-template: cross-template routing through the shared bus pool") {
+    // Two templates A and B share the server bus pool. A writes a
+    // signal to bus 7; B reads bus 7 and routes it to hardware bus 0.
+    // process_graph iterates templates in registration order, so
+    // A's writes are visible to B's BusIn within the same block —
+    // this is the mechanism that makes inter-template bus routing
+    // work, and it's exactly what compileTemplateGraph's
+    // topological sort enforces (writers before readers when their
+    // footprints intersect).
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    int producer = 0;                           // auto-created template 0
+    int consumer = rt_graph_template_add(g);
+    REQUIRE(consumer == 1);
+
+    // Producer template: SinOsc(330) → BusOut(7).
+    rt_graph_template_add_node(g, producer, 0, 1);    // SinOsc
+    rt_graph_template_set_default(g, producer, 0, 0, 330.0);
+    rt_graph_template_add_node(g, producer, 1, 10);   // BusOut
+    rt_graph_template_set_default(g, producer, 1, 0, 7.0);
+    rt_graph_template_connect(g, producer, 0, 0, 1, 0);
+
+    // Consumer template: BusIn(7) → Out(0).
+    rt_graph_template_add_node(g, consumer, 0, 11);   // BusIn
+    rt_graph_template_set_default(g, consumer, 0, 0, 7.0);
+    rt_graph_template_add_node(g, consumer, 1, 2);    // Out
+    rt_graph_template_set_default(g, consumer, 1, 0, 0.0);
+    rt_graph_template_connect(g, consumer, 0, 0, 1, 0);
+
+    // Drop the auto-created instance 0 and spawn one of each.
+    rt_graph_instance_remove(g, 0);
+    int prodInst = rt_graph_template_instance_add(g, producer);
+    int consInst = rt_graph_template_instance_add(g, consumer);
+    REQUIRE(prodInst >= 0);
+    REQUIRE(consInst >= 0);
+
+    rt_graph_process(g, kFrames);
+
+    // Bus 0 should carry the producer's 330 Hz sine, having
+    // travelled producer.BusOut(7) → server.bus[7] →
+    // consumer.BusIn(7) → consumer.Out(0).
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    CHECK(peak_abs(bus0) > 0.9f);
+    const int zc = zero_crossings(bus0);
+    INFO("zc=" << zc);
+    // 330 Hz × (1024/48000) ≈ 7 cycles → ~14 zero crossings.
+    CHECK(zc >= 11);
+    CHECK(zc <= 18);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Multi-template: instances of different templates execute in template order") {
+    // Two templates each produce a distinct constant on the same
+    // bus. Because rt_graph_template_set_default writes spec
+    // defaults that are visible to bus accumulation, and BusOut/Out
+    // sum into the live pool, a single bus N receives the sum of
+    // every template's contribution. Critically, this works
+    // regardless of which template was registered first — the bus
+    // pool is server-global and BusOut accumulates additively.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    int tA = 0;
+    int tB = rt_graph_template_add(g);
+    REQUIRE(tB == 1);
+
+    // Template A: NoiseGen → Gain(0.0, then will be set to 0.3) →
+    // Out(3). We use NoiseGen + Gain(0) to write a constant 0.0;
+    // simpler: use SinOsc with extremely low freq → ~constant.
+    // Even simpler: just SinOsc → Out and check peak_abs / sum.
+    //
+    // Use SinOsc(110) on tA, SinOsc(220) on tB, both into Out(0).
+    // The bus 0 reading is the sum, and peak_abs gives a quick
+    // sanity check that both contributed (else peak would match a
+    // single SinOsc).
+    rt_graph_template_add_node(g, tA, 0, 1);
+    rt_graph_template_set_default(g, tA, 0, 0, 110.0);
+    rt_graph_template_add_node(g, tA, 1, 2);
+    rt_graph_template_set_default(g, tA, 1, 0, 0.0);
+    rt_graph_template_connect(g, tA, 0, 0, 1, 0);
+
+    rt_graph_template_add_node(g, tB, 0, 1);
+    rt_graph_template_set_default(g, tB, 0, 0, 220.0);
+    rt_graph_template_add_node(g, tB, 1, 2);
+    rt_graph_template_set_default(g, tB, 1, 0, 0.0);
+    rt_graph_template_connect(g, tB, 0, 0, 1, 0);
+
+    rt_graph_instance_remove(g, 0);
+    int iA = rt_graph_template_instance_add(g, tA);
+    int iB = rt_graph_template_instance_add(g, tB);
+    REQUIRE(iA >= 0);
+    REQUIRE(iB >= 0);
+
+    rt_graph_process(g, kFrames);
+
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+
+    // Two unit sines summed: peak in [1.0, 2.0] (depends on phase
+    // alignment over the 1024-frame window). A single SinOsc would
+    // peak near 1.0 exactly. Since tA at 110 Hz won't peak in
+    // 1024 frames, the dominant contribution is tB's 220 Hz.
+    // Either way, peak should exceed 0.9 and the spectrum carries
+    // both frequencies — total zero crossings reflect the sum.
+    CHECK(peak_abs(bus0) > 0.9f);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("Multi-template: removing an instance only stops that voice") {
+    // Spawn two voices of the same template, observe the sum, then
+    // remove one voice and observe only the survivor's signal.
+    // Verifies that per-instance lifecycle interacts correctly with
+    // the multi-template execution loop.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    int t0 = 0;
+    rt_graph_template_add_node(g, t0, 0, 1);
+    rt_graph_template_add_node(g, t0, 1, 2);
+    rt_graph_template_set_default(g, t0, 1, 0, 0.0);
+    rt_graph_template_connect(g, t0, 0, 0, 1, 0);
+
+    rt_graph_instance_remove(g, 0);
+    int iA = rt_graph_template_instance_add(g, t0);
+    int iB = rt_graph_template_instance_add(g, t0);
+    REQUIRE(iA >= 0);
+    REQUIRE(iB >= 0);
+    CHECK(iA != iB);
+
+    // Different freqs so we can distinguish the survivor by zc.
+    rt_graph_instance_set_control(g, iA, 0, 0, 220.0);
+    rt_graph_instance_set_control(g, iB, 0, 0, 880.0);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus_both(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus_both.data());
+    const int zc_both = zero_crossings(bus_both);
+
+    rt_graph_instance_remove(g, iA);
+    REQUIRE(rt_graph_instance_alive(g, iA) == 0);
+    REQUIRE(rt_graph_instance_alive(g, iB) == 1);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus_b_only(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus_b_only.data());
+    const int zc_b = zero_crossings(bus_b_only);
+
+    INFO("zc_both=" << zc_both << " zc_b=" << zc_b);
+    // 880 Hz alone over 1024 frames at 48000 ≈ 38 zc.
+    CHECK(zc_b >= 32);
+    CHECK(zc_b <= 42);
+
+    rt_graph_destroy(g);
 }

@@ -17,8 +17,10 @@ module MetaSonic.Bridge.FFI
     RTGraph
   , -- * Lifecycle
     withRTGraph
-  , -- * Loading a compiled graph
+  , -- * Loading a compiled graph (single-template, legacy)
     loadRuntimeGraph
+  , -- * Loading a compiled template graph (multi-template, §2.D.3)
+    loadTemplateGraph
   , -- * Realtime audio lifecycle
     startAudio
   , waitAudioStarted
@@ -31,15 +33,30 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_start_audio
   , c_rt_graph_wait_started
   , c_rt_graph_stop_audio
+  , -- * Multi-template low-level (re-exported for tests)
+    c_rt_graph_template_add
+  , c_rt_graph_template_count
+  , c_rt_graph_template_add_node
+  , c_rt_graph_template_set_default
+  , c_rt_graph_template_connect
+  , c_rt_graph_template_instance_add
+  , c_rt_graph_instance_remove
+  , c_rt_graph_instance_count
+  , c_rt_graph_instance_alive
+  , c_rt_graph_instance_set_control
+  , c_rt_graph_instance_read_bus
   ) where
 
-import           Control.Exception        (bracket)
-import           Control.Monad            (forM_)
+import           Control.Exception          (bracket)
+import qualified Control.Monad              as M (void)
+import           Control.Monad              (forM_)
 import           Foreign
 import           Foreign.C.Types
 
-import           MetaSonic.Bridge.Compile (RuntimeGraph (..), RuntimeInput (..),
-                                           RuntimeNode (..))
+import           MetaSonic.Bridge.Compile   (RuntimeGraph (..), RuntimeInput (..),
+                                             RuntimeNode (..))
+import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
+                                             TemplateID (..))
 import           MetaSonic.Types
 
 {- Note [FFI boundary design]
@@ -243,6 +260,76 @@ foreign import ccall unsafe "rt_graph_kind_supported"
 foreign import ccall unsafe "rt_graph_read_bus"
   c_rt_graph_read_bus :: Ptr RTGraph -> CInt -> CInt -> Ptr CFloat -> IO CInt
 
+-- ----------------------------------------------------------------
+-- Multi-template ABI bindings (§2.D.3)
+-- ----------------------------------------------------------------
+--
+-- Mirror of the C ABI in tinysynth/rt_graph.h. All graph-loading
+-- entries are 'unsafe' for the same reason as their single-template
+-- counterparts above (synchronous, non-blocking, called only during
+-- load). See Note [Mixed foreign call safety].
+
+-- | Register a fresh empty MetaDef and return its dense template_id.
+-- Registration order is execution order — process_graph iterates
+-- templates in this order, and the Haskell side
+-- (compileTemplateGraph) picks registration order to match the
+-- topological sort over template precedence.
+foreign import ccall unsafe "rt_graph_template_add"
+  c_rt_graph_template_add :: Ptr RTGraph -> IO CInt
+
+-- | Number of templates currently registered.
+foreign import ccall unsafe "rt_graph_template_count"
+  c_rt_graph_template_count :: Ptr RTGraph -> IO CInt
+
+-- | Add a node to the named template's MetaDef. Walks every live
+-- instance of that template to install per-instance state at the
+-- same index. Other templates' instances are not touched.
+foreign import ccall unsafe "rt_graph_template_add_node"
+  c_rt_graph_template_add_node
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> IO ()
+
+-- | Set one entry of a template's spec.default_controls. Future
+-- instances inherit the value; existing instances are not mutated.
+-- This is the "spec default" setter used by 'loadTemplateGraph';
+-- callers wanting to update a live instance use
+-- 'c_rt_graph_instance_set_control' instead.
+foreign import ccall unsafe "rt_graph_template_set_default"
+  c_rt_graph_template_set_default
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO ()
+
+-- | Connect ports within a single template. Cross-template signal
+-- flow goes through the shared bus pool, not direct port wiring;
+-- this entry does not validate that constraint.
+foreign import ccall unsafe "rt_graph_template_connect"
+  c_rt_graph_template_connect
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> CInt -> IO ()
+
+-- | Spawn a fresh instance of the named template. Returns globally-
+-- unique instance_id (>= 0) or -1 on failure.
+foreign import ccall unsafe "rt_graph_template_instance_add"
+  c_rt_graph_template_instance_add :: Ptr RTGraph -> CInt -> IO CInt
+
+-- ----------------------------------------------------------------
+-- Multi-instance ABI bindings (§2.B carry-overs, re-exported)
+-- ----------------------------------------------------------------
+
+foreign import ccall unsafe "rt_graph_instance_remove"
+  c_rt_graph_instance_remove :: Ptr RTGraph -> CInt -> IO ()
+
+foreign import ccall unsafe "rt_graph_instance_count"
+  c_rt_graph_instance_count :: Ptr RTGraph -> IO CInt
+
+foreign import ccall unsafe "rt_graph_instance_alive"
+  c_rt_graph_instance_alive :: Ptr RTGraph -> CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_instance_set_control"
+  c_rt_graph_instance_set_control
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO ()
+
+foreign import ccall unsafe "rt_graph_instance_read_bus"
+  c_rt_graph_instance_read_bus
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> Ptr CFloat -> IO CInt
+
 -- | Allocate a C++ runtime graph, run an action with it, and
 -- guarantee cleanup via bracket.
 --
@@ -329,6 +416,97 @@ loadRuntimeGraph g rg = do
               (cPortIndex (PortIndex i))
           RConst _ ->
             pure ()
+
+{- Note [loadTemplateGraph protocol]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The multi-template counterpart of 'loadRuntimeGraph'. The protocol is:
+
+  1. rt_graph_clear(g) — resets to template 0 (empty MetaDef) +
+     instance 0 (empty GraphInstance of template 0). The auto-
+     created instance 0 is the legacy single-template world; we
+     remove it immediately because the multi-template flow spawns
+     fresh instances per template explicitly.
+
+  2. For each template in 'tgTemplates' (which is already in
+     execution order — that's compileTemplateGraph's job):
+
+     a. The first template uses the auto-created template_id 0;
+        subsequent templates call rt_graph_template_add to allocate
+        a new template_id. By construction, the C-side template_id
+        equals the position in tgTemplates.
+
+     b. Two passes per template, mirroring loadRuntimeGraph:
+        - Pass 1: rt_graph_template_add_node + per-control
+          rt_graph_template_set_default (so future instances inherit
+          the user-supplied defaults, not just kind defaults).
+        - Pass 2: rt_graph_template_connect for each RFrom input.
+
+     c. rt_graph_template_instance_add to spawn one instance of the
+        template. This makes the typical "one voice per template"
+        case work without callers having to spawn instances
+        manually. For polyphony, callers spawn additional instances
+        after loading.
+
+The C-side template_id (registration order) equals the Haskell-side
+position in tgTemplates. The 'tplID' field on the Haskell side is
+the *input* position (set by compileTemplateGraph for diagnostics)
+and may differ from the execution-order position; this function
+always uses the execution-order position when crossing the FFI.
+
+Per Note [Mixed foreign call safety], the c_rt_graph_clear call is
+'safe' because it can stop a live audio stream; the per-template
+add/connect/set/instance calls are 'unsafe' (graph-loading work,
+synchronous, non-blocking).
+-}
+
+-- | Transfer a compiled 'TemplateGraph' to the C++ runtime. Clears
+-- any existing graph state first, registers each template in
+-- execution order, populates its nodes and wiring, and spawns one
+-- instance per template.
+--
+-- See Note [loadTemplateGraph protocol].
+loadTemplateGraph :: Ptr RTGraph -> TemplateGraph -> IO ()
+loadTemplateGraph g tg = do
+  c_rt_graph_clear g
+  -- The clear left an auto-created instance 0 for legacy callers.
+  -- Multi-template loading spawns its own instances per template
+  -- below, so remove it first to start with a clean slate.
+  c_rt_graph_instance_remove g 0
+  forM_ (zip [0 ..] (tgTemplates tg)) $ \(i, tpl) -> do
+    cTid <- if i == (0 :: Int)
+              then pure 0           -- auto-created template 0
+              else c_rt_graph_template_add g
+    populateTemplate cTid (tplGraph tpl)
+    -- Spawn one instance per template so the typical single-voice
+    -- ensemble case works without explicit instance spawning. For
+    -- polyphony, callers spawn additional instances afterwards via
+    -- c_rt_graph_template_instance_add.
+    M.void $ c_rt_graph_template_instance_add g cTid
+  where
+    populateTemplate :: CInt -> RuntimeGraph -> IO ()
+    populateTemplate cTid rg = do
+      -- Pass 1: nodes + per-spec control defaults.
+      forM_ (rgNodes rg) $ \node -> do
+        c_rt_graph_template_add_node g cTid
+          (cNodeIndex (rnIndex node))
+          (kindTag    (rnKind  node))
+        forM_ (zip [0 ..] (rnControls node)) $ \(ci, v) ->
+          c_rt_graph_template_set_default g cTid
+            (cNodeIndex    (rnIndex node))
+            (cControlIndex (ControlIndex ci))
+            (CDouble v)
+      -- Pass 2: wire connections (all nodes now exist).
+      forM_ (rgNodes rg) $ \node ->
+        forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+          case inp of
+            RFrom src srcPort ->
+              c_rt_graph_template_connect g cTid
+                (cNodeIndex src)
+                (cPortIndex srcPort)
+                (cNodeIndex (rnIndex node))
+                (cPortIndex (PortIndex i))
+            RConst _ ->
+              pure ()
 
 {- Note [Realtime audio lifecycle]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
