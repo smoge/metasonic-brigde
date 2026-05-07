@@ -11,6 +11,8 @@ add_library(tinysynth_rt STATIC
     tinysynth/midi_voice_processor.cpp
     vendor/q/q_io/src/audio_device.cpp
     vendor/q/q_io/src/audio_stream.cpp
+    vendor/q/q_io/src/midi_device.cpp
+    vendor/q/q_io/src/midi_stream.cpp
 )
 
 target_include_directories(tinysynth_rt
@@ -19,19 +21,27 @@ target_include_directories(tinysynth_rt
     # q_lib/include + infra/include are PUBLIC because
     # midi_voice_processor.h exposes q::midi_1_0::note_on /
     # note_off types in its function signatures, and q_lib's
-    # headers transitively include infra/. Dependents
+    # headers transitively include infra/.
+    # q_io/include is PUBLIC because the documented integration
+    # path (in midi_voice_processor.h) wires our processor to
+    # q::midi_input_stream, which lives in q_io. Dependents
     # (tinysynth_tests, the Haskell side via cxx-sources) need
-    # the same paths.
+    # all three include paths.
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q/q_lib/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q/q_io/include
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/infra/include
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q/q_io/include
 )
 
-target_link_libraries(tinysynth_rt PRIVATE
+target_link_libraries(tinysynth_rt PUBLIC
     portaudio
     portmidi
+    # PortMIDI's static lib (libportmidi.a) uses ALSA on Linux but
+    # does not propagate the dependency, so dependents must link
+    # libasound directly. PUBLIC so tinysynth_tests / rt_graph_smoke
+    # / hpack-driven cxx-sources all pick it up.
+    asound
 )
 
 add_executable(rt_graph_smoke

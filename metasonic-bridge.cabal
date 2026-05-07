@@ -46,10 +46,13 @@ library
       tinysynth/midi_voice_processor.cpp
       vendor/q/q_io/src/audio_device.cpp
       vendor/q/q_io/src/audio_stream.cpp
+      vendor/q/q_io/src/midi_device.cpp
+      vendor/q/q_io/src/midi_stream.cpp
   extra-libraries:
       stdc++
       portaudio
       portmidi
+      asound
   build-depends:
       base >=4.14 && <5
     , brick

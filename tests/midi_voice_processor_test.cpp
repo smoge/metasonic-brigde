@@ -15,6 +15,8 @@
 #include "voice_allocator.h"
 
 #include <q/support/midi_messages.hpp>
+#include <q_io/midi_device.hpp>
+#include <q_io/midi_stream.hpp>
 
 #include <cstdint>
 #include <vector>
@@ -288,6 +290,26 @@ TEST_CASE("MidiVoiceProcessor: ignored MIDI categories do not disturb allocator 
 // ----------------------------------------------------------------
 // Out-of-spec inputs
 // ----------------------------------------------------------------
+
+// ----------------------------------------------------------------
+// Q MIDI-source linkage
+// ----------------------------------------------------------------
+
+TEST_CASE("Linkage: Q MIDI sources are compiled into tinysynth_rt") {
+    // The header advertises wiring against q::midi_input_stream and
+    // q::midi_device. Both live in q_io/src/midi_*.cpp and must be
+    // compiled into the static lib (alongside the audio_*.cpp files).
+    // Reference one symbol from each translation unit so the linker
+    // is forced to pull them in — a missing source surfaces as a
+    // link error before the tests even start. We do NOT actually
+    // construct a midi_input_stream (its destructor calls Pm_Close
+    // unconditionally on _impl, and on systems without a MIDI device
+    // _impl can be nullptr).
+    auto stream_set_default = &cycfi::q::midi_input_stream::set_default_device;
+    auto device_list        = &cycfi::q::midi_device::list;
+    CHECK(reinterpret_cast<void*>(stream_set_default) != nullptr);
+    CHECK(reinterpret_cast<void*>(device_list)        != nullptr);
+}
 
 TEST_CASE("MidiVoiceProcessor: note_off on never-played note is a safe no-op") {
     auto *g = make_graph_with_polyphony(2);
