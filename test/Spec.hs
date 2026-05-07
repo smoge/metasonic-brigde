@@ -1026,6 +1026,38 @@ unitTests = testGroup "Unit tests"
               length [() | NoOutput      <- uses] @?= 2
               length [() | RegionLocal   <- uses] @?= 2
               length [() | RegionEscapes <- uses] @?= 0
+
+      , -- Step C precondition: pin Gain's compiled shape so the
+        -- single-edge fusion rewrite has something stable to match
+        -- against. For 'gain o (Param k)':
+        --   * rnInputs[0] is RFrom <o's index> 0 — the audio signal.
+        --   * rnInputs[1] is RConst k          — the gain port is
+        --     unconnected; the literal flows to the C++ control slot
+        --     and the kernel takes its else-branch reading
+        --     controls[0]. set_control(gainNode, 0, _) is therefore
+        --     observable on the unfused output, which is what makes
+        --     the fused form's (gainNode, ControlIndex 0) reference
+        --     semantically equivalent.
+        --   * rnControls is [k] — connDefault pulls the Param's value
+        --     into the single Gain control slot.
+        -- See connDefault and ugenView in MetaSonic.Bridge.Source.
+        testCase "Gain's compiled IR shape pins Step-C fusion preconditions" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              case [n | n <- rgNodes rg, rnKind n == KGain] of
+                [gn] -> do
+                  rnControls gn @?= [0.5]
+                  case rnInputs gn of
+                    [RFrom _ (PortIndex 0), RConst 0.5] -> pure ()
+                    other -> assertFailure $
+                      "unexpected rnInputs shape: " <> show other
+                gns -> assertFailure $
+                  "expected exactly one Gain node, got " <> show (length gns)
       ]
 
   , testCase "kindTag is injective" $
