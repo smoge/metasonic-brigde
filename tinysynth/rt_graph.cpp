@@ -799,10 +799,10 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
     break;
   }
 
-  // Grow outputs to hold target_outputs without ever shrinking. The
-  // grow path allocates one default-constructed inner vector on first
-  // use; subsequent reuses for the same kind hit the loop below with
-  // size already at target_outputs.
+  // Grow outputs to hold target_outputs without ever shrinking the
+  // outer vector. The grow path allocates one default-constructed
+  // inner vector on first use; subsequent reuses for the same kind
+  // hit the loop below with size already at target_outputs.
   while (node.outputs.size() < target_outputs) {
     node.outputs.emplace_back();
   }
@@ -814,6 +814,19 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
   const auto frames = static_cast<std::size_t>(max_frames);
   for (std::size_t i = 0; i < target_outputs; ++i) {
     node.outputs[i].assign(frames, 0.0f);
+  }
+
+  // Inactive outputs at indices >= target_outputs are kept in the
+  // outer vector (capacity preservation for future shape changes
+  // back to a higher arity), but each inner buffer is shrunk to
+  // size 0 so resolve_input's outputs[port].size() < nframes check
+  // returns an empty span. Without this, reconfiguring a node from
+  // a higher-arity kind (SinOsc, Add) to a lower-arity kind (Out,
+  // BusOut) via rt_graph_template_add_node would leave stale audio
+  // at outputs[0..] visible to any downstream wiring still aimed at
+  // the old port. clear() preserves capacity.
+  for (std::size_t i = target_outputs; i < node.outputs.size(); ++i) {
+    node.outputs[i].clear();
   }
 
   // Per-instance controls take their initial values from the spec's

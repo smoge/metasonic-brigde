@@ -4566,6 +4566,48 @@ TEST_CASE("A.2 allocator failure path: queue-full activate, cancel, drain, retry
     rt_graph_destroy(g);
 }
 
+TEST_CASE("init_node_state: reconfiguring a node to lower arity hides stale outputs") {
+    // rt_graph_template_add_node may reconfigure a node in place at
+    // the same index. When the new kind has fewer outputs than the
+    // old one (e.g. SinOsc → Out drops from 1 output to 0), any
+    // downstream wiring still aimed at the old port must see an empty
+    // span, not a stale audio buffer. init_node_state preserves the
+    // outer outputs vector for capacity, so the test for "no port
+    // exists" sits in the inner buffer's size — clear()-on-shrink is
+    // what makes resolve_input bail out.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Initial graph: SinOsc(node 0) → Out(node 1, bus 0).
+    rt_graph_add_node(g, 0, 1);                    // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0);
+    rt_graph_add_node(g, 1, 2);                    // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    REQUIRE(peak_abs(bus0) > 0.5f);                // baseline: oscillator audible
+
+    // Reconfigure node 0 from SinOsc (1 output) to Out (0 outputs).
+    // The connect from node 0 → node 1 is unchanged at the spec
+    // level, but node 0 no longer produces a signal at port 0.
+    rt_graph_add_node(g, 0, 2);                    // re-add as Out
+    rt_graph_set_control(g, 0, 0, 1.0);            // route node 0 to bus 1 (junk)
+
+    rt_graph_process(g, kFrames);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+
+    // Bus 0 must be silent: node 1's input port 0 is wired to node 0
+    // which now has 0 outputs. Without the inactive-buffer clear,
+    // node 0's old outputs[0] (last block of SinOsc audio) would be
+    // exposed to node 1 and copied to bus 0.
+    CHECK(peak_abs(bus0) == doctest::Approx(0.0f));
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("A.2 slot reuse: per-voice state resets across reserve cycles") {
     // init_node_state's contract is that every reserve produces a
     // freshly-zeroed slot — no carryover of phase, filter memory,
