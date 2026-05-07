@@ -42,6 +42,7 @@ library
       vendor/infra/include
   cxx-sources:
       tinysynth/rt_graph.cpp
+      tinysynth/voice_allocator.cpp
       vendor/q/q_io/src/audio_device.cpp
       vendor/q/q_io/src/audio_stream.cpp
   extra-libraries:

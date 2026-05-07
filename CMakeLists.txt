@@ -7,6 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(tinysynth_rt STATIC
     tinysynth/rt_graph.cpp
+    tinysynth/voice_allocator.cpp
     vendor/q/q_io/src/audio_device.cpp
     vendor/q/q_io/src/audio_stream.cpp
 )
@@ -57,6 +58,7 @@ if(METASONIC_BUILD_TESTS)
 
     add_executable(tinysynth_tests
         tests/rt_graph_test.cpp
+        tests/voice_allocator_test.cpp
     )
 
     target_link_libraries(tinysynth_tests PRIVATE
