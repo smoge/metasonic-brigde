@@ -1176,7 +1176,14 @@ static void ensure_node_slot(RTGraph &g, int template_id, NodeIndex node_index) 
     def->nodes.resize(idx + 1);
   }
   for (auto &inst : g.instances) {
-    if (inst.state.load() == SlotState::Available) continue;
+    // ensure_node_slot is [T:construction] and shouldn't see any
+    // Reserved slots in practice (no producer is running during
+    // construction), but skip them defensively if encountered: a
+    // Reserved slot is being prepared by a producer that owns
+    // inst.nodes; growing the vector behind the producer's back
+    // would race their writes.
+    const SlotState s = inst.state.load();
+    if (s != SlotState::Active && s != SlotState::Releasing) continue;
     if (inst.template_id != template_id) continue;
     if (inst.nodes.size() <= idx) {
       inst.nodes.resize(idx + 1);
@@ -1981,7 +1988,15 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   for (std::size_t tid = 0; tid < template_count; ++tid) {
     const int tid_i = static_cast<int>(tid);
     for (auto &inst : g.instances) {
-      if (inst.state.load() == SlotState::Available) continue;
+      // Skip every state that is not part of the audio schedule.
+      // Available is "free", Reserved is the producer's private claim
+      // (preparation in progress — the producer may be resizing /
+      // initialising inst.nodes right now, so the audio thread MUST
+      // NOT race those writes). Only Active and Releasing slots have
+      // already been published into the schedule. Snapshot once; the
+      // §2.E silence-window branch reuses the snapshot.
+      const SlotState s = inst.state.load();
+      if (s != SlotState::Active && s != SlotState::Releasing) continue;
       if (inst.template_id != tid_i) continue;
       process_instance(g, inst, nframes);
 
@@ -1994,7 +2009,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       // slots bypass this entirely; the field is consulted only when
       // state == Releasing. See Note [§2.E: release-then-free instance
       // lifecycle].
-      if (inst.state.load() == SlotState::Releasing) {
+      if (s == SlotState::Releasing) {
         if (inst.block_sink_peak < kReleaseSilenceThreshold) {
           if (++inst.silent_blocks >= kReleaseSilenceBlocks) {
             inst.state.store(SlotState::Available);
@@ -2469,7 +2484,14 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
   ensure_node_slot(*g, template_id, idx);
   configure_spec(def->nodes[to_size(idx)], kind);
   for (auto &inst : g->instances) {
-    if (inst.state.load() == SlotState::Available) continue;
+    // [T:construction]: walk only the slots that already participate
+    // in the audio schedule, skipping Reserved alongside Available.
+    // A Reserved slot is owned by a producer that may be writing
+    // inst.nodes[i] right now; init_node_state would race those
+    // writes. (In practice no producer runs during construction,
+    // but defense in depth makes the rule legible.)
+    const SlotState s = inst.state.load();
+    if (s != SlotState::Active && s != SlotState::Releasing) continue;
     if (inst.template_id != template_id) continue;
     init_node_state(
         inst.nodes[to_size(idx)],
@@ -2841,9 +2863,17 @@ void rt_graph_instance_remove(RTGraph *g, int instance_id) {
   if (instance_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return;
-  // Hard-free path under A.1: flip the slot to Available; preserve
-  // the GraphInstance object and its node-state vector capacity for
-  // the next reuse. No allocation, no destruction.
+  // Gate to Active / Releasing only. Hard-freeing an Available slot
+  // is a silent no-op (the slot is already free); hard-freeing a
+  // Reserved slot would yank a producer's claim out from under it,
+  // dropping in-progress preparation work — the producer is the
+  // only legitimate owner of a Reserved slot's lifecycle. See
+  // Note [Pool model] and the SlotState comment.
+  const SlotState s = g->instances[idx].state.load();
+  if (s != SlotState::Active && s != SlotState::Releasing) return;
+  // Flip to Available; preserve the GraphInstance object and its
+  // node-state vector capacity for the next reuse. No allocation,
+  // no destruction.
   g->instances[idx].state.store(SlotState::Available);
 }
 
@@ -2918,7 +2948,16 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
   if (instance_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return;
-  if (g->instances[idx].state.load() == SlotState::Available) return;
+  // Gate to Active / Releasing only. Releasing an Available slot is
+  // a no-op (nothing to release). Releasing a Reserved slot would
+  // flip it to Releasing and publish it into the audio schedule
+  // *without* the producer's Activate ever having been processed,
+  // so process_graph would iterate a slot whose preparation is still
+  // in flight. The producer is the only legitimate owner of a
+  // Reserved slot's lifecycle; external callers must wait until the
+  // queued Activate publishes it before they can ask for release.
+  const SlotState pre_state = g->instances[idx].state.load();
+  if (pre_state != SlotState::Active && pre_state != SlotState::Releasing) return;
 
   GraphInstance &inst = g->instances[idx];
   const MetaDef *def = template_at(*g, inst.template_id);
