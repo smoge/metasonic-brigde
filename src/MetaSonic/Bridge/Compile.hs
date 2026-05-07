@@ -457,7 +457,7 @@ form.
 -- See Note [Runtime regions overlay].
 data RuntimeRegion = RuntimeRegion
   { rrIndex :: !RegionIndex
-    -- ^ Dense position of this region in 'rgRegions'.
+    -- ^ Dense position of this region in 'rgRuntimeRegions'.
   , rrRate  :: !Rate
     -- ^ Region execution rate (the join of member rates; see
     -- Note [Region rate compatibility]).
