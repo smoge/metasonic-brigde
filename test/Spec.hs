@@ -2331,9 +2331,11 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- + compileRuntimeGraph) must equal the fused render
     -- (loadRuntimeGraphFused + compileRuntimeGraphFused) sample-
     -- for-sample. The fused path takes a different runtime route
-    -- — elided dispatch + fused-scale resolver — but the
-    -- materialisation discipline (cast double→float, multiply) is
-    -- chosen to mirror process_gain's scalar branch exactly, so
+    -- — elided dispatch + fused-input resolver (any of single-scale,
+    -- scale chain, or affine; selected by the FusedInput
+    -- constructor) — but each step's materialisation discipline
+    -- (cast double→float, multiply or add) is chosen to mirror
+    -- process_gain / process_add scalar branches exactly, so
     -- equivalence is bit-strict, not approx.
     --
     -- Each case must actually exercise fusion: the assertion

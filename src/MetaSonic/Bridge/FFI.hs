@@ -727,11 +727,12 @@ unfused 'RuntimeGraph' values; on a graph that contains no 'RFused'
 inputs and no 'rnElided' nodes, the wire-level effect is identical
 to 'loadRuntimeGraph'. On a fused graph it additionally:
 
-  Pass 2b — emits 'rt_graph_template_connect_fused_scale_input' for
-            every 'RFused' input. Must follow Pass 2 (regular wires)
-            so the override lands on a fully-wired spec, and must
-            precede the region pass so the FusedScaleRef is in place
-            before any later instance spawn allocates scratch.
+  Pass 2b — for every 'RFused' input, dispatches to the matching
+            fused-* connect ABI entry: single-scale, scale chain, or
+            affine (mixed scale + bias). Must follow Pass 2 (regular
+            wires) so the override lands on a fully-wired spec, and
+            must precede the region pass so the FusedAffineRef is in
+            place before any later instance spawn allocates scratch.
   Pass 2c — emits 'rt_graph_template_set_node_elided' for every
             elided node. Order vs. 2b doesn't matter — the dispatch
             skip and the resolver redirection are independent —
@@ -748,8 +749,9 @@ right slot count.
 -- | Step C (e): fused-aware single-template loader. Equivalent to
 -- 'loadRuntimeGraph' on graphs from 'compileRuntimeGraph' (no
 -- 'RFused' / no 'rnElided'); on graphs from
--- 'compileRuntimeGraphFused' it additionally wires fused-scale
--- inputs and marks elided nodes via the dedicated ABI entries.
+-- 'compileRuntimeGraphFused' it additionally wires fused inputs
+-- (single-scale, scale chain, or affine) and marks elided nodes
+-- via the dedicated ABI entries.
 --
 -- See Note [loadRuntimeGraphFused protocol].
 loadRuntimeGraphFused :: Ptr RTGraph -> RuntimeGraph -> IO ()
@@ -760,9 +762,10 @@ loadRuntimeGraphFused g rg = do
   -- Pass 2: regular RFrom wiring. RFused / RConst are no-ops here;
   -- the fused inputs land in pass 2b instead of failing.
   mapM_ wireNode (rgNodes rg)
-  -- Pass 2b: register fused-scale overrides. Each RFused input
-  -- becomes one 'rt_graph_template_connect_fused_scale_input' call
-  -- on template 0.
+  -- Pass 2b: register fused-input overrides. Each RFused input
+  -- becomes one fused-* connect call on template 0; the constructor
+  -- of the carried 'FusedInput' selects the matching ABI entry
+  -- (single-scale, scale chain, or affine). See 'wireFusedScale'.
   mapM_ wireFusedNode (rgNodes rg)
   -- Pass 2c: mark elided nodes so dispatch skips them. Must run
   -- after fused inputs are registered (the resolver redirects via
@@ -931,13 +934,14 @@ loadTemplateGraph g tg = do
 
 -- | Step C (e): fused-aware multi-template loader. Sibling of
 -- 'loadTemplateGraph' that handles 'RFused' inputs and 'rnElided'
--- nodes via the fused-scale ABI. Each template's per-spec passes
--- run in the same order as 'loadRuntimeGraphFused':
+-- nodes via the fused-* connect ABI entries. Each template's
+-- per-spec passes run in the same order as 'loadRuntimeGraphFused':
 --
 --   1. ensure-bus
 --   2. add-node + set-default
 --   3. wire RFrom connections
---   3b. wire RFused inputs (template-aware fused-scale ABI)
+--   3b. wire RFused inputs (template-aware; dispatches to the
+--       matching single-scale, scale-chain, or affine ABI entry)
 --   3c. mark elided nodes
 --   4. region overlay
 --

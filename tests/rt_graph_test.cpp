@@ -5809,11 +5809,13 @@ TEST_CASE("rt_graph_template_add_region rejects out-of-range ranges") {
 }
 
 // ----------------------------------------------------------------
-// Step C (d): elided dispatch + fused-scale resolver. Pins the
-// runtime contract that fuseRuntimeGraph (Haskell) will produce
-// for the FFI loader (Step C (e)) to consume. The kernels are
-// unchanged; only NodeSpec.elided / NodeSpec.fused_inputs and the
-// resolver path are new.
+// Step C: elided dispatch + fused-input resolver. Pins the runtime
+// contract that fuseRuntimeGraph (Haskell) produces for the FFI
+// loader to consume. The kernels are unchanged; only NodeSpec.elided
+// / NodeSpec.fused_inputs and the resolver path are new. The cases
+// in this section exercise the scale-only legacy ABI
+// (rt_graph_connect_fused_scale_input); chain and affine paths are
+// covered by the equivalent Haskell-side tests in test/Spec.hs.
 // ----------------------------------------------------------------
 
 TEST_CASE("Step C (d): fused Gain renders bit-identically to unfused chain") {
@@ -5837,8 +5839,8 @@ TEST_CASE("Step C (d): fused Gain renders bit-identically to unfused chain") {
     auto unfused_samples = render_bus0(g_un, kFrames);
     rt_graph_destroy(g_un);
 
-    // Path 2: fused — Gain elided, Out reads from a fused-scale
-    // input (SinOsc.out0 × Gain.controls[0]). The Out -> Gain
+    // Path 2: fused — Gain elided, Out reads from a fused input
+    // (single-scale: SinOsc.out0 × Gain.controls[0]). The Out -> Gain
     // direct connect is intentionally still present: the resolver
     // must take the fused path because fused_inputs[port] carries
     // a value, regardless of input_refs.
@@ -5926,7 +5928,7 @@ TEST_CASE("Step C (d): recycled instance slot grows fused_scratch on reuse") {
 
     // Auto-created template 0 starts with an instance 0 (also auto-
     // created). Remove it so the slot enters Available *before* any
-    // fused-scale input has been registered on the template.
+    // fused input has been registered on the template.
     rt_graph_instance_remove(g, 0);
 
     // Build the spec.
@@ -5940,10 +5942,11 @@ TEST_CASE("Step C (d): recycled instance slot grows fused_scratch on reuse") {
     rt_graph_template_connect(g, 0, 0, 0, 1, 0);
     rt_graph_template_connect(g, 0, 1, 0, 2, 0);
 
-    // Register the fused-scale input *while* the prior instance
-    // slot is sitting Available. The growth path inside
-    // _connect_fused_scale_input only walks Active/Releasing slots,
-    // so the Available slot's fused_scratch stays empty until reuse.
+    // Register the fused input (single-scale flavor) *while* the
+    // prior instance slot is sitting Available. The growth path
+    // inside _connect_fused_scale_input only walks Active/Releasing
+    // slots, so the Available slot's fused_scratch stays empty until
+    // reuse.
     rt_graph_template_set_node_elided(g, 0, 1);
     rt_graph_template_connect_fused_scale_input(
         g, 0,
@@ -5976,7 +5979,7 @@ TEST_CASE("Step C (d): out-of-range fused refs are silent no-ops, render is unaf
 
     // Each of these should leave fused_inputs untouched. The
     // override is rejected before fused_input_count is bumped, so a
-    // resolver call on this graph never sees a stale FusedScaleRef
+    // resolver call on this graph never sees a stale FusedAffineRef
     // pointing at an out-of-range source/scale slot — which would
     // silence a previously-valid direct input, since the fused
     // override takes precedence inside resolve_input.

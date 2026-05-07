@@ -681,11 +681,12 @@ struct NodeSpec {
   std::vector<double> default_controls;
   std::vector<InputRef> input_refs;
 
-  // Step C (d): per-input fused override. Parallel-sized to
-  // input_refs whenever populated. An empty optional means "use
-  // the regular input_refs[port] path"; a populated one redirects
-  // the consumer's read through a scaled-source materialisation.
-  // See FusedAffineRef and Note [Fused inputs] (Compile.hs).
+  // Step C: per-input fused override. Parallel-sized to input_refs
+  // whenever populated. An empty optional means "use the regular
+  // input_refs[port] path"; a populated one redirects the consumer's
+  // read through an affine-chain materialisation (any sequence of
+  // scale and bias steps; see FusedAffineStep::Kind). See
+  // FusedAffineRef and Note [Fused inputs] (Compile.hs).
   std::vector<std::optional<FusedAffineRef>> fused_inputs;
 
   // Step C (d): when true, process_instance skips this node's
