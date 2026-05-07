@@ -2125,20 +2125,22 @@ static void apply_instance_set_control(
 // directly with rt_graph_instance_set_control on the Reserved slot;
 // see the [T:control] exception in rt_graph.h.
 //
-// May allocate (vector resize) on the *first* time a slot is used
-// for a template whose node count exceeds the slot's current vector
-// capacity. To keep the steady state allocation-free, callers should
-// pre-warm the pool during construction (the established pattern is
-// to spawn N instances via _template_instance_add and immediately
-// remove them — the slots stay Available with their vector capacity
-// preserved). See Note [Pool model] and Note [A.2: realtime control
-// queue].
+// Allocates. The outer slot.nodes.resize is a no-op once the slot
+// has been used for any template of equal or greater node count,
+// but init_node_state itself is NOT capacity-preserving today: it
+// does node.outputs.clear() + node.outputs.resize(1) (re-default-
+// constructs the inner buffer) and reassigns node.state from a
+// fresh value, so per-node output buffers and kernel state allocate
+// on every reserve even for a pre-warmed slot. A future "reset in
+// place" path on init_node_state would close this gap; in the
+// meantime the producer thread (not the audio thread) absorbs the
+// allocations.
 //
-// Not noexcept: slot.nodes.resize and init_node_state's vector
-// assignments can throw bad_alloc. rt_graph_realtime_reserve wraps
-// the call in a try/catch that rolls the slot back to Available so
-// no exception escapes through the extern "C" boundary. With proper
-// pre-warming the resize is a no-op and bad_alloc cannot fire.
+// Not noexcept: those allocations can throw bad_alloc.
+// rt_graph_realtime_reserve wraps the call in a try/catch that
+// rolls the slot back to Available so no exception escapes through
+// the extern "C" boundary. See Note [Pool model] and Note [A.2:
+// realtime control queue].
 static void prepare_reserved_slot(
     RTGraph &g, GraphInstance &slot, const MetaDef &def, int template_id
 ) {
