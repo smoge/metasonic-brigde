@@ -7,7 +7,7 @@ import           Control.DeepSeq            (force)
 import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
 import           Data.Char                  (toLower)
-import           Data.List                  (find, intercalate)
+import           Data.List                  (find, intercalate, nub, sort)
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
 import           System.Environment         (getArgs, getProgName)
@@ -21,7 +21,7 @@ import           MetaSonic.Bridge.MidiDemo  (CCMapping (..),
                                              VoiceMapping (..), withMidiDemo)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
-import           MetaSonic.Types            (NodeIndex (..))
+import           MetaSonic.Types            (NodeIndex (..), NodeKind (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
 import           MetaSonic.Visualize.TUI    (launchInspector)
@@ -342,12 +342,19 @@ data RunMode
 data Options = Options
   { optMode    :: RunMode
   , optTargets :: [String]
+  , optFused   :: Bool
+    -- ^ When True, demos load through 'loadRuntimeGraphFused' /
+    -- 'loadTemplateGraphFused' on a 'compileRuntimeGraphFused'-
+    -- produced 'RuntimeGraph'. Default False — Step C is opt-in
+    -- in normal demo use until benchmarking warrants flipping the
+    -- default. The MIDI-poly demo is unaffected for now.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
 defaultOptions = Options
   { optMode    = AudioOnly
   , optTargets = []
+  , optFused   = False
   }
 
 parseArgs :: [String] -> Either String Options
@@ -363,6 +370,8 @@ parseArgs = go defaultOptions
       go opts { optMode = InspectOnly } xs
     go opts ("--audio-only" : xs) =
       go opts { optMode = AudioOnly } xs
+    go opts ("--fused" : xs) =
+      go opts { optFused = True } xs
     go opts (x : xs)
       | "--" `prefixOf` x = Left ("Unknown option: " <> x)
       | otherwise         = go opts { optTargets = optTargets opts <> [x] } xs
@@ -388,11 +397,17 @@ resolveTargets ks = traverse lookupDemo ks
 usage :: String -> String
 usage prog = unlines
   [ "Usage:"
-  , "  " <> prog <> " [--audio-only] [DEMO ...]"
-  , "  " <> prog <> " --inspect [DEMO ...]"
+  , "  " <> prog <> " [--audio-only] [--fused] [DEMO ...]"
+  , "  " <> prog <> " --inspect [--fused] [DEMO ...]"
   , "  " <> prog <> " --inspect-only [DEMO ...]"
   , ""
   , "If no demo names are given, all demos are run."
+  , ""
+  , "Flags:"
+  , "  --fused          Compile and load via the Step-C fused path"
+  , "                   (compileRuntimeGraphFused / loadRuntimeGraphFused)."
+  , "                   Single-graph and multi-template demos only;"
+  , "                   the live-MIDI poly demo always runs unfused."
   , ""
   , "Availavle demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
@@ -402,7 +417,9 @@ usage prog = unlines
   , "  " <> prog <> " simple"
   , "  " <> prog <> " --inspect chain"
   , "  " <> prog <> " --inspect-only fanout"
-  , "  " <> prog <> " send-return  # multi-template demo"
+  , "  " <> prog <> " send-return            # multi-template demo"
+  , "  " <> prog <> " --fused chain          # same audio, fused load"
+  , "  " <> prog <> " --fused send-return    # multi-template fused"
   ]
 
 --------------------------------------------------------------------------------
@@ -459,6 +476,14 @@ runDemo opts demo = case demoBody demo of
 
 -- Single-template demo runner. Identical to the pre-§2.D.3 path:
 -- traceCompile → optional inspector → loadRuntimeGraph → audio.
+--
+-- When 'optFused opts' is True, the audio path takes the
+-- 'compileRuntimeGraphFused' + 'loadRuntimeGraphFused' route
+-- instead. The inspector still walks the unfused IR / region trace
+-- — those passes give the most informative view of the source
+-- graph and are unaffected by Step C. A 'printFusionSummary' line
+-- is emitted on the fused path so callers can see the rewrite's
+-- effect at a glance.
 runSingleDemo :: Options -> Demo -> SynthGraph -> IO ()
 runSingleDemo opts demo g = do
   let !trace = traceCompile g
@@ -468,21 +493,55 @@ runSingleDemo opts demo g = do
       inspectTrace trace
       putBanner (demoLabel demo)
       _ <- printTraceSummary trace
+      printFusionSummaryFor opts g
       putStrLn "\n  Audio skipped (--inspect-only)."
       putStrLn ""
 
     InspectThenRun -> do
       inspectTrace trace
       putBanner (demoLabel demo)
-      mRt <- printTraceSummary trace
-      maybe (pure ()) runAudio mRt
+      _mRtUnfused <- printTraceSummary trace
+      runSingleAudio opts g
       putStrLn ""
 
     AudioOnly -> do
       putBanner (demoLabel demo)
-      mRt <- printTraceSummary trace
-      maybe (pure ()) runAudio mRt
+      _mRtUnfused <- printTraceSummary trace
+      runSingleAudio opts g
       putStrLn ""
+
+-- Print just the fusion summary for a single-graph demo, without
+-- running audio. Used by --inspect-only so callers can compare
+-- fused vs. unfused stats statically.
+printFusionSummaryFor :: Options -> SynthGraph -> IO ()
+printFusionSummaryFor opts g =
+  let compileFn = if optFused opts
+                    then compileRuntimeGraphFused
+                    else compileRuntimeGraph
+      label     = if optFused opts then "fused" else "unfused"
+  in case lowerGraph g >>= compileFn of
+       Left _   -> pure () -- the trace summary already reported errors
+       Right rg -> printFusionSummary label rg
+
+-- Pick the loader path for a single-graph demo based on
+-- 'optFused'. The fused path recompiles from scratch via
+-- 'compileRuntimeGraphFused'; the unfused path reuses the trace's
+-- already-computed RuntimeGraph. The fusion summary fires once on
+-- whichever path runs so the output stays consistent across modes.
+runSingleAudio :: Options -> SynthGraph -> IO ()
+runSingleAudio opts g
+  | optFused opts =
+      case lowerGraph g >>= compileRuntimeGraphFused of
+        Left err -> putStrLn $ "  Compilation error (fused): " <> err
+        Right rg -> do
+          printFusionSummary "fused" rg
+          runAudioFused rg
+  | otherwise =
+      case lowerGraph g >>= compileRuntimeGraph of
+        Left err -> putStrLn $ "  Compilation error: " <> err
+        Right rg -> do
+          printFusionSummary "unfused" rg
+          runAudio rg
 
 {- Note [Multi-template demo runner]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -507,18 +566,31 @@ exit cleanly on Enter or on signal exactly like single-graph
 demos.
 -}
 
--- Multi-template demo runner.
+-- Multi-template demo runner. Picks the fused or unfused compile
+-- and load path based on 'optFused'. The textual template summary
+-- is unchanged across modes; the 'printFusionSummary' line per
+-- template makes it visible whether the Step-C rewrite found
+-- anything to fuse.
 runTemplateDemo :: Options -> Demo -> [(String, SynthGraph)] -> IO ()
 runTemplateDemo opts demo tpls = do
   putBanner (demoLabel demo)
 
-  case compileTemplateGraph tpls of
+  let compileFn = if optFused opts
+                    then compileTemplateGraphFused
+                    else compileTemplateGraph
+      label     = if optFused opts then "fused" else "unfused"
+
+  case compileFn tpls of
     Left err -> do
-      putStrLn $ "  Compilation error: " <> err
+      putStrLn $ "  Compilation error (" <> label <> "): " <> err
       putStrLn ""
 
     Right tg -> do
       printTemplateGraph tg
+      forM_ (tgTemplates tg) $ \tpl ->
+        printFusionSummary
+          (label <> " " <> show (tplName tpl))
+          (tplGraph tpl)
 
       case optMode opts of
         InspectOnly -> do
@@ -530,7 +602,9 @@ runTemplateDemo opts demo tpls = do
         _ -> do
           let totalNodes =
                 sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
-          runTemplateAudio totalNodes tg
+          if optFused opts
+            then runTemplateAudioFused totalNodes tg
+            else runTemplateAudio      totalNodes tg
           putStrLn ""
 
 -- Live-MIDI poly synth runner. Compiles the builder as a single-
@@ -751,6 +825,15 @@ runAudio rg =
     loadRuntimeGraph rt rg
     runRealtimeBracket rt
 
+-- Step C: same shape as runAudio but loads the fused 'RuntimeGraph'
+-- through 'loadRuntimeGraphFused'. The bracket is identical — only
+-- the loader changes.
+runAudioFused :: RuntimeGraph -> IO ()
+runAudioFused rg =
+  withRTGraph (length (rgNodes rg)) demoMaxFrames $ \rt -> do
+    loadRuntimeGraphFused rt rg
+    runRealtimeBracket rt
+
 -- Multi-template realtime audio: wraps loadTemplateGraph in the
 -- same start/wait/stop bracket. The 'capacity' argument to
 -- withRTGraph is a soft hint for vector pre-allocation; we sum
@@ -760,6 +843,35 @@ runTemplateAudio capacity tg =
   withRTGraph capacity demoMaxFrames $ \rt -> do
     loadTemplateGraph rt tg
     runRealtimeBracket rt
+
+-- Step C: fused multi-template realtime audio. Same bracket as
+-- runTemplateAudio; the only difference is the loader.
+runTemplateAudioFused :: Int -> TemplateGraph -> IO ()
+runTemplateAudioFused capacity tg =
+  withRTGraph capacity demoMaxFrames $ \rt -> do
+    loadTemplateGraphFused rt tg
+    runRealtimeBracket rt
+
+-- Print a one-line fusion summary for a compiled 'RuntimeGraph'.
+-- Useful for both unfused and fused runs: an unfused compile shows
+-- elided=0 and fused-inputs=0, which makes it obvious at a glance
+-- whether a graph went through the Step-C rewrite.
+printFusionSummary :: String -> RuntimeGraph -> IO ()
+printFusionSummary label rg = do
+  let nodes  = length (rgNodes rg)
+      elidedN = length (filter rnElided (rgNodes rg))
+      fusedN  = length [() | n <- rgNodes rg, RFused _ <- rnInputs n]
+      buses   = sort $ nub
+        [ truncate v :: Int
+        | n <- rgNodes rg
+        , rnKind n == KOut || rnKind n == KBusOut
+        , v : _ <- [rnControls n]
+        , v >= 0
+        ]
+  putStrLn $ "  [Fusion " <> label <> "] nodes=" <> show nodes
+          <> " elided=" <> show elidedN
+          <> " fused-inputs=" <> show fusedN
+          <> " buses=" <> show buses
 
 -- Shared realtime audio entry point: start, wait for the callback
 -- to fire, accept Enter to stop, and unwind via 'finally' so the
