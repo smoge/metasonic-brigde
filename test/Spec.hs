@@ -1091,8 +1091,9 @@ unitTests = testGroup "Unit tests"
 
       , -- Fan-out: SinOsc → 2× Gain → 2× Out. Each Gain has a single
         -- consumer (its own Out), so both Gains fuse independently.
-        -- The shared SinOsc isn't a Gain candidate, so gate 5 is
-        -- satisfied for both fusions.
+        -- The shared SinOsc isn't a Gain candidate, so the chain
+        -- walk terminates at SinOsc for both branches and each
+        -- fuses as a length-1 'FScaleFrom'.
         testCase "fuseRuntimeGraph: fan-out fuses both Gains independently" $ do
           let g = runSynth $ do
                 o  <- sinOsc 440.0 0.0
@@ -1130,21 +1131,13 @@ unitTests = testGroup "Unit tests"
               map rnKind       (rgNodes fused)
                 @?= map rnKind       (rgNodes unfused)
 
-      , -- Step C (c) gate 5: chained Gains. SinOsc → Gain₁(0.5) →
-        -- Gain₂(0.25) → Out. First-pass fusion only elides the
-        -- upstream Gain because Gain₂'s signal source (Gain₁) is
-        -- itself a candidate; chained-fusion deferred. After the
-        -- pass:
-        --   * Gain₁ is elided.
-        --   * Gain₂ stays dispatched and its signal input is
-        --     RFused (FScaleFrom SinOsc 0 Gain₁ 0).
-        --   * Out's input remains RFrom Gain₂ 0 (unchanged).
-        --
-        -- The dispatched Gain₂ then reads from a fused source at
-        -- run time, which is exactly the case Step C (d) needs to
-        -- handle in resolve_input — this test pins the IR shape
-        -- it must consume.
-        testCase "fuseRuntimeGraph: chain elides only upstream Gain (gate 5)" $ do
+      , -- Chain extension: SinOsc → Gain₁(0.5) → Gain₂(0.25) →
+        -- Out collapses both scalar Gains into one fused chain on
+        -- Out's input. Both Gains are elided; the chain is stored
+        -- in source-to-sink order so the resolver applies 0.5
+        -- before 0.25 — same float-rounding order as the unfused
+        -- chained kernels would.
+        testCase "fuseRuntimeGraph: chain of two Gains fuses into FScaleChainFrom" $ do
           let g = runSynth $ do
                 o  <- sinOsc 440.0 0.0
                 a1 <- gain o  (Param 0.5)
@@ -1158,22 +1151,109 @@ unitTests = testGroup "Unit tests"
                   sinNode  = head [n | n <- nodes, rnKind n == KSinOsc]
                   gainsExec = [n | n <- nodes, rnKind n == KGain]
                   outNode  = head [n | n <- nodes, rnKind n == KOut]
-              -- Two Gains in execution order: upstream then downstream.
               length gainsExec @?= 2
               let [gUpstream, gDownstream] = gainsExec
+              -- Both Gains are elided; chain ate the whole run.
               rnElided gUpstream   @?= True
-              rnElided gDownstream @?= False
-              -- Gain₂'s signal input now reads through the fused
-              -- form, scaled by the elided Gain₁'s control 0.
-              rnInputs gDownstream @?=
-                [ RFused (FScaleFrom (rnIndex sinNode)   (PortIndex 0)
-                                     (rnIndex gUpstream) (ControlIndex 0))
-                , RConst 0.25
-                ]
-              -- Out is untouched by the rewrite — its input still
-              -- targets the dispatched downstream Gain.
+              rnElided gDownstream @?= True
+              -- Out's input is the chain in source-to-sink order:
+              -- SinOsc:0 × gUpstream.c[0] × gDownstream.c[0].
               rnInputs outNode @?=
-                [ RFrom (rnIndex gDownstream) (PortIndex 0) ]
+                [ RFused (FScaleChainFrom (rnIndex sinNode) (PortIndex 0)
+                            [ ScaleRef (rnIndex gUpstream)   (ControlIndex 0)
+                            , ScaleRef (rnIndex gDownstream) (ControlIndex 0)
+                            ])
+                ]
+
+      , -- Length-3 chain: SinOsc → G1(0.5) → G2(0.25) → G3(0.125)
+        -- → Out. All three Gains elided; chain length 3 in
+        -- source-to-sink order.
+        testCase "fuseRuntimeGraph: chain of three Gains fuses end-to-end" $ do
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                a1 <- gain o  (Param 0.5)
+                a2 <- gain a1 (Param 0.25)
+                a3 <- gain a2 (Param 0.125)
+                out 0 a3
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes   = rgNodes rg
+                  gains   = [n | n <- nodes, rnKind n == KGain]
+                  outNode = head [n | n <- nodes, rnKind n == KOut]
+              length gains @?= 3
+              all rnElided gains @?= True
+              case rnInputs outNode of
+                [RFused (FScaleChainFrom _ _ scales)] ->
+                  length scales @?= 3
+                other -> assertFailure $
+                  "expected single FScaleChainFrom of length 3, got "
+                    <> show other
+
+      , -- Chain stops at audio-modulated Gain. carrier × modulator
+        -- (audio-modulated, gate-4 reject) followed by scalar Gain
+        -- → Out: only the trailing scalar Gain fuses; the audio-
+        -- modulated Gain stays dispatched. Chain length is 1, so
+        -- the IR uses FScaleFrom (not FScaleChainFrom) — the chain
+        -- terminator is the audio-modulated Gain itself.
+        testCase "fuseRuntimeGraph: chain stops at audio-modulated Gain" $ do
+          let g = runSynth $ do
+                c <- sinOsc 440.0 0.0
+                m <- sinOsc  73.0 0.0
+                r <- gain c m            -- audio-modulated: not fusable
+                a <- gain r (Param 0.5)  -- scalar: fuses
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  gains = [n | n <- nodes, rnKind n == KGain]
+              length gains @?= 2
+              -- Exactly one Gain elided (the scalar one).
+              length [() | n <- gains, rnElided n] @?= 1
+              -- Out's input is FScaleFrom (length-1, not chain).
+              let outNode = head [n | n <- nodes, rnKind n == KOut]
+              case rnInputs outNode of
+                [RFused FScaleFrom{}] -> pure ()
+                other -> assertFailure $
+                  "expected FScaleFrom on Out, got " <> show other
+
+      , -- Mid-chain multi-consumer: a Gain in the middle of what
+        -- *would* be a chain has rnConsumerCount > 1 and so fails
+        -- the candidate predicate. Chain extension must stop there
+        -- and not elide it.
+        --
+        --   SinOsc → G1(0.5) → { G2(0.25) → Out0,  G3(0.125) → Out1 }
+        --
+        -- G1 has two consumers (G2 and G3) and is therefore not a
+        -- candidate. The two trailing Gains each fuse independently
+        -- as length-1 FScaleFrom with G1 as the source — the chain
+        -- never grows past G1 because G1 is non-candidate.
+        testCase "fuseRuntimeGraph: chain stops at multi-consumer mid-chain Gain" $ do
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                a1 <- gain o (Param 0.5)
+                a2 <- gain a1 (Param 0.25)
+                a3 <- gain a1 (Param 0.125)
+                out 0 a2
+                out 1 a3
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let nodes = rgNodes rg
+                  gains = [n | n <- nodes, rnKind n == KGain]
+              length gains @?= 3
+              -- G1 stays dispatched (consumer count 2). G2 and G3
+              -- each fuse as length-1.
+              let elidedG = [n | n <- gains, rnElided n]
+              length elidedG @?= 2
+              -- Both Out nodes carry an RFused FScaleFrom (length-1
+              -- chain), not an FScaleChainFrom.
+              let outs = [n | n <- nodes, rnKind n == KOut]
+              length outs @?= 2
+              let isLengthOne (RFused FScaleFrom{}) = True
+                  isLengthOne _                     = False
+              all isLengthOne (concatMap rnInputs outs) @?= True
 
       , -- Idempotence: applying the rewrite twice must equal applying
         -- it once. Elided Gains fail the candidate predicate
@@ -1183,6 +1263,26 @@ unitTests = testGroup "Unit tests"
                 o <- sinOsc 440.0 0.0
                 a <- gain o (Param 0.5)
                 out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              fuseRuntimeGraph (fuseRuntimeGraph rg) @?= fuseRuntimeGraph rg
+
+      , -- Chain idempotence: a second pass over an already-fused
+        -- chain must be a no-op. After the first pass every Gain
+        -- in the chain is rnElided (failing gate 4 of the candidate
+        -- predicate via 'not (rnElided n)'), and the consumer's
+        -- input is RFused (which 'tryFuseInput' ignores since it
+        -- only matches RFrom). Pinned separately from the length-1
+        -- idempotence test so a regression in chain handling
+        -- doesn't masquerade as the single-edge bug.
+        testCase "fuseRuntimeGraph is idempotent on chains" $ do
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                a1 <- gain o  (Param 0.5)
+                a2 <- gain a1 (Param 0.25)
+                a3 <- gain a2 (Param 0.125)
+                out 0 a3
           case lowerGraph g >>= compileRuntimeGraph of
             Left err -> assertFailure $ "compile failed: " <> err
             Right rg ->
@@ -2138,6 +2238,87 @@ crossCuttingTests = testGroup "End-to-end FFI"
       assertBool ("expected peak ≈ 0.7 after set_control, got " <> show peak)
                  (peak > 0.6 && peak < 0.75)
 
+  , -- Chain control identity. With both Gains in a chain elided,
+    -- live set_control on every Gain in the chain must steer the
+    -- fused output exactly as it steers the unfused chain of
+    -- process_gain kernels. The fact that *both* mid-chain Gains
+    -- remain control-addressable is the guarantee that
+    -- 'rt_graph_template_connect_fused_scale_chain_input' stored
+    -- each ScaleRef and the resolver reads each control live —
+    -- pre-multiplication or stale caching would either silently
+    -- ignore one of the writes or change the output's float-
+    -- rounding profile. Done as a separate test from the
+    -- single-Gain identity test so a regression in chain handling
+    -- doesn't masquerade as the simpler bug.
+    testCase "Step C: set_control on every elided Gain in a chain matches unfused output" $ do
+      let nframes = 256
+          chain = runSynth $ do
+            o  <- sinOsc 440.0 0.0
+            a1 <- gain o  (Param 0.5)
+            a2 <- gain a1 (Param 0.25)
+            out 0 a2
+          newG1 = 0.7  :: Double
+          newG2 = 0.6  :: Double
+
+      rtUn <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- Both Gains' NodeIndex must survive identically across
+      -- fused/unfused. compileRuntimeGraphFused preserves rgNodes
+      -- ordering, so the indices line up.
+      let gainIxs rg =
+            [ rnIndex n | n <- rgNodes rg, rnKind n == KGain ]
+      gainIxs rtUn @?= gainIxs rtF
+      case gainIxs rtF of
+        [_, _] -> pure ()
+        other  -> assertFailure $
+          "expected exactly two Gains in chain, got " <> show other
+      let [NodeIndex g1, NodeIndex g2] = gainIxs rtF
+
+      -- Sanity: the fused compile actually produced a chain (not
+      -- two independent FScaleFroms). If this assertion ever flips
+      -- to FScaleFrom, the chain extension regressed.
+      assertBool "chain test: expected FScaleChainFrom on Out's input"
+        (not (null
+          [ ()
+          | n <- rgNodes rtF
+          , rnKind n == KOut
+          , RFused FScaleChainFrom{} <- rnInputs n
+          ]))
+
+      let renderWith loader rt = withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+            loader handle rt
+            -- Mutate both elided Gain controls. In the unfused
+            -- graph each kernel reads its own controls[0]; in the
+            -- fused graph the chain resolver reads each ScaleRef's
+            -- live control. Both reads must reflect the new values.
+            c_rt_graph_instance_set_control handle 0
+              (fromIntegral g1) 0 (CDouble newG1)
+            c_rt_graph_instance_set_control handle 0
+              (fromIntegral g2) 0 (CDouble newG2)
+            c_rt_graph_process handle (fromIntegral nframes)
+            allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+              _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                       (castPtr buf)
+              cs <- peekArray nframes (buf :: PtrCFloat)
+              pure (map (\(CFloat x) -> x) cs)
+
+      unfusedSamples <- renderWith loadRuntimeGraph      rtUn
+      fusedSamples   <- renderWith loadRuntimeGraphFused rtF
+
+      length unfusedSamples @?= length fusedSamples
+      assertBool "chain fused/unfused samples differ after live set_control on both Gains"
+        (unfusedSamples == fusedSamples)
+      -- Sanity: combined gain ≈ 0.7 * 0.6 = 0.42, so peak should
+      -- be near that on a 440 Hz sine.
+      let peak = maximum (map abs unfusedSamples)
+      assertBool ("expected peak ≈ 0.42 after chain set_control, got " <> show peak)
+                 (peak > 0.36 && peak < 0.48)
+
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
       -- read is gain-attenuated and sent to hardware bus 0. We then
@@ -2774,6 +2955,25 @@ fusedEquivalenceCases =
        car <- sinOsc dev 0.0
        a   <- gain car (Param 0.4)        -- scalar output gain: fuses into Out
        out 0 a)
+
+  -- Chain extension cases. Two and three consecutive scalar Gains
+  -- collapse into one fused chain on Out's input. The fused
+  -- resolver must apply each scale in source-to-sink order and
+  -- cast control to float per step (no pre-multiplication), so
+  -- the rendered samples must be bit-identical to the unfused
+  -- chain of process_gain kernels.
+  , ("scalar Gain chain x2", runSynth $ do
+       o  <- sinOsc 440.0 0.0
+       a1 <- gain o  (Param 0.5)
+       a2 <- gain a1 (Param 0.25)
+       out 0 a2)
+
+  , ("scalar Gain chain x3", runSynth $ do
+       o  <- sinOsc 440.0 0.0
+       a1 <- gain o  (Param 0.5)
+       a2 <- gain a1 (Param 0.25)
+       a3 <- gain a2 (Param 0.125)
+       out 0 a3)
   ]
 
 -- | Render @graph@ through the unfused and fused loaders and assert

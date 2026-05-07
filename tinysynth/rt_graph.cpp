@@ -441,21 +441,36 @@ struct InputRef {
 // Step C (d): per-input override that turns a kernel's input read
 // into an inline scaled-source materialisation. When NodeSpec's
 // fused_inputs[port] holds one of these, resolve_input writes
-// scratch[i] = source.outputs[port][i] * float(scale.controls[c])
-// into the consuming GraphInstance's fused_scratch[scratch_slot]
-// and returns a span over it. The scale control is read live so
-// rt_graph_instance_set_control on the elided Gain still drives
-// the consumer's input.
+// scratch[i] = source.outputs[port][i] then folds in each scale
+// in source-to-sink order:
 //
-// scratch_slot is dense across the template: each call to
-// rt_graph_template_connect_fused_scale_input claims a fresh slot
-// and grows every live instance's fused_scratch in lockstep.
+//   for each (scale_node, scale_control) in scales:
+//     k = sanitize_finite(float(scale_node.controls[scale_control]), 1)
+//     for i in [0, nframes): scratch[i] *= k
+//
+// into the consuming GraphInstance's fused_scratch[scratch_slot]
+// and returns a span over it. Each scale's control is read live so
+// rt_graph_instance_set_control on any elided Gain still drives
+// the consumer's input. Scales are *not* pre-multiplied (float
+// multiplication is non-associative), so chained-fused output is
+// bit-identical to chained-unfused output.
+//
+// scratch_slot is dense across the template: every fused input
+// (single-scale or chain) claims one slot regardless of chain
+// length, sized to one max_frames buffer. See
+// rt_graph_template_connect_fused_scale_input (single scale) and
+// rt_graph_template_connect_fused_scale_chain_input (chain ≥ 1).
 struct FusedScaleRef {
-  NodeIndex    source_node{};
-  PortIndex    source_port{};
-  NodeIndex    scale_node{};
-  ControlIndex scale_control{};
-  int          scratch_slot = -1;
+  NodeIndex source_node{};
+  PortIndex source_port{};
+  // Length ≥ 1. The single-scale ABI pushes one entry; the chain
+  // ABI pushes count entries. Resolver iterates in stored order
+  // (= source-to-sink). Stored inline as a small vector of pairs
+  // because the chain is read once per block per input, never on
+  // the inner sample loop, so heap traffic at chain construction
+  // does not affect realtime cost.
+  std::vector<std::pair<NodeIndex, ControlIndex>> scales;
+  int scratch_slot = -1;
 };
 
 // Shared oscillator phase state. q::phase_iterator owns the 1.31 fixed-point
@@ -1636,12 +1651,13 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
   if (idx < dst_spec.fused_inputs.size()) {
     if (const auto &fopt = dst_spec.fused_inputs[idx]; fopt.has_value()) {
       const FusedScaleRef &fr = *fopt;
-      // Validate the source node / port and the scale node /
-      // control. Any failure returns empty span, mirroring the
-      // existing "unavailable input -> caller silences or falls
-      // back to control" contract.
-      if (!valid(fr.source_node) || !valid(fr.source_port) ||
-          !valid(fr.scale_node)  || !valid(fr.scale_control)) {
+      // Validate the source node / port. Any failure returns empty
+      // span, mirroring the existing "unavailable input -> caller
+      // silences or falls back to control" contract.
+      if (!valid(fr.source_node) || !valid(fr.source_port)) {
+        return {};
+      }
+      if (fr.scales.empty()) {
         return {};
       }
       const std::size_t src_index = to_size(fr.source_node);
@@ -1653,12 +1669,6 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
         return {};
       }
 
-      const std::size_t scale_idx = to_size(fr.scale_node);
-      if (scale_idx >= inst.nodes.size()) return {};
-      const NodeInstanceState &scale = inst.nodes[scale_idx];
-      const std::size_t cidx = to_size(fr.scale_control);
-      if (cidx >= scale.controls.size()) return {};
-
       const std::size_t slot = static_cast<std::size_t>(fr.scratch_slot);
       if (fr.scratch_slot < 0 || slot >= inst.fused_scratch.size()) {
         return {};
@@ -1668,16 +1678,39 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
         return {};
       }
 
-      // Same NaN discipline as process_gain's scalar branch:
-      // a NaN control falls back to unity so the IIR / smoother
-      // state of any downstream filter doesn't get poisoned by a
-      // single bad write into controls[scale_control].
-      const float scale_f = sanitize_finite(
-          static_cast<float>(scale.controls[cidx]), 1.0f);
+      // Pre-validate every scale ref before writing the scratch:
+      // a single bad ref must not leave a partial materialisation
+      // visible to the consumer.
+      for (const auto &[scale_node, scale_control] : fr.scales) {
+        if (!valid(scale_node) || !valid(scale_control)) return {};
+        const std::size_t scale_idx = to_size(scale_node);
+        if (scale_idx >= inst.nodes.size()) return {};
+        const NodeInstanceState &scale = inst.nodes[scale_idx];
+        const std::size_t cidx = to_size(scale_control);
+        if (cidx >= scale.controls.size()) return {};
+      }
+
+      // Materialise: scratch = src, then apply each scale in
+      // source-to-sink order. Same NaN discipline as
+      // process_gain's scalar branch — a NaN control falls back
+      // to unity so chained smoothing/IIR state downstream is
+      // never poisoned by a single bad write. Float multiplies
+      // are non-associative, so ordering matters: this loop
+      // produces ((src * k1) * k2) * … per sample, which is what
+      // chained process_gain kernels also produce.
       const auto src_span = output_span(src, fr.source_port, nframes);
       for (int i = 0; i < nframes; ++i) {
         const std::size_t fi = static_cast<std::size_t>(i);
-        scratch[fi] = src_span[fi] * scale_f;
+        scratch[fi] = src_span[fi];
+      }
+      for (const auto &[scale_node, scale_control] : fr.scales) {
+        const NodeInstanceState &scale = inst.nodes[to_size(scale_node)];
+        const float scale_f = sanitize_finite(
+            static_cast<float>(scale.controls[to_size(scale_control)]), 1.0f);
+        for (int i = 0; i < nframes; ++i) {
+          const std::size_t fi = static_cast<std::size_t>(i);
+          scratch[fi] *= scale_f;
+        }
       }
       return std::span<const float>(scratch.data(),
                                     static_cast<std::size_t>(nframes));
@@ -4058,19 +4091,98 @@ void rt_graph_template_connect_fused_scale_input(
   // alias them while resolving.
   const int slot = def->fused_input_count++;
 
-  dst_spec.fused_inputs[dport] = FusedScaleRef{
-      NodeIndex{src_node},
-      PortIndex{src_port},
-      NodeIndex{scale_node},
-      ControlIndex{scale_control_index},
-      slot
-  };
+  FusedScaleRef ref;
+  ref.source_node  = NodeIndex{src_node};
+  ref.source_port  = PortIndex{src_port};
+  ref.scales.emplace_back(NodeIndex{scale_node},
+                          ControlIndex{scale_control_index});
+  ref.scratch_slot = slot;
+  dst_spec.fused_inputs[dport] = std::move(ref);
 
   // Grow every live instance of this template in lockstep so the
   // newly-claimed slot has a backing buffer ready for the next
   // process_instance call. Mirrors rt_graph_template_add_node's
   // parallel-growth contract; uses the shared ensure_fused_scratch
   // helper so reuse paths and growth paths agree exactly.
+  for (auto &inst : g->instances) {
+    if (inst.template_id != template_id) continue;
+    if (inst.state.load() == SlotState::Available) continue;
+    ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
+  }
+}
+
+// Step C chain extension: wire one input port through a chain of
+// scalar Gains. Validates every (src, dst, scale[k]) ref before
+// claiming a scratch slot — a partial allocation on a bad chain
+// would leak the slot and wedge fused_input_count above what the
+// resolver can actually use. One slot per fused input regardless of
+// chain length; per-block resolver folds the chain into the slot in
+// source-to-sink order. See FusedScaleRef::scales and resolve_input.
+void rt_graph_template_connect_fused_scale_chain_input(
+    RTGraph *g, int template_id,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int scale_count,
+    const int *scale_nodes,
+    const int *scale_controls
+) {
+  if (!g) return;
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+
+  if (scale_count <= 0) return;
+  if (!scale_nodes || !scale_controls) return;
+
+  if (dst_node < 0 || dst_port < 0 ||
+      src_node < 0 || src_port < 0) {
+    return;
+  }
+  const std::size_t didx = static_cast<std::size_t>(dst_node);
+  const std::size_t sidx = static_cast<std::size_t>(src_node);
+  if (didx >= def->nodes.size() || sidx >= def->nodes.size()) {
+    return;
+  }
+
+  NodeSpec &dst_spec = def->nodes[didx];
+  const std::size_t dport = static_cast<std::size_t>(dst_port);
+  if (dport >= dst_spec.fused_inputs.size()) return;
+
+  // Validate src_port against source kind's output arity. Mirrors
+  // the single-scale path so chain-mode rejects the same invalid
+  // shapes (Out / BusOut as a source, etc.).
+  const NodeSpec &src_spec = def->nodes[sidx];
+  const int src_output_count =
+      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut)
+          ? 0 : 1;
+  if (src_port >= src_output_count) return;
+
+  // Pre-validate every scale ref. A bad mid-chain entry must
+  // abort the whole call, otherwise we'd claim the scratch slot
+  // and leave fused_input_count permanently inflated relative to
+  // what is actually wired.
+  for (int k = 0; k < scale_count; ++k) {
+    const int sn = scale_nodes[k];
+    const int sc = scale_controls[k];
+    if (sn < 0 || sc < 0) return;
+    const std::size_t snidx = static_cast<std::size_t>(sn);
+    if (snidx >= def->nodes.size()) return;
+    const NodeSpec &scale_spec = def->nodes[snidx];
+    if (sc >= static_cast<int>(scale_spec.default_controls.size())) return;
+  }
+
+  const int slot = def->fused_input_count++;
+
+  FusedScaleRef ref;
+  ref.source_node  = NodeIndex{src_node};
+  ref.source_port  = PortIndex{src_port};
+  ref.scales.reserve(static_cast<std::size_t>(scale_count));
+  for (int k = 0; k < scale_count; ++k) {
+    ref.scales.emplace_back(NodeIndex{scale_nodes[k]},
+                            ControlIndex{scale_controls[k]});
+  }
+  ref.scratch_slot = slot;
+  dst_spec.fused_inputs[dport] = std::move(ref);
+
   for (auto &inst : g->instances) {
     if (inst.template_id != template_id) continue;
     if (inst.state.load() == SlotState::Available) continue;

@@ -25,6 +25,7 @@ module MetaSonic.Bridge.Compile
   ( -- * Runtime representation
     RuntimeInput (..)
   , FusedInput (..)
+  , ScaleRef (..)
   , RuntimeNode (..)
   , RuntimeRegion (..)
   , RuntimeGraph (..)
@@ -426,30 +427,62 @@ data RuntimeInput
 {- Note [Fused inputs]
 ~~~~~~~~~~~~~~~~~~~~~~
 'FusedInput' carries the transform that an elided producer would
-have applied if it were materialising its output buffer. The first
-shipping variant is 'FScaleFrom', emitted by single-edge fusion of a
-scalar 'Gain':
+have applied if it were materialising its output buffer.
 
-  before fusion:
-    src ──▶ Gain(signal=src, gain control 0 = k) ──▶ consumer
-            (consumer.input[i] = RFrom gain 0)
+Two shipping variants today:
 
-  after fusion:
-    src ──▶ [Gain elided] ──▶ consumer
-            (consumer.input[i] = RFused (FScaleFrom src srcPort gain 0))
+  * 'FScaleFrom' is emitted by single-edge fusion of a scalar
+    'Gain':
 
-The Gain stays in 'rgNodes' with 'rnElided = True' so its 'NodeIndex'
-remains addressable. 'rt_graph_instance_set_control(gain, 0, x)' still
-mutates the live control; the runtime reads it through the fused
-input at consumer-evaluation time, exactly as 'process_gain''s
-controls-fallback branch would have.
+      before:  src ──▶ Gain(k) ──▶ consumer
+                       consumer.input[i] = RFrom gain 0
+      after:   src ──▶ [Gain elided] ──▶ consumer
+                       consumer.input[i] = RFused (FScaleFrom src srcPort gain 0)
 
-Equivalence discipline: the fused evaluation must reproduce the
-unfused output sample-for-sample. 'process_gain''s scalar branch
-casts the 'double' control value to 'float' before multiplying the
-'float' source sample, so 'FScaleFrom' must do the same on the
-runtime side.
+  * 'FScaleChainFrom' is the chain extension: a run of two or more
+    scalar Gains @G1 → G2 → … → Gn@ feeding a single non-candidate
+    consumer collapses to one fused input that walks an ordered list
+    of 'ScaleRef' on the same source buffer:
+
+      before:  src ──▶ G1(k1) ──▶ G2(k2) ──▶ consumer
+      after:   src ──▶ [G1, G2 elided] ──▶ consumer
+                       consumer.input[i] = RFused
+                         (FScaleChainFrom src srcPort
+                            [ScaleRef g1 0, ScaleRef g2 0])
+
+    The list is in source-to-sink order; the resolver applies each
+    scale to the running scratch in that order, so the per-sample
+    arithmetic is @((src[i] * float k1) * float k2) * …@ — bit-
+    identical to chained 'process_gain' kernels. The scales are
+    *not* pre-multiplied (float multiplication is non-associative),
+    so each elided Gain's control remains live and observable.
+
+In both cases, every elided Gain stays in 'rgNodes' with
+'rnElided = True' so its 'NodeIndex' remains addressable.
+'rt_graph_instance_set_control(gain, 0, x)' continues to mutate the
+live control; the runtime reads it at consumer-evaluation time,
+exactly as 'process_gain''s controls-fallback branch would have.
+
+Equivalence discipline: 'process_gain''s scalar branch casts the
+'double' control to 'float' before multiplying the 'float' source
+sample, so the fused resolver must do the same — once per scale,
+in the order the chain stores them.
 -}
+
+-- | One scale step in a fused 'FScaleChainFrom': a reference to an
+-- elided 'KGain' node and the control slot that supplies its scalar
+-- gain. Kept as a separate type so the runtime dispatch over a chain
+-- iterates one tuple per step and so the structure survives future
+-- Gain control-shape changes.
+data ScaleRef = ScaleRef
+  { srScaleNode    :: !NodeIndex
+    -- ^ The elided 'KGain' node whose control supplies the scale.
+    --   Preserved for 'set_control' / realtime control writes.
+  , srScaleControl :: !ControlIndex
+    -- ^ Control slot on the elided Gain (always 0 today).
+  }
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
 
 -- | Fused input transforms. One constructor per fusion shape; the
 -- runtime dispatches on the constructor and reads the live state
@@ -467,6 +500,19 @@ data FusedInput
         -- ^ Control slot on the elided Gain (always 0 today; declared
         --   explicitly so the structure survives future Gain shape
         --   changes).
+      }
+  | FScaleChainFrom
+      { fcSourceNode :: !NodeIndex
+        -- ^ The non-elided producer feeding the fused chain.
+      , fcSourcePort :: !PortIndex
+        -- ^ Port on the producer to read.
+      , fcScales     :: ![ScaleRef]
+        -- ^ The chain of elided Gains, in source-to-sink order
+        --   (length ≥ 2 by construction; a length-1 chain is emitted
+        --   as 'FScaleFrom' instead, so existing single-edge tests are
+        --   unaffected). Multiplications are applied in this order
+        --   per sample to preserve float rounding identity with the
+        --   unfused kernel chain.
       }
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
@@ -817,14 +863,15 @@ compileRuntimeGraphUnfused = compileRuntimeGraph
 compileRuntimeGraphFused :: GraphIR -> Either String RuntimeGraph
 compileRuntimeGraphFused = fmap fuseRuntimeGraph . compileRuntimeGraph
 
-{- Note [Single-edge Gain fusion]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The Step-C fusion pass elides a 'KGain' node whose entire role is to
+{- Note [Scalar Gain fusion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Step-C fusion pass elides 'KGain' nodes whose entire role is to
 multiply a single-consumer signal by a control-rate scalar. After
-fusion, the consumer reads the source directly through an 'RFused'
-input that applies the gain inline.
+fusion, a non-candidate consumer reads the upstream producer
+directly through an 'RFused' input that applies the chain of scales
+inline.
 
-A Gain @g@ qualifies for the first-pass rewrite iff:
+A Gain @g@ is a /candidate/ iff:
 
   1. @rnKind g == KGain@.
   2. @rnOutputUse g == RegionLocal@ — its output never escapes the
@@ -836,41 +883,71 @@ A Gain @g@ qualifies for the first-pass rewrite iff:
      gain port is unwired (the typical @gain o (Param k)@ shape).
      Audio-modulated gains keep the kernel because the rate
      semantics differ.
-  5. The signal source is not itself a candidate. Chained fusion
-     (collapsing @G1 → G2 → ...@ into one fused chain) is deferred
-     to a future pass — first-pass fusion only elides one Gain at
-     a time.
 
-Identity preservation: an elided Gain remains in 'rgNodes' with
+Chain extension. The rewrite is driven from /non-candidate/
+consumers: for each input @RFrom srcIx _@ whose @srcIx@ is a
+candidate, walk upstream through candidates and collect them into a
+chain @[Gn, …, G1]@ stopping at the first non-candidate source. The
+walked candidates are marked 'rnElided'; the consumer's input
+becomes 'RFused' carrying the upstream source and the chain in
+source-to-sink order @[G1, …, Gn]@.
+
+A length-1 chain is emitted as 'FScaleFrom' so existing single-edge
+behaviour (and its tests) is preserved bit-identically; chains of
+length two or more are emitted as 'FScaleChainFrom'. Driving the
+rewrite from non-candidate consumers means a candidate Gain whose
+own consumer is /also/ a candidate is never the rewriting site —
+the chain is collected once, by the eventual non-candidate sink.
+This is how the algorithm avoids both double-fusion and recursion
+on already-fused inputs.
+
+Termination. Each candidate's 'rnConsumerCount' is exactly 1, so a
+chain has a unique sink. The graph is a DAG, so the upstream walk
+cannot loop. The walk terminates at the first non-candidate
+'rnIndex' encountered — typically the producer of the original
+signal (e.g., a 'KSinOsc'), but it can also be an audio-modulated
+Gain whose shape gate (4) excludes it.
+
+Identity preservation. Every elided Gain remains in 'rgNodes' with
 'rnElided = True', preserving its 'NodeIndex'. Direct
 'rt_graph_instance_set_control' / realtime control writes to
 @(gainNode, ControlIndex 0)@ continue to land on
-@inst.nodes[gainNode].controls[0]@; the runtime reads that slot at
-fused-input evaluation time, exactly as 'process_gain''s
+@inst.nodes[gainNode].controls[0]@; the runtime reads each scale
+live at fused-input evaluation time, exactly as 'process_gain''s
 controls-fallback branch does. No control-addressable identity
-disappears.
+disappears, including for Gains in the middle of a chain.
 
-Counter-state: 'rnConsumerCount' and 'rnOutputUse' are not
+Float-rounding identity. The fused resolver applies scales in
+source-to-sink order, casting each control to 'float' before the
+multiply, mirroring chained 'process_gain' kernels exactly. Scales
+are /not/ pre-multiplied (float multiplication is non-associative),
+so chained-fused output is bit-identical to chained-unfused output.
+
+Counter-state. 'rnConsumerCount' and 'rnOutputUse' are not
 recomputed by the rewrite. They reflect the post-compile state,
 not the post-fusion state. A future fusion pass that needs updated
 counts must rebuild them.
 -}
 
--- | Step C: single-edge Gain fusion. Walks 'rgNodes' once, identifies
--- fusable Gain nodes, marks them elided, and rewrites their
--- consumers' inputs to read the producer through a fused inline
--- transform.
+-- | Step C: scalar Gain fusion with chain extension. Walks
+-- 'rgNodes', identifies candidate Gains, and for each non-candidate
+-- consumer rewrites @RFrom gainIx _@ inputs into 'RFused' values
+-- that absorb the upstream candidate chain. All Gains in a fused
+-- chain are marked elided; their 'NodeIndex' and controls remain
+-- addressable.
 --
--- Idempotent: a second call is a no-op because the elided Gains no
--- longer satisfy the candidate predicate ('rnElided' is now True).
+-- Idempotent: a second call is a no-op because previously-elided
+-- Gains fail the candidate predicate ('rnElided' check) and the
+-- consumer inputs already carry 'RFused' values that the rewrite
+-- ignores.
 --
--- See Note [Single-edge Gain fusion].
+-- See Note [Scalar Gain fusion].
 fuseRuntimeGraph :: RuntimeGraph -> RuntimeGraph
 fuseRuntimeGraph rg =
   let nodes = rgNodes rg
 
-      -- Shape-only candidate predicate (gates 1-4). Gate 5 is
-      -- applied below over the candidate set itself.
+      -- Shape-only candidate predicate (gates 1-4). Chain extension
+      -- (the former gate 5) now lives in the walk below.
       isCandidate n =
         rnKind n == KGain
           && rnOutputUse n == RegionLocal
@@ -880,34 +957,69 @@ fuseRuntimeGraph rg =
                [RFrom _ _, RConst _] -> True
                _                     -> False
 
-      candidates       = filter isCandidate nodes
-      candidateIndices = S.fromList (map rnIndex candidates)
+      candById :: M.Map NodeIndex RuntimeNode
+      candById = M.fromList [(rnIndex n, n) | n <- nodes, isCandidate n]
 
-      -- Gate 5: a Gain only fuses if its signal source is NOT
-      -- itself a candidate. Survivors carry their (source, port)
-      -- mapping for the rewrite step.
-      fusable :: M.Map NodeIndex (NodeIndex, PortIndex)
-      fusable = M.fromList
-        [ (rnIndex g, (src, srcPort))
-        | g <- candidates
-        , let RFrom src srcPort : _ = rnInputs g
-        , src `S.notMember` candidateIndices
-        ]
+      -- Walk upstream from a candidate Gain. Returns:
+      --   * terminal source node + port (the first non-candidate
+      --     producer reached)
+      --   * the list of elided Gain indices (chain members, any
+      --     order — only used as a set)
+      --   * the chain of (gain, ctl 0) refs in source-to-sink order
+      --     (first element is the upstream-most Gain)
+      walkChain
+        :: NodeIndex
+        -> (NodeIndex, PortIndex, [NodeIndex], [ScaleRef])
+      walkChain gainIx =
+        let g = candById M.! gainIx          -- safe: caller checked
+            (src, srcPort) = case rnInputs g of
+              RFrom s p : _ -> (s, p)
+              _             -> error "fuseRuntimeGraph: candidate \
+                                     \without RFrom signal input \
+                                     \(gate 4 broken)"
+            here = ScaleRef gainIx (ControlIndex 0)
+        in case M.lookup src candById of
+             Nothing ->
+               -- Source is non-candidate: chain ends here.
+               (src, srcPort, [gainIx], [here])
+             Just _  ->
+               -- Source is itself a candidate: extend upstream and
+               -- prepend the upstream chain so source-to-sink order
+               -- is preserved.
+               let (term, termPort, elided, scalesUp) = walkChain src
+               in (term, termPort, gainIx : elided, scalesUp ++ [here])
 
-      -- Rewrite a consumer-side input: an 'RFrom gainIx _' pointing
-      -- at a fusable Gain becomes 'RFused FScaleFrom'. The original
-      -- port is always 0 (Gain has one output) so the pattern need
-      -- not inspect it.
-      rewriteInput inp = case inp of
+      -- Try to fuse a single consumer-side input. Returns the
+      -- (possibly rewritten) input plus any Gain indices that
+      -- should be marked elided as a result.
+      tryFuseInput :: RuntimeInput -> (RuntimeInput, [NodeIndex])
+      tryFuseInput inp = case inp of
         RFrom gainIx _port
-          | Just (src, srcPort) <- M.lookup gainIx fusable
-          -> RFused (FScaleFrom src srcPort gainIx (ControlIndex 0))
-        _ -> inp
+          | M.member gainIx candById ->
+              let (src, srcPort, elidedIxs, scales) = walkChain gainIx
+                  fused = case scales of
+                    [ScaleRef g0 c0] -> FScaleFrom src srcPort g0 c0
+                    _                -> FScaleChainFrom src srcPort scales
+              in (RFused fused, elidedIxs)
+        _ -> (inp, [])
 
-      -- Per-node: fusable Gains become elided (inputs preserved so
-      -- structural info survives); everyone else gets their inputs
-      -- rewritten.
-      rewriteNode n
-        | M.member (rnIndex n) fusable = n { rnElided = True }
-        | otherwise = n { rnInputs = map rewriteInput (rnInputs n) }
-  in rg { rgNodes = map rewriteNode nodes }
+      -- Process one node. Candidates are left alone here — they
+      -- become elided once a downstream non-candidate consumer
+      -- walks them. Non-candidates have each input considered for
+      -- chain fusion.
+      processNode n
+        | M.member (rnIndex n) candById = (n, [])
+        | otherwise =
+            let pairs   = map tryFuseInput (rnInputs n)
+                inputs' = map fst pairs
+                elided  = concatMap snd pairs
+            in (n { rnInputs = inputs' }, elided)
+
+      processed = map processNode nodes
+      newNodes  = map fst processed
+      elidedSet = S.fromList (concatMap snd processed)
+
+      finalize n
+        | rnIndex n `S.member` elidedSet = n { rnElided = True }
+        | otherwise                      = n
+  in rg { rgNodes = map finalize newNodes }

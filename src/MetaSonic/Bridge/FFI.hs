@@ -46,6 +46,7 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_template_add_region
   , c_rt_graph_template_set_node_elided
   , c_rt_graph_template_connect_fused_scale_input
+  , c_rt_graph_template_connect_fused_scale_chain_input
   , c_rt_graph_template_instance_add
   , c_rt_graph_instance_remove
   , c_rt_graph_instance_release
@@ -74,7 +75,8 @@ import           Foreign.C.Types
 import           MetaSonic.Bridge.Compile   (FusedInput (..), RuntimeGraph (..),
                                              RuntimeInput (..),
                                              RuntimeNode (..),
-                                             RuntimeRegion (..))
+                                             RuntimeRegion (..),
+                                             ScaleRef (..))
 import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
                                              TemplateID (..))
 import           MetaSonic.Types
@@ -392,6 +394,24 @@ foreign import ccall unsafe "rt_graph_template_connect_fused_scale_input"
     -> CInt -> CInt
     -> IO ()
 
+-- | Step C chain extension: wire one input port through a
+-- chained fused scaled-source form. The runtime materialises
+-- @scratch[i] = src[i]@, then folds in each
+-- @float(scale_nodes[k].controls[scale_controls[k]])@ in
+-- source-to-sink order. One scratch slot per fused input
+-- regardless of chain length. See
+-- 'rt_graph_template_connect_fused_scale_chain_input' in
+-- @rt_graph.h@.
+foreign import ccall unsafe "rt_graph_template_connect_fused_scale_chain_input"
+  c_rt_graph_template_connect_fused_scale_chain_input
+    :: Ptr RTGraph -> CInt
+    -> CInt -> CInt
+    -> CInt -> CInt
+    -> CInt
+    -> Ptr CInt
+    -> Ptr CInt
+    -> IO ()
+
 -- | Spawn a fresh instance of the named template. Returns globally-
 -- unique instance_id (>= 0) or -1 on failure.
 foreign import ccall unsafe "rt_graph_template_instance_add"
@@ -556,6 +576,39 @@ addRegionTo g cTid r =
         (fromIntegral h)
         (fromIntegral (length (rrNodes r)))
 
+-- | Cross the fused-input ABI for one consumer port. Dispatches
+-- between the single-scale and chain entry points so the loaders
+-- only have to recognise 'RFused' once. The chain entry point
+-- claims one scratch slot regardless of length, so emitting the
+-- chain form for length-1 chains would be correct but wasteful;
+-- the compiler emits 'FScaleFrom' for length-1 to avoid the array
+-- marshalling and to preserve bit-equivalence with the original
+-- single-edge wiring.
+wireFusedScale
+  :: Ptr RTGraph -> CInt
+  -> CInt -> CInt
+  -> FusedInput
+  -> IO ()
+wireFusedScale g cTid dstNode dstPort fused = case fused of
+  FScaleFrom srcN srcP scaleN scaleC ->
+    c_rt_graph_template_connect_fused_scale_input g cTid
+      dstNode dstPort
+      (cNodeIndex srcN)
+      (cPortIndex srcP)
+      (cNodeIndex scaleN)
+      (cControlIndex scaleC)
+  FScaleChainFrom srcN srcP scales ->
+    let nodes = [cNodeIndex n | ScaleRef n _ <- scales]
+        ctls  = [cControlIndex c | ScaleRef _ c <- scales]
+        n     = fromIntegral (length scales)
+    in withArray nodes $ \pNodes ->
+       withArray ctls  $ \pCtls  ->
+         c_rt_graph_template_connect_fused_scale_chain_input g cTid
+           dstNode dstPort
+           (cNodeIndex srcN)
+           (cPortIndex srcP)
+           n pNodes pCtls
+
 -- | Transfer a compiled 'RuntimeGraph' to the C++ runtime.
 -- Clears any existing graph state first, then adds nodes and
 -- wires connections.
@@ -714,14 +767,11 @@ loadRuntimeGraphFused g rg = do
     wireFusedNode node =
       forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
         case inp of
-          RFused (FScaleFrom srcN srcP scaleN scaleC) ->
-            c_rt_graph_template_connect_fused_scale_input g 0
+          RFused fused ->
+            wireFusedScale g 0
               (cNodeIndex (rnIndex node))
               (cPortIndex (PortIndex i))
-              (cNodeIndex srcN)
-              (cPortIndex srcP)
-              (cNodeIndex scaleN)
-              (cControlIndex scaleC)
+              fused
           _ -> pure ()
 
     markElided :: RuntimeNode -> IO ()
@@ -895,14 +945,11 @@ loadTemplateGraphFused g tg = do
       forM_ (rgNodes rg) $ \node ->
         forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
           case inp of
-            RFused (FScaleFrom srcN srcP scaleN scaleC) ->
-              c_rt_graph_template_connect_fused_scale_input g cTid
+            RFused fused ->
+              wireFusedScale g cTid
                 (cNodeIndex (rnIndex node))
                 (cPortIndex (PortIndex i))
-                (cNodeIndex srcN)
-                (cPortIndex srcP)
-                (cNodeIndex scaleN)
-                (cControlIndex scaleC)
+                fused
             _ -> pure ()
       forM_ (rgNodes rg) $ \node ->
         when (rnElided node) $

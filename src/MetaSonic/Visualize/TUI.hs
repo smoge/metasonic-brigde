@@ -297,6 +297,14 @@ fmtRtInput (RFused (FScaleFrom s (PortIndex p) g (ControlIndex c))) =
   -- being scaled and by which elided Gain.
   "[" <> showNodeIndex s <> "]:" <> show p
     <> " × [" <> showNodeIndex g <> "].c[" <> show c <> "]"
+fmtRtInput (RFused (FScaleChainFrom s (PortIndex p) scales)) =
+  -- Step C chain fusion: src × g1.c[c1] × g2.c[c2] × … applied in
+  -- source-to-sink order. Each ScaleRef references one elided Gain.
+  "[" <> showNodeIndex s <> "]:" <> show p
+    <> concatMap fmtScale scales
+  where
+    fmtScale (ScaleRef g (ControlIndex c)) =
+      " × [" <> showNodeIndex g <> "].c[" <> show c <> "]"
 
 drawDetailPanel :: AppState -> Widget Name
 drawDetailPanel st =

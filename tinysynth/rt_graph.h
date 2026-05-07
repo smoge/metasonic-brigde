@@ -190,6 +190,48 @@ void rt_graph_template_connect_fused_scale_input(
     int src_node, int src_port,
     int scale_node, int scale_control_index);
 
+// [T:construction] Wire one input port of a destination node so it
+// reads through a chained fused scaled-source form: a single source
+// buffer multiplied by a sequence of scalar gains, applied in
+// source-to-sink order.
+//
+// Operationally equivalent to making N consecutive single-edge fused
+// inputs, except (a) it claims one scratch slot regardless of chain
+// length, and (b) the resolver applies all scales in a single
+// per-block pass, preserving float multiplication order so the fused
+// output is bit-identical to the unfused chain of process_gain
+// kernels:
+//
+//   scratch[i] = src[i]
+//   for k in 0 .. scale_count-1:
+//     k_f = sanitize_finite(static_cast<float>(scale_nodes[k]
+//                            .controls[scale_controls[k]]), 1.0f)
+//     for i in 0 .. nframes-1: scratch[i] *= k_f
+//
+// scale_count must be ≥ 1. Each (scale_nodes[k], scale_controls[k])
+// pair is a live read on every block — the elided Gain nodes remain
+// addressable and rt_graph_instance_set_control on any of them
+// continues to drive the consumer's input.
+//
+// Validation: every scale_node / scale_control pair is checked
+// before the scratch slot is claimed. On any invalid index (or null
+// arrays / zero count), this is a silent no-op and no slot is
+// allocated. Multiple fused-scale wires (chain or single) to the
+// same (dst_node, dst_port) overwrite the previous; the older
+// scratch slot becomes unused but is not reclaimed.
+//
+// Construction-only: must run before audio starts. Walks every live
+// instance of the named template to grow its scratch storage in
+// lockstep with the new slot, mirroring the parallel-growth contract
+// of rt_graph_template_add_node.
+void rt_graph_template_connect_fused_scale_chain_input(
+    RTGraph *g, int template_id,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int scale_count,
+    const int *scale_nodes,
+    const int *scale_controls);
+
 // [T:construction] Add one region to the named template's MetaDef.
 // Regions are an execution-order overlay on the template's node array;
 // process_instance iterates them as the unit of dispatch when the
