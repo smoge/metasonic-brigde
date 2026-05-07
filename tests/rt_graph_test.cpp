@@ -4517,6 +4517,55 @@ TEST_CASE("A.2 queued set_control: takes effect on the block following the enque
     rt_graph_destroy(g);
 }
 
+TEST_CASE("A.2 allocator failure path: queue-full activate, cancel, drain, retry") {
+    // The realistic producer flow when the audio thread is too slow
+    // and the queue saturates:
+    //   1. queue is full (256 commands waiting for the next drain);
+    //   2. realtime_reserve still succeeds — it never touches the
+    //      queue, just CAS-claims a slot synchronously;
+    //   3. realtime_activate returns 0 (queue rejects the enqueue);
+    //   4. producer falls back: cancel rolls the slot back, the next
+    //      process_graph drains the queue, and a fresh reserve+activate
+    //      succeeds.
+    //
+    // This locks down the cancel-as-rollback contract end-to-end.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    rt_graph_template_set_default(g, 0, 0, 0, 0.5);  // Add a-default = 0.5
+    rt_graph_instance_remove(g, 0);
+
+    // Saturate the queue. Slot 99 is out of range; the drain will
+    // silently drop each command. Queue mechanics still advance.
+    for (int i = 0; i < 256; ++i) {
+        REQUIRE(rt_graph_realtime_set_control(g, 99, 0, 0, 0.0) == 1);
+    }
+
+    int s = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s >= 0);                                  // synchronous; queue state irrelevant
+    CHECK(rt_graph_realtime_activate(g, s) == 0);     // queue full
+
+    rt_graph_realtime_cancel(g, s);                   // roll back
+    CHECK(rt_graph_instance_alive(g, s) == 0);
+    CHECK(rt_graph_instance_status(g, s) == -1);
+
+    // One process call drains the saturated queue.
+    rt_graph_process(g, kFrames);
+
+    int s2 = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(s2 >= 0);
+    CHECK(s2 == s);                                   // cancel returned the same slot
+    CHECK(rt_graph_realtime_activate(g, s2) == 1);    // queue has room now
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.5f).epsilon(1e-6));
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("A.2 reset: rt_graph_clear discards pending queued commands") {
     // Without resetting the queue's read/write indices in the clear
     // path, the next process_graph after rt_graph_clear would replay

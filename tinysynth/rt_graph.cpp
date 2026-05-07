@@ -26,10 +26,12 @@
 #include <portaudio.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <optional>
@@ -2131,9 +2133,15 @@ static void apply_instance_set_control(
 // remove them — the slots stay Available with their vector capacity
 // preserved). See Note [Pool model] and Note [A.2: realtime control
 // queue].
+//
+// Not noexcept: slot.nodes.resize and init_node_state's vector
+// assignments can throw bad_alloc. rt_graph_realtime_reserve wraps
+// the call in a try/catch that rolls the slot back to Available so
+// no exception escapes through the extern "C" boundary. With proper
+// pre-warming the resize is a no-op and bad_alloc cannot fire.
 static void prepare_reserved_slot(
     RTGraph &g, GraphInstance &slot, const MetaDef &def, int template_id
-) noexcept {
+) {
   slot.template_id    = template_id;
   slot.silent_blocks  = 0;
   slot.block_sink_peak = 0.0f;
@@ -3511,7 +3519,20 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
     return -1;
   }
 
-  prepare_reserved_slot(*g, g->instances[free_slot], *def, template_id);
+  // prepare_reserved_slot can throw bad_alloc when the slot is
+  // being reused for a template shape larger than its current
+  // capacity (the not-pre-warmed path). Catch it here, roll the
+  // slot back to Available with release ordering so a subsequent
+  // reserver sees a clean state, and report failure as -1. With
+  // the recommended pre-warm pattern resize is a no-op and the
+  // catch never fires; this is defense in depth so an exception
+  // never escapes the extern "C" boundary into producer code.
+  try {
+    prepare_reserved_slot(*g, g->instances[free_slot], *def, template_id);
+  } catch (...) {
+    g->instances[free_slot].state.store(SlotState::Available, std::memory_order_release);
+    return -1;
+  }
   return static_cast<int>(free_slot);
 }
 
