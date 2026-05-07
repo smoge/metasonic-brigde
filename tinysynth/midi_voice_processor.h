@@ -54,11 +54,11 @@
 //     don't have an obvious universal mapping. Wire them via a
 //     custom processor subclass if needed.
 //
-// Known limitation (Phase 3.3a/b): CC and pitch-bend updates land
-// at the next process_graph block boundary, not per-sample. Rapid
-// sweeps (e.g. mod-wheel ramps, pitch-bend trills) may produce
-// audible zippering. Phase 3.3c adds q::dynamic_smoother to the
-// runtime to fix this without changing the API surface.
+// Control timing: note, CC, and pitch-bend writes are queued and
+// applied at the next process_graph block boundary. Direct mappings
+// therefore step once per block. For controls that should glide, map
+// the event to a Smooth node's target control; the Haskell `cc`
+// builder does this automatically for CC-bound controls.
 
 #pragma once
 

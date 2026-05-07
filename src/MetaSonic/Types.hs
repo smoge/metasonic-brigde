@@ -211,23 +211,22 @@ data NodeKind
   | KHPF
     -- ^ High-pass biquad (wraps Q's @q::highpass@). Same input
     -- shape as 'KLPF': @[signal, cutoff, q]@. cutoff in Hz,
-    -- q is the resonance. Cutoff and q are block-latched: the
-    -- kernel reads sample 0 of each input port once per block
-    -- (mirroring 'KLPF'). An upstream 'KSmooth' softens
-    -- block-to-block / control-rate jumps in the cutoff trajectory
-    -- but cannot give within-block sweeps — those need a
-    -- sample-accurate kernel path that doesn't exist today.
+    -- q is the resonance. The filter reads cutoff and q once at
+    -- the start of each block, matching 'KLPF'. Put 'KSmooth'
+    -- before the cutoff input when MIDI or UI changes should glide
+    -- from block to block instead of jumping; true within-block
+    -- sweeps would need a sample-accurate filter path.
   | KBPF
     -- ^ Band-pass biquad (wraps Q's @q::bandpass_cpg@, the
     -- constant-peak-gain variant favoured for music). Same input
     -- shape as 'KLPF': @[signal, cutoff, q]@. q controls bandwidth
-    -- (higher q = narrower band). Like 'KHPF' \/ 'KLPF', cutoff
-    -- and q are block-latched at sample 0 of each block.
+    -- (higher q = narrower band). Cutoff and q are read once per
+    -- block, like 'KHPF' and 'KLPF'.
   | KNotch
     -- ^ Notch biquad (wraps Q's @q::notch@). Same input shape as
     -- 'KLPF': @[signal, cutoff, q]@. Useful for hum removal and
-    -- spectral notching. Cutoff and q are block-latched, like the
-    -- rest of the biquad family.
+    -- spectral notching. Cutoff and q are read once per block, like
+    -- the rest of the biquad family.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 

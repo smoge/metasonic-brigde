@@ -26,18 +26,15 @@
 // before opening the demo (or after — order doesn't matter, the demo
 // only writes the producer side of the realtime queue).
 //
-// Single-session contract: the live-MIDI demo runner is externally
-// synchronized and single-session today. Do not call
-// rt_midi_demo_open concurrently in one process, and do not race
-// rt_midi_demo_open / rt_midi_demo_close from multiple threads.
-// Device enumeration uses Q's process-global midi_device storage
-// (see tinysynth/q_midi_device.cpp's CONTRACT CHANGE note); the
-// returned midi_device instances borrow that storage, so safely
-// supporting multiple concurrent opens needs a process-wide guard
-// covering the full list() -> probe -> q::midi_input_stream
-// construction span -- locking just list() is not enough. The
-// preferred long-term fix is patching Q's header so midi_device
-// owns impl by value.
+// Single-session contract: run at most one live-MIDI demo session in a
+// process, and serialize open/close calls. This is enough for the demo
+// runner's intended use: one producer worker feeding one RTGraph.
+//
+// Why: Q's midi_device objects borrow process-global listing storage
+// (see tinysynth/q_midi_device.cpp). Supporting concurrent opens safely
+// would need a process-wide guard around list() -> probe ->
+// q::midi_input_stream construction, or the cleaner upstream fix where
+// midi_device owns its impl by value.
 //
 // Graceful no-device behaviour: the worker walks
 // q::midi_device::list() and only constructs a q::midi_input_stream

@@ -11,6 +11,13 @@ typedef struct RTGraph RTGraph;
 // its comment. Categories and the contract they participate in are
 // enumerated in Note [Thread safety contract] in rt_graph.cpp:
 //
+// Rule of thumb:
+//   * Build and reconfigure graphs before audio starts.
+//   * While audio is running, use rt_graph_realtime_* from one
+//     producer thread for note/control changes.
+//   * Read-only helpers are diagnostic; they may be stale during
+//     concurrent mutation.
+//
 //   construction       — mutates shared structure; safe only when
 //                        the audio callback is not running
 //   control            — mutates per-instance state; safe only when

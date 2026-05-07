@@ -123,19 +123,13 @@ envPluckGraph = runSynth $ do
   scale <- gain amped 0.5
   out 0 scale
 
--- | Intermodulation showcase: a pulse oscillator whose width is
--- modulated by a slow triangle LFO (PWM), filtered through a
--- band-pass whose cutoff is swept by a separate sine LFO (filter
--- sweep). Each new ugen family exercises its modulation handle:
--- 'pulseOsc' takes truly audio-rate width input (per-sample
--- @osc.width(...)@ inside the kernel); 'bpf' takes block-latched
--- cutoff input (mirrors 'lpf') — the LFO at 0.3 Hz produces sub-Hz
--- step changes per 256-sample block, so the cutoff at sample 0 of
--- each block follows the LFO smoothly enough to be audibly
--- continuous. Faster control-rate modulators (e.g. a CC sweep
--- updating once per block) would still step at block boundaries;
--- inserting 'smooth' between the modulator and the cutoff softens
--- those block-to-block jumps but does not give within-block sweeps.
+-- | Intermodulation showcase: a pulse voice with slow PWM, then a
+-- band-pass that drifts through the spectrum. 'pulseOsc' reads width
+-- sample-by-sample, so the PWM is genuinely audio-rate. 'bpf' reads
+-- cutoff once per block, which is fine for this slow 0.3 Hz sweep.
+-- For faster MIDI/UI cutoff changes, put 'smooth' before the cutoff
+-- input to glide between blocks; within-block filter sweeps would
+-- need a sample-accurate filter kernel.
 intermodGraph :: SynthGraph
 intermodGraph = runSynth $ do
   -- LFO 1 (PWM): triangle at 0.7 Hz, scaled+offset to [0.15, 0.85]

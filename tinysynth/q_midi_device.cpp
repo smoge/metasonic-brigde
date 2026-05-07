@@ -3,46 +3,29 @@
 // Description : Local replacement for vendor/q/q_io/src/midi_device.cpp
 // ================================================================
 //
-// Replicated from Q (MIT-licensed, copyright Cycfi Research) with
-// one targeted fix; see PATCH note below. Built in place of the
-// vendor copy, which is dropped from cxx-sources / CMakeLists.txt
-// to avoid an ODR collision on midi_device::list / portmidi_init.
+// Replicated from Q (MIT-licensed, copyright Cycfi Research) with one
+// local fix to midi_device::list(). This file is built instead of the
+// vendor copy to avoid duplicate definitions of midi_device::list /
+// portmidi_init.
 //
-// When upstream Q gets the same fix (or this codebase monorepo's
-// the vendor split), this file can go away in favour of the upstream
-// implementation.
+// Why this copy exists:
+// upstream list() kept a static accumulator and never cleared it.
+// Repeated calls accumulated duplicates, and unplugged devices stayed
+// visible as stale entries. The live-MIDI demo chooses devices by id,
+// so it needs each list() call to describe the current PortMIDI view.
 //
-// PATCH (vs. upstream): midi_device::list() previously used a static
-// std::vector<midi_device::impl> as an accumulator and never cleared
-// it, so:
-//   * Each call appended every device again -> duplicates grew
-//     without bound.
-//   * Devices unplugged between calls stuck around in the vector
-//     forever (stale entries reported as live).
-// Both feed back into rt_midi_demo's id-matching probe, where a
-// stale ghost would pass the input-device check, get handed to
-// q::midi_input_stream(device), trigger Pm_OpenInput failure on the
-// gone hardware, and the resulting _impl == nullptr would later
-// crash in the (also-patched) ~midi_input_stream Pm_Close call.
+// What changed:
+// keep the backing vector static, but clear() and repopulate it on
+// every call. The vector must stay static because midi_device stores
+// `impl const& _impl`; a local backing vector would be destroyed on
+// return and every midi_device would dangle.
 //
-// We keep `devices` static but clear() it at the top of every call,
-// then reserve() and repopulate. We can NOT switch to a local vector
-// because midi_device stores `impl const& _impl` (header line ~35),
-// not by value -- a local accumulator dies on return and leaves
-// every returned midi_device with a dangling reference.
-//
-// CONTRACT CHANGE: a midi_device instance retained across two list()
-// calls becomes invalidated by the second call's clear() +
-// push_back(). Callers (including rt_midi_demo) must use the
-// returned vector before the next list() call. The original
-// buggy Q version silently kept stale entries valid; that
-// behaviour was load-bearing for *no one*, since stale entries
-// crash the stream constructor for any device that was actually
-// removed.
-//
-// The cleaner fix would be patching the vendor header to make
-// midi_device own impl by value -- deferred since it widens the
-// blast radius to every Q consumer.
+// Contract:
+// use the returned midi_device objects before the next list() call.
+// A later list() invalidates earlier objects by clearing and
+// repopulating the shared backing vector. The cleaner long-term fix is
+// to patch Q's header so midi_device owns impl by value; that is
+// deferred because it affects every Q consumer.
 //
 // Upstream copyright preserved verbatim:
 

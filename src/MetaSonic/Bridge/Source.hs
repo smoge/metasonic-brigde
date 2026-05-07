@@ -221,18 +221,27 @@ Each UGen constructor defines a DSP primitive. The
 constructor's fields are Connections, not raw values — every
 input is uniformly either a constant or a dependency.
 
-The current set covers signal sources, stateless transforms, an envelope
-generator, bus routing, and a delay line:
+The current set covers oscillators, filters, signal transforms,
+envelopes, smoothing, bus routing, and delay:
 
-  SinOsc, SawOsc, NoiseGen   — signal sources
-  Gain, LPF, Add             — stateless signal transforms
-  Env                        — ADSR envelope generator
-  Out                        — write a signal to a hardware output channel
-  BusOut                     — write a signal to a shared audio bus
-  BusIn                      — read a signal from a shared audio bus
-  BusInDelayed               — read the previous block's snapshot of a bus
-                               (the feedback primitive)
-  Delay                      — per-node fractional delay line (q::delay)
+  SinOsc, SawOsc, PulseOsc, TriOsc, NoiseGen
+     signal sources
+  Gain, Add, Smooth
+     signal/control transforms
+  LPF, HPF, BPF, Notch
+     biquad filters
+  Env
+     ADSR envelope generator
+  Out
+     write a signal to a hardware output channel
+  BusOut
+     write a signal to a shared audio bus
+  BusIn
+     read a signal from a shared audio bus
+  BusInDelayed
+     read the previous block's snapshot of a bus (the feedback primitive)
+  Delay
+     per-node fractional delay line (q::delay)
 
 Adding a new UGen constructor requires coordinated changes across:
 
@@ -240,8 +249,8 @@ Adding a new UGen constructor requires coordinated changes across:
   - 'UGen' constructor + 'ugenView' row + builder in this module
   - per-instance 'inferEff' case in "MetaSonic.Bridge.IR" if effects
     depend on a constructor field (see 'BusOut' / 'BusIn')
-  - C++ enum value, 'configure_node' case, 'process_*' kernel, and
-    'process_graph' dispatch case in @rt_graph.cpp@
+  - C++ enum value, 'configure_spec' / 'init_node_state' cases,
+    'process_*' kernel, and 'process_instance' dispatch in @rt_graph.cpp@
 
 A property test in @test/Spec.hs@ cross-checks 'kindSpec' against
 'ugenView' so the two sources of per-kind shape information cannot drift.
@@ -676,24 +685,22 @@ triOsc :: Connection -> Connection -> SynthM Connection
 triOsc freq phase = insertNodeC "triOsc" (TriOsc freq phase)
 
 -- | High-pass biquad: signal, cutoff frequency, Q factor. Mirrors
--- 'lpf'. Cutoff and Q are __block-latched__ — the kernel reads
--- sample 0 of each input port once per block. An upstream 'smooth'
--- softens block-to-block / control-rate jumps in the cutoff
--- trajectory (e.g. CC-driven cutoff that updates between blocks),
--- but cannot give true within-block sweeps; for that, the kernel
--- would need a sample-accurate path that doesn't exist today.
+-- 'lpf'. Cutoff and Q are read once at the start of each block. Put
+-- 'smooth' before the cutoff input when MIDI or UI changes should
+-- glide from block to block instead of jumping; true within-block
+-- sweeps would need a sample-accurate filter path.
 hpf :: Connection -> Connection -> Connection -> SynthM Connection
 hpf sig freq q = insertNodeC "hpf" (HPF sig freq q)
 
 -- | Band-pass biquad (constant-peak-gain): signal, centre frequency,
--- Q factor. Higher Q = narrower band. Cutoff and Q are
--- __block-latched__, like 'lpf' \/ 'hpf'.
+-- Q factor. Higher Q = narrower band. Cutoff and Q are read once per
+-- block, like 'lpf' and 'hpf'.
 bpf :: Connection -> Connection -> Connection -> SynthM Connection
 bpf sig freq q = insertNodeC "bpf" (BPF sig freq q)
 
 -- | Notch (band-reject) biquad: signal, centre frequency, Q factor.
--- Useful for hum removal and spectral notching. Cutoff and Q are
--- __block-latched__, like the rest of the biquad family.
+-- Useful for hum removal and spectral notching. Cutoff and Q are read
+-- once per block, like the rest of the biquad family.
 notch :: Connection -> Connection -> Connection -> SynthM Connection
 notch sig freq q = insertNodeC "notch" (Notch sig freq q)
 
