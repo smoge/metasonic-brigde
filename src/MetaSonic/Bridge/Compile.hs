@@ -75,26 +75,39 @@ graph relates to parallel scheduling.
 
 {- Note [Region rate compatibility]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A node can extend the current region only if its rate matches
-the region's rate. This is condition (1) from the region
-formation criteria:
+A node can extend the current region only if its rate is
+*compatible* with the region's rate. This is condition (1) from
+the region formation criteria:
 
   "All members share a compatible rate and staging regime"
 
-Currently "compatible" means "equal". A future relaxation could
-allow CompileRate nodes into any region (since their value is
-known statically), or allow BlockRate nodes into SampleRate
-regions with automatic sample-and-hold at the region boundary.
+Two rates are compatible iff they are equal or at least one of
+them is 'CompileRate'. The region's stored 'regRate' is the join
+('max') of its members' rates, so a 'CompileRate' node absorbed
+into a 'SampleRate' region does not lower the region's execution
+rate; it is simply scheduled inside the faster region (its value
+is statically known and trivially sample-and-held).
+
+Members of a single region therefore no longer all share an
+identical 'irRate'. The post-condition is the weaker invariant
+that every member's rate is compatible with 'regRate' — see
+'propRegionRateCompatible' in Spec.hs.
+
+A future relaxation could also admit 'BlockRate' into 'SampleRate'
+regions, but that needs an explicit sample-and-hold boundary in
+the runtime and is deferred until a kind actually produces
+'BlockRate' (none does today).
 
 Rate assignment is computed by 'MetaSonic.Bridge.IR.propagateRates'
 before this pass runs: each node's 'irRate' is the join of its
 kind's floor rate and the rates of its inputs. So a 'Gain' fed by
-two 'Param' literals receives 'irRate = CompileRate' and forms (or
-joins) a CompileRate region; the same 'Gain' fed by a 'SinOsc'
-receives 'irRate = SampleRate' and joins a sample-rate region. This
-is what makes region formation non-degenerate — pre-propagation
-every node was unconditionally SampleRate, so the entire graph
-formed one region.
+two 'Param' literals receives 'irRate = CompileRate' and joins a
+neighbouring 'SampleRate' region (or starts its own pure-constant
+region if there is no faster neighbour); the same 'Gain' fed by a
+'SinOsc' receives 'irRate = SampleRate' and joins a sample-rate
+region. This is what makes region formation non-degenerate —
+pre-propagation every node was unconditionally SampleRate, so the
+entire graph formed one region.
 
 See Note [Rate inference vs rate propagation] in
 "MetaSonic.Bridge.IR".
@@ -190,6 +203,11 @@ data RegionGraph = RegionGraph
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
+-- | Two rates may share a region iff they are equal or at
+-- least one is 'CompileRate'. See Note [Region rate compatibility].
+compatibleRate :: Rate -> Rate -> Bool
+compatibleRate a b = a == b || a == CompileRate || b == CompileRate
+
 -- | Greedy region formation over a list of 'NodeIR' in
 -- execution order.
 --
@@ -249,7 +267,7 @@ formRegions nodes =
           canExtend = case openRegion of
             Nothing -> False
             Just (_, curRate, _, _, _) ->
-              nRate == curRate
+              compatibleRate curRate nRate
               && all (\d -> M.member d owner || S.member d curNodes)
                      (S.toList nDeps)
 
@@ -257,12 +275,17 @@ formRegions nodes =
          then
            -- Extend the current open region with this node.
            case openRegion of
-             Just (rid, _curRate, curEffs, members, curDeps) ->
+             Just (rid, curRate, curEffs, members, curDeps) ->
                let !newOwner    = M.insert nid rid owner
                    !newCurNodes = S.insert nid curNodes
+                   -- Region rate is the join of its members'
+                   -- rates: a CompileRate node absorbed into a
+                   -- SampleRate region keeps the region at
+                   -- SampleRate. See Note [Region rate compatibility].
+                   !newRate     = max curRate nRate
                in go nextID acc newOwner newCurNodes
                     (Just ( rid
-                          , nRate
+                          , newRate
                           , nEffs ++ curEffs
                           , nid : members
                           , curDeps `S.union` externalRegions

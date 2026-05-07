@@ -422,10 +422,22 @@ Rate annotations influence three downstream passes:
   3. Future vectorization — sample-rate regions are candidates
      for SIMD; block-rate regions are not.
 
-Currently, rates are inferred by dispatch on NodeKind alone
-(inferRate in MetaSonic.IR). A future improvement would
-propagate rates upward from inputs so that, for example, a
-Gain fed by two BlockRate signals is itself BlockRate.
+Rates start from the kind floor in 'kindSpec', then
+'MetaSonic.Bridge.IR.propagateRates' raises each node to the maximum
+rate required by its inputs. For example, a 'Gain' fed only by
+'CompileRate' values stays 'CompileRate', while the same 'Gain' fed by
+a 'SampleRate' oscillator becomes 'SampleRate'.
+
+'MetaSonic.Bridge.Compile.formRegions' merges adjacent nodes whose
+propagated rates are *compatible* — equal, or with at least one side
+'CompileRate'. A 'CompileRate' helper is therefore folded into the
+neighbouring faster region rather than forming a separate one (its
+value is known statically and is trivially sample-and-held). A region's
+'regRate' is the maximum of its members' rates. 'BlockRate' into
+'SampleRate' would need an explicit sample-and-hold boundary in the
+runtime and is deferred until a kind actually produces 'BlockRate'
+(none does today). See Note [Region rate compatibility] in
+"MetaSonic.Bridge.Compile".
 
 See Note [Rate inference vs rate propagation] in MetaSonic.IR.
 -}

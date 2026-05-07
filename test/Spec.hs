@@ -916,6 +916,41 @@ unitTests = testGroup "Unit tests"
                 _ <- delayL 0.01 o (Param 0.005)
                 pure ()
           rateOfFirst KDelay g @?= SampleRate
+
+      , -- Region-rate absorption: a CompileRate helper (an all-Param
+        -- Gain producing a static amplitude) sits adjacent to a
+        -- SampleRate path (SinOsc → Gain → Out) and is folded into
+        -- the same region instead of forming its own. The dominant
+        -- rate (SampleRate) wins for regRate.
+        -- See Note [Region rate compatibility] in MetaSonic.Bridge.Compile.
+        testCase "CompileRate absorption: helper folds into adjacent SampleRate region" $ do
+          let g = runSynth $ do
+                s   <- sinOsc 440.0 0.0
+                amp <- gain (Param 0.5) (Param 0.3)  -- CompileRate Gain
+                sc  <- gain s amp                     -- SampleRate Gain
+                out 0 sc
+          case lowerGraph g of
+            Left err -> assertFailure $ "lowerGraph failed: " <> err
+            Right ir -> do
+              let rg      = formRegions (giNodes ir)
+                  regions = rgRegions rg
+                  rates   = map irRate (giNodes ir)
+              -- Sanity: rates still mixed at the node level.
+              assertBool
+                ("expected at least one CompileRate node, got " <> show rates)
+                (CompileRate `elem` rates)
+              assertBool
+                ("expected at least one SampleRate node, got " <> show rates)
+                (SampleRate `elem` rates)
+              -- Absorption: a single SampleRate region holds them all.
+              assertEqual
+                "absorption should yield exactly one region"
+                1 (length regions)
+              case regions of
+                [r] -> do
+                  regRate r   @?= SampleRate
+                  length (regNodes r) @?= length (giNodes ir)
+                _   -> assertFailure "unreachable: length checked above"
       ]
 
   , testCase "kindTag is injective" $
@@ -1073,7 +1108,7 @@ properties = testGroup "Properties"
       forAllShrink genWellFormedGraph shrinkSynthGraph propRegionDepsWellFormed
 
   , QC.testProperty "every region's rate matches its member nodes" $
-      forAllShrink genWellFormedGraph shrinkSynthGraph propRegionRateAgreement
+      forAllShrink genWellFormedGraph shrinkSynthGraph propRegionRateCompatible
 
   , QC.testProperty "every BusOut precedes every same-bus BusIn in the schedule" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propBusOrdering
@@ -1364,18 +1399,41 @@ propPropagationStructural g = case lowerGraph g of
          , same irEffects  "irEffects"
          ]
 
--- | Region rate matches its members'. A region with mixed rates would
--- be a broken merge in formRegions.
-propRegionRateAgreement :: SynthGraph -> Property
-propRegionRateAgreement g = case lowerGraph g of
+-- | Region rate is consistent with its members'. After CompileRate
+-- absorption (see Note [Region rate compatibility] in
+-- MetaSonic.Bridge.Compile), member rates may differ from 'regRate':
+-- a CompileRate helper folded into a SampleRate region keeps its own
+-- 'irRate = CompileRate' while the region's 'regRate' stays SampleRate.
+-- Two invariants together replace the old "all equal" check:
+--
+--   1. Every member rate is compatible with 'regRate', i.e. either
+--      equal to it or 'CompileRate'.
+--   2. 'regRate' is the maximum of member rates, so at least one
+--      member's rate equals 'regRate' (the dominant one that drove
+--      the join).
+propRegionRateCompatible :: SynthGraph -> Property
+propRegionRateCompatible g = case lowerGraph g of
   Left err -> counterexample ("lowerGraph failed: " <> err) False
   Right ir ->
     let rg     = formRegions (giNodes ir)
         nodes  = giNodes ir
         rateOf nid = irRate <$> findNode nid nodes
+        memberRates r = [ mr | nid <- regNodes r, Just mr <- [rateOf nid] ]
+        compatible rr mr = mr == rr || mr == CompileRate
     in conjoin
-         [ counterexample (show (regID r) <> " rate disagreement") $
-             property $ all (\nid -> rateOf nid == Just (regRate r)) (regNodes r)
+         [ conjoin
+             [ counterexample
+                 (show (regID r) <> ": member " <> show nid
+                    <> " has rate " <> show (rateOf nid)
+                    <> " not compatible with regRate " <> show (regRate r))
+                 $ property $ maybe False (compatible (regRate r)) (rateOf nid)
+             | nid <- regNodes r
+             ] .&&.
+             counterexample
+               (show (regID r) <> ": regRate " <> show (regRate r)
+                  <> " is not max of member rates " <> show (memberRates r))
+               (property $ regRate r == maximum (regRate r : memberRates r)
+                          && regRate r `elem` memberRates r)
          | r <- rgRegions rg
          ]
   where
