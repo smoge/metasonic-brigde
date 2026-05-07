@@ -3570,6 +3570,41 @@ TEST_CASE("oscillator freq sanitized: SinOsc/SawOsc/PulseOsc/TriOsc accept any d
     }
 }
 
+TEST_CASE("biquad q sanitized at and near zero (divide-by-zero in alpha = sin/(2Q))") {
+    // Q = 0 makes alpha = sin(omega) / 0 = ±Inf in q::biquad's
+    // coefficient math; tiny Q (e.g. 1e-9) gives huge but finite
+    // alpha. Both produce ill-conditioned biquads. The sanitizer
+    // clamps Q to a useful musical range, so output stays finite +
+    // bounded for a 440 Hz sine through the filter. Pinned because
+    // the general "any double on q" battery uses {NaN, ±Inf,
+    // ±1e9} but not 0 / sub-eps positive, even though those are
+    // exactly the divide-by-zero / near-zero cases the audit
+    // flagged.
+    const int biquad_kinds[] = {7, 17, 18, 19};
+    for (int kind : biquad_kinds) {
+        for (double bad_q : {0.0, 1e-15, 1e-9, -1e-9}) {
+            CAPTURE(kind);
+            CAPTURE(bad_q);
+            auto *g = rt_graph_create(4, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, 1);
+            rt_graph_set_control(g, 0, 0, 440.0f);
+            rt_graph_add_node(g, 1, kind);
+            rt_graph_set_control(g, 1, 0, 1000.0);
+            rt_graph_set_control(g, 1, 1, bad_q);
+            rt_graph_add_node(g, 2, 2);
+            rt_graph_set_control(g, 2, 0, 0.0f);
+            rt_graph_connect(g, 0, 0, 1, 0);
+            rt_graph_connect(g, 1, 0, 2, 0);
+            for (int b = 0; b < 4; ++b) {
+                auto samples = render_bus0(g, kFrames);
+                check_block_finite_bounded(samples, 8.0f);
+            }
+            rt_graph_destroy(g);
+        }
+    }
+}
+
 TEST_CASE("biquad freq sanitized: LPF/HPF/BPF/Notch accept any double on cutoff/q") {
     // Drive a 440 Hz sine through the filter; sweep one control at
     // a time through the pathological set. Both freq (control 0)
@@ -3633,6 +3668,177 @@ TEST_CASE("Env A/D/S/R sanitized: pathological ramp params still produce a bound
             rt_graph_destroy(g);
         }
     }
+}
+
+TEST_CASE("Out / BusIn / BusInDelayed bus index validates before double->int cast") {
+    // controls[0] on Out / BusIn / BusInDelayed is cast to int before
+    // the range check. NaN / ±Inf / out-of-int-range finite double
+    // (e.g. 1e15, 1e30) hit the unspecified-conversion case in C++,
+    // so sanitation has to happen in the double domain BEFORE the
+    // cast. Verifies all three kernels emit silence (no crash, no
+    // out-of-bounds bus access) for each pathological value.
+    //
+    // Set-up: feed a SinOsc into the kind under test; the kind's
+    // bus control is the pathological value. Out is a sink (we read
+    // the *audio thread's* bus 0 by adding a benign Out as well so
+    // render_bus0 has something to read). BusIn / BusInDelayed are
+    // sources with no audio input — their output is what we sample.
+
+    SUBCASE("Out with pathological bus index: silent (no crash)") {
+        for (double bad_bus : {kPathNaN, kPathPosInf, kPathNegInf,
+                                -1.0, 1e15, 1e30}) {
+            CAPTURE(bad_bus);
+            auto *g = rt_graph_create(4, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, 1);
+            rt_graph_set_control(g, 0, 0, 440.0f);
+            rt_graph_add_node(g, 1, 2);                  // Out
+            rt_graph_set_control(g, 1, 0, bad_bus);      // bad bus index
+            rt_graph_connect(g, 0, 0, 1, 0);
+            for (int b = 0; b < 2; ++b) {
+                auto samples = render_bus0(g, kFrames);
+                check_block_finite_bounded(samples, 4.0f);
+            }
+            rt_graph_destroy(g);
+        }
+    }
+
+    SUBCASE("BusIn with pathological bus index: silence on its output port") {
+        for (double bad_bus : {kPathNaN, kPathPosInf, kPathNegInf,
+                                -1.0, 1e15, 1e30}) {
+            CAPTURE(bad_bus);
+            auto *g = rt_graph_create(4, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, 11);                 // BusIn
+            rt_graph_set_control(g, 0, 0, bad_bus);
+            rt_graph_add_node(g, 1, 2);                  // Out -> bus 0
+            rt_graph_set_control(g, 1, 0, 0.0f);
+            rt_graph_connect(g, 0, 0, 1, 0);
+            for (int b = 0; b < 2; ++b) {
+                auto samples = render_bus0(g, kFrames);
+                check_block_finite_bounded(samples, 4.0f);
+                // BusIn with an invalid bus emits silence; nothing
+                // else writes the output bus, so bus 0 is all zeros.
+                for (auto s : samples) CHECK(s == 0.0f);
+            }
+            rt_graph_destroy(g);
+        }
+    }
+
+    SUBCASE("BusInDelayed with pathological bus index: silence") {
+        for (double bad_bus : {kPathNaN, kPathPosInf, kPathNegInf,
+                                -1.0, 1e15, 1e30}) {
+            CAPTURE(bad_bus);
+            auto *g = rt_graph_create(4, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, 12);                 // BusInDelayed
+            rt_graph_set_control(g, 0, 0, bad_bus);
+            rt_graph_add_node(g, 1, 2);
+            rt_graph_set_control(g, 1, 0, 0.0f);
+            rt_graph_connect(g, 0, 0, 1, 0);
+            for (int b = 0; b < 2; ++b) {
+                auto samples = render_bus0(g, kFrames);
+                check_block_finite_bounded(samples, 4.0f);
+                for (auto s : samples) CHECK(s == 0.0f);
+            }
+            rt_graph_destroy(g);
+        }
+    }
+}
+
+TEST_CASE("Gain + Add: NaN control default doesn't poison the audio path") {
+    // Gain.controls[0] (gain amount) and Add.controls[0/1] (bias
+    // operands) are reached only when the corresponding audio input
+    // port is unconnected. A NaN control value would multiply / add
+    // NaN into every sample of the block and propagate to downstream
+    // filters / smoothers, where their IIR state then carries NaN
+    // forever. Sanitizers fall back to identity (Gain -> 1.0,
+    // Add -> 0.0).
+
+    SUBCASE("Gain: NaN amount falls back to unity") {
+        auto *g = rt_graph_create(4, kFrames);
+        REQUIRE(g != nullptr);
+        rt_graph_add_node(g, 0, 1);
+        rt_graph_set_control(g, 0, 0, 440.0f);
+        rt_graph_add_node(g, 1, 3);                       // Gain
+        rt_graph_set_control(g, 1, 0, kPathNaN);          // pathological
+        rt_graph_add_node(g, 2, 2);
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+        auto samples = render_bus0(g, kFrames);
+        check_block_finite_bounded(samples, 1.5f);
+        // Sin amplitude ~1.0; with NaN→1.0 fallback the gain pass-
+        // through keeps the sine at its natural amplitude.
+        CHECK(peak_abs(samples) > 0.5f);
+        rt_graph_destroy(g);
+    }
+
+    SUBCASE("Add: NaN bias on each control falls back to zero") {
+        for (int which : {0, 1}) {
+            CAPTURE(which);
+            auto *g = rt_graph_create(4, kFrames);
+            REQUIRE(g != nullptr);
+            rt_graph_add_node(g, 0, 1);
+            rt_graph_set_control(g, 0, 0, 440.0f);
+            rt_graph_add_node(g, 1, 8);                   // Add
+            rt_graph_set_control(g, 1, 0, 0.0);
+            rt_graph_set_control(g, 1, 1, 0.0);
+            rt_graph_set_control(g, 1, which, kPathNaN);  // bad bias
+            rt_graph_add_node(g, 2, 2);
+            rt_graph_set_control(g, 2, 0, 0.0f);
+            // Wire only ONE audio input so the OTHER port falls back
+            // to its (now-pathological-but-sanitized) control.
+            rt_graph_connect(g, 0, 0, 1, 1 - which);
+            rt_graph_connect(g, 1, 0, 2, 0);
+            auto samples = render_bus0(g, kFrames);
+            check_block_finite_bounded(samples, 1.5f);
+            rt_graph_destroy(g);
+        }
+    }
+}
+
+TEST_CASE("Smooth: NaN target does not poison IIR state across blocks") {
+    // The audit flagged this as the worst case: q::dynamic_smoother
+    // runs `low1 += g * (input - low1)`, so a single NaN target
+    // makes low1 + low2 NaN and they stay NaN forever -- even after
+    // the producer writes a valid target on a later block. Sanitizer
+    // substitutes 0.0 for non-finite, so the smoother's state stays
+    // finite and recovers normally on the next valid write.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 14);                          // Smooth
+    rt_graph_set_control(g, 0, 0, 20.0);                  // base_freq
+    rt_graph_set_control(g, 0, 1, 0.5);                   // initial target
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    // Block 1: settle at target=0.5.
+    auto block1 = render_bus0(g, kFrames);
+    for (auto s : block1) CHECK(std::isfinite(s));
+
+    // Block 2: producer writes a NaN target. Sanitizer should fall
+    // back to 0.0; smoother state must stay finite.
+    rt_graph_set_control(g, 0, 1, kPathNaN);
+    auto block2 = render_bus0(g, kFrames);
+    for (auto s : block2) CHECK(std::isfinite(s));
+
+    // Block 3: producer writes a valid target again. State must NOT
+    // be poisoned -- output should track toward the new target.
+    // Without the sanitizer, low1 / low2 would still be NaN here and
+    // every subsequent sample would also be NaN.
+    rt_graph_set_control(g, 0, 1, 0.8);
+    auto block3 = render_bus0(g, kFrames);
+    for (auto s : block3) CHECK(std::isfinite(s));
+    // State recovered: the smoother should be tracking toward 0.8.
+    // Allow generous slack since the smoothing time constant could
+    // leave us anywhere in [0, 0.8] depending on exactly when it
+    // resumed.
+    CHECK(block3[kFrames - 1] > 0.0f);
+    CHECK(block3[kFrames - 1] < 1.0f);
+
+    rt_graph_destroy(g);
 }
 
 TEST_CASE("Delay max_time + time sanitized: pathological values stay finite + bounded") {

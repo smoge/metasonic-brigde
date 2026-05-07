@@ -2152,8 +2152,12 @@ static void process_gain(const RTGraph &g, GraphInstance &inst,
       out[fi] = sig_in[fi] * gain_in[fi];
     }
   } else {
-    // Constant gain from the control default.
-    const float amount = static_cast<float>(node.controls[0]);
+    // Constant gain from the control default. Sanitize so a NaN
+    // write to controls[0] doesn't multiply the input into NaN — the
+    // result would propagate into every downstream consumer (filters,
+    // smoothers) and poison their IIR state. Fallback 1.0 = unity.
+    const float amount = sanitize_finite(
+        static_cast<float>(node.controls[0]), 1.0f);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       out[fi] = sig_in[fi] * amount;
@@ -2181,8 +2185,12 @@ static void process_add(const RTGraph &g, GraphInstance &inst,
   const auto a_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
   const auto b_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
 
-  const float a_const = static_cast<float>(node.controls[0]);
-  const float b_const = static_cast<float>(node.controls[1]);
+  // Sanitize control defaults so a NaN write to either control
+  // doesn't add a NaN bias into the audio path. Fallback 0.0 = no bias.
+  const float a_const = sanitize_finite(
+      static_cast<float>(node.controls[0]), 0.0f);
+  const float b_const = sanitize_finite(
+      static_cast<float>(node.controls[1]), 0.0f);
 
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
@@ -2314,9 +2322,15 @@ static void process_out(RTGraph &g, GraphInstance &inst,
   if (in.empty())
     return;
 
-  const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= g.server.output_buses.size())
+  // Validate the bus index in the double domain BEFORE casting to int.
+  // double -> int is unspecified for NaN / Inf / out-of-int-range
+  // finite values; the range check below would run on garbage. See
+  // Note [Pathological-input sanitation].
+  const double bus_d = node.controls[0];
+  const double bus_lim = static_cast<double>(g.server.output_buses.size());
+  if (!std::isfinite(bus_d) || bus_d < 0.0 || bus_d >= bus_lim)
     return;
+  const int bus = static_cast<int>(bus_d);
 
   // Accumulate into the bus and, in the same pass, track the block's
   // peak |input| for §2.E release-then-free silence detection. The
@@ -2363,11 +2377,14 @@ static void process_busin(const RTGraph &g, GraphInstance &inst,
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
-  const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= g.server.output_buses.size()) {
+  // Validate before casting; see process_out comment.
+  const double bus_d = node.controls[0];
+  const double bus_lim = static_cast<double>(g.server.output_buses.size());
+  if (!std::isfinite(bus_d) || bus_d < 0.0 || bus_d >= bus_lim) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
+  const int bus = static_cast<int>(bus_d);
 
   const auto &src = g.server.output_buses[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
@@ -2417,11 +2434,14 @@ static void process_busin_delayed(
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
-  const int bus = static_cast<int>(node.controls[0]);
-  if (bus < 0 || static_cast<std::size_t>(bus) >= g.server.output_buses_prev.size()) {
+  // Validate before casting; see process_out comment.
+  const double bus_d = node.controls[0];
+  const double bus_lim = static_cast<double>(g.server.output_buses_prev.size());
+  if (!std::isfinite(bus_d) || bus_d < 0.0 || bus_d >= bus_lim) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
+  const int bus = static_cast<int>(bus_d);
 
   const auto &src = g.server.output_buses_prev[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
@@ -2585,7 +2605,15 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
       std::isfinite(raw_base)
           ? std::clamp(raw_base, kMinBaseFreqHz, max_base)
           : kMinBaseFreqHz;
-  const float  target  = static_cast<float>(node.controls[1]);
+  // Sanitize the target *before* it reaches the smoother. q's
+  // dynamic_smoother runs `low1 += g * (input - low1)` per sample;
+  // a single NaN target poisons low1 / low2 forever and the smoother
+  // never recovers, even when the producer writes a valid target on
+  // a later block. Fallback 0.0 keeps the IIR state finite. (This is
+  // the strictly worse failure mode the audit flagged: cross-block
+  // state poisoning, not just one bad block of output.)
+  const float target = sanitize_finite(
+      static_cast<float>(node.controls[1]), 0.0f);
 
   // Lazy construction on first call or after a sample-rate change.
   // Seed the IIR state to the first input sample so the smoother
