@@ -81,16 +81,31 @@ constexpr float kDefaultSampleRate = 48000.0f;
 constexpr float kReleaseSilenceThreshold = 1e-4f;
 constexpr int   kReleaseSilenceBlocks    = 8;
 
-// Lifecycle state for a GraphInstance. "Dead" is not represented here
-// — a dead slot is a std::optional<GraphInstance> with no value, which
-// is observably distinct from any InstanceStatus.
+// Lifecycle state of a pool slot. After A.1 the instance pool is a
+// std::vector<GraphInstance> of caller-declared size, not a vector of
+// std::optional. Slot liveness is now a SlotState enum on the
+// GraphInstance itself: Available means the slot is free for reuse;
+// Active and Releasing mean the slot holds a running voice (matching
+// the pre-A.1 InstanceStatus::Live and Releasing).
 //
-// The integer values are part of the C ABI returned by
-// rt_graph_instance_status; do not renumber.
-enum class InstanceStatus : int {
-  Live      = 0,  // default; gate-on / sustaining
-  Releasing = 1,  // release requested; processing continues until silent
+// The integer values mirror the C ABI for rt_graph_instance_status:
+// Active = 0, Releasing = 1, Available = -1 (the same value the ABI
+// returns for "no such instance"). casting SlotState directly to int
+// gives the right ABI behaviour for any valid slot. Do not renumber.
+//
+// See Note [§2.E: release-then-free instance lifecycle] and
+// Note [Pool model] (this file).
+enum class SlotState : int {
+  Available = -1,  // free; reusable by the next _instance_add
+  Active    = 0,   // running, gate-on / sustaining (was Live)
+  Releasing = 1,   // release requested, awaiting silence
 };
+
+// Default per-template polyphony cap when the caller does not call
+// rt_graph_template_set_polyphony explicitly. Generous enough for
+// every test in tree (the polyphonic stress test uses 8); callers
+// that need more declare the cap during construction.
+constexpr int kDefaultPolyphony = 8;
 
 // ----------------------------------------------------------------
 // Strong internal indices
@@ -465,6 +480,15 @@ template_id is stable.
 struct MetaDef {
   int max_frames = 0;
   std::vector<NodeSpec> nodes;
+
+  // Per-template polyphony cap: the maximum number of simultaneously
+  // live (Active or Releasing) instances of this template. Set via
+  // rt_graph_template_set_polyphony during construction; defaults to
+  // kDefaultPolyphony. rt_graph_template_instance_add returns -1 once
+  // the cap is reached (the runtime is dumb about voice stealing —
+  // that policy lives in the future Phase-3 voice allocator).
+  // See Note [Pool model].
+  int polyphony = kDefaultPolyphony;
 };
 
 struct GraphInstance {
@@ -474,13 +498,15 @@ struct GraphInstance {
 
   std::vector<NodeInstanceState> nodes;
 
-  // §2.E lifecycle state. Default-constructed instances are Live.
-  // rt_graph_instance_release flips the status to Releasing and the
-  // process_graph loop reclaims the slot once the instance has been
-  // silent (peak < kReleaseSilenceThreshold) for kReleaseSilenceBlocks
+  // Slot lifecycle state. Default-constructed slots are Available
+  // (free). rt_graph_template_instance_add transitions Available →
+  // Active; rt_graph_instance_release transitions Active → Releasing;
+  // the §2.E auto-free path in process_graph transitions Releasing →
+  // Available once the slot has been silent
+  // (peak < kReleaseSilenceThreshold) for kReleaseSilenceBlocks
   // consecutive blocks. See Note [§2.E: release-then-free instance
-  // lifecycle].
-  InstanceStatus status = InstanceStatus::Live;
+  // lifecycle] and Note [Pool model].
+  SlotState state = SlotState::Available;
 
   // Consecutive blocks (while Releasing) the instance has produced a
   // peak below kReleaseSilenceThreshold. Reset to 0 every time the
@@ -905,7 +931,14 @@ struct RTGraph {
   // Each GraphInstance carries its template_id; process_graph filters
   // by it to group instances per template. Slot index is the
   // instance_id exposed at the C ABI; std::optional models live/dead.
-  std::vector<std::optional<GraphInstance>> instances;
+  // Pool of GraphInstance slots. Replaces the pre-A.1
+  // std::vector<std::optional<GraphInstance>>: each slot is now a
+  // GraphInstance carrying a SlotState; "dead" is state == Available
+  // (the slot exists in the vector but has no live instance), so
+  // freeing an instance no longer destructs anything — vector
+  // capacity for the per-node state is preserved across reuse.
+  // See Note [Pool model].
+  std::vector<GraphInstance> instances;
   Server server;
   std::unique_ptr<GraphAudioStream> audio;
 };
@@ -931,14 +964,17 @@ template_at(const RTGraph &g, int template_id) noexcept {
 }
 
 // Lookup an instance by id. Returns nullptr for negative / out-of-range
-// / dead-slot ids.
+// / dead-slot ids. After A.1 a "dead slot" is one whose SlotState is
+// Available; the GraphInstance object still exists in the vector and
+// retains its node-state allocations for the next reuse, but it is
+// not part of the audio schedule.
 [[nodiscard]] static GraphInstance *
 instance_at(RTGraph &g, int instance_id) noexcept {
   if (instance_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g.instances.size()) return nullptr;
-  if (!g.instances[idx].has_value()) return nullptr;
-  return &*g.instances[idx];
+  if (g.instances[idx].state == SlotState::Available) return nullptr;
+  return &g.instances[idx];
 }
 
 [[nodiscard]] static const GraphInstance *
@@ -946,8 +982,8 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
   if (instance_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g.instances.size()) return nullptr;
-  if (!g.instances[idx].has_value()) return nullptr;
-  return &*g.instances[idx];
+  if (g.instances[idx].state == SlotState::Available) return nullptr;
+  return &g.instances[idx];
 }
 
 // Resolve one connected input to the source node's output span.
@@ -1034,11 +1070,11 @@ static void ensure_node_slot(RTGraph &g, int template_id, NodeIndex node_index) 
   if (def->nodes.size() <= idx) {
     def->nodes.resize(idx + 1);
   }
-  for (auto &maybe_inst : g.instances) {
-    if (!maybe_inst) continue;
-    if (maybe_inst->template_id != template_id) continue;
-    if (maybe_inst->nodes.size() <= idx) {
-      maybe_inst->nodes.resize(idx + 1);
+  for (auto &inst : g.instances) {
+    if (inst.state == SlotState::Available) continue;
+    if (inst.template_id != template_id) continue;
+    if (inst.nodes.size() <= idx) {
+      inst.nodes.resize(idx + 1);
     }
   }
 }
@@ -1839,24 +1875,27 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   const std::size_t template_count = g.defs.size();
   for (std::size_t tid = 0; tid < template_count; ++tid) {
     const int tid_i = static_cast<int>(tid);
-    for (auto &maybe_inst : g.instances) {
-      if (!maybe_inst) continue;
-      if (maybe_inst->template_id != tid_i) continue;
-      process_instance(g, *maybe_inst, nframes);
+    for (auto &inst : g.instances) {
+      if (inst.state == SlotState::Available) continue;
+      if (inst.template_id != tid_i) continue;
+      process_instance(g, inst, nframes);
 
-      // §2.E: if the instance is Releasing, drive the silence counter
-      // from the peak that process_out just recorded into
-      // block_sink_peak. Reclaim the slot once the counter crosses
-      // kReleaseSilenceBlocks. Live instances bypass this entirely —
-      // the field is consulted only when status == Releasing.
-      // See Note [§2.E: release-then-free instance lifecycle].
-      if (maybe_inst->status == InstanceStatus::Releasing) {
-        if (maybe_inst->block_sink_peak < kReleaseSilenceThreshold) {
-          if (++maybe_inst->silent_blocks >= kReleaseSilenceBlocks) {
-            maybe_inst.reset();
+      // §2.E: if the slot is Releasing, drive the silence counter from
+      // the peak that process_out just recorded into block_sink_peak.
+      // Once the counter crosses kReleaseSilenceBlocks, transition the
+      // slot back to Available — the GraphInstance object stays in
+      // place (its node-state vectors are kept for the next reuse), so
+      // there is no allocation/deallocation on the audio thread. Active
+      // slots bypass this entirely; the field is consulted only when
+      // state == Releasing. See Note [§2.E: release-then-free instance
+      // lifecycle].
+      if (inst.state == SlotState::Releasing) {
+        if (inst.block_sink_peak < kReleaseSilenceThreshold) {
+          if (++inst.silent_blocks >= kReleaseSilenceBlocks) {
+            inst.state = SlotState::Available;
           }
         } else {
-          maybe_inst->silent_blocks = 0;
+          inst.silent_blocks = 0;
         }
       }
     }
@@ -2073,14 +2112,80 @@ static void reset_to_default_state(RTGraph &g) {
   }
   g.defs.push_back(std::move(def));
 
-  // Push instance 0 (empty GraphInstance, template_id = 0).
+  // Push instance 0 (empty GraphInstance, template_id = 0). Active
+  // by default so the legacy single-template ABI (rt_graph_set_control
+  // and friends, which target instance 0) sees a live slot from the
+  // moment the handle is constructed.
   GraphInstance inst;
   inst.template_id = 0;
+  inst.state = SlotState::Active;
   if (g.capacity > 0) {
     inst.nodes.reserve(static_cast<std::size_t>(g.capacity));
   }
   g.instances.push_back(std::move(inst));
 }
+
+/* Note [Pool model]
+~~~~~~~~~~~~~~~~~~~~~
+A.1 replaces the pre-existing instance representation
+(std::vector<std::optional<GraphInstance>>, with reset() acting as
+"free this slot" by destructing the GraphInstance and its kernel
+state) with a fixed-shape pool: std::vector<GraphInstance> where
+each slot carries a SlotState (Available / Active / Releasing).
+A "dead" slot is one whose state is Available; the GraphInstance
+object stays in place, retaining its node-state vector capacity for
+the next reuse.
+
+Why the change:
+
+  * No allocation on free. rt_graph_instance_remove and the §2.E
+    auto-free path both used to call optional::reset(), which
+    destructed the per-node state vectors and freed their memory.
+    Under the pool model both paths just set state = Available; the
+    vectors stay sized and ready. The next _instance_add into that
+    slot reinitialises kernel state in place rather than allocating
+    fresh.
+  * Sized-once, mutated-by-state. The Phase 3 control queue (A.2)
+    will mediate _instance_add / _release / _remove from a non-
+    audio thread. Under the optional model, free-then-allocate-on-
+    a-different-thread risked tearing or use-after-free in the audio
+    callback. Under the pool model the audio thread sees only state
+    transitions on slots that already exist.
+  * Per-template polyphony as an honest cap. Each MetaDef carries
+    a polyphony field; _instance_add returns -1 when the count of
+    Active+Releasing slots assigned to that template reaches the cap.
+    The runtime does not steal — that's the voice allocator's job.
+
+Pool layout: g.instances is a flat vector across all templates, each
+slot tagged with template_id (preserved from §2.D.3). A template's
+polyphony cap is enforced by counting at spawn time, not by reserving
+a contiguous range. Spawn prefers reuse (first Available slot) over
+growth (push_back); growth is construction-only in practice — once
+audio is running the live count is bounded by polyphony, every
+"removed" slot stays Available, and the queue path will never grow.
+
+Lazy materialisation: an Available slot may have empty node-state
+vectors (never used) or full vectors (was previously occupied). On
+transition to Active, _template_instance_add resizes the nodes
+vector to match the current spec and re-initialises each entry via
+init_node_state. A previously-occupied slot reuses its existing
+vector capacity; a fresh slot does the first allocation here. Either
+way, allocation happens in _instance_add (control thread today,
+control queue tomorrow), never in the audio callback.
+
+Slot identity: the C ABI's instance_id is the slot index in
+g.instances. instance_count returns g.instances.size() — under the
+pool model that's the slot-pool size, not a high-water-mark of
+ever-used indices. instance_alive returns 1 iff state != Available.
+instance_status casts state to int (Available = -1, Active = 0,
+Releasing = 1), matching the C ABI codes for "no such instance",
+"Live", and "Releasing" respectively.
+
+The auto-created template 0 + instance 0 (rt_graph_create /
+rt_graph_clear) keeps the legacy single-template ABI working: the
+instance is created with state = Active so _set_control / _read_bus
+hit a live target on a freshly-constructed handle.
+*/
 
 /* Note [Legacy single-template ABI as template-0 shim]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2197,6 +2302,26 @@ int rt_graph_template_add(RTGraph *g) {
   return static_cast<int>(g->defs.size() - 1);
 }
 
+// Set the per-template polyphony cap (max simultaneously-live
+// instances of this template). Construction-only.
+//
+// Values <= 0 are clamped to 1: every template needs room for at
+// least one instance, and a zero cap would deadlock callers that
+// expect _instance_add to succeed at least once. Unknown template_id
+// is a silent no-op. Calling this *after* live instances exceed the
+// new cap is allowed but has no immediate effect — already-live
+// instances keep running until they release/free naturally; the cap
+// gates *future* spawns.
+//
+// See Note [Pool model] for how the cap interacts with the
+// std::vector<GraphInstance> pool model.
+void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony) {
+  if (!g) return;
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+  def->polyphony = polyphony < 1 ? 1 : polyphony;
+}
+
 // Number of registered templates. Iterate 0..count-1 to enumerate.
 int rt_graph_template_count(RTGraph *g) {
   if (!g) return 0;
@@ -2235,11 +2360,11 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
 
   ensure_node_slot(*g, template_id, idx);
   configure_spec(def->nodes[to_size(idx)], kind);
-  for (auto &maybe_inst : g->instances) {
-    if (!maybe_inst) continue;
-    if (maybe_inst->template_id != template_id) continue;
+  for (auto &inst : g->instances) {
+    if (inst.state == SlotState::Available) continue;
+    if (inst.template_id != template_id) continue;
     init_node_state(
-        maybe_inst->nodes[to_size(idx)],
+        inst.nodes[to_size(idx)],
         def->nodes[to_size(idx)],
         g->max_frames);
   }
@@ -2333,26 +2458,65 @@ void rt_graph_template_connect(
 // Spawn a fresh instance of the named template. Returns globally-
 // unique instance_id (>= 0) or -1 on failure.
 //
-// Slot reuse: scans for the first free std::optional in g.instances
-// and overwrites it; only appends if no free slot exists. So an
-// instance_id may be returned twice over the life of the RTGraph (the
-// dead slot is reused after rt_graph_instance_remove), but never
-// concurrently.
+// Slot allocation rules:
+//
+//   1. If the named template's per-template polyphony cap is already
+//      reached (count of Active + Releasing slots assigned to this
+//      template_id == def->polyphony), return -1. The voice allocator
+//      will eventually own the stealing policy; the runtime is dumb.
+//   2. Scan g.instances for an Available slot, preferring reuse over
+//      growth. A reused slot keeps its node-state vector capacity
+//      from the previous occupant, which is the whole point of A.1's
+//      pool model.
+//   3. Only append a new slot if no Available one exists. Growth is
+//      construction-only — once audio starts the audio thread sees
+//      every slot already; spawning more during audio is the
+//      Phase 3 control-queue path, which will be limited to the
+//      pre-allocated slots.
+//
+// Slot reuse means an instance_id may be returned twice over the life
+// of the RTGraph (the dead slot is reused after rt_graph_instance_-
+// remove or after the §2.E auto-free path), but never concurrently.
 int rt_graph_template_instance_add(RTGraph *g, int template_id) {
   if (!g) return -1;
 
   const MetaDef *def = template_at(*g, template_id);
   if (!def) return -1;
 
-  GraphInstance inst = make_instance(*def, template_id, g->max_frames);
-
-  // Reuse a free slot if any, otherwise append.
+  // Count live slots (Active + Releasing) assigned to this template
+  // and remember the first Available slot we see, so the cap check
+  // and the slot scan share one pass over g.instances.
+  int live_count = 0;
+  std::size_t free_slot = g->instances.size();  // sentinel: no slot found
   for (std::size_t i = 0; i < g->instances.size(); ++i) {
-    if (!g->instances[i].has_value()) {
-      g->instances[i] = std::move(inst);
-      return static_cast<int>(i);
+    auto &s = g->instances[i];
+    if (s.state == SlotState::Available) {
+      if (free_slot == g->instances.size()) free_slot = i;
+    } else if (s.template_id == template_id) {
+      ++live_count;
     }
   }
+  if (live_count >= def->polyphony) return -1;
+
+  if (free_slot < g->instances.size()) {
+    // Reuse: preserve the GraphInstance's vector capacity, just
+    // re-initialise its node state from the (possibly mutated) spec
+    // and flip the slot to Active.
+    GraphInstance &slot = g->instances[free_slot];
+    slot.template_id = template_id;
+    slot.silent_blocks = 0;
+    slot.block_sink_peak = 0.0f;
+    slot.nodes.resize(def->nodes.size());
+    for (std::size_t i = 0; i < def->nodes.size(); ++i) {
+      init_node_state(slot.nodes[i], def->nodes[i], g->max_frames);
+    }
+    slot.state = SlotState::Active;
+    return static_cast<int>(free_slot);
+  }
+
+  // No free slot — grow the pool by one. Construction-only path.
+  GraphInstance inst = make_instance(*def, template_id, g->max_frames);
+  inst.state = SlotState::Active;
   g->instances.push_back(std::move(inst));
   return static_cast<int>(g->instances.size() - 1);
 }
@@ -2569,7 +2733,10 @@ void rt_graph_instance_remove(RTGraph *g, int instance_id) {
   if (instance_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return;
-  g->instances[idx].reset();
+  // Hard-free path under A.1: flip the slot to Available; preserve
+  // the GraphInstance object and its node-state vector capacity for
+  // the next reuse. No allocation, no destruction.
+  g->instances[idx].state = SlotState::Available;
 }
 
 /* Note [§2.E: release-then-free instance lifecycle]
@@ -2643,13 +2810,13 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
   if (instance_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return;
-  if (!g->instances[idx]) return;
+  if (g->instances[idx].state == SlotState::Available) return;
 
-  GraphInstance &inst = *g->instances[idx];
+  GraphInstance &inst = g->instances[idx];
   const MetaDef *def = template_at(*g, inst.template_id);
   if (!def) {
     // Defensive: template gone — nothing sensible to do but free.
-    g->instances[idx].reset();
+    inst.state = SlotState::Available;
     return;
   }
 
@@ -2674,11 +2841,11 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
 
   if (!has_env) {
     // Nothing to release — fall back to hard-free. See Note above.
-    g->instances[idx].reset();
+    inst.state = SlotState::Available;
     return;
   }
 
-  inst.status = InstanceStatus::Releasing;
+  inst.state = SlotState::Releasing;
   inst.silent_blocks = 0;
   // block_sink_peak is reset by process_instance at the top of each
   // block; no need to touch it here.
@@ -2689,12 +2856,17 @@ int rt_graph_instance_status(RTGraph *g, int instance_id) {
   if (instance_id < 0) return -1;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return -1;
-  if (!g->instances[idx]) return -1;
-  return static_cast<int>(g->instances[idx]->status);
+  // Cast directly: SlotState's int values are the C ABI return codes
+  // (Available = -1, Active = 0, Releasing = 1).
+  return static_cast<int>(g->instances[idx].state);
 }
 
 int rt_graph_instance_count(RTGraph *g) {
   if (!g) return 0;
+  // After A.1 this is the slot-pool size, not a high-water-mark of
+  // ever-used indices. The pool grows during construction up to the
+  // sum of per-template polyphony caps; once stable, instance_count
+  // is constant for the life of the graph.
   return static_cast<int>(g->instances.size());
 }
 
@@ -2703,7 +2875,7 @@ int rt_graph_instance_alive(RTGraph *g, int instance_id) {
   if (instance_id < 0) return 0;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return 0;
-  return g->instances[idx].has_value() ? 1 : 0;
+  return g->instances[idx].state != SlotState::Available ? 1 : 0;
 }
 
 void rt_graph_instance_set_control(

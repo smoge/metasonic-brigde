@@ -36,6 +36,7 @@ module MetaSonic.Bridge.FFI
   , -- * Multi-template low-level (re-exported for tests)
     c_rt_graph_template_add
   , c_rt_graph_template_count
+  , c_rt_graph_template_set_polyphony
   , c_rt_graph_template_add_node
   , c_rt_graph_ensure_bus
   , c_rt_graph_template_set_default
@@ -310,6 +311,17 @@ foreign import ccall unsafe "rt_graph_template_add"
 -- | Number of templates currently registered.
 foreign import ccall unsafe "rt_graph_template_count"
   c_rt_graph_template_count :: Ptr RTGraph -> IO CInt
+
+-- | Set the per-template polyphony cap (max simultaneously-live
+-- instances of this template). Construction-only;
+-- 'c_rt_graph_template_instance_add' returns -1 once the cap is
+-- reached. Default per template is 8. Values <= 0 are clamped to 1
+-- by the runtime; invalid template_id is a silent no-op.
+--
+-- See Note [Pool model] in @rt_graph.cpp@ for how the cap interacts
+-- with the pre-allocated GraphInstance pool.
+foreign import ccall unsafe "rt_graph_template_set_polyphony"
+  c_rt_graph_template_set_polyphony :: Ptr RTGraph -> CInt -> CInt -> IO ()
 
 -- | Add a node to the named template's MetaDef. Walks every live
 -- instance of that template to install per-instance state at the

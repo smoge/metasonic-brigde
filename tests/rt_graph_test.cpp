@@ -4002,3 +4002,115 @@ TEST_CASE("§2.E polyphonic stress: staggered release, slot reuse, full drain") 
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// A.1: per-template polyphony cap
+// ----------------------------------------------------------------
+//
+// rt_graph_template_set_polyphony bounds the number of simultaneously
+// live (Active or Releasing) instances of a template; once the cap is
+// reached, rt_graph_template_instance_add returns -1 instead of
+// silently growing the pool. The cap is per-template — one template
+// hitting its cap doesn't keep other templates from spawning. After
+// remove or auto-free transitions the slot back to Available, a
+// future spawn fits within the cap again.
+
+TEST_CASE("A.1 polyphony: default cap of 8 rejects the 9th spawn") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                    // SinOsc
+    rt_graph_add_node(g, 1, 2);                    // Out
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    // Drop the auto-spawned instance 0 to start with a clean count.
+    rt_graph_instance_remove(g, 0);
+
+    // Default cap is 8; eight spawns must succeed, the ninth must fail.
+    for (int i = 0; i < 8; ++i) {
+        const int id = rt_graph_instance_add(g);
+        REQUIRE(id >= 0);
+    }
+    CHECK(rt_graph_instance_add(g) == -1);  // cap reached
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.1 polyphony: explicit cap is honoured per-template") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    int t0 = 0;
+    int t1 = rt_graph_template_add(g);
+    REQUIRE(t1 == 1);
+
+    rt_graph_template_add_node(g, t0, 0, 1);
+    rt_graph_template_add_node(g, t0, 1, 2);
+    rt_graph_template_add_node(g, t1, 0, 1);
+    rt_graph_template_add_node(g, t1, 1, 2);
+
+    rt_graph_template_set_polyphony(g, t0, 2);
+    rt_graph_template_set_polyphony(g, t1, 4);
+
+    // Drop auto-instance 0; spawn pool starts empty.
+    rt_graph_instance_remove(g, 0);
+
+    // Template 0: cap 2. Two succeed, third returns -1.
+    REQUIRE(rt_graph_template_instance_add(g, t0) >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, t0) >= 0);
+    CHECK(rt_graph_template_instance_add(g, t0) == -1);
+
+    // Template 1's cap is independent — its 4-slot allocation is
+    // unaffected by template 0 being full.
+    REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+    CHECK(rt_graph_template_instance_add(g, t1) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.1 polyphony: cap <= 0 clamps to 1") {
+    // Defensive: zero or negative caps would deadlock callers that
+    // expect _instance_add to succeed at least once. The runtime
+    // clamps them up to 1 instead of refusing or accepting.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_set_polyphony(g, 0, 0);
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_instance_add(g) >= 0);     // first spawn succeeds (cap = 1)
+    CHECK(rt_graph_instance_add(g) == -1);      // second spawn refused
+
+    rt_graph_template_set_polyphony(g, 0, -10); // negatives clamp the same way
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_instance_add(g) >= 0);
+    CHECK(rt_graph_instance_add(g) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("A.1 polyphony: removing a slot frees up a cap unit") {
+    // After remove (or §2.E auto-free) transitions a slot back to
+    // Available, the cap regains one unit and a new spawn fits.
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_set_polyphony(g, 0, 2);
+    rt_graph_instance_remove(g, 0);
+
+    int a = rt_graph_instance_add(g);
+    int b = rt_graph_instance_add(g);
+    REQUIRE(a >= 0);
+    REQUIRE(b >= 0);
+    CHECK(rt_graph_instance_add(g) == -1);  // cap reached
+
+    rt_graph_instance_remove(g, a);
+    int c = rt_graph_instance_add(g);
+    REQUIRE(c >= 0);                        // freed slot now reusable
+    CHECK(c == a);                          // and the very same slot index
+
+    rt_graph_destroy(g);
+}

@@ -87,6 +87,21 @@ int rt_graph_template_add(RTGraph *g);
 // 0..count-1 to enumerate template_ids.
 int rt_graph_template_count(RTGraph *g);
 
+// [T:construction] Set the polyphony cap for a template — the maximum
+// number of simultaneously-live (Active or Releasing) instances of
+// that template. rt_graph_template_instance_add returns -1 once the
+// cap is reached; the runtime does not steal voices automatically
+// (the future Phase-3 voice allocator owns that policy).
+//
+// Default: 8 per template (covers existing tests). Callers that need
+// more declare it explicitly during construction. Values <= 0 are
+// clamped to 1. Silent no-op on invalid template_id.
+//
+// See Note [Pool model] in rt_graph.cpp for how the cap interacts
+// with the pre-allocated GraphInstance pool, and Note [Thread safety
+// contract] for why this is construction-only.
+void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony);
+
 // [T:construction] Add or reconfigure one node at its dense runtime
 // index in the named template. Walks every live instance of that
 // template and installs freshly-initialised state at the same index,
