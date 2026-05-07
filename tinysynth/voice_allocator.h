@@ -137,8 +137,13 @@ public:
   void        tick();
 
   // Hard panic: enqueue Remove on every Active or Releasing voice,
-  // drop every PendingSteal. Returns the allocator to all-Free.
-  void        all_notes_off();
+  // drop every PendingSteal. Returns true if every voice is now
+  // Free; false if some Active/Releasing voice could not be Removed
+  // because the realtime queue was full — those voices are kept in
+  // their current state so the allocator's accounting stays
+  // consistent with the runtime, and the caller can retry on a
+  // later block once the queue has drained.
+  bool        all_notes_off();
 
   // Introspection. voice_count is constant for the life of the
   // allocator (= polyphony). voice_state / voice_handle / voice_note
@@ -158,9 +163,21 @@ private:
     VoiceState    state      = VoiceState::Free;
   };
 
-  int  find_free_voice() const noexcept;
-  int  pick_steal_victim() const noexcept;
-  bool reserve_map_activate(Voice &v) noexcept;
+  // Outcome of a reserve+map+activate attempt. Transient failures
+  // (queue full, no Available slot yet) leave the voice in whatever
+  // state the caller chose — the caller can retry on a later tick.
+  // MapFailed is *permanent* for this note: the user-supplied map
+  // callback rejected the slot, so no amount of retrying helps; the
+  // caller must drop the voice.
+  enum class ReserveStatus {
+    Success,
+    Transient,
+    MapFailed,
+  };
+
+  int           find_free_voice() const noexcept;
+  int           pick_steal_victim() const noexcept;
+  ReserveStatus reserve_map_activate(Voice &v) noexcept;
 
   RTGraph           *graph_;
   int                template_id_;

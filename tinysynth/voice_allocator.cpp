@@ -57,30 +57,33 @@ int VoiceAllocator::pick_steal_victim() const noexcept {
 }
 
 // Synchronous reserve → map → activate sequence on a voice record
-// already populated with note / velocity. Returns true on full
-// success (slot reserved, controls written, Activate enqueued); on
-// failure rolls back any partial reservation and returns false. The
-// voice's state and slot_id are updated only on success — caller
-// reverts the voice to Free or leaves it PendingSteal as appropriate.
-bool VoiceAllocator::reserve_map_activate(Voice &v) noexcept {
+// already populated with note / velocity. Distinguishes Transient
+// failures (caller may retry on a later tick) from MapFailed (the
+// caller's user-supplied map callback rejected the slot — retrying
+// will hit the same rejection, so the caller must drop the voice).
+// On Success the voice's state is updated to Active and slot_id is
+// filled in; on any failure the partial reservation is rolled back
+// and the voice's state is left untouched for the caller to handle.
+VoiceAllocator::ReserveStatus
+VoiceAllocator::reserve_map_activate(Voice &v) noexcept {
   int slot = rt_graph_realtime_reserve(graph_, template_id_);
-  if (slot < 0) return false;  // pool not pre-warmed or cap hit
+  if (slot < 0) return ReserveStatus::Transient;  // pool not pre-warmed or cap hit
 
   if (map_ && !map_(graph_, slot, v.note, v.velocity, user_data_)) {
     rt_graph_realtime_cancel(graph_, slot);
-    return false;
+    return ReserveStatus::MapFailed;
   }
 
   if (rt_graph_realtime_activate(graph_, slot) == 0) {
     // Queue full. Roll back the reservation so the slot returns to
     // Available; the caller can retry next tick.
     rt_graph_realtime_cancel(graph_, slot);
-    return false;
+    return ReserveStatus::Transient;
   }
 
   v.slot_id = slot;
   v.state   = VoiceState::Active;
-  return true;
+  return ReserveStatus::Success;
 }
 
 VoiceResult VoiceAllocator::note_on(int note, float velocity) {
@@ -195,58 +198,105 @@ void VoiceAllocator::note_off(int note) {
 void VoiceAllocator::tick() {
   // Pass 1: reap Releasing voices whose runtime slots auto-freed
   // via the §2.E silence window.
-  for (auto &v : voices_) {
+  //
+  // The note_to_voice clear is gated on `mapped == vi`, NOT on a
+  // generation match. Generations are per-voice and can collide
+  // across different voice indices — e.g., voice 0 and voice 1 may
+  // both happen to be on their first assignment (gen == 1) at the
+  // same time. If a same-pitch retrigger has already remapped the
+  // note to a different voice, that voice's mapping must NOT be
+  // clobbered when we reap the old voice.
+  for (std::size_t i = 0; i < voices_.size(); ++i) {
+    Voice    &v  = voices_[i];
+    const int vi = static_cast<int>(i);
     if (v.state != VoiceState::Releasing) continue;
     if (rt_graph_instance_status(graph_, v.slot_id) != -1) continue;
 
-    if (v.note >= 0 && note_to_voice_[v.note] >= 0) {
-      const int mapped = note_to_voice_[v.note];
-      if (mapped >= 0 && voices_[static_cast<std::size_t>(mapped)].generation == v.generation) {
-        note_to_voice_[v.note] = -1;
-      }
+    if (v.note >= 0 && note_to_voice_[v.note] == vi) {
+      note_to_voice_[v.note] = -1;
     }
-    v.note   = -1;
-    v.state  = VoiceState::Free;
+    v.note    = -1;
+    v.state   = VoiceState::Free;
     v.slot_id = -1;
   }
 
-  // Pass 2: retry pending steals. The victim's Remove may not yet
-  // have drained on the audio thread, in which case reserve fails
-  // (no Available slot of this template's shape) and we just leave
-  // the voice pending for the next tick.
-  for (auto &v : voices_) {
+  // Pass 2: retry pending steals.
+  //   * Success: voice is now Active — done.
+  //   * Transient (no slot yet, queue full): leave voice in
+  //     PendingSteal so the next tick can retry. The victim's
+  //     Remove may simply not have drained yet.
+  //   * MapFailed: permanent — the user's map callback rejected
+  //     this note. Drop the voice so it doesn't stay pending
+  //     forever; another note_on can pick it up.
+  for (std::size_t i = 0; i < voices_.size(); ++i) {
+    Voice    &v  = voices_[i];
+    const int vi = static_cast<int>(i);
     if (v.state != VoiceState::PendingSteal) continue;
-    (void) reserve_map_activate(v);
-    // On success v.state is now Active. On failure (queue full, map
-    // failed, or no Available slot yet), v stays PendingSteal. We
-    // do NOT bump generation here — the voice's logical owner did
-    // not change.
+
+    switch (reserve_map_activate(v)) {
+      case ReserveStatus::Success:
+        // v.state is now Active.
+        break;
+      case ReserveStatus::Transient:
+        // Stay pending for the next tick.
+        break;
+      case ReserveStatus::MapFailed:
+        if (v.note >= 0 && note_to_voice_[v.note] == vi) {
+          note_to_voice_[v.note] = -1;
+        }
+        v.note    = -1;
+        v.state   = VoiceState::Free;
+        v.slot_id = -1;
+        break;
+    }
   }
 }
 
-void VoiceAllocator::all_notes_off() {
-  for (auto &v : voices_) {
+bool VoiceAllocator::all_notes_off() {
+  bool all_clear = true;
+  for (std::size_t i = 0; i < voices_.size(); ++i) {
+    Voice    &v  = voices_[i];
+    const int vi = static_cast<int>(i);
     switch (v.state) {
       case VoiceState::Active:
-      case VoiceState::Releasing:
-        // Hard remove. Queue full here means the panic is best-
-        // effort; the voice record still resets locally so the
-        // allocator's accounting stays consistent.
-        (void) rt_graph_realtime_remove(graph_, v.slot_id);
-        v.note   = -1;
-        v.state  = VoiceState::Free;
+      case VoiceState::Releasing: {
+        // Try to enqueue Remove. On queue-full, leave the voice in
+        // its current state and its note_to_voice mapping intact —
+        // marking the voice Free here would lose ownership while
+        // the runtime slot keeps sounding. The caller checks the
+        // return value and retries on a later block once drain has
+        // freed queue capacity.
+        if (rt_graph_realtime_remove(graph_, v.slot_id) == 0) {
+          all_clear = false;
+          break;
+        }
+        // Removed successfully. Clear note_to_voice only if it
+        // still points at *this* voice (a same-pitch retrigger may
+        // have remapped the note to a different voice already).
+        if (v.note >= 0 && note_to_voice_[v.note] == vi) {
+          note_to_voice_[v.note] = -1;
+        }
+        v.note    = -1;
+        v.state   = VoiceState::Free;
         v.slot_id = -1;
         break;
+      }
       case VoiceState::PendingSteal:
-        v.note   = -1;
-        v.state  = VoiceState::Free;
+        // The victim's queued Remove will still fire on the audio
+        // thread; nothing more to do at runtime. Drop our pending
+        // allocation locally.
+        if (v.note >= 0 && note_to_voice_[v.note] == vi) {
+          note_to_voice_[v.note] = -1;
+        }
+        v.note    = -1;
+        v.state   = VoiceState::Free;
         v.slot_id = -1;
         break;
       case VoiceState::Free:
         break;
     }
   }
-  std::fill(std::begin(note_to_voice_), std::end(note_to_voice_), -1);
+  return all_clear;
 }
 
 int VoiceAllocator::voice_count() const noexcept {

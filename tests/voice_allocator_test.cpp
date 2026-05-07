@@ -401,3 +401,179 @@ TEST_CASE("VoiceAllocator: note_off on never-played note is a no-op") {
     }
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// Regression: P2 fixes (review followups)
+// ----------------------------------------------------------------
+
+TEST_CASE("VoiceAllocator regression: tick reaping a Releasing voice does not clobber a remapped note") {
+    // P2 #1: tick's note_to_voice clear used to gate on a generation
+    // match across voice indices. Generations are per-voice and can
+    // collide — e.g., voice 0 and voice 1 may both be on their first
+    // assignment (gen == 1) at the same time. If a same-pitch
+    // retrigger has remapped note N to a different voice while the
+    // original voice is still Releasing, reaping the original voice
+    // would have wiped the new voice's mapping and a subsequent
+    // note_off(N) would have no-op'd, leaving the new voice stuck
+    // Active.
+    //
+    // The fix gates the clear on `mapped == this_voice_index`
+    // instead.
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, write_velocity_as_constant, nullptr);
+
+    auto a = alloc.note_on(60, 0.1f);
+    REQUIRE(a.status == VoiceResultStatus::Started);
+    alloc.note_off(60);
+    REQUIRE(alloc.voice_state(a.voice.voice_index) == VoiceState::Releasing);
+
+    // Same-pitch retrigger lands on a different voice. Both voices
+    // happen to share generation == 1 at this point.
+    auto b = alloc.note_on(60, 0.2f);
+    REQUIRE(b.status == VoiceResultStatus::Started);
+    REQUIRE(b.voice.voice_index != a.voice.voice_index);
+    REQUIRE(a.voice.generation == b.voice.generation);
+
+    // Process + tick: voice a auto-frees. Without the index check,
+    // tick would see "mapped voice's gen matches mine" and clear
+    // note_to_voice[60].
+    rt_graph_process(g, kFrames);
+    alloc.tick();
+    CHECK(alloc.voice_state(a.voice.voice_index) == VoiceState::Free);
+    CHECK(alloc.voice_state(b.voice.voice_index) == VoiceState::Active);
+
+    // The note→voice map must still point at voice b. note_off(60)
+    // hits voice b, not no-op.
+    alloc.note_off(60);
+    CHECK(alloc.voice_state(b.voice.voice_index) == VoiceState::Releasing);
+
+    rt_graph_destroy(g);
+}
+
+namespace {
+
+struct ToggleableMapState {
+    bool fail_next = false;
+    int  success_calls = 0;
+    int  fail_calls = 0;
+};
+
+bool toggleable_map(RTGraph *g, int slot, int /*note*/,
+                    float velocity, void *user_data) {
+    auto *m = static_cast<ToggleableMapState *>(user_data);
+    if (m->fail_next) {
+        ++m->fail_calls;
+        return false;
+    }
+    ++m->success_calls;
+    rt_graph_instance_set_control(g, slot, 0, 0, static_cast<double>(velocity));
+    return true;
+}
+
+} // namespace
+
+TEST_CASE("VoiceAllocator regression: pending-steal MapFailed drops the voice instead of looping forever") {
+    // P2 #2: tick's pending-steal retry used to swallow MapFailed as
+    // a transient failure, so a callback that rejects the pending
+    // note left the voice in PendingSteal forever — every subsequent
+    // tick would re-reserve, re-call the callback, and re-cancel.
+    //
+    // The fix splits reserve_map_activate's return into
+    // {Success, Transient, MapFailed}; tick treats MapFailed as
+    // permanent and frees the voice.
+    auto *g = make_graph_with_polyphony(1);
+    ToggleableMapState m{};
+    VoiceAllocator alloc(g, 0, 1, toggleable_map, &m);
+
+    // First note: callback succeeds.
+    auto a = alloc.note_on(60, 0.1f);
+    REQUIRE(a.status == VoiceResultStatus::Started);
+    REQUIRE(m.success_calls == 1);
+
+    // Second note: voice 0 is full → steal. No map call yet.
+    auto b = alloc.note_on(62, 0.2f);
+    REQUIRE(b.status == VoiceResultStatus::PendingSteal);
+    REQUIRE(alloc.voice_state(b.voice.voice_index) == VoiceState::PendingSteal);
+
+    // Arm the callback to reject the next call (the tick retry).
+    m.fail_next = true;
+
+    rt_graph_process(g, kFrames);
+    alloc.tick();
+
+    // Voice must be Free, not stuck PendingSteal.
+    CHECK(alloc.voice_state(b.voice.voice_index) == VoiceState::Free);
+    CHECK(alloc.voice_note(b.voice.voice_index) == -1);
+    CHECK(m.fail_calls == 1);
+
+    // The note 62 mapping was cleared. note_off(62) is a no-op.
+    alloc.note_off(62);
+    for (int i = 0; i < alloc.voice_count(); ++i) {
+        CHECK(alloc.voice_state(i) == VoiceState::Free);
+    }
+
+    // Callback recovers — a new note_on works synchronously.
+    m.fail_next = false;
+    auto c = alloc.note_on(64, 0.3f);
+    CHECK(c.status == VoiceResultStatus::Started);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("VoiceAllocator regression: all_notes_off keeps voices Active when remove enqueue fails") {
+    // P2 #3: all_notes_off used to mark voices Free even when
+    // rt_graph_realtime_remove returned 0 (queue full). That lost
+    // allocator ownership while the runtime slot kept sounding —
+    // a subsequent note_on would happily reuse a "Free" voice
+    // record whose runtime slot was still Active.
+    //
+    // The fix: leave voices in their current state on enqueue
+    // failure and return false from all_notes_off so callers can
+    // retry once the queue drains.
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, write_velocity_as_constant, nullptr);
+
+    auto a = alloc.note_on(60, 0.1f);
+    auto b = alloc.note_on(62, 0.2f);
+    REQUIRE(a.status == VoiceResultStatus::Started);
+    REQUIRE(b.status == VoiceResultStatus::Started);
+
+    // Drain the two Activates so the queue is empty before we
+    // saturate it.
+    rt_graph_process(g, kFrames);
+
+    // Saturate the queue with set_controls targeting an out-of-range
+    // slot. The drain will silently drop them; queue mechanics still
+    // count them as enqueued.
+    for (int i = 0; i < 256; ++i) {
+        REQUIRE(rt_graph_realtime_set_control(g, 99, 0, 0, 0.0) == 1);
+    }
+    REQUIRE(rt_graph_realtime_set_control(g, 99, 0, 0, 0.0) == 0);  // confirms full
+
+    // Panic. Both Removes must fail because the queue is full.
+    bool ok = alloc.all_notes_off();
+    CHECK(ok == false);
+
+    // Voices must still be alive — runtime is still sounding.
+    int alive = 0;
+    for (int i = 0; i < alloc.voice_count(); ++i) {
+        if (alloc.voice_state(i) != VoiceState::Free) ++alive;
+    }
+    CHECK(alive == 2);
+
+    // Drain the saturated queue. Retry the panic — now it succeeds.
+    rt_graph_process(g, kFrames);
+    bool ok2 = alloc.all_notes_off();
+    CHECK(ok2 == true);
+    for (int i = 0; i < alloc.voice_count(); ++i) {
+        CHECK(alloc.voice_state(i) == VoiceState::Free);
+    }
+
+    // Bus 0 silent after the second panic + drain.
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    for (auto x : bus0) CHECK(x == doctest::Approx(0.0f));
+
+    rt_graph_destroy(g);
+}
