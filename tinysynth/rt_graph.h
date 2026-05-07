@@ -143,6 +143,53 @@ void rt_graph_template_connect(RTGraph *g, int template_id,
                                int src_index, int src_port,
                                int dst_index, int dst_port);
 
+// [T:construction] Mark a node in the named template as elided. An
+// elided node remains in the spec — its NodeIndex is preserved,
+// its controls remain addressable via rt_graph_template_set_default,
+// rt_graph_instance_set_control, and the realtime control queue —
+// but process_instance skips its kernel. The Step C single-edge
+// fusion pass uses this to keep a Gain node addressable while
+// absorbing its per-block work into the consumer's input read.
+//
+// Silent no-op on invalid template_id or node_index. Idempotent:
+// marking the same node elided twice is harmless.
+void rt_graph_template_set_node_elided(RTGraph *g, int template_id,
+                                       int node_index);
+
+// [T:construction] Wire one input port of a destination node so it
+// reads through a fused scaled-source form rather than from a
+// producer's output buffer. At runtime the input resolver
+// materialises the value as
+//
+//   scratch[i] = src[i] * static_cast<float>(scale_node.controls[scale_control])
+//
+// into a per-instance scratch buffer (allocated here, never grown
+// in the audio callback) and returns a span over it. Mirrors the
+// scalar branch of process_gain so fused vs. unfused outputs are
+// bit-identical.
+//
+// The scale control is read live: rt_graph_instance_set_control
+// (or the realtime queue) targeting (scale_node, scale_control)
+// continues to drive the fused output, exactly as it did the
+// dispatched Gain.
+//
+// Allocates one fresh scratch slot per call. Walks every live
+// instance of the named template to grow its scratch storage
+// in lockstep, mirroring rt_graph_template_add_node's parallel-
+// growth contract. Construction-only: must run before audio
+// starts.
+//
+// Silent no-op on any invalid index (template_id, dst_node /
+// dst_port out of range, src_node / src_port likewise, or
+// scale_node / scale_control likewise). Multiple fused-scale
+// wires to the same (dst_node, dst_port) overwrite the previous;
+// the older scratch slot becomes unused but is not reclaimed.
+void rt_graph_template_connect_fused_scale_input(
+    RTGraph *g, int template_id,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int scale_node, int scale_control_index);
+
 // [T:construction] Add one region to the named template's MetaDef.
 // Regions are an execution-order overlay on the template's node array;
 // process_instance iterates them as the unit of dispatch when the
@@ -205,6 +252,17 @@ void rt_graph_connect(RTGraph *g, int src_index, int src_port, int dst_index,
 
 // [T:construction] Template-0 shim for rt_graph_template_add_region.
 void rt_graph_add_region(RTGraph *g, int rate, int first_node, int node_count);
+
+// [T:construction] Template-0 shim for rt_graph_template_set_node_elided.
+void rt_graph_set_node_elided(RTGraph *g, int node_index);
+
+// [T:construction] Template-0 shim for
+// rt_graph_template_connect_fused_scale_input.
+void rt_graph_connect_fused_scale_input(
+    RTGraph *g,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int scale_node, int scale_control_index);
 
 // [T:render] Offline block rendering. Processes every live instance of
 // every template, in template registration (= execution) order.

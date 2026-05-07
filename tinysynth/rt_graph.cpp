@@ -438,6 +438,26 @@ struct InputRef {
   PortIndex src_port{};
 };
 
+// Step C (d): per-input override that turns a kernel's input read
+// into an inline scaled-source materialisation. When NodeSpec's
+// fused_inputs[port] holds one of these, resolve_input writes
+// scratch[i] = source.outputs[port][i] * float(scale.controls[c])
+// into the consuming GraphInstance's fused_scratch[scratch_slot]
+// and returns a span over it. The scale control is read live so
+// rt_graph_instance_set_control on the elided Gain still drives
+// the consumer's input.
+//
+// scratch_slot is dense across the template: each call to
+// rt_graph_template_connect_fused_scale_input claims a fresh slot
+// and grows every live instance's fused_scratch in lockstep.
+struct FusedScaleRef {
+  NodeIndex    source_node{};
+  PortIndex    source_port{};
+  NodeIndex    scale_node{};
+  ControlIndex scale_control{};
+  int          scratch_slot = -1;
+};
+
 // Shared oscillator phase state. q::phase_iterator owns the 1.31 fixed-point
 // accumulator and per-sample increment. Fixed-point phase wraps at 2pi with
 // uint32 overflow — no fmod, no conditional branch.
@@ -633,6 +653,19 @@ struct NodeSpec {
   NodeKind kind = NodeKind::Out;
   std::vector<double> default_controls;
   std::vector<InputRef> input_refs;
+
+  // Step C (d): per-input fused override. Parallel-sized to
+  // input_refs whenever populated. An empty optional means "use
+  // the regular input_refs[port] path"; a populated one redirects
+  // the consumer's read through a scaled-source materialisation.
+  // See FusedScaleRef and Note [Fused inputs] (Compile.hs).
+  std::vector<std::optional<FusedScaleRef>> fused_inputs;
+
+  // Step C (d): when true, process_instance skips this node's
+  // kernel entirely. The node's controls and its NodeIndex remain
+  // addressable; only dispatch is suppressed. Set by
+  // rt_graph_template_set_node_elided.
+  bool elided = false;
 };
 
 struct NodeInstanceState {
@@ -760,6 +793,14 @@ struct MetaDef {
   // dispatch; behaviour is identical either way for Step A. See
   // Note [Region fallback].
   std::vector<RegionSpec> regions;
+
+  // Step C (d): running tally of how many fused-scale inputs have
+  // been registered across this template. Each call to
+  // rt_graph_template_connect_fused_scale_input claims the slot at
+  // this index and increments. GraphInstance::fused_scratch is sized
+  // to fused_input_count * max_frames at construction (or grown in
+  // lockstep when a fused input is registered after instances exist).
+  int fused_input_count = 0;
 };
 
 struct GraphInstance {
@@ -791,6 +832,14 @@ struct GraphInstance {
   // actual contribution to the bus pool rather than internal node
   // activity that may be silenced downstream.
   float block_sink_peak = 0.0f;
+
+  // Step C (d): one float[max_frames] buffer per registered
+  // fused-scale input. resolve_input materialises into the slot
+  // assigned in the matching FusedScaleRef, then returns a span
+  // over it. Sized at construction (make_instance) and grown in
+  // lockstep with rt_graph_template_connect_fused_scale_input;
+  // never resized in the audio callback.
+  std::vector<std::vector<float>> fused_scratch;
 };
 
 /* Note [Node configuration: spec vs state]
@@ -819,6 +868,16 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
   spec.kind = kind;
   spec.default_controls.clear();
   spec.input_refs.clear();
+  // Step C (d): fused-input overlay clears alongside input_refs;
+  // the elision flag also resets on reconfigure. The spec is being
+  // rebuilt from scratch so stale fusion metadata would only
+  // misroute future kernels. Slot reservations on the MetaDef are
+  // kept (fused_input_count is not decremented) — slot identity is
+  // template-wide and a reconfigured node simply stops claiming
+  // its old slot. Reclaiming would risk colliding with another
+  // node's still-live slot index.
+  spec.fused_inputs.clear();
+  spec.elided = false;
 
   switch (kind) {
   case NodeKind::SinOsc:
@@ -930,6 +989,11 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.input_refs.resize(3);            // [signal_in, freq_in, q_in]
     break;
   }
+
+  // Step C (d): fused_inputs is parallel to input_refs. Sizing it
+  // here means resolve_input can index by port without bounds-
+  // checking the vector itself; only its optional payload matters.
+  spec.fused_inputs.assign(spec.input_refs.size(), std::nullopt);
 }
 
 // Reset a per-node state slot in place, preserving vector capacities
@@ -1529,9 +1593,20 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
 // via BusOut/BusIn, not through direct port wiring) and reads the
 // wiring from the *template* that instance belongs to. Wiring is
 // per-template, state is per-instance.
+//
+// Step C (d) extends the resolver with a fused-input path: when a
+// destination port carries a FusedScaleRef in dst_spec.fused_inputs
+// it is materialised into the consuming GraphInstance's
+// fused_scratch slot and the returned span views that scratch.
+// Mirrors process_gain's scalar-fallback discipline (cast double
+// control to float, then multiply float source samples) so fused
+// vs. unfused outputs are bit-identical. The instance is taken by
+// non-const reference because the scratch is part of the resolver's
+// own working memory; kernel callers already pass their instance
+// non-const.
 [[nodiscard]] static std::span<const float> resolve_input(
     const RTGraph &g,
-    const GraphInstance &inst,
+    GraphInstance &inst,
     std::size_t dst_idx,
     PortIndex input_index,
     int nframes
@@ -1553,6 +1628,60 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
   const std::size_t idx = to_size(input_index);
   if (idx >= dst_spec.input_refs.size()) {
     return {};
+  }
+
+  // Step C (d): fused-scale input takes precedence over the
+  // direct-port path. The override is per-(spec, port); when
+  // present, the regular input_refs[idx] is ignored.
+  if (idx < dst_spec.fused_inputs.size()) {
+    if (const auto &fopt = dst_spec.fused_inputs[idx]; fopt.has_value()) {
+      const FusedScaleRef &fr = *fopt;
+      // Validate the source node / port and the scale node /
+      // control. Any failure returns empty span, mirroring the
+      // existing "unavailable input -> caller silences or falls
+      // back to control" contract.
+      if (!valid(fr.source_node) || !valid(fr.source_port) ||
+          !valid(fr.scale_node)  || !valid(fr.scale_control)) {
+        return {};
+      }
+      const std::size_t src_index = to_size(fr.source_node);
+      if (src_index >= inst.nodes.size()) return {};
+      const NodeInstanceState &src = inst.nodes[src_index];
+      const std::size_t src_port = to_size(fr.source_port);
+      if (src_port >= src.outputs.size()) return {};
+      if (src.outputs[src_port].size() < static_cast<std::size_t>(nframes)) {
+        return {};
+      }
+
+      const std::size_t scale_idx = to_size(fr.scale_node);
+      if (scale_idx >= inst.nodes.size()) return {};
+      const NodeInstanceState &scale = inst.nodes[scale_idx];
+      const std::size_t cidx = to_size(fr.scale_control);
+      if (cidx >= scale.controls.size()) return {};
+
+      const std::size_t slot = static_cast<std::size_t>(fr.scratch_slot);
+      if (fr.scratch_slot < 0 || slot >= inst.fused_scratch.size()) {
+        return {};
+      }
+      auto &scratch = inst.fused_scratch[slot];
+      if (scratch.size() < static_cast<std::size_t>(nframes)) {
+        return {};
+      }
+
+      // Same NaN discipline as process_gain's scalar branch:
+      // a NaN control falls back to unity so the IIR / smoother
+      // state of any downstream filter doesn't get poisoned by a
+      // single bad write into controls[scale_control].
+      const float scale_f = sanitize_finite(
+          static_cast<float>(scale.controls[cidx]), 1.0f);
+      const auto src_span = output_span(src, fr.source_port, nframes);
+      for (int i = 0; i < nframes; ++i) {
+        const std::size_t fi = static_cast<std::size_t>(i);
+        scratch[fi] = src_span[fi] * scale_f;
+      }
+      return std::span<const float>(scratch.data(),
+                                    static_cast<std::size_t>(nframes));
+    }
   }
 
   const InputRef &ref = dst_spec.input_refs[idx];
@@ -3048,8 +3177,11 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
   // See Note [Region fallback]: when the template has no registered
   // regions (typically C++ tests built directly via rt_graph_add_node
   // without going through the Haskell loaders), iterate nodes flatly.
+  // Step C (d): skip elided nodes — their work has been absorbed
+  // into a fused consumer input. See FusedScaleRef.
   if (def->regions.empty()) {
     for (std::size_t i = 0; i < node_count; ++i) {
+      if (def->nodes[i].elided) continue;
       dispatch_node(g, inst, i, nframes, def->nodes[i]);
     }
     return;
@@ -3064,6 +3196,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
     const std::size_t end_excl =
         std::min(node_count, first + static_cast<std::size_t>(r.node_count));
     for (std::size_t i = first; i < end_excl; ++i) {
+      if (def->nodes[i].elided) continue;
       dispatch_node(g, inst, i, nframes, def->nodes[i]);
     }
   }
@@ -3342,6 +3475,16 @@ static GraphInstance make_instance(const MetaDef &def, int template_id, int max_
   inst.nodes.resize(def.nodes.size());
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
     init_node_state(inst.nodes[i], def.nodes[i], max_frames);
+  }
+  // Step C (d): one scratch buffer per fused-scale input registered
+  // on the spec, sized to max_frames. resolve_input materialises
+  // into these and returns a span over them; never resized in the
+  // audio callback. See FusedScaleRef.
+  const std::size_t slot_count = static_cast<std::size_t>(def.fused_input_count);
+  const auto frames = static_cast<std::size_t>(max_frames);
+  inst.fused_scratch.resize(slot_count);
+  for (auto &slot : inst.fused_scratch) {
+    slot.assign(frames, 0.0f);
   }
   return inst;
 }
@@ -3793,6 +3936,94 @@ void rt_graph_template_add_region(
   def->regions.push_back(RegionSpec{rate, first_node, node_count});
 }
 
+// Step C (d): mark a node as elided. Idempotent on existing state;
+// silent no-op on bad indices. The node remains in def->nodes and
+// every live instance keeps its NodeInstanceState slot, so control
+// writes targeting node_index continue to land on the same controls
+// vector that resolve_input reads at fused-input materialisation
+// time.
+void rt_graph_template_set_node_elided(
+    RTGraph *g, int template_id, int node_index
+) {
+  if (!g) return;
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+  if (node_index < 0) return;
+  const std::size_t idx = static_cast<std::size_t>(node_index);
+  if (idx >= def->nodes.size()) return;
+  def->nodes[idx].elided = true;
+}
+
+// Step C (d): wire one input port through a fused scaled-source
+// form. Validates each index, claims a fresh scratch slot on the
+// MetaDef, writes the FusedScaleRef into dst_spec.fused_inputs[port],
+// and walks every live instance of the template to grow its
+// fused_scratch in lockstep — the same parallel-growth contract as
+// rt_graph_template_add_node. Multiple calls to the same
+// (dst_node, dst_port) overwrite the previous fused override; the
+// older slot stays allocated but unused.
+void rt_graph_template_connect_fused_scale_input(
+    RTGraph *g, int template_id,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int scale_node, int scale_control_index
+) {
+  if (!g) return;
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+
+  // Validate every index in the template's spec frame.
+  if (dst_node   < 0 || dst_port   < 0 ||
+      src_node   < 0 || src_port   < 0 ||
+      scale_node < 0 || scale_control_index < 0) {
+    return;
+  }
+  const std::size_t didx = static_cast<std::size_t>(dst_node);
+  const std::size_t sidx = static_cast<std::size_t>(src_node);
+  const std::size_t scidx = static_cast<std::size_t>(scale_node);
+  if (didx >= def->nodes.size() ||
+      sidx >= def->nodes.size() ||
+      scidx >= def->nodes.size()) {
+    return;
+  }
+
+  NodeSpec &dst_spec = def->nodes[didx];
+  const std::size_t dport = static_cast<std::size_t>(dst_port);
+  if (dport >= dst_spec.fused_inputs.size()) {
+    // dst_spec was reconfigured to a kind whose port-count doesn't
+    // cover dst_port. Keeping this a silent no-op matches the
+    // policy of the surrounding ABI entries.
+    return;
+  }
+
+  // Claim a fresh scratch slot. Multiple fused inputs must each
+  // own a separate slot so a kernel with two fused inputs does not
+  // alias them while resolving.
+  const int slot = def->fused_input_count++;
+
+  dst_spec.fused_inputs[dport] = FusedScaleRef{
+      NodeIndex{src_node},
+      PortIndex{src_port},
+      NodeIndex{scale_node},
+      ControlIndex{scale_control_index},
+      slot
+  };
+
+  // Grow every live instance of this template in lockstep so the
+  // newly-claimed slot has a backing buffer ready for the next
+  // process_instance call. Mirrors rt_graph_template_add_node's
+  // parallel-growth contract.
+  const auto frames = static_cast<std::size_t>(def->max_frames);
+  for (auto &inst : g->instances) {
+    if (inst.template_id != template_id) continue;
+    if (inst.state.load() == SlotState::Available) continue;
+    while (inst.fused_scratch.size() <=
+           static_cast<std::size_t>(slot)) {
+      inst.fused_scratch.emplace_back(frames, 0.0f);
+    }
+  }
+}
+
 // Spawn a fresh instance of the named template. Returns globally-
 // unique instance_id (>= 0) or -1 on failure.
 //
@@ -3905,6 +4136,23 @@ void rt_graph_add_region(
     RTGraph *g, int rate, int first_node, int node_count
 ) {
   rt_graph_template_add_region(g, 0, rate, first_node, node_count);
+}
+
+// Legacy: mark a node in template 0 as elided. Step C (d).
+void rt_graph_set_node_elided(RTGraph *g, int node_index) {
+  rt_graph_template_set_node_elided(g, 0, node_index);
+}
+
+// Legacy: wire a fused-scale input on template 0. Step C (d).
+void rt_graph_connect_fused_scale_input(
+    RTGraph *g,
+    int dst_node, int dst_port,
+    int src_node, int src_port,
+    int scale_node, int scale_control_index
+) {
+  rt_graph_template_connect_fused_scale_input(
+      g, 0, dst_node, dst_port, src_node, src_port,
+      scale_node, scale_control_index);
 }
 
 // Render one block offline; processes every live instance of every

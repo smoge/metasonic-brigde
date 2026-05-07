@@ -5807,3 +5807,131 @@ TEST_CASE("rt_graph_template_add_region rejects out-of-range ranges") {
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// Step C (d): elided dispatch + fused-scale resolver. Pins the
+// runtime contract that fuseRuntimeGraph (Haskell) will produce
+// for the FFI loader (Step C (e)) to consume. The kernels are
+// unchanged; only NodeSpec.elided / NodeSpec.fused_inputs and the
+// resolver path are new.
+// ----------------------------------------------------------------
+
+TEST_CASE("Step C (d): fused Gain renders bit-identically to unfused chain") {
+    // Helper: build SinOsc(440) → Gain(0.5) → Out(0).
+    auto build_unfused = [](RTGraph *g) {
+        rt_graph_add_node(g, 0, 1); // SinOsc
+        rt_graph_set_control(g, 0, 0, 440.0f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        rt_graph_add_node(g, 1, 3); // Gain
+        rt_graph_set_control(g, 1, 0, 0.5f);
+        rt_graph_add_node(g, 2, 2); // Out
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0); // SinOsc → Gain.signal
+        rt_graph_connect(g, 1, 0, 2, 0); // Gain → Out.signal
+    };
+
+    // Path 1: unfused — Gain dispatched, Out reads from Gain.
+    auto *g_un = rt_graph_create(4, kFrames);
+    REQUIRE(g_un != nullptr);
+    build_unfused(g_un);
+    auto unfused_samples = render_bus0(g_un, kFrames);
+    rt_graph_destroy(g_un);
+
+    // Path 2: fused — Gain elided, Out reads from a fused-scale
+    // input (SinOsc.out0 × Gain.controls[0]). The Out -> Gain
+    // direct connect is intentionally still present: the resolver
+    // must take the fused path because fused_inputs[port] carries
+    // a value, regardless of input_refs.
+    auto *g_fu = rt_graph_create(4, kFrames);
+    REQUIRE(g_fu != nullptr);
+    build_unfused(g_fu);
+    rt_graph_set_node_elided(g_fu, /*node=*/1);
+    rt_graph_connect_fused_scale_input(
+        g_fu,
+        /*dst_node=*/2, /*dst_port=*/0,
+        /*src_node=*/0, /*src_port=*/0,
+        /*scale_node=*/1, /*scale_control_index=*/0);
+    auto fused_samples = render_bus0(g_fu, kFrames);
+    rt_graph_destroy(g_fu);
+
+    REQUIRE(unfused_samples.size() == fused_samples.size());
+    for (std::size_t i = 0; i < unfused_samples.size(); ++i) {
+        // Bit-identical: the materialisation casts the same way
+        // and multiplies in the same order as process_gain's
+        // scalar branch. Any divergence is a step-(d) bug.
+        CHECK(unfused_samples[i] == fused_samples[i]);
+    }
+}
+
+TEST_CASE("Step C (d): set_control on an elided Gain still drives the fused output") {
+    // Build a fused chain twice with different scale values and
+    // confirm the rendered amplitude tracks the live control.
+    // This pins the load-bearing semantic claim that elided Gains
+    // remain control-addressable.
+    auto build_fused = [](RTGraph *g, float scale) {
+        rt_graph_add_node(g, 0, 1); // SinOsc
+        rt_graph_set_control(g, 0, 0, 440.0f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        rt_graph_add_node(g, 1, 3); // Gain (will be elided)
+        rt_graph_set_control(g, 1, 0, 1.0f); // initial value, overwritten below
+        rt_graph_add_node(g, 2, 2); // Out
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+        rt_graph_set_node_elided(g, 1);
+        rt_graph_connect_fused_scale_input(g, 2, 0, 0, 0, 1, 0);
+        // Overwrite the elided Gain's control AFTER fusion is
+        // wired. The next render must materialise scratch through
+        // this freshly-set value.
+        rt_graph_set_control(g, 1, 0, scale);
+    };
+
+    auto *g1 = rt_graph_create(4, kFrames);
+    REQUIRE(g1 != nullptr);
+    build_fused(g1, 0.5f);
+    auto half = render_bus0(g1, kFrames);
+    rt_graph_destroy(g1);
+
+    auto *g2 = rt_graph_create(4, kFrames);
+    REQUIRE(g2 != nullptr);
+    build_fused(g2, 0.25f);
+    auto quarter = render_bus0(g2, kFrames);
+    rt_graph_destroy(g2);
+
+    // SinOsc peaks at ~1.0; the fused path scales it by the
+    // elided Gain's live control. Two renders should differ by
+    // exactly the ratio of their controls (modulo float fuzz).
+    const float peak_half    = peak_abs(half);
+    const float peak_quarter = peak_abs(quarter);
+    CHECK(peak_half    == doctest::Approx(0.5f).epsilon(0.05));
+    CHECK(peak_quarter == doctest::Approx(0.25f).epsilon(0.05));
+    // Sample-wise ratio is 2:1 wherever the source is non-trivial.
+    for (std::size_t i = 0; i < half.size(); ++i) {
+        if (std::abs(half[i]) > 0.05f) {
+            CHECK(half[i] / quarter[i] == doctest::Approx(2.0f).epsilon(0.01));
+        }
+    }
+}
+
+TEST_CASE("Step C (d): out-of-range fused refs are silent no-ops, render is unaffected") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_add_node(g, 0, 1);
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    // Each of these should leave fused_inputs untouched.
+    rt_graph_connect_fused_scale_input(g, 1, /*dst_port=*/9, 0, 0, 0, 0); // bad dst_port
+    rt_graph_connect_fused_scale_input(g, 1, 0, /*src_node=*/-1, 0, 0, 0); // bad src_node
+    rt_graph_connect_fused_scale_input(g, 1, 0, 0, 0, /*scale_node=*/9, 0); // bad scale_node
+    rt_graph_set_node_elided(g, /*node=*/9); // bad node
+    rt_graph_set_node_elided(g, /*node=*/-1);
+
+    auto samples = render_bus0(g, kFrames);
+    CHECK(peak_abs(samples) == doctest::Approx(1.0f).epsilon(0.02));
+
+    rt_graph_destroy(g);
+}
