@@ -1740,6 +1740,17 @@ follows the new shift on the next sample, so width modulation is
 glitch-free as long as the modulator stays within [0, 1].
 */
 
+// Sanitize a width sample before handing it to q::pulse_osc::width().
+// q::frac_to_phase asserts (debug) on negative input, and on
+// non-finite input would multiply by NaN/Inf and convert the result
+// to uint32_t — undefined per the C++ standard. Clamp finite values
+// to [0, 1] and substitute the kindSpec default (0.5 = square) for
+// NaN / +/-Inf. Width 1.0 is handled internally by frac_to_phase
+// (returns phase::end), so [0, 1] is the safe domain.
+static inline float sanitize_pulse_width(float w) noexcept {
+  return std::isfinite(w) ? std::clamp(w, 0.0f, 1.0f) : 0.5f;
+}
+
 static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
                               std::size_t node_idx, int nframes) noexcept {
   auto &node = inst.nodes[node_idx];
@@ -1756,10 +1767,13 @@ static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
 
   // Width: sample-accurate modulation when port 2 is wired; otherwise
   // memoize against last_width and update once per block on change.
+  // Block-rate path: sanitize the *raw* control value before
+  // comparing against last_width so a single non-finite write
+  // doesn't lock the memo into a poison state.
   if (width_in.empty()) {
-    const double w = node.controls[2];
+    const float w = sanitize_pulse_width(static_cast<float>(node.controls[2]));
     if (w != st->last_width) {
-      st->osc.width(static_cast<float>(w));
+      st->osc.width(w);
       st->last_width = w;
     }
   }
@@ -1771,7 +1785,7 @@ static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
       st->phase_iter.set(
           q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
       if (!width_in.empty()) {
-        st->osc.width(width_in[fi]);
+        st->osc.width(sanitize_pulse_width(width_in[fi]));
       }
       out[fi] = st->osc(st->phase_iter++);
     }
@@ -1783,7 +1797,7 @@ static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       if (!width_in.empty()) {
-        st->osc.width(width_in[fi]);
+        st->osc.width(sanitize_pulse_width(width_in[fi]));
       }
       out[fi] = st->osc(st->phase_iter++);
     }

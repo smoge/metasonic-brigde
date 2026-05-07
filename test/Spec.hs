@@ -933,8 +933,13 @@ ugenKind :: UGen -> NodeKind
 ugenKind = \case
   SinOsc{}        -> KSinOsc
   SawOsc{}        -> KSawOsc
+  PulseOsc{}      -> KPulseOsc
+  TriOsc{}        -> KTriOsc
   NoiseGen        -> KNoiseGen
   LPF{}           -> KLPF
+  HPF{}           -> KHPF
+  BPF{}           -> KBPF
+  Notch{}         -> KNotch
   Gain{}          -> KGain
   Add{}           -> KAdd
   Env{}           -> KEnv
@@ -2070,10 +2075,21 @@ data Op
   = OSinOsc    Double Double
   | OSinOscMod Int Double      -- audio-rate freq from source-idx, phase
   | OSawOsc    Double Double
+  | OPulseOsc  Double Double Double
+                               -- freq, phase, width
+  | OPulseOscWMod Double Double Int
+                               -- freq, phase, audio-source-idx -> width
+                               -- (exercises the new audio-rate
+                               -- intermodulation primitive)
+  | OTriOsc    Double Double
+  | OTriOscMod Int Double      -- audio-rate freq, phase
   | ONoise
   | OGain      Int Double      -- audio source-idx, constant gain
   | OGainMod   Int Int         -- audio × audio (ring-mod shape)
   | OLPF       Int Double Double -- source-index, cutoff, q
+  | OHPF       Int Double Double -- source-index, cutoff, q
+  | OBPF       Int Double Double -- source-index, centre, q
+  | ONotch     Int Double Double -- source-index, centre, q
   | OAdd       Double Int      -- bias × audio source-idx
   | OAddMod    Int Int         -- audio + audio
   | OEnv       Int Double Double Double Double
@@ -2094,10 +2110,19 @@ genOp = oneof
   [ OSinOsc    <$> choose (50, 8000) <*> choose (0.0, 1.0)
   , OSinOscMod <$> nonNegInt         <*> choose (0.0, 1.0)
   , OSawOsc    <$> choose (50, 8000) <*> choose (0.0, 1.0)
+  , OPulseOsc  <$> choose (50, 8000) <*> choose (0.0, 1.0)
+                                     <*> choose (0.05, 0.95)
+  , OPulseOscWMod <$> choose (50, 8000) <*> choose (0.0, 1.0)
+                                     <*> nonNegInt
+  , OTriOsc    <$> choose (50, 8000) <*> choose (0.0, 1.0)
+  , OTriOscMod <$> nonNegInt         <*> choose (0.0, 1.0)
   , pure ONoise
   , OGain    <$> nonNegInt <*> choose (0.0, 1.0)
   , OGainMod <$> nonNegInt <*> nonNegInt
   , OLPF     <$> nonNegInt <*> choose (50, 8000) <*> choose (0.1, 4.0)
+  , OHPF     <$> nonNegInt <*> choose (50, 8000) <*> choose (0.1, 4.0)
+  , OBPF     <$> nonNegInt <*> choose (50, 8000) <*> choose (0.1, 4.0)
+  , ONotch   <$> nonNegInt <*> choose (50, 8000) <*> choose (0.1, 4.0)
   , OAdd     <$> choose (-1.0, 1.0) <*> nonNegInt
   , OAddMod  <$> nonNegInt <*> nonNegInt
   , OEnv     <$> nonNegInt
@@ -2195,6 +2220,28 @@ interpret = go [] S.empty
       c <- sawOsc (Param f) (Param p)
       go (xs <> [c]) r rest
 
+    go xs r (OPulseOsc f p w : rest) = do
+      c <- pulseOsc (Param f) (Param p) (Param w)
+      go (xs <> [c]) r rest
+
+    go xs r (OPulseOscWMod f p i : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let w = xs !! (i `mod` length xs)
+          c <- pulseOsc (Param f) (Param p) w
+          go (xs <> [c]) r rest
+
+    go xs r (OTriOsc f p : rest) = do
+      c <- triOsc (Param f) (Param p)
+      go (xs <> [c]) r rest
+
+    go xs r (OTriOscMod i p : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let freq = xs !! (i `mod` length xs)
+          c <- triOsc freq (Param p)
+          go (xs <> [c]) r rest
+
     go xs r (ONoise : rest) = do
       c <- noiseGen
       go (xs <> [c]) r rest
@@ -2220,6 +2267,27 @@ interpret = go [] S.empty
       | otherwise = do
           let src = xs !! (i `mod` length xs)
           c <- lpf src (Param f) (Param q)
+          go (xs <> [c]) r rest
+
+    go xs r (OHPF i f q : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let src = xs !! (i `mod` length xs)
+          c <- hpf src (Param f) (Param q)
+          go (xs <> [c]) r rest
+
+    go xs r (OBPF i f q : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let src = xs !! (i `mod` length xs)
+          c <- bpf src (Param f) (Param q)
+          go (xs <> [c]) r rest
+
+    go xs r (ONotch i f q : rest)
+      | null xs   = go xs r rest
+      | otherwise = do
+          let src = xs !! (i `mod` length xs)
+          c <- notch src (Param f) (Param q)
           go (xs <> [c]) r rest
 
     go xs r (OAdd b i : rest)

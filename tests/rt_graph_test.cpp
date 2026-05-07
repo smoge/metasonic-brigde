@@ -584,6 +584,88 @@ TEST_CASE("PulseOsc takes audio-rate width modulation (PWM) without zippering") 
     rt_graph_destroy(g);
 }
 
+TEST_CASE("PulseOsc: pathological width is sanitized — no UB, output stays bounded") {
+    // q::frac_to_phase asserts frac >= 0.0 (debug-only) and would
+    // convert NaN / -Inf / negative finite to uint32_t in release —
+    // unspecified per the C++ standard. The kernel sanitizer should
+    // clamp finite values to [0, 1] and substitute 0.5 for non-finite,
+    // so every reachable sample stays finite and within the pulse
+    // oscillator's [-1, 1] output range regardless of the control
+    // input.
+    auto run_with_bad_width = [](double bad_w) {
+        auto *g = rt_graph_create(2, kFrames);
+        REQUIRE(g != nullptr);
+
+        rt_graph_add_node(g, 0, 15);                  // PulseOsc
+        rt_graph_set_control(g, 0, 0, 440.0f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        rt_graph_set_control(g, 0, 2, bad_w);         // pathological
+
+        rt_graph_add_node(g, 1, 2);
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+
+        auto samples = render_bus0(g, kFrames);
+
+        for (auto s : samples) {
+            CHECK(std::isfinite(s));
+            CHECK(std::abs(s) <= 4.0f);  // ±1 base + polyBLEP transient
+        }
+        rt_graph_destroy(g);
+    };
+
+    // Non-finite: NaN / +/-Inf would propagate through frac_to_phase.
+    run_with_bad_width(std::numeric_limits<double>::quiet_NaN());
+    run_with_bad_width(std::numeric_limits<double>::infinity());
+    run_with_bad_width(-std::numeric_limits<double>::infinity());
+    // Negative finite: trips the debug assert; in release wraps the
+    // float→uint32_t conversion.
+    run_with_bad_width(-1.0);
+    run_with_bad_width(-1000.0);
+    // Above 1: frac_to_phase clamps internally, but we still want
+    // bounded output in the kernel as a defence-in-depth check.
+    run_with_bad_width(2.5);
+    run_with_bad_width(1e9);
+}
+
+TEST_CASE("PulseOsc: pathological audio-rate width modulator is sanitized") {
+    // Same contract for the sample-accurate path: feed a SinOsc
+    // multiplied by a huge gain so the width input contains values
+    // far outside [0, 1] (and the BLEP can drive sub-sample-accurate
+    // values into NaN if multiplied with q::pulse_osc internals
+    // without sanitisation). Verifies the inner-loop sanitiser fires.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                       // SinOsc LFO
+    rt_graph_set_control(g, 0, 0, 5.0f);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+    rt_graph_add_node(g, 1, 3);                       // Gain × 1e6
+    rt_graph_set_control(g, 1, 0, 1.0e6);
+    rt_graph_connect(g, 0, 0, 1, 0);                  // wild swings
+
+    rt_graph_add_node(g, 2, 15);                      // PulseOsc
+    rt_graph_set_control(g, 2, 0, 220.0f);
+    rt_graph_set_control(g, 2, 1, 0.0f);
+    rt_graph_connect(g, 1, 0, 2, 2);                  // bad width signal
+
+    rt_graph_add_node(g, 3, 2);
+    rt_graph_set_control(g, 3, 0, 0.0f);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    // Render multiple blocks so the width sweeps the full LFO range
+    // (and through wraparound in the *1e6-amplified signal).
+    for (int b = 0; b < 6; ++b) {
+        auto samples = render_bus0(g, kFrames);
+        for (auto s : samples) {
+            CHECK(std::isfinite(s));
+            CHECK(std::abs(s) <= 4.0f);
+        }
+    }
+
+    rt_graph_destroy(g);
+}
+
 // ----------------------------------------------------------------
 // TriOsc kernel
 // ----------------------------------------------------------------

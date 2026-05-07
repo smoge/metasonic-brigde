@@ -211,18 +211,21 @@ data NodeKind
   | KHPF
     -- ^ High-pass biquad (wraps Q's @q::highpass@). Same input
     -- shape as 'KLPF': @[signal, cutoff, q]@. cutoff in Hz,
-    -- q is the resonance. Audio-rate cutoff is the intermodulation
-    -- handle: drive it with an LFO for filter sweeps.
+    -- q is the resonance. Cutoff and q are block-latched (the
+    -- kernel reads sample 0 of each input port once per block,
+    -- mirroring 'KLPF'); for smooth audio-rate sweeps, put a
+    -- 'KSmooth' between the modulator and the cutoff input.
   | KBPF
     -- ^ Band-pass biquad (wraps Q's @q::bandpass_cpg@, the
     -- constant-peak-gain variant favoured for music). Same input
     -- shape as 'KLPF': @[signal, cutoff, q]@. q controls bandwidth
-    -- (higher q = narrower band). Audio-rate cutoff sweeps for
-    -- wah-style modulation.
+    -- (higher q = narrower band). Like 'KHPF' \/ 'KLPF', cutoff and
+    -- q are block-latched.
   | KNotch
     -- ^ Notch biquad (wraps Q's @q::notch@). Same input shape as
     -- 'KLPF': @[signal, cutoff, q]@. Useful for hum removal and
-    -- spectral notching.
+    -- spectral notching. Cutoff and q are block-latched, like the
+    -- rest of the biquad family.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 

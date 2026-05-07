@@ -676,18 +676,22 @@ triOsc :: Connection -> Connection -> SynthM Connection
 triOsc freq phase = insertNodeC "triOsc" (TriOsc freq phase)
 
 -- | High-pass biquad: signal, cutoff frequency, Q factor. Mirrors
--- 'lpf'. Audio-rate cutoff is the modulation handle.
+-- 'lpf'. Cutoff and Q are __block-latched__ — the kernel reads
+-- sample 0 of each input port once per block. For smooth audio-rate
+-- cutoff sweeps, put a 'smooth' between the modulator and the cutoff
+-- input.
 hpf :: Connection -> Connection -> Connection -> SynthM Connection
 hpf sig freq q = insertNodeC "hpf" (HPF sig freq q)
 
 -- | Band-pass biquad (constant-peak-gain): signal, centre frequency,
--- Q factor. Higher Q = narrower band. Audio-rate cutoff sweeps for
--- wah-style modulation.
+-- Q factor. Higher Q = narrower band. Cutoff and Q are
+-- __block-latched__, like 'lpf' \/ 'hpf'.
 bpf :: Connection -> Connection -> Connection -> SynthM Connection
 bpf sig freq q = insertNodeC "bpf" (BPF sig freq q)
 
 -- | Notch (band-reject) biquad: signal, centre frequency, Q factor.
--- Useful for hum removal and spectral notching.
+-- Useful for hum removal and spectral notching. Cutoff and Q are
+-- __block-latched__, like the rest of the biquad family.
 notch :: Connection -> Connection -> Connection -> SynthM Connection
 notch sig freq q = insertNodeC "notch" (Notch sig freq q)
 
