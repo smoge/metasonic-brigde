@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(tinysynth_rt STATIC
     tinysynth/rt_graph.cpp
     tinysynth/voice_allocator.cpp
+    tinysynth/midi_voice_processor.cpp
     vendor/q/q_io/src/audio_device.cpp
     vendor/q/q_io/src/audio_stream.cpp
 )
@@ -15,11 +16,17 @@ add_library(tinysynth_rt STATIC
 target_include_directories(tinysynth_rt
     PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/tinysynth
+    # q_lib/include + infra/include are PUBLIC because
+    # midi_voice_processor.h exposes q::midi_1_0::note_on /
+    # note_off types in its function signatures, and q_lib's
+    # headers transitively include infra/. Dependents
+    # (tinysynth_tests, the Haskell side via cxx-sources) need
+    # the same paths.
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q/q_lib/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/infra/include
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q/q_lib/include
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/q/q_io/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/infra/include
 )
 
 target_link_libraries(tinysynth_rt PRIVATE
@@ -59,6 +66,7 @@ if(METASONIC_BUILD_TESTS)
     add_executable(tinysynth_tests
         tests/rt_graph_test.cpp
         tests/voice_allocator_test.cpp
+        tests/midi_voice_processor_test.cpp
     )
 
     target_link_libraries(tinysynth_tests PRIVATE
