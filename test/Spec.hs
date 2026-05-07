@@ -33,7 +33,7 @@ import           Control.Exception         (try)
 import           Data.Maybe                (mapMaybe)
 import           Data.Ord                  (comparing)
 import           Data.Word                 (Word8)
-import           Foreign.C.Types           (CFloat (..))
+import           Foreign.C.Types           (CDouble (..), CFloat (..))
 import           Foreign.Marshal.Alloc     (allocaBytes)
 import           Foreign.Marshal.Array     (peekArray)
 import           Foreign.Ptr               (Ptr, castPtr)
@@ -2059,6 +2059,85 @@ crossCuttingTests = testGroup "End-to-end FFI"
       assertBool ("expected non-silent fused render, peak = " <> show peak)
                  (peak > 0.4 && peak < 0.55)
 
+  , -- Step C (f): bit-equivalence battery. For every graph in
+    -- 'fusedEquivalenceCases' the unfused render (loadRuntimeGraph
+    -- + compileRuntimeGraph) must equal the fused render
+    -- (loadRuntimeGraphFused + compileRuntimeGraphFused) sample-
+    -- for-sample. The fused path takes a different runtime route
+    -- — elided dispatch + fused-scale resolver — but the
+    -- materialisation discipline (cast double→float, multiply) is
+    -- chosen to mirror process_gain's scalar branch exactly, so
+    -- equivalence is bit-strict, not approx.
+    --
+    -- Each case must actually exercise fusion: the assertion
+    -- includes a sanity check that the fused graph produced at
+    -- least one RFused input and at least one elided node.
+    testGroup "Step C (f): fused render equals unfused render"
+      [ testCase name $ assertFusedEquivalent name graph
+      | (name, graph) <- fusedEquivalenceCases
+      ]
+
+  , -- Step C (f): control identity. A live set_control on the
+    -- elided Gain node must steer the fused output exactly as it
+    -- steers the unfused Gain's kernel. This is the load-bearing
+    -- claim that elided nodes remain control-addressable through
+    -- the FFI: NodeIndex, control slot, and control values all
+    -- survive elision.
+    testCase "Step C (f): set_control on elided Gain matches unfused output" $ do
+      let nframes = 256
+          chain = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            a <- gain o (Param 0.5)  -- initial scalar gain
+            out 0 a
+          newGain = 0.7 :: Double
+
+      rtUn <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- The elided Gain's NodeIndex must survive identically in
+      -- both graphs. compileRuntimeGraphFused preserves rgNodes
+      -- ordering (Step C (c)) so the index is the same.
+      let gainIdxFromGraph rg =
+            case [rnIndex n | n <- rgNodes rg, rnKind n == KGain] of
+              [NodeIndex i] -> i
+              other -> error $ "expected one Gain, got " <> show other
+          gainIxUn = gainIdxFromGraph rtUn
+          gainIxF  = gainIdxFromGraph rtF
+      gainIxUn @?= gainIxF
+
+      let renderWith loader rt = withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+            loader handle rt
+            -- Live control write on the (elided / dispatched) Gain.
+            -- In the fused graph the kernel never runs, but
+            -- resolve_input reads controls[0] when materialising
+            -- the FScaleFrom; in the unfused graph process_gain's
+            -- scalar branch reads the same slot. Both should
+            -- track newGain identically.
+            c_rt_graph_instance_set_control handle 0
+              (fromIntegral gainIxUn) 0 (CDouble newGain)
+            c_rt_graph_process handle (fromIntegral nframes)
+            allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+              _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                       (castPtr buf)
+              cs <- peekArray nframes (buf :: PtrCFloat)
+              pure (map (\(CFloat x) -> x) cs)
+
+      unfusedSamples <- renderWith loadRuntimeGraph      rtUn
+      fusedSamples   <- renderWith loadRuntimeGraphFused rtF
+
+      length unfusedSamples @?= length fusedSamples
+      assertBool "fused/unfused samples differ after live set_control"
+        (unfusedSamples == fusedSamples)
+      -- Sanity: the new gain actually took effect — a 440 Hz sine
+      -- at 0.7 should peak around 0.7, not at the original 0.5.
+      let peak = maximum (map abs unfusedSamples)
+      assertBool ("expected peak ≈ 0.7 after set_control, got " <> show peak)
+                 (peak > 0.6 && peak < 0.75)
+
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
       -- read is gain-attenuated and sent to hardware bus 0. We then
@@ -2642,6 +2721,90 @@ crossCuttingTests = testGroup "End-to-end FFI"
         (abs (actual - expected) < 0.05)
 
 type PtrCFloat = Ptr CFloat
+
+------------------------------------------------------------
+-- Step C (f): fused render equivalence cases + helper
+------------------------------------------------------------
+
+-- | Demo-shaped graphs that all contain at least one fusable Gain.
+-- 'assertFusedEquivalent' renders each one through the unfused and
+-- fused FFI loaders and asserts bit-for-bit sample equality. Cases
+-- that don't fuse (no scalar Gain, e.g. NoiseGen-only chains, or
+-- audio-modulated gain) are excluded — they would pass trivially
+-- because 'fuseRuntimeGraph' is a no-op on them.
+fusedEquivalenceCases :: [(String, SynthGraph)]
+fusedEquivalenceCases =
+  [ ("chain", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       a <- gain o (Param 0.5)
+       out 0 a)
+
+  , ("fanout (two scalar Gains share a SinOsc)", runSynth $ do
+       o  <- sinOsc 440.0 0.0
+       g1 <- gain o (Param 0.5)
+       g2 <- gain o (Param 0.3)
+       out 0 g1
+       out 1 g2)
+
+  , ("saw → lpf → scalar gain → out", runSynth $ do
+       s <- sawOsc 110.0 0.0
+       f <- lpf s (Param 800.0) (Param 4.0)
+       a <- gain f (Param 0.4)
+       out 0 a)
+
+  , ("ring mod (audio-mod gain stays dispatched, output gain fuses)", runSynth $ do
+       c <- sinOsc 440.0 0.0
+       m <- sinOsc 73.0  0.0
+       r <- gain c m              -- audio-modulated: no fusion (kept dispatched)
+       a <- gain r (Param 0.5)    -- scalar: fuses
+       out 0 a)
+
+  , ("fm carrier with scalar output gain", runSynth $ do
+       lfo <- sinOsc 6.0 0.0
+       dev <- gain lfo (Param 8.0)        -- scalar dev gain: fuses into carrier.freq
+       car <- sinOsc dev 0.0
+       a   <- gain car (Param 0.4)        -- scalar output gain: fuses into Out
+       out 0 a)
+  ]
+
+-- | Render @graph@ through the unfused and fused loaders and assert
+-- the two outputs are bit-identical. Also verifies that the fused
+-- compile actually triggered fusion (≥1 RFused input + ≥1 elided
+-- node) so the test isn't degenerate.
+assertFusedEquivalent :: String -> SynthGraph -> Assertion
+assertFusedEquivalent name graph = do
+  let nframes = 256
+  rtUn <- case lowerGraph graph >>= compileRuntimeGraph of
+    Right r  -> pure r
+    Left err -> assertFailure (name <> ": compile (unfused) failed: " <> err)
+                  >> error "unreachable"
+  rtF  <- case lowerGraph graph >>= compileRuntimeGraphFused of
+    Right r  -> pure r
+    Left err -> assertFailure (name <> ": compile (fused) failed: " <> err)
+                  >> error "unreachable"
+
+  assertBool (name <> ": fused compile produced no RFused inputs")
+    (not (null [() | n <- rgNodes rtF, RFused _ <- rnInputs n]))
+  assertBool (name <> ": fused compile elided no nodes")
+    (any rnElided (rgNodes rtF))
+
+  let render loader rt =
+        withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+          loader handle rt
+          c_rt_graph_process handle (fromIntegral nframes)
+          allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+            _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                     (castPtr buf)
+            cs <- peekArray nframes (buf :: PtrCFloat)
+            pure (map (\(CFloat x) -> x) cs)
+
+  unfused <- render loadRuntimeGraph      rtUn
+  fused   <- render loadRuntimeGraphFused rtF
+  assertBool (name <> ": fused render must match unfused render")
+             (unfused == fused)
+  where
+    -- Mirrors the local sizeOfFloat in crossCuttingTests' where-clause.
+    sizeOfFloat = 4 :: Int
 
 ------------------------------------------------------------
 -- Generator: well-formed SynthGraphs
