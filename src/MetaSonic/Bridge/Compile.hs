@@ -32,6 +32,9 @@ module MetaSonic.Bridge.Compile
   , NodeOutputUse (..)
   , -- * Compilation
     compileRuntimeGraph
+  , compileRuntimeGraphUnfused
+  , compileRuntimeGraphFused
+  , fuseRuntimeGraph
   , resolveNodeIndex
   , -- * Region formation
     RegionID (..)
@@ -339,15 +342,13 @@ This is the property that makes the runtime intentionally
 simple: all symbolic reasoning has been discharged before the
 FFI boundary.
 
-Currently, dense lowering operates at node granularity: each
-NodeIR becomes one RuntimeNode. When kernel fusion is
-implemented, the granularity will change — a fused region will
-become a single runtime unit, and the NodeIndex space will
-index regions (or fused kernels) rather than individual nodes.
-The runtime should not need to know whether a unit arose from
-one primitive, a fused chain, a vector loop, or a cached shared
-region. The current node-level lowering is a special case of
-this principle where every region contains exactly one node.
+Dense lowering deliberately preserves node identity: each NodeIR
+becomes one RuntimeNode, and the resulting NodeIndex remains the
+addressable key for controls, CC mappings, diagnostics, and the C ABI.
+Fusion is layered on top of that identity rather than replacing it.
+An optimized graph may mark a RuntimeNode as elided and redirect a
+consumer through an RFused input, but the elided node stays present so
+control writes to its NodeIndex keep their meaning.
 
 See Note [Dense runtime representation] for the types involved.
 -}
@@ -382,16 +383,25 @@ A RuntimeNode carries:
                      Combined with 'rnOutputUse' it forms the
                      Step-C single-edge fusion gate. See Note
                      [Output-use classification].
+  rnElided         — Step-C execution flag. The node remains in
+                     'rgNodes' and keeps its NodeIndex, but the runtime
+                     may skip its kernel because a fused consumer input
+                     now performs the same work.
 
 A RuntimeInput is either:
 
   RFrom NodeIndex PortIndex — read from the dense array
   RConst Double             — compile-time constant (was a
                               Literal in the IR)
+  RFused FusedInput          — read through an inline transform that
+                              preserves the elided node's control
+                              identity
 
-After fusion, a RuntimeNode (or its successor type) may
-correspond to an entire fused region rather than a single
-source node. The runtime does not distinguish the two cases.
+This representation is intentionally conservative: fusion reduces the
+number of kernels that execute, not the number of addressable nodes.
+That keeps 'rt_graph_instance_set_control', realtime control writes,
+and source-to-runtime diagnostics stable across fused and unfused
+graphs.
 -}
 
 -- | A runtime input reference. The first two variants are produced
@@ -793,3 +803,111 @@ compileRuntimeGraph ir = do
         Nothing -> Left $ "Missing runtime index for region member "
                        ++ show nid
         Just ix -> Right ix
+
+-- | Alias for 'compileRuntimeGraph'. Provided so callers can opt
+-- explicitly into the unfused path (today's default behaviour) and
+-- be paired with 'compileRuntimeGraphFused' at the call site.
+compileRuntimeGraphUnfused :: GraphIR -> Either String RuntimeGraph
+compileRuntimeGraphUnfused = compileRuntimeGraph
+
+-- | Compile then run the Step-C single-edge fusion rewrite.
+-- Equivalent to @'fuseRuntimeGraph' '<$>' 'compileRuntimeGraph'@.
+-- Existing audio loaders use the unfused path; tests and future
+-- fused-aware loaders call this entry point explicitly.
+compileRuntimeGraphFused :: GraphIR -> Either String RuntimeGraph
+compileRuntimeGraphFused = fmap fuseRuntimeGraph . compileRuntimeGraph
+
+{- Note [Single-edge Gain fusion]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Step-C fusion pass elides a 'KGain' node whose entire role is to
+multiply a single-consumer signal by a control-rate scalar. After
+fusion, the consumer reads the source directly through an 'RFused'
+input that applies the gain inline.
+
+A Gain @g@ qualifies for the first-pass rewrite iff:
+
+  1. @rnKind g == KGain@.
+  2. @rnOutputUse g == RegionLocal@ — its output never escapes the
+     region (Step B-Light).
+  3. @rnConsumerCount g == 1@ — a single 'FromNode' reader, so
+     destructive single-edge rewriting cannot orphan a sibling
+     consumer (Step B-Light multiplicity count).
+  4. @rnInputs g == [RFrom _ _, RConst _]@ — signal port is wired,
+     gain port is unwired (the typical @gain o (Param k)@ shape).
+     Audio-modulated gains keep the kernel because the rate
+     semantics differ.
+  5. The signal source is not itself a candidate. Chained fusion
+     (collapsing @G1 → G2 → ...@ into one fused chain) is deferred
+     to a future pass — first-pass fusion only elides one Gain at
+     a time.
+
+Identity preservation: an elided Gain remains in 'rgNodes' with
+'rnElided = True', preserving its 'NodeIndex'. Direct
+'rt_graph_instance_set_control' / realtime control writes to
+@(gainNode, ControlIndex 0)@ continue to land on
+@inst.nodes[gainNode].controls[0]@; the runtime reads that slot at
+fused-input evaluation time, exactly as 'process_gain''s
+controls-fallback branch does. No control-addressable identity
+disappears.
+
+Counter-state: 'rnConsumerCount' and 'rnOutputUse' are not
+recomputed by the rewrite. They reflect the post-compile state,
+not the post-fusion state. A future fusion pass that needs updated
+counts must rebuild them.
+-}
+
+-- | Step C: single-edge Gain fusion. Walks 'rgNodes' once, identifies
+-- fusable Gain nodes, marks them elided, and rewrites their
+-- consumers' inputs to read the producer through a fused inline
+-- transform.
+--
+-- Idempotent: a second call is a no-op because the elided Gains no
+-- longer satisfy the candidate predicate ('rnElided' is now True).
+--
+-- See Note [Single-edge Gain fusion].
+fuseRuntimeGraph :: RuntimeGraph -> RuntimeGraph
+fuseRuntimeGraph rg =
+  let nodes = rgNodes rg
+
+      -- Shape-only candidate predicate (gates 1-4). Gate 5 is
+      -- applied below over the candidate set itself.
+      isCandidate n =
+        rnKind n == KGain
+          && rnOutputUse n == RegionLocal
+          && rnConsumerCount n == 1
+          && not (rnElided n)
+          && case rnInputs n of
+               [RFrom _ _, RConst _] -> True
+               _                     -> False
+
+      candidates       = filter isCandidate nodes
+      candidateIndices = S.fromList (map rnIndex candidates)
+
+      -- Gate 5: a Gain only fuses if its signal source is NOT
+      -- itself a candidate. Survivors carry their (source, port)
+      -- mapping for the rewrite step.
+      fusable :: M.Map NodeIndex (NodeIndex, PortIndex)
+      fusable = M.fromList
+        [ (rnIndex g, (src, srcPort))
+        | g <- candidates
+        , let RFrom src srcPort : _ = rnInputs g
+        , src `S.notMember` candidateIndices
+        ]
+
+      -- Rewrite a consumer-side input: an 'RFrom gainIx _' pointing
+      -- at a fusable Gain becomes 'RFused FScaleFrom'. The original
+      -- port is always 0 (Gain has one output) so the pattern need
+      -- not inspect it.
+      rewriteInput inp = case inp of
+        RFrom gainIx _port
+          | Just (src, srcPort) <- M.lookup gainIx fusable
+          -> RFused (FScaleFrom src srcPort gainIx (ControlIndex 0))
+        _ -> inp
+
+      -- Per-node: fusable Gains become elided (inputs preserved so
+      -- structural info survives); everyone else gets their inputs
+      -- rewritten.
+      rewriteNode n
+        | M.member (rnIndex n) fusable = n { rnElided = True }
+        | otherwise = n { rnInputs = map rewriteInput (rnInputs n) }
+  in rg { rgNodes = map rewriteNode nodes }

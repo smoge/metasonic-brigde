@@ -29,6 +29,7 @@ import qualified Data.Map.Strict           as M
 import qualified Data.Set                  as S
 import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
                                             sortBy)
+import           Control.Exception         (try)
 import           Data.Maybe                (mapMaybe)
 import           Data.Ord                  (comparing)
 import           Data.Word                 (Word8)
@@ -1041,6 +1042,105 @@ unitTests = testGroup "Unit tests"
             Left err -> assertFailure $ "compile failed: " <> err
             Right rg -> all (not . rnElided) (rgNodes rg) @?= True
 
+      , -- Step C (c): chain SinOsc → Gain(Param 0.5) → Out, fused.
+        -- Expectations:
+        --   * rgNodes length is 3 (no node removed).
+        --   * Gain has rnElided = True.
+        --   * Out's input is RFused (FScaleFrom sinOsc 0 gain 0).
+        --   * SinOsc and Out keep rnElided = False.
+        -- See Note [Single-edge Gain fusion].
+        testCase "fuseRuntimeGraph: linear chain elides Gain, redirects Out" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              length (rgNodes rg) @?= 3
+              let gainNode = head [n | n <- rgNodes rg, rnKind n == KGain]
+                  sinNode  = head [n | n <- rgNodes rg, rnKind n == KSinOsc]
+                  outNode  = head [n | n <- rgNodes rg, rnKind n == KOut]
+              rnElided gainNode @?= True
+              rnElided sinNode  @?= False
+              rnElided outNode  @?= False
+              rnInputs outNode @?=
+                [ RFused (FScaleFrom (rnIndex sinNode) (PortIndex 0)
+                                     (rnIndex gainNode) (ControlIndex 0))
+                ]
+
+      , -- Audio-modulated Gain ('gain sig modSig') has rnInputs[1] as
+        -- RFrom (not RConst), so the shape gate fails and no fusion
+        -- happens. This case keeps the Gain dispatched.
+        testCase "fuseRuntimeGraph: audio-modulated Gain is left alone" $ do
+          let g = runSynth $ do
+                sig <- sinOsc 440.0 0.0
+                m   <- sinOsc 73.0  0.0
+                a   <- gain sig m
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              all (not . rnElided) (rgNodes rg) @?= True
+              -- No RFused inputs introduced.
+              null [() | n <- rgNodes rg
+                       , RFused _ <- rnInputs n
+                       ] @?= True
+
+      , -- Fan-out: SinOsc → 2× Gain → 2× Out. Each Gain has a single
+        -- consumer (its own Out), so both Gains fuse independently.
+        -- The shared SinOsc isn't a Gain candidate, so gate 5 is
+        -- satisfied for both fusions.
+        testCase "fuseRuntimeGraph: fan-out fuses both Gains independently" $ do
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                g1 <- gain o (Param 0.5)
+                g2 <- gain o (Param 0.3)
+                out 0 g1
+                out 1 g2
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let gains = [n | n <- rgNodes rg, rnKind n == KGain]
+                  outs  = [n | n <- rgNodes rg, rnKind n == KOut]
+              length gains                          @?= 2
+              all rnElided gains                    @?= True
+              -- Each Out reads through an RFused.
+              [length [() | RFused _ <- rnInputs o] | o <- outs] @?= [1, 1]
+
+      , -- Identity preservation: fusion never reorders, removes, or
+        -- renames nodes. rnOriginalID and rnIndex are unchanged
+        -- across a (compileRuntimeGraph, compileRuntimeGraphFused)
+        -- pair on the same source graph.
+        testCase "fuseRuntimeGraph preserves NodeIndex and rnOriginalID" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                out 0 a
+          case (,) <$> (lowerGraph g >>= compileRuntimeGraph)
+                   <*> (lowerGraph g >>= compileRuntimeGraphFused) of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right (unfused, fused) -> do
+              map rnIndex      (rgNodes fused)
+                @?= map rnIndex      (rgNodes unfused)
+              map rnOriginalID (rgNodes fused)
+                @?= map rnOriginalID (rgNodes unfused)
+              map rnKind       (rgNodes fused)
+                @?= map rnKind       (rgNodes unfused)
+
+      , -- Idempotence: applying the rewrite twice must equal applying
+        -- it once. Elided Gains fail the candidate predicate
+        -- (rnElided check) on the second pass, so nothing changes.
+        testCase "fuseRuntimeGraph is idempotent" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              fuseRuntimeGraph (fuseRuntimeGraph rg) @?= fuseRuntimeGraph rg
+
       , -- Step C precondition: pin Gain's compiled shape so the
         -- single-edge fusion rewrite has something stable to match
         -- against. For 'gain o (Param k)':
@@ -1846,6 +1946,34 @@ crossCuttingTests = testGroup "End-to-end FFI"
       assertBool
         ("expected bit-equivalent samples, max diff = " <> show maxDiff)
         (maxDiff < 1e-5)
+
+  , -- Step C (c) guard: feeding a fused graph through the unfused
+    -- 'loadRuntimeGraph' must fail fast with the documented error,
+    -- not miswire silently. This pins the contract until Step C (e)
+    -- adds a fused-aware loader.
+    testCase "loadRuntimeGraph rejects RFused inputs with the documented error" $ do
+      let graph = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            a <- gain o (Param 0.5)
+            out 0 a
+      rt <- case lowerGraph graph >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      -- Sanity: the fused graph really has at least one RFused.
+      assertBool "fused compile produced no RFused inputs"
+        (not (null [() | n <- rgNodes rt, RFused _ <- rnInputs n]))
+      let attempt :: IO (Either IOError ())
+          attempt = try $
+            withRTGraph (length (rgNodes rt)) 64 $ \handle ->
+              loadRuntimeGraph handle rt
+      result <- attempt
+      case result of
+        Right () ->
+          assertFailure "expected loadRuntimeGraph to fail on RFused input"
+        Left e ->
+          assertBool
+            ("error message did not mention the fused loader: " <> show e)
+            ("RFused input requires the fused loader" `isInfixOf` show e)
 
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
