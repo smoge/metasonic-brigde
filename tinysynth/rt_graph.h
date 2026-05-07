@@ -181,9 +181,10 @@ void rt_graph_template_set_node_elided(RTGraph *g, int template_id,
 //
 // Silent no-op on any invalid index (template_id, dst_node /
 // dst_port out of range, src_node / src_port likewise, or
-// scale_node / scale_control likewise). Multiple fused-scale
-// wires to the same (dst_node, dst_port) overwrite the previous;
-// the older scratch slot becomes unused but is not reclaimed.
+// scale_node / scale_control likewise). Multiple fused-input
+// wires (any of the fused-* connect entries) to the same
+// (dst_node, dst_port) overwrite the previous; the older scratch
+// slot becomes unused but is not reclaimed.
 void rt_graph_template_connect_fused_scale_input(
     RTGraph *g, int template_id,
     int dst_node, int dst_port,
@@ -216,9 +217,9 @@ void rt_graph_template_connect_fused_scale_input(
 // Validation: every scale_node / scale_control pair is checked
 // before the scratch slot is claimed. On any invalid index (or null
 // arrays / zero count), this is a silent no-op and no slot is
-// allocated. Multiple fused-scale wires (chain or single) to the
-// same (dst_node, dst_port) overwrite the previous; the older
-// scratch slot becomes unused but is not reclaimed.
+// allocated. Multiple fused-input wires (any of the fused-* connect
+// entries) to the same (dst_node, dst_port) overwrite the previous;
+// the older scratch slot becomes unused but is not reclaimed.
 //
 // Construction-only: must run before audio starts. Walks every live
 // instance of the named template to grow its scratch storage in

@@ -472,7 +472,7 @@ struct FusedAffineStep {
   ControlIndex control{};
 };
 
-struct FusedScaleRef {
+struct FusedAffineRef {
   NodeIndex source_node{};
   PortIndex source_port{};
   // Length ≥ 1. The pure-scale ABIs push only Scale-kinded steps;
@@ -685,8 +685,8 @@ struct NodeSpec {
   // input_refs whenever populated. An empty optional means "use
   // the regular input_refs[port] path"; a populated one redirects
   // the consumer's read through a scaled-source materialisation.
-  // See FusedScaleRef and Note [Fused inputs] (Compile.hs).
-  std::vector<std::optional<FusedScaleRef>> fused_inputs;
+  // See FusedAffineRef and Note [Fused inputs] (Compile.hs).
+  std::vector<std::optional<FusedAffineRef>> fused_inputs;
 
   // Step C (d): when true, process_instance skips this node's
   // kernel entirely. The node's controls and its NodeIndex remain
@@ -821,12 +821,13 @@ struct MetaDef {
   // Note [Region fallback].
   std::vector<RegionSpec> regions;
 
-  // Step C (d): running tally of how many fused-scale inputs have
-  // been registered across this template. Each call to
-  // rt_graph_template_connect_fused_scale_input claims the slot at
-  // this index and increments. GraphInstance::fused_scratch is sized
-  // to fused_input_count * max_frames at construction (or grown in
-  // lockstep when a fused input is registered after instances exist).
+  // Step C: running tally of how many fused inputs have been
+  // registered across this template, across every fused-* ABI entry
+  // (single scale, scale chain, affine). Each connect call claims
+  // the slot at this index and increments. GraphInstance::fused_scratch
+  // is sized to fused_input_count * max_frames at construction (or
+  // grown in lockstep when a fused input is registered after instances
+  // exist).
   int fused_input_count = 0;
 };
 
@@ -860,12 +861,12 @@ struct GraphInstance {
   // activity that may be silenced downstream.
   float block_sink_peak = 0.0f;
 
-  // Step C (d): one float[max_frames] buffer per registered
-  // fused-scale input. resolve_input materialises into the slot
-  // assigned in the matching FusedScaleRef, then returns a span
-  // over it. Sized at construction (make_instance) and grown in
-  // lockstep with rt_graph_template_connect_fused_scale_input;
-  // never resized in the audio callback.
+  // Step C: one float[max_frames] buffer per registered fused input
+  // (any kind — single scale, scale chain, or affine chain).
+  // resolve_input materialises into the slot assigned in the matching
+  // FusedAffineRef, then returns a span over it. Sized at
+  // construction (make_instance) and grown in lockstep with each
+  // fused-* connect ABI entry; never resized in the audio callback.
   std::vector<std::vector<float>> fused_scratch;
 };
 
@@ -1622,7 +1623,7 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
 // per-template, state is per-instance.
 //
 // Step C (d) extends the resolver with a fused-input path: when a
-// destination port carries a FusedScaleRef in dst_spec.fused_inputs
+// destination port carries a FusedAffineRef in dst_spec.fused_inputs
 // it is materialised into the consuming GraphInstance's
 // fused_scratch slot and the returned span views that scratch.
 // Mirrors process_gain's scalar-fallback discipline (cast double
@@ -1657,12 +1658,12 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
     return {};
   }
 
-  // Step C (d): fused-scale input takes precedence over the
-  // direct-port path. The override is per-(spec, port); when
-  // present, the regular input_refs[idx] is ignored.
+  // Step C: fused input takes precedence over the direct-port path.
+  // The override is per-(spec, port); when present, the regular
+  // input_refs[idx] is ignored.
   if (idx < dst_spec.fused_inputs.size()) {
     if (const auto &fopt = dst_spec.fused_inputs[idx]; fopt.has_value()) {
-      const FusedScaleRef &fr = *fopt;
+      const FusedAffineRef &fr = *fopt;
       // Validate the source node / port. Any failure returns empty
       // span, mirroring the existing "unavailable input -> caller
       // silences or falls back to control" contract.
@@ -3031,11 +3032,11 @@ static void prepare_reserved_slot(
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
     init_node_state(slot.nodes[i], def.nodes[i], g.max_frames);
   }
-  // Step C (d): a recycled Available slot may have been created
-  // before fused-scale inputs were registered on this template;
-  // its fused_scratch vector might therefore be shorter than the
-  // template's current slot count. Catch up here, before the
-  // audio callback can read it.
+  // Step C: a recycled Available slot may have been created before
+  // fused inputs were registered on this template; its fused_scratch
+  // vector might therefore be shorter than the template's current
+  // slot count. Catch up here, before the audio callback can read
+  // it.
   ensure_fused_scratch(slot, def.fused_input_count, g.max_frames);
 }
 
@@ -3249,7 +3250,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
   // regions (typically C++ tests built directly via rt_graph_add_node
   // without going through the Haskell loaders), iterate nodes flatly.
   // Step C (d): skip elided nodes — their work has been absorbed
-  // into a fused consumer input. See FusedScaleRef.
+  // into a fused consumer input. See FusedAffineRef.
   if (def->regions.empty()) {
     for (std::size_t i = 0; i < node_count; ++i) {
       if (def->nodes[i].elided) continue;
@@ -3540,15 +3541,15 @@ open_audio_stream(RTGraph &g, int requested_output_channels, int requested_devic
 // per-node state. The bus pool lives on the Server, so a new instance
 // carries no bus state of its own. Sets template_id so process_graph
 // dispatches to the right MetaDef.
-// Step C (d): grow (or reset) an instance's fused-scale scratch
-// vector so it covers every slot the template has registered.
-// Idempotent on a slot count it already covers — newly-appended
-// buffers get max_frames zeros; existing buffers keep their
-// capacity. Called from every code path that prepares a slot for
-// audio scheduling: make_instance, prepare_reserved_slot, and the
-// reuse branch of rt_graph_template_instance_add. Also called by
-// rt_graph_template_connect_fused_scale_input when registering a
-// new slot post-spawn (lockstep with each live instance).
+// Step C: grow (or reset) an instance's fused-input scratch vector
+// so it covers every slot the template has registered. Idempotent
+// on a slot count it already covers — newly-appended buffers get
+// max_frames zeros; existing buffers keep their capacity. Called
+// from every code path that prepares a slot for audio scheduling:
+// make_instance, prepare_reserved_slot, and the reuse branch of
+// rt_graph_template_instance_add. Also called by every fused-*
+// connect ABI entry when registering a new slot post-spawn
+// (lockstep with each live instance).
 //
 // The contract is parallel to the per-node init: scratch must be
 // preallocated before the audio callback can read it. Skipping
@@ -3577,10 +3578,10 @@ static GraphInstance make_instance(const MetaDef &def, int template_id, int max_
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
     init_node_state(inst.nodes[i], def.nodes[i], max_frames);
   }
-  // Step C (d): one scratch buffer per fused-scale input registered
-  // on the spec, sized to max_frames. resolve_input materialises
+  // Step C: one scratch buffer per fused input registered on the
+  // spec (any kind), sized to max_frames. resolve_input materialises
   // into these and returns a span over them; never resized in the
-  // audio callback. See FusedScaleRef and ensure_fused_scratch.
+  // audio callback. See FusedAffineRef and ensure_fused_scratch.
   ensure_fused_scratch(inst, def.fused_input_count, max_frames);
   return inst;
 }
@@ -4052,7 +4053,7 @@ void rt_graph_template_set_node_elided(
 
 // Step C (d): wire one input port through a fused scaled-source
 // form. Validates each index, claims a fresh scratch slot on the
-// MetaDef, writes the FusedScaleRef into dst_spec.fused_inputs[port],
+// MetaDef, writes the FusedAffineRef into dst_spec.fused_inputs[port],
 // and walks every live instance of the template to grow its
 // fused_scratch in lockstep — the same parallel-growth contract as
 // rt_graph_template_add_node. Multiple calls to the same
@@ -4117,7 +4118,7 @@ void rt_graph_template_connect_fused_scale_input(
   // alias them while resolving.
   const int slot = def->fused_input_count++;
 
-  FusedScaleRef ref;
+  FusedAffineRef ref;
   ref.source_node  = NodeIndex{src_node};
   ref.source_port  = PortIndex{src_port};
   ref.steps.push_back(FusedAffineStep{
@@ -4145,7 +4146,7 @@ void rt_graph_template_connect_fused_scale_input(
 // would leak the slot and wedge fused_input_count above what the
 // resolver can actually use. One slot per fused input regardless of
 // chain length; per-block resolver folds the chain into the slot in
-// source-to-sink order. See FusedScaleRef::steps and resolve_input.
+// source-to-sink order. See FusedAffineRef::steps and resolve_input.
 void rt_graph_template_connect_fused_scale_chain_input(
     RTGraph *g, int template_id,
     int dst_node, int dst_port,
@@ -4200,7 +4201,7 @@ void rt_graph_template_connect_fused_scale_chain_input(
 
   const int slot = def->fused_input_count++;
 
-  FusedScaleRef ref;
+  FusedAffineRef ref;
   ref.source_node  = NodeIndex{src_node};
   ref.source_port  = PortIndex{src_port};
   ref.steps.reserve(static_cast<std::size_t>(scale_count));
@@ -4288,7 +4289,7 @@ void rt_graph_template_connect_fused_affine_input(
 
   const int slot = def->fused_input_count++;
 
-  FusedScaleRef ref;
+  FusedAffineRef ref;
   ref.source_node = NodeIndex{src_node};
   ref.source_port = PortIndex{src_port};
   ref.steps.reserve(static_cast<std::size_t>(step_count));
@@ -4791,7 +4792,7 @@ void rt_graph_instance_set_control(
 // queue that drain_control_queue applies at the top of each
 // process_graph block. Single-producer contract: only ONE thread
 // may call this group of entries (UI / OSC / MIDI ingress all feed
-// *into* the producer thread, not the queue directly). Cooncurrent
+// *into* the producer thread, not the queue directly). Concurrent
 // calls from multiple threads will corrupt the queue.
 //
 // rt_graph_realtime_reserve does its work synchronously on the
