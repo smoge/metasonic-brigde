@@ -67,6 +67,7 @@
 #include <q/support/midi_messages.hpp>
 #include <q/support/midi_processor.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -154,12 +155,18 @@ public:
   // control_change_events / pitch_bend_events count accepted
   // dispatches; events that match channel but have no binding still
   // increment.
-  int note_on_events()         const noexcept { return note_on_events_; }
-  int note_off_events()        const noexcept { return note_off_events_; }
-  int running_status_offs()    const noexcept { return running_status_offs_; }
-  int filtered_events()        const noexcept { return filtered_events_; }
-  int control_change_events()  const noexcept { return cc_events_; }
-  int pitch_bend_events()      const noexcept { return pb_events_; }
+  //
+  // The counters are atomic with relaxed ordering so the live-MIDI
+  // demo runner (rt_midi_demo, on a worker thread) and exported
+  // diagnostic accessors (called from any thread) don't race. Relaxed
+  // is enough because no other state ordering hangs off these counters
+  // — they're pure observers.
+  int note_on_events()         const noexcept { return note_on_events_.load(std::memory_order_relaxed); }
+  int note_off_events()        const noexcept { return note_off_events_.load(std::memory_order_relaxed); }
+  int running_status_offs()    const noexcept { return running_status_offs_.load(std::memory_order_relaxed); }
+  int filtered_events()        const noexcept { return filtered_events_.load(std::memory_order_relaxed); }
+  int control_change_events()  const noexcept { return cc_events_.load(std::memory_order_relaxed); }
+  int pitch_bend_events()      const noexcept { return pb_events_.load(std::memory_order_relaxed); }
 
 private:
   bool channel_matches(std::uint8_t channel) const noexcept {
@@ -215,12 +222,16 @@ private:
 
   VoiceAllocator &alloc_;
   std::uint16_t   channel_mask_;
-  int             note_on_events_      = 0;
-  int             note_off_events_     = 0;
-  int             running_status_offs_ = 0;
-  int             filtered_events_     = 0;
-  int             cc_events_           = 0;
-  int             pb_events_           = 0;
+  // Diagnostic counters: see the public accessors above for the
+  // why-atomic rationale. Producer-thread (rt_midi_demo's worker)
+  // increments via fetch_add(.., relaxed); other threads load via
+  // .load(relaxed) through the accessors.
+  std::atomic<int> note_on_events_      {0};
+  std::atomic<int> note_off_events_     {0};
+  std::atomic<int> running_status_offs_ {0};
+  std::atomic<int> filtered_events_     {0};
+  std::atomic<int> cc_events_           {0};
+  std::atomic<int> pb_events_           {0};
 
   std::size_t             cc_mapping_count_ = 0;
   CCMapping               cc_mappings_[kMaxCCMappings];

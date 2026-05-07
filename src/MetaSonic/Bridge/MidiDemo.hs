@@ -225,7 +225,12 @@ toCPitchBendBinding pb = CPitchBendBinding
 -- Foreign imports
 -- ---------------------------------------------------------------------------
 
-foreign import ccall unsafe "rt_midi_demo_open"
+-- 'safe' (rather than 'unsafe') because rt_midi_demo_open allocates,
+-- spawns a worker thread, and probes MIDI devices via Q/PortMIDI —
+-- all of which can block briefly on syscalls. 'unsafe' would stall
+-- the Haskell scheduler. The trivial counter / has_device accessors
+-- below stay 'unsafe' since they're a single atomic load each.
+foreign import ccall safe "rt_midi_demo_open"
   c_rt_midi_demo_open
     :: Ptr RTGraph
     -> CInt                         -- template_id
@@ -237,7 +242,10 @@ foreign import ccall unsafe "rt_midi_demo_open"
     -> CUShort                      -- channel_mask
     -> IO (Ptr CMidiDemo)
 
-foreign import ccall unsafe "rt_midi_demo_close"
+-- 'safe' because rt_midi_demo_close joins the worker thread (which
+-- may sleep up to ~1 ms before observing the stop flag) and tears
+-- down the MIDI input stream.
+foreign import ccall safe "rt_midi_demo_close"
   c_rt_midi_demo_close :: Ptr CMidiDemo -> IO ()
 
 foreign import ccall unsafe "rt_midi_demo_note_on_count"

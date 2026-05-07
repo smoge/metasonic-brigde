@@ -11,11 +11,13 @@
 
 #include <q/support/midi_processor.hpp>
 #include <q/support/pitch.hpp>
+#include <q_io/midi_device.hpp>
 #include <q_io/midi_stream.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <new>
+#include <optional>
 #include <thread>
 
 namespace {
@@ -65,7 +67,15 @@ struct rt_midi_demo {
   rt_midi_voice_mapping             voice_mapping;
   metasonic::VoiceAllocator         alloc;
   metasonic::MidiVoiceProcessor     proc;
-  cycfi::q::midi_input_stream       stream;
+  // Held in std::optional and only emplaced when q::midi_device::list()
+  // reports at least one device. On hosts without /dev/snd/seq access
+  // (no ALSA seq, sandboxed CI, headless Docker), Q's
+  // q::midi_input_stream() default-ctor calls Pm_OpenInput on device 0
+  // unconditionally, prints "open /dev/snd/seq failed", and the dtor's
+  // Pm_Close(nullptr) can crash on some PortMIDI builds. Keeping the
+  // stream optional means we never construct it (and never run its
+  // dtor) on no-device hosts.
+  std::optional<cycfi::q::midi_input_stream> stream;
   std::atomic<bool>                 stop;
   std::atomic<int>                  has_device;  // 0 / 1, set by worker
   std::thread                       worker;
@@ -77,21 +87,36 @@ struct rt_midi_demo {
       voice_mapping(mapping),
       alloc(g, tid, polyphony, &default_voice_map, &voice_mapping),
       proc(alloc, channel_mask),
-      stream(),
+      stream(std::nullopt),
       stop(false),
       has_device(0) {}
 
   void run() noexcept {
-    // Snapshot the device state once. is_valid() reflects whether
-    // PortMIDI opened a stream successfully; on no-device boxes
-    // process()/next() are no-ops, so the loop is harmless either
-    // way, but recording it lets callers diagnose "did MIDI come
-    // up?" without their own probe.
-    has_device.store(stream.is_valid() ? 1 : 0, std::memory_order_release);
+    // Probe device availability before constructing the stream.
+    // q::midi_device::list() calls Pm_Initialize and Pm_CountDevices,
+    // both of which return error codes rather than crashing on hosts
+    // that lack ALSA seq access. Only emplace the stream if at least
+    // one device is reported AND construction succeeds with
+    // is_valid() == true; otherwise the worker idles.
+    bool ok = false;
+    try {
+      if (!cycfi::q::midi_device::list().empty()) {
+        stream.emplace();
+        ok = stream->is_valid();
+        if (!ok) stream.reset();  // skip the Pm_Close(nullptr) dtor path
+      }
+    } catch (...) {
+      // PortMIDI / ALSA enumeration failed catastrophically; stay idle.
+      stream.reset();
+      ok = false;
+    }
+    has_device.store(ok ? 1 : 0, std::memory_order_release);
 
     while (!stop.load(std::memory_order_acquire)) {
-      for (int i = 0; i < kEventsPerPass; ++i) {
-        stream.process(proc);
+      if (stream) {
+        for (int i = 0; i < kEventsPerPass; ++i) {
+          stream->process(proc);
+        }
       }
       proc.tick();
       std::this_thread::sleep_for(kWorkerSleep);
@@ -114,12 +139,13 @@ rt_midi_demo_open(RTGraph                            *graph,
   if (!graph || !voice_mapping) return nullptr;
 
   // Q's set_default_device is a static module-level setting consulted
-  // by the next midi_input_stream() default-ctor invocation. We honour
-  // -1 by leaving it at whatever the previous setting was (initial
-  // value is 0 = first device).
-  if (midi_device_index >= 0) {
-    cycfi::q::midi_input_stream::set_default_device(midi_device_index);
-  }
+  // by the next midi_input_stream() default-ctor invocation. The
+  // initial value (before any set_default_device call in this process)
+  // is 0 = first enumerated device. To keep -1 idempotent regardless
+  // of earlier opens that may have left a non-zero default behind, we
+  // explicitly reset to 0 on -1; otherwise honour the requested index.
+  cycfi::q::midi_input_stream::set_default_device(
+      midi_device_index >= 0 ? midi_device_index : 0);
 
   rt_midi_demo *h = nullptr;
   try {

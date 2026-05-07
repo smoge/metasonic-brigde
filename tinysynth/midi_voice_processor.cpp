@@ -24,38 +24,38 @@ MidiVoiceProcessor::MidiVoiceProcessor(VoiceAllocator &alloc,
 
 void MidiVoiceProcessor::operator()(midi::note_on msg, std::size_t /*time*/) {
   if (!channel_matches(msg.channel())) {
-    ++filtered_events_;
+    filtered_events_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
 
   if (msg.velocity() == 0) {
     // Running-status convention: note_on(vel=0) == note_off.
-    ++running_status_offs_;
-    ++note_off_events_;
+    running_status_offs_.fetch_add(1, std::memory_order_relaxed);
+    note_off_events_.fetch_add(1, std::memory_order_relaxed);
     alloc_.note_off(static_cast<int>(msg.key()));
     return;
   }
 
-  ++note_on_events_;
+  note_on_events_.fetch_add(1, std::memory_order_relaxed);
   const float velocity = static_cast<float>(msg.velocity()) / 127.0f;
   alloc_.note_on(static_cast<int>(msg.key()), velocity);
 }
 
 void MidiVoiceProcessor::operator()(midi::note_off msg, std::size_t /*time*/) {
   if (!channel_matches(msg.channel())) {
-    ++filtered_events_;
+    filtered_events_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  ++note_off_events_;
+  note_off_events_.fetch_add(1, std::memory_order_relaxed);
   alloc_.note_off(static_cast<int>(msg.key()));
 }
 
 void MidiVoiceProcessor::operator()(midi::control_change msg, std::size_t /*time*/) {
   if (!channel_matches(msg.channel())) {
-    ++filtered_events_;
+    filtered_events_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  ++cc_events_;
+  cc_events_.fetch_add(1, std::memory_order_relaxed);
 
   // Walk the table once. Multiple mappings may target the same CC
   // number — they all fire in registration order.
@@ -97,10 +97,10 @@ void MidiVoiceProcessor::operator()(midi::control_change msg, std::size_t /*time
 
 void MidiVoiceProcessor::operator()(midi::pitch_bend msg, std::size_t /*time*/) {
   if (!channel_matches(msg.channel())) {
-    ++filtered_events_;
+    filtered_events_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  ++pb_events_;
+  pb_events_.fetch_add(1, std::memory_order_relaxed);
   if (!pitch_bend_bound_) return;
 
   // Cache the raw 14-bit value so a stolen / pending-steal voice
