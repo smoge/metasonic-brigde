@@ -954,12 +954,8 @@ unitTests = testGroup "Unit tests"
                 _   -> assertFailure "unreachable: length checked above"
 
       , -- Step B-Light: pinned output-use counts on a known graph.
-        -- Linear chain SinOsc → Gain → Out: the SinOsc output flows
-        -- only into the Gain (same region), the Gain output flows only
-        -- into the Out (same region), Out is a sink. Expect:
-        --   NoOutput      = 1  (the Out)
-        --   RegionLocal   = 2  (SinOsc, Gain)
-        --   RegionEscapes = 0
+        -- Linear chain SinOsc → Gain → Out: each transform has
+        -- exactly one consumer; Out is a sink with no consumers.
         -- See Note [Output-use classification] in MetaSonic.Bridge.Compile.
         testCase "rnOutputUse on a linear SinOsc → Gain → Out chain" $ do
           let g = runSynth $ do
@@ -973,6 +969,41 @@ unitTests = testGroup "Unit tests"
               length [() | NoOutput      <- uses] @?= 1
               length [() | RegionLocal   <- uses] @?= 2
               length [() | RegionEscapes <- uses] @?= 0
+              -- Step-C single-edge fusion gate: every transform has
+              -- exactly one consumer; the Out sink has zero.
+              [ rnConsumerCount n
+                | n <- rgNodes rg, rnKind n /= KOut
+                ] @?= [1, 1]
+              [ rnConsumerCount n
+                | n <- rgNodes rg, rnKind n == KOut
+                ] @?= [0]
+
+      , -- Fan-out: a single SinOsc feeds two Gains. Both Gains are
+        -- still RegionLocal (no cross-region escape) but the SinOsc's
+        -- rnConsumerCount is 2, so it fails the destructive single-
+        -- edge fusion gate. This is the case the gate is designed to
+        -- catch — without it, fusion would clobber one Gain by
+        -- inlining into the other.
+        testCase "rnConsumerCount on SinOsc with fan-out to two Gains" $ do
+          let g = runSynth $ do
+                o  <- sinOsc 440.0 0.0
+                g1 <- gain o (Param 0.5)
+                g2 <- gain o (Param 0.3)
+                out 0 g1
+                out 1 g2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let uses = map rnOutputUse (rgNodes rg)
+              length [() | NoOutput      <- uses] @?= 2
+              length [() | RegionLocal   <- uses] @?= 3
+              length [() | RegionEscapes <- uses] @?= 0
+              [ rnConsumerCount n
+                | n <- rgNodes rg, rnKind n == KSinOsc
+                ] @?= [2]
+              [ rnConsumerCount n
+                | n <- rgNodes rg, rnKind n == KGain
+                ] @?= [1, 1]
 
       , -- Bus routing keeps every transform RegionLocal too: BusOut
         -- and Out are NoOutput sinks; SinOsc's output is consumed by
@@ -1162,6 +1193,9 @@ properties = testGroup "Properties"
 
   , QC.testProperty "rnOutputUse classification matches consumer-region membership" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propOutputUseConsistent
+
+  , QC.testProperty "rnConsumerCount matches direct FromNode references" $
+      forAllShrink genWellFormedGraph shrinkSynthGraph propConsumerCountConsistent
 
   , QC.testProperty "every BusOut precedes every same-bus BusIn in the schedule" $
       forAllShrink genWellFormedGraph shrinkSynthGraph propBusOrdering
@@ -1593,6 +1627,32 @@ propOutputUseConsistent g = case lowerGraph g of
                   <> "): rnOutputUse = " <> show (rnOutputUse n)
                   <> ", expected " <> show (expected n))
                (rnOutputUse n === expected n)
+           | n <- rgNodes rg
+           ]
+
+-- | 'rnConsumerCount' equals the number of direct 'FromNode'
+-- references to this node across 'rgNodes'. The crisp Step-C
+-- single-edge fusion predicate (rnOutputUse == RegionLocal &&
+-- rnConsumerCount == 1) only works if this count is honest.
+propConsumerCountConsistent :: SynthGraph -> Property
+propConsumerCountConsistent g = case lowerGraph g of
+  Left err -> counterexample ("lowerGraph failed: " <> err) False
+  Right ir -> case compileRuntimeGraph ir of
+    Left err -> counterexample ("compileRuntimeGraph failed: " <> err) False
+    Right rg ->
+      let countFor ix =
+            length
+              [ ()
+              | c <- rgNodes rg
+              , RFrom src _ <- rnInputs c
+              , src == ix
+              ]
+      in conjoin
+           [ counterexample
+               (show (rnIndex n) <> ": rnConsumerCount = "
+                  <> show (rnConsumerCount n)
+                  <> ", direct count = " <> show (countFor (rnIndex n)))
+               (rnConsumerCount n === countFor (rnIndex n))
            | n <- rgNodes rg
            ]
 

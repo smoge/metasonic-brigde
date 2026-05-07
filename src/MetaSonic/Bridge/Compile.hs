@@ -418,6 +418,19 @@ data RuntimeNode = RuntimeNode
     -- 'compileRuntimeGraph' from the consumer set after regions
     -- are formed; pure analysis, never crosses the FFI.
     -- See Note [Output-use classification].
+  , rnConsumerCount :: !Int
+    -- ^ Number of direct 'FromNode' consumers across 'rgNodes'.
+    -- 'RegionLocal' is a *gate* for fusion (no cross-region
+    -- escape), not a *license* — destructive single-edge fusion
+    -- additionally needs to know there is exactly one consumer.
+    -- Step C's first-pass predicate is therefore
+    --
+    -- > rnOutputUse == RegionLocal && rnConsumerCount == 1
+    --
+    -- Fan-out cases ('rnConsumerCount > 1') stay correct as
+    -- 'RegionLocal' but are ineligible for narrow single-edge
+    -- rewriting; whole-region fusion can pick them up later.
+    -- See Note [Output-use classification].
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -627,7 +640,10 @@ compileRuntimeGraph ir = do
             allLocal  = all (\c -> M.lookup c nodeRegion == myRegion) consumers
         in if allLocal then RegionLocal else RegionEscapes
 
-  rtNodes <- mapM (compileNode indexMap classify) (zip [0..] irNodes)
+      consumerCount :: NodeIndex -> Int
+      consumerCount ix = length (M.findWithDefault [] ix consumerMap)
+
+  rtNodes <- mapM (compileNode indexMap classify consumerCount) (zip [0..] irNodes)
 
   pure $! RuntimeGraph rtNodes rtRegions
 
@@ -635,19 +651,21 @@ compileRuntimeGraph ir = do
     compileNode
       :: M.Map NodeID NodeIndex
       -> (NodeIndex -> NodeKind -> NodeOutputUse)
+      -> (NodeIndex -> Int)
       -> (Int, NodeIR)
       -> Either String RuntimeNode
-    compileNode indexMap classify (i, node) = do
+    compileNode indexMap classify consumerCount (i, node) = do
       inputs <- mapM (compileInput indexMap) (irInputs node)
       let !ix   = NodeIndex i
           !kind = irKind node
       pure $! RuntimeNode
-        { rnIndex      = ix
-        , rnOriginalID = irNodeID node
-        , rnKind       = kind
-        , rnInputs     = inputs
-        , rnControls   = irControls node
-        , rnOutputUse  = classify ix kind
+        { rnIndex         = ix
+        , rnOriginalID    = irNodeID node
+        , rnKind          = kind
+        , rnInputs        = inputs
+        , rnControls      = irControls node
+        , rnOutputUse     = classify ix kind
+        , rnConsumerCount = consumerCount ix
         }
 
     -- Rewrite a symbolic InputConn to a dense RuntimeInput.
