@@ -268,13 +268,16 @@ void rt_graph_instance_remove(RTGraph *g, int instance_id);
 void rt_graph_instance_release(RTGraph *g, int instance_id);
 
 // [T:read-only] Returns the lifecycle status of an instance:
-//   0  = Live (default after add; the steady-state of a sounding voice)
+//   0  = Live (Active; the steady-state of a sounding voice)
 //   1  = Releasing (release requested, awaiting silence)
-//  -1  = no such instance (dead slot, out of range, or null graph)
+//  -1  = no such instance (free slot, slot reserved by a producer
+//        but not yet activated, out of range, or null graph)
 //
-// "Dead" is reported as -1 (same as out-of-range), not as a separate
-// positive value, because a freed slot is observationally identical to
-// a slot that never existed. Use rt_graph_instance_alive when the
+// Both freed and Reserved slots return -1: a freed slot is
+// observationally identical to a slot that never existed, and a
+// Reserved slot is the producer's private claim (under the Phase-3
+// realtime queue) that has not yet been published to the audio
+// schedule via Activate. Use rt_graph_instance_alive when the
 // distinction the caller cares about is liveness rather than status.
 int rt_graph_instance_status(RTGraph *g, int instance_id);
 
@@ -282,10 +285,11 @@ int rt_graph_instance_status(RTGraph *g, int instance_id);
 // 0..count-1 to enumerate; check liveness with rt_graph_instance_alive.
 int rt_graph_instance_count(RTGraph *g);
 
-// [T:read-only] 1 if the slot holds a live instance, 0 otherwise
-// (dead slot, out of range, or null graph). May race with the §2.E
-// auto-free path; treat the result as a hint, not a synchronization
-// barrier.
+// [T:read-only] 1 if the slot is part of the audio schedule (Active
+// or Releasing), 0 otherwise (free, reserved-but-not-activated, out
+// of range, or null graph). May race with the §2.E auto-free path
+// and the Phase-3 realtime queue; treat the result as a hint, not a
+// synchronization barrier.
 int rt_graph_instance_alive(RTGraph *g, int instance_id);
 
 // [T:control] Per-instance variant of rt_graph_set_control.

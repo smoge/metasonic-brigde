@@ -84,21 +84,128 @@ constexpr int   kReleaseSilenceBlocks    = 8;
 // Lifecycle state of a pool slot. After A.1 the instance pool is a
 // std::vector<GraphInstance> of caller-declared size, not a vector of
 // std::optional. Slot liveness is now a SlotState enum on the
-// GraphInstance itself: Available means the slot is free for reuse;
-// Active and Releasing mean the slot holds a running voice (matching
-// the pre-A.1 InstanceStatus::Live and Releasing).
+// GraphInstance itself; the audio thread reads it under acquire
+// ordering and processes only Active and Releasing slots.
 //
-// The integer values mirror the C ABI for rt_graph_instance_status:
-// Active = 0, Releasing = 1, Available = -1 (the same value the ABI
-// returns for "no such instance"). casting SlotState directly to int
-// gives the right ABI behaviour for any valid slot. Do not renumber.
+// State transitions:
 //
-// See Note [§2.E: release-then-free instance lifecycle] and
-// Note [Pool model] (this file).
+//   Available -- CAS (producer, queued path) -----> Reserved
+//   Reserved  -- store (audio drain, Activate) ---> Active
+//   Active    -- store (release ABI / drain) -----> Releasing
+//   Releasing -- store (audio §2.E silence) ------> Available
+//   Active    -- store (remove ABI / drain) ------> Available
+//   Available -- store (construction-path spawn) -> Active
+//
+// The "construction-path" transition (Available → Active in one step,
+// without going through Reserved) is reserved for offline /
+// stopped-audio callers — rt_graph_template_instance_add and the
+// auto-instance-0 setup. The queued realtime path always takes the
+// Available → Reserved → Active route because preparation (resize
+// nodes, init kernel state, set defaults) must happen *before* the
+// audio thread sees the slot, and that work is performed by the
+// producer while the slot is Reserved.
+//
+// ABI mapping for rt_graph_instance_status:
+//   Active    -> 0   (caller-visible "Live")
+//   Releasing -> 1
+//   Available -> -1  (slot is free)
+//   Reserved  -> -1  (claimed by producer; not yet visible to other callers)
+//
+// The integer values for Active and Releasing match the C ABI return
+// codes for those states. Available retains -1 (matches the ABI's
+// "no such instance" return). Reserved's integer value (2) is
+// internal only — _instance_status translates it to -1 because a
+// caller that does not own the reservation has no business seeing
+// it. Do not renumber Active or Releasing without auditing
+// rt_graph_instance_status.
+//
+// See Note [§2.E: release-then-free instance lifecycle], Note [Pool
+// model], and (when it lands) Note [A.2: realtime control queue].
 enum class SlotState : int {
-  Available = -1,  // free; reusable by the next _instance_add
+  Available = -1,  // free; reusable by any spawn path
   Active    = 0,   // running, gate-on / sustaining (was Live)
   Releasing = 1,   // release requested, awaiting silence
+  Reserved  = 2,   // CAS-claimed by producer; preparation in progress, audio thread skips
+};
+
+// Wrapper that exposes a SlotState surface but stores the underlying
+// value as std::atomic<int>. The int storage avoids portability
+// traps around enum atomics (lock-freedom, ABI of <atomic>); callers
+// stay in SlotState terms.
+//
+// Move/copy constructible via *non-atomic* relaxed load/store. This
+// is required because std::atomic<T> itself is neither, but
+// std::vector<GraphInstance> (the slot pool) needs its element type
+// to be moveable for the rare growth path — push_back during
+// construction can reallocate the vector and move existing elements.
+// The non-atomic move/copy is sound because vector growth is
+// single-threaded by contract:
+//
+//   * during graph construction the audio thread does not exist yet
+//     (no rt_graph_start_audio has run), so no other thread observes
+//     the slot;
+//   * during audio operation the pool size is stable (the realtime
+//     queue path never grows the vector — it only flips state on
+//     pre-allocated slots), so the move/copy paths never execute.
+//
+// All real synchronization between producer and audio thread goes
+// through load / store / compare_exchange_strong, which use atomic
+// operations on the underlying int.
+//
+// Default memory orders: load is acquire, store is release. CAS
+// callers pass success / failure orders explicitly (the canonical
+// claim is acquire on success / relaxed on failure for spin-with-
+// no-spurious-load-on-failure).
+struct AtomicSlotState {
+  std::atomic<int> value{static_cast<int>(SlotState::Available)};
+
+  AtomicSlotState() = default;
+
+  // explicit: prevents the implicit-conversion-then-operator=
+  // relaxed-store path. Writers must call store() (or
+  // compare_exchange_strong) directly, which uses release ordering by
+  // default and makes the synchronization point visible at the call
+  // site rather than hidden inside an assignment.
+  explicit AtomicSlotState(SlotState s) noexcept
+      : value(static_cast<int>(s)) {}
+
+  AtomicSlotState(const AtomicSlotState &o) noexcept {
+    value.store(static_cast<int>(o.load(std::memory_order_relaxed)),
+                std::memory_order_relaxed);
+  }
+
+  AtomicSlotState(AtomicSlotState &&o) noexcept {
+    value.store(static_cast<int>(o.load(std::memory_order_relaxed)),
+                std::memory_order_relaxed);
+  }
+
+  AtomicSlotState &operator=(const AtomicSlotState &o) noexcept {
+    store(o.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return *this;
+  }
+
+  AtomicSlotState &operator=(AtomicSlotState &&o) noexcept {
+    store(o.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return *this;
+  }
+
+  SlotState load(std::memory_order order = std::memory_order_acquire) const noexcept {
+    return static_cast<SlotState>(value.load(order));
+  }
+
+  void store(SlotState s, std::memory_order order = std::memory_order_release) noexcept {
+    value.store(static_cast<int>(s), order);
+  }
+
+  bool compare_exchange_strong(SlotState &expected, SlotState desired,
+                                std::memory_order success_order,
+                                std::memory_order failure_order) noexcept {
+    int expected_int = static_cast<int>(expected);
+    const bool ok = value.compare_exchange_strong(
+        expected_int, static_cast<int>(desired), success_order, failure_order);
+    if (!ok) expected = static_cast<SlotState>(expected_int);
+    return ok;
+  }
 };
 
 // Default per-template polyphony cap when the caller does not call
@@ -498,15 +605,13 @@ struct GraphInstance {
 
   std::vector<NodeInstanceState> nodes;
 
-  // Slot lifecycle state. Default-constructed slots are Available
-  // (free). rt_graph_template_instance_add transitions Available →
-  // Active; rt_graph_instance_release transitions Active → Releasing;
-  // the §2.E auto-free path in process_graph transitions Releasing →
-  // Available once the slot has been silent
-  // (peak < kReleaseSilenceThreshold) for kReleaseSilenceBlocks
-  // consecutive blocks. See Note [§2.E: release-then-free instance
-  // lifecycle] and Note [Pool model].
-  SlotState state = SlotState::Available;
+  // Slot lifecycle state. Atomic so the producer (Phase-3 control
+  // queue) and the audio thread can synchronize safely via CAS and
+  // acquire / release stores. See AtomicSlotState above for the
+  // wrapper, the SlotState comment for the state machine, and
+  // Note [§2.E: release-then-free instance lifecycle] / Note [Pool
+  // model] for the lifecycle and pool design.
+  AtomicSlotState state;
 
   // Consecutive blocks (while Releasing) the instance has produced a
   // peak below kReleaseSilenceThreshold. Reset to 0 every time the
@@ -973,7 +1078,7 @@ instance_at(RTGraph &g, int instance_id) noexcept {
   if (instance_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g.instances.size()) return nullptr;
-  if (g.instances[idx].state == SlotState::Available) return nullptr;
+  if (g.instances[idx].state.load() == SlotState::Available) return nullptr;
   return &g.instances[idx];
 }
 
@@ -982,7 +1087,7 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
   if (instance_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g.instances.size()) return nullptr;
-  if (g.instances[idx].state == SlotState::Available) return nullptr;
+  if (g.instances[idx].state.load() == SlotState::Available) return nullptr;
   return &g.instances[idx];
 }
 
@@ -1071,7 +1176,7 @@ static void ensure_node_slot(RTGraph &g, int template_id, NodeIndex node_index) 
     def->nodes.resize(idx + 1);
   }
   for (auto &inst : g.instances) {
-    if (inst.state == SlotState::Available) continue;
+    if (inst.state.load() == SlotState::Available) continue;
     if (inst.template_id != template_id) continue;
     if (inst.nodes.size() <= idx) {
       inst.nodes.resize(idx + 1);
@@ -1876,7 +1981,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   for (std::size_t tid = 0; tid < template_count; ++tid) {
     const int tid_i = static_cast<int>(tid);
     for (auto &inst : g.instances) {
-      if (inst.state == SlotState::Available) continue;
+      if (inst.state.load() == SlotState::Available) continue;
       if (inst.template_id != tid_i) continue;
       process_instance(g, inst, nframes);
 
@@ -1889,10 +1994,10 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       // slots bypass this entirely; the field is consulted only when
       // state == Releasing. See Note [§2.E: release-then-free instance
       // lifecycle].
-      if (inst.state == SlotState::Releasing) {
+      if (inst.state.load() == SlotState::Releasing) {
         if (inst.block_sink_peak < kReleaseSilenceThreshold) {
           if (++inst.silent_blocks >= kReleaseSilenceBlocks) {
-            inst.state = SlotState::Available;
+            inst.state.store(SlotState::Available);
           }
         } else {
           inst.silent_blocks = 0;
@@ -2118,7 +2223,7 @@ static void reset_to_default_state(RTGraph &g) {
   // moment the handle is constructed.
   GraphInstance inst;
   inst.template_id = 0;
-  inst.state = SlotState::Active;
+  inst.state.store(SlotState::Active);
   if (g.capacity > 0) {
     inst.nodes.reserve(static_cast<std::size_t>(g.capacity));
   }
@@ -2131,10 +2236,12 @@ A.1 replaces the pre-existing instance representation
 (std::vector<std::optional<GraphInstance>>, with reset() acting as
 "free this slot" by destructing the GraphInstance and its kernel
 state) with a fixed-shape pool: std::vector<GraphInstance> where
-each slot carries a SlotState (Available / Active / Releasing).
-A "dead" slot is one whose state is Available; the GraphInstance
-object stays in place, retaining its node-state vector capacity for
-the next reuse.
+each slot carries an atomic SlotState (Available / Reserved /
+Active / Releasing). A "dead" slot is one whose state is Available;
+the GraphInstance object stays in place, retaining its node-state
+vector capacity for the next reuse. Reserved is the producer-claim
+state used by the Phase-3 realtime queue (A.2) — see that Note for
+the producer-side reserve/prepare/activate flow.
 
 Why the change:
 
@@ -2176,10 +2283,11 @@ control queue tomorrow), never in the audio callback.
 Slot identity: the C ABI's instance_id is the slot index in
 g.instances. instance_count returns g.instances.size() — under the
 pool model that's the slot-pool size, not a high-water-mark of
-ever-used indices. instance_alive returns 1 iff state != Available.
-instance_status casts state to int (Available = -1, Active = 0,
-Releasing = 1), matching the C ABI codes for "no such instance",
-"Live", and "Releasing" respectively.
+ever-used indices. instance_alive returns 1 iff state is Active or
+Releasing (Reserved slots are not yet schedulable, so they read as
+not alive). instance_status returns 0 for Active, 1 for Releasing,
+and -1 for both Available and Reserved (a caller that did not
+perform the reservation has no business observing it).
 
 The auto-created template 0 + instance 0 (rt_graph_create /
 rt_graph_clear) keeps the legacy single-template ABI working: the
@@ -2361,7 +2469,7 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
   ensure_node_slot(*g, template_id, idx);
   configure_spec(def->nodes[to_size(idx)], kind);
   for (auto &inst : g->instances) {
-    if (inst.state == SlotState::Available) continue;
+    if (inst.state.load() == SlotState::Available) continue;
     if (inst.template_id != template_id) continue;
     init_node_state(
         inst.nodes[to_size(idx)],
@@ -2490,7 +2598,7 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
   std::size_t free_slot = g->instances.size();  // sentinel: no slot found
   for (std::size_t i = 0; i < g->instances.size(); ++i) {
     auto &s = g->instances[i];
-    if (s.state == SlotState::Available) {
+    if (s.state.load() == SlotState::Available) {
       if (free_slot == g->instances.size()) free_slot = i;
     } else if (s.template_id == template_id) {
       ++live_count;
@@ -2510,13 +2618,13 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
     for (std::size_t i = 0; i < def->nodes.size(); ++i) {
       init_node_state(slot.nodes[i], def->nodes[i], g->max_frames);
     }
-    slot.state = SlotState::Active;
+    slot.state.store(SlotState::Active);
     return static_cast<int>(free_slot);
   }
 
   // No free slot — grow the pool by one. Construction-only path.
   GraphInstance inst = make_instance(*def, template_id, g->max_frames);
-  inst.state = SlotState::Active;
+  inst.state.store(SlotState::Active);
   g->instances.push_back(std::move(inst));
   return static_cast<int>(g->instances.size() - 1);
 }
@@ -2736,7 +2844,7 @@ void rt_graph_instance_remove(RTGraph *g, int instance_id) {
   // Hard-free path under A.1: flip the slot to Available; preserve
   // the GraphInstance object and its node-state vector capacity for
   // the next reuse. No allocation, no destruction.
-  g->instances[idx].state = SlotState::Available;
+  g->instances[idx].state.store(SlotState::Available);
 }
 
 /* Note [§2.E: release-then-free instance lifecycle]
@@ -2810,13 +2918,13 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
   if (instance_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return;
-  if (g->instances[idx].state == SlotState::Available) return;
+  if (g->instances[idx].state.load() == SlotState::Available) return;
 
   GraphInstance &inst = g->instances[idx];
   const MetaDef *def = template_at(*g, inst.template_id);
   if (!def) {
     // Defensive: template gone — nothing sensible to do but free.
-    inst.state = SlotState::Available;
+    inst.state.store(SlotState::Available);
     return;
   }
 
@@ -2841,11 +2949,11 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
 
   if (!has_env) {
     // Nothing to release — fall back to hard-free. See Note above.
-    inst.state = SlotState::Available;
+    inst.state.store(SlotState::Available);
     return;
   }
 
-  inst.state = SlotState::Releasing;
+  inst.state.store(SlotState::Releasing);
   inst.silent_blocks = 0;
   // block_sink_peak is reset by process_instance at the top of each
   // block; no need to touch it here.
@@ -2856,9 +2964,15 @@ int rt_graph_instance_status(RTGraph *g, int instance_id) {
   if (instance_id < 0) return -1;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return -1;
-  // Cast directly: SlotState's int values are the C ABI return codes
-  // (Available = -1, Active = 0, Releasing = 1).
-  return static_cast<int>(g->instances[idx].state);
+  // Active and Releasing have ABI-stable integer values (0 and 1);
+  // Available and Reserved both surface as -1 to external callers.
+  // Reserved is the producer's claim and is not visible through this
+  // entry — a caller that did not perform the reservation has no
+  // business observing it as "live". See SlotState comment.
+  const SlotState s = g->instances[idx].state.load();
+  if (s == SlotState::Active)    return 0;
+  if (s == SlotState::Releasing) return 1;
+  return -1;
 }
 
 int rt_graph_instance_count(RTGraph *g) {
@@ -2875,7 +2989,12 @@ int rt_graph_instance_alive(RTGraph *g, int instance_id) {
   if (instance_id < 0) return 0;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
   if (idx >= g->instances.size()) return 0;
-  return g->instances[idx].state != SlotState::Available ? 1 : 0;
+  // Alive iff the slot is part of the audio schedule. Reserved slots
+  // (claimed by a producer but not yet activated) are not yet
+  // schedulable, so they read as not alive — same as Available. See
+  // SlotState comment for the full state machine.
+  const SlotState s = g->instances[idx].state.load();
+  return (s == SlotState::Active || s == SlotState::Releasing) ? 1 : 0;
 }
 
 void rt_graph_instance_set_control(
