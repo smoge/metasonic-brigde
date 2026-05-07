@@ -26,13 +26,16 @@
 // before opening the demo (or after — order doesn't matter, the demo
 // only writes the producer side of the realtime queue).
 //
-// Graceful no-device behaviour: if no MIDI device is present (or the
-// requested device_index is out of range), q::midi_input_stream's
-// is_valid() returns false. The worker thread observes this once and
-// exits immediately. The handle remains valid; rt_midi_demo_close
-// still joins cleanly. Counters stay at zero. This means a CI box
-// without a controller can still construct/destroy a demo without
-// crashing — useful for tests.
+// Graceful no-device behaviour: the worker walks
+// q::midi_device::list() and only constructs a q::midi_input_stream
+// when a device matches the requested id AND has num_inputs() > 0.
+// On a host with no MIDI devices, an out-of-range id, or only
+// output-only devices at the requested id, no stream is constructed
+// at all; the worker stays idle, has_device reports 0, counters stay
+// at zero. The handle remains valid; rt_midi_demo_close still joins
+// cleanly. CI boxes without a controller (and headless / sandboxed
+// hosts without /dev/snd/seq) can construct and destroy demos
+// uneventfully.
 
 #pragma once
 

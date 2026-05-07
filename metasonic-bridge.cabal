@@ -46,10 +46,10 @@ library
       tinysynth/voice_allocator.cpp
       tinysynth/midi_voice_processor.cpp
       tinysynth/midi_demo.cpp
+      tinysynth/q_midi_device.cpp
+      tinysynth/q_midi_stream.cpp
       vendor/q/q_io/src/audio_device.cpp
       vendor/q/q_io/src/audio_stream.cpp
-      vendor/q/q_io/src/midi_device.cpp
-      vendor/q/q_io/src/midi_stream.cpp
   extra-libraries:
       stdc++
       portaudio

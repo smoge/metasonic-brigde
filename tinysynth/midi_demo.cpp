@@ -120,14 +120,13 @@ struct rt_midi_demo {
         if (static_cast<int>(d.id()) == target && d.num_inputs() > 0) {
           stream.emplace(d);
           ok = stream->is_valid();
-          // If is_valid() is false here, Pm_OpenInput failed
-          // despite the probe — typically a hot-unplug racing with
-          // open. We deliberately do NOT call stream.reset(): that
-          // would invoke ~midi_input_stream() right now, and on some
-          // PortMIDI builds Pm_Close(nullptr) crashes. Leaving the
-          // optional engaged means the same dtor still runs at
-          // ~rt_midi_demo, but at least we don't double-trigger it
-          // and the worker's `if (ok)` below skips processing.
+          // is_valid() == false here means Pm_OpenInput failed
+          // despite the probe (e.g., hot-unplug racing with open).
+          // The dtor running on a stream with _impl == nullptr is
+          // now safe because tinysynth/q_midi_stream.cpp's patched
+          // ~midi_input_stream guards _impl before Pm_Close. The
+          // worker's `if (ok)` below still skips processing on the
+          // failed stream.
           break;
         }
       }
