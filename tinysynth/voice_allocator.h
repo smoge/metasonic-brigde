@@ -153,6 +153,13 @@ public:
   VoiceHandle voice_handle(int voice_index) const noexcept;
   int         voice_note(int voice_index) const noexcept;
 
+  // The runtime graph this allocator targets. Exposed so a layer
+  // above (e.g. MidiVoiceProcessor's CC / pitch-bend dispatch) can
+  // call rt_graph_realtime_set_control on Active / Releasing voices
+  // without having to be passed the graph pointer separately.
+  RTGraph    *graph() const noexcept { return graph_; }
+  int         template_id() const noexcept { return template_id_; }
+
 private:
   struct Voice {
     int           slot_id    = -1;   // runtime slot id; -1 when Free or PendingSteal

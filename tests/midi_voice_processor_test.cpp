@@ -260,10 +260,12 @@ TEST_CASE("MidiVoiceProcessor: full note lifecycle through the processor") {
     rt_graph_destroy(g);
 }
 
-TEST_CASE("MidiVoiceProcessor: ignored MIDI categories do not disturb allocator state") {
-    // CC, pitch_bend, aftertouch, etc. are silently dropped in 3.2.
-    // The base midi_1_0::processor's empty operator() handles the
-    // catch-all. Verify nothing leaks into the allocator.
+TEST_CASE("MidiVoiceProcessor: unbound CC / pitch-bend and aftertouch do not disturb voices") {
+    // After Phase 3.3a, CC and pitch-bend have explicit overloads —
+    // but with no mappings registered (and no pitch-bend bound),
+    // they're no-ops on the allocator/runtime side. Aftertouch and
+    // program-change are still routed to the base processor's empty
+    // catch-all and remain ignored.
     auto *g = make_graph_with_polyphony(2);
     VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
     MidiVoiceProcessor proc(alloc);
@@ -271,9 +273,8 @@ TEST_CASE("MidiVoiceProcessor: ignored MIDI categories do not disturb allocator 
     proc(midi::note_on{0, 60, 100}, 0);
     REQUIRE(alloc.voice_state(0) == VoiceState::Active);
 
-    // Send a smattering of categories the processor doesn't (yet) wire.
     proc(midi::control_change{0, midi::cc::channel_volume, 100}, 0);
-    proc(midi::pitch_bend{0, 0x40, 0x40}, 0);     // centered pitch bend
+    proc(midi::pitch_bend{0, 0x40, 0x40}, 0);     // centred pitch-bend
     proc(midi::channel_aftertouch{0, 64}, 0);
     proc(midi::poly_aftertouch{0, 60, 64}, 0);
     proc(midi::program_change{0, 1}, 0);
@@ -283,6 +284,9 @@ TEST_CASE("MidiVoiceProcessor: ignored MIDI categories do not disturb allocator 
     CHECK(alloc.voice_note(0) == 60);
     CHECK(proc.note_on_events() == 1);
     CHECK(proc.note_off_events() == 0);
+    // CC and pitch-bend events were accepted (just no mappings to fire).
+    CHECK(proc.control_change_events() == 1);
+    CHECK(proc.pitch_bend_events() == 1);
 
     rt_graph_destroy(g);
 }
@@ -323,6 +327,343 @@ TEST_CASE("MidiVoiceProcessor: note_off on never-played note is a safe no-op") {
     for (int i = 0; i < alloc.voice_count(); ++i) {
         CHECK(alloc.voice_state(i) == VoiceState::Free);
     }
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Phase 3.3a: CC dispatch through the mapping table
+// ----------------------------------------------------------------
+
+namespace {
+
+// Read bus 0's first sample after one block. The Add(constant) →
+// Out(bus 0) template emits a steady value, so this is enough to
+// observe what the allocator's voices are writing.
+float bus0_first_sample(RTGraph *g) {
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    return bus0[0];
+}
+
+} // namespace
+
+TEST_CASE("MidiVoiceProcessor CC: bound CC writes to the mapped control on every Active voice") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(/*cc*/ 7, /*node*/ 0, /*ctl*/ 0,
+                                /*min*/ 0.0f, /*max*/ 1.0f));
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+
+    // Send CC 7 with value 64 → 64/127 → 0.5039...
+    proc(midi::control_change{0, midi::cc::channel_volume, 64}, 0);
+    CHECK(proc.control_change_events() == 1);
+
+    CHECK(bus0_first_sample(g) == doctest::Approx(64.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor CC: linear scaling with custom min/max") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    // Map CC 7 to control[0] scaled to [0.5, 1.5].
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, /*min*/ 0.5f, /*max*/ 1.5f));
+
+    proc(midi::note_on{0, 60, 100}, 0);
+
+    proc(midi::control_change{0, midi::cc::channel_volume, 0}, 0);
+    CHECK(bus0_first_sample(g) == doctest::Approx(0.5f).epsilon(1e-5));
+
+    proc(midi::control_change{0, midi::cc::channel_volume, 127}, 0);
+    CHECK(bus0_first_sample(g) == doctest::Approx(1.5f).epsilon(1e-5));
+
+    proc(midi::control_change{0, midi::cc::channel_volume, 64}, 0);
+    const float mid = 0.5f + (64.0f / 127.0f) * 1.0f;
+    CHECK(bus0_first_sample(g) == doctest::Approx(mid).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor CC: unmapped CC numbers are no-op for voice state") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));  // bind only CC 7
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    const float before = bus0_first_sample(g);
+
+    // CC 1 (mod wheel) is not mapped — bus value should not change.
+    proc(midi::control_change{0, midi::cc::modulation, 100}, 0);
+    CHECK(bus0_first_sample(g) == doctest::Approx(before).epsilon(1e-6));
+    // The event was still counted as a CC dispatch.
+    CHECK(proc.control_change_events() == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor CC: channel mask filters CC events") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    // Listen on channel 0 only.
+    MidiVoiceProcessor proc(alloc, /*channel_mask*/ 0x0001);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    const float before = bus0_first_sample(g);
+
+    // CC on channel 1 is filtered.
+    proc(midi::control_change{1, midi::cc::channel_volume, 0}, 0);
+    CHECK(proc.filtered_events() == 1);
+    CHECK(proc.control_change_events() == 0);
+    CHECK(bus0_first_sample(g) == doctest::Approx(before).epsilon(1e-6));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor CC: multiple mappings on the same CC all fire") {
+    // Two mappings both target the same CC number but write different
+    // controls. The Add template only has control[0] and control[1]
+    // (the two summed constants) so we can verify both writes by
+    // reading bus 0, which carries control[0] + control[1].
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 0.25f));   // → control[0]
+    REQUIRE(proc.add_cc_mapping(7, 0, 1, 0.0f, 0.75f));   // → control[1]
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    proc(midi::control_change{0, midi::cc::channel_volume, 127}, 0);
+
+    // Both mappings fired: control[0] = 0.25, control[1] = 0.75.
+    // Add outputs control[0] + control[1] = 1.0.
+    CHECK(bus0_first_sample(g) == doctest::Approx(1.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor CC: PendingSteal voices are skipped, Active voices receive") {
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+
+    // Voice 0 is Active.
+    proc(midi::note_on{0, 60, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+
+    // Steal: voice 0 is now PendingSteal (its slot is being recycled).
+    proc(midi::note_on{0, 62, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::PendingSteal);
+    REQUIRE(alloc.voice_handle(0).slot_id == -1);
+
+    // CC arrives mid-steal. Should be enqueued for nobody — the
+    // PendingSteal voice has no slot_id yet. Process to drain.
+    proc(midi::control_change{0, midi::cc::channel_volume, 127}, 0);
+    rt_graph_process(g, kFrames);
+    alloc.tick();
+
+    // Voice now Active. The CC value was *not* applied retroactively
+    // (this is the documented limitation: PendingSteal voices miss
+    // CC events that arrive during their pending window). The voice
+    // started with the map callback's velocity (100/127 ≈ 0.787).
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+    CHECK(bus0_first_sample(g) == doctest::Approx(100.0f / 127.0f).epsilon(1e-5));
+
+    // A subsequent CC arrives now that the voice is Active.
+    proc(midi::control_change{0, midi::cc::channel_volume, 64}, 0);
+    CHECK(bus0_first_sample(g) == doctest::Approx(64.0f / 127.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor CC: clear_cc_mappings empties the table") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    REQUIRE(proc.add_cc_mapping(7, 0, 0, 0.0f, 1.0f));
+    proc(midi::note_on{0, 60, 100}, 0);
+
+    proc(midi::control_change{0, midi::cc::channel_volume, 0}, 0);
+    REQUIRE(bus0_first_sample(g) == doctest::Approx(0.0f).epsilon(1e-5));
+
+    proc.clear_cc_mappings();
+
+    proc(midi::control_change{0, midi::cc::channel_volume, 127}, 0);
+    // After clear, the table is empty; bus 0 stays at the previous
+    // value (0).
+    CHECK(bus0_first_sample(g) == doctest::Approx(0.0f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor CC: mapping table caps at kMaxCCMappings (32)") {
+    auto *g = make_graph_with_polyphony(1);
+    VoiceAllocator alloc(g, 0, 1, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    for (int i = 0; i < 32; ++i) {
+        CHECK(proc.add_cc_mapping(static_cast<std::uint8_t>(i), 0, 0));
+    }
+    // 33rd binding is rejected.
+    CHECK_FALSE(proc.add_cc_mapping(99, 0, 0));
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Phase 3.3a: pitch-bend dispatch
+// ----------------------------------------------------------------
+
+TEST_CASE("MidiVoiceProcessor PB: bound pitch-bend at centre writes the unbent base frequency") {
+    // Bind pitch-bend to Add's control[0]. Note 60 → MIDI middle C
+    // → ~261.626 Hz via Q's 12-TET pitch utilities. Centred bend
+    // (value 8192) gives a multiplier of 1.0.
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(/*node*/ 0, /*ctl*/ 0, /*range*/ 2.0f);
+
+    proc(midi::note_on{0, 60, 100}, 0);
+    REQUIRE(alloc.voice_state(0) == VoiceState::Active);
+
+    proc(midi::pitch_bend{0, 8192}, 0);
+    CHECK(proc.pitch_bend_events() == 1);
+
+    // Q's as_frequency uses fast log2/pow2 — float tolerance for
+    // the round-trip. ~261.6 Hz for note 60.
+    CHECK(bus0_first_sample(g) == doctest::Approx(261.6f).epsilon(0.01));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor PB: positive bend raises frequency by 2^(range/12)") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+    proc(midi::note_on{0, 60, 100}, 0);
+
+    // Maximum positive bend (16383) → bend ≈ +1.0 → multiplier 2^(2/12)
+    // ≈ 1.1224.
+    proc(midi::pitch_bend{0, 16383}, 0);
+
+    constexpr float base = 261.6256f;          // MIDI 60
+    const float expected = base * 1.1224620f;  // ~293.6
+    CHECK(bus0_first_sample(g) == doctest::Approx(expected).epsilon(0.01));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor PB: negative bend lowers frequency by 1/2^(range/12)") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+    proc(midi::note_on{0, 60, 100}, 0);
+
+    // Minimum bend (0) → bend = -1.0 → multiplier 2^(-2/12) ≈ 0.8909.
+    proc(midi::pitch_bend{0, 0}, 0);
+
+    constexpr float base = 261.6256f;
+    const float expected = base * 0.8908987f;  // ~233.1
+    CHECK(bus0_first_sample(g) == doctest::Approx(expected).epsilon(0.01));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor PB: unbound pitch-bend is a no-op") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    // No set_pitch_bend call.
+    proc(midi::note_on{0, 60, 100}, 0);
+    const float before = bus0_first_sample(g);
+
+    proc(midi::pitch_bend{0, 16383}, 0);
+    CHECK(proc.pitch_bend_events() == 1);   // event was dispatched
+    // But the voice's control did not change.
+    CHECK(bus0_first_sample(g) == doctest::Approx(before).epsilon(1e-6));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor PB: clear_pitch_bend disables the binding") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+    proc(midi::note_on{0, 60, 100}, 0);
+
+    proc(midi::pitch_bend{0, 8192}, 0);
+    const float bound_value = bus0_first_sample(g);
+    REQUIRE(bound_value == doctest::Approx(261.6f).epsilon(0.01));
+
+    proc.clear_pitch_bend();
+    proc(midi::pitch_bend{0, 16383}, 0);
+    // Bound value unchanged.
+    CHECK(bus0_first_sample(g) == doctest::Approx(bound_value).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor PB: applies independently to every voice's own note") {
+    // Two voices, two different notes. A single pitch-bend message
+    // updates each voice's frequency control to its own base * factor.
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+
+    proc(midi::note_on{0, 60, 100}, 0);   // voice 0, base ~261.6
+    proc(midi::note_on{0, 72, 100}, 0);   // voice 1, base ~523.3
+
+    // Centred bend → each voice's freq is its own base.
+    proc(midi::pitch_bend{0, 8192}, 0);
+
+    rt_graph_process(g, kFrames);
+    std::vector<float> bus0(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    // Bus 0 carries the sum of both voices' Add(constant) writes:
+    // ~261.6 + ~523.3 = ~784.9 (well within the float bus's range).
+    CHECK(bus0[0] == doctest::Approx(261.6256f + 523.2511f).epsilon(0.01));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("MidiVoiceProcessor PB: channel mask filters pitch-bend events") {
+    auto *g = make_graph_with_polyphony(2);
+    VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
+    MidiVoiceProcessor proc(alloc, /*ch 0 only*/ 0x0001);
+
+    proc.set_pitch_bend(0, 0, 2.0f);
+    proc(midi::note_on{0, 60, 100}, 0);
+    const float before = bus0_first_sample(g);
+
+    // Bend on channel 1 — filtered out, so the voice (which lives on
+    // channel 0's allocator) keeps its previous value.
+    proc(midi::pitch_bend{1, 16383}, 0);
+    CHECK(proc.filtered_events() == 1);
+    CHECK(proc.pitch_bend_events() == 0);
+    CHECK(bus0_first_sample(g) == doctest::Approx(before).epsilon(1e-6));
 
     rt_graph_destroy(g);
 }
