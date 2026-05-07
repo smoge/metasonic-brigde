@@ -281,12 +281,11 @@ void rt_graph_instance_set_control(RTGraph *g, int instance_id,
                                    int node_index, int control_index,
                                    double value);
 
-// [T:bus-read] Per-instance variant of rt_graph_read_bus.
-// instance_id must reference a live instance; otherwise returns 0.
-// Reads from the shared Server bus pool, same caveats as
-// rt_graph_read_bus regarding torn samples during live audio.
-int rt_graph_instance_read_bus(RTGraph *g, int instance_id,
-                               int bus_index, int nframes, float *out);
+// (rt_graph_instance_read_bus was removed in the post-§2.E ABI
+// cleanup. Under §2.C the bus pool is server-global, so an
+// instance-keyed bus read added nothing beyond rt_graph_read_bus
+// except a liveness gate the caller can do explicitly via
+// rt_graph_instance_alive / _status. Use rt_graph_read_bus.)
 
 #ifdef __cplusplus
 }

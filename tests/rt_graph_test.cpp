@@ -3101,9 +3101,22 @@ TEST_CASE("Multi-instance: lifecycle (add, remove, re-add reuses slot)") {
     CHECK(peak_abs(fresh) < 1e-3f);
 }
 
-TEST_CASE("Multi-instance: removing an instance silences its bus") {
+TEST_CASE("Multi-instance: removing an instance stops its contribution to the pool") {
+    // Two instances of one template route to *different* buses
+    // (instance 0 → bus 0 by default; instance 1 → bus 1 via per-
+    // instance control). After removing instance 1, bus 1 should
+    // go silent (clear_output_buses zeroes it each block and no
+    // kernel writes to it anymore), while bus 0 keeps singing.
+    //
+    // This pins the actually-load-bearing semantics: removing an
+    // instance withdraws its kernels from the schedule. The earlier
+    // version of this test relied on rt_graph_instance_read_bus's
+    // liveness gate, which was removed alongside the function in
+    // the post-§2.E ABI cleanup.
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);                           // inst 1 routes here
+
     rt_graph_add_node(g, 0, 1);                          // SinOsc
     rt_graph_set_control(g, 0, 0, 440.0);
     rt_graph_add_node(g, 1, 2);                          // Out
@@ -3112,26 +3125,30 @@ TEST_CASE("Multi-instance: removing an instance silences its bus") {
 
     int inst1 = rt_graph_instance_add(g);
     REQUIRE(inst1 == 1);
-    rt_graph_instance_set_control(g, 1, 0, 0, 880.0);
+    rt_graph_instance_set_control(g, inst1, 0, 0, 880.0);
+    rt_graph_instance_set_control(g, inst1, 1, 0, 1.0);  // route to bus 1
 
     // Both alive and producing.
     rt_graph_process(g, kFrames);
-    std::vector<float> bus_inst1(kFrames, 0.0f);
-    rt_graph_instance_read_bus(g, 1, 0, kFrames, bus_inst1.data());
-    CHECK(peak_abs(bus_inst1) > 0.9f);
+    std::vector<float> bus0(kFrames, 0.0f);
+    std::vector<float> bus1(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1.data());
+    CHECK(peak_abs(bus0) > 0.9f);
+    CHECK(peak_abs(bus1) > 0.9f);
 
-    // Remove instance 1: read_bus on it must now return 0; instance 0
-    // is unaffected.
-    rt_graph_instance_remove(g, 1);
+    // Remove instance 1, run another block: bus 1 has no writer left,
+    // so clear_output_buses leaves it at zero. Bus 0 still gets
+    // instance 0's contribution.
+    rt_graph_instance_remove(g, inst1);
     rt_graph_process(g, kFrames);
 
-    std::vector<float> dead(kFrames, 0.0f);
-    int n = rt_graph_instance_read_bus(g, 1, 0, kFrames, dead.data());
-    CHECK(n == 0);
-
-    std::vector<float> inst0_after(kFrames, 0.0f);
-    rt_graph_instance_read_bus(g, 0, 0, kFrames, inst0_after.data());
-    CHECK(peak_abs(inst0_after) > 0.9f);
+    std::vector<float> bus0_after(kFrames, 0.0f);
+    std::vector<float> bus1_after(kFrames, 0.0f);
+    rt_graph_read_bus(g, 0, kFrames, bus0_after.data());
+    rt_graph_read_bus(g, 1, kFrames, bus1_after.data());
+    CHECK(peak_abs(bus0_after) > 0.9f);  // survivor still sings
+    CHECK(peak_abs(bus1_after) < 1e-6f); // removed voice's bus is silent
 
     rt_graph_destroy(g);
 }
@@ -3149,36 +3166,14 @@ TEST_CASE("Multi-instance: counting and aliveness on null/bad ids") {
     rt_graph_destroy(g);
 }
 
-TEST_CASE("Multi-instance: legacy API targets instance 0") {
-    // Verifies the back-compat invariant: rt_graph_set_control and
-    // rt_graph_read_bus operate on instance 0, even when other
-    // instances exist.
-    auto *g = rt_graph_create(4, kFrames);
-    REQUIRE(g != nullptr);
-    rt_graph_add_node(g, 0, 1);                          // SinOsc
-    rt_graph_set_control(g, 0, 0, 440.0);                // legacy → instance 0
-    rt_graph_add_node(g, 1, 2);                          // Out
-    rt_graph_set_control(g, 1, 0, 0.0);
-    rt_graph_connect(g, 0, 0, 1, 0);
-
-    int inst1 = rt_graph_instance_add(g);
-    rt_graph_instance_set_control(g, inst1, 0, 0, 880.0);
-
-    rt_graph_process(g, kFrames);
-
-    std::vector<float> via_legacy(kFrames, 0.0f);
-    rt_graph_read_bus(g, 0, kFrames, via_legacy.data());
-
-    std::vector<float> via_new(kFrames, 0.0f);
-    rt_graph_instance_read_bus(g, 0, 0, kFrames, via_new.data());
-
-    rt_graph_destroy(g);
-
-    REQUIRE(via_legacy.size() == via_new.size());
-    for (std::size_t i = 0; i < via_legacy.size(); ++i) {
-        CHECK(via_legacy[i] == via_new[i]);
-    }
-}
+// (TEST_CASE "Multi-instance: legacy API targets instance 0" was
+// deleted in the post-§2.E ABI cleanup. It compared rt_graph_read_bus
+// to rt_graph_instance_read_bus; with the latter removed (under §2.C
+// it added nothing beyond a liveness gate over the shared pool), the
+// comparison has no remaining content. The "legacy entries target
+// instance 0" invariant is covered by the legacy-shim Note in
+// rt_graph.cpp and exercised by every test that uses the bare
+// rt_graph_set_control entry.)
 
 TEST_CASE("Multi-instance: removing instance 0 disables instance-scoped API only") {
     // After removing instance 0, instance-scoped legacy entries
@@ -3203,10 +3198,11 @@ TEST_CASE("Multi-instance: removing instance 0 disables instance-scoped API only
 
     // Bus read after removal: returns kFrames (the shared pool still
     // holds whatever the last block left there). This is *not* the
-    // pre-§2.D.3 behavior — the legacy entry used to delegate to
-    // rt_graph_instance_read_bus, which checked instance liveness.
-    // Under §2.C the pool is shared, so the instance check was a
-    // legacy quirk that masked the real (pool-scoped) semantics.
+    // pre-§2.D.3 behavior — the legacy entry used to delegate to a
+    // since-removed rt_graph_instance_read_bus, which checked instance
+    // liveness. Under §2.C the pool is shared, so the instance check
+    // was a legacy quirk that masked the real (pool-scoped) semantics;
+    // the post-§2.E ABI cleanup dropped the entry alongside its quirk.
     std::vector<float> samples(kFrames, 7.0f);
     int n = rt_graph_read_bus(g, 0, kFrames, samples.data());
     CHECK(n == kFrames);

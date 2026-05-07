@@ -2756,32 +2756,11 @@ void rt_graph_instance_set_control(
   }
 }
 
-// Read one bus from the server pool. The instance_id argument acts as
-// a scope check (must reference a live instance) but the data comes
-// from the shared pool — under §2.C+§2.D.3, "instance K's view of bus
-// N" is just bus N, regardless of which template K belongs to. A dead
-// instance returns 0 with the buffer untouched.
-int rt_graph_instance_read_bus(
-    RTGraph *g, int instance_id, int bus_index, int nframes, float *out
-) {
-  if (!g || !out || bus_index < 0 || nframes <= 0) {
-    return 0;
-  }
-
-  if (!instance_at(*g, instance_id)) {
-    return 0;
-  }
-
-  const std::size_t bus = static_cast<std::size_t>(bus_index);
-  if (bus >= g->server.output_buses.size()) {
-    return 0;
-  }
-
-  const auto &src = g->server.output_buses[bus];
-  const std::size_t to_copy =
-      std::min(static_cast<std::size_t>(nframes), src.size());
-  std::copy_n(src.begin(), to_copy, out);
-  return static_cast<int>(to_copy);
-}
+// (rt_graph_instance_read_bus was removed in the post-§2.E ABI
+// cleanup. Under §2.C the bus pool is server-global; an instance-
+// keyed bus read added nothing beyond rt_graph_read_bus except a
+// liveness gate that the caller can do explicitly. The function name
+// is preserved here as a comment so anyone bisecting an old test
+// failure to the cleanup commit can find the rationale.)
 
 } // extern "C"

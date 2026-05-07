@@ -47,7 +47,6 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_instance_count
   , c_rt_graph_instance_alive
   , c_rt_graph_instance_set_control
-  , c_rt_graph_instance_read_bus
   , -- * §2.E lifecycle status values (mirroring rt_graph.h's InstanceStatus)
     instanceStatusLive
   , instanceStatusReleasing
@@ -385,9 +384,13 @@ foreign import ccall unsafe "rt_graph_instance_set_control"
   c_rt_graph_instance_set_control
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO ()
 
-foreign import ccall unsafe "rt_graph_instance_read_bus"
-  c_rt_graph_instance_read_bus
-    :: Ptr RTGraph -> CInt -> CInt -> CInt -> Ptr CFloat -> IO CInt
+-- (c_rt_graph_instance_read_bus was removed in the post-§2.E ABI
+-- cleanup. The C entry was a thin liveness-gated alias for
+-- rt_graph_read_bus; under §2.C the bus pool is server-global, so
+-- the instance gate didn't reflect any real per-instance scope.
+-- Use c_rt_graph_read_bus and, if you need a liveness check, gate
+-- the call yourself with c_rt_graph_instance_alive or
+-- c_rt_graph_instance_status.)
 
 -- | Allocate a C++ runtime graph, run an action with it, and
 -- guarantee cleanup via bracket.
