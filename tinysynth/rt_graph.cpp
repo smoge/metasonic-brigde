@@ -19,8 +19,10 @@
 #include <q/support/phase.hpp>
 #include <q/synth/envelope_gen.hpp>
 #include <q/synth/noise_gen.hpp>
+#include <q/synth/pulse_osc.hpp>
 #include <q/synth/saw_osc.hpp>
 #include <q/synth/sin_osc.hpp>
+#include <q/synth/triangle_osc.hpp>
 #include <q_io/audio_device.hpp>
 #include <q_io/audio_stream.hpp>
 
@@ -266,6 +268,11 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KBusInDelayed = 12           BusInDelayed  = 12
   kindTag KDelay        = 13           Delay        = 13
   kindTag KSmooth       = 14           Smooth       = 14
+  kindTag KPulseOsc     = 15           PulseOsc     = 15
+  kindTag KTriOsc       = 16           TriOsc       = 16
+  kindTag KHPF          = 17           HPF          = 17
+  kindTag KBPF          = 18           BPF          = 18
+  kindTag KNotch        = 19           Notch        = 19
 
   Bus model: Out, BusOut, BusIn, and BusInDelayed all operate on the
   same bus pool, owned by the Server (see Note [§2.C: server-global
@@ -319,6 +326,11 @@ enum class NodeKind : int {
   BusInDelayed = 12,
   Delay        = 13,
   Smooth       = 14,
+  PulseOsc     = 15,
+  TriOsc       = 16,
+  HPF          = 17,
+  BPF          = 18,
+  Notch        = 19,
 };
 
 // Single source of truth for the integer-tag → NodeKind mapping.
@@ -341,6 +353,11 @@ kind_from_tag(int node_kind) noexcept {
   case 12: return NodeKind::BusInDelayed;
   case 13: return NodeKind::Delay;
   case 14: return NodeKind::Smooth;
+  case 15: return NodeKind::PulseOsc;
+  case 16: return NodeKind::TriOsc;
+  case 17: return NodeKind::HPF;
+  case 18: return NodeKind::BPF;
+  case 19: return NodeKind::Notch;
   default: return std::nullopt;
   }
 }
@@ -380,6 +397,18 @@ struct OscState {
   q::phase_iterator phase_iter;
 };
 
+// Pulse oscillator state. q::pulse_osc carries the bandlimited
+// pulse-width as integer phase (`_shift`) so we keep a stateful
+// instance and update its width via `osc.width(float)` only when the
+// width control changes (or on every sample when an audio-rate width
+// modulator is wired). last_width tracks the block-rate path's
+// memoization; -1.0 forces reconfigure on the first sample.
+struct PulseOscState {
+  q::phase_iterator phase_iter;
+  q::pulse_osc      osc{0.5f};
+  double            last_width = -1.0;
+};
+
 struct NoiseGenState {
   q::white_noise_gen noise;
 };
@@ -390,6 +419,33 @@ struct NoiseGenState {
 // controls.
 struct LPFState {
   q::lowpass filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
+  double last_freq = -1.0;
+  double last_q = -1.0;
+};
+
+// HPF / BPF / Notch share LPF's reconfigure-on-change pattern and only
+// differ in the underlying biquad alternative. The audio I/O contract
+// is identical (3 inputs [signal, freq, q], 2 controls [freq_default,
+// q_default], 1 output). Each carries last_freq / last_q so the
+// kernel only re-derives biquad coefficients when a control changes.
+struct HPFState {
+  q::highpass filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
+  double last_freq = -1.0;
+  double last_q = -1.0;
+};
+
+struct BPFState {
+  // bandpass_cpg: constant-peak-gain — peak amplitude stays roughly
+  // constant as Q changes, which is the musical / wah-style behaviour.
+  // (bandpass_csg, the constant-skirt-gain variant, is sharper but
+  // its peak gain scales with Q.)
+  q::bandpass_cpg filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
+  double last_freq = -1.0;
+  double last_q = -1.0;
+};
+
+struct NotchState {
+  q::notch filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
   double last_freq = -1.0;
   double last_q = -1.0;
 };
@@ -478,7 +534,8 @@ struct SmoothState {
 // directly with every possible state object.
 using NodeState =
     std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState,
-                 DelayState, SmoothState>;
+                 DelayState, SmoothState, PulseOscState,
+                 HPFState, BPFState, NotchState>;
 
 /* Note [Spec/state split: NodeSpec vs NodeInstanceState]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -764,6 +821,33 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.default_controls = {20.0, 0.0};  // [base_freq_hz, target_default]
     spec.input_refs.resize(1);            // [signal_in]
     break;
+
+  case NodeKind::PulseOsc:
+    // Bandwidth-limited pulse oscillator. Three audio inputs
+    // [freq, phase, width]; three controls [freq_default,
+    // phase_default, width_default]. width is in [0, 1] (0.5 =
+    // square). Like SinOsc/SawOsc, phase is initial-only — the
+    // kernel reads it at the first sample after a reset and then
+    // ignores port 1 for the rest of the block.
+    spec.default_controls = {0.0, 0.0, 0.5};
+    spec.input_refs.resize(3);            // [freq_in, phase_in, width_in]
+    break;
+
+  case NodeKind::TriOsc:
+    // Bandwidth-limited triangle oscillator. Same shape as
+    // SinOsc/SawOsc.
+    spec.default_controls.resize(2, 0.0); // [freq, initial_phase]
+    spec.input_refs.resize(2);            // [freq_in, phase_in]
+    break;
+
+  case NodeKind::HPF:
+  case NodeKind::BPF:
+  case NodeKind::Notch:
+    // Biquad family — same I/O shape as LPF: 3 audio inputs
+    // [signal, cutoff, q]; 2 controls [cutoff_default, q_default].
+    spec.default_controls = {1000.0, 0.707};
+    spec.input_refs.resize(3);            // [signal_in, freq_in, q_in]
+    break;
   }
 }
 
@@ -793,6 +877,7 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
   switch (spec.kind) {
   case NodeKind::SinOsc:
   case NodeKind::SawOsc:
+  case NodeKind::TriOsc:
     target_outputs = 1;
     node.state = OscState{};
     break;
@@ -820,6 +905,26 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
   case NodeKind::Smooth:
     target_outputs = 1;
     node.state = SmoothState{};
+    break;
+
+  case NodeKind::PulseOsc:
+    target_outputs = 1;
+    node.state = PulseOscState{};
+    break;
+
+  case NodeKind::HPF:
+    target_outputs = 1;
+    node.state = HPFState{};
+    break;
+
+  case NodeKind::BPF:
+    target_outputs = 1;
+    node.state = BPFState{};
+    break;
+
+  case NodeKind::Notch:
+    target_outputs = 1;
+    node.state = NotchState{};
     break;
 
   case NodeKind::Gain:
@@ -1486,9 +1591,18 @@ static void clear_output_buses(Server &server, int nframes) noexcept {
 }
 
 void set_osc_initial_phase(NodeInstanceState &node, double value) noexcept {
-  auto *osc = std::get_if<OscState>(&node.state);
-  assert(osc && "oscillator node has non-oscillator state");
-  if (!osc) {
+  // Multiple oscillator state types share a phase_iterator (OscState
+  // for SinOsc/SawOsc, PulseOscState for PulseOsc, ...). Locate the
+  // right one by variant alternative; if none matches, the caller
+  // dispatched a phase-set on a non-oscillator kind.
+  q::phase_iterator *iter = nullptr;
+  if (auto *osc = std::get_if<OscState>(&node.state)) {
+    iter = &osc->phase_iter;
+  } else if (auto *p = std::get_if<PulseOscState>(&node.state)) {
+    iter = &p->phase_iter;
+  }
+  assert(iter && "oscillator node has non-oscillator state");
+  if (!iter) {
     return;
   }
 
@@ -1500,7 +1614,7 @@ void set_osc_initial_phase(NodeInstanceState &node, double value) noexcept {
   // operator=(phase) also sets _step, not _phase — a counterintuitive trap.
   //
   // Let's keep this direct field access here so a Q API change breaks in one place...
-  osc->phase_iter._phase = q::frac_to_phase(frac);
+  iter->_phase = q::frac_to_phase(frac);
 }
 
 /* Note [SinOsc processing semantics]
@@ -1609,6 +1723,73 @@ static void process_sawosc(const RTGraph &g, GraphInstance &inst,
   }
 }
 
+/* Note [PulseOsc processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Bandwidth-limited pulse oscillator wrapping q::pulse_osc. Three audio
+inputs in declared order: freq (port 0), phase (port 1, initial-only,
+ignored after the first sample like SinOsc/SawOsc), and width (port 2,
+in [0, 1]; 0.5 = square wave). When width is wired the kernel takes a
+sample-accurate path (per-sample osc.width(...) call); otherwise it
+memo-checks controls[2] against last_width and updates only on change.
+
+Width semantics: q's pulse_osc holds the pulse threshold internally
+as integer phase. We update via osc.width(float) which stores the
+converted phase in osc._shift. The bandlimit (poly_blep) correctly
+follows the new shift on the next sample, so width modulation is
+glitch-free as long as the modulator stays within [0, 1].
+*/
+
+static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
+                              std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto freq_in  = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const auto width_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+
+  auto *st = std::get_if<PulseOscState>(&node.state);
+  assert(st && "PulseOsc node has non-pulse state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  // Width: sample-accurate modulation when port 2 is wired; otherwise
+  // memoize against last_width and update once per block on change.
+  if (width_in.empty()) {
+    const double w = node.controls[2];
+    if (w != st->last_width) {
+      st->osc.width(static_cast<float>(w));
+      st->last_width = w;
+    }
+  }
+
+  if (!freq_in.empty()) {
+    // Sample-accurate FM (and PWM, if width_in is also wired).
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      st->phase_iter.set(
+          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      if (!width_in.empty()) {
+        st->osc.width(width_in[fi]);
+      }
+      out[fi] = st->osc(st->phase_iter++);
+    }
+  } else {
+    // Constant frequency: set the increment once per block. Width
+    // may still be sample-accurate.
+    const double freq = node.controls[0];
+    st->phase_iter.set(q::frequency{freq}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      if (!width_in.empty()) {
+        st->osc.width(width_in[fi]);
+      }
+      out[fi] = st->osc(st->phase_iter++);
+    }
+  }
+}
+
 /* Note [NoiseGen processing semantics]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1691,6 +1872,155 @@ static void process_lpf(const RTGraph &g, GraphInstance &inst,
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
     out[fi] = lpf->filter(sig_in[fi]);
+  }
+}
+
+/* Note [HPF / BPF / Notch processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+These three are biquad siblings of LPF: same I/O contract (3 audio
+inputs [signal, freq, q], 2 controls [freq_default, q_default]),
+same block-latched freq/q (read at sample 0 each block), same
+reconfigure-on-change discipline. They differ only in the underlying
+q::biquad alternative:
+
+  * HPF   uses q::highpass.
+  * BPF   uses q::bandpass_cpg (constant-peak-gain — peak amplitude
+          is roughly Q-independent, the musical / wah variant).
+  * Notch uses q::notch (band-reject).
+
+Audio-rate cutoff isn't truly sample-accurate here — the kernel
+samples freq_in[0] once per block. Users who need a glitch-free
+sweep should put a Smooth between the modulator and the cutoff input.
+*/
+
+static void process_hpf(const RTGraph &g, GraphInstance &inst,
+                        std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  if (sig_in.empty()) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+  const double freq  = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
+  const double q_val = !q_in.empty()    ? static_cast<double>(q_in[0])    : node.controls[1];
+
+  auto *st = std::get_if<HPFState>(&node.state);
+  assert(st && "HPF node has non-HPF state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+  if (freq != st->last_freq || q_val != st->last_q) {
+    st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
+    st->last_freq = freq;
+    st->last_q    = q_val;
+  }
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    out[fi] = st->filter(sig_in[fi]);
+  }
+}
+
+static void process_bpf(const RTGraph &g, GraphInstance &inst,
+                        std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  if (sig_in.empty()) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+  const double freq  = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
+  const double q_val = !q_in.empty()    ? static_cast<double>(q_in[0])    : node.controls[1];
+
+  auto *st = std::get_if<BPFState>(&node.state);
+  assert(st && "BPF node has non-BPF state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+  if (freq != st->last_freq || q_val != st->last_q) {
+    st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
+    st->last_freq = freq;
+    st->last_q    = q_val;
+  }
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    out[fi] = st->filter(sig_in[fi]);
+  }
+}
+
+static void process_notch(const RTGraph &g, GraphInstance &inst,
+                          std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  if (sig_in.empty()) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+  const double freq  = !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0];
+  const double q_val = !q_in.empty()    ? static_cast<double>(q_in[0])    : node.controls[1];
+
+  auto *st = std::get_if<NotchState>(&node.state);
+  assert(st && "Notch node has non-Notch state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+  if (freq != st->last_freq || q_val != st->last_q) {
+    st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
+    st->last_freq = freq;
+    st->last_q    = q_val;
+  }
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    out[fi] = st->filter(sig_in[fi]);
+  }
+}
+
+/* Note [TriOsc processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Same shape as SinOsc/SawOsc: q::phase_iterator + a stateless
+waveshape. q::triangle is a free constant of triangle_osc. Phase
+port (port 1) is initial-only, same convention as SinOsc/SawOsc.
+*/
+
+static void process_triosc(const RTGraph &g, GraphInstance &inst,
+                           std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+
+  auto *osc = std::get_if<OscState>(&node.state);
+  assert(osc && "TriOsc node has non-oscillator state");
+  if (!osc) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  if (!freq_in.empty()) {
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      osc->phase_iter.set(
+          q::frequency{static_cast<double>(freq_in[fi])}, g.sample_rate);
+      out[fi] = q::triangle(osc->phase_iter++);
+    }
+  } else {
+    const double freq = node.controls[0];
+    osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      out[static_cast<std::size_t>(i)] = q::triangle(osc->phase_iter++);
+    }
   }
 }
 
@@ -2288,7 +2618,10 @@ static void apply_instance_set_control(
 
   node.controls[cidx] = value;
 
-  if (cidx == 1 && (spec.kind == NodeKind::SinOsc || spec.kind == NodeKind::SawOsc)) {
+  if (cidx == 1 && (spec.kind == NodeKind::SinOsc
+                    || spec.kind == NodeKind::SawOsc
+                    || spec.kind == NodeKind::PulseOsc
+                    || spec.kind == NodeKind::TriOsc)) {
     set_osc_initial_phase(node, value);
   }
 }
@@ -2508,6 +2841,21 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
       break;
     case NodeKind::Smooth:
       process_smooth(g, inst, i, nframes);
+      break;
+    case NodeKind::PulseOsc:
+      process_pulse_osc(g, inst, i, nframes);
+      break;
+    case NodeKind::TriOsc:
+      process_triosc(g, inst, i, nframes);
+      break;
+    case NodeKind::HPF:
+      process_hpf(g, inst, i, nframes);
+      break;
+    case NodeKind::BPF:
+      process_bpf(g, inst, i, nframes);
+      break;
+    case NodeKind::Notch:
+      process_notch(g, inst, i, nframes);
       break;
     default:
       assert(false && "unhandled NodeKind in process_instance");

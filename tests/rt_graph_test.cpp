@@ -77,12 +77,17 @@ TEST_CASE("kind_from_tag accepts every defined tag") {
     CHECK(rt_graph_kind_supported(12) == 1); // BusInDelayed
     CHECK(rt_graph_kind_supported(13) == 1); // Delay
     CHECK(rt_graph_kind_supported(14) == 1); // Smooth
+    CHECK(rt_graph_kind_supported(15) == 1); // PulseOsc
+    CHECK(rt_graph_kind_supported(16) == 1); // TriOsc
+    CHECK(rt_graph_kind_supported(17) == 1); // HPF
+    CHECK(rt_graph_kind_supported(18) == 1); // BPF
+    CHECK(rt_graph_kind_supported(19) == 1); // Notch
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
     CHECK(rt_graph_kind_supported(4) == 0);  // intentional gap
-    CHECK(rt_graph_kind_supported(15) == 0); // first unallocated past KSmooth
+    CHECK(rt_graph_kind_supported(20) == 0); // first unallocated past KNotch
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
 }
@@ -409,6 +414,317 @@ TEST_CASE("SawOsc(440 Hz) produces a bandlimited saw with peak ≈ 1") {
     CHECK(zc <= 21);
 
     rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// PulseOsc kernel
+// ----------------------------------------------------------------
+
+TEST_CASE("PulseOsc(440 Hz, width=0.5) is a bandlimited square: peak ~1, balanced duty") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 15);              // PulseOsc
+    rt_graph_set_control(g, 0, 0, 440.0f);    // freq
+    rt_graph_set_control(g, 0, 1, 0.0f);      // initial phase
+    rt_graph_set_control(g, 0, 2, 0.5f);      // width = square
+
+    rt_graph_add_node(g, 1, 2);               // Out
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+
+    // PolyBLEP pulse is bipolar [-1, 1]; peak should be near 1.
+    CHECK(peak_abs(samples) == doctest::Approx(1.0f).epsilon(0.05));
+
+    // 440 Hz over 1024 frames at 48 kHz = ~9.4 cycles. Each square
+    // cycle crosses zero exactly twice (rising + falling edge), so
+    // we expect ~18-19 crossings, with a small margin for the
+    // start/end-of-block partial cycle.
+    int zc = zero_crossings(samples);
+    CHECK(zc >= 17);
+    CHECK(zc <= 21);
+
+    // 50% duty: roughly half the samples should be above zero. Allow
+    // ±5% slack for BLEP-softened transitions and partial cycles.
+    int high = 0;
+    for (auto s : samples) if (s > 0.0f) ++high;
+    const float duty = static_cast<float>(high) / samples.size();
+    CHECK(duty == doctest::Approx(0.5f).epsilon(0.05));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("PulseOsc width=0.25 produces a narrower duty cycle") {
+    // The pulse is high for `width` of each cycle. width=0.25 means
+    // ~25% of samples should be > 0. Confirms the width control is
+    // actually consulted and translated to phase correctly.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 15);
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+    rt_graph_set_control(g, 0, 2, 0.25f);     // narrow pulse
+
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+
+    int high = 0;
+    for (auto s : samples) if (s > 0.0f) ++high;
+    const float duty = static_cast<float>(high) / samples.size();
+    CHECK(duty == doctest::Approx(0.25f).epsilon(0.05));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("PulseOsc width-modulation via set_control changes duty within the kernel") {
+    // Render two consecutive blocks at different widths. If the
+    // block-rate width path is wired correctly, the second block's
+    // duty should reflect the new width without restarting phase.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 15);
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+    rt_graph_set_control(g, 0, 2, 0.1f);      // very narrow
+
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto narrow = render_bus0(g, kFrames);
+
+    rt_graph_set_control(g, 0, 2, 0.9f);      // very wide
+    auto wide   = render_bus0(g, kFrames);
+
+    int narrow_high = 0;
+    for (auto s : narrow) if (s > 0.0f) ++narrow_high;
+    int wide_high = 0;
+    for (auto s : wide)   if (s > 0.0f) ++wide_high;
+
+    const float narrow_duty = static_cast<float>(narrow_high) / narrow.size();
+    const float wide_duty   = static_cast<float>(wide_high)   / wide.size();
+
+    CHECK(narrow_duty == doctest::Approx(0.10f).epsilon(0.05));
+    CHECK(wide_duty   == doctest::Approx(0.90f).epsilon(0.05));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("PulseOsc takes audio-rate width modulation (PWM) without zippering") {
+    // Wire a slow LFO into the width input. The output's duty cycle
+    // should drift across the block — counted as: the second half's
+    // duty differs from the first half's. A failure here would mean
+    // the kernel ignores the width port or only samples it once.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // LFO: SinOsc at ~5 Hz scaled+offset to [0.1, 0.9] via a Gain
+    // (output ∈ [-1,1] -> scale by 0.4 -> [-0.4, 0.4]) + Add 0.5
+    // -> [0.1, 0.9].
+    rt_graph_add_node(g, 0, 1);                 // SinOsc (LFO)
+    rt_graph_set_control(g, 0, 0, 5.0f);        // 5 Hz
+    rt_graph_set_control(g, 0, 1, 0.0f);
+
+    rt_graph_add_node(g, 1, 3);                 // Gain: scale LFO
+    rt_graph_set_control(g, 1, 0, 0.4f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(g, 2, 8);                 // Add: bias
+    rt_graph_set_control(g, 2, 1, 0.5f);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    rt_graph_add_node(g, 3, 15);                // PulseOsc
+    rt_graph_set_control(g, 3, 0, 440.0f);
+    rt_graph_set_control(g, 3, 1, 0.0f);
+    rt_graph_connect(g, 2, 0, 3, 2);            // LFO -> width
+
+    rt_graph_add_node(g, 4, 2);                 // Out
+    rt_graph_set_control(g, 4, 0, 0.0f);
+    rt_graph_connect(g, 3, 0, 4, 0);
+
+    // Render enough samples to span at least one LFO half-cycle
+    // (5 Hz at 48 kHz = 9600 samples per cycle, ~9 blocks of 1024).
+    constexpr int kBlocks = 10;
+    std::vector<float> all;
+    all.reserve(kFrames * kBlocks);
+    for (int b = 0; b < kBlocks; ++b) {
+        auto block = render_bus0(g, kFrames);
+        all.insert(all.end(), block.begin(), block.end());
+    }
+
+    // Output is finite, bounded, non-trivial.
+    for (auto s : all) {
+        CHECK(std::isfinite(s));
+        CHECK(std::abs(s) <= 1.5f);
+    }
+
+    // Duty in the first vs. last quarter should differ noticeably:
+    // the LFO is sweeping width, so the first quarter (LFO near
+    // crossing zero, width near 0.5) and the last quarter (LFO at
+    // a different phase, width different) should produce different
+    // ratios. Threshold is loose (just "not identical") to avoid
+    // depending on LFO phase alignment.
+    const std::size_t qsize = all.size() / 4;
+    int first_high = 0, last_high = 0;
+    for (std::size_t i = 0;            i < qsize;            ++i) if (all[i] > 0.0f) ++first_high;
+    for (std::size_t i = all.size()-qsize; i < all.size();    ++i) if (all[i] > 0.0f) ++last_high;
+
+    const float first_duty = static_cast<float>(first_high) / qsize;
+    const float last_duty  = static_cast<float>(last_high)  / qsize;
+    INFO("first_duty=" << first_duty << " last_duty=" << last_duty);
+    CHECK(std::abs(first_duty - last_duty) > 0.05f);
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// TriOsc kernel
+// ----------------------------------------------------------------
+
+TEST_CASE("TriOsc(440 Hz) is a bandlimited triangle: peak ~1, ~18 zero-crossings") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 16);              // TriOsc
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_set_control(g, 0, 1, 0.0f);
+
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    auto samples = render_bus0(g, kFrames);
+    CHECK(peak_abs(samples) == doctest::Approx(1.0f).epsilon(0.05));
+
+    int zc = zero_crossings(samples);
+    CHECK(zc >= 17);
+    CHECK(zc <= 21);
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Biquad family: HPF / BPF / Notch
+// ----------------------------------------------------------------
+//
+// Each filter test runs a few "settling" blocks before measuring so
+// the IIR transient has decayed. Amplitude thresholds are loose
+// (0.3 / 0.7) to tolerate biquad rolloff variation between Q values
+// without depending on exact magnitude-response curves.
+
+namespace {
+// Render N blocks and return the last one. Lets the IIR settle before
+// the test reads peak amplitude.
+std::vector<float> render_settled(RTGraph *g, int blocks, int frames) {
+    std::vector<float> out;
+    for (int i = 0; i < blocks; ++i) {
+        out = render_bus0(g, frames);
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("HPF rejects sub-cutoff sine and passes super-cutoff sine") {
+    constexpr int kSettle = 4;
+    auto build = [](float sine_hz, float cutoff_hz) {
+        auto *g = rt_graph_create(4, kFrames);
+        REQUIRE(g != nullptr);
+        rt_graph_add_node(g, 0, 1);                       // SinOsc source
+        rt_graph_set_control(g, 0, 0, sine_hz);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        rt_graph_add_node(g, 1, 17);                      // HPF
+        rt_graph_set_control(g, 1, 0, cutoff_hz);
+        rt_graph_set_control(g, 1, 1, 0.707);
+        rt_graph_add_node(g, 2, 2);                       // Out
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);                  // sine -> HPF
+        rt_graph_connect(g, 1, 0, 2, 0);                  // HPF -> Out
+        return g;
+    };
+
+    SUBCASE("100 Hz sine through HPF cutoff=2000 Hz: heavily attenuated") {
+        auto *g = build(100.0f, 2000.0f);
+        auto last = render_settled(g, kSettle, kFrames);
+        CHECK(peak_abs(last) < 0.3f);
+        rt_graph_destroy(g);
+    }
+    SUBCASE("5000 Hz sine through HPF cutoff=1000 Hz: passes through") {
+        auto *g = build(5000.0f, 1000.0f);
+        auto last = render_settled(g, kSettle, kFrames);
+        CHECK(peak_abs(last) > 0.7f);
+        rt_graph_destroy(g);
+    }
+}
+
+TEST_CASE("BPF passes centre-tuned sine and rejects off-band sine") {
+    constexpr int kSettle = 6;
+    auto build = [](float sine_hz, float centre_hz, double q) {
+        auto *g = rt_graph_create(4, kFrames);
+        REQUIRE(g != nullptr);
+        rt_graph_add_node(g, 0, 1);
+        rt_graph_set_control(g, 0, 0, sine_hz);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        rt_graph_add_node(g, 1, 18);                      // BPF
+        rt_graph_set_control(g, 1, 0, centre_hz);
+        rt_graph_set_control(g, 1, 1, q);
+        rt_graph_add_node(g, 2, 2);
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+        return g;
+    };
+
+    SUBCASE("1000 Hz sine through BPF centre=1000 Hz: passes through") {
+        auto *g = build(1000.0f, 1000.0f, 2.0);
+        auto last = render_settled(g, kSettle, kFrames);
+        CHECK(peak_abs(last) > 0.7f);
+        rt_graph_destroy(g);
+    }
+    SUBCASE("100 Hz sine through BPF centre=1000 Hz: rejected") {
+        auto *g = build(100.0f, 1000.0f, 2.0);
+        auto last = render_settled(g, kSettle, kFrames);
+        CHECK(peak_abs(last) < 0.5f);
+        rt_graph_destroy(g);
+    }
+}
+
+TEST_CASE("Notch rejects centre-tuned sine and passes off-band sine") {
+    constexpr int kSettle = 6;
+    auto build = [](float sine_hz, float centre_hz, double q) {
+        auto *g = rt_graph_create(4, kFrames);
+        REQUIRE(g != nullptr);
+        rt_graph_add_node(g, 0, 1);
+        rt_graph_set_control(g, 0, 0, sine_hz);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        rt_graph_add_node(g, 1, 19);                      // Notch
+        rt_graph_set_control(g, 1, 0, centre_hz);
+        rt_graph_set_control(g, 1, 1, q);
+        rt_graph_add_node(g, 2, 2);
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+        return g;
+    };
+
+    SUBCASE("1000 Hz sine through Notch centre=1000 Hz: heavily attenuated") {
+        auto *g = build(1000.0f, 1000.0f, 8.0);
+        auto last = render_settled(g, kSettle, kFrames);
+        CHECK(peak_abs(last) < 0.3f);
+        rt_graph_destroy(g);
+    }
+    SUBCASE("100 Hz sine through Notch centre=1000 Hz: passes through") {
+        auto *g = build(100.0f, 1000.0f, 8.0);
+        auto last = render_settled(g, kSettle, kFrames);
+        CHECK(peak_abs(last) > 0.7f);
+        rt_graph_destroy(g);
+    }
 }
 
 // ----------------------------------------------------------------

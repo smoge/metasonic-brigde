@@ -123,6 +123,30 @@ envPluckGraph = runSynth $ do
   scale <- gain amped 0.5
   out 0 scale
 
+-- | Intermodulation showcase: a pulse oscillator whose width is
+-- modulated by a slow triangle LFO (PWM), filtered through a
+-- band-pass whose cutoff is swept by a separate sine LFO (filter
+-- sweep). Both new ugen families exercise their modulation handle:
+-- 'pulseOsc' takes audio-rate width input, 'bpf' takes audio-rate
+-- cutoff input.
+intermodGraph :: SynthGraph
+intermodGraph = runSynth $ do
+  -- LFO 1 (PWM): triangle at 0.7 Hz, scaled+offset to [0.15, 0.85]
+  -- so the pulse never fully collapses to silence at either extreme.
+  lfo1   <- triOsc 0.7 0.0
+  lfo1s  <- gain lfo1 0.35      -- ±0.35
+  width  <- add  lfo1s 0.5      -- [0.15, 0.85]
+  -- LFO 2 (filter sweep): sine at 0.3 Hz, biased to ~ [400, 2000] Hz.
+  lfo2   <- sinOsc 0.3 0.0
+  lfo2s  <- gain lfo2 800.0     -- ±800 Hz
+  cutoff <- add  lfo2s 1200.0   -- [400, 2000]
+  -- Voice: 220 Hz pulse with the modulated width.
+  voice  <- pulseOsc 220.0 0.0 width
+  -- BPF with audio-rate cutoff and a moderately resonant Q.
+  filt   <- bpf voice cutoff 4.0
+  master <- gain filt 0.4
+  out 0 master
+
 -- | Captured Connections + control indices for a poly synth template
 -- whose voice / CC / pitch-bend inputs the live-MIDI demo runner
 -- needs to bind. Each tuple is @(target_node, control_index)@; the
@@ -294,6 +318,8 @@ demoTable =
          (SingleGraph fmGraph)
   , Demo "env-pluck" "Plucked-tone envelope (Env → Gain × SinOsc → Out)"
          (SingleGraph envPluckGraph)
+  , Demo "im"        "Intermodulation showcase (PulseOsc-PWM → BPF-sweep → Out)"
+         (SingleGraph intermodGraph)
   , Demo "send-return"
          "Send/return (voice → BusOut 7 │ fx: BusIn 7 → LPF → Out)"
          (MultiTemplate sendReturnDemo)

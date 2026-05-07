@@ -195,6 +195,34 @@ data NodeKind
     -- 'controls[1]' (the target) and downstream consumers read the
     -- smoothed sample-by-sample output. See Note
     -- [Per-node smooth state] in @tinysynth/rt_graph.cpp@.
+  | KPulseOsc
+    -- ^ Bandwidth-limited pulse oscillator (wraps Q's
+    -- @q::pulse_osc@). Audio inputs in declared order:
+    -- @[freq, phase, width]@. Controls @[freq_default,
+    -- phase_default, width_default]@. The width input is the
+    -- intermodulation primitive: drive it with an LFO for classic
+    -- PWM. Width is in [0, 1] (0.5 = square). Phase is initial-only
+    -- (consulted at first sample, like 'KSinOsc' \/ 'KSawOsc').
+  | KTriOsc
+    -- ^ Bandwidth-limited triangle oscillator (wraps Q's
+    -- @q::triangle_osc@). Same input shape as 'KSinOsc' \/ 'KSawOsc':
+    -- @[freq, phase]@. The triangle's stateless waveshape pairs
+    -- well with FM via the freq input.
+  | KHPF
+    -- ^ High-pass biquad (wraps Q's @q::highpass@). Same input
+    -- shape as 'KLPF': @[signal, cutoff, q]@. cutoff in Hz,
+    -- q is the resonance. Audio-rate cutoff is the intermodulation
+    -- handle: drive it with an LFO for filter sweeps.
+  | KBPF
+    -- ^ Band-pass biquad (wraps Q's @q::bandpass_cpg@, the
+    -- constant-peak-gain variant favoured for music). Same input
+    -- shape as 'KLPF': @[signal, cutoff, q]@. q controls bandwidth
+    -- (higher q = narrower band). Audio-rate cutoff sweeps for
+    -- wah-style modulation.
+  | KNotch
+    -- ^ Notch biquad (wraps Q's @q::notch@). Same input shape as
+    -- 'KLPF': @[signal, cutoff, q]@. Useful for hum removal and
+    -- spectral notching.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -314,6 +342,22 @@ kindSpec = \case
   -- Stateful (the smoother carries low1/low2 history across blocks)
   -- so the floor is SampleRate.
   KSmooth       -> KindSpec 14 SampleRate  1 2 "smooth"
+  -- Pulse oscillator: phase accumulator + per-sample width
+  -- application via q::pulse_osc. 3 audio inputs (freq, phase,
+  -- width), 3 controls [freq_default, phase_default, width_default].
+  -- Stateful (the phase iterator carries the integer-phase
+  -- accumulator across blocks), so the floor is SampleRate.
+  KPulseOsc     -> KindSpec 15 SampleRate  3 3 "pulseOsc"
+  -- Triangle oscillator: stateless waveshape over a phase iterator.
+  -- Same shape as KSinOsc/KSawOsc. SampleRate floor for the same
+  -- reason — the phase accumulator is per-sample.
+  KTriOsc       -> KindSpec 16 SampleRate  2 2 "triOsc"
+  -- Biquad family: signal_in + cutoff + q. Same shape as KLPF
+  -- (3 audio inputs, 2 controls [cutoff, q]). SampleRate floor
+  -- because the biquad carries IIR state per sample.
+  KHPF          -> KindSpec 17 SampleRate  3 2 "hpf"
+  KBPF          -> KindSpec 18 SampleRate  3 2 "bpf"
+  KNotch        -> KindSpec 19 SampleRate  3 2 "notch"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to the

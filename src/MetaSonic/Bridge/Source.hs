@@ -37,10 +37,15 @@ module MetaSonic.Bridge.Source
     -- $combinators
     sinOsc
   , sawOsc
+  , pulseOsc
+  , triOsc
   , noiseGen
   , out
   , gain
   , lpf
+  , hpf
+  , bpf
+  , notch
   , add
   , env
   , busOut
@@ -365,6 +370,23 @@ data UGen
     -- ^ Sine oscillator: frequency, initial phase.
   | SawOsc !Connection !Connection
     -- ^ Bandlimited sawtooth oscillator: frequency, initial phase.
+  | PulseOsc !Connection !Connection !Connection
+    -- ^ Bandlimited pulse oscillator: frequency, initial phase,
+    -- pulse width in [0, 1]. The width input is the intermodulation
+    -- primitive — drive it with an LFO for classic PWM. Width 0.5
+    -- = square wave.
+  | TriOsc !Connection !Connection
+    -- ^ Bandlimited triangle oscillator: frequency, initial phase.
+    -- Same shape as 'SinOsc' \/ 'SawOsc'.
+  | HPF !Connection !Connection !Connection
+    -- ^ High-pass biquad: signal in, cutoff frequency, Q factor.
+    -- Mirrors 'LPF'.
+  | BPF !Connection !Connection !Connection
+    -- ^ Band-pass biquad (constant-peak-gain variant): signal in,
+    -- centre frequency, Q factor (higher Q = narrower band).
+  | Notch !Connection !Connection !Connection
+    -- ^ Notch (band-reject) biquad: signal in, centre frequency,
+    -- Q factor.
   | NoiseGen
     -- ^ White noise generator. No connections; pure source.
   | LPF !Connection !Connection !Connection
@@ -639,6 +661,36 @@ sinOsc freq phase = insertNodeC "sinOsc" (SinOsc freq phase)
 sawOsc :: Connection -> Connection -> SynthM Connection
 sawOsc freq phase = insertNodeC "sawOsc" (SawOsc freq phase)
 
+-- | Bandlimited pulse oscillator with pulse-width modulation.
+-- Wraps Q's @q::pulse_osc@. Width is in [0, 1], where 0.5 = square.
+-- Driving @width@ from another oscillator (e.g. a slow @sinOsc@) is
+-- the classic PWM patch — the width input is the intermodulation
+-- primitive on this kind.
+pulseOsc :: Connection -> Connection -> Connection -> SynthM Connection
+pulseOsc freq phase width =
+  insertNodeC "pulseOsc" (PulseOsc freq phase width)
+
+-- | Bandlimited triangle oscillator. Same input shape as 'sinOsc' \/
+-- 'sawOsc' (frequency, initial phase). Wraps Q's @q::triangle_osc@.
+triOsc :: Connection -> Connection -> SynthM Connection
+triOsc freq phase = insertNodeC "triOsc" (TriOsc freq phase)
+
+-- | High-pass biquad: signal, cutoff frequency, Q factor. Mirrors
+-- 'lpf'. Audio-rate cutoff is the modulation handle.
+hpf :: Connection -> Connection -> Connection -> SynthM Connection
+hpf sig freq q = insertNodeC "hpf" (HPF sig freq q)
+
+-- | Band-pass biquad (constant-peak-gain): signal, centre frequency,
+-- Q factor. Higher Q = narrower band. Audio-rate cutoff sweeps for
+-- wah-style modulation.
+bpf :: Connection -> Connection -> Connection -> SynthM Connection
+bpf sig freq q = insertNodeC "bpf" (BPF sig freq q)
+
+-- | Notch (band-reject) biquad: signal, centre frequency, Q factor.
+-- Useful for hum removal and spectral notching.
+notch :: Connection -> Connection -> Connection -> SynthM Connection
+notch sig freq q = insertNodeC "notch" (Notch sig freq q)
+
 -- | White noise generator. No inputs.
 noiseGen :: SynthM Connection
 noiseGen = insertNodeC "noiseGen" NoiseGen
@@ -892,6 +944,12 @@ ugenView :: UGen -> UGenView
 ugenView = \case
   SinOsc f p   -> UGenView KSinOsc   [f, p]    [connDefault f, connDefault p]
   SawOsc f p   -> UGenView KSawOsc   [f, p]    [connDefault f, connDefault p]
+  PulseOsc f p w ->
+    UGenView KPulseOsc [f, p, w] [connDefault f, connDefault p, connDefault w]
+  TriOsc f p   -> UGenView KTriOsc   [f, p]    [connDefault f, connDefault p]
+  HPF s f q    -> UGenView KHPF      [s, f, q] [connDefault f, connDefault q]
+  BPF s f q    -> UGenView KBPF      [s, f, q] [connDefault f, connDefault q]
+  Notch s f q  -> UGenView KNotch    [s, f, q] [connDefault f, connDefault q]
   NoiseGen     -> UGenView KNoiseGen []        []
   LPF s f q    -> UGenView KLPF      [s, f, q] [connDefault f, connDefault q]
   Gain s a     -> UGenView KGain     [s, a]    [connDefault a]
@@ -1022,6 +1080,11 @@ dependencies = \case
   Delay _ s t      -> deps [s, t]
   SinOsc a b       -> deps [a, b]
   SawOsc a b       -> deps [a, b]
+  PulseOsc a b c   -> deps [a, b, c]
+  TriOsc a b       -> deps [a, b]
+  HPF a b c        -> deps [a, b, c]
+  BPF a b c        -> deps [a, b, c]
+  Notch a b c      -> deps [a, b, c]
   NoiseGen         -> []
   LPF a b c        -> deps [a, b, c]
   Gain a b         -> deps [a, b]
