@@ -37,6 +37,7 @@ library:
     - MetaSonic.Bridge.Compile
     - MetaSonic.Bridge.Templates
     - MetaSonic.Bridge.FFI
+    - MetaSonic.Bridge.MidiDemo
     - MetaSonic.Visualize.Trace
     - MetaSonic.Visualize.TUI
 

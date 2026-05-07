@@ -5,9 +5,10 @@ module Main where
 
 import           Control.DeepSeq            (force)
 import           Control.Exception          (evaluate, finally)
-import           Control.Monad              (forM_)
+import           Control.Monad              (forM_, replicateM)
 import           Data.Char                  (toLower)
 import           Data.List                  (find, intercalate)
+import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
 import           System.Environment         (getArgs, getProgName)
 import           System.Exit                (die)
@@ -15,8 +16,12 @@ import           System.Exit                (die)
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR
+import           MetaSonic.Bridge.MidiDemo  (CCMapping (..),
+                                             PitchBendBinding (..),
+                                             VoiceMapping (..), withMidiDemo)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
+import           MetaSonic.Types            (NodeIndex (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
 import           MetaSonic.Visualize.TUI    (launchInspector)
@@ -118,6 +123,42 @@ envPluckGraph = runSynth $ do
   scale <- gain amped 0.5
   out 0 scale
 
+-- | Captured Connections + control indices for a poly synth template
+-- whose voice / CC / pitch-bend inputs the live-MIDI demo runner
+-- needs to bind. Each tuple is @(target_node, control_index)@; the
+-- runner resolves @target_node@ to a dense 'NodeIndex' post-compile
+-- via 'connectionNodeID' + 'resolveNodeIndex'.
+data PolyMidiBindings = PolyMidiBindings
+  { pmbFreq      :: !(Connection, Int)
+  , pmbGate      :: !(Connection, Int)
+  , pmbVelocity  :: !(Maybe (Connection, Int))
+  , pmbCCs       :: ![(Word8, Connection, Int, Float, Float)]
+    -- ^ @(cc_number, target, control_index, min, max)@.
+  , pmbPitchBend :: !(Maybe (Connection, Int, Float))
+    -- ^ @(target, control_index, semitone_range)@.
+  }
+
+-- A poly synth template for the live-MIDI demo. The producer thread
+-- (driven by tinysynth/midi_demo.cpp) writes per-voice freq into the
+-- sine's freq control on note-on, gate=1 into the env's gate control,
+-- and CC 7 into the master gain's amount. Pitch-bend rewrites the
+-- sine's freq control. Note-offs trigger the env's release segment
+-- via VoiceAllocator, which delivers a click-free fade.
+midiPolySynth :: SynthM PolyMidiBindings
+midiPolySynth = do
+  osc    <- sinOsc 220.0 0.0
+  e      <- env 0.0 0.005 0.2 0.5 0.1
+  amped  <- gain osc e
+  master <- gain amped 0.3
+  _      <- out 0 master
+  pure PolyMidiBindings
+    { pmbFreq      = (osc, 0)
+    , pmbGate      = (e,   0)
+    , pmbVelocity  = Nothing
+    , pmbCCs       = [(7, master, 0, 0.0, 1.0)]
+    , pmbPitchBend = Just (osc, 0, 2.0)
+    }
+
 {- Note [sendReturnDemo: cross-template send/return]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The first and (so far) only multi-template demo. Two MetaDefs share
@@ -208,6 +249,14 @@ data DemoBody
     -- compileTemplateGraph, loads via loadTemplateGraph. The
     -- compiler picks template execution order to match the
     -- topological sort over inter-template bus precedence.
+  | MidiPoly Int (SynthM PolyMidiBindings)
+    -- ^ Live-MIDI poly synth (Phase 3 closing piece). The 'Int' is
+    -- polyphony; the builder returns the bindings the runner needs
+    -- to wire MIDI input to per-voice controls. Compiles via
+    -- 'compileTemplateGraph' as a single-template ensemble, sets
+    -- polyphony, pre-warms the per-template pool, then opens a
+    -- 'MetaSonic.Bridge.MidiDemo.MidiDemo' session around the
+    -- realtime audio bracket.
 
 data Demo = Demo
   { demoKey   :: String
@@ -242,6 +291,9 @@ demoTable =
   , Demo "send-return"
          "Send/return (voice → BusOut 7 │ fx: BusIn 7 → LPF → Out)"
          (MultiTemplate sendReturnDemo)
+  , Demo "midi-poly"
+         "Live MIDI poly synth (8 voices; CC7 → master, pitch-bend ±2)"
+         (MidiPoly 8 midiPolySynth)
   ]
 
 --------------------------------------------------------------------------------
@@ -368,8 +420,9 @@ main = do
 -- Note [Demo body: single-graph vs multi-template].
 runDemo :: Options -> Demo -> IO ()
 runDemo opts demo = case demoBody demo of
-  SingleGraph    g    -> runSingleDemo   opts demo g
-  MultiTemplate  tpls -> runTemplateDemo opts demo tpls
+  SingleGraph    g          -> runSingleDemo   opts demo g
+  MultiTemplate  tpls       -> runTemplateDemo opts demo tpls
+  MidiPoly       poly build -> runMidiPolyDemo opts demo poly build
 
 -- Single-template demo runner. Identical to the pre-§2.D.3 path:
 -- traceCompile → optional inspector → loadRuntimeGraph → audio.
@@ -446,6 +499,140 @@ runTemplateDemo opts demo tpls = do
                 sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
           runTemplateAudio totalNodes tg
           putStrLn ""
+
+-- Live-MIDI poly synth runner. Compiles the builder as a single-
+-- template graph, sets polyphony, pre-warms the per-template pool
+-- (spawn-then-remove polyphony times so VoiceAllocator finds
+-- Available slots on its first reserve), opens the MIDI demo
+-- session, and hands off to runRealtimeBracket. The bracket waits
+-- for Enter, then closes audio first and the MIDI session second
+-- via withMidiDemo's bracket finalizer.
+runMidiPolyDemo
+  :: Options -> Demo -> Int -> SynthM PolyMidiBindings -> IO ()
+runMidiPolyDemo opts demo poly build = do
+  putBanner (demoLabel demo)
+
+  case optMode opts of
+    InspectOnly -> do
+      putStrLn $ "  Inspector skipped — the live-MIDI demo only "
+              <> "ships an audio runner."
+      putStrLn ""
+    _ -> do
+      let (bindings, sg) = runSynthWith build
+      case compileTemplateGraph [(demoKey demo, sg)] of
+        Left err -> do
+          putStrLn $ "  Compilation error: " <> err
+          putStrLn ""
+        Right tg -> case tgTemplates tg of
+          [tpl] -> case resolveBindings (tplGraph tpl) bindings of
+            Left err -> do
+              putStrLn $ "  Binding resolution failed: " <> err
+              putStrLn ""
+            Right (vm, ccs, mpb) ->
+              runMidiPolyAudio (length (rgNodes (tplGraph tpl)))
+                               poly tg vm ccs mpb
+          _ -> do
+            putStrLn $ "  Internal error: midi-poly compiled to "
+                    <> show (length (tgTemplates tg))
+                    <> " templates (expected exactly 1)."
+            putStrLn ""
+
+-- Resolve the captured Connections in PolyMidiBindings to dense
+-- (NodeIndex, control_index) pairs against the compiled template's
+-- RuntimeGraph. A Param connection or an unknown NodeID is a
+-- programming error in the demo definition; we surface it as a
+-- left-side String rather than crashing.
+resolveBindings
+  :: RuntimeGraph
+  -> PolyMidiBindings
+  -> Either String (VoiceMapping, [CCMapping], Maybe PitchBendBinding)
+resolveBindings rg b = do
+  (fnode, fctl) <- resolvePair "freq"     (pmbFreq b)
+  (gnode, gctl) <- resolvePair "gate"     (pmbGate b)
+  velMaybe <- traverse (resolvePair "velocity") (pmbVelocity b)
+  ccs <- traverse resolveCC (pmbCCs b)
+  mpb <- traverse resolvePB (pmbPitchBend b)
+  pure ( VoiceMapping
+           { vmFreqNode = fnode
+           , vmFreqCtl  = fctl
+           , vmGateNode = gnode
+           , vmGateCtl  = gctl
+           , vmVelocity = velMaybe
+           }
+       , ccs
+       , mpb
+       )
+  where
+    resolvePair :: String -> (Connection, Int) -> Either String (NodeIndex, Int)
+    resolvePair label (c, ctl) = case connectionNodeID c of
+      Nothing  -> Left $ label <> " binding is a Param, not a node output"
+      Just nid -> case resolveNodeIndex rg nid of
+        Nothing -> Left $ label <> " node " <> show nid
+                       <> " not found in compiled template"
+        Just ni -> Right (ni, ctl)
+
+    resolveCC :: (Word8, Connection, Int, Float, Float)
+              -> Either String CCMapping
+    resolveCC (cc, c, ctl, mn, mx) = do
+      (ni, _) <- resolvePair ("CC " <> show cc) (c, ctl)
+      pure CCMapping
+        { ccNumber = cc
+        , ccNode   = ni
+        , ccCtl    = ctl
+        , ccMin    = mn
+        , ccMax    = mx
+        }
+
+    resolvePB :: (Connection, Int, Float)
+              -> Either String PitchBendBinding
+    resolvePB (c, ctl, st) = do
+      (ni, _) <- resolvePair "pitch-bend" (c, ctl)
+      pure PitchBendBinding
+        { pbNode      = ni
+        , pbCtl       = ctl
+        , pbSemitones = st
+        }
+
+-- Wire the loaded template graph + MIDI bindings to the audio bracket.
+-- 'capacity' is a soft hint for the runtime's node-vector pre-alloc.
+runMidiPolyAudio
+  :: Int                       -- ^ runtime capacity hint
+  -> Int                       -- ^ polyphony
+  -> TemplateGraph
+  -> VoiceMapping
+  -> [CCMapping]
+  -> Maybe PitchBendBinding
+  -> IO ()
+runMidiPolyAudio capacity poly tg vm ccs mpb =
+  withRTGraph capacity demoMaxFrames $ \rt -> do
+    loadTemplateGraph rt tg
+
+    -- Set the per-template polyphony cap and pre-warm the pool so
+    -- VoiceAllocator's first reserve finds an Available slot. This
+    -- mirrors make_graph_with_polyphony in the C++ tests: remove
+    -- the auto-spawned instance 0, spawn `poly` instances, then
+    -- remove all of them.
+    let cTid = 0
+    c_rt_graph_template_set_polyphony rt cTid (fromIntegral poly)
+    c_rt_graph_instance_remove rt 0
+    spawned <- replicateM poly (c_rt_graph_template_instance_add rt cTid)
+    mapM_ (c_rt_graph_instance_remove rt) spawned
+
+    putStrLn $ "  Polyphony=" <> show poly
+            <> ", template_id=" <> show cTid
+            <> "; opening MIDI session..."
+
+    withMidiDemo rt 0 poly Nothing vm ccs mpb 0xFFFF $ \mh ->
+      case mh of
+        Nothing -> do
+          putStrLn $ "  Failed to open MIDI session "
+                  <> "(allocation or thread spawn failed)."
+        Just _  -> do
+          putStrLn $ "  MIDI session live. If a controller is "
+                  <> "plugged in, play notes / send CCs / pitch-bend."
+          putStrLn $ "  No-MIDI environments still run cleanly — "
+                  <> "the worker stays idle and audio remains silent."
+          runRealtimeBracket rt
 
 inspectTrace :: CompileTrace -> IO ()
 inspectTrace = launchInspector
