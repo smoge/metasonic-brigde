@@ -9,6 +9,7 @@ add_library(tinysynth_rt STATIC
     tinysynth/rt_graph.cpp
     tinysynth/voice_allocator.cpp
     tinysynth/midi_voice_processor.cpp
+    tinysynth/midi_demo.cpp
     vendor/q/q_io/src/audio_device.cpp
     vendor/q/q_io/src/audio_stream.cpp
     vendor/q/q_io/src/midi_device.cpp
@@ -77,6 +78,7 @@ if(METASONIC_BUILD_TESTS)
         tests/rt_graph_test.cpp
         tests/voice_allocator_test.cpp
         tests/midi_voice_processor_test.cpp
+        tests/midi_demo_test.cpp
     )
 
     target_link_libraries(tinysynth_tests PRIVATE
