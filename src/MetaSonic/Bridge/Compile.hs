@@ -358,16 +358,29 @@ Haskell-side representation before the FFI boundary.
 
 A RuntimeNode carries:
 
-  rnIndex      — dense position in the array; execution order
-                 equals storage order equals this index
-  rnOriginalID — the symbolic NodeID from which this node was
-                 compiled; retained only for diagnostics, never
-                 used by the runtime
-  rnKind       — dispatches to the correct C++ process function
-  rnInputs     — dense input references; each RFrom points to
-                 a node earlier in the array (guaranteed by
-                 topological ordering)
-  rnControls   — default control values, sent to C++ at load time
+  rnIndex          — dense position in the array; execution order
+                     equals storage order equals this index
+  rnOriginalID     — the symbolic NodeID from which this node was
+                     compiled; retained only for diagnostics, never
+                     used by the runtime
+  rnKind           — dispatches to the correct C++ process function
+  rnInputs         — dense input references; each RFrom points to
+                     a node earlier in the array (guaranteed by
+                     topological ordering)
+  rnControls       — default control values, sent to C++ at load time
+  rnOutputUse      — Step B-Light analysis: whether this node's output
+                     buffer is consumed only within its region
+                     ('RegionLocal'), escapes to a different region
+                     ('RegionEscapes'), or doesn't exist at all
+                     ('NoOutput' for sinks). Pure analysis, never
+                     crosses the FFI. See Note [Output-use
+                     classification].
+  rnConsumerCount  — number of direct 'FromNode' input references to
+                     this node across 'rgNodes' (multiplicity, not
+                     distinct nodes — @add x x@ counts as 2).
+                     Combined with 'rnOutputUse' it forms the
+                     Step-C single-edge fusion gate. See Note
+                     [Output-use classification].
 
 A RuntimeInput is either:
 
@@ -419,11 +432,15 @@ data RuntimeNode = RuntimeNode
     -- are formed; pure analysis, never crosses the FFI.
     -- See Note [Output-use classification].
   , rnConsumerCount :: !Int
-    -- ^ Number of direct 'FromNode' consumers across 'rgNodes'.
-    -- 'RegionLocal' is a *gate* for fusion (no cross-region
-    -- escape), not a *license* — destructive single-edge fusion
-    -- additionally needs to know there is exactly one consumer.
-    -- Step C's first-pass predicate is therefore
+    -- ^ Number of direct 'FromNode' input references to this node
+    -- across 'rgNodes'. This is a multiplicity count, not a count
+    -- of distinct consumer nodes: @add x x@ contributes 2, since
+    -- the producer's stateful kernel must not be re-executed for
+    -- the second read. 'RegionLocal' is a *gate* for fusion (no
+    -- cross-region escape), not a *license* — destructive single-
+    -- edge fusion additionally needs to know there is exactly one
+    -- read of the output. Step C's first-pass predicate is
+    -- therefore
     --
     -- > rnOutputUse == RegionLocal && rnConsumerCount == 1
     --
