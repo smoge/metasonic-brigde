@@ -686,6 +686,117 @@ struct GraphAudioStream : q::audio_stream {
 
 } // namespace
 
+/* Note [Thread safety contract]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Today (post-§2.E) the C ABI assumes a "single-thread mutator"
+contract: while the realtime audio callback is running, the audio
+thread is the only thread allowed to touch RTGraph state. Other
+threads may construct, configure, mutate, or tear down the graph
+only between rt_graph_stop_audio and the next rt_graph_start_audio
+(or before any start, or after the final stop).
+
+This is enforced *by convention*, not by locks. Existing callers
+obey it by sequencing all graph construction before
+rt_graph_start_audio and not modifying state during the realtime
+bracket. Tests run offline (no audio thread), so the question does
+not arise.
+
+The voice allocator (Phase 3.1) and Q MIDI input (Phase 3.2) will
+break the convention: they need to spawn, release, and set-control
+on instances while audio is live. That requires a new mechanism
+(see Note [Thread safety: Phase 3 gap]). Until that mechanism lands,
+*none of the construction or control-thread entries below are safe
+to call concurrently with rt_graph_start_audio's callback*.
+
+Per-entry classification — each ABI function falls into exactly
+one of these categories:
+
+  Construction-only — mutates shared structure (template specs,
+    instance vectors, bus pool sizing) that the audio callback
+    iterates. Race-free only when the callback is not running.
+      rt_graph_template_add
+      rt_graph_template_add_node
+      rt_graph_template_set_default
+      rt_graph_template_connect
+      rt_graph_add_node          (template-0 shim)
+      rt_graph_set_control       (template-0 shim — see note below)
+      rt_graph_connect           (template-0 shim)
+
+  Control-thread (realtime-unsafe today) — mutates per-instance
+    state and/or the instance vector. Audio thread reads and writes
+    the same data structures from the callback. Today: call only
+    when audio is stopped. Phase 3: must become callable concurrently
+    with the callback via the deferred mechanism.
+      rt_graph_instance_add
+      rt_graph_template_instance_add
+      rt_graph_instance_remove
+      rt_graph_instance_release
+      rt_graph_instance_set_control
+      rt_graph_set_control       (legacy: same posture; see below)
+
+  Note: rt_graph_set_control is a template-0 shim that *during
+  construction* writes a NodeSpec field (the spec.default_controls
+  values referenced through the instance, on first set), and
+  *afterwards* writes per-instance controls. The current code path
+  (rt_graph_instance_set_control) does only the per-instance write
+  and may grow the bus pool as a side effect on Out/BusOut/BusIn/
+  BusInDelayed control 0. Pool growth is the truly racy step — the
+  bus vectors are read by the audio callback. Today this is safe
+  only because every existing caller sets bus controls during
+  construction.
+
+  Read-only introspection — reads small scalar or std::optional
+    fields. Safe to call concurrently with the callback in the
+    sense that it cannot crash, but the value may be stale or torn
+    (the callback may flip a slot's optional via the §2.E auto-free
+    path). Do not use for synchronization.
+      rt_graph_kind_supported   (pure function — always safe)
+      rt_graph_template_count
+      rt_graph_instance_count
+      rt_graph_instance_alive
+      rt_graph_instance_status
+
+  Bus read — copies samples out of server.output_buses. The audio
+    callback writes to those vectors during process_graph. Bus pool
+    *resizing* is construction-only (see above), so there is no
+    container resize race; only sample contents may be torn. Useful
+    for tests and offline rendering; not for sample-accurate
+    sampling alongside live audio.
+      rt_graph_read_bus
+      rt_graph_instance_read_bus
+
+  Audio lifecycle — open and close the realtime stream. Each is
+    expected to be called once per session and never concurrently
+    with itself or with the other.
+      rt_graph_start_audio
+      rt_graph_stop_audio
+      rt_graph_wait_started   (polls an std::atomic<bool>; safe)
+
+  Render — runs process_graph for one block.
+      rt_graph_process — single-thread only. While audio is running
+        the callback runs process_graph from its own thread; a
+        concurrent call from any other thread is UB. Used by
+        offline tests and the demo's pre-audio warm-up.
+
+  Allocation / reset — cooperate with the audio lifecycle.
+      rt_graph_create — no concurrency by construction (caller does
+        not yet hold the handle).
+      rt_graph_destroy — calls stop_audio_stream first, joining the
+        audio thread before deleting the RTGraph. Caller must ensure
+        no other thread holds the handle.
+      rt_graph_clear — same: joins the audio thread, then resets
+        state in the now-quiescent graph.
+
+The §2.E auto-free path (process_graph reclaiming a Releasing slot
+that has gone silent for kReleaseSilenceBlocks) runs entirely on
+the audio thread and mutates only the slot's std::optional. Other
+threads that have a stored instance_id from before may observe the
+liveness change via instance_alive / instance_status; they must not
+assume a previously-live id stays live across blocks. This is the
+same observable model the voice allocator will need to handle when
+voices auto-free between note-on and note-off.
+*/
+
 /* Note [RTGraph ownership]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 RTGraph is the sole owner of runtime state.
