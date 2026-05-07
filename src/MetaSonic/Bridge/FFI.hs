@@ -587,6 +587,15 @@ loadRuntimeGraph g rg = do
               (cPortIndex (PortIndex i))
           RConst _ ->
             pure ()
+          RFused _ ->
+            -- Step C: 'fuseRuntimeGraph' produces RFused; the legacy
+            -- single-template loader does not yet teach the C++ side
+            -- about it. A future Step C (d) commit will add an FFI
+            -- entry that ships fused inputs across; until then,
+            -- callers wanting fusion must use the dedicated fused
+            -- loader path. Treating RFused as a no-op here keeps
+            -- 'compileRuntimeGraph' (unfused) safe for this loader.
+            pure ()
 
     addRegion :: CInt -> RuntimeRegion -> IO ()
     addRegion = addRegionTo g
@@ -688,6 +697,12 @@ loadTemplateGraph g tg = do
                 (cNodeIndex (rnIndex node))
                 (cPortIndex (PortIndex i))
             RConst _ ->
+              pure ()
+            RFused _ ->
+              -- See the matching no-op note in 'loadRuntimeGraph'.
+              -- Step C's fused inputs will get a dedicated FFI entry;
+              -- the unfused loader treats them as silent so it stays
+              -- robust if a fused graph is ever fed through it.
               pure ()
       -- Pass 3: register the region overlay for this template.
       -- See Note [Region fallback] in rt_graph.cpp.

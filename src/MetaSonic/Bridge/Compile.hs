@@ -24,6 +24,7 @@
 module MetaSonic.Bridge.Compile
   ( -- * Runtime representation
     RuntimeInput (..)
+  , FusedInput (..)
   , RuntimeNode (..)
   , RuntimeRegion (..)
   , RuntimeGraph (..)
@@ -393,15 +394,70 @@ correspond to an entire fused region rather than a single
 source node. The runtime does not distinguish the two cases.
 -}
 
--- | A runtime input reference: either a dense index into the
--- node array, or a compile-time constant.
+-- | A runtime input reference. The first two variants are produced
+-- by 'compileRuntimeGraph' as part of dense lowering. 'RFused' is
+-- produced by Step C's 'fuseRuntimeGraph' rewrite to redirect a
+-- consumer's input through a transformation that absorbs an elided
+-- producer's per-block work.
 --
--- See Note [Dense runtime representation].
+-- See Note [Dense runtime representation] and Note [Fused inputs].
 data RuntimeInput
   = RFrom  !NodeIndex !PortIndex
     -- ^ Read from node at this dense index, this port.
   | RConst !Double
     -- ^ Compile-time constant (was a 'Literal' in the IR).
+  | RFused !FusedInput
+    -- ^ Read from a fused source: an inline transform that the
+    -- runtime evaluates in place of materialising the elided
+    -- producer's output buffer. See 'FusedInput'.
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
+{- Note [Fused inputs]
+~~~~~~~~~~~~~~~~~~~~~~
+'FusedInput' carries the transform that an elided producer would
+have applied if it were materialising its output buffer. The first
+shipping variant is 'FScaleFrom', emitted by single-edge fusion of a
+scalar 'Gain':
+
+  before fusion:
+    src ──▶ Gain(signal=src, gain control 0 = k) ──▶ consumer
+            (consumer.input[i] = RFrom gain 0)
+
+  after fusion:
+    src ──▶ [Gain elided] ──▶ consumer
+            (consumer.input[i] = RFused (FScaleFrom src srcPort gain 0))
+
+The Gain stays in 'rgNodes' with 'rnElided = True' so its 'NodeIndex'
+remains addressable. 'rt_graph_instance_set_control(gain, 0, x)' still
+mutates the live control; the runtime reads it through the fused
+input at consumer-evaluation time, exactly as 'process_gain''s
+controls-fallback branch would have.
+
+Equivalence discipline: the fused evaluation must reproduce the
+unfused output sample-for-sample. 'process_gain''s scalar branch
+casts the 'double' control value to 'float' before multiplying the
+'float' source sample, so 'FScaleFrom' must do the same on the
+runtime side.
+-}
+
+-- | Fused input transforms. One constructor per fusion shape; the
+-- runtime dispatches on the constructor and reads the live state
+-- of the referenced node (controls etc.) at evaluation time.
+data FusedInput
+  = FScaleFrom
+      { fiSourceNode   :: !NodeIndex
+        -- ^ The non-elided producer feeding the fused chain.
+      , fiSourcePort   :: !PortIndex
+        -- ^ Port on the producer to read.
+      , fiScaleNode    :: !NodeIndex
+        -- ^ The elided 'KGain' node whose control supplies the scale.
+        --   Kept addressable for 'set_control' / realtime control writes.
+      , fiScaleControl :: !ControlIndex
+        -- ^ Control slot on the elided Gain (always 0 today; declared
+        --   explicitly so the structure survives future Gain shape
+        --   changes).
+      }
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -448,6 +504,16 @@ data RuntimeNode = RuntimeNode
     -- 'RegionLocal' but are ineligible for narrow single-edge
     -- rewriting; whole-region fusion can pick them up later.
     -- See Note [Output-use classification].
+  , rnElided :: !Bool
+    -- ^ Step C: whether the runtime should skip this node's
+    -- per-block kernel because its work has been absorbed into a
+    -- fused consumer input. Set only by 'fuseRuntimeGraph'; always
+    -- 'False' on graphs from 'compileRuntimeGraph'. Elided nodes
+    -- remain in 'rgNodes' so that 'NodeIndex' identity, control
+    -- defaults, and 'rt_graph_instance_set_control' targeting the
+    -- elided node all keep working — the only thing that changes
+    -- is that 'process_instance' skips dispatch for the elided
+    -- slot. See Note [Fused inputs].
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -683,6 +749,10 @@ compileRuntimeGraph ir = do
         , rnControls      = irControls node
         , rnOutputUse     = classify ix kind
         , rnConsumerCount = consumerCount ix
+        , rnElided        = False
+          -- compileRuntimeGraph never elides; only fuseRuntimeGraph
+          -- (Step C) flips this to True for nodes absorbed by a
+          -- fused consumer input. See Note [Fused inputs].
         }
 
     -- Rewrite a symbolic InputConn to a dense RuntimeInput.

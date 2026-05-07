@@ -1027,6 +1027,20 @@ unitTests = testGroup "Unit tests"
               length [() | RegionLocal   <- uses] @?= 2
               length [() | RegionEscapes <- uses] @?= 0
 
+      , -- Step C invariant: 'compileRuntimeGraph' never sets
+        -- 'rnElided'. Only 'fuseRuntimeGraph' (added later in Step
+        -- C) flips the bit. This pins the contract that the unfused
+        -- compile path is unchanged in observable behaviour by
+        -- Step B's machinery additions.
+        testCase "compileRuntimeGraph leaves rnElided False on every node" $ do
+          let g = runSynth $ do
+                o <- sinOsc 440.0 0.0
+                a <- gain o (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> all (not . rnElided) (rgNodes rg) @?= True
+
       , -- Step C precondition: pin Gain's compiled shape so the
         -- single-edge fusion rewrite has something stable to match
         -- against. For 'gain o (Param k)':

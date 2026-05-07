@@ -291,6 +291,12 @@ fmtDense n =
 fmtRtInput :: RuntimeInput -> String
 fmtRtInput (RFrom ix (PortIndex p)) = "[" <> showNodeIndex ix <> "]:" <> show p
 fmtRtInput (RConst x)               = show x
+fmtRtInput (RFused (FScaleFrom s (PortIndex p) g (ControlIndex c))) =
+  -- Step C scalar Gain fusion: src × gain.controls[c]. Renders as
+  -- "[s]:p × [g].c[c]" so the inspector shows which producer is
+  -- being scaled and by which elided Gain.
+  "[" <> showNodeIndex s <> "]:" <> show p
+    <> " × [" <> showNodeIndex g <> "].c[" <> show c <> "]"
 
 drawDetailPanel :: AppState -> Widget Name
 drawDetailPanel st =
