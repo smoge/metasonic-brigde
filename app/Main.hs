@@ -3,21 +3,23 @@
 
 module Main where
 
-import           Control.DeepSeq           (force)
-import           Control.Exception         (evaluate, finally)
-import           Control.Monad             (forM_)
-import           Data.Char                 (toLower)
-import           Data.List                 (find, intercalate)
-import           System.Environment        (getArgs, getProgName)
-import           System.Exit               (die)
+import           Control.DeepSeq            (force)
+import           Control.Exception          (evaluate, finally)
+import           Control.Monad              (forM_)
+import           Data.Char                  (toLower)
+import           Data.List                  (find, intercalate)
+import           Foreign.Ptr                (Ptr)
+import           System.Environment         (getArgs, getProgName)
+import           System.Exit                (die)
 
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
-import           MetaSonic.Visualize.Trace (CompileTrace (..), traceCompile)
+import           MetaSonic.Bridge.Templates
+import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
-import           MetaSonic.Visualize.TUI   (launchInspector)
+import           MetaSonic.Visualize.TUI    (launchInspector)
 
 
 simpleGraph :: SynthGraph
@@ -116,26 +118,131 @@ envPluckGraph = runSynth $ do
   scale <- gain amped 0.5
   out 0 scale
 
-demoTable :: [Demo]
-demoTable =
-  [ Demo "simple"    "Simple (SinOsc → Out)"                           simpleGraph
-  , Demo "chain"     "Chain (SinOsc → Gain → Out)"                     chainGraph
-  , Demo "fanout"    "Fan-out (SinOsc → 2×Gain → 2×Out)"               fanOutGraph
-  , Demo "saw"       "Saw oscillator (SawOsc → Gain → Out)"            sawGraph
-  , Demo "noise"     "White noise (NoiseGen → Gain → Out)"             noiseGraph
-  , Demo "noise-lpf" "Filtered noise (NoiseGen → LPF → Gain → Out)"   noiseLpfGraph
-  , Demo "saw-lpf"   "Resonant bass (SawOsc → LPF → Gain → Out)"      filteredSawGraph
-  , Demo "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"  detunedSawGraph
-  , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"        ringModGraph
-  , Demo "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)" fmGraph
-  , Demo "env-pluck" "Plucked-tone envelope (Env → Gain × SinOsc → Out)" envPluckGraph
+{- Note [sendReturnDemo: cross-template send/return]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The first and (so far) only multi-template demo. Two MetaDefs share
+one Server-global bus pool: the "voice" template writes a vibrato
+saw to bus 7, and the "fx" template reads bus 7, low-pass filters it,
+and routes the result to hardware bus 0. This is the canonical
+"synth + FX send/return" pattern that single-template graphs cannot
+express — putting the LPF inside the voice would couple them, and
+sharing an LPF across N voices is exactly what motivates the
+template-level abstraction.
+
+What this demonstrates concretely:
+
+  - Two SynthGraphs compiled independently into RuntimeGraphs.
+  - compileTemplateGraph derives bus footprints (voice writes {7},
+    fx reads {7}) and topologically sorts: voice precedes fx in
+    'tgTemplates'. The runtime processes templates in that order
+    every block, so by the time fx's BusIn(7) reads, voice's
+    BusOut(7) has already accumulated this block's contribution.
+  - loadTemplateGraph spawns one instance per template
+    automatically, so a typical "one voice + one FX" ensemble works
+    without explicit instance management.
+
+The voice template uses the 'add'/'gain' bias-and-scale idiom from
+fmGraph for vibrato (LFO → ±8 Hz deviation around 110 Hz). The fx
+template is intentionally minimal (just an LPF) — the point is the
+cross-template plumbing, not DSP cleverness.
+-}
+
+sendReturnVoice :: SynthGraph
+sendReturnVoice = runSynth $ do
+  lfo       <- sinOsc 5.0 0.0
+  deviation <- gain lfo 8.0           -- ±8 Hz vibrato depth
+  pitch     <- add 110.0 deviation    -- 110 Hz ± 8 Hz
+  carrier   <- sawOsc pitch 0.0
+  amped     <- gain carrier 0.4       -- attenuate before send
+  busOut 7 amped                      -- → shared send bus 7
+
+sendReturnFx :: SynthGraph
+sendReturnFx = runSynth $ do
+  send     <- busIn 7                 -- read voice's send
+  filtered <- lpf send 800.0 0.7      -- LPF at 800 Hz
+  out 0 filtered                      -- → hardware bus 0
+
+sendReturnDemo :: [(String, SynthGraph)]
+sendReturnDemo =
+  [ ("voice", sendReturnVoice)
+  , ("fx",    sendReturnFx)
   ]
+
+{- Note [Demo body: single-graph vs multi-template]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A demo is either a single SynthGraph (the legacy single-template
+shape, used by every demo before §2.D.3) or a list of named
+SynthGraphs that compileTemplateGraph composes into an ensemble.
+
+The two paths diverge in three places:
+
+  1. Compilation: SingleGraph runs through traceCompile + lowerGraph
+     + compileRuntimeGraph; MultiTemplate runs through
+     compileTemplateGraph (which internally runs lowerGraph +
+     compileRuntimeGraph for each entry, then derives precedence
+     and topo-sorts).
+
+  2. Inspection: SingleGraph plugs into the existing
+     launchInspector / printTraceSummary path. MultiTemplate has
+     no per-graph inspector yet; we print the template list and
+     the bus footprint per template instead.
+
+  3. Loading: SingleGraph uses loadRuntimeGraph; MultiTemplate uses
+     loadTemplateGraph (which auto-spawns one instance per template
+     so a typical single-voice-per-template ensemble works without
+     explicit setup).
+
+The shared part is realtime audio: both paths use the same
+startAudio / waitAudioStarted / stopAudio bracket, since the C
+runtime treats both as "iterate every live instance of every
+template" once loaded.
+-}
+
+data DemoBody
+  = SingleGraph SynthGraph
+    -- ^ Legacy single-template demo. Compiles via traceCompile +
+    -- compileRuntimeGraph, loads via loadRuntimeGraph, runs against
+    -- the auto-created template 0 / instance 0 of an RTGraph.
+  | MultiTemplate [(String, SynthGraph)]
+    -- ^ Multi-template demo (§2.D.3). Compiles via
+    -- compileTemplateGraph, loads via loadTemplateGraph. The
+    -- compiler picks template execution order to match the
+    -- topological sort over inter-template bus precedence.
 
 data Demo = Demo
   { demoKey   :: String
   , demoLabel :: String
-  , demoGraph :: SynthGraph
+  , demoBody  :: DemoBody
   }
+
+demoTable :: [Demo]
+demoTable =
+  [ Demo "simple"    "Simple (SinOsc → Out)"
+         (SingleGraph simpleGraph)
+  , Demo "chain"     "Chain (SinOsc → Gain → Out)"
+         (SingleGraph chainGraph)
+  , Demo "fanout"    "Fan-out (SinOsc → 2×Gain → 2×Out)"
+         (SingleGraph fanOutGraph)
+  , Demo "saw"       "Saw oscillator (SawOsc → Gain → Out)"
+         (SingleGraph sawGraph)
+  , Demo "noise"     "White noise (NoiseGen → Gain → Out)"
+         (SingleGraph noiseGraph)
+  , Demo "noise-lpf" "Filtered noise (NoiseGen → LPF → Gain → Out)"
+         (SingleGraph noiseLpfGraph)
+  , Demo "saw-lpf"   "Resonant bass (SawOsc → LPF → Gain → Out)"
+         (SingleGraph filteredSawGraph)
+  , Demo "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"
+         (SingleGraph detunedSawGraph)
+  , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"
+         (SingleGraph ringModGraph)
+  , Demo "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)"
+         (SingleGraph fmGraph)
+  , Demo "env-pluck" "Plucked-tone envelope (Env → Gain × SinOsc → Out)"
+         (SingleGraph envPluckGraph)
+  , Demo "send-return"
+         "Send/return (voice → BusOut 7 │ fx: BusIn 7 → LPF → Out)"
+         (MultiTemplate sendReturnDemo)
+  ]
 
 --------------------------------------------------------------------------------
 -- CLI options
@@ -210,6 +317,7 @@ usage prog = unlines
   , "  " <> prog <> " simple"
   , "  " <> prog <> " --inspect chain"
   , "  " <> prog <> " --inspect-only fanout"
+  , "  " <> prog <> " send-return  # multi-template demo"
   ]
 
 --------------------------------------------------------------------------------
@@ -256,9 +364,18 @@ main = do
 
   putStrLn "Done."
 
+-- Top-level dispatch: route a Demo to its body-specific runner. See
+-- Note [Demo body: single-graph vs multi-template].
 runDemo :: Options -> Demo -> IO ()
-runDemo opts demo = do
-  let !trace = traceCompile (demoGraph demo)
+runDemo opts demo = case demoBody demo of
+  SingleGraph    g    -> runSingleDemo   opts demo g
+  MultiTemplate  tpls -> runTemplateDemo opts demo tpls
+
+-- Single-template demo runner. Identical to the pre-§2.D.3 path:
+-- traceCompile → optional inspector → loadRuntimeGraph → audio.
+runSingleDemo :: Options -> Demo -> SynthGraph -> IO ()
+runSingleDemo opts demo g = do
+  let !trace = traceCompile g
 
   case optMode opts of
     InspectOnly -> do
@@ -281,6 +398,55 @@ runDemo opts demo = do
       maybe (pure ()) runAudio mRt
       putStrLn ""
 
+{- Note [Multi-template demo runner]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+runTemplateDemo is the §2.D.3 counterpart of runSingleDemo. It:
+
+  1. Calls compileTemplateGraph on the (name, SynthGraph) list,
+     reporting an error on cycle / per-template compile failure.
+  2. Prints a small summary: each template's name, its bus
+     footprint (writes / live-reads / delayed-reads), and the
+     compile-decreed execution order.
+  3. In InspectOnly mode, stops there. The brick-based inspector
+     is single-graph only today; bringing it up to multi-template
+     would mean teaching it about TemplateGraph, which is a
+     separate piece of work.
+  4. In AudioOnly / InspectThenRun mode, calls loadTemplateGraph
+     (which auto-spawns one instance per template) and starts the
+     realtime audio stream.
+
+The audio bracket reuses runAudioCommon — the same start/wait/stop
+sequence as the single-template path — so multi-template demos
+exit cleanly on Enter or on signal exactly like single-graph
+demos.
+-}
+
+-- Multi-template demo runner.
+runTemplateDemo :: Options -> Demo -> [(String, SynthGraph)] -> IO ()
+runTemplateDemo opts demo tpls = do
+  putBanner (demoLabel demo)
+
+  case compileTemplateGraph tpls of
+    Left err -> do
+      putStrLn $ "  Compilation error: " <> err
+      putStrLn ""
+
+    Right tg -> do
+      printTemplateGraph tg
+
+      case optMode opts of
+        InspectOnly -> do
+          putStrLn "\n  Audio skipped (--inspect-only)."
+          putStrLn $ "  (The brick inspector is single-graph only; "
+                  <> "multi-template demos print a textual summary above.)"
+          putStrLn ""
+
+        _ -> do
+          let totalNodes =
+                sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+          runTemplateAudio totalNodes tg
+          putStrLn ""
+
 inspectTrace :: CompileTrace -> IO ()
 inspectTrace = launchInspector
 
@@ -289,6 +455,21 @@ putBanner label = do
   putStrLn "\n══════════════════════════════════════"
   putStrLn $ "  " <> label
   putStrLn   "══════════════════════════════════════"
+
+-- Print a TemplateGraph as a compact textual summary: per-template
+-- bus footprint plus the precedence DAG that drove the topo sort.
+-- Parallels printTraceSummary for the single-graph path; deliberately
+-- terse since multi-template demos are typically small (2-3 templates).
+printTemplateGraph :: TemplateGraph -> IO ()
+printTemplateGraph tg = do
+  putStrLn "\n  Templates (execution order):"
+  forM_ (zip [(0 :: Int) ..] (tgTemplates tg)) $ \(i, t) -> do
+    let fp = tplFootprint t
+    putStrLn $
+      "    " <> show i <> ". " <> tplName t
+      <> "  writes=" <> show (bfWrites fp)
+      <> "  live-reads=" <> show (bfReads fp)
+      <> "  delayed-reads=" <> show (bfDelayedReads fp)
 
 printTraceSummary :: CompileTrace -> IO (Maybe RuntimeGraph)
 printTraceSummary ct =
@@ -325,28 +506,47 @@ printTraceSummary ct =
           mapM_ printRTNode (rgNodes rt)
           pure (Just rt)
 
+-- Single-template realtime audio: wraps loadRuntimeGraph in the
+-- standard start/wait/stop bracket.
 runAudio :: RuntimeGraph -> IO ()
 runAudio rg =
   withRTGraph (length (rgNodes rg)) demoMaxFrames $ \rt -> do
     loadRuntimeGraph rt rg
+    runRealtimeBracket rt
 
-    putStrLn "\n  Starting realtime audio..."
-    startRC <- startAudio rt demoOutputChannels demoDeviceID
-    if startRC /= 0
-      then
-        putStrLn $ "  Audio start failed with status " <> show startRC
-      else
-        flip finally (stopAudio rt) $ do
-          ready <- waitAudioStarted rt audioReadyTimeoutMs
-          if ready
-            then do
-              putStrLn "  Press Enter to stop audio."
-              _ <- getLine
-              pure ()
-            else
-              putStrLn $
-                "  Audio stream opened, but the callback did not report "
-                <> "ready within " <> show audioReadyTimeoutMs <> " ms."
+-- Multi-template realtime audio: wraps loadTemplateGraph in the
+-- same start/wait/stop bracket. The 'capacity' argument to
+-- withRTGraph is a soft hint for vector pre-allocation; we sum
+-- node counts across all templates so it's not under-provisioned.
+runTemplateAudio :: Int -> TemplateGraph -> IO ()
+runTemplateAudio capacity tg =
+  withRTGraph capacity demoMaxFrames $ \rt -> do
+    loadTemplateGraph rt tg
+    runRealtimeBracket rt
+
+-- Shared realtime audio entry point: start, wait for the callback
+-- to fire, accept Enter to stop, and unwind via 'finally' so the
+-- stream is always cleaned up even on early exit. Used by both the
+-- single-template and multi-template runners.
+runRealtimeBracket :: Ptr RTGraph -> IO ()
+runRealtimeBracket rt = do
+  putStrLn "\n  Starting realtime audio..."
+  startRC <- startAudio rt demoOutputChannels demoDeviceID
+  if startRC /= 0
+    then
+      putStrLn $ "  Audio start failed with status " <> show startRC
+    else
+      flip finally (stopAudio rt) $ do
+        ready <- waitAudioStarted rt audioReadyTimeoutMs
+        if ready
+          then do
+            putStrLn "  Press Enter to stop audio."
+            _ <- getLine
+            pure ()
+          else
+            putStrLn $
+              "  Audio stream opened, but the callback did not report "
+              <> "ready within " <> show audioReadyTimeoutMs <> " ms."
 
 
 printIRNode :: NodeIR -> IO ()
