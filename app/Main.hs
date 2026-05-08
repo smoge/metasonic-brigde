@@ -7,6 +7,7 @@ import           Control.DeepSeq            (force)
 import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
 import           Data.Char                  (toLower)
+import           Data.Either                (partitionEithers)
 import           Data.List                  (find, intercalate, nub, sort)
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
@@ -1121,31 +1122,49 @@ surveyRuntimeGraph d t rt rtF =
        , srShapes       = scanSinkShapes rt
        }
 
-surveySynthGraph :: String -> Maybe String -> SynthGraph -> Maybe SurveyRow
+-- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
+-- caller-friendly @"demo=…[ template=…]: <err>"@ message on
+-- compile failure so the survey driver can surface it instead of
+-- silently dropping the row. Coverage totals are misleading if a
+-- targeted graph just disappears.
+surveySynthGraph
+  :: String -> Maybe String -> SynthGraph -> Either String SurveyRow
 surveySynthGraph d t g = do
-  rt  <- either (const Nothing) Just (lowerGraph g >>= compileRuntimeGraph)
-  rtF <- either (const Nothing) Just (lowerGraph g >>= compileRuntimeGraphFused)
-  Just (surveyRuntimeGraph d t rt rtF)
+  let stamp err = surveyTag d t <> ": " <> err
+  rt  <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraph)
+  rtF <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraphFused)
+  Right (surveyRuntimeGraph d t rt rtF)
 
-surveyDemo :: Demo -> [SurveyRow]
+-- | A short human label used in error messages.
+surveyTag :: String -> Maybe String -> String
+surveyTag d Nothing  = "demo=" <> d
+surveyTag d (Just t) = "demo=" <> d <> " template=" <> t
+
+-- | Compile every (demo, template) pair, returning one
+-- 'Either String SurveyRow' per pair so the driver can split
+-- successes from failures.
+surveyDemo :: Demo -> [Either String SurveyRow]
 surveyDemo demo = case demoBody demo of
   SingleGraph g ->
-    maybe [] (: []) (surveySynthGraph (demoKey demo) Nothing g)
+    [surveySynthGraph (demoKey demo) Nothing g]
   MultiTemplate tpls ->
-    [ row
-    | (name, g) <- tpls
-    , Just row  <- [surveySynthGraph (demoKey demo) (Just name) g]
-    ]
+    [ surveySynthGraph (demoKey demo) (Just name) g | (name, g) <- tpls ]
   MidiPoly _ build ->
     let (_b, g, _cc) = runSynthCCs build
-    in maybe [] (: []) (surveySynthGraph (demoKey demo) Nothing g)
+    in [surveySynthGraph (demoKey demo) Nothing g]
 
 -- Top-level entry for the --fusion-survey mode. Produces the
 -- per-template summary, a sink-terminal opportunity table, and
--- aggregate totals — no audio, no TUI.
+-- aggregate totals. Compile failures are surfaced explicitly:
+-- they're not counted in the totals (because we have no graph to
+-- count) but they /are/ reported in a dedicated banner so a
+-- failed-but-targeted graph doesn't silently lower aggregate
+-- coverage. Exits with status 1 if any survey row failed, since
+-- the resulting numbers are by definition incomplete.
 runFusionSurvey :: [Demo] -> IO ()
 runFusionSurvey demos = do
-  let rows = concatMap surveyDemo demos
+  let results        = concatMap surveyDemo demos
+      (errs, rows)   = partitionEithers results
   putStrLn ""
   printSurveyTable rows
   putStrLn ""
@@ -1153,7 +1172,14 @@ runFusionSurvey demos = do
   putStrLn ""
   printSurveyTotals rows
   putStrLn ""
-  putStrLn "Done."
+  case errs of
+    [] -> putStrLn "Done."
+    es -> do
+      putStrLn "─── Survey failures ───"
+      mapM_ (\e -> putStrLn ("  " <> e)) es
+      putStrLn ""
+      die $ "Done with " <> show (length es)
+          <> " compile failure(s); coverage totals above exclude them."
 
 -- Per-template table.
 printSurveyTable :: [SurveyRow] -> IO ()
