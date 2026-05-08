@@ -1636,6 +1636,49 @@ unitTests = testGroup "Unit tests"
             Left err -> assertFailure $ "compile failed: " <> err
             Right rg ->
               selectRegionKernels rg @?= rg
+
+      , -- Multi-match: two independent saw → lpf → gain chains in
+        -- one original region must both be tagged in a single
+        -- 'selectRegionKernels' pass. The selector recurses on the
+        -- suffix after each match, so missing the second chain
+        -- would mean an optimization that depends on the loader
+        -- accidentally re-running the pass. Idempotence still
+        -- holds: a second 'selectRegionKernels' application is a
+        -- no-op on the already-tagged result.
+        testCase "two chains in one region: both tagged in one pass" $ do
+          let g = runSynth $ do
+                s1 <- sawOsc 110.0 0.0
+                f1 <- lpf s1 (Param 800.0) (Param 4.0)
+                a1 <- gain f1 (Param 0.4)
+                s2 <- sawOsc 220.0 0.0
+                f2 <- lpf s2 (Param 1200.0) (Param 4.0)
+                a2 <- gain f2 (Param 0.3)
+                out 0 a1
+                out 1 a2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              -- Both chains must come back tagged from one pass.
+              let tagged = [ r | r <- rgRuntimeRegions rg
+                               , rrKernel r == RSawLpfGain ]
+              length tagged @?= 2
+              -- Each tagged region must cover exactly its own three
+              -- nodes in the canonical [Saw, LPF, Gain] order — no
+              -- accidental cross-chain claim.
+              let nodeMap = M.fromList
+                    [ (rnIndex n, n) | n <- rgNodes rg ]
+                  kindsOf r =
+                    [ rnKind n
+                    | ix <- rrNodes r
+                    , Just n <- [M.lookup ix nodeMap] ]
+              mapM_ (\r -> do
+                        length (rrNodes r) @?= 3
+                        kindsOf r @?= [KSawOsc, KLPF, KGain])
+                    tagged
+              -- Idempotence on the multi-match result: re-running
+              -- 'selectRegionKernels' after both chains have already
+              -- been claimed must not split or relabel anything.
+              selectRegionKernels rg @?= rg
       ]
 
   , testCase "kindTag is injective" $
@@ -3481,19 +3524,42 @@ prop_fusedRenderEqualsUnfused graph =
              pure $ counterexample ("buses compared: " <> show buses)
                   $ unfused === fused
 
--- | Render @graph@ through the unfused and fused loaders and assert
--- their outputs are bit-identical on every bus the graph writes
--- (not only bus 0). Comparing every output bus catches the case
--- where a fanout's second fused branch is miswired but its sibling
--- on bus 0 happens to match. Also verifies that the fused compile
--- actually triggered fusion (≥1 RFused input + ≥1 elided node) so
+-- | Force every region in a 'RuntimeGraph' back to 'RNodeLoop'.
+-- 'compileRuntimeGraph' runs 'selectRegionKernels' unconditionally,
+-- so the "unfused" output of 'compileRuntimeGraph' already carries
+-- §4.B kernel tags. Without stripping them, an equivalence test
+-- that renders @compileRuntimeGraph@ vs @compileRuntimeGraphFused@
+-- would dispatch /both/ sides through 'process_region_*', and a
+-- broken kernel implementation could pass by matching itself.
+-- Stripping the baseline gives an honest comparison: the baseline
+-- takes the per-node dispatch path while the fused side exercises
+-- whichever kernels and rewrites §4.B / §4.C selected.
+stripRegionKernels :: RuntimeGraph -> RuntimeGraph
+stripRegionKernels rg = rg
+  { rgRuntimeRegions =
+      map (\r -> r { rrKernel = RNodeLoop }) (rgRuntimeRegions rg)
+  }
+
+-- | Render @graph@ through a node-loop baseline and the fused
+-- loader, asserting their outputs are bit-identical on every bus
+-- the graph writes (not only bus 0). Comparing every output bus
+-- catches the case where a fanout's second fused branch is
+-- miswired but its sibling on bus 0 happens to match. Also
+-- verifies that the fused compile actually triggered fusion (≥1
+-- RFused input + ≥1 elided node, or a non-RNodeLoop region) so
 -- the test isn't degenerate.
+--
+-- The "node-loop baseline" is the same compiled graph as the fused
+-- side, except every region is forced back to 'RNodeLoop' via
+-- 'stripRegionKernels' — see that helper for why this matters.
 assertFusedEquivalent :: String -> SynthGraph -> Assertion
 assertFusedEquivalent name graph = do
   let nframes = 256
+  -- Strip kernels from the baseline so 'loadRuntimeGraph' takes the
+  -- per-node dispatch path even on regions §4.B would have claimed.
   rtUn <- case lowerGraph graph >>= compileRuntimeGraph of
-    Right r  -> pure r
-    Left err -> assertFailure (name <> ": compile (unfused) failed: " <> err)
+    Right r  -> pure (stripRegionKernels r)
+    Left err -> assertFailure (name <> ": compile (node-loop baseline) failed: " <> err)
                   >> error "unreachable"
   rtF  <- case lowerGraph graph >>= compileRuntimeGraphFused of
     Right r  -> pure r
@@ -3504,7 +3570,7 @@ assertFusedEquivalent name graph = do
   -- — either §4.C single-input rewrite (RFused inputs / rnElided
   -- nodes) or §4.B region kernel selection (a non-RNodeLoop
   -- region). A graph whose fused render trivially equals the
-  -- unfused render because no fusion fired isn't a useful
+  -- baseline render because no fusion fired isn't a useful
   -- equivalence case.
   let hasRFused   = not (null [() | n <- rgNodes rtF, RFused _ <- rnInputs n])
       hasElided   = any rnElided (rgNodes rtF)
@@ -3512,12 +3578,14 @@ assertFusedEquivalent name graph = do
   assertBool (name <> ": fused compile triggered no fusion of any kind")
     (hasRFused || hasElided || hasFusedReg)
 
-  -- Walk the (unfused) graph to collect every bus index that an Out
+  -- Walk the baseline graph to collect every bus index that an Out
   -- or BusOut node writes to. rnControls[0] holds the bus id by
   -- convention (see kindSpec for KOut / KBusOut). Bus indices that
   -- both graphs write to are compared sample-for-sample; if either
   -- side renders silence on a bus the other one drives, the test
-  -- fails.
+  -- fails. Stripping kernels does not change rgNodes or controls,
+  -- so walking rtUn here still sees every Out the original graph
+  -- declared.
   let busesWritten rg =
         nub
           [ truncate v
@@ -3542,12 +3610,12 @@ assertFusedEquivalent name graph = do
         cs <- peekArray nframes (buf :: PtrCFloat)
         pure (bus, map (\(CFloat x) -> x) cs)
 
-  unfused <- render loadRuntimeGraph      rtUn
-  fused   <- render loadRuntimeGraphFused rtF
+  baseline <- render loadRuntimeGraph      rtUn
+  fused    <- render loadRuntimeGraphFused rtF
   assertBool
-    (name <> ": fused render must match unfused render on every bus "
+    (name <> ": fused render must match node-loop baseline on every bus "
        <> show buses)
-    (unfused == fused)
+    (baseline == fused)
   where
     -- Mirrors the local sizeOfFloat in crossCuttingTests' where-clause.
     sizeOfFloat = 4 :: Int

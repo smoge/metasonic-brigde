@@ -1021,15 +1021,38 @@ the region kernel still expects to address by control slot. The
 candidate predicate in 'fuseRuntimeGraph' enforces that gate.
 -}
 
--- | §4.B: scan every region for a fused-kernel shape match and
--- split / re-tag accordingly. Idempotent: a second pass is a no-op
--- because regions tagged with a fused kernel are skipped.
+-- | §4.B: scan every region for fused-kernel shape matches and
+-- split / re-tag accordingly. The selector recurses over the suffix
+-- after each match, so a single original 'RNodeLoop' region that
+-- contains @N@ independent eligible chains is reduced to its full
+-- maximal non-overlapping selection in one compile pass — not @N@
+-- accidental re-runs.
+--
+-- Idempotent: a second pass is a no-op because regions already
+-- tagged with a non-'RNodeLoop' kernel are returned unchanged, and
+-- any 'RNodeLoop' region produced by an earlier pass is exactly the
+-- pre/post slice that already failed to match.
 --
 -- See Note [Region kernel selection].
 selectRegionKernels :: RuntimeGraph -> RuntimeGraph
 selectRegionKernels rg =
   let nodeMap :: M.Map NodeIndex RuntimeNode
       nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
+
+      -- Drop empty parts; stamp rrIndex with a placeholder
+      -- (renumbered after splat) and inherit rrRate from the
+      -- enclosing original region.
+      placeholder = RegionIndex (-1)
+      mkPart rate ks ker
+        | null ks   = []
+        | otherwise =
+            [ RuntimeRegion
+                { rrIndex  = placeholder
+                , rrRate   = rate
+                , rrNodes  = ks
+                , rrKernel = ker
+                }
+            ]
 
       split :: RuntimeRegion -> [RuntimeRegion]
       split r
@@ -1041,23 +1064,25 @@ selectRegionKernels rg =
                 let members = rrNodes r
                     (pre, restA) = splitAt off members
                     (mid, post)  = splitAt 3 restA
-                    -- Drop empty prefix / suffix; stamp rrIndex
-                    -- with a placeholder (renumber below) and
-                    -- inherit rrRate from the original region.
-                    placeholder = RegionIndex (-1)
-                    mkPart ks ker
-                      | null ks   = []
-                      | otherwise =
-                          [ RuntimeRegion
-                              { rrIndex  = placeholder
-                              , rrRate   = rrRate r
-                              , rrNodes  = ks
-                              , rrKernel = ker
-                              }
-                          ]
-                in mkPart pre RNodeLoop
-                ++ mkPart mid RSawLpfGain
-                ++ mkPart post RNodeLoop
+                    rate = rrRate r
+                    -- The prefix cannot itself contain an earlier
+                    -- match (findSawLpfGain returns the leftmost
+                    -- offset), so it stays RNodeLoop without further
+                    -- inspection. The suffix may contain another
+                    -- independent chain — recurse on a synthetic
+                    -- RNodeLoop region carrying the same rate so the
+                    -- selector reaches its own fixed point in one
+                    -- pass.
+                    postRegion =
+                      RuntimeRegion
+                        { rrIndex  = placeholder
+                        , rrRate   = rate
+                        , rrNodes  = post
+                        , rrKernel = RNodeLoop
+                        }
+                in  mkPart rate pre RNodeLoop
+                 ++ mkPart rate mid RSawLpfGain
+                 ++ (if null post then [] else split postRegion)
 
       splat = concatMap split (rgRuntimeRegions rg)
 
