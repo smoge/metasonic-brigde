@@ -2507,14 +2507,21 @@ unitTests = testGroup "Unit tests"
         -- This pins the kind-level contract directly so the
         -- graph-level tests below can rely on it for shape-
         -- specific cases without re-arguing the policy.
-        testCase "isLiveBusKind: KBusIn / KOut / KBusOut yes; KBusInDelayed and others no" $ do
-          isLiveBusKind KBusIn        @?= True
-          isLiveBusKind KOut          @?= True
-          isLiveBusKind KBusOut       @?= True
-          isLiveBusKind KBusInDelayed @?= False
-          isLiveBusKind KSinOsc       @?= False
-          isLiveBusKind KGain         @?= False
-          isLiveBusKind KLPF          @?= False
+        testCase "isLiveBusKind: exhaustively {KBusIn, KOut, KBusOut}; everything else no" $ do
+          -- Enumerate every 'NodeKind' so the assertion proves the
+          -- exact membership of the live-bus set, not just spot-
+          -- checks. A new kind added to 'Types.hs' that is
+          -- accidentally classified as live-bus (or accidentally
+          -- excluded from it) fails this test the next time the
+          -- suite runs.
+          --
+          -- 'NodeKind' has no 'Ord', so the comparison is on lists
+          -- in declaration ('Enum') order rather than sets.
+          let live = [k | k <- [minBound .. maxBound :: NodeKind]
+                        , isLiveBusKind k]
+          -- Expected list is also in declaration order, which
+          -- happens to match the enum: KOut < KBusOut < KBusIn.
+          live @?= [KOut, KBusOut, KBusIn]
 
       , -- A simple sin → gain → out chain has KOut in its
         -- single region, so 'regionHasLiveBus' must say True —
@@ -2589,6 +2596,208 @@ unitTests = testGroup "Unit tests"
             Right rg -> do
               let regions = rgRuntimeRegions rg
               all (regionHasLiveBus rg) regions @?= True
+      ]
+
+  , -- Phase 4.E.2a: pure single-thread region scheduler planner.
+    -- 'regionSchedule' encodes the contract a future scheduler
+    -- consumes — barrier regions (live-bus) execute in
+    -- compile-decreed 'rrIndex' order; non-barrier regions are
+    -- topologically scheduled within each barrier-delimited
+    -- segment using 'regionDependencies' with 'rrIndex' as the
+    -- stable tie-breaker. No runtime change in this slice.
+    --
+    -- Today's 'compileRuntimeGraph' produces a topologically
+    -- valid 'rrIndex' sequence, so 'regionSchedule' returns
+    -- 'rrIndex' order verbatim. The tests pin /that property/
+    -- across the relevant graph shapes, so a future change that
+    -- accidentally introduces a real reorder is caught here
+    -- before §4.E.2b lands and starts depending on the contract
+    -- for actual concurrency.
+    testGroup "Phase 4.E.2a: regionSchedule planner"
+      [ -- Single-region baseline: only one region, schedule must
+        -- be its singleton index.
+        testCase "single-region chain: schedule is [0]" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> regionSchedule rg @?= [RegionIndex 0]
+
+      , -- Internal send/return: producer (KBusOut) and consumer
+        -- (RBusInLpfGainOut, contains KBusIn + KOut) are both
+        -- barriers, anchored at their compile-decreed positions.
+        -- Schedule equals 'rrIndex' order; segmentByBarrier sees
+        -- two singleton barrier slots and no free segment.
+        testCase "send/return barriers: both regions barriers, schedule = rrIndex order" $ do
+          let g = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                busOut 5 s
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions  = rgRuntimeRegions rg
+                  segments = segmentByBarrier rg
+              -- Both regions are barriers under §4.E.1c.
+              all (regionHasLiveBus rg) regions @?= True
+              length segments @?= 2
+              -- Both segments are 'Barrier' (no free runs between
+              -- them). Pattern match inline rather than using a
+              -- helper to keep the assertion self-explanatory.
+              let isBarrier seg = case seg of
+                    Barrier _ -> True
+                    _         -> False
+              all isBarrier segments @?= True
+              regionSchedule rg @?= map rrIndex regions
+
+      , -- Kernel-split structural-edge case: 'RSawLpfGain'
+        -- buffer region (no live-bus, free) precedes the
+        -- trailing 'RNodeLoop' tail (KOut, barrier). The
+        -- structural cross-region edge (Add reads Gain across
+        -- the region boundary) is part of 'regionDependencies',
+        -- but the planner doesn't need to reorder anything —
+        -- 'rrIndex' order is already topologically valid.
+        --
+        -- Pins: a free region preceding a barrier ends up in a
+        -- one-element free segment, then the barrier. The barrier
+        -- doesn't get folded into the free segment.
+        testCase "kernel-split: free buffer region precedes barrier tail" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions = rgRuntimeRegions rg
+                  bufs    = [r | r <- regions, rrKernel r == RSawLpfGain]
+                  tails   = [r | r <- regions, rrKernel r == RNodeLoop]
+              case (bufs, tails) of
+                ([buf], [tail_]) -> do
+                  -- Free region is not a barrier, tail is.
+                  regionHasLiveBus rg buf   @?= False
+                  regionHasLiveBus rg tail_ @?= True
+                  -- segmentByBarrier emits free segment, then
+                  -- barrier — same number of slices as regions
+                  -- since the free segment carries one region.
+                  segmentByBarrier rg @?= [ FreeSegment [buf]
+                                          , Barrier tail_
+                                          ]
+                  -- Schedule equals rrIndex order.
+                  regionSchedule rg @?= [rrIndex buf, rrIndex tail_]
+                _ -> assertFailure $
+                  "expected one RSawLpfGain region + one RNodeLoop "
+                  <> "tail, got " <> show (length bufs)
+                  <> " + " <> show (length tails)
+
+      , -- BusInDelayed reader: the delayed read does not
+        -- contribute to 'regionDependencies' (and so doesn't
+        -- create a precedence edge between producer and reader).
+        -- Both regions in this graph contain live-bus nodes
+        -- (producer has KBusOut; reader has KOut), so both are
+        -- barriers and the schedule is 'rrIndex' order. Pins
+        -- that delayed-only readers don't somehow short-circuit
+        -- the barrier classification.
+        testCase "BusInDelayed: schedule is rrIndex order, both barriers" $ do
+          let g = runSynth $ do
+                s1 <- sinOsc 220.0 0.0
+                g1 <- gain s1 (Param 0.3)
+                busOut 5 g1
+                d  <- busInDelayed 5
+                g2 <- gain d (Param 0.4)
+                out 0 g2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions = rgRuntimeRegions rg
+              all (regionHasLiveBus rg) regions @?= True
+              regionSchedule rg @?= map rrIndex regions
+
+      , -- Independent non-barrier reordering: a graph with /two/
+        -- 'RSawLpfGain' free regions adjacent in 'rrIndex' order,
+        -- both feeding the same trailing 'RNodeLoop' barrier
+        -- (Add + Out). The free regions land in a single free
+        -- segment; the planner topologically sorts them with
+        -- stable 'rrIndex' tie-breaking. Since the two free
+        -- regions are independent (neither depends on the
+        -- other), the stable rrIndex order is the natural
+        -- output.
+        --
+        -- This is the headline test for stable-rrIndex
+        -- reordering: the segment has more than one non-barrier
+        -- region, the topo-sort actually has a choice, and the
+        -- choice is the rrIndex order.
+        testCase "independent free regions: stable rrIndex order in single segment" $ do
+          let g = runSynth $ do
+                s1 <- sawOsc 110.0 0.0
+                f1 <- lpf s1 (Param 800.0)  (Param 4.0)
+                g1 <- gain f1 (Param 0.4)
+                s2 <- sawOsc 220.0 0.0
+                f2 <- lpf s2 (Param 1200.0) (Param 4.0)
+                g2 <- gain f2 (Param 0.4)
+                summed <- add g1 g2
+                out 0 summed
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions = rgRuntimeRegions rg
+                  buffers = [r | r <- regions, rrKernel r == RSawLpfGain]
+                  tails   = [r | r <- regions, rrKernel r == RNodeLoop]
+              case (buffers, tails) of
+                ([b1, b2], [tail_]) -> do
+                  -- Both buffer regions are free; the tail is a
+                  -- barrier (KOut).
+                  regionHasLiveBus rg b1    @?= False
+                  regionHasLiveBus rg b2    @?= False
+                  regionHasLiveBus rg tail_ @?= True
+                  -- The free segment groups both buffer regions;
+                  -- the barrier follows.
+                  segmentByBarrier rg
+                    @?= [ FreeSegment [b1, b2], Barrier tail_ ]
+                  -- Schedule emits both free regions in rrIndex
+                  -- order, then the barrier.
+                  regionSchedule rg
+                    @?= [ rrIndex b1, rrIndex b2, rrIndex tail_ ]
+                _ -> assertFailure $
+                  "expected two RSawLpfGain regions + one RNodeLoop "
+                  <> "tail, got "
+                  <> show (length buffers) <> " + "
+                  <> show (length tails)
+
+      , -- Multi-template send/return: each template's 'RuntimeGraph'
+        -- carries its own one-region schedule. The voice template
+        -- is a barrier (RSinGainOut via BusOut), the fx template is
+        -- a barrier (RBusInLpfGainOut). Pins that the planner runs
+        -- correctly through 'compileTemplateGraph' as well as the
+        -- single-graph 'compileRuntimeGraph' direct path.
+        testCase "multi-template: per-template schedule = [0] for each one-region template" $ do
+          let voice = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                a <- gain s (Param 0.4)
+                busOut 5 a
+              fx = runSynth $ do
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                out 0 a
+
+          tg <- case compileTemplateGraph
+                       [("voice", voice), ("fx", fx)] of
+            Right t  -> pure t
+            Left err -> assertFailure err >> error "unreachable"
+
+          let voiceTpl = head [t | t <- tgTemplates tg, tplName t == "voice"]
+              fxTpl    = head [t | t <- tgTemplates tg, tplName t == "fx"]
+
+          regionSchedule (tplGraph voiceTpl) @?= [RegionIndex 0]
+          regionSchedule (tplGraph fxTpl)    @?= [RegionIndex 0]
       ]
 
   , testCase "kindTag is injective" $

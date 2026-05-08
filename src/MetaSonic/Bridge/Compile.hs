@@ -61,6 +61,14 @@ module MetaSonic.Bridge.Compile
     -- Note [Region barrier policy] in that module.
     isLiveBusKind
   , regionHasLiveBus
+  , -- * Region schedule planner (§4.E.2a)
+    --
+    -- From "MetaSonic.Bridge.Compile.Schedule". Pure planner —
+    -- no runtime change. Encodes the contract a future scheduler
+    -- consumes.
+    regionSchedule
+  , Segment (..)
+  , segmentByBarrier
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
@@ -87,6 +95,7 @@ import           MetaSonic.Bridge.Compile.Regions
 import           MetaSonic.Bridge.Compile.RegionKernels
 import           MetaSonic.Bridge.Compile.Dependencies
 import           MetaSonic.Bridge.Compile.Fusion
+import           MetaSonic.Bridge.Compile.Schedule
 
 -- | Look up the dense 'NodeIndex' that a given symbolic 'NodeID'
 -- compiled to. Returns 'Nothing' if the 'NodeID' isn't present in
