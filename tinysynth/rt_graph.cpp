@@ -2939,6 +2939,131 @@ vs runtime ordering" in CLAUDE.md.
 // Phase 4.B region kernels
 // ----------------------------------------------------------------
 
+/* Note [Region kernel helpers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Two narrow helpers shared across the §4.B region kernels.
+Intentionally not a "kernel envelope" or a full DSL: they capture
+exactly the boilerplate that was duplicated character-for-character
+across kernels, and leave every kernel-specific detail (the DSP
+sequence, the LPF block-rate latch, which oscillator function to
+call) hand-written and visible in the kernel body.
+
+  * 'SinkAccumulator' — the bus + 'inst.block_sink_peak' protocol
+    that 'process_out' implements. Open it from the Out node's
+    bus-index control; push per-sample contributions; flush the
+    running peak back to the instance once the loop is done. On an
+    invalid bus index every operation is a no-op, mirroring
+    'process_out's silent-degradation discipline. Used by the
+    sink-terminal kernels (SinGainOut, SawLpfGainOut). The
+    buffer-terminal SawLpfGain doesn't touch this.
+
+  * 'drive_oscillator' — the "audio-rate freq input vs control
+    fallback" branch every oscillator kernel does. Resolves the
+    freq-port span at the call site, picks the per-sample vs
+    block-rate phase increment update, and invokes a per-sample
+    body callback @body(fi, sample)@ where @sample@ is the
+    oscillator output for sample @fi@. The oscillator function
+    ('q::sin', 'q::saw') is passed as a function object; both are
+    'constexpr' instances of 'sin_osc' / 'saw_osc' in q_lib so
+    the template instantiation costs nothing at runtime.
+
+The LPF block-rate freq/q latch deliberately stays inline in the
+saw-bearing kernels: it's filter-specific stateful DSP and
+hand-writing it keeps the kernel body readable. The same applies
+to any future per-kernel state setup — these helpers do not
+attempt to be a unified region kernel runner.
+*/
+
+// Bus + sink-peak accumulator for sink-terminal kernels.
+// Mirrors process_out's bus index validation (double-domain
+// finite/range check before casting to int) and its
+// read-modify-write of inst.block_sink_peak, with the same
+// silent-no-op behavior on an invalid bus.
+struct SinkAccumulator {
+  std::vector<float> *dst;   // null when the bus index was invalid
+  float peak;                // running max(|sample|) for this block
+
+  // Validate the bus index and snapshot the per-instance running
+  // peak. process_instance reset block_sink_peak to 0 before this
+  // kernel runs, so the snapshot reflects any sibling Out / BusOut
+  // that already ran in this block.
+  static SinkAccumulator open(RTGraph &g, GraphInstance &inst,
+                              double bus_control) noexcept {
+    const double bus_lim =
+        static_cast<double>(g.server.output_buses.size());
+    if (!std::isfinite(bus_control) || bus_control < 0.0
+        || bus_control >= bus_lim) {
+      return SinkAccumulator{nullptr, 0.0f};
+    }
+    return SinkAccumulator{
+      &g.server.output_buses[static_cast<std::size_t>(bus_control)],
+      inst.block_sink_peak,
+    };
+  }
+
+  // Add a sample to the live bus and update the block peak. No-op
+  // on an invalid bus.
+  inline void push(std::size_t fi, float s) noexcept {
+    if (dst) {
+      (*dst)[fi] += s;
+      const float a = std::fabs(s);
+      if (a > peak) peak = a;
+    }
+  }
+
+  // Write the running peak back to the instance. No-op on an
+  // invalid bus so the rejected-bus path cannot stomp a peak that
+  // a sibling kernel had already recorded.
+  inline void flush_to(GraphInstance &inst) const noexcept {
+    if (dst) inst.block_sink_peak = peak;
+  }
+};
+
+// Drives an oscillator across `nframes` samples, picking the
+// per-sample audio-rate freq update vs the block-rate fallback,
+// and invoking `body(fi, sample)` for each sample.
+//
+//   freq_in              : resolve_input(...) on the oscillator's
+//                          freq port. May be empty (control-rate).
+//   freq_control_default : fallback freq from controls[0] when
+//                          freq_in is empty.
+//   wave_fn              : q::sin / q::saw — any callable taking
+//                          q::phase_iterator and returning float.
+//
+// Mirrors the shape of process_sinosc / process_sawosc; the
+// per-node kernels still hand-write it because they're outside
+// §4.B's scope, but the same idiom is visible in all three
+// region kernels via this helper.
+template <class WaveFn, class Body>
+static inline void drive_oscillator(
+    RTGraph const &g,
+    OscState &osc,
+    std::span<const float> freq_in,
+    double freq_control_default,
+    int nframes,
+    WaveFn wave_fn,
+    Body body
+) noexcept {
+  if (!freq_in.empty()) {
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const double freq = sanitize_finite(
+          static_cast<double>(freq_in[fi]), 0.0);
+      osc.phase_iter.set(q::frequency{freq}, g.sample_rate);
+      const float sample = wave_fn(osc.phase_iter++);
+      body(fi, sample);
+    }
+  } else {
+    const double freq = sanitize_finite(freq_control_default, 0.0);
+    osc.phase_iter.set(q::frequency{freq}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float sample = wave_fn(osc.phase_iter++);
+      body(fi, sample);
+    }
+  }
+}
+
 /* Note [Region kernel: SawLpfGain]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Hand-written fused kernel for a region tagged 'RegionKernel::SawLpfGain'.
@@ -3024,29 +3149,16 @@ static void process_region_saw_lpf_gain(
   const float gain_amount = sanitize_finite(
       static_cast<float>(gain_node.controls[0]), 1.0f);
 
-  if (!saw_freq_in.empty()) {
-    // Audio-rate saw frequency: per-sample increment update,
-    // mirroring process_sawosc's audio-rate branch.
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const double freq = sanitize_finite(
-          static_cast<double>(saw_freq_in[fi]), 0.0);
-      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-      const float saw_sample = q::saw(osc->phase_iter++);
+  // Buffer-terminal: write each per-sample product to the gain's
+  // output buffer for sibling regions to read. drive_oscillator
+  // handles the audio-rate vs block-rate freq branch and the
+  // phase-iterator advance; the body inlines the LPF + gain step.
+  drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
+                   nframes, q::saw,
+    [&](std::size_t fi, float saw_sample) noexcept {
       const float lpf_sample = lpf->filter(saw_sample);
       out[fi] = lpf_sample * gain_amount;
-    }
-  } else {
-    // Block-rate saw frequency: increment set once per block.
-    const double saw_freq = sanitize_finite(saw_node.controls[0], 0.0);
-    osc->phase_iter.set(q::frequency{saw_freq}, g.sample_rate);
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const float saw_sample = q::saw(osc->phase_iter++);
-      const float lpf_sample = lpf->filter(saw_sample);
-      out[fi] = lpf_sample * gain_amount;
-    }
-  }
+    });
 }
 
 /* Note [Region kernel: SinGainOut]
@@ -3113,66 +3225,23 @@ static void process_region_sin_gain_out(
     return;
   }
 
-  // Sanitise the gain control once per block. Audio-rate gain is
+  // Sanitize the gain control once per block. Audio-rate gain is
   // disallowed at the Haskell match level, so this scalar value
   // is the only path to compute the per-sample product.
   const float gain_amount = sanitize_finite(
       static_cast<float>(gain_node.controls[0]), 1.0f);
 
-  // Validate the bus index in the double domain BEFORE casting to
-  // int. Mirrors process_out's pathological-input sanitation.
-  const double bus_d   = out_node.controls[0];
-  const double bus_lim =
-      static_cast<double>(g.server.output_buses.size());
-  const bool bus_ok =
-      std::isfinite(bus_d) && bus_d >= 0.0 && bus_d < bus_lim;
-  const int  bus     = bus_ok ? static_cast<int>(bus_d) : -1;
-  std::vector<float> *dst =
-      bus_ok ? &g.server.output_buses[static_cast<std::size_t>(bus)]
-             : nullptr;
-
-  // Pull the sink-peak running max into a register for the inner
-  // loop, then write back once. process_instance reset this to 0
-  // at block start; multiple Out / BusOut nodes in the same instance
-  // contribute to the same max, so we read-modify-write rather than
-  // overwrite.
-  float peak = inst.block_sink_peak;
-
-  if (!sin_freq_in.empty()) {
-    // Audio-rate sin frequency: per-sample increment update,
-    // mirroring process_sinosc's audio-rate branch.
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const double freq = sanitize_finite(
-          static_cast<double>(sin_freq_in[fi]), 0.0);
-      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-      const float sin_sample = q::sin(osc->phase_iter++);
-      const float s          = sin_sample * gain_amount;
-      if (dst) {
-        (*dst)[fi] += s;
-        const float a = std::fabs(s);
-        if (a > peak) peak = a;
-      }
-    }
-  } else {
-    // Block-rate sin frequency: increment set once per block.
-    const double sin_freq = sanitize_finite(sin_node.controls[0], 0.0);
-    osc->phase_iter.set(q::frequency{sin_freq}, g.sample_rate);
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const float sin_sample = q::sin(osc->phase_iter++);
-      const float s          = sin_sample * gain_amount;
-      if (dst) {
-        (*dst)[fi] += s;
-        const float a = std::fabs(s);
-        if (a > peak) peak = a;
-      }
-    }
-  }
-
-  if (dst) {
-    inst.block_sink_peak = peak;
-  }
+  // Sink-terminal: open the bus accumulator (validates the Out
+  // node's bus index in the double domain, snapshots the
+  // running peak), drive the sin osc, push each per-sample
+  // product, then flush the running peak back to the instance.
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  drive_oscillator(g, *osc, sin_freq_in, sin_node.controls[0],
+                   nframes, q::sin,
+    [&](std::size_t fi, float sin_sample) noexcept {
+      sink.push(fi, sin_sample * gain_amount);
+    });
+  sink.flush_to(inst);
 }
 
 /* Note [Region kernel: SawLpfGainOut]
@@ -3253,59 +3322,19 @@ static void process_region_saw_lpf_gain_out(
   const float gain_amount = sanitize_finite(
       static_cast<float>(gain_node.controls[0]), 1.0f);
 
-  // Bus index validation in the double domain — same discipline as
-  // process_out / process_region_sin_gain_out.
-  const double bus_d   = out_node.controls[0];
-  const double bus_lim =
-      static_cast<double>(g.server.output_buses.size());
-  const bool bus_ok =
-      std::isfinite(bus_d) && bus_d >= 0.0 && bus_d < bus_lim;
-  const int  bus     = bus_ok ? static_cast<int>(bus_d) : -1;
-  std::vector<float> *dst =
-      bus_ok ? &g.server.output_buses[static_cast<std::size_t>(bus)]
-             : nullptr;
-
-  // Read-modify-write the per-block sink peak: process_instance
-  // reset it to 0, but a sibling Out / BusOut may run later in the
-  // same block and contribute to the same max.
-  float peak = inst.block_sink_peak;
-
-  if (!saw_freq_in.empty()) {
-    // Audio-rate saw frequency: per-sample increment update.
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const double freq = sanitize_finite(
-          static_cast<double>(saw_freq_in[fi]), 0.0);
-      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-      const float saw_sample = q::saw(osc->phase_iter++);
+  // Sink-terminal: open the bus accumulator, drive the saw osc,
+  // run the LPF + gain step inline (the LPF state stays
+  // hand-written; the freq/q latch above is filter-specific
+  // setup that intentionally doesn't live in the helpers), and
+  // flush the running peak back to the instance.
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
+                   nframes, q::saw,
+    [&](std::size_t fi, float saw_sample) noexcept {
       const float lpf_sample = lpf->filter(saw_sample);
-      const float s          = lpf_sample * gain_amount;
-      if (dst) {
-        (*dst)[fi] += s;
-        const float a = std::fabs(s);
-        if (a > peak) peak = a;
-      }
-    }
-  } else {
-    // Block-rate saw frequency: increment set once per block.
-    const double saw_freq = sanitize_finite(saw_node.controls[0], 0.0);
-    osc->phase_iter.set(q::frequency{saw_freq}, g.sample_rate);
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const float saw_sample = q::saw(osc->phase_iter++);
-      const float lpf_sample = lpf->filter(saw_sample);
-      const float s          = lpf_sample * gain_amount;
-      if (dst) {
-        (*dst)[fi] += s;
-        const float a = std::fabs(s);
-        if (a > peak) peak = a;
-      }
-    }
-  }
-
-  if (dst) {
-    inst.block_sink_peak = peak;
-  }
+      sink.push(fi, lpf_sample * gain_amount);
+    });
+  sink.flush_to(inst);
 }
 
 // ----------------------------------------------------------------
