@@ -431,8 +431,9 @@ usage prog = unlines
   , "                   counts) and print a coverage table — per-template"
   , "                   region-kernel claims, §4.C elisions, and a sink-"
   , "                   terminal opportunity scan flagging shapes a future"
-  , "                   kernel could claim. The fixed 'surveyCorpus' set"
-  , "                   of survey-only graphs (corpus:* rows) is always"
+  , "                   kernel could claim. The fixed 'surveyShapeProbes'"
+  , "                   single-graph set plus 'surveyEnsembleCorpus'"
+  , "                   multi-template ensembles (corpus:* rows) are always"
   , "                   included regardless of demo targeting; demos and"
   , "                   corpus get separate subtotals. No audio, no TUI,"
   , "                   just the report."
@@ -1248,21 +1249,21 @@ surveyDemoEnsembles demo = case demoBody demo of
   MultiTemplate tpls -> [surveyEnsemble (demoKey demo) tpls]
   _                  -> []
 
--- | Every entry in 'surveyTemplateCorpus' becomes one ensemble row
+-- | Every entry in 'surveyEnsembleCorpus' becomes one ensemble row
 -- under the @corpus:<name>@ key.
-surveyTemplateCorpusEnsembles :: [Either String EnsembleScheduleRow]
-surveyTemplateCorpusEnsembles =
+surveyEnsembleCorpusScheduleRows :: [Either String EnsembleScheduleRow]
+surveyEnsembleCorpusScheduleRows =
   [ surveyEnsemble ("corpus:" <> ensembleName) tpls
-  | (ensembleName, tpls) <- surveyTemplateCorpus
+  | (ensembleName, tpls) <- surveyEnsembleCorpus
   ]
 
 -- Note [Survey corpus design]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- 'surveyCorpus' is a small, fixed set of survey-only graphs that
--- exists to give --fusion-survey realistic patch shapes without
--- polluting the playable demo list. Demos answer "what plays";
--- corpus answers "what coverage do the §4.B kernels achieve on
--- patches users will plausibly write".
+-- 'surveyShapeProbes' is a small, fixed set of survey-only single
+-- graphs that exists to give --fusion-survey realistic patch shapes
+-- without polluting the playable demo list. Demos answer "what
+-- plays"; the shape-probe corpus answers "what kernel shape did
+-- this graph produce, and which §4.B kernel (if any) claimed it".
 --
 -- The corpus is grouped by intent:
 --
@@ -1284,13 +1285,13 @@ surveyTemplateCorpusEnsembles =
 -- comment) — not to fix the comment without thought.
 --
 -- These graphs are not run as audio. They flow only through
--- --fusion-survey via 'surveyCorpusRows'.
+-- --fusion-survey via 'surveyShapeProbeRows'.
 --
 -- Multi-template ensembles (cross-template send / return topology)
--- live in 'surveyTemplateCorpus'; see Note [Template corpus] below
+-- live in 'surveyEnsembleCorpus'; see Note [Template corpus] below
 -- for why they're a separate list rather than a sum-typed body.
-surveyCorpus :: [(String, SynthGraph)]
-surveyCorpus =
+surveyShapeProbes :: [(String, SynthGraph)]
+surveyShapeProbes =
   -- ── Positive: chains the §4.B matcher should claim ────────────
   [ ( "pos/sin-gain-out"
     , runSynth $ do
@@ -1343,7 +1344,7 @@ surveyCorpus =
         -- writer in this single-graph corpus, so the BusIn reads
         -- silence at runtime — this entry exercises the matcher on
         -- the shape, /not/ a complete send/return topology.
-        -- Real send/return topology lives in 'surveyTemplateCorpus'
+        -- Real send/return topology lives in 'surveyEnsembleCorpus'
         -- (cross-template writer + reader pair).
         r <- busIn 3
         f <- lpf r 2000.0 0.6
@@ -1482,27 +1483,27 @@ surveyCorpus =
         out 0 a )                            -- unclaimed: Delay stateful, excluded
   ]
 
--- | Compile every entry in 'surveyCorpus', stamping each row's demo
+-- | Compile every entry in 'surveyShapeProbes', stamping each row's demo
 -- key with a "corpus:" prefix so the unified survey table makes the
 -- source obvious. Errors are surfaced the same way as for demos.
-surveyCorpusRows :: [Either String SurveyRow]
-surveyCorpusRows =
+surveyShapeProbeRows :: [Either String SurveyRow]
+surveyShapeProbeRows =
   [ surveySynthGraph ("corpus:" <> name) Nothing g
-  | (name, g) <- surveyCorpus
+  | (name, g) <- surveyShapeProbes
   ]
 
 -- Note [Template corpus]
 -- ~~~~~~~~~~~~~~~~~~~~~~
--- 'surveyTemplateCorpus' is the multi-template counterpart of
--- 'surveyCorpus'. Each entry is a named ensemble of (template-name,
+-- 'surveyEnsembleCorpus' is the multi-template counterpart of
+-- 'surveyShapeProbes'. Each entry is a named ensemble of (template-name,
 -- SynthGraph) pairs that mirrors how a real cross-template send /
 -- return ensemble compiles: voice templates write to a shared bus,
 -- fx templates read from it. This is the topology that BusIn-rooted
 -- chains naturally arise from in practice.
 --
--- Why a separate list rather than wrapping 'surveyCorpus' in a
+-- Why a separate list rather than wrapping 'surveyShapeProbes' in a
 -- sum-type body: keeping single-graph and multi-template entries
--- in two parallel lists means existing 'surveyCorpus' entries
+-- in two parallel lists means existing 'surveyShapeProbes' entries
 -- stay untouched, and the survey driver concatenates rows from
 -- both. The trade-off is one extra type signature; the upside is
 -- zero churn on the 20 single-graph entries.
@@ -1513,15 +1514,15 @@ surveyCorpusRows =
 -- demo already shows up in the per-row table (one row per
 -- template, sharing a demo key).
 --
--- Like 'surveyCorpus', these graphs are not run as audio. Each
+-- Like 'surveyShapeProbes', these graphs are not run as audio. Each
 -- template is compiled as a standalone 'SynthGraph' for the
 -- survey, so a voice template's BusOut writes to "nowhere" and an
 -- fx template's BusIn reads silence. That's the same trick
 -- 'surveyDemo' uses for the playable send-return demo — the
 -- matcher only inspects per-template structure, not cross-template
 -- runtime values.
-surveyTemplateCorpus :: [(String, [(String, SynthGraph)])]
-surveyTemplateCorpus =
+surveyEnsembleCorpus :: [(String, [(String, SynthGraph)])]
+surveyEnsembleCorpus =
   [ ( "two-voices-one-fx"
     , [ ( "voice-low"
         , runSynth $ do
@@ -1598,15 +1599,15 @@ surveyTemplateCorpus =
   ]
 
 -- | Compile every (ensemble, template) pair in
--- 'surveyTemplateCorpus' into a 'SurveyRow', stamping the demo key
+-- 'surveyEnsembleCorpus' into a 'SurveyRow', stamping the demo key
 -- with "corpus:" and the ensemble name, and putting the template
 -- name in the template column. One row per template; ensembles are
 -- not summarized — the per-template granularity is what makes
 -- BusIn-rooted return tails legible.
-surveyTemplateCorpusRows :: [Either String SurveyRow]
-surveyTemplateCorpusRows =
+surveyEnsembleCorpusRows :: [Either String SurveyRow]
+surveyEnsembleCorpusRows =
   [ surveySynthGraph ("corpus:" <> ensembleName) (Just templateName) g
-  | (ensembleName, templates) <- surveyTemplateCorpus
+  | (ensembleName, templates) <- surveyEnsembleCorpus
   , (templateName, g)         <- templates
   ]
 
@@ -1619,7 +1620,7 @@ surveyTemplateCorpusRows =
 -- coverage. Exits with status 1 if any survey row failed, since
 -- the resulting numbers are by definition incomplete.
 --
--- The corpus ('surveyCorpus' + 'surveyTemplateCorpus' — fixed sets
+-- The corpus ('surveyShapeProbes' + 'surveyEnsembleCorpus' — fixed sets
 -- of survey-only graphs designed to exercise §4.B kernel coverage on
 -- realistic patches) is always included regardless of demo
 -- targeting. Corpus rows exist for coverage measurement, not
@@ -1630,14 +1631,14 @@ runFusionSurvey :: [Demo] -> IO ()
 runFusionSurvey demos = do
   let demoResults              = concatMap surveyDemo demos
       corpusResults            =
-        surveyCorpusRows <> surveyTemplateCorpusRows
+        surveyShapeProbeRows <> surveyEnsembleCorpusRows
       (demoErrs,   demoRows)   = partitionEithers demoResults
       (corpusErrs, corpusRows) = partitionEithers corpusResults
       allRows                  = demoRows <> corpusRows
 
       ensembleResults          =
         concatMap surveyDemoEnsembles demos
-        <> surveyTemplateCorpusEnsembles
+        <> surveyEnsembleCorpusScheduleRows
       (ensembleErrs, ensembleRows) = partitionEithers ensembleResults
 
       allErrs                  =
@@ -1703,7 +1704,7 @@ formatSurveyRow cols =
       | otherwise     = s <> replicate (w - length s) ' '
 
 -- Column 1 is wide enough to fit the longest 'corpus:*' key in
--- 'surveyCorpus' (~38 chars) plus a couple of characters of slack.
+-- 'surveyShapeProbes' (~38 chars) plus a couple of characters of slack.
 -- If a future corpus entry needs a longer name, bump the first
 -- entry rather than letting the row shove later columns right.
 surveyColumnWidths :: [Int]
