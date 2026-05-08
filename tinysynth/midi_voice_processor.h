@@ -35,7 +35,7 @@
 //     1.0 running-status convention used by many controllers).
 //   * Channel filtering via a 16-bit mask. Bit i = listen on
 //     channel i; default 0xFFFF is omni mode.
-//   * Velocity is normalised to a float in [0, 1] (= MIDI value /
+//   * Velocity is normalized to a float in [0, 1] (= MIDI value /
 //     127). The user's voice-allocator map callback is responsible
 //     for any further re-scaling (e.g. perceptual curves).
 //   * Control change (CC) is dispatched through a small mapping
@@ -123,9 +123,9 @@ public:
   // generation) pair: idempotent across multiple tick() calls
   // while the voice stays Active. CC mappings replay only after
   // they have observed at least one CC event (no fabricated
-  // defaults); pitch-bend replays the centred default (factor
+  // defaults); pitch-bend replays the centered default (factor
   // 1.0) once set_pitch_bend has been called, even before the
-  // first pitch-bend message — that centred default IS the
+  // first pitch-bend message — that centered default IS the
   // inherited value, since binding pitch-bend to a control
   // declares pitch-bend ownership of it.
   void tick();
@@ -199,12 +199,12 @@ private:
     int           node_index     = 0;
     int           control_index  = 0;
     float         semitone_range = 2.0f;
-    // 14-bit last raw value (0..16383). Defaults to 8192 (centred)
+    // 14-bit last raw value (0..16383). Defaults to 8192 (centered)
     // when set_pitch_bend is called, so a newly-activated voice
     // receives its base frequency on its bound control even before
     // the first pitch-bend message arrives. This is intentional:
     // binding pitch-bend to a control declares "this control is
-    // owned by pitch-bend"; the centred default is the only sane
+    // owned by pitch-bend"; the centered default is the only sane
     // pre-event value.
     std::uint16_t last_raw       = 8192;
   };

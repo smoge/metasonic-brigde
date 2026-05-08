@@ -118,7 +118,7 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
 
 // [T:construction] Add or reconfigure one node at its dense runtime
 // index in the named template. Walks every live instance of that
-// template and installs freshly-initialised state at the same index,
+// template and installs freshly-initialized state at the same index,
 // so adding a node early or late produces the same final layout
 // per-template. Instances of other templates are not touched (each
 // template has its own dense node space). Silent no-op if template_id
@@ -159,7 +159,7 @@ void rt_graph_template_set_node_elided(RTGraph *g, int template_id,
 // [T:construction] Wire one input port of a destination node so it
 // reads through a fused scaled-source form rather than from a
 // producer's output buffer. At runtime the input resolver
-// materialises the value as
+// materializes the value as
 //
 //   scratch[i] = src[i] * static_cast<float>(scale_node.controls[scale_control])
 //
@@ -249,7 +249,7 @@ void rt_graph_template_connect_fused_scale_chain_input(
 //                     0 or 1 for Add, depending on which port
 //                     held the bias literal.
 //
-// Per-block resolver materialises:
+// Per-block resolver materializes:
 //
 //   scratch[i] = src[i]
 //   for k in 0 .. step_count-1:
@@ -687,7 +687,7 @@ int rt_graph_realtime_release(RTGraph *g, int slot_id);
 // [T:realtime-producer] Enqueue Remove(slot_id) — hard-free at the
 // next block boundary. The audio drain gates to Active or
 // Releasing; Reserved slots are producer-private and should be
-// cancelled via rt_graph_realtime_cancel instead. Returns 1 on
+// canceled via rt_graph_realtime_cancel instead. Returns 1 on
 // success, 0 if the queue is full.
 int rt_graph_realtime_remove(RTGraph *g, int slot_id);
 

@@ -218,7 +218,7 @@ constexpr int kBlockSizes[]  = { 64, 128, 512 };
 constexpr int kVoiceCounts[] = { 1, 8, 32 };
 
 // Drain the bus into the volatile sink. Prevents the optimizer
-// from realising nothing reads the rendered output.
+// from realizing nothing reads the rendered output.
 void drain_into_sink(RTGraph *g, int nframes,
                      std::vector<float> &scratch) {
   scratch.resize(static_cast<std::size_t>(nframes));

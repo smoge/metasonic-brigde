@@ -165,7 +165,7 @@ node executing in the current block. Two consequences:
      "cycle" is across blocks, broken by the runtime's swap of the
      bus pool's snapshot and live buffers.
   2. 'BusInDelayed' on a bus with no writer is well-defined: the
-     snapshot stays at the zero-initialised state and the read produces
+     snapshot stays at the zero-initialized state and the read produces
      silence — same as 'BusIn' on an unwritten bus.
 
 The asymmetric treatment of 'BusRead' vs 'BusReadDelayed' is the central
@@ -186,7 +186,7 @@ See also: Note [Resource effects] in "MetaSonic.Types", Note [Bus model:
 SC-style same-cycle audio buses] in "MetaSonic.Bridge.Source", Note
 [Effects are per-UGen, not per-kind] in "MetaSonic.Bridge.Source", and
 Note [Bus pool double-buffering] in @tinysynth/rt_graph.cpp@ for the
-runtime-side ping-pong that realises the snapshot semantics.
+runtime-side ping-pong that realizes the snapshot semantics.
 -}
 
 -- | Verify that every 'NodeID' referenced by a 'Connection'

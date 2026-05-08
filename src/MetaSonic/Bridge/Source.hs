@@ -374,7 +374,7 @@ data UGen
     -- so the snapshot 'BusInDelayed' reads is always exactly what the
     -- previous block wrote (zero on the very first block).
     --
-    -- The delayed read is the SuperCollider 'InFeedback.ar' analogue;
+    -- The delayed read is the SuperCollider 'InFeedback.ar' counterpart;
     -- see Note [Bus model: SC-style same-cycle audio buses].
   | SinOsc !Connection !Connection
     -- ^ Sine oscillator: frequency, initial phase.
@@ -393,9 +393,9 @@ data UGen
     -- Mirrors 'LPF'.
   | BPF !Connection !Connection !Connection
     -- ^ Band-pass biquad (constant-peak-gain variant): signal in,
-    -- centre frequency, Q factor (higher Q = narrower band).
+    -- center frequency, Q factor (higher Q = narrower band).
   | Notch !Connection !Connection !Connection
-    -- ^ Notch (band-reject) biquad: signal in, centre frequency,
+    -- ^ Notch (band-reject) biquad: signal in, center frequency,
     -- Q factor.
   | NoiseGen
     -- ^ White noise generator. No connections; pure source.
@@ -693,13 +693,13 @@ triOsc freq phase = insertNodeC "triOsc" (TriOsc freq phase)
 hpf :: Connection -> Connection -> Connection -> SynthM Connection
 hpf sig freq q = insertNodeC "hpf" (HPF sig freq q)
 
--- | Band-pass biquad (constant-peak-gain): signal, centre frequency,
+-- | Band-pass biquad (constant-peak-gain): signal, center frequency,
 -- Q factor. Higher Q = narrower band. Cutoff and Q are read once per
 -- block, like 'lpf' and 'hpf'.
 bpf :: Connection -> Connection -> Connection -> SynthM Connection
 bpf sig freq q = insertNodeC "bpf" (BPF sig freq q)
 
--- | Notch (band-reject) biquad: signal, centre frequency, Q factor.
+-- | Notch (band-reject) biquad: signal, center frequency, Q factor.
 -- Useful for hum removal and spectral notching. Cutoff and Q are read
 -- once per block, like the rest of the biquad family.
 notch :: Connection -> Connection -> Connection -> SynthM Connection

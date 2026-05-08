@@ -107,7 +107,7 @@ void MidiVoiceProcessor::operator()(midi::pitch_bend msg, std::size_t /*time*/) 
   // inherits the current bend on activation.
   pitch_bend_.last_raw = static_cast<std::uint16_t>(msg.value());
 
-  // 14-bit value: 0..16383, centre = 8192.
+  // 14-bit value: 0..16383, center = 8192.
   const int   raw  = static_cast<int>(msg.value()) - 8192;
   const float bend = static_cast<float>(raw) / 8192.0f;  // [-1, 1)
   const float bend_semitones = bend * pitch_bend_.semitone_range;
@@ -219,7 +219,7 @@ void MidiVoiceProcessor::apply_inherited_state_to_voice(
         static_cast<double>(m.last_value));
   }
 
-  // Pitch-bend: always replay if bound. The centred default
+  // Pitch-bend: always replay if bound. The centered default
   // (last_raw = 8192, factor 1.0) is the right inherited value
   // pre-event because binding pitch-bend to a control declares
   // pitch-bend ownership of it — silence-by-omission would be

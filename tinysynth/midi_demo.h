@@ -36,7 +36,7 @@
 // q::midi_input_stream construction, or the cleaner upstream fix where
 // midi_device owns its impl by value.
 //
-// Graceful no-device behaviour: the worker walks
+// Graceful no-device behavior: the worker walks
 // q::midi_device::list() and only constructs a q::midi_input_stream
 // when a device matches the requested id AND has num_inputs() > 0.
 // On a host with no MIDI devices, an out-of-range id, or only
@@ -135,7 +135,7 @@ struct rt_midi_pitch_bend_binding {
 //
 // Returns nullptr on hard allocation failure or invalid arguments
 // (null graph, null voice_mapping). Returns a valid handle even if
-// no MIDI device is present — see "Graceful no-device behaviour"
+// no MIDI device is present — see "Graceful no-device behavior"
 // at the top of this header.
 rt_midi_demo *
 rt_midi_demo_open(RTGraph                            *graph,
@@ -161,7 +161,7 @@ int rt_midi_demo_pitch_bend_count(const rt_midi_demo *h);
 
 // True when the underlying q::midi_input_stream connected to a
 // device. False on no-device boxes, or before the worker has
-// initialised. -1 if h is null. Useful for CI / smoke tests that
+// initialized. -1 if h is null. Useful for CI / smoke tests that
 // want to assert "this binary handles a no-MIDI environment."
 int rt_midi_demo_has_device(const rt_midi_demo *h);
 

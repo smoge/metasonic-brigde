@@ -407,7 +407,7 @@ foreign import ccall unsafe "rt_graph_template_set_node_elided"
     :: Ptr RTGraph -> CInt -> CInt -> IO ()
 
 -- | Step C (e): wire one input port through a fused scaled-source
--- form. The runtime materialises the value as
+-- form. The runtime materializes the value as
 -- @src[i] * float(scale_node.controls[scale_control_index])@ into a
 -- per-instance scratch slot at resolve time. See
 -- 'rt_graph_template_connect_fused_scale_input' in @rt_graph.h@.
@@ -420,7 +420,7 @@ foreign import ccall unsafe "rt_graph_template_connect_fused_scale_input"
     -> IO ()
 
 -- | Step C chain extension: wire one input port through a
--- chained fused scaled-source form. The runtime materialises
+-- chained fused scaled-source form. The runtime materializes
 -- @scratch[i] = src[i]@, then folds in each
 -- @float(scale_nodes[k].controls[scale_controls[k]])@ in
 -- source-to-sink order. One scratch slot per fused input
@@ -605,7 +605,7 @@ cControlIndex (ControlIndex x) = fromIntegral x
 --
 -- 'rrRate' marshals via 'fromEnum' to match the Haskell 'Rate'
 -- lattice ordering — see Note [Rate discipline] in MetaSonic.Types.
--- The runtime stores the int but does not currently key behaviour
+-- The runtime stores the int but does not currently key behavior
 -- on it.
 addRegionTo :: Ptr RTGraph -> CInt -> RuntimeRegion -> IO ()
 addRegionTo g cTid r =
@@ -617,7 +617,7 @@ addRegionTo g cTid r =
           cCount = fromIntegral (length (rrNodes r))
       in case rrKernel r of
            RNodeLoop ->
-             -- Default behaviour: existing entry, identical wire
+             -- Default behavior: existing entry, identical wire
              -- format to pre-§4.B graphs.
              c_rt_graph_template_add_region g cTid
                cRate cFirst cCount
@@ -634,7 +634,7 @@ addRegionTo g cTid r =
 
 -- | Cross the fused-input ABI for one consumer port. Dispatches
 -- between the single-scale and chain entry points so the loaders
--- only have to recognise 'RFused' once. The chain entry point
+-- only have to recognize 'RFused' once. The chain entry point
 -- claims one scratch slot regardless of length, so emitting the
 -- chain form for length-1 chains would be correct but wasteful;
 -- the compiler emits 'FScaleFrom' for length-1 to avoid the array

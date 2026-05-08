@@ -19,7 +19,7 @@
 // _impl-null check Q already does in next() at line ~50.
 //
 // When upstream Q lands the same guard, this file can go away in
-// favour of the upstream implementation.
+// favor of the upstream implementation.
 //
 // Upstream copyright preserved verbatim:
 

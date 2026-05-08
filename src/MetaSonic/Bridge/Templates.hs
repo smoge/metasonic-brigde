@@ -13,7 +13,7 @@
 -- produces a dense per-template 'RuntimeGraph', this module composes
 -- several templates into a 'TemplateGraph': an ordered list of
 -- templates plus the precedence DAG that the compiler decreed by
--- analysing each template's bus reads/writes.
+-- analyzing each template's bus reads/writes.
 --
 -- The whole module exists to keep execution order on the Haskell
 -- side at compile time, the way intra-graph ordering already is. The
@@ -70,7 +70,7 @@ Precedence between two templates @T_a@ and @T_b@:
   T_a precedes T_b   iff   bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅
 
 That is: if @T_b@ reads, in this block, a bus that @T_a@ writes,
-then @T_a@ must run first. This is the inter-template analogue of
+then @T_a@ must run first. This is the inter-template counterpart of
 E_r. 'BusReadDelayed' deliberately does not contribute, exactly as
 within a single graph — see Note [Effect-induced edges (E_r)] in
 "MetaSonic.Bridge.Validate" — so cross-template feedback through

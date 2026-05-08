@@ -76,7 +76,7 @@ constexpr float kDefaultSampleRate = 48000.0f;
 /* Note [Pathological-input sanitation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Several Q primitives have undefined behaviour on non-finite inputs:
+Several Q primitives have undefined behavior on non-finite inputs:
 
   * q::phase::phase(frequency, sps) computes (2^31 * freq) / sps and
     stores the double as a uint32_t. NaN/Inf -> impl-defined / unspec.
@@ -451,7 +451,7 @@ struct InputRef {
 };
 
 // Step C: per-input override that turns a kernel's input read into
-// an inline affine-chain materialisation. When NodeSpec's
+// an inline affine-chain materialization. When NodeSpec's
 // fused_inputs[port] holds one of these, resolve_input writes
 // scratch[i] = source.outputs[port][i] then folds in each step
 // (scale or bias) in source-to-sink order:
@@ -525,7 +525,7 @@ struct NoiseGenState {
 
 // LPF holds a q::lowpass biquad and the last-applied freq/q so the filter is
 // _only_ reconfigured when a parameter changes (block-rate). last_freq/last_q
-// are initialised to -1 so the first process call reconfigures with the node's
+// are initialized to -1 so the first process call reconfigures with the node's
 // controls.
 struct LPFState {
   q::lowpass filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
@@ -546,7 +546,7 @@ struct HPFState {
 
 struct BPFState {
   // bandpass_cpg: constant-peak-gain — peak amplitude stays roughly
-  // constant as Q changes, which is the musical / wah-style behaviour.
+  // constant as Q changes, which is the musical / wah-style behavior.
   // (bandpass_csg, the constant-skirt-gain variant, is sharper but
   // its peak gain scales with Q.)
   q::bandpass_cpg filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
@@ -660,7 +660,7 @@ Each node's *spec* (immutable per template) is separated from its
     every GraphInstance of the same MetaDef.
 
   * NodeInstanceState — the parts each instance owns: its current
-    control values (initialised from the spec's defaults; mutable
+    control values (initialized from the spec's defaults; mutable
     via rt_graph_instance_set_control), per-port output buffers
     preallocated to max_frames, and the kernel state variant
     (OscState, LPFState, …).
@@ -696,7 +696,7 @@ struct NodeSpec {
   // Step C: per-input fused override. Parallel-sized to input_refs
   // whenever populated. An empty optional means "use the regular
   // input_refs[port] path"; a populated one redirects the consumer's
-  // read through an affine-chain materialisation (any sequence of
+  // read through an affine-chain materialization (any sequence of
   // scale and bias steps; see FusedAffineStep::Kind). See
   // FusedAffineRef and Note [Fused inputs] (Compile.hs).
   std::vector<std::optional<FusedAffineRef>> fused_inputs;
@@ -848,7 +848,7 @@ region_kernel_from_tag(int kind) noexcept {
 // this struct does not pretend to handle that case.
 //
 // `kernel` is the §4.B region-kernel selector. NodeLoop preserves
-// the legacy "iterate member nodes via dispatch_node" behaviour;
+// the legacy "iterate member nodes via dispatch_node" behavior;
 // non-NodeLoop values redirect process_instance to a hand-written
 // fused per-sample kernel. The runtime validates the member kind
 // sequence on entry and falls back to NodeLoop on a mismatch, so
@@ -879,7 +879,7 @@ struct MetaDef {
   // per-node loop (legacy callers that don't emit regions, e.g.
   // C++ doctests building graphs via rt_graph_add_node directly).
   // When non-empty, process_instance iterates regions as the unit of
-  // dispatch; behaviour is identical either way for Step A. See
+  // dispatch; behavior is identical either way for Step A. See
   // Note [Region fallback].
   std::vector<RegionSpec> regions;
 
@@ -925,7 +925,7 @@ struct GraphInstance {
 
   // Step C: one float[max_frames] buffer per registered fused input
   // (any kind — single scale, scale chain, or affine chain).
-  // resolve_input materialises into the slot assigned in the matching
+  // resolve_input materializes into the slot assigned in the matching
   // FusedAffineRef, then returns a span over it. Sized at
   // construction (make_instance) and grown in lockstep with each
   // fused-* connect ABI entry; never resized in the audio callback.
@@ -1087,7 +1087,7 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
 }
 
 // Reset a per-node state slot in place, preserving vector capacities
-// across reuse. The first time a slot is initialised for a given kind
+// across reuse. The first time a slot is initialized for a given kind
 // the buffers and controls vector grow to size, allocating; subsequent
 // reuses (same shape) reset values without allocating. This is the
 // path realtime_reserve hits, so keeping it allocation-free in steady
@@ -1309,7 +1309,7 @@ Single-producer contract
 Only one producer thread may enqueue. Phase 3 makes this thread
 the voice-allocator's input handler; UI / OSC / MIDI ingress all
 feed *into* the allocator rather than the queue directly. If
-multiple ingress points ever materialise, an MPSC layer should
+multiple ingress points ever materialize, an MPSC layer should
 sit *above* this queue, not inside it.
 */
 
@@ -1532,7 +1532,7 @@ All ownership, lifetime, and mutation live here.
 Legacy single-template back-compat: the existing ABI surface
 (rt_graph_add_node, rt_graph_set_control, rt_graph_connect,
 rt_graph_instance_add without a template argument) operates on
-template 0, which rt_graph_create / rt_graph_clear materialise as an
+template 0, which rt_graph_create / rt_graph_clear materialize as an
 empty MetaDef so legacy callers don't need to issue an explicit
 rt_graph_template_add. See Note [Legacy single-template ABI as
 template-0 shim].
@@ -1583,7 +1583,7 @@ Within a block, reads and writes have well-defined origins:
     (and across instances, and across templates).
 
 On the very first block, output_buses_prev contains the
-zero-initialised state assigned by ensure_output_bus_count, so a
+zero-initialized state assigned by ensure_output_bus_count, so a
 first-block BusInDelayed produces silence. After block N completes,
 its writes become block N+1's "prev" snapshot.
 
@@ -1686,7 +1686,7 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
 //
 // Step C (d) extends the resolver with a fused-input path: when a
 // destination port carries a FusedAffineRef in dst_spec.fused_inputs
-// it is materialised into the consuming GraphInstance's
+// it is materialized into the consuming GraphInstance's
 // fused_scratch slot and the returned span views that scratch.
 // Mirrors process_gain's scalar-fallback discipline (cast double
 // control to float, then multiply float source samples) so fused
@@ -1754,7 +1754,7 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
       }
 
       // Pre-validate every step before writing the scratch: a
-      // single bad ref must not leave a partial materialisation
+      // single bad ref must not leave a partial materialization
       // visible to the consumer.
       for (const auto &step : fr.steps) {
         if (!valid(step.node) || !valid(step.control)) return {};
@@ -1892,9 +1892,9 @@ and accumulation remain allocation-free inside the DSP loop.
 // Grow both halves of the double-buffered bus pool to hold at least
 // `count` buses. The two vectors must always be the same size so the
 // per-block std::swap in process_graph stays size-consistent. New
-// slots are zero-initialised on both sides — a first-block
+// slots are zero-initialized on both sides — a first-block
 // BusInDelayed reading from output_buses_prev therefore gets silence
-// rather than uninitialised memory. See Note [Bus pool
+// rather than uninitialized memory. See Note [Bus pool
 // double-buffering].
 static void ensure_output_bus_count(Server &server, std::size_t count, int max_frames) {
   if (server.output_buses.size() >= count) {
@@ -1993,7 +1993,7 @@ static void process_sinosc(const RTGraph &g, GraphInstance &inst,
   if (!freq_in.empty()) {
     // Sample-accurate FM: update the phase increment per sample.
     // Sanitize NaN/Inf -> 0 Hz (DC); finite negative + above-Nyquist
-    // pass through unchanged — they have documented behaviour
+    // pass through unchanged — they have documented behavior
     // (existing tests pin negative-freq oscillation and above-Nyquist
     // aliasing). See Note [Pathological-input sanitation].
     for (int i = 0; i < nframes; ++i) {
@@ -2700,7 +2700,7 @@ hazards.
 Out-of-range bus indices emit silence (same as BusIn). Reading a bus
 that no node ever wrote — including on the first block, before any
 swap — also produces silence, because ensure_output_bus_count
-zero-initialises both halves of the pool.
+zero-initializes both halves of the pool.
 
 The kernel is a straight memcpy from prev[bus] into the node's output
 port; downstream consumers see no difference from BusIn beyond the
@@ -2792,7 +2792,7 @@ static void process_delay(const RTGraph &g, GraphInstance &inst,
 
   // (Re)build the ring buffer on first call or after a sample-rate /
   // max-time change. q::delay's constructor sizes the buffer to
-  // ceil(max_time * sps) samples and zero-initialises it.
+  // ceil(max_time * sps) samples and zero-initializes it.
   if (!st->line || st->last_sps != g.sample_rate || st->last_max_time != max_time) {
     st->line.emplace(q::duration{max_time}, g.sample_rate);
     st->last_sps = g.sample_rate;
@@ -3103,7 +3103,7 @@ control slots addressable: 'rt_graph_instance_set_control(saw_idx,
 lpf_idx, 0, x)' still drives the LPF cutoff, and so on, exactly as
 they did with the unfused kernels.
 
-Only the gain's output buffer is materialised — that's the read
+Only the gain's output buffer is materialized — that's the read
 target for any external consumer (typically an Out node in a
 sibling region). Saw and LPF intermediates stay in registers. The
 'selectRegionKernels' pass on the Haskell side ensures saw/lpf
@@ -3114,7 +3114,7 @@ intermediate buffers; we don't need to keep them live.
 Bit-equivalence with the unfused chain depends on the per-sample
 arithmetic being identical: q::saw(phase_iter), lpf->filter(...),
 multiply by gain_amount, in that order, with the same NaN
-sanitisation and the same block-rate latch for LPF freq/q. That
+sanitization and the same block-rate latch for LPF freq/q. That
 is exactly what process_sawosc / process_lpf / process_gain do
 when run in sequence, so the fused output matches sample-for-sample.
 
@@ -3214,7 +3214,7 @@ Semantics held in lockstep with the unfused chain:
 
   * Sin freq: RFrom (audio-rate FM) per-sample, else RConst block-rate
     increment, mirroring process_sinosc.
-  * Gain: scalar from gain_node.controls[0], sanitised to 1.0 on
+  * Gain: scalar from gain_node.controls[0], sanitized to 1.0 on
     NaN, mirroring process_gain's scalar branch. Audio-modulated
     gain blocks the kernel on the Haskell side, so we never need
     the per-sample gain branch here.
@@ -3541,20 +3541,33 @@ static void process_region_busin_lpf_gain_out(
   auto &gain_node  = inst.nodes[gain_idx];
   auto &out_node   = inst.nodes[out_idx];
 
-  // Source bus index — same validation as process_busin so the
-  // silent-no-op contract on invalid buses is preserved across
-  // fused vs. unfused.
+  // Source bus resolution. An invalid 'busin.bus' must NOT
+  // short-circuit the kernel: process_busin's contract on an
+  // invalid bus is to fill the BusIn output buffer with zeros,
+  // which process_lpf then filters /still advancing the IIR
+  // state/ on zero input. Skipping the loop here would freeze
+  // the LPF state for the block — fine in the steady-zero case
+  // (state already converged), but divergent the moment a
+  // valid block precedes or follows: the per-node baseline's
+  // LPF state would be settled-toward-zero, the fused side's
+  // would hold the prior valid block's history. Same divergence
+  // applies to 'block_sink_peak' and the sink-bus accumulation.
+  //
+  // Fix: resolve to a non-null 'src_data' for valid buses, leave
+  // it null for invalid ones, and switch the inner loop on it.
+  // The compiler hoists the branch past the loop body either
+  // way; written as two loops here for reading-order obviousness.
   const double busin_bus_d = busin_node.controls[0];
   const double busin_bus_lim =
       static_cast<double>(g.server.output_buses.size());
-  if (!std::isfinite(busin_bus_d)
-      || busin_bus_d < 0.0
-      || busin_bus_d >= busin_bus_lim) {
-    return;
+  const float *src_data = nullptr;
+  if (std::isfinite(busin_bus_d)
+      && busin_bus_d >= 0.0
+      && busin_bus_d < busin_bus_lim) {
+    const int busin_bus = static_cast<int>(busin_bus_d);
+    src_data =
+        g.server.output_buses[static_cast<std::size_t>(busin_bus)].data();
   }
-  const int busin_bus = static_cast<int>(busin_bus_d);
-  const auto &src_bus =
-      g.server.output_buses[static_cast<std::size_t>(busin_bus)];
 
   // LPF freq/q resolution + block-rate latch. Identical to
   // RSawLpfGainOut — the LPF state machine doesn't care what feeds
@@ -3593,17 +3606,32 @@ static void process_region_busin_lpf_gain_out(
       static_cast<float>(gain_node.controls[0]), 1.0f);
 
   // Sink-terminal accumulate. No 'drive_oscillator' here — there's
-  // no oscillator to drive; the source is a bus read. The per-sample
-  // body is intentionally written out so the relationship to the
-  // unfused chain (process_busin's std::copy_n + process_lpf's
-  // filter() + process_gain's scalar mult + process_out's sink push)
-  // is reading-order obvious.
+  // no oscillator to drive; the source is a bus read. Two loops to
+  // make the valid- vs. invalid-bus paths legible: both still
+  // advance the LPF state every sample and still push every
+  // sample into the SinkAccumulator (so 'block_sink_peak' tracks
+  // the LPF's transient response on a fresh-state filter just as
+  // process_lpf + process_out would have).
   auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
-  for (int i = 0; i < nframes; ++i) {
-    const std::size_t fi = static_cast<std::size_t>(i);
-    const float busin_sample = src_bus[fi];
-    const float lpf_sample = lpf->filter(busin_sample);
-    sink.push(fi, lpf_sample * gain_amount);
+  if (src_data != nullptr) {
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float busin_sample = src_data[fi];
+      const float lpf_sample = lpf->filter(busin_sample);
+      sink.push(fi, lpf_sample * gain_amount);
+    }
+  } else {
+    // Invalid source bus: equivalent to process_busin filling its
+    // output with zeros and process_lpf filtering those zeros.
+    // The LPF state still advances; the sink still receives the
+    // filter's response (which on a converged-zero state is
+    // exactly zero, but on a non-fresh state is the natural decay
+    // envelope — exactly what the per-node baseline would emit).
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float lpf_sample = lpf->filter(0.0f);
+      sink.push(fi, lpf_sample * gain_amount);
+    }
   }
   sink.flush_to(inst);
 }
@@ -3703,7 +3731,7 @@ static void apply_instance_set_control(
 
 // Prepare a freshly-CAS-Reserved slot for a given template. Sets
 // template_id, resizes the per-node state vector to match the
-// template's spec, and re-initialises every node's kernel state via
+// template's spec, and re-initializes every node's kernel state via
 // init_node_state. The slot's SlotState stays at Reserved — only
 // rt_graph_realtime_activate (via the queued drain) flips it to
 // Active. After this call the producer may apply per-note overrides
@@ -4123,7 +4151,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       // Skip every state that is not part of the audio schedule.
       // Available is "free", Reserved is the producer's private claim
       // (preparation in progress — the producer may be resizing /
-      // initialising inst.nodes right now, so the audio thread MUST
+      // initializing inst.nodes right now, so the audio thread MUST
       // NOT race those writes). Only Active and Releasing slots have
       // already been published into the schedule. Snapshot once; the
       // §2.E silence-window branch reuses the snapshot.
@@ -4362,7 +4390,7 @@ static GraphInstance make_instance(const MetaDef &def, int template_id, int max_
     init_node_state(inst.nodes[i], def.nodes[i], max_frames);
   }
   // Step C: one scratch buffer per fused input registered on the
-  // spec (any kind), sized to max_frames. resolve_input materialises
+  // spec (any kind), sized to max_frames. resolve_input materializes
   // into these and returns a span over them; never resized in the
   // audio callback. See FusedAffineRef and ensure_fused_scratch.
   ensure_fused_scratch(inst, def.fused_input_count, max_frames);
@@ -4442,7 +4470,7 @@ Why the change:
     destructed the per-node state vectors and freed their memory.
     Under the pool model both paths just set state = Available; the
     vectors stay sized and ready. The next _instance_add into that
-    slot reinitialises kernel state in place rather than allocating
+    slot reinitializes kernel state in place rather than allocating
     fresh.
   * Sized-once, mutated-by-state. The Phase 3 control queue (A.2)
     will mediate _instance_add / _release / _remove from a non-
@@ -4463,10 +4491,10 @@ growth (push_back); growth is construction-only in practice — once
 audio is running the live count is bounded by polyphony, every
 "removed" slot stays Available, and the queue path will never grow.
 
-Lazy materialisation: an Available slot may have empty node-state
+Lazy materialization: an Available slot may have empty node-state
 vectors (never used) or full vectors (was previously occupied). On
 transition to Active, _template_instance_add resizes the nodes
-vector to match the current spec and re-initialises each entry via
+vector to match the current spec and re-initializes each entry via
 init_node_state. A previously-occupied slot reuses its existing
 vector capacity; a fresh slot does the first allocation here. Either
 way, allocation happens in _instance_add (control thread today,
@@ -4505,7 +4533,7 @@ template 0:
                             globally unique across templates
 
 The auto-created template 0 + instance 0 in rt_graph_create /
-rt_graph_clear (see reset_to_default_state) materialises the
+rt_graph_clear (see reset_to_default_state) materializes the
 "single-template world" so legacy callers don't see any difference.
 
 New multi-template callers register additional templates via
@@ -4632,7 +4660,7 @@ int rt_graph_template_count(RTGraph *g) {
 // template.
 //
 // Updates template_id's spec once and walks every live instance *of
-// this template* to install freshly-initialised state at the same
+// this template* to install freshly-initialized state at the same
 // index. Adding a node "early" (before any extra instances) and
 // "late" (after rt_graph_template_instance_add) produce the same
 // final layout — every live instance of this template ends up with a
@@ -4804,7 +4832,7 @@ void rt_graph_template_add_region(
   // The kernel-aware entry takes a kernel_kind in addition to rate /
   // first_node / node_count. Existing callers (Haskell pre-§4.B
   // loaders, all C++ tests built directly via rt_graph_add_region)
-  // get the default NodeLoop behaviour by going through the kind=0
+  // get the default NodeLoop behavior by going through the kind=0
   // path; that preserves their bit-identical render against the
   // pre-§4.B world.
   rt_graph_template_add_region_kernel(
@@ -4852,7 +4880,7 @@ int rt_graph_region_kernel_supported(int kernel_kind) {
 // silent no-op on bad indices. The node remains in def->nodes and
 // every live instance keeps its NodeInstanceState slot, so control
 // writes targeting node_index continue to land on the same controls
-// vector that resolve_input reads at fused-input materialisation
+// vector that resolve_input reads at fused-input materialization
 // time.
 void rt_graph_template_set_node_elided(
     RTGraph *g, int template_id, int node_index
@@ -5170,7 +5198,7 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
 
   if (free_slot < g->instances.size()) {
     // Reuse: preserve the GraphInstance's vector capacity, just
-    // re-initialise its node state from the (possibly mutated) spec
+    // re-initialize its node state from the (possibly mutated) spec
     // and flip the slot to Active.
     GraphInstance &slot = g->instances[free_slot];
     slot.template_id = template_id;
@@ -5629,7 +5657,7 @@ void rt_graph_instance_set_control(
 // toward the polyphony cap.
 //
 // On success the slot is fully prepared (template_id set, nodes
-// vector sized to spec, kernel state freshly initialised, default
+// vector sized to spec, kernel state freshly initialized, default
 // controls inherited from spec) and in Reserved state. The
 // producer may then write per-note overrides directly via
 // rt_graph_instance_set_control on the Reserved slot, and finally
@@ -5701,7 +5729,7 @@ void rt_graph_realtime_cancel(RTGraph *g, int slot_id) {
   const std::size_t idx = static_cast<std::size_t>(slot_id);
   if (idx >= g->instances.size()) return;
   SlotState expected = SlotState::Reserved;
-  // Failure is silent — Available means already cancelled, Active
+  // Failure is silent — Available means already canceled, Active
   // means the queue already activated us, Releasing means the
   // queue activated then released. None of these are recoverable
   // by cancel; the producer must handle that path differently.

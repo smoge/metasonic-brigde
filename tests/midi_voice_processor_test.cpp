@@ -146,7 +146,7 @@ TEST_CASE("MidiVoiceProcessor: note_on with velocity 0 is treated as note_off") 
     rt_graph_destroy(g);
 }
 
-TEST_CASE("MidiVoiceProcessor: velocity is normalised to [0, 1]") {
+TEST_CASE("MidiVoiceProcessor: velocity is normalized to [0, 1]") {
     auto *g = make_graph_with_polyphony(2);
     MapCapture cap{};
     VoiceAllocator alloc(g, 0, 2, capture_map, &cap);
@@ -274,7 +274,7 @@ TEST_CASE("MidiVoiceProcessor: unbound CC / pitch-bend and aftertouch do not dis
     REQUIRE(alloc.voice_state(0) == VoiceState::Active);
 
     proc(midi::control_change{0, midi::cc::channel_volume, 100}, 0);
-    proc(midi::pitch_bend{0, 0x40, 0x40}, 0);     // centred pitch-bend
+    proc(midi::pitch_bend{0, 0x40, 0x40}, 0);     // centered pitch-bend
     proc(midi::channel_aftertouch{0, 64}, 0);
     proc(midi::poly_aftertouch{0, 60, 64}, 0);
     proc(midi::program_change{0, 1}, 0);
@@ -527,7 +527,7 @@ TEST_CASE("MidiVoiceProcessor CC: mapping table caps at kMaxCCMappings (32)") {
 // Phase 3.3a: pitch-bend dispatch
 // ----------------------------------------------------------------
 
-TEST_CASE("MidiVoiceProcessor PB: bound pitch-bend at centre writes the unbent base frequency") {
+TEST_CASE("MidiVoiceProcessor PB: bound pitch-bend at center writes the unbent base frequency") {
     // Bind pitch-bend to Add's control[0]. Note 60 → MIDI middle C
     // → ~261.626 Hz via Q's 12-TET pitch utilities. Centred bend
     // (value 8192) gives a multiplier of 1.0.
@@ -736,10 +736,10 @@ TEST_CASE("MidiVoiceProcessor 3.3b: no CC observed -> map callback's value stand
     rt_graph_destroy(g);
 }
 
-TEST_CASE("MidiVoiceProcessor 3.3b: pitch-bend bound -> centred default is the inherited value") {
+TEST_CASE("MidiVoiceProcessor 3.3b: pitch-bend bound -> centered default is the inherited value") {
     // Binding pitch-bend to a control implies pitch-bend ownership.
     // A newly-activated voice gets its base frequency on that
-    // control even before the first pitch-bend event — the centred
+    // control even before the first pitch-bend event — the centered
     // default factor (1.0) IS the inherited value.
     auto *g = make_graph_with_polyphony(2);
     VoiceAllocator alloc(g, 0, 2, simple_map, nullptr);
@@ -767,7 +767,7 @@ TEST_CASE("MidiVoiceProcessor 3.3b: pitch-bend last value is inherited at activa
 
     // First voice + a +1 semitone bend (raw 12288 ~ +0.5 of range).
     proc(midi::note_on{0, 60, 100}, 0);
-    proc.tick();   // initial inheritance: centred → base freq.
+    proc.tick();   // initial inheritance: centered → base freq.
     proc(midi::pitch_bend{0, 12288}, 0);  // ~+1 semitone
 
     // Steal: voice 0 PendingSteal.
@@ -893,7 +893,7 @@ TEST_CASE("MidiVoiceProcessor 3.3b: clear_pitch_bend disables the inheritance de
     proc(midi::note_on{0, 60, 100}, 0);
     proc.tick();
 
-    // No PB binding → no centred default applied. Velocity from
+    // No PB binding → no centered default applied. Velocity from
     // the map callback stands.
     CHECK(bus0_first_sample(g) == doctest::Approx(100.0f / 127.0f).epsilon(1e-5));
 

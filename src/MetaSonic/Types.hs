@@ -218,7 +218,7 @@ data NodeKind
     -- sweeps would need a sample-accurate filter path.
   | KBPF
     -- ^ Band-pass biquad (wraps Q's @q::bandpass_cpg@, the
-    -- constant-peak-gain variant favoured for music). Same input
+    -- constant-peak-gain variant favored for music). Same input
     -- shape as 'KLPF': @[signal, cutoff, q]@. q controls bandwidth
     -- (higher q = narrower band). Cutoff and q are read once per
     -- block, like 'KHPF' and 'KLPF'.
@@ -290,7 +290,7 @@ data KindSpec = KindSpec
     -- carries.
   , ksControlArity :: !Int
     -- ^ Number of control slots the C++ kernel expects, in declared order.
-    -- The mapping from inputs to controls is per-kind and is realised by
+    -- The mapping from inputs to controls is per-kind and is realized by
     -- 'MetaSonic.Bridge.Source.ugenView'; this field exists for cross-check
     -- only.
   , ksLabel        :: !String
@@ -431,7 +431,7 @@ a 'SampleRate' oscillator becomes 'SampleRate'.
 'MetaSonic.Bridge.Compile.formRegions' merges adjacent nodes whose
 propagated rates are *compatible* — equal, or with at least one side
 'CompileRate'. A 'CompileRate' helper is therefore folded into the
-neighbouring faster region rather than forming a separate one (its
+neighboring faster region rather than forming a separate one (its
 value is known statically and is trivially sample-and-held). A region's
 'regRate' is the maximum of its members' rates. 'BlockRate' into
 'SampleRate' would need an explicit sample-and-hold boundary in the

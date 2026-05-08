@@ -70,7 +70,7 @@ enum class VoiceResultStatus : int {
   // later block.
   QueueFull    = 2,
   // The user-supplied control-mapping callback returned false; the
-  // reservation was cancelled.
+  // reservation was canceled.
   MapFailed    = 3,
 };
 

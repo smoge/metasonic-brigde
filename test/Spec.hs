@@ -587,7 +587,7 @@ unitTests = testGroup "Unit tests"
       ]
 
   , -- Template-level precedence from bus dataflow. busFootprint
-    -- summarises a single template's bus surface; compileTemplateGraph
+    -- summarizes a single template's bus surface; compileTemplateGraph
     -- composes several templates and derives a topological execution
     -- order from their footprints. The pattern mirrors the intra-graph
     -- E_r machinery one tier up; see Note [Template-level precedence
@@ -1051,7 +1051,7 @@ unitTests = testGroup "Unit tests"
       , -- Step C invariant: 'compileRuntimeGraph' never sets
         -- 'rnElided'. Only 'fuseRuntimeGraph' (added later in Step
         -- C) flips the bit. This pins the contract that the unfused
-        -- compile path is unchanged in observable behaviour by
+        -- compile path is unchanged in observable behavior by
         -- Step B's machinery additions.
         testCase "compileRuntimeGraph leaves rnElided False on every node" $ do
           let g = runSynth $ do
@@ -1654,7 +1654,7 @@ unitTests = testGroup "Unit tests"
       , -- Negative: an extra consumer of the LPF intermediate
         -- (lpf has rnConsumerCount > 1) blocks §4.B because the
         -- fused kernel can't keep lpf's output in registers — the
-        -- second consumer needs a materialised buffer.
+        -- second consumer needs a materialized buffer.
         testCase "near-miss: lpf with multiple consumers stays RNodeLoop" $ do
           let g = runSynth $ do
                 s  <- sawOsc 110.0 0.0
@@ -1674,7 +1674,7 @@ unitTests = testGroup "Unit tests"
         -- The lpf's freq input here is wired to the saw, which is
         -- a real audio-rate filter sweep but also makes saw a
         -- multi-consumer node — so the fused kernel can't elide
-        -- saw's output materialisation.
+        -- saw's output materialization.
         testCase "near-miss: saw with multiple consumers stays RNodeLoop" $ do
           let g = runSynth $ do
                 s <- sawOsc 110.0 0.0
@@ -1825,9 +1825,9 @@ unitTests = testGroup "Unit tests"
         -- consumer rule, so longest-match fails over from
         -- 'RSawLpfGainOut' to 'RSawLpfGain'. Pinned because this is
         -- the structural property that justifies keeping both
-        -- kernels — the 3-node one materialises the gain's output
+        -- kernels — the 3-node one materializes the gain's output
         -- buffer for external readers, the 4-node one absorbs the
-        -- single Out and skips materialisation.
+        -- single Out and skips materialization.
         testCase "fallback: multi-consumer gain falls through from RSawLpfGainOut to RSawLpfGain" $ do
           let g = runSynth $ do
                 s <- sawOsc 110.0 0.0
@@ -1847,7 +1847,7 @@ unitTests = testGroup "Unit tests"
         -- require 'isScalarGain'), so the whole chain stays
         -- 'RNodeLoop'. Distinct from the 3-node-only audio-mod
         -- near-miss above because it specifically pins the 4-node
-        -- shape's behaviour on the same blocker.
+        -- shape's behavior on the same blocker.
         testCase "near-miss (4-node): audio-modulated gain stays RNodeLoop" $ do
           let g = runSynth $ do
                 s   <- sawOsc 110.0 0.0
@@ -1922,7 +1922,7 @@ unitTests = testGroup "Unit tests"
         -- the 4-node match is rejected. Without an LPF-rooted
         -- 3-node fallback (we don't have one), the chain stays
         -- 'RNodeLoop'. Pins that the multi-consumer gate is the
-        -- BusIn analogue of 'matchesSawLpfGainOut's
+        -- BusIn counterpart of 'matchesSawLpfGainOut's
         -- 'rnConsumerCount saw == 1' rule.
         testCase "near-miss: multi-consumer BusIn blocks RBusInLpfGainOut" $ do
           let g = runSynth $ do
@@ -2015,11 +2015,11 @@ unitTests = testGroup "Unit tests"
               selectRegionKernels rg @?= rg
 
       , -- Phase 4.B sink-terminal: SinOsc → Gain → Out is the second
-        -- recognised kernel shape. Distinct protocol axis from
+        -- recognized kernel shape. Distinct protocol axis from
         -- 'RSawLpfGain' (which is buffer-terminal): the 'Out' node
         -- lives /inside/ the fused region, so the kernel does the
         -- bus accumulation and §2.E sink-peak update inline rather
-        -- than materialising an intermediate buffer.
+        -- than materializing an intermediate buffer.
         testCase "sin → gain → out: middle region tagged RSinGainOut" $ do
           let g = runSynth $ do
                 s <- sinOsc 440.0 0.0
@@ -2074,7 +2074,7 @@ unitTests = testGroup "Unit tests"
       , -- §4.C interaction: §4.B claims this shape /before/ §4.C
         -- runs. Without that claim, §4.C would elide the Gain into
         -- an 'FScaleFrom' on Out's input (the original §4.C
-        -- behaviour for sin → gain → out). Pinned because the
+        -- behavior for sin → gain → out). Pinned because the
         -- region kernel needs the Gain's control slot still
         -- addressable, so eliding it would silently break
         -- 'process_region_sin_gain_out''s read of
@@ -2109,7 +2109,7 @@ unitTests = testGroup "Unit tests"
 
       , -- Negative: a SinOsc with multiple consumers can't be
         -- claimed by the kernel because the second consumer needs
-        -- the SinOsc's output materialised, but the kernel keeps
+        -- the SinOsc's output materialized, but the kernel keeps
         -- it in registers.
         testCase "near-miss (sin chain): multi-consumer sin stays RNodeLoop" $ do
           let g = runSynth $ do
@@ -3051,7 +3051,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- for-sample. The fused path takes a different runtime route
     -- — elided dispatch + fused-input resolver (any of single-scale,
     -- scale chain, or affine; selected by the FusedInput
-    -- constructor) — but each step's materialisation discipline
+    -- constructor) — but each step's materialization discipline
     -- (cast double→float, multiply or add) is chosen to mirror
     -- process_gain / process_add scalar branches exactly, so
     -- equivalence is bit-strict, not approx.
@@ -3111,7 +3111,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
             loader handle rt
             -- Live control write on the (elided / dispatched) Gain.
             -- In the fused graph the kernel never runs, but
-            -- resolve_input reads controls[0] when materialising
+            -- resolve_input reads controls[0] when materializing
             -- the FScaleFrom; in the unfused graph process_gain's
             -- scalar branch reads the same slot. Both should
             -- track newGain identically.
@@ -3476,18 +3476,24 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- the kernel exactly as it steers the per-node 'process_busin'
     -- baseline.
     --
-    -- The graph also has a 'voice' chain (SinOsc → BusOut 5)
-    -- whose only job is to put a real signal on bus 5 so the
-    -- comparison isn't "fused silence == baseline silence". When
-    -- the test redirects busin.bus to bus 6 (a bus no one writes
-    -- in this graph), the kernel must read silence the same way
-    -- 'process_busin' would have copied silence — that's the
-    -- BusIn-bus control identity we care about.
+    -- The graph carries /two/ independent voice writers — a 440 Hz
+    -- sine on bus 5 (the BusIn's graph default) and a 220 Hz saw
+    -- on bus 6 (the redirect target). Setting busin.bus from 5 to
+    -- 6 swaps the entire downstream signal: LPF now filters a
+    -- saw, gain scales the saw, the sink accumulates the filtered
+    -- saw. If the kernel hard-coded the source bus or otherwise
+    -- didn't honor live control writes, the baseline would
+    -- observe the redirect through 'process_busin' but the fused
+    -- path would still read the sine — they'd diverge. Bit-
+    -- equivalence on the redirected sink bus pins that the kernel
+    -- reads 'busin.controls[0]' fresh on every block.
     testCase "Phase 4.B: set_control on RBusInLpfGainOut covers busin.bus + lpf.freq/q + gain + out.bus" $ do
       let nframes = 256
           chain = runSynth $ do
-            o <- sinOsc 440.0 0.0
-            busOut 5 o                               -- voice writes bus 5
+            o1 <- sinOsc 440.0 0.0
+            busOut 5 o1                              -- bus 5: 440 Hz sine (busIn graph default)
+            o2 <- sawOsc 220.0 0.0
+            busOut 6 o2                              -- bus 6: 220 Hz saw (redirect target)
             r <- busIn 5
             f <- lpf r (Param 800.0) (Param 4.0)
             a <- gain f (Param 0.4)
@@ -3496,7 +3502,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
           newLpfQ       = 6.0    :: Double
           newGain       = 0.3    :: Double
           newSinkBus    = 2      :: Int              -- redirect sink
-          newBusInBus   = 5      :: Int              -- (unchanged) keeps the live signal
+          newBusInBus   = 6      :: Int              -- redirect to the saw writer
 
       rtUnRaw <- case lowerGraph chain >>= compileRuntimeGraph of
         Right r  -> pure r
@@ -3557,6 +3563,116 @@ crossCuttingTests = testGroup "End-to-end FFI"
       assertBool ("expected non-silent render on bus " <> show newSinkBus
                   <> ", got peak " <> show peak)
                  (peak > 0.05)
+
+  , -- Phase 4.B regression: 'RBusInLpfGainOut' state advancement
+    -- on an invalid source bus.
+    --
+    -- Background: the per-node 'process_busin' fills its output
+    -- buffer with zeros when 'busin.bus' is invalid, and
+    -- 'process_lpf' /still runs/ over those zeros — advancing the
+    -- IIR state and emitting the filter's natural decay envelope
+    -- if the state was non-zero from a prior valid block. An
+    -- early version of 'process_region_busin_lpf_gain_out'
+    -- silent-no-op'd the entire block on invalid 'busin.bus',
+    -- which froze the LPF state and skipped all 'block_sink_peak'
+    -- + sink-accumulation work. The bug surfaces on a subsequent
+    -- valid-bus block as a state mismatch: the per-node baseline's
+    -- LPF state has settled toward zero, while the buggy fused
+    -- side's still holds the prior block's filter history.
+    --
+    -- This test deliberately walks that exact transition: warm
+    -- the LPF on a real signal, switch 'busin.bus' to an invalid
+    -- index for one block, switch back to a valid index, and
+    -- compare every block's sink output against the stripped
+    -- baseline. Bit-equivalence across all four blocks pins that
+    -- the kernel's invalid-bus path keeps the LPF advancing.
+    testCase "Phase 4.B: RBusInLpfGainOut state advances on invalid source bus" $ do
+      let nframes    = 256
+          validBus   = 5  :: Int
+          invalidBus = -1 :: Int                     -- triggers silent-source path
+          chain = runSynth $ do
+            o <- sinOsc 220.0 0.0
+            busOut validBus o                        -- voice writes the BusIn's source
+            r <- busIn validBus
+            f <- lpf r (Param 800.0) (Param 6.0)     -- moderate Q: noticeable ringing decay
+            a <- gain f (Param 0.6)
+            out 0 a
+
+      rtUnRaw <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      assertBool "fused compile lacks RBusInLpfGainOut"
+        (any ((== RBusInLpfGainOut) . rrKernel) (rgRuntimeRegions rtF))
+
+      let rtUn    = stripRegionKernels rtUnRaw
+          ixOf k rg =
+            let NodeIndex i = head [rnIndex n | n <- rgNodes rg, rnKind n == k]
+            in i
+          busInIx = ixOf KBusIn rtF
+
+      let sizeOfFloat' = 4 :: Int
+          -- Render four blocks with control flips between them, and
+          -- return the per-block sink bus reads in execution order.
+          -- Reading the bus after each block (rather than only at
+          -- the end) lets the assertion message show /which/ block
+          -- diverged when the test fails — block 3 indicts the
+          -- silent-block decay; block 4 indicts the post-transition
+          -- state mismatch.
+          renderSequence loader rt =
+            withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+              loader handle rt
+              let processAndRead = do
+                    c_rt_graph_process handle (fromIntegral nframes)
+                    allocaBytes (nframes * sizeOfFloat') $ \buf -> do
+                      _ <- c_rt_graph_read_bus handle 0
+                             (fromIntegral nframes) (castPtr buf)
+                      cs <- peekArray nframes (buf :: PtrCFloat)
+                      pure (map (\(CFloat x) -> x) cs)
+              -- Blocks 1+2: valid source bus. LPF state warms up
+              -- on the 220 Hz sine.
+              b1 <- processAndRead
+              b2 <- processAndRead
+              -- Switch BusIn to invalid; run block 3.
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral busInIx) 0
+                (CDouble (fromIntegral invalidBus))
+              b3 <- processAndRead
+              -- Switch back to valid; run block 4. State mismatch
+              -- from block 3 surfaces here as a transient diff.
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral busInIx) 0
+                (CDouble (fromIntegral validBus))
+              b4 <- processAndRead
+              pure [b1, b2, b3, b4]
+
+      baselineBlocks <- renderSequence loadRuntimeGraph      rtUn
+      fusedBlocks    <- renderSequence loadRuntimeGraphFused rtF
+
+      length baselineBlocks @?= length fusedBlocks
+      let labeled = zip3 ([1..] :: [Int]) baselineBlocks fusedBlocks
+      sequence_
+        [ assertBool
+            ("RBusInLpfGainOut: fused diverges from per-node baseline "
+             <> "on block " <> show n
+             <> " (block 3 indicts silent-bus state freeze; "
+             <> "block 4 indicts post-transition state mismatch)")
+            (b == f)
+        | (n, b, f) <- labeled
+        ]
+
+      -- Sanity: blocks 1+2 (warm LPF on a 220 Hz sine through 800 Hz
+      -- LPF, scaled by 0.6) must be non-silent — otherwise the
+      -- "LPF state actually warmed up" premise of the test fails
+      -- and a regression on the silent-bus path would slip past.
+      let warmPeak = maximum
+            (map abs (concat (take 2 fusedBlocks)))
+      assertBool
+        ("expected LPF to warm up on the valid bus, peak=" <> show warmPeak)
+        (warmPeak > 0.05)
 
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
@@ -4450,7 +4566,7 @@ fusedEquivalenceCases =
   -- Phase 4.C.2 affine cases. A single Add elides into FAffineFrom
   -- [AffBias _ _]; mixed Gain/Add chains compose end-to-end through
   -- one FAffineFrom on Out's input. The fused resolver applies each
-  -- step in source-to-sink order with the same NaN sanitisation as
+  -- step in source-to-sink order with the same NaN sanitization as
   -- the unfused kernels, so output must be bit-identical.
   , ("scalar Add bias", runSynth $ do
        o <- sinOsc 440.0 0.0
@@ -4493,7 +4609,7 @@ fusedEquivalenceCases =
 -- C++ resolver — over random topology, including shapes nobody
 -- thought to write down. Bit-equivalence (===) is the right
 -- comparison: process_gain / process_add scalar branches, the chain
--- resolver, and the affine resolver all use the same NaN-sanitised
+-- resolver, and the affine resolver all use the same NaN-sanitized
 -- @float@ casts, so any difference is a bug.
 --
 -- The baseline side applies 'stripRegionKernels' before render so
@@ -4702,8 +4818,8 @@ data Op
   | OGainMod   Int Int         -- audio × audio (ring-mod shape)
   | OLPF       Int Double Double -- source-index, cutoff, q
   | OHPF       Int Double Double -- source-index, cutoff, q
-  | OBPF       Int Double Double -- source-index, centre, q
-  | ONotch     Int Double Double -- source-index, centre, q
+  | OBPF       Int Double Double -- source-index, center, q
+  | ONotch     Int Double Double -- source-index, center, q
   | OAdd       Double Int      -- bias × audio source-idx
   | OAddMod    Int Int         -- audio + audio
   | OEnv       Int Double Double Double Double

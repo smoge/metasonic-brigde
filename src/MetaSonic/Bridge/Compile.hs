@@ -115,8 +115,8 @@ Rate assignment is computed by 'MetaSonic.Bridge.IR.propagateRates'
 before this pass runs: each node's 'irRate' is the join of its
 kind's floor rate and the rates of its inputs. So a 'Gain' fed by
 two 'Param' literals receives 'irRate = CompileRate' and joins a
-neighbouring 'SampleRate' region (or starts its own pure-constant
-region if there is no faster neighbour); the same 'Gain' fed by a
+neighboring 'SampleRate' region (or starts its own pure-constant
+region if there is no faster neighbor); the same 'Gain' fed by a
 'SinOsc' receives 'irRate = SampleRate' and joins a sample-rate
 region. This is what makes region formation non-degenerate —
 pre-propagation every node was unconditionally SampleRate, so the
@@ -424,7 +424,7 @@ data RuntimeInput
     -- ^ Compile-time constant (was a 'Literal' in the IR).
   | RFused !FusedInput
     -- ^ Read from a fused source: an inline transform that the
-    -- runtime evaluates in place of materialising the elided
+    -- runtime evaluates in place of materializing the elided
     -- producer's output buffer. See 'FusedInput'.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
@@ -432,7 +432,7 @@ data RuntimeInput
 {- Note [Fused inputs]
 ~~~~~~~~~~~~~~~~~~~~~~
 'FusedInput' carries the transform that an elided producer would
-have applied if it were materialising its output buffer.
+have applied if it were materializing its output buffer.
 
 Three shipping variants today:
 
@@ -727,7 +727,7 @@ form.
 -- | Region kernel selector. Tells the runtime which dispatch
 -- strategy to use for the region: the default flat per-node loop,
 -- or a hand-written fused kernel that processes every member node
--- of the region in one tight per-sample loop without materialising
+-- of the region in one tight per-sample loop without materializing
 -- intermediate output buffers.
 --
 -- The fused-kernel variants are claimed by the post-compile
@@ -1062,7 +1062,7 @@ compileRuntimeGraph ir = do
         Just ix -> Right ix
 
 -- | Alias for 'compileRuntimeGraph'. Provided so callers can opt
--- explicitly into the unfused path (today's default behaviour) and
+-- explicitly into the unfused path (today's default behavior) and
 -- be paired with 'compileRuntimeGraphFused' at the call site.
 compileRuntimeGraphUnfused :: GraphIR -> Either String RuntimeGraph
 compileRuntimeGraphUnfused = compileRuntimeGraph
@@ -1252,7 +1252,7 @@ selectRegionKernels rg =
                     -- offset across all shapes), so it stays
                     -- RNodeLoop without further inspection. The
                     -- suffix may contain another independent chain
-                    -- of any recognised shape — recurse on a
+                    -- of any recognized shape — recurse on a
                     -- synthetic RNodeLoop region carrying the same
                     -- rate so the selector reaches its own fixed
                     -- point in one pass.
@@ -1286,7 +1286,7 @@ data KernelMatch = KernelMatch
   }
   deriving stock (Eq, Show)
 
--- | Look for the leftmost match of any recognised kernel shape in
+-- | Look for the leftmost match of any recognized kernel shape in
 -- a region's member list.
 --
 -- /Longest-match priority/ at each offset: a 4-node match beats a

@@ -304,7 +304,7 @@ TEST_CASE("SinOsc with audio-rate freq input runs and oscillates") {
 
     CHECK(peak_abs(samples) == doctest::Approx(1.0f).epsilon(0.03));
 
-    // Carrier centred around 440 Hz with ±30 Hz LFO at 5 Hz over 1024
+    // Carrier centered around 440 Hz with ±30 Hz LFO at 5 Hz over 1024
     // frames is essentially 9-10 cycles → 18-20 ZCs.
     int zc = zero_crossings(samples);
     CHECK(zc >= 16);
@@ -737,16 +737,16 @@ TEST_CASE("HPF rejects sub-cutoff sine and passes super-cutoff sine") {
     }
 }
 
-TEST_CASE("BPF passes centre-tuned sine and rejects off-band sine") {
+TEST_CASE("BPF passes center-tuned sine and rejects off-band sine") {
     constexpr int kSettle = 6;
-    auto build = [](float sine_hz, float centre_hz, double q) {
+    auto build = [](float sine_hz, float center_hz, double q) {
         auto *g = rt_graph_create(4, kFrames);
         REQUIRE(g != nullptr);
         rt_graph_add_node(g, 0, 1);
         rt_graph_set_control(g, 0, 0, sine_hz);
         rt_graph_set_control(g, 0, 1, 0.0f);
         rt_graph_add_node(g, 1, 18);                      // BPF
-        rt_graph_set_control(g, 1, 0, centre_hz);
+        rt_graph_set_control(g, 1, 0, center_hz);
         rt_graph_set_control(g, 1, 1, q);
         rt_graph_add_node(g, 2, 2);
         rt_graph_set_control(g, 2, 0, 0.0f);
@@ -755,13 +755,13 @@ TEST_CASE("BPF passes centre-tuned sine and rejects off-band sine") {
         return g;
     };
 
-    SUBCASE("1000 Hz sine through BPF centre=1000 Hz: passes through") {
+    SUBCASE("1000 Hz sine through BPF center=1000 Hz: passes through") {
         auto *g = build(1000.0f, 1000.0f, 2.0);
         auto last = render_settled(g, kSettle, kFrames);
         CHECK(peak_abs(last) > 0.7f);
         rt_graph_destroy(g);
     }
-    SUBCASE("100 Hz sine through BPF centre=1000 Hz: rejected") {
+    SUBCASE("100 Hz sine through BPF center=1000 Hz: rejected") {
         auto *g = build(100.0f, 1000.0f, 2.0);
         auto last = render_settled(g, kSettle, kFrames);
         CHECK(peak_abs(last) < 0.5f);
@@ -769,16 +769,16 @@ TEST_CASE("BPF passes centre-tuned sine and rejects off-band sine") {
     }
 }
 
-TEST_CASE("Notch rejects centre-tuned sine and passes off-band sine") {
+TEST_CASE("Notch rejects center-tuned sine and passes off-band sine") {
     constexpr int kSettle = 6;
-    auto build = [](float sine_hz, float centre_hz, double q) {
+    auto build = [](float sine_hz, float center_hz, double q) {
         auto *g = rt_graph_create(4, kFrames);
         REQUIRE(g != nullptr);
         rt_graph_add_node(g, 0, 1);
         rt_graph_set_control(g, 0, 0, sine_hz);
         rt_graph_set_control(g, 0, 1, 0.0f);
         rt_graph_add_node(g, 1, 19);                      // Notch
-        rt_graph_set_control(g, 1, 0, centre_hz);
+        rt_graph_set_control(g, 1, 0, center_hz);
         rt_graph_set_control(g, 1, 1, q);
         rt_graph_add_node(g, 2, 2);
         rt_graph_set_control(g, 2, 0, 0.0f);
@@ -787,13 +787,13 @@ TEST_CASE("Notch rejects centre-tuned sine and passes off-band sine") {
         return g;
     };
 
-    SUBCASE("1000 Hz sine through Notch centre=1000 Hz: heavily attenuated") {
+    SUBCASE("1000 Hz sine through Notch center=1000 Hz: heavily attenuated") {
         auto *g = build(1000.0f, 1000.0f, 8.0);
         auto last = render_settled(g, kSettle, kFrames);
         CHECK(peak_abs(last) < 0.3f);
         rt_graph_destroy(g);
     }
-    SUBCASE("100 Hz sine through Notch centre=1000 Hz: passes through") {
+    SUBCASE("100 Hz sine through Notch center=1000 Hz: passes through") {
         auto *g = build(100.0f, 1000.0f, 8.0);
         auto last = render_settled(g, kSettle, kFrames);
         CHECK(peak_abs(last) > 0.7f);
@@ -870,7 +870,7 @@ TEST_CASE("NoiseGen has low autocorrelation at lag 1") {
     const double r1 = num / den;
 
     // White noise has expected r1 = 0; a deterministic ramp or
-    // strongly-coloured signal would push toward ±1. Anything past
+    // strongly-colored signal would push toward ±1. Anything past
     // ±0.2 in 1024 samples points at non-whiteness.
     CHECK(std::abs(r1) < 0.2);
 }
@@ -1037,7 +1037,7 @@ TEST_CASE("BusInDelayed reads the previous block's BusOut contents") {
     // Phase 2 ping-pong test. Build:
     //   SinOsc(440) → BusOut(5)
     //   BusInDelayed(5) → Out(0)
-    // Block 1: prev is zero-initialised, so BusInDelayed → Out(0) = silence.
+    // Block 1: prev is zero-initialized, so BusInDelayed → Out(0) = silence.
     //          BusOut still writes block 1's sine into live bus 5.
     // Block 2: the swap moves block 1's bus 5 into the snapshot;
     //          BusInDelayed therefore reads block 1's sine into Out(0),
@@ -1138,7 +1138,7 @@ TEST_CASE("BusInDelayed snapshot is one-block-old across many blocks") {
         rt_graph_read_bus(g, kBus, kFrames, bus5[blk].data());
     }
 
-    // Block 0: prev was zero-initialised → Out(0) is silence.
+    // Block 0: prev was zero-initialized → Out(0) is silence.
     CHECK(peak_abs(out0[0]) < 1e-6f);
 
     // Sanity: each block produces a non-trivial sine on bus 5
@@ -1176,7 +1176,7 @@ TEST_CASE("BusInDelayed snapshot is one-block-old across many blocks") {
 }
 
 TEST_CASE("BusIn (live) and BusInDelayed (prev) coexist on the same bus") {
-    // SC analogue: In.ar(5) and InFeedback.ar(5) on the same bus.
+    // SC counterpart: In.ar(5) and InFeedback.ar(5) on the same bus.
     // The live BusIn is forced to follow BusOut by an E_r edge, so
     // it sees this block's writes; BusInDelayed reads the snapshot,
     // unconstrained, so it sees the previous block's writes. Both
@@ -1229,7 +1229,7 @@ TEST_CASE("BusIn (live) and BusInDelayed (prev) coexist on the same bus") {
         live_diff_b1 = std::max(live_diff_b1, std::abs(b1_bus0[i] - b1_bus5[i]));
     }
     CHECK(live_diff_b1 < 1e-6f);
-    // Delayed: bus 1 is silence (zero-initialised snapshot).
+    // Delayed: bus 1 is silence (zero-initialized snapshot).
     CHECK(peak_abs(b1_bus1) < 1e-6f);
 
     // Block 2.
@@ -1415,7 +1415,7 @@ TEST_CASE("BusInDelayed feedback path: stable attenuated loop") {
     //   BusInDelayed(5) ──────┘
     //
     // We just check the output is finite and non-zero after several
-    // blocks — a hard correctness oracle would require modelling the
+    // blocks — a hard correctness oracle would require modeling the
     // feedback transfer function. The test's real value is that it
     // exercises the swap+clear+kernel sequence under feedback load
     // and that nothing becomes NaN/inf.
@@ -2077,7 +2077,7 @@ TEST_CASE("LPF(800 Hz) passes 100 Hz and attenuates 4 kHz") {
 //
 // The cutoff control gates the rolloff frequency; the Q control
 // shapes the peak around the cutoff. Existing tests pin passband and
-// stopband behaviour at Q=0.7. These pin that Q is actually wired and
+// stopband behavior at Q=0.7. These pin that Q is actually wired and
 // has the expected resonant effect: at the cutoff frequency, output
 // amplitude scales with Q. A regression that ignores Q (or wires the
 // wrong control) would silence this difference.
@@ -2527,7 +2527,7 @@ TEST_CASE("process(g, 0) is a no-op and does not crash") {
     auto *g = build_sin_out(2, kFrames);
     rt_graph_process(g, 0);
     // Reading 0 frames returns 0 written; reading kFrames after a 0-frame
-    // process should still return whatever the bus holds (zero-initialised).
+    // process should still return whatever the bus holds (zero-initialized).
     std::vector<float> buf(static_cast<std::size_t>(kFrames), 7.0f);
     int wrote = rt_graph_read_bus(g, 0, 0, buf.data());
     CHECK(wrote == 0);
@@ -3175,7 +3175,7 @@ TEST_CASE("audio start/stop cycle 25× does not exhaust device handles") {
 }
 
 TEST_CASE("clear during a running audio stream does not crash") {
-    // Pin the observed behaviour: it is safe to call rt_graph_clear
+    // Pin the observed behavior: it is safe to call rt_graph_clear
     // while audio is running. Whether clear silences the stream
     // immediately, on the next callback, or only after a follow-up
     // stop_audio is left to the implementation — this test only
@@ -3536,7 +3536,7 @@ void check_block_finite_bounded(const std::vector<float> &samples, float max_abs
 // Battery of pathological doubles. NaN + non-finite is the load-
 // bearing class we just stamped out; >Nyquist / negative finite are
 // already exercised elsewhere but doubling-up is cheap and pins the
-// new sanitizer's "finite passes through" behaviour for those.
+// new sanitizer's "finite passes through" behavior for those.
 const std::vector<double> kPathologicalParams = {
     kPathNaN, kPathPosInf, kPathNegInf, -1e9, 1e9
 };
@@ -3874,7 +3874,7 @@ TEST_CASE("Delay max_time + time sanitized: pathological values stay finite + bo
 TEST_CASE("self-loop wiring does not crash and stays finite") {
     // Wire a Gain node to itself. Whatever the runtime does (read
     // last-block buffer, read zeros, etc.) it must not crash or
-    // produce NaN/Inf. We don't assert audio behaviour beyond that.
+    // produce NaN/Inf. We don't assert audio behavior beyond that.
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
 
@@ -4320,7 +4320,7 @@ TEST_CASE("Server buses §2.C: cross-instance routing through a shared bus") {
     rt_graph_read_bus(g, 0, kFrames, bus0.data());
     rt_graph_destroy(g);
 
-    // Bus 0 should carry voice A's 440 Hz sine, having travelled
+    // Bus 0 should carry voice A's 440 Hz sine, having traveled
     // A.BusOut(5) → server.bus[5] → B.BusIn(5) → B.Out(0).
     CHECK(peak_abs(bus0) > 0.9f);
     const int zc = zero_crossings(bus0);
@@ -4517,7 +4517,7 @@ TEST_CASE("Multi-template: cross-template routing through the shared bus pool") 
     rt_graph_process(g, kFrames);
 
     // Bus 0 should carry the producer's 330 Hz sine, having
-    // travelled producer.BusOut(7) → server.bus[7] →
+    // traveled producer.BusOut(7) → server.bus[7] →
     // consumer.BusIn(7) → consumer.Out(0).
     std::vector<float> bus0(kFrames, 0.0f);
     rt_graph_read_bus(g, 0, kFrames, bus0.data());
@@ -4846,7 +4846,7 @@ TEST_CASE("§2.E releasing a slot then re-adding reuses the freed id") {
 // A future voice allocator (Phase 3.1) will routinely run with eight
 // to a few dozen concurrent voices, with new voices spawning while
 // older ones are mid-release and slot reuse cycling continuously.
-// This test pins the concurrent behaviour:
+// This test pins the concurrent behavior:
 //
 //   * many voices Live + Releasing in the same template,
 //   * staggered release so per-instance silence counters are at
@@ -5031,7 +5031,7 @@ TEST_CASE("A.1 polyphony: default cap of 8 rejects the 9th spawn") {
     rt_graph_destroy(g);
 }
 
-TEST_CASE("A.1 polyphony: explicit cap is honoured per-template") {
+TEST_CASE("A.1 polyphony: explicit cap is honored per-template") {
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
 
@@ -5692,7 +5692,7 @@ TEST_CASE("A.2 reset: rt_graph_clear discards pending queued commands") {
 // callers building graphs via rt_graph_add_node directly do not.
 // process_instance must produce sample-identical output along both
 // paths (this is the entire point of Step A — structural plumbing,
-// no behaviour change).
+// no behavior change).
 // ----------------------------------------------------------------
 
 TEST_CASE("regions overlay produces sample-identical output to flat node loop") {
@@ -5858,7 +5858,7 @@ TEST_CASE("Step C (d): fused Gain renders bit-identically to unfused chain") {
 
     REQUIRE(unfused_samples.size() == fused_samples.size());
     for (std::size_t i = 0; i < unfused_samples.size(); ++i) {
-        // Bit-identical: the materialisation casts the same way
+        // Bit-identical: the materialization casts the same way
         // and multiplies in the same order as process_gain's
         // scalar branch. Any divergence is a step-(d) bug.
         CHECK(unfused_samples[i] == fused_samples[i]);
@@ -5883,7 +5883,7 @@ TEST_CASE("Step C (d): set_control on an elided Gain still drives the fused outp
         rt_graph_set_node_elided(g, 1);
         rt_graph_connect_fused_scale_input(g, 2, 0, 0, 0, 1, 0);
         // Overwrite the elided Gain's control AFTER fusion is
-        // wired. The next render must materialise scratch through
+        // wired. The next render must materialize scratch through
         // this freshly-set value.
         rt_graph_set_control(g, 1, 0, scale);
     };

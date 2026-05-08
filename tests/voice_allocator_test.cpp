@@ -267,7 +267,7 @@ TEST_CASE("VoiceAllocator: note_off on PendingSteal drops the pending allocation
     CHECK(alloc.voice_note(c.voice.voice_index) == -1);
 
     // Drain the victim's queued Remove. tick must NOT resurrect the
-    // cancelled note — the voice stays Free.
+    // canceled note — the voice stays Free.
     rt_graph_process(g, kFrames);
     alloc.tick();
     CHECK(alloc.voice_state(c.voice.voice_index) == VoiceState::Free);

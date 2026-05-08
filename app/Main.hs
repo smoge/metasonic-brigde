@@ -102,7 +102,7 @@ ringModGraph = runSynth $ do
 
 -- Vibrato: a 5 Hz LFO biased by 440 Hz drives the carrier's
 -- frequency between 410 and 470 Hz. Demonstrates the full bias-and-
--- scale pattern: gain to set deviation depth, add to set the centre.
+-- scale pattern: gain to set deviation depth, add to set the center.
 fmGraph :: SynthGraph
 fmGraph = runSynth $ do
   lfo       <- sinOsc 5.0 0.0
@@ -1392,7 +1392,7 @@ surveyCorpus =
 
   , ( "miss/shared-lpf-feeds-two-gains"
     , runSynth $ do
-        -- Filtered-tail analogue of miss/shared-producer-two-gains:
+        -- Filtered-tail counterpart of miss/shared-producer-two-gains:
         -- one LPF feeds two parallel Gain→Out chains. The LPF's
         -- multi-consumer count must block the 4-node match on both
         -- chains. If a future change relaxes the single-consumer
@@ -1405,7 +1405,7 @@ surveyCorpus =
 
   , ( "miss/filtered-tail-audio-mod-gain"
     , runSynth $ do
-        -- Filtered-tail analogue of miss/audio-modulated-gain:
+        -- Filtered-tail counterpart of miss/audio-modulated-gain:
         -- audio-rate signal feeds the gain's amount in a 4-node
         -- chain. isScalarGain must block the match exactly the
         -- same way it does in the 3-node case.
