@@ -3151,6 +3151,60 @@ unitTests = testGroup "Unit tests"
               , rssMaxFreeSegmentWidth = 2
               , rssMaxFreeLayerWidth   = 2
               }
+
+      , -- Cross-template width: a chain ensemble (voice → fx via
+        -- shared bus) has 'tssMaxTemplateLayerWidth' = 1, even
+        -- though the per-template aggregate sums two regions.
+        testCase "templateScheduleStats: chain ensemble has layer width 1" $ do
+          let voice = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                a <- gain s (Param 0.4)
+                busOut 5 a
+              fx = runSynth $ do
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                out 0 a
+          case compileTemplateGraph [("voice", voice), ("fx", fx)] of
+            Left err -> assertFailure err
+            Right tg -> case templateScheduleStats tg of
+              Left err -> assertFailure $ "stats failed: " <> err
+              Right s -> do
+                tssTemplateCount         s @?= 2
+                tssMaxTemplateLayerWidth s @?= 1
+                rssTotal    (tssAggregate s) @?= 2
+                rssBarriers (tssAggregate s) @?= 2
+
+      , -- Two independent voices feeding one fx: voices have no
+        -- precedence on each other (both write the same bus,
+        -- neither reads from the other), so layer 0 = {voice-l,
+        -- voice-r}, layer 1 = {fx}. Max layer width = 2 — the
+        -- headline cross-template parallelism case.
+        testCase "templateScheduleStats: two voices + one fx → layer width 2" $ do
+          let voiceL = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                a <- gain s (Param 0.3)
+                busOut 7 a
+              voiceR = runSynth $ do
+                s <- sawOsc 220.0 0.0
+                a <- gain s (Param 0.3)
+                busOut 7 a
+              fx = runSynth $ do
+                r <- busIn 7
+                f <- lpf r (Param 1200.0) (Param 0.7)
+                a <- gain f (Param 0.6)
+                out 0 a
+          case compileTemplateGraph
+                  [ ("voice-l", voiceL)
+                  , ("voice-r", voiceR)
+                  , ("fx",      fx)
+                  ] of
+            Left err -> assertFailure err
+            Right tg -> case templateScheduleStats tg of
+              Left err -> assertFailure $ "stats failed: " <> err
+              Right s -> do
+                tssTemplateCount         s @?= 3
+                tssMaxTemplateLayerWidth s @?= 2
       ]
 
   , testCase "kindTag is injective" $

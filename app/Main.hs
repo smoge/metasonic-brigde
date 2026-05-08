@@ -1220,6 +1220,42 @@ surveyDemo demo = case demoBody demo of
     let (_b, g, _cc) = runSynthCCs build
     in [surveySynthGraph (demoKey demo) Nothing g]
 
+-- | One row of the §4.E.2c cross-template width table. Pairs an
+-- ensemble label with the 'TemplateScheduleStats' that
+-- 'compileTemplateGraph' + 'templateScheduleStats' produced.
+data EnsembleScheduleRow = EnsembleScheduleRow
+  { esLabel :: !String
+  , esStats :: !TemplateScheduleStats
+  } deriving (Eq, Show)
+
+-- | Compile a list of named graphs into a 'TemplateGraph' and
+-- compute its 'TemplateScheduleStats'. Forwards diagnostics from
+-- 'compileTemplateGraph' / 'templateScheduleStats' so the survey
+-- driver can split successes from failures.
+surveyEnsemble
+  :: String -> [(String, SynthGraph)] -> Either String EnsembleScheduleRow
+surveyEnsemble label tpls = do
+  let stamp err = "ensemble=" <> label <> ": " <> err
+  tg <- either (Left . stamp) Right (compileTemplateGraph tpls)
+  ts <- either (Left . stamp) Right (templateScheduleStats tg)
+  Right (EnsembleScheduleRow label ts)
+
+-- | Multi-template demos contribute one ensemble row each;
+-- single-graph and MIDI-poly demos don't (they have no
+-- cross-template precedence DAG to measure).
+surveyDemoEnsembles :: Demo -> [Either String EnsembleScheduleRow]
+surveyDemoEnsembles demo = case demoBody demo of
+  MultiTemplate tpls -> [surveyEnsemble (demoKey demo) tpls]
+  _                  -> []
+
+-- | Every entry in 'surveyTemplateCorpus' becomes one ensemble row
+-- under the @corpus:<name>@ key.
+surveyTemplateCorpusEnsembles :: [Either String EnsembleScheduleRow]
+surveyTemplateCorpusEnsembles =
+  [ surveyEnsemble ("corpus:" <> ensembleName) tpls
+  | (ensembleName, tpls) <- surveyTemplateCorpus
+  ]
+
 -- Note [Survey corpus design]
 -- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 -- 'surveyCorpus' is a small, fixed set of survey-only graphs that
@@ -1598,13 +1634,22 @@ runFusionSurvey demos = do
       (demoErrs,   demoRows)   = partitionEithers demoResults
       (corpusErrs, corpusRows) = partitionEithers corpusResults
       allRows                  = demoRows <> corpusRows
-      allErrs                  = demoErrs <> corpusErrs
+
+      ensembleResults          =
+        concatMap surveyDemoEnsembles demos
+        <> surveyTemplateCorpusEnsembles
+      (ensembleErrs, ensembleRows) = partitionEithers ensembleResults
+
+      allErrs                  =
+        demoErrs <> corpusErrs <> ensembleErrs
   putStrLn ""
   printSurveyTable allRows
   putStrLn ""
   printOpportunityScan allRows
   putStrLn ""
   printScheduleWidth allRows
+  putStrLn ""
+  printEnsembleScheduleWidth ensembleRows
   putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
@@ -1767,6 +1812,75 @@ scheduleColumnWidths = [42, 14, 6, 4, 4, 5, 6, 6]
 formatScheduleRow :: [String] -> String
 formatScheduleRow cols =
   intercalate "  " (zipWith pad scheduleColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+-- §4.E.2c cross-template width section. One row per multi-template
+-- ensemble. Single-graph and MIDI-poly demos are excluded — they
+-- have no precedence DAG to measure.
+--
+--   tpls       : number of templates in the ensemble
+--   tplLayerW  : max count of templates at any topological layer
+--                of 'tgPrecedence'. The headline number for "is
+--                there cross-template parallelism here?" — width
+--                @>= 2@ means some templates have no precedence
+--                dependency on each other and could run
+--                concurrently if a future scheduler exploited it.
+--   sumTotal   : sum of 'rssTotal' across templates (all regions
+--                in the ensemble)
+--   sumF       : sum of 'rssFree' across templates
+--   maxLW      : max of 'rssMaxFreeLayerWidth' across templates
+--                (intra-template parallel work, repeated here
+--                for at-a-glance comparison with tplLayerW)
+--
+-- Footer reports survey-wide max @tplLayerW@. If that stays at 1,
+-- not even template-level scheduling has surface area; if it
+-- exceeds 1, cross-template width exists even when intra-template
+-- width does not.
+printEnsembleScheduleWidth :: [EnsembleScheduleRow] -> IO ()
+printEnsembleScheduleWidth rows = do
+  putStrLn "─── Cross-template width (§4.E.2c) ───"
+  putStrLn $ formatEnsembleRow
+    [ "ensemble", "tpls", "tplLayerW"
+    , "sumTotal", "sumF", "maxLW"
+    ]
+  mapM_ (putStrLn . formatEnsembleRow . renderEnsembleRow) rows
+  putStrLn ""
+  let maxTplLW = maxOr0 (map (tssMaxTemplateLayerWidth . esStats) rows)
+      sumTpls  = sum    (map (tssTemplateCount        . esStats) rows)
+      aggAll   = foldr addScheduleStats emptyScheduleStats
+                       (map (tssAggregate . esStats) rows)
+  putStrLn $ "  totals: "
+          <> "ensembles="            <> show (length rows)
+          <> "  templates="          <> show sumTpls
+          <> "  max(tplLayerW)="     <> show maxTplLW
+          <> "  total="              <> show (rssTotal               aggAll)
+          <> "  F="                  <> show (rssFree                aggAll)
+          <> "  max(maxLW)="         <> show (rssMaxFreeLayerWidth   aggAll)
+  where
+    maxOr0 [] = 0
+    maxOr0 xs = maximum xs
+
+renderEnsembleRow :: EnsembleScheduleRow -> [String]
+renderEnsembleRow r =
+  let s   = esStats r
+      agg = tssAggregate s
+  in [ esLabel r
+     , show (tssTemplateCount         s)
+     , show (tssMaxTemplateLayerWidth s)
+     , show (rssTotal               agg)
+     , show (rssFree                agg)
+     , show (rssMaxFreeLayerWidth   agg)
+     ]
+
+ensembleColumnWidths :: [Int]
+ensembleColumnWidths = [42, 5, 10, 9, 5, 6]
+
+formatEnsembleRow :: [String] -> String
+formatEnsembleRow cols =
+  intercalate "  " (zipWith pad ensembleColumnWidths cols)
   where
     pad w s
       | length s >= w = s

@@ -37,11 +37,14 @@ module MetaSonic.Bridge.Templates
     TemplateGraph (..)
   , compileTemplateGraph
   , compileTemplateGraphFused
+  , -- * Template-level schedule stats (§4.E.2c read-only view)
+    TemplateScheduleStats (..)
+  , templateScheduleStats
   ) where
 
 import           Control.DeepSeq             (NFData)
 import           Data.Foldable               (foldlM)
-import           Data.List                   (intercalate)
+import           Data.List                   (intercalate, partition)
 import qualified Data.Map.Strict             as M
 import qualified Data.Set                    as S
 import           GHC.Generics                (Generic)
@@ -365,3 +368,73 @@ topoSortTemplates ts precedence = do
       case [ tplName t | t <- ts, tplID t == tid ] of
         (n : _) -> show n
         []      -> show tid
+
+-- | Read-only ensemble-level schedule view used by the
+-- '--fusion-survey' parallel-readiness section. Pairs the
+-- template-precedence DAG width with the per-template
+-- aggregate produced by 'addScheduleStats'.
+--
+-- The precedence-layer width is the natural cross-template
+-- analogue of 'rssMaxFreeLayerWidth' inside a single graph: how
+-- many templates have no precedence dependency on each other at
+-- some topological layer of 'tgPrecedence', i.e. how many could
+-- run concurrently if a future scheduler exploited cross-template
+-- parallelism. Width 1 means templates form a chain; width @>= 2@
+-- means there is real cross-template surface area even if every
+-- template is internally barrier-dominated.
+--
+-- This is a /descriptive/ measure for the survey, not a runtime
+-- contract. The C++ side still walks templates in their
+-- compile-decreed @tgTemplates@ order; nothing currently consumes
+-- the layer width.
+data TemplateScheduleStats = TemplateScheduleStats
+  { tssTemplateCount         :: !Int
+    -- ^ Total templates in the ensemble.
+  , tssMaxTemplateLayerWidth :: !Int
+    -- ^ Max count of templates at any topological layer of
+    -- 'tgPrecedence'.
+  , tssAggregate             :: !RegionScheduleStats
+    -- ^ Per-template stats combined via 'addScheduleStats'
+    -- (counts add; widths take the max).
+  } deriving stock (Eq, Show)
+
+-- | Compute 'TemplateScheduleStats' for an ensemble. Forwards any
+-- per-template 'regionScheduleStats' diagnostic on @Left@ so a
+-- malformed template propagates as a survey-row failure rather
+-- than a silent zero entry.
+templateScheduleStats
+  :: TemplateGraph -> Either String TemplateScheduleStats
+templateScheduleStats tg = do
+  perTpl <- traverse (regionScheduleStats . tplGraph) (tgTemplates tg)
+  let agg   = foldr addScheduleStats emptyScheduleStats perTpl
+      width = templateLayerMaxWidth tg
+  pure TemplateScheduleStats
+    { tssTemplateCount         = length (tgTemplates tg)
+    , tssMaxTemplateLayerWidth = width
+    , tssAggregate             = agg
+    }
+
+-- | Kahn's by-layer over 'tgPrecedence': the width of each
+-- precedence-DAG layer is the count of templates whose
+-- predecessors are all already scheduled. Returns the @max@
+-- across layers, or 0 for an empty ensemble.
+--
+-- @tgPrecedence@ is keyed by the /reader/ template (the one
+-- that depends), so a template missing from the map has no
+-- predecessors and lands in layer 0.
+templateLayerMaxWidth :: TemplateGraph -> Int
+templateLayerMaxWidth tg =
+  let tids       = map tplID (tgTemplates tg)
+      precedence = tgPrecedence tg
+      depsOf t   = M.findWithDefault S.empty t precedence
+      goLayers _ [] = []
+      goLayers done remaining =
+        let ready t = S.null (depsOf t `S.difference` done)
+            (layer, rest) = partition ready remaining
+        in if null layer
+             then [length remaining]   -- defensive: cycle was
+                                       -- already rejected upstream
+             else length layer
+                  : goLayers (foldr S.insert done layer) rest
+      widths = goLayers S.empty tids
+  in if null widths then 0 else maximum widths
