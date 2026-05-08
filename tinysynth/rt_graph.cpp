@@ -4817,14 +4817,19 @@ without Haskell. There is no plan to remove it.
 // Add one region to the named template's MetaDef. The Haskell
 // loaders (loadRuntimeGraph, loadTemplateGraph) emit one call per
 // `RuntimeRegion` after every node and connection has been registered;
-// regions are appended in execution order so def->regions[i] matches
-// the Haskell-side rgRuntimeRegions[i].
+// regions are appended in /scheduled execution order/ so
+// def->regions[i] matches the Haskell-side regionSchedule output —
+// which is identity-equal to rgRuntimeRegions today and may diverge
+// from raw rgRuntimeRegions order once the planner becomes
+// non-identity (§4.E.2b onward). process_instance walks
+// def->regions in registration order; the C++ side does not analyze
+// or reorder.
 //
 // Validation here is loose: invalid template_id, negative or zero
 // node_count, or a range that would step outside def->nodes are
 // silent no-ops. The Haskell side guarantees the precondition (every
-// node covered exactly once, contiguous, in execution order); the
-// C ABI does not duplicate that check. See Note [Region fallback].
+// node covered exactly once, contiguous, in scheduled execution order);
+// the C ABI does not duplicate that check. See Note [Region fallback].
 void rt_graph_template_add_region(
     RTGraph *g, int template_id,
     int rate, int first_node, int node_count

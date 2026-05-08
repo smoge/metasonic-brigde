@@ -689,12 +689,16 @@ wireFusedScale g cTid dstNode dstPort fused = case fused of
     stepCtl  (AffBias  _ c) = c
 
 -- | Transfer a compiled 'RuntimeGraph' to the C++ runtime.
--- Clears any existing graph state first, then adds nodes and
--- wires connections.
+-- Validates the region schedule first, then clears any existing
+-- graph state, adds nodes, wires connections, and registers
+-- regions in scheduled execution order.
 --
--- Clearing first gives the runtime a chance to stop any live
--- audio stream associated with the old graph before loading
--- the new one.
+-- Schedule validation runs /before/ 'c_rt_graph_clear', so a
+-- malformed graph (cycle in 'regionDependencies', non-ascending
+-- 'rgRuntimeRegions', etc.) raises 'fail' without disturbing the
+-- currently loaded graph. Clearing first thereafter gives the
+-- runtime a chance to stop any live audio stream associated
+-- with the old graph before loading the new one.
 --
 -- See Note [Two-pass loading].
 -- See Note [FFI boundary design].
@@ -919,10 +923,13 @@ add/connect/set/instance calls are 'unsafe' (graph-loading work,
 synchronous, non-blocking).
 -}
 
--- | Transfer a compiled 'TemplateGraph' to the C++ runtime. Clears
--- any existing graph state first, registers each template in
--- execution order, populates its nodes and wiring, and spawns one
--- instance per template.
+-- | Transfer a compiled 'TemplateGraph' to the C++ runtime.
+-- Validates the per-template region schedule for every template
+-- /before/ clearing, then registers each template in execution
+-- order, populates its nodes and wiring, and spawns one instance
+-- per template. A malformed schedule on /any/ template raises
+-- 'fail' before 'c_rt_graph_clear' so the currently loaded graph
+-- is preserved.
 --
 -- See Note [loadTemplateGraph protocol].
 loadTemplateGraph :: Ptr RTGraph -> TemplateGraph -> IO ()

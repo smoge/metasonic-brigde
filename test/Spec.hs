@@ -2968,6 +2968,95 @@ unitTests = testGroup "Unit tests"
                     map rrIndex scheduled @?=
                       map rrIndex (rgRuntimeRegions (tplGraph tpl)))
                 (tgTemplates tg)
+
+      , -- §4.E.2b loader-preservation contract: a failed schedule
+        -- must not disturb the currently loaded graph. Compute the
+        -- schedule first, fail before 'c_rt_graph_clear', leave
+        -- the previous graph fully renderable.
+        --
+        -- Procedure: load a good graph, snapshot bus 0 after one
+        -- block. Construct a malformed graph (reverse the region
+        -- list — trips the dense-ascending check). 'try' to load
+        -- it; expect 'Left'. Render again on the same handle and
+        -- compare the second snapshot against the first — they
+        -- must be bit-identical.
+        testCase "loadRuntimeGraph: failed schedule preserves previous graph" $ do
+          let nframes, sizeOfFloat :: Int
+              nframes     = 256
+              sizeOfFloat = 4
+              -- Two-region graph: an 'RSawLpfGain' buffer feeds an
+              -- 'RNodeLoop' tail. Reversing 'rgRuntimeRegions'
+              -- produces a non-ascending list that the planner
+              -- must reject.
+              good = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)
+                out 0 b
+          rt <- case lowerGraph good >>= compileRuntimeGraph of
+            Right r  -> pure r
+            Left err -> assertFailure err >> error "unreachable"
+          -- Sanity: the chosen graph has at least two regions, so
+          -- the reversal is observable.
+          assertBool
+            "expected good graph to have at least two regions"
+            (length (rgRuntimeRegions rt) >= 2)
+          let bad = rt { rgRuntimeRegions =
+                           reverse (rgRuntimeRegions rt) }
+          withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+            loadRuntimeGraph handle rt
+            c_rt_graph_process handle (fromIntegral nframes)
+            before <-
+              allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+                _ <- c_rt_graph_read_bus handle 0
+                       (fromIntegral nframes) (castPtr buf)
+                cs <- peekArray nframes (buf :: PtrCFloat)
+                pure (map (\(CFloat x) -> x) cs)
+
+            -- Attempt the bad load; must fail before clear.
+            let attempt :: IO (Either IOError ())
+                attempt = try $ loadRuntimeGraph handle bad
+            result <- attempt
+            case result of
+              Right () ->
+                assertFailure $
+                  "loadRuntimeGraph should have rejected the "
+                  <> "malformed graph"
+              Left e ->
+                assertBool
+                  ("expected dense-ordering diagnostic in: "
+                   <> show e)
+                  ("dense" `isInfixOf` show e)
+
+            -- The previously loaded graph must still produce the
+            -- same audio. Render another block and compare.
+            c_rt_graph_process handle (fromIntegral nframes)
+            after <-
+              allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+                _ <- c_rt_graph_read_bus handle 0
+                       (fromIntegral nframes) (castPtr buf)
+                cs <- peekArray nframes (buf :: PtrCFloat)
+                pure (map (\(CFloat x) -> x) cs)
+
+            -- 'before' is block 0 and 'after' is block 1 of the
+            -- /same/ continuous oscillator. Pinning that both
+            -- blocks render non-silent audio at a similar level
+            -- shows the graph survived the failed load — a
+            -- half-cleared state would produce silence or
+            -- diverge in level. We don't compare sample-for-sample
+            -- because the oscillator phase advances between
+            -- blocks (which is the correct behavior).
+            let peakBefore = maximum (map abs before)
+                peakAfter  = maximum (map abs after)
+            assertBool ("peak before > 0, got " <> show peakBefore)
+                       (peakBefore > 0.05)
+            assertBool ("peak after > 0, got " <> show peakAfter)
+                       (peakAfter > 0.05)
+            assertBool
+              ("peaks should be in same ballpark; before="
+               <> show peakBefore <> " after=" <> show peakAfter)
+              (abs (peakBefore - peakAfter) < 0.5 * peakBefore)
       ]
 
   , testCase "kindTag is injective" $
