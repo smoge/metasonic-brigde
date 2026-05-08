@@ -1895,12 +1895,18 @@ unitTests = testGroup "Unit tests"
         -- holds: a second 'selectRegionKernels' application is a
         -- no-op on the already-tagged result.
         --
-        -- Both chains end in 'busOut' (not 'out') so each falls
-        -- through longest-match into 'RSawLpfGain' rather than
-        -- 'RSawLpfGainOut'. The multi-match property is about
-        -- claiming both chains in one pass — orthogonal to which
-        -- terminal kernel claims them — so we pick the kernel
-        -- that keeps the assertion shape simple and pinned.
+        -- Why each chain tags as 'RSawLpfGain' rather than the
+        -- longer 'RSawLpfGainOut': the topo sort emits both
+        -- sinks at the /end/ of the region, after both
+        -- saw/lpf/gain triples. Each gain's sink consumer is
+        -- therefore not contiguous with the prefix, so the
+        -- 4-node 'RSawLpfGainOut' shape's contiguity gate
+        -- (gainIx feeds the next listed member) fails for each
+        -- chain and longest-match falls through to the 3-node
+        -- 'RSawLpfGain'. 'busOut' vs 'out' is incidental here —
+        -- either sink kind produces the same trace because the
+        -- topo-order clumping is what breaks contiguity, not the
+        -- terminal kind.
         testCase "two chains in one region: both tagged in one pass" $ do
           let g = runSynth $ do
                 s1 <- sawOsc 110.0 0.0

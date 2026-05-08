@@ -755,17 +755,19 @@ data RegionKernel
     -- @[KSawOsc, KLPF, KGain]@ with single-use internal edges
     -- (saw → lpf, lpf → gain), no audio modulation on the gain
     -- port, and no external readers of the saw or lpf intermediate
-    -- buffers. The gain's output buffer is materialised; sibling
-    -- regions (typically containing a 'BusOut') read from it. The
-    -- runtime calls one fused per-sample kernel; saw / lpf / gain
-    -- per-node kernels are skipped.
+    -- buffers. The gain's output buffer is materialized; whoever
+    -- consumes it (downstream node, sibling region's sink) reads
+    -- it from there. The runtime calls one fused per-sample
+    -- kernel; saw / lpf / gain per-node kernels are skipped.
     --
-    -- Note: when the gain's sole consumer is an 'Out' node and that
-    -- 'Out' would form a contiguous suffix, longest-match priority
-    -- in 'findKernelMatch' picks 'RSawLpfGainOut' instead. This
-    -- 3-node kernel still fires for non-'Out' terminals (notably
-    -- 'BusOut') and for shapes where the gain has multiple
-    -- consumers.
+    -- Note: when the gain's sole consumer is a sink terminal
+    -- ('KOut' or 'KBusOut') and that sink would form a contiguous
+    -- suffix, longest-match priority in 'findKernelMatch' picks
+    -- the 4-node 'RSawLpfGainOut' instead. This 3-node kernel
+    -- still fires when at least one of those gates fails: the
+    -- gain has multiple consumers, the gain's sole consumer is a
+    -- non-sink (e.g. 'Add', another 'Gain', 'BusIn'), or the sink
+    -- is not contiguous with the prefix in the host region.
   | RSinGainOut
     -- ^ Sink-terminal kernel. The region is exactly
     -- @[KSinOsc, KGain, /sink/]@ with single-use internal edges
