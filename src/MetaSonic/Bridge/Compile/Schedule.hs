@@ -54,8 +54,13 @@ module MetaSonic.Bridge.Compile.Schedule
   , scheduledRuntimeRegions
   , Segment (..)
   , segmentByBarrier
+  , RegionScheduleStats (..)
+  , regionScheduleStats
+  , emptyScheduleStats
+  , addScheduleStats
   ) where
 
+import           Data.List       (partition)
 import qualified Data.Map.Strict as M
 import qualified Data.Set        as S
 
@@ -269,3 +274,165 @@ topoSortStable intraDeps = go S.empty
                "regionSchedule: cycle in intra-segment "
                <> "regionDependencies among regions "
                <> show remaining
+
+-- | Read-only descriptive view of a 'RuntimeGraph''s schedule —
+-- the survey input for the parallel-readiness question "do MetaSonic
+-- graphs actually contain wide non-barrier work, or are they
+-- sink/barrier dominated?"
+--
+-- Counts derive from 'segmentByBarrier' + 'regionDependencies' and
+-- preserve the §4.E.1c invariants: barriers are immovable; free
+-- segments admit topological reordering with 'rrIndex' as the
+-- stable tie-breaker.
+--
+--   * 'rssTotal'           — total runtime regions in the graph.
+--   * 'rssBarriers'        — regions classified as live-bus
+--                            barriers ('regionHasLiveBus').
+--   * 'rssFree'            — non-barrier regions; together with
+--                            'rssBarriers' equals 'rssTotal'.
+--   * 'rssFreeSegments'    — number of maximal free runs between
+--                            barriers (length of 'segmentByBarrier'
+--                            minus the barrier count).
+--   * 'rssMaxFreeSegmentWidth'
+--                          — region count of the widest free
+--                            segment. An upper bound on parallel
+--                            work if every free region in that
+--                            segment were independent.
+--   * 'rssMaxFreeLayerWidth'
+--                          — widest topological /layer/ within any
+--                            free segment, computed as Kahn's
+--                            by-layer over intra-segment
+--                            dependencies. The realistic
+--                            parallelism estimate: layer width is
+--                            how many regions could actually run
+--                            concurrently. A pure chain has
+--                            layer width 1 even if the segment
+--                            itself is wide.
+--
+-- All fields are non-negative; an empty graph yields all zeros
+-- ('emptyScheduleStats'). 'addScheduleStats' aggregates across
+-- templates by summing the four counts and taking the @max@ of
+-- the two width fields, which preserves the "biggest opportunity
+-- in this ensemble" reading.
+data RegionScheduleStats = RegionScheduleStats
+  { rssTotal               :: !Int
+  , rssBarriers            :: !Int
+  , rssFree                :: !Int
+  , rssFreeSegments        :: !Int
+  , rssMaxFreeSegmentWidth :: !Int
+  , rssMaxFreeLayerWidth   :: !Int
+  } deriving (Eq, Show)
+
+-- | The zero stats — the identity for 'addScheduleStats'. Useful
+-- as a 'foldr' / 'foldl'' seed when aggregating across templates
+-- or when an empty graph is the right answer.
+emptyScheduleStats :: RegionScheduleStats
+emptyScheduleStats = RegionScheduleStats
+  { rssTotal               = 0
+  , rssBarriers            = 0
+  , rssFree                = 0
+  , rssFreeSegments        = 0
+  , rssMaxFreeSegmentWidth = 0
+  , rssMaxFreeLayerWidth   = 0
+  }
+
+-- | Combine two stats records: counts add, widths take the max.
+-- This is the natural aggregation for template ensembles —
+-- summing the four counts gives total work across templates, and
+-- max-of-widths preserves "biggest single opportunity anywhere
+-- in the ensemble". Associative; 'emptyScheduleStats' is the
+-- identity.
+addScheduleStats
+  :: RegionScheduleStats -> RegionScheduleStats -> RegionScheduleStats
+addScheduleStats a b = RegionScheduleStats
+  { rssTotal               = rssTotal a               + rssTotal b
+  , rssBarriers            = rssBarriers a            + rssBarriers b
+  , rssFree                = rssFree a                + rssFree b
+  , rssFreeSegments        = rssFreeSegments a        + rssFreeSegments b
+  , rssMaxFreeSegmentWidth =
+      max (rssMaxFreeSegmentWidth a) (rssMaxFreeSegmentWidth b)
+  , rssMaxFreeLayerWidth   =
+      max (rssMaxFreeLayerWidth   a) (rssMaxFreeLayerWidth   b)
+  }
+
+-- | Walk a 'RuntimeGraph''s schedule and report the descriptive
+-- counts. Read-only — no compile or runtime change. Returns
+-- @Left@ only if 'regionSchedule' itself rejects the input
+-- (cycle / cross-segment edge / non-dense list); the diagnostic
+-- is forwarded verbatim.
+--
+-- Today's 'compileRuntimeGraph' output never fails this check
+-- because the planner is the identity over 'rrIndex' order, so
+-- in practice every survey row succeeds.
+regionScheduleStats
+  :: RuntimeGraph -> Either String RegionScheduleStats
+regionScheduleStats rg = do
+  -- Forward any planner diagnostic. We only need the side effect
+  -- of validation here — the layer widths derive from
+  -- 'segmentByBarrier' + 'regionDependencies' directly.
+  _ <- regionSchedule rg
+  let segments = segmentByBarrier rg
+      deps     = regionDependencies rg
+
+      barriers, free :: Int
+      barriers = length [() | Barrier _      <- segments]
+      free     = sum    [length rs | FreeSegment rs <- segments]
+
+      freeSegs = [rs | FreeSegment rs <- segments]
+      maxSegW  = maxOr0 (map length freeSegs)
+
+      layerWidths = concatMap (segmentLayerWidths deps) freeSegs
+      maxLayerW   = maxOr0 layerWidths
+
+  pure RegionScheduleStats
+    { rssTotal               = length (rgRuntimeRegions rg)
+    , rssBarriers            = barriers
+    , rssFree                = free
+    , rssFreeSegments        = length freeSegs
+    , rssMaxFreeSegmentWidth = maxSegW
+    , rssMaxFreeLayerWidth   = maxLayerW
+    }
+
+-- | Per-layer Kahn's over a free segment's intra-segment
+-- dependencies. Each layer is the set of regions whose deps are
+-- all already in earlier layers; layer 0 is the segment's roots.
+-- Returns one width per layer.
+--
+-- A degenerate fallback (no region ready in a non-empty
+-- @remaining@) emits the rest as one final "layer" so the survey
+-- doesn't loop. The schedule planner's own cycle check would have
+-- already returned 'Left' before this code runs in
+-- 'regionScheduleStats', so this branch is purely defensive.
+segmentLayerWidths
+  :: M.Map RegionIndex (S.Set RegionIndex)
+  -> [RuntimeRegion]
+  -> [Int]
+segmentLayerWidths deps members =
+  let memberSet = S.fromList (map rrIndex members)
+      intraDeps = M.fromList
+        [ (rrIndex r
+          , S.intersection
+              memberSet
+              (M.findWithDefault S.empty (rrIndex r) deps))
+        | r <- members
+        ]
+  in goLayers S.empty (map rrIndex members) intraDeps
+
+goLayers
+  :: S.Set RegionIndex
+  -> [RegionIndex]
+  -> M.Map RegionIndex (S.Set RegionIndex)
+  -> [Int]
+goLayers _    []        _    = []
+goLayers done remaining deps =
+  let depsOf ix = M.findWithDefault S.empty ix deps
+      ready ix  = S.null (depsOf ix `S.difference` done)
+      (layer, rest) = partition ready remaining
+  in if null layer
+       then [length remaining]   -- defensive cycle fallback
+       else length layer
+            : goLayers (foldr S.insert done layer) rest deps
+
+maxOr0 :: [Int] -> Int
+maxOr0 [] = 0
+maxOr0 xs = maximum xs

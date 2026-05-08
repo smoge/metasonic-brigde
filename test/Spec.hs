@@ -2977,9 +2977,11 @@ unitTests = testGroup "Unit tests"
         -- Procedure: load a good graph, snapshot bus 0 after one
         -- block. Construct a malformed graph (reverse the region
         -- list — trips the dense-ascending check). 'try' to load
-        -- it; expect 'Left'. Render again on the same handle and
-        -- compare the second snapshot against the first — they
-        -- must be bit-identical.
+        -- it; expect 'Left'. Render another block on the same
+        -- handle and confirm it is non-silent and at a similar
+        -- peak level. (We can't compare sample-for-sample because
+        -- the oscillator phase has advanced; the right invariant
+        -- is "same audible signal, just one block later".)
         testCase "loadRuntimeGraph: failed schedule preserves previous graph" $ do
           let nframes, sizeOfFloat :: Int
               nframes     = 256
@@ -3057,6 +3059,98 @@ unitTests = testGroup "Unit tests"
               ("peaks should be in same ballpark; before="
                <> show peakBefore <> " after=" <> show peakAfter)
               (abs (peakBefore - peakAfter) < 0.5 * peakBefore)
+      ]
+
+  , -- Phase 4.E.2c (parallel-readiness survey): descriptive
+    -- 'regionScheduleStats' counts. Read-only summary used by
+    -- '--fusion-survey' to answer "do graphs have wide non-barrier
+    -- work?" before any worker-pool design lands.
+    testGroup "Phase 4.E.2c: regionScheduleStats descriptive counts"
+      [ -- Single-region all-barrier graph: one barrier, no free.
+        testCase "single-region (sin -> out): 1 barrier, 0 free, max widths 0" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> case regionScheduleStats rg of
+              Left err -> assertFailure $ "stats failed: " <> err
+              Right s ->
+                s @?= RegionScheduleStats
+                  { rssTotal               = 1
+                  , rssBarriers            = 1
+                  , rssFree                = 0
+                  , rssFreeSegments        = 0
+                  , rssMaxFreeSegmentWidth = 0
+                  , rssMaxFreeLayerWidth   = 0
+                  }
+
+      , -- Kernel-split: free buffer + barrier tail.
+        testCase "saw -> lpf -> gain -> add -> out: 1 free + 1 barrier, max widths 1" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> case regionScheduleStats rg of
+              Left err -> assertFailure $ "stats failed: " <> err
+              Right s ->
+                s @?= RegionScheduleStats
+                  { rssTotal               = 2
+                  , rssBarriers            = 1
+                  , rssFree                = 1
+                  , rssFreeSegments        = 1
+                  , rssMaxFreeSegmentWidth = 1
+                  , rssMaxFreeLayerWidth   = 1
+                  }
+
+      , -- Headline parallelism case: two independent free buffers
+        -- in one segment. Width = 2 at both segment and layer
+        -- level (regions are independent → one layer of size 2).
+        testCase "two independent buffers + shared tail: free width 2 at layer 0" $ do
+          let g = runSynth $ do
+                s1 <- sawOsc 110.0 0.0
+                f1 <- lpf s1 (Param 800.0)  (Param 4.0)
+                g1 <- gain f1 (Param 0.4)
+                s2 <- sawOsc 220.0 0.0
+                f2 <- lpf s2 (Param 1200.0) (Param 4.0)
+                g2 <- gain f2 (Param 0.4)
+                summed <- add g1 g2
+                out 0 summed
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> case regionScheduleStats rg of
+              Left err -> assertFailure $ "stats failed: " <> err
+              Right s ->
+                s @?= RegionScheduleStats
+                  { rssTotal               = 3
+                  , rssBarriers            = 1
+                  , rssFree                = 2
+                  , rssFreeSegments        = 1
+                  , rssMaxFreeSegmentWidth = 2
+                  , rssMaxFreeLayerWidth   = 2
+                  }
+
+      , -- Aggregation: empty + s = s, and (a + b) sums counts and
+        -- maxes widths.
+        testCase "addScheduleStats: counts add, widths max" $ do
+          let a = RegionScheduleStats 3 1 2 1 2 2
+              b = RegionScheduleStats 5 4 1 1 1 1
+          addScheduleStats emptyScheduleStats a @?= a
+          addScheduleStats a emptyScheduleStats @?= a
+          addScheduleStats a b @?=
+            RegionScheduleStats
+              { rssTotal               = 8
+              , rssBarriers            = 5
+              , rssFree                = 3
+              , rssFreeSegments        = 2
+              , rssMaxFreeSegmentWidth = 2
+              , rssMaxFreeLayerWidth   = 2
+              }
       ]
 
   , testCase "kindTag is injective" $

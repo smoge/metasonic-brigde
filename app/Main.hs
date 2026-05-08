@@ -1130,6 +1130,9 @@ data SurveyRow = SurveyRow
   , srElided       :: !Int
   , srRFused       :: !Int
   , srShapes       :: ![(SinkShape, Bool)]
+  , srSchedStats   :: !RegionScheduleStats
+    -- ^ §4.E.2c parallel-readiness counts. Read-only; surfaces in
+    -- the schedule-width section of '--fusion-survey'.
   } deriving (Eq, Show)
 
 -- Build a SurveyRow from /two/ compiled 'RuntimeGraph's of the
@@ -1153,8 +1156,13 @@ data SurveyRow = SurveyRow
 -- shape predicate. Scanning 'rtF' would silently zero out
 -- exactly the rows the survey exists to surface.
 surveyRuntimeGraph
-  :: String -> Maybe String -> RuntimeGraph -> RuntimeGraph -> SurveyRow
-surveyRuntimeGraph d t rt rtF =
+  :: String
+  -> Maybe String
+  -> RuntimeGraph
+  -> RuntimeGraph
+  -> RegionScheduleStats
+  -> SurveyRow
+surveyRuntimeGraph d t rt rtF stats =
   let allRegions  = rgRuntimeRegions rt
       fused       = [r | r <- allRegions, rrKernel r /= RNodeLoop]
       -- Enumerate kernel kinds via Bounded/Enum rather than keying
@@ -1177,6 +1185,7 @@ surveyRuntimeGraph d t rt rtF =
        , srElided       = length (filter rnElided (rgNodes rtF))
        , srRFused       = length [() | n <- rgNodes rtF, RFused _ <- rnInputs n]
        , srShapes       = scanSinkShapes rt
+       , srSchedStats   = stats
        }
 
 -- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
@@ -1188,9 +1197,10 @@ surveySynthGraph
   :: String -> Maybe String -> SynthGraph -> Either String SurveyRow
 surveySynthGraph d t g = do
   let stamp err = surveyTag d t <> ": " <> err
-  rt  <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraph)
-  rtF <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraphFused)
-  Right (surveyRuntimeGraph d t rt rtF)
+  rt    <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraph)
+  rtF   <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraphFused)
+  stats <- either (Left . stamp) Right (regionScheduleStats rt)
+  Right (surveyRuntimeGraph d t rt rtF stats)
 
 -- | A short human label used in error messages.
 surveyTag :: String -> Maybe String -> String
@@ -1594,6 +1604,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printOpportunityScan allRows
   putStrLn ""
+  printScheduleWidth allRows
+  putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
   case allErrs of
@@ -1691,6 +1703,74 @@ scanRows rows =
      , let (found, claimed, missed) = countFor sh
      , found > 0 || shapeHasKernel sh
      ]
+
+-- §4.E.2c parallel-readiness section. One row per surveyed graph,
+-- plus a footer with aggregate counts and the maximum free-segment
+-- and free-layer widths across the whole survey.
+--
+--   total : total runtime regions in the graph
+--   B     : barrier regions (live-bus — KOut / KBusOut / KBusIn)
+--   F     : free regions (non-barrier; admit topological reorder)
+--   segs  : number of maximal free runs between barriers
+--   maxSW : widest free segment, in regions
+--   maxLW : widest topological /layer/ within any free segment.
+--           This is the realistic parallel-work upper bound: a
+--           pure chain has layer width 1 even when the segment
+--           is wide, so a graph with @maxLW = 1@ everywhere has
+--           no parallelism a worker pool could exploit.
+--
+-- The headline number for "is a worker pool worth building yet"
+-- is the survey-wide @max(maxLW)@ in the footer. If it stays at
+-- 1 across demos and corpus, the graphs are sink-or-chain
+-- dominated and worker threads are premature.
+printScheduleWidth :: [SurveyRow] -> IO ()
+printScheduleWidth rows = do
+  putStrLn "─── Schedule width (§4.E.2c parallel-readiness) ───"
+  putStrLn $ formatScheduleRow
+    [ "demo", "template"
+    , "total", "B", "F", "segs", "maxSW", "maxLW"
+    ]
+  mapM_ (putStrLn . formatScheduleRow . renderScheduleRow) rows
+  putStrLn ""
+  -- Footer: total counts via 'addScheduleStats' (sums counts,
+  -- maxes widths) so the maxSW / maxLW columns show the widest
+  -- single opportunity anywhere in the survey.
+  let agg = foldr addScheduleStats emptyScheduleStats
+              (map srSchedStats rows)
+  putStrLn $ "  totals: "
+          <> "graphs="    <> show (length rows)
+          <> "  total="   <> show (rssTotal               agg)
+          <> "  B="       <> show (rssBarriers            agg)
+          <> "  F="       <> show (rssFree                agg)
+          <> "  segs="    <> show (rssFreeSegments        agg)
+          <> "  maxSW="   <> show (rssMaxFreeSegmentWidth agg)
+          <> "  maxLW="   <> show (rssMaxFreeLayerWidth   agg)
+
+renderScheduleRow :: SurveyRow -> [String]
+renderScheduleRow r =
+  let s = srSchedStats r
+  in [ srDemo r
+     , maybe "" id (srTemplate r)
+     , show (rssTotal               s)
+     , show (rssBarriers            s)
+     , show (rssFree                s)
+     , show (rssFreeSegments        s)
+     , show (rssMaxFreeSegmentWidth s)
+     , show (rssMaxFreeLayerWidth   s)
+     ]
+
+-- Mirrors 'surveyColumnWidths' in shape but narrower — the
+-- schedule columns are all small integers.
+scheduleColumnWidths :: [Int]
+scheduleColumnWidths = [42, 14, 6, 4, 4, 5, 6, 6]
+
+formatScheduleRow :: [String] -> String
+formatScheduleRow cols =
+  intercalate "  " (zipWith pad scheduleColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
 
 -- Aggregate totals across every surveyed graph, plus a subtotal
 -- block that splits demo rows from corpus rows. The split lets the

@@ -70,6 +70,10 @@ module MetaSonic.Bridge.Compile
   , scheduledRuntimeRegions
   , Segment (..)
   , segmentByBarrier
+  , RegionScheduleStats (..)
+  , regionScheduleStats
+  , emptyScheduleStats
+  , addScheduleStats
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
