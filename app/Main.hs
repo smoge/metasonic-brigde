@@ -399,7 +399,7 @@ usage prog = unlines
   [ "Usage:"
   , "  " <> prog <> " [--audio-only] [--fused] [DEMO ...]"
   , "  " <> prog <> " --inspect [--fused] [DEMO ...]"
-  , "  " <> prog <> " --inspect-only [DEMO ...]"
+  , "  " <> prog <> " --inspect-only [--fused] [DEMO ...]"
   , ""
   , "If no demo names are given, all demos are run."
   , ""
