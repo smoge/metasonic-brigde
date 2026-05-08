@@ -1015,6 +1015,7 @@ shapeHasKernel (SinkOscGain    KSinOsc)   = True   -- RSinGainOut
 shapeHasKernel (SinkOscGain    KSawOsc)   = True   -- RSawGainOut
 shapeHasKernel (SinkOscGain    KNoiseGen) = True   -- RNoiseGainOut
 shapeHasKernel (SinkOscLpfGain KSawOsc)   = True   -- RSawLpfGainOut
+shapeHasKernel SinkBusInLpfGain           = True   -- RBusInLpfGainOut
 shapeHasKernel _                          = False
 
 -- Sink-terminal classifier: matches NodeKind.{Out,BusOut} on the

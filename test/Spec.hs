@@ -1862,6 +1862,142 @@ unitTests = testGroup "Unit tests"
               null [() | RSawLpfGainOut <- kernels] @?= True
               null [() | RSawLpfGain    <- kernels] @?= True
 
+      , -- §4.B BusIn-rooted 4-node sink-terminal claim.
+        -- @[BusIn, LPF, Gain, Out]@ matches 'matchesBusInLpfGainOut'
+        -- and the whole chain becomes one 'RBusInLpfGainOut' region.
+        -- Same longest-match-wins structural property as
+        -- 'RSawLpfGainOut' but on the non-oscillator producer axis.
+        testCase "busIn → lpf → gain → out: full region tagged RBusInLpfGainOut" $ do
+          let g = runSynth $ do
+                r <- busIn 7
+                f <- lpf r (Param 1500.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RBusInLpfGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg
+                      , rrKernel r == RBusInLpfGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 4
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KBusIn, KLPF, KGain, KOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got "
+                  <> show (length rs)
+
+      , -- BusOut as sink terminal for the BusIn-rooted shape.
+        -- Pins that the kind-sequence assertion still tags as
+        -- 'RBusInLpfGainOut' regardless of whether the absorbed
+        -- terminal is 'KOut' or 'KBusOut'.
+        testCase "busIn → lpf → gain → busOut: full region tagged RBusInLpfGainOut" $ do
+          let g = runSynth $ do
+                r <- busIn 7
+                f <- lpf r (Param 1500.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                busOut 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RBusInLpfGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg
+                      , rrKernel r == RBusInLpfGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 4
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KBusIn, KLPF, KGain, KBusOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got "
+                  <> show (length rs)
+
+      , -- Near-miss: BusIn fans out to two consumers. The single-
+        -- use internal-edge precondition on the BusIn fails, so
+        -- the 4-node match is rejected. Without an LPF-rooted
+        -- 3-node fallback (we don't have one), the chain stays
+        -- 'RNodeLoop'. Pins that the multi-consumer gate is the
+        -- BusIn analogue of 'matchesSawLpfGainOut's
+        -- 'rnConsumerCount saw == 1' rule.
+        testCase "near-miss: multi-consumer BusIn blocks RBusInLpfGainOut" $ do
+          let g = runSynth $ do
+                r  <- busIn 7
+                f1 <- lpf r (Param 800.0)  (Param 4.0)
+                f2 <- lpf r (Param 2400.0) (Param 4.0)   -- second consumer of busIn
+                a1 <- gain f1 (Param 0.4); out 0 a1
+                a2 <- gain f2 (Param 0.4); out 1 a2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RBusInLpfGainOut <- kernels] @?= True
+
+      , -- Near-miss: audio-modulated gain in a BusIn-rooted chain.
+        -- 'isScalarGain' fails on the gain, so the 4-node kernel
+        -- doesn't fire. Mirrors the audio-mod near-miss pinned for
+        -- 'RSawLpfGainOut'.
+        testCase "near-miss (BusIn): audio-modulated gain stays RNodeLoop" $ do
+          let g = runSynth $ do
+                r   <- busIn 7
+                f   <- lpf r (Param 1500.0) (Param 4.0)
+                lfo <- sinOsc 6.0 0.0
+                a   <- gain f lfo                    -- audio-rate gain modulation
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RBusInLpfGainOut <- kernels] @?= True
+
+      , -- Near-miss: the chain ends at a non-sink consumer (Add),
+        -- so 'isSinkTerminal' on the terminal slot fails and the
+        -- 4-node match is rejected. Without an LPF-rooted 3-node
+        -- fallback for the BusIn-rooted shape, the chain stays
+        -- 'RNodeLoop'. Pins that the sink-class gate distinguishes
+        -- 'RBusInLpfGainOut' from a hypothetical "BusIn-rooted
+        -- buffer-terminal" kernel.
+        testCase "near-miss (BusIn): non-sink terminal stays RNodeLoop" $ do
+          let g = runSynth $ do
+                r <- busIn 7
+                f <- lpf r (Param 1500.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                b <- add a (Param 0.0)              -- non-sink consumer
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RBusInLpfGainOut <- kernels] @?= True
+
+      , -- §4.C interaction (BusIn-rooted 4-node kernel): when
+        -- §4.B's 'RBusInLpfGainOut' claims the chain, §4.C must
+        -- skip the Gain. Otherwise scalar-Gain elision would
+        -- eliminate the live control slot the kernel reads
+        -- 'controls[0]' from. Mirrors the §4.C-deferral pin for
+        -- 'RSawLpfGainOut'.
+        testCase "fuseRuntimeGraph: defers to RBusInLpfGainOut on busIn → lpf → gain → out" $ do
+          let g = runSynth $ do
+                r <- busIn 7
+                f <- lpf r (Param 1500.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "fused compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RBusInLpfGainOut <- kernels] @?= 1
+              -- The Gain is a member of the kernel's region, not
+              -- elided by §4.C (otherwise the kernel would have no
+              -- live control slot to read 'controls[0]' from).
+              let elidedKinds =
+                    [rnKind n | n <- rgNodes rg, rnElided n]
+              KGain `elem` elidedKinds @?= False
+
       , -- Idempotence: a second pass over an already-tagged region
         -- must be a no-op. Pinned because 'selectRegionKernels'
         -- recurses on splits and a regression that re-fires on
@@ -3330,6 +3466,98 @@ crossCuttingTests = testGroup "End-to-end FFI"
                   <> ", got peak " <> show peak)
                  (peak > 0.05)
 
+  , -- Phase 4.B: 'RBusInLpfGainOut' control identity. Mirrors the
+    -- 'RSawLpfGainOut' set_control test but exercises the controls
+    -- specific to the BusIn-rooted shape: busin.bus (slot 0),
+    -- lpf.freq (slot 0), lpf.q (slot 1), gain.amount, and
+    -- out.bus. Critically, busin.bus is the new ground here: the
+    -- kernel reads 'output_buses[busin_bus][i]' inline, so
+    -- redirecting the BusIn to a different source bus must steer
+    -- the kernel exactly as it steers the per-node 'process_busin'
+    -- baseline.
+    --
+    -- The graph also has a 'voice' chain (SinOsc → BusOut 5)
+    -- whose only job is to put a real signal on bus 5 so the
+    -- comparison isn't "fused silence == baseline silence". When
+    -- the test redirects busin.bus to bus 6 (a bus no one writes
+    -- in this graph), the kernel must read silence the same way
+    -- 'process_busin' would have copied silence — that's the
+    -- BusIn-bus control identity we care about.
+    testCase "Phase 4.B: set_control on RBusInLpfGainOut covers busin.bus + lpf.freq/q + gain + out.bus" $ do
+      let nframes = 256
+          chain = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            busOut 5 o                               -- voice writes bus 5
+            r <- busIn 5
+            f <- lpf r (Param 800.0) (Param 4.0)
+            a <- gain f (Param 0.4)
+            out 0 a                                  -- initial sink: bus 0
+          newLpfFreq    = 1500.0 :: Double
+          newLpfQ       = 6.0    :: Double
+          newGain       = 0.3    :: Double
+          newSinkBus    = 2      :: Int              -- redirect sink
+          newBusInBus   = 5      :: Int              -- (unchanged) keeps the live signal
+
+      rtUnRaw <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      assertBool "Phase 4.B: fused compile has no RBusInLpfGainOut region"
+        (any ((== RBusInLpfGainOut) . rrKernel) (rgRuntimeRegions rtF))
+
+      let rtUn = stripRegionKernels rtUnRaw
+
+          ixOf k rg =
+            let NodeIndex i = head [rnIndex n | n <- rgNodes rg, rnKind n == k]
+            in i
+          busInIx = ixOf KBusIn rtF
+          lpfIx   = ixOf KLPF   rtF
+          gainIx  = ixOf KGain  rtF
+          outIx   = ixOf KOut   rtF
+
+      let sizeOfFloat' = 4 :: Int
+          renderBus loader rt readBus =
+            withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+              loader handle rt
+              c_rt_graph_ensure_bus handle (fromIntegral newSinkBus)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral busInIx) 0 (CDouble (fromIntegral newBusInBus))
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral lpfIx)   0 (CDouble newLpfFreq)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral lpfIx)   1 (CDouble newLpfQ)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral gainIx)  0 (CDouble newGain)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral outIx)   0 (CDouble (fromIntegral newSinkBus))
+              c_rt_graph_process handle (fromIntegral nframes)
+              allocaBytes (nframes * sizeOfFloat') $ \buf -> do
+                _ <- c_rt_graph_read_bus handle (fromIntegral readBus)
+                                         (fromIntegral nframes) (castPtr buf)
+                cs <- peekArray nframes (buf :: PtrCFloat)
+                pure (map (\(CFloat x) -> x) cs)
+
+      baselineSamples <- renderBus loadRuntimeGraph      rtUn newSinkBus
+      fusedSamples    <- renderBus loadRuntimeGraphFused rtF  newSinkBus
+
+      length baselineSamples @?= length fusedSamples
+      assertBool
+        ("Phase 4.B: RBusInLpfGainOut set_control divergence on bus "
+         <> show newSinkBus)
+        (baselineSamples == fusedSamples)
+
+      -- Sanity: a 440 Hz sine through an LPF at 1500 Hz with
+      -- moderate Q, scaled by 0.3, must produce non-silent output
+      -- on the redirected bus. Same loose-peak threshold as the
+      -- RSawLpfGainOut variant.
+      let peak = maximum (map abs baselineSamples)
+      assertBool ("expected non-silent render on bus " <> show newSinkBus
+                  <> ", got peak " <> show peak)
+                 (peak > 0.05)
+
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
       -- read is gain-attenuated and sent to hardware bus 0. We then
@@ -3766,6 +3994,85 @@ crossCuttingTests = testGroup "End-to-end FFI"
           assertBool ("bus 1 (voice B) should sing, peak=" <> show peak1)
                      (peak1 > 0.9)
 
+  , -- Phase 4.B: 'RBusInLpfGainOut' end-to-end through a real
+    -- multi-template send/return. The /fx/ template's
+    -- @[BusIn, LPF, Gain, Out]@ chain is what the survey's
+    -- BusIn-rooted opportunity scan was tracking; this test pins
+    -- bit-equivalence between the kernel and the per-node baseline
+    -- /through the actual cross-template loader path/, not just a
+    -- single-graph approximation.
+    --
+    -- 'compileTemplateGraph' compiles each template through
+    -- 'compileRuntimeGraph' (which runs 'selectRegionKernels'
+    -- unconditionally), so the fx template's chain claims
+    -- 'RBusInLpfGainOut' on the fused side. The baseline strips
+    -- region kernels per template — same TemplateGraph shape, just
+    -- per-node dispatch — so the comparison isolates the kernel's
+    -- output from any other change.
+    testCase "loadTemplateGraph: cross-template send/return claims RBusInLpfGainOut bit-equivalently" $ do
+      let nframes = 256
+          voice = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            busOut 5 o                            -- voice template writes bus 5
+          fx = runSynth $ do
+            r <- busIn 5
+            f <- lpf r (Param 1500.0) (Param 4.0)
+            a <- gain f (Param 0.6)
+            out 0 a                               -- fx-tail kernel sinks to bus 0
+
+      tg <- case compileTemplateGraph [("voice", voice), ("fx", fx)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- Sanity: the fx template's chain claims RBusInLpfGainOut.
+      -- If this assertion fires, the test isn't testing what it
+      -- claims (a future kernel-precondition tightening might have
+      -- silently disclaimed the chain).
+      let fxTpl = head [t | t <- tgTemplates tg, tplName t == "fx"]
+          fxKernels = map rrKernel (rgRuntimeRegions (tplGraph fxTpl))
+      assertBool "fx template should carry an RBusInLpfGainOut region"
+        (RBusInLpfGainOut `elem` fxKernels)
+
+      -- Stripped TemplateGraph: same shape, kernels forced to
+      -- RNodeLoop. Per-node dispatch on the C side; bit-equivalent
+      -- baseline by construction.
+      let strippedTg = tg
+            { tgTemplates =
+                [ tpl { tplGraph = stripRegionKernels (tplGraph tpl) }
+                | tpl <- tgTemplates tg ]
+            }
+
+      let totalNodes = sum (map (length . rgNodes . tplGraph)
+                                (tgTemplates tg))
+          renderTg label thisTg =
+            withRTGraph totalNodes nframes $ \handle -> do
+              loadTemplateGraph handle thisTg
+              c_rt_graph_process handle (fromIntegral nframes)
+              allocaBytes (nframes * sizeOfFloat) $ \buf -> do
+                _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                                         (castPtr buf)
+                cs <- peekArray nframes (buf :: PtrCFloat)
+                pure (label, map (\(CFloat x) -> x) cs)
+
+      (_, fusedSamples)    <- renderTg "fused"    tg
+      (_, baselineSamples) <- renderTg "baseline" strippedTg
+
+      length fusedSamples @?= length baselineSamples
+      assertBool
+        ("RBusInLpfGainOut (template path): kernel diverges from "
+         <> "per-node baseline on bus 0")
+        (fusedSamples == baselineSamples)
+
+      -- Sanity: the fx chain actually processes the voice signal
+      -- — we want a non-silent render so any future regression
+      -- where the kernel reads zeros (e.g. wrong source bus) shows
+      -- up as a peak collapse, not as silently-bit-equivalent
+      -- silence.
+      let peak = maximum (map abs fusedSamples)
+      assertBool ("expected non-silent send/return on bus 0, peak="
+                  <> show peak)
+                 (peak > 0.05)
+
   , testCase "loadTemplateGraph: cross-template routing (BusOut → BusIn through shared pool)" $ do
       -- Producer template writes a SinOsc to bus 5; consumer
       -- template reads bus 5 and routes to hardware bus 0. This is
@@ -4074,6 +4381,38 @@ fusedEquivalenceCases =
        n <- noiseGen
        a <- gain n (Param 0.4)
        busOut 0 a)
+
+    -- 'RBusInLpfGainOut' coverage. The first non-oscillator
+    -- producer kernel: source is a bus reader, not a generator.
+    -- The fused kernel reads 'output_buses[busin_bus][i]' inline
+    -- (mirroring 'process_busin's std::copy_n + per-node LPF +
+    -- per-node Gain + per-node Out); the stripped baseline runs
+    -- those same per-node steps in sequence. Bit-equivalence on
+    -- the sink bus pins that the inlined bus read produces the
+    -- same float as the materialized 'process_busin' copy would
+    -- have, in the same per-sample order.
+    --
+    -- We pair a BusOut writer with the BusIn reader in the same
+    -- graph (bus 5 carries a SinOsc) so the chain processes a
+    -- real signal rather than silence from an unwritten bus —
+    -- otherwise the test would degenerate into "fused silence ==
+    -- baseline silence", which is too weak to catch a per-sample
+    -- divergence introduced by a future change.
+  , ("§4.B sink-terminal: busIn → lpf → gain → out", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       busOut 5 o                              -- voice side: bus 5 carries the carrier
+       r <- busIn 5
+       f <- lpf r (Param 1500.0) (Param 4.0)
+       a <- gain f (Param 0.6)
+       out 0 a)                                -- fx-tail kernel sinks to bus 0
+
+  , ("§4.B sink-terminal via busOut: busIn → lpf → gain → busOut", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       busOut 5 o
+       r <- busIn 5
+       f <- lpf r (Param 1500.0) (Param 4.0)
+       a <- gain f (Param 0.6)
+       busOut 1 a)                             -- BusOut as absorbed terminal
 
   , ("ring mod (audio-mod gain stays dispatched, output gain fuses)", runSynth $ do
        c <- sinOsc 440.0 0.0

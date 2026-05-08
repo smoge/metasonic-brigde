@@ -742,8 +742,9 @@ form.
 --
 -- The integer tag is part of the C ABI: 0 = NodeLoop,
 -- 1 = SawLpfGain, 2 = SinGainOut, 3 = SawLpfGainOut,
--- 4 = SawGainOut, 5 = NoiseGainOut. Keep 'kernelTag' in lockstep
--- with the C++ 'RegionKernel' enum in @rt_graph.cpp@.
+-- 4 = SawGainOut, 5 = NoiseGainOut, 6 = BusInLpfGainOut.
+-- Keep 'kernelTag' in lockstep with the C++ 'RegionKernel' enum in
+-- @rt_graph.cpp@.
 data RegionKernel
   = RNodeLoop
     -- ^ Default: process each member node individually, in stored
@@ -812,6 +813,26 @@ data RegionKernel
     -- bipolar, multiply by the gain control, accumulate into
     -- the bus. Reuses 'SinkAccumulator' but /not/
     -- 'drive_oscillator' (no freq port to branch on).
+  | RBusInLpfGainOut
+    -- ^ Sink-terminal kernel for @[KBusIn, KLPF, KGain, /sink/]@.
+    -- The first non-oscillator producer in the §4.B family: the
+    -- chain's source isn't a generator with phase / PRNG state,
+    -- it's a bus reader. Per-sample body: read
+    -- 'output_buses[busin_bus][i]' (same value 'process_busin'
+    -- would have copied), filter, multiply by the scalar gain,
+    -- accumulate into the sink bus. Reuses the LPF freq/q
+    -- block-rate latch from 'RSawLpfGainOut' and 'SinkAccumulator'
+    -- for the bus + sink-peak side; no 'drive_oscillator' (no
+    -- oscillator state).
+    --
+    -- This is the canonical send-return tail kernel: a voice
+    -- template writes a bus, the fx template's
+    -- @[BusIn, LPF, Gain, Out]@ chain reads it. Added after the
+    -- @--fusion-survey@ scan (with the post-template-corpus
+    -- counts in @c206794@..@fd9c8e6@) flagged
+    -- @BusIn → LPF → Gain → sink@ as the strongest recurring
+    -- missed shape — 9 misses across template ensembles vs. 3
+    -- for the noise-rooted alternative.
   deriving stock    (Eq, Show, Generic, Bounded, Enum)
   deriving anyclass (NFData)
 
@@ -821,12 +842,13 @@ data RegionKernel
 -- @rt_graph_region_kernel_supported@ entry; do not change either
 -- value in isolation.
 kernelTag :: RegionKernel -> CInt
-kernelTag RNodeLoop      = 0
-kernelTag RSawLpfGain    = 1
-kernelTag RSinGainOut    = 2
-kernelTag RSawLpfGainOut = 3
-kernelTag RSawGainOut    = 4
-kernelTag RNoiseGainOut  = 5
+kernelTag RNodeLoop        = 0
+kernelTag RSawLpfGain      = 1
+kernelTag RSinGainOut      = 2
+kernelTag RSawLpfGainOut   = 3
+kernelTag RSawGainOut      = 4
+kernelTag RNoiseGainOut    = 5
+kernelTag RBusInLpfGainOut = 6
 
 -- | Number of contiguous member nodes a fused kernel claims when
 -- it matches. 'RNodeLoop' has no fixed arity — a NodeLoop region
@@ -836,12 +858,13 @@ kernelTag RNoiseGainOut  = 5
 -- ever ask about successfully-matched fused kernels, so the
 -- 'RNodeLoop' branch is never exercised in production paths.
 kernelArity :: RegionKernel -> Int
-kernelArity RSawLpfGain    = 3
-kernelArity RSinGainOut    = 3
-kernelArity RSawLpfGainOut = 4
-kernelArity RSawGainOut    = 3
-kernelArity RNoiseGainOut  = 3
-kernelArity RNodeLoop      = 0
+kernelArity RSawLpfGain      = 3
+kernelArity RSinGainOut      = 3
+kernelArity RSawLpfGainOut   = 4
+kernelArity RSawGainOut      = 3
+kernelArity RNoiseGainOut    = 3
+kernelArity RBusInLpfGainOut = 4
+kernelArity RNodeLoop        = 0
 
 -- | One execution region in the runtime graph: a contiguous block
 -- of nodes (in execution order) that 'formRegions' grouped together.
@@ -1112,6 +1135,14 @@ fused kernel body absorbs them identically. See 'isSinkTerminal'.
     processing with the inline bus accumulation and sink-peak
     tracking; like 'RSinGainOut' it materializes no intermediate
     buffer and accepts either sink kind at the terminal slot.
+  * 'RBusInLpfGainOut' — 4-node sink-terminal:
+    @[KBusIn, KLPF, KGain, /sink/]@. The send-return tail kernel:
+    voice template writes a bus, fx template's @[BusIn, LPF, Gain,
+    Out]@ chain reads it. The producer is a bus reader (no
+    oscillator state), so the kernel inlines
+    @output_buses[busin_bus][i]@ instead of stepping a phase
+    iterator. Filter / gain / sink absorption are identical to
+    'RSawLpfGainOut'.
 
 /Longest-match priority/. At each candidate offset
 'findKernelMatch' tries shapes longest-first: for example, on
@@ -1290,6 +1321,8 @@ findKernelMatch nodes = go 0
       a : b : c : d : _
         | matchesSawLpfGainOut nodes a b c d ->
             Just (mkMatch RSawLpfGainOut)
+        | matchesBusInLpfGainOut nodes a b c d ->
+            Just (mkMatch RBusInLpfGainOut)
       _ -> match3 ixs
 
     match3 ixs = case ixs of
@@ -1449,6 +1482,50 @@ matchesSawLpfGainOut nodes sawIx lpfIx gainIx outIx =
         && signalSourceIs sawIx  lpf
         && signalSourceIs lpfIx  gain
         && signalSourceIs gainIx out_
+        && isScalarGain gain
+    _ -> False
+
+-- | The 4-node BusIn-rooted sink-terminal shape: KBusIn → KLPF →
+-- KGain → /sink/. The first non-oscillator producer in the §4.B
+-- family — the chain's source isn't a generator with phase or PRNG
+-- state, it's a bus reader. Same single-use internal-edge /
+-- scalar-gain / sink-class rules as 'matchesSawLpfGainOut',
+-- mechanically substitute KSawOsc → KBusIn at the head. The
+-- 'rnConsumerCount busin == 1' precondition is what licenses the
+-- kernel to read 'output_buses[busin_bus][i]' inline rather than
+-- materializing a copy through 'process_busin' — if anything else
+-- read the BusIn's output buffer, that buffer would have to be
+-- written for them, and the fusion would lose its point.
+--
+-- The matcher has no per-shape rule for the BusIn's bus index. A
+-- bus that no node wrote to in the same block reads zero (per
+-- 'process_busin' semantics), and the kernel inherits that
+-- behavior — silence on the sink-bus side. That's a runtime fact,
+-- not a compile-time one, so it doesn't constrain the match.
+matchesBusInLpfGainOut
+  :: M.Map NodeIndex RuntimeNode
+  -> NodeIndex -> NodeIndex -> NodeIndex -> NodeIndex
+  -> Bool
+matchesBusInLpfGainOut nodes businIx lpfIx gainIx outIx =
+  case ( M.lookup businIx nodes
+       , M.lookup lpfIx   nodes
+       , M.lookup gainIx  nodes
+       , M.lookup outIx   nodes ) of
+    (Just busin, Just lpf, Just gain, Just out_) ->
+      rnKind busin == KBusIn
+        && rnKind lpf  == KLPF
+        && rnKind gain == KGain
+        && isSinkTerminal (rnKind out_)
+        && not (rnElided busin)
+        && not (rnElided lpf)
+        && not (rnElided gain)
+        && not (rnElided out_)
+        && rnConsumerCount busin == 1
+        && rnConsumerCount lpf   == 1
+        && rnConsumerCount gain  == 1
+        && signalSourceIs businIx lpf
+        && signalSourceIs lpfIx   gain
+        && signalSourceIs gainIx  out_
         && isScalarGain gain
     _ -> False
 

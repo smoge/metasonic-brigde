@@ -14,6 +14,12 @@
 //                     both modes.
 //   * SinGainOut    — sink-terminal:   kernel covers [Sin, Gain, Out].
 //   * SawLpfGainOut — sink-terminal:   kernel covers [Saw, LPF, Gain, Out].
+//   * BusInLpfGainOut — sink-terminal: kernel covers [BusIn, LPF, Gain, Out].
+//                       The bus the BusIn reads has no writer in this
+//                       harness, so both fused and baseline read zeros
+//                       and do the same arithmetic — the time delta
+//                       captures the per-node-dispatch vs. fused-loop
+//                       structural cost, not filter-on-real-signal cost.
 //
 // For each shape × block_size × voice_count × mode, render N blocks
 // and report ns/sample. The "fused" line of each row also reports
@@ -46,16 +52,18 @@ constexpr int kNkOut    = 2;
 constexpr int kNkGain   = 3;
 constexpr int kNkSawOsc = 5;
 constexpr int kNkLPF    = 7;
+constexpr int kNkBusIn  = 11;
 
 // Rate ints — value 3 corresponds to SampleRate.
 constexpr int kRateSampleRate = 3;
 
 // RegionKernel tags — must match Haskell kernelTag and the
 // RegionKernel enum in rt_graph.cpp.
-constexpr int kKernelNodeLoop      = 0;
-constexpr int kKernelSawLpfGain    = 1;
-constexpr int kKernelSinGainOut    = 2;
-constexpr int kKernelSawLpfGainOut = 3;
+constexpr int kKernelNodeLoop        = 0;
+constexpr int kKernelSawLpfGain      = 1;
+constexpr int kKernelSinGainOut      = 2;
+constexpr int kKernelSawLpfGainOut   = 3;
+constexpr int kKernelBusInLpfGainOut = 6;
 
 constexpr int kSampleRate    = 48000;
 constexpr int kCapacity      = 64;
@@ -113,6 +121,39 @@ void build_saw_lpf_gain_out_chain(RTGraph *g) {
   build_saw_lpf_gain_chain(g);
 }
 
+// Build [BusIn, LPF, Gain, Out] in template 0 with sample-rate
+// defaults. The BusIn reads a bus that nothing in this harness
+// writes to, so process_busin (baseline) and the fused kernel
+// both read zeros — the time delta we measure is the per-node-
+// dispatch vs. fused-loop structural cost on the LPF/Gain/Out
+// portion, not filter-on-real-signal cost. See the file header.
+void build_busin_lpf_gain_out_chain(RTGraph *g) {
+  rt_graph_template_add_node(g, 0, 0, kNkBusIn);
+  rt_graph_template_add_node(g, 0, 1, kNkLPF);
+  rt_graph_template_add_node(g, 0, 2, kNkGain);
+  rt_graph_template_add_node(g, 0, 3, kNkOut);
+
+  rt_graph_template_connect(g, 0, 0, 0, 1, 0);  // busIn -> lpf signal
+  rt_graph_template_connect(g, 0, 1, 0, 2, 0);  // lpf   -> gain signal
+  rt_graph_template_connect(g, 0, 2, 0, 3, 0);  // gain  -> out signal
+
+  // BusIn reads bus 1 (no writer in this harness → silent input).
+  // Bench Bus is bus 0 for the sink terminal.
+  rt_graph_template_set_default(g, 0, 0, 0, 1.0);     // busIn bus
+  rt_graph_template_set_default(g, 0, 1, 0, 800.0);   // lpf freq
+  rt_graph_template_set_default(g, 0, 1, 1, 4.0);     // lpf q
+  rt_graph_template_set_default(g, 0, 2, 0, 0.4);     // gain amount
+  rt_graph_template_set_default(g, 0, 3, 0, kBenchBus); // out bus
+
+  // Auto-bus-grow only fires on Out node addition, not on BusIn.
+  // Without this, busin_bus=1 fails the validation in both
+  // process_busin and process_region_busin_lpf_gain_out and the
+  // chain silent-no-ops every block — which would let the fused
+  // path falsely report 100x+ speedup as the "kernel" early-
+  // returns past every sample of work.
+  rt_graph_ensure_bus(g, 1);
+}
+
 // ----------------------------------------------------------------
 // Region registration
 // ----------------------------------------------------------------
@@ -147,6 +188,14 @@ void register_saw_lpf_gain_out_regions(RTGraph *g, bool fused) {
                                       kRateSampleRate, 0, 4);
 }
 
+// Register a single 4-node region covering the whole template,
+// tagged either BusInLpfGainOut (fused) or NodeLoop (baseline).
+void register_busin_lpf_gain_out_regions(RTGraph *g, bool fused) {
+  const int kernel_tag = fused ? kKernelBusInLpfGainOut : kKernelNodeLoop;
+  rt_graph_template_add_region_kernel(g, 0, kernel_tag,
+                                      kRateSampleRate, 0, 4);
+}
+
 // ----------------------------------------------------------------
 // Bench harness
 // ----------------------------------------------------------------
@@ -159,9 +208,10 @@ struct ShapeSpec {
 };
 
 const ShapeSpec kShapes[] = {
-  { "SawLpfGain",    4, &build_saw_lpf_gain_chain,     &register_saw_lpf_gain_regions     },
-  { "SinGainOut",    3, &build_sin_gain_out_chain,     &register_sin_gain_out_regions     },
-  { "SawLpfGainOut", 4, &build_saw_lpf_gain_out_chain, &register_saw_lpf_gain_out_regions },
+  { "SawLpfGain",      4, &build_saw_lpf_gain_chain,       &register_saw_lpf_gain_regions       },
+  { "SinGainOut",      3, &build_sin_gain_out_chain,       &register_sin_gain_out_regions       },
+  { "SawLpfGainOut",   4, &build_saw_lpf_gain_out_chain,   &register_saw_lpf_gain_out_regions   },
+  { "BusInLpfGainOut", 4, &build_busin_lpf_gain_out_chain, &register_busin_lpf_gain_out_regions },
 };
 
 constexpr int kBlockSizes[]  = { 64, 128, 512 };

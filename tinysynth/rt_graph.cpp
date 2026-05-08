@@ -795,18 +795,22 @@ template_id is stable.
 // 'RegionKernel' data constructors; integer values are part of
 // the C ABI and pinned by 'rt_graph_region_kernel_supported'.
 enum class RegionKernel : int {
-  NodeLoop      = 0,  // dispatch each member node individually
-  SawLpfGain    = 1,  // fused per-sample SawOsc -> LPF -> Gain
-                      // (buffer-terminal: gain output materialized)
-  SinGainOut    = 2,  // fused per-sample SinOsc -> Gain -> Out
-                      // (sink-terminal: bus accumulate + sink-peak)
-  SawLpfGainOut = 3,  // fused per-sample SawOsc -> LPF -> Gain -> Out
-                      // (4-node sink-terminal)
-  SawGainOut    = 4,  // fused per-sample SawOsc -> Gain -> Out
-                      // (3-node sink-terminal; SinGainOut counterpart)
-  NoiseGainOut  = 5   // fused per-sample NoiseGen -> Gain -> Out
-                      // (3-node sink-terminal; PRNG-state class —
-                      //  no freq port, no phase iterator)
+  NodeLoop        = 0,  // dispatch each member node individually
+  SawLpfGain      = 1,  // fused per-sample SawOsc -> LPF -> Gain
+                        // (buffer-terminal: gain output materialized)
+  SinGainOut      = 2,  // fused per-sample SinOsc -> Gain -> Out
+                        // (sink-terminal: bus accumulate + sink-peak)
+  SawLpfGainOut   = 3,  // fused per-sample SawOsc -> LPF -> Gain -> Out
+                        // (4-node sink-terminal)
+  SawGainOut      = 4,  // fused per-sample SawOsc -> Gain -> Out
+                        // (3-node sink-terminal; SinGainOut counterpart)
+  NoiseGainOut    = 5,  // fused per-sample NoiseGen -> Gain -> Out
+                        // (3-node sink-terminal; PRNG-state class —
+                        //  no freq port, no phase iterator)
+  BusInLpfGainOut = 6   // fused per-sample BusIn -> LPF -> Gain -> Out
+                        // (4-node sink-terminal; first non-oscillator
+                        //  producer kernel — reads output_buses[busin_bus]
+                        //  inline instead of stepping a phase iterator)
 };
 
 // Validate an int from the C ABI. Returns nullopt on an unknown
@@ -822,6 +826,7 @@ region_kernel_from_tag(int kind) noexcept {
   case 3: return RegionKernel::SawLpfGainOut;
   case 4: return RegionKernel::SawGainOut;
   case 5: return RegionKernel::NoiseGainOut;
+  case 6: return RegionKernel::BusInLpfGainOut;
   default: return std::nullopt;
   }
 }
@@ -3482,6 +3487,127 @@ static void process_region_saw_lpf_gain_out(
   sink.flush_to(inst);
 }
 
+/* Note [Region kernel: BusInLpfGainOut]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+4-node sink-terminal kernel. The chain's source is a BusIn node, so
+unlike RSawLpfGainOut there's no phase iterator to step — the kernel
+reads samples directly from 'g.server.output_buses[busin_bus]', the
+same place 'process_busin' would have copied from. Member layout:
+  * busin_idx — KBusIn (controls[0] = source bus index)
+  * lpf_idx   — KLPF   (block-rate latch on freq/q like
+                        RSawLpfGainOut; same audio-rate freq/q
+                        resolution rules)
+  * gain_idx  — KGain  (scalar control on port 1; audio modulation
+                        blocks the kernel at match time)
+  * out_idx   — sink terminal: KOut or KBusOut
+                (controls[0] = destination bus index). Validated
+                via 'is_sink_terminal' at dispatch time.
+
+The Haskell-side gate ('matchesBusInLpfGainOut' / 'findKernelMatch')
+ensures 'rnConsumerCount busin == 1', which is what licenses the
+kernel to read 'output_buses[busin_bus][i]' inline rather than
+materializing a copy through 'process_busin' first — if anything
+else read the BusIn's output buffer, that buffer would have to be
+written for them.
+
+Bit equivalence with the unfused chain: per-sample we do exactly
+what process_busin + process_lpf + process_gain + process_out would
+have done. The unfused 'process_busin' is just
+@out_buf[i] = output_buses[bus][i]@, so reading the bus directly
+inside the kernel produces the same float in the same order. The
+bus-validation branch (out-of-range busin_bus_d → silent no-op
+this block, sink unchanged) mirrors process_busin's silence-on-
+invalid contract: the unfused chain would zero the BusIn's output
+buffer, the LPF would filter zeros, the gain would scale zeros,
+and Out would accumulate zeros — i.e. no contribution to the sink
+bus this block, exactly the kernel's no-op semantics.
+
+Same-block ordering: this kernel reads 'output_buses' (live), the
+same way 'process_busin' does. Within an instance it sees any
+BusOut writes that have already executed in this block; across
+templates it sees writes from earlier-in-the-topo-sort templates,
+matching Note [Bus model] semantics. For deterministic feedback,
+use BusInDelayed at the source level — the BusInDelayed → LPF →
+Gain → sink shape would be a separate kernel (no candidate today).
+*/
+static void process_region_busin_lpf_gain_out(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t busin_idx, std::size_t lpf_idx,
+    std::size_t gain_idx, std::size_t out_idx,
+    int nframes
+) noexcept {
+  auto &busin_node = inst.nodes[busin_idx];
+  auto &lpf_node   = inst.nodes[lpf_idx];
+  auto &gain_node  = inst.nodes[gain_idx];
+  auto &out_node   = inst.nodes[out_idx];
+
+  // Source bus index — same validation as process_busin so the
+  // silent-no-op contract on invalid buses is preserved across
+  // fused vs. unfused.
+  const double busin_bus_d = busin_node.controls[0];
+  const double busin_bus_lim =
+      static_cast<double>(g.server.output_buses.size());
+  if (!std::isfinite(busin_bus_d)
+      || busin_bus_d < 0.0
+      || busin_bus_d >= busin_bus_lim) {
+    return;
+  }
+  const int busin_bus = static_cast<int>(busin_bus_d);
+  const auto &src_bus =
+      g.server.output_buses[static_cast<std::size_t>(busin_bus)];
+
+  // LPF freq/q resolution + block-rate latch. Identical to
+  // RSawLpfGainOut — the LPF state machine doesn't care what feeds
+  // its signal port, just that freq/q reach the right q::lowpass
+  // configure call.
+  const auto lpf_freq_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double lpf_freq = sanitize_finite_clamp(
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
+                           : lpf_node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double lpf_q = sanitize_finite_clamp(
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
+                        : lpf_node.controls[1],
+      kQMin, kQMax, kQFallback);
+
+  auto *lpf = std::get_if<LPFState>(&lpf_node.state);
+  if (!lpf) {
+    // No filter state to drive; silently no-op (block_sink_peak
+    // unchanged, sink bus untouched). Mirrors RSawLpfGainOut's
+    // early return.
+    return;
+  }
+
+  if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
+    lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
+    lpf->last_freq = lpf_freq;
+    lpf->last_q    = lpf_q;
+  }
+
+  const float gain_amount = sanitize_finite(
+      static_cast<float>(gain_node.controls[0]), 1.0f);
+
+  // Sink-terminal accumulate. No 'drive_oscillator' here — there's
+  // no oscillator to drive; the source is a bus read. The per-sample
+  // body is intentionally written out so the relationship to the
+  // unfused chain (process_busin's std::copy_n + process_lpf's
+  // filter() + process_gain's scalar mult + process_out's sink push)
+  // is reading-order obvious.
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    const float busin_sample = src_bus[fi];
+    const float lpf_sample = lpf->filter(busin_sample);
+    sink.push(fi, lpf_sample * gain_amount);
+  }
+  sink.flush_to(inst);
+}
+
 // ----------------------------------------------------------------
 // Lifecycle helpers (shared between the direct ABI entries and the
 // queued-drain path)
@@ -3907,6 +4033,18 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && is_sink_terminal(def->nodes[first + 2].kind)) {
       process_region_noise_gain_out(g, inst, first, first + 1, first + 2,
                                     nframes);
+      fused = true;
+    } else if (r.kernel == RegionKernel::BusInLpfGainOut
+        && r.node_count == 4
+        && first + 4 <= node_count
+        && def->nodes[first    ].kind == NodeKind::BusIn
+        && def->nodes[first + 1].kind == NodeKind::LPF
+        && def->nodes[first + 2].kind == NodeKind::Gain
+        && is_sink_terminal(def->nodes[first + 3].kind)) {
+      process_region_busin_lpf_gain_out(g, inst,
+                                        first, first + 1,
+                                        first + 2, first + 3,
+                                        nframes);
       fused = true;
     }
 

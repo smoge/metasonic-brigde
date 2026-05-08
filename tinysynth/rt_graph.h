@@ -318,17 +318,19 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //                The full set of accepted tags is the source of
 //                truth on the Haskell side ('kernelTag' in
 //                MetaSonic.Bridge.Compile); current tags are
-//                  0 = NodeLoop      (per-node dispatch, any arity)
-//                  1 = SawLpfGain    (3-node buffer-terminal:
-//                                     SawOsc -> LPF -> Gain)
-//                  2 = SinGainOut    (3-node sink-terminal:
-//                                     SinOsc -> Gain -> Out)
-//                  3 = SawLpfGainOut (4-node sink-terminal:
-//                                     SawOsc -> LPF -> Gain -> Out)
-//                  4 = SawGainOut    (3-node sink-terminal:
-//                                     SawOsc -> Gain -> Out)
-//                  5 = NoiseGainOut  (3-node sink-terminal:
-//                                     NoiseGen -> Gain -> Out)
+//                  0 = NodeLoop        (per-node dispatch, any arity)
+//                  1 = SawLpfGain      (3-node buffer-terminal:
+//                                       SawOsc -> LPF -> Gain)
+//                  2 = SinGainOut      (3-node sink-terminal:
+//                                       SinOsc -> Gain -> Out)
+//                  3 = SawLpfGainOut   (4-node sink-terminal:
+//                                       SawOsc -> LPF -> Gain -> Out)
+//                  4 = SawGainOut      (3-node sink-terminal:
+//                                       SawOsc -> Gain -> Out)
+//                  5 = NoiseGainOut    (3-node sink-terminal:
+//                                       NoiseGen -> Gain -> Out)
+//                  6 = BusInLpfGainOut (4-node sink-terminal:
+//                                       BusIn -> LPF -> Gain -> Out)
 //                The Haskell side machine-checks tag agreement in a
 //                property test (mirroring the kindTag pattern in
 //                §0.5.1) so this set cannot drift between aligned
@@ -383,6 +385,19 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //                   one PRNG read per sample × scalar gain →
 //                   bus accumulation. Same Out/BusOut rule on
 //                   the terminal slot.
+//   * BusInLpfGainOut needs node_count == 4 and kinds
+//                   [BusIn, LPF, Gain, /sink/]. The first non-
+//                   oscillator producer kernel: the source is a
+//                   bus reader, not a generator with phase or
+//                   PRNG state. The kernel reads
+//                   output_buses[busin_bus][i] inline (same
+//                   value process_busin would have copied) and
+//                   feeds it through the same LPF + scalar gain
+//                   + sink-accumulate pipeline as
+//                   SawLpfGainOut. Same Out/BusOut rule on the
+//                   terminal slot. An out-of-range BusIn bus
+//                   silent-no-ops the block, mirroring
+//                   process_busin's invalid-bus contract.
 // The runtime validates the kind sequence at dispatch time and
 // falls back to per-node iteration on any mismatch.
 //
