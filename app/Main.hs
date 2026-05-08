@@ -1267,17 +1267,22 @@ surveyEnsembleCorpusScheduleRows =
 --
 -- The corpus is grouped by intent:
 --
---   * pos/…   — chains expected to claim a §4.B kernel today, plus
---               one "missed-opportunity" entry pointing at the next
---               kernel candidate (Noise → LPF → Gain → sink).
---   * multi/… — multi-branch / send-return shapes that exercise
---               the matcher's per-chain claiming.
---   * miss/…  — modulation-heavy or multi-consumer shapes that
---               should /not/ claim, on purpose. They guard against
---               matcher overreach (a future change widening the
---               claim predicate would start firing kernels here).
---   * neg/…   — stateful producers (Env, Smooth, Delay) explicitly
---               excluded from §4.B candidacy by the strategy note.
+--   * shape/… — single chains and multi-branch graphs that probe
+--               which kernel topology a graph produced. Includes
+--               both positive cases (existing kernel should claim)
+--               and missed-opportunity cases (no kernel today;
+--               feeds the future-kernel decision in step 5 of the
+--               corpus-driven roadmap).
+--   * mod/…   — modulation-heavy probes. Audio-rate signals on
+--               control inputs (osc.freq, gain.amount, lpf.cutoff).
+--               Some should still claim (matcher narrow enough to
+--               ignore the modulation), some intentionally must
+--               not (e.g., audio-rate gain amount — scalar-gain
+--               gating is intentional).
+--   * neg/…   — structural and strategic negatives that must not
+--               claim. Multi-consumer producers, non-sink terminals,
+--               stateful producers (Env, Smooth, Delay) excluded
+--               from §4.B candidacy by the strategy note.
 --
 -- Intent is encoded in inline comments per graph; the survey reports
 -- counts only. If a comment and the survey output disagree, that's a
@@ -1292,101 +1297,153 @@ surveyEnsembleCorpusScheduleRows =
 -- for why they're a separate list rather than a sum-typed body.
 surveyShapeProbes :: [(String, SynthGraph)]
 surveyShapeProbes =
-  -- ── Positive: chains the §4.B matcher should claim ────────────
-  [ ( "pos/sin-gain-out"
+  -- ── shape/: kernel-shape probes (single chains) ───────────────
+  [ ( "shape/sin-gain-out"
     , runSynth $ do
         s <- sinOsc 220.0 0.0
         a <- gain s 0.4
         out 0 a )                            -- expect: RSinGainOut
 
-  , ( "pos/saw-gain-out"
+  , ( "shape/saw-gain-out"
     , runSynth $ do
         s <- sawOsc 110.0 0.0
         a <- gain s 0.3
         out 0 a )                            -- expect: RSawGainOut
 
-  , ( "pos/noise-gain-out"
+  , ( "shape/noise-gain-out"
     , runSynth $ do
         n <- noiseGen
         a <- gain n 0.2
         out 0 a )                            -- expect: RNoiseGainOut
 
-  , ( "pos/saw-lpf-gain-out"
+  , ( "shape/noise-gain-busout"
+    , runSynth $ do
+        -- BusOut counterpart of shape/noise-gain-out. Same shape
+        -- via BusOut sink rather than Out — confirms that producer-
+        -- gain claims survive sink-terminal variation.
+        n <- noiseGen
+        a <- gain n 0.25
+        busOut 0 a )                         -- expect: RNoiseGainOut via BusOut
+
+  , ( "shape/saw-lpf-gain-out"
     , runSynth $ do
         s <- sawOsc 110.0 0.0
         f <- lpf s 1200.0 0.7
         a <- gain f 0.4
         out 0 a )                            -- expect: RSawLpfGainOut
 
-  , ( "pos/noise-lpf-gain-out"
+  , ( "shape/tri-lpf-gain-out"
+    , runSynth $ do
+        -- Triangle producer; no kernel today. Probes whether the
+        -- tri-rooted filtered tail is a recurring family before any
+        -- tri-specific kernel is considered.
+        t <- triOsc 220.0 0.0
+        f <- lpf t 1200.0 0.7
+        a <- gain f 0.3
+        out 0 a )                            -- missed opportunity: tri-rooted filtered tail
+
+  , ( "shape/pulse-lpf-gain-busout"
+    , runSynth $ do
+        -- Pulse producer (square at width=0.5) into LPF tail
+        -- terminating at BusOut. No kernel today.
+        p <- pulseOsc 110.0 0.0 0.5
+        f <- lpf p 1200.0 0.7
+        a <- gain f 0.3
+        busOut 0 a )                         -- missed opportunity: pulse-rooted filtered tail via BusOut
+
+  , ( "shape/noise-lpf-gain-out"
     , runSynth $ do
         n <- noiseGen
         f <- lpf n 800.0 0.7
         a <- gain f 0.3
-        out 0 a )                            -- missed opportunity: no
-                                             -- Noise→LPF→Gain→sink kernel today
+        out 0 a )                            -- missed opportunity: Noise→LPF→Gain→Out (RNoiseLpfGainOut candidate)
 
-  , ( "pos/noise-lpf-gain-busOut"
+  , ( "shape/noise-lpf-gain-busout"
     , runSynth $ do
-        -- BusOut counterpart of pos/noise-lpf-gain-out. Adds a
-        -- second instance of Noise→LPF→Gain→sink against the same
-        -- (still-missing) kernel; tests whether the recurring shape
-        -- is robust to sink-terminal variation, not just hand-
-        -- authored against KOut.
+        -- BusOut counterpart of shape/noise-lpf-gain-out. Adds a
+        -- second instance of the same shape against the still-
+        -- missing kernel; tests whether the recurring shape is
+        -- robust to sink-terminal variation, not just hand-authored
+        -- against KOut.
         n <- noiseGen
         f <- lpf n 1200.0 0.6
         a <- gain f 0.25
         busOut 0 a )                         -- missed opportunity: same shape via BusOut
 
-  , ( "pos/busIn-lpf-gain-busOut"
+  , ( "shape/busin-lpf-gain-out"
     , runSynth $ do
-        -- Shape probe: BusIn → LPF → Gain → BusOut. Bus 3 has no
+        -- BusIn-rooted return tail terminating at Out. Bus 3 has no
         -- writer in this single-graph corpus, so the BusIn reads
         -- silence at runtime — this entry exercises the matcher on
-        -- the shape, /not/ a complete send/return topology.
-        -- Real send/return topology lives in 'surveyEnsembleCorpus'
-        -- (cross-template writer + reader pair).
+        -- the shape, /not/ a complete send/return topology. Real
+        -- cross-template send/return ensembles live in
+        -- 'surveyEnsembleCorpus'.
+        r <- busIn 3
+        f <- lpf r 1500.0 0.7
+        a <- gain f 0.7
+        out 0 a )                            -- claims RBusInLpfGainOut (Out variant)
+
+  , ( "shape/busin-lpf-gain-busout"
+    , runSynth $ do
+        -- BusOut counterpart of shape/busin-lpf-gain-out. Same
+        -- BusIn-silence-at-runtime caveat applies.
         r <- busIn 3
         f <- lpf r 2000.0 0.6
         a <- gain f 0.7
-        busOut 0 a )                         -- missed opportunity: BusIn→LPF→Gain→BusOut
+        busOut 0 a )                         -- claims RBusInLpfGainOut (BusOut variant)
 
-  -- ── Multi-branch / realistic patch shapes ─────────────────────
-  , ( "multi/three-detuned-saws-summed"
+  , ( "shape/add-saw-noise-lpf-gain-out"
+    , runSynth $ do
+        -- Mixed-producer probe: saw + noise summed via Add, then
+        -- filtered/scaled/sunk. Same "filtered tail" shape as the
+        -- saw/noise-rooted variants, but with an Add node ahead of
+        -- the LPF, so producer-specific kernels can't claim it.
+        -- Tells us whether post-mix filtered tails are a recurring
+        -- family worth a producer-agnostic kernel.
+        s <- sawOsc 110.0 0.0
+        n <- noiseGen
+        m <- add s n
+        f <- lpf m 1200.0 0.7
+        a <- gain f 0.25
+        out 0 a )                            -- missed opportunity: Add-rooted filtered tail
+
+  -- ── shape/: multi-branch single graphs ────────────────────────
+  , ( "shape/three-detuned-saws-summed"
     , runSynth $ do
         -- Each branch is independent; the runtime sums onto bus 0.
-        -- Same shape as 'detunedSawGraph' but with three voices.
         s1 <- sawOsc 110.0 0.0; a1 <- gain s1 0.2; out 0 a1
         s2 <- sawOsc 110.5 0.0; a2 <- gain s2 0.2; out 0 a2
         s3 <- sawOsc 109.5 0.0; a3 <- gain s3 0.2; out 0 a3 )
                                              -- expect: 3 × RSawGainOut
 
-  , ( "multi/additive-sin-saw-noise"
+  , ( "shape/additive-sin-saw-noise"
     , runSynth $ do
         s <- sinOsc 220.0 0.0; a1 <- gain s 0.3; out 0 a1
         w <- sawOsc 110.0 0.0; a2 <- gain w 0.3; out 0 a2
         n <- noiseGen;         a3 <- gain n 0.1; out 0 a3 )
                                              -- expect: RSinGainOut + RSawGainOut + RNoiseGainOut
 
-  , ( "multi/send-return"
+  , ( "shape/single-graph-send-return"
     , runSynth $ do
         -- Voice writes to bus 7; return reads, filters, scales.
+        -- Self-contained single graph; the cross-template variant
+        -- lives in 'surveyEnsembleCorpus' (ens/two-voices-one-fx
+        -- and friends).
         s <- sawOsc 110.0 0.0
         a <- gain s 0.4
         busOut 7 a                           -- voice: RSawGainOut via BusOut sink
         r <- busIn 7
         f <- lpf r 1500.0 0.7
         b <- gain f 0.8
-        out 0 b )                            -- return tail: tracked as BusIn→LPF→Gain→sink
-                                             -- (a future-kernel candidate, no kernel today)
+        out 0 b )                            -- return tail: RBusInLpfGainOut
 
-  , ( "multi/send-return-two-tails"
+  , ( "shape/single-graph-send-return-two-tails"
     , runSynth $ do
         -- Single voice, two independent filtered return paths
         -- reading the same bus. Each return tail is its own
         -- BusIn→LPF→Gain→sink, so this contributes /two/ rows to
-        -- the BusIn-rooted opportunity scan. Realistic stereo /
-        -- parallel-FX patch shape.
+        -- the BusIn-rooted opportunity scan. Self-contained variant
+        -- of a stereo/parallel-FX shape.
         s <- sawOsc 110.0 0.0
         a <- gain s 0.4
         busOut 7 a                           -- voice: RSawGainOut via BusOut sink
@@ -1394,42 +1451,70 @@ surveyShapeProbes =
         r1 <- busIn 7
         f1 <- lpf r1 800.0 0.7
         b1 <- gain f1 0.6
-        out 0 b1                             -- return tail 1: BusIn→LPF→Gain→Out
+        out 0 b1                             -- return tail 1: RBusInLpfGainOut
 
         r2 <- busIn 7
         f2 <- lpf r2 2400.0 0.7
         b2 <- gain f2 0.6
-        out 1 b2 )                           -- return tail 2: BusIn→LPF→Gain→Out
+        out 1 b2 )                           -- return tail 2: RBusInLpfGainOut
 
-  -- ── Mod-heavy / intentional misses ────────────────────────────
-  , ( "miss/audio-modulated-gain"
-    , runSynth $ do
-        -- Gain amount is an audio-rate signal (LFO), not a Param;
-        -- isScalarGain blocks the match.
-        s   <- sinOsc 220.0 0.0
-        lfo <- sinOsc 4.0   0.0
-        a   <- gain s lfo
-        out 0 a )                            -- unclaimed: gain control not Param
-
-  , ( "miss/lfo-on-osc-freq"
+  -- ── mod/: modulation-heavy probes ─────────────────────────────
+  , ( "mod/lfo-osc-freq-sin-gain-out"
     , runSynth $ do
         -- LFO feeds the carrier's freq input. The matcher only
-        -- inspects port 0 (signal flow) of Gain, so this is expected
-        -- to still claim RSinGainOut — a useful negative control
-        -- showing the matcher is narrow enough to ignore FM.
+        -- inspects port 0 (signal flow) of Gain, so this is
+        -- expected to /still/ claim RSinGainOut — useful "control
+        -- modulation does not necessarily block fusion" probe.
         lfo <- sinOsc 4.0 0.0
         s   <- sinOsc lfo 0.0
         a   <- gain s 0.3
         out 0 a )                            -- expect: RSinGainOut still fires
 
-  , ( "miss/shared-producer-two-gains"
+  , ( "mod/lfo-lpf-cutoff-saw-lpf-gain-out"
+    , runSynth $ do
+        -- LFO drives the LPF cutoff. The biquad treats cutoff as
+        -- block-rate (zipper artifacts on audio-rate sweeps; see
+        -- the note on 'lpf' in Bridge/Source.hs), so this exercises
+        -- whether the matcher accepts a non-Param cutoff. Likely a
+        -- miss today; a useful "is cutoff modulation a recurring
+        -- shape" probe.
+        lfo <- sinOsc 4.0 0.0
+        s   <- sawOsc 110.0 0.0
+        f   <- lpf s lfo 0.7
+        a   <- gain f 0.4
+        out 0 a )                            -- probe: cutoff is non-Param
+
+  , ( "mod/audio-rate-gain-control"
+    , runSynth $ do
+        -- Gain amount is an audio-rate signal (LFO), not a Param;
+        -- isScalarGain blocks the match. Strategy: scalar-gain
+        -- gating is intentional — this should remain a miss.
+        s   <- sinOsc 220.0 0.0
+        lfo <- sinOsc 4.0   0.0
+        a   <- gain s lfo
+        out 0 a )                            -- unclaimed: gain control not Param
+
+  , ( "mod/audio-rate-gain-control-filtered"
+    , runSynth $ do
+        -- 4-node counterpart of mod/audio-rate-gain-control:
+        -- audio-rate signal feeds the gain's amount in a
+        -- producer→LPF→Gain→sink chain. isScalarGain must block
+        -- the match exactly as it does in the 3-node case.
+        n   <- noiseGen
+        f   <- lpf n 1000.0 0.7
+        lfo <- sinOsc 4.0 0.0
+        a   <- gain f lfo
+        out 0 a )                            -- unclaimed: gain control not Param
+
+  -- ── neg/: structural negatives ────────────────────────────────
+  , ( "neg/shared-producer-two-gains"
     , runSynth $ do
         s  <- sawOsc 110.0 0.0
         a1 <- gain s 0.3; out 0 a1
         a2 <- gain s 0.2; out 1 a2 )
                                              -- unclaimed: producer has multiple consumers
 
-  , ( "miss/gain-feeds-two-sinks"
+  , ( "neg/gain-feeds-two-sinks"
     , runSynth $ do
         s <- sawOsc 110.0 0.0
         a <- gain s 0.3
@@ -1437,32 +1522,35 @@ surveyShapeProbes =
         busOut 7 a )
                                              -- unclaimed: gain has multiple consumers
 
-  , ( "miss/shared-lpf-feeds-two-gains"
+  , ( "neg/shared-lpf-feeds-two-gains"
     , runSynth $ do
-        -- Filtered-tail counterpart of miss/shared-producer-two-gains:
-        -- one LPF feeds two parallel Gain→Out chains. The LPF's
-        -- multi-consumer count must block the 4-node match on both
-        -- chains. If a future change relaxes the single-consumer
-        -- precondition for the filter node, this row starts firing.
+        -- Filtered-tail counterpart of neg/shared-producer-two-
+        -- gains: one LPF feeds two parallel Gain→Out chains. The
+        -- LPF's multi-consumer count must block the 4-node match
+        -- on both chains. If a future change relaxes the single-
+        -- consumer precondition for the filter node, this row
+        -- starts firing.
         n  <- noiseGen
         f  <- lpf n 1000.0 0.7
         a1 <- gain f 0.3; out 0 a1
         a2 <- gain f 0.2; out 1 a2 )
                                              -- unclaimed: LPF multi-consumer blocks classification
 
-  , ( "miss/filtered-tail-audio-mod-gain"
+  , ( "neg/non-sink-terminal"
     , runSynth $ do
-        -- Filtered-tail counterpart of miss/audio-modulated-gain:
-        -- audio-rate signal feeds the gain's amount in a 4-node
-        -- chain. isScalarGain must block the match exactly the
-        -- same way it does in the 3-node case.
-        n   <- noiseGen
-        f   <- lpf n 1000.0 0.7
-        lfo <- sinOsc 4.0 0.0
-        a   <- gain f lfo
-        out 0 a )                            -- unclaimed: gain control not Param
+        -- Sin→Gain doesn't end at a sink kernel: another node (Add)
+        -- sits between the gain and Out. Sink-terminal matchers
+        -- must not claim the sin→gain pair because its terminal is
+        -- Add, not Out/BusOut. Exercises the strategy exclusion
+        -- "non-sink terminal".
+        s <- sinOsc 220.0 0.0
+        a <- gain s 0.4
+        n <- noiseGen
+        b <- gain n 0.1
+        m <- add a b
+        out 0 m )                            -- unclaimed: gain feeds Add, not sink
 
-  -- ── Stateful negatives ────────────────────────────────────────
+  -- ── neg/: stateful producers (strategy exclusions) ────────────
   , ( "neg/env-gain-out"
     , runSynth $ do
         e <- env (Param 1.0) 0.0005 0.002 1.0 0.002
@@ -1523,7 +1611,12 @@ surveyShapeProbeRows =
 -- runtime values.
 surveyEnsembleCorpus :: [(String, [(String, SynthGraph)])]
 surveyEnsembleCorpus =
-  [ ( "two-voices-one-fx"
+  -- Direct-out ensembles stress sink kernels in each template.
+  -- Bus-send ensembles stress shared-bus dataflow and template
+  -- precedence DAG width; their cross-template width is the
+  -- template precedence width reported by templateScheduleStats
+  -- in the §4.E.2c survey section.
+  [ ( "ens/two-voices-one-fx"
     , [ ( "voice-low"
         , runSynth $ do
             s <- sawOsc 110.0 0.0
@@ -1545,7 +1638,43 @@ surveyEnsembleCorpus =
       ]
     )
 
-  , ( "voice-parallel-fx"
+  , ( "ens/four-voices-one-fx"
+    , -- Scaled-up two-voices-one-fx. Four independent voice
+      -- templates write to bus 7; one fx template reads. Tests
+      -- whether template precedence width grows with voice count
+      -- (expected: width 4 at layer 0, then fx at layer 1) and
+      -- whether the §4.B per-template kernel claims hold up across
+      -- a larger ensemble.
+      [ ( "voice-1"
+        , runSynth $ do
+            s <- sawOsc 110.0 0.0
+            a <- gain s 0.25
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+      , ( "voice-2"
+        , runSynth $ do
+            s <- sawOsc 165.0 0.0
+            a <- gain s 0.25
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+      , ( "voice-3"
+        , runSynth $ do
+            s <- sawOsc 220.0 0.0
+            a <- gain s 0.25
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+      , ( "voice-4"
+        , runSynth $ do
+            s <- sawOsc 277.0 0.0
+            a <- gain s 0.25
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+      , ( "fx"
+        , runSynth $ do
+            r <- busIn 7
+            f <- lpf r 1200.0 0.7
+            a <- gain f 0.5
+            out 0 a )                        -- BusIn→LPF→Gain→sink candidate
+      ]
+    )
+
+  , ( "ens/one-voice-two-parallel-fx"
     , [ ( "voice"
         , runSynth $ do
             s <- sawOsc 110.0 0.0
@@ -1568,7 +1697,7 @@ surveyEnsembleCorpus =
       ]
     )
 
-  , ( "stereo-send-return"
+  , ( "ens/stereo-send-return"
     , [ ( "voice-l"
         , runSynth $ do
             s <- sawOsc 110.0 0.0
@@ -1594,6 +1723,103 @@ surveyEnsembleCorpus =
             f <- lpf r 1200.0 0.7
             a <- gain f 0.6
             out 1 a )                        -- BusIn→LPF→Gain→sink candidate
+      ]
+    )
+
+  , ( "ens/layered-direct-outs"
+    , -- Three independent voice templates writing direct to Out
+      -- (no shared bus, no fx). Stresses sink-kernel claims in
+      -- every template. Template precedence DAG has no edges, so
+      -- precedence width = template count = 3. Cross-template
+      -- audio reaches the user via the runtime's per-channel bus
+      -- accumulation, not bus dataflow visible to the compiler.
+      [ ( "voice-sin"
+        , runSynth $ do
+            s <- sinOsc 220.0 0.0
+            a <- gain s 0.3
+            out 0 a )                        -- claims RSinGainOut
+      , ( "voice-saw"
+        , runSynth $ do
+            s <- sawOsc 110.0 0.0
+            a <- gain s 0.3
+            out 0 a )                        -- claims RSawGainOut
+      , ( "voice-noise"
+        , runSynth $ do
+            n <- noiseGen
+            a <- gain n 0.1
+            out 1 a )                        -- claims RNoiseGainOut
+      ]
+    )
+
+  , ( "ens/layered-bus-sends"
+    , -- Three voice/return pairs on three distinct buses
+      -- (7, 8, 9). No template depends on another's bus, so each
+      -- pair is its own precedence chain (voice→fx) and the three
+      -- pairs sit at the same precedence layer. Stresses parallel
+      -- bus-write/bus-read fan-out that a future template-level
+      -- scheduler with deterministic shared-bus reduction would
+      -- have to handle (here, no shared write target makes the
+      -- "deterministic reduction" question moot — a clean
+      -- counterpoint to ens/four-voices-one-fx).
+      [ ( "voice-a"
+        , runSynth $ do
+            s <- sawOsc 110.0 0.0
+            a <- gain s 0.3
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+      , ( "voice-b"
+        , runSynth $ do
+            s <- sawOsc 165.0 0.0
+            a <- gain s 0.3
+            busOut 8 a )                     -- claims RSawGainOut via BusOut
+      , ( "voice-c"
+        , runSynth $ do
+            s <- sawOsc 220.0 0.0
+            a <- gain s 0.3
+            busOut 9 a )                     -- claims RSawGainOut via BusOut
+      , ( "fx-a"
+        , runSynth $ do
+            r <- busIn 7
+            f <- lpf r 800.0 0.7
+            a <- gain f 0.5
+            out 0 a )                        -- BusIn→LPF→Gain→sink candidate
+      , ( "fx-b"
+        , runSynth $ do
+            r <- busIn 8
+            f <- lpf r 1500.0 0.7
+            a <- gain f 0.5
+            out 0 a )                        -- BusIn→LPF→Gain→sink candidate
+      , ( "fx-c"
+        , runSynth $ do
+            r <- busIn 9
+            f <- lpf r 2400.0 0.7
+            a <- gain f 0.5
+            out 1 a )                        -- BusIn→LPF→Gain→sink candidate
+      ]
+    )
+
+  , ( "ens/voice-noise-return"
+    , -- Voice on bus 7, plus a noise-rooted parallel layer
+      -- writing direct to Out. Two independent template chains —
+      -- the voice→fx pair has internal precedence; the noise
+      -- layer has none. Useful "non-fx ambient layer next to a
+      -- send/return" probe.
+      [ ( "voice"
+        , runSynth $ do
+            s <- sawOsc 110.0 0.0
+            a <- gain s 0.4
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+      , ( "voice-fx"
+        , runSynth $ do
+            r <- busIn 7
+            f <- lpf r 1200.0 0.7
+            a <- gain f 0.6
+            out 0 a )                        -- BusIn→LPF→Gain→sink candidate
+      , ( "noise-layer"
+        , runSynth $ do
+            n <- noiseGen
+            f <- lpf n 600.0 0.7
+            a <- gain f 0.1
+            out 1 a )                        -- missed opportunity: Noise→LPF→Gain→sink
       ]
     )
   ]
