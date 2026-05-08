@@ -29,6 +29,7 @@ module MetaSonic.Bridge.FFI
   , stopAudio
   , -- * Introspection
     c_rt_graph_kind_supported
+  , c_rt_graph_region_kernel_supported
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
   , c_rt_graph_read_bus
@@ -74,11 +75,14 @@ import           Foreign
 import           Foreign.C.Types
 
 import           MetaSonic.Bridge.Compile   (AffineStep (..),
-                                             FusedInput (..), RuntimeGraph (..),
+                                             FusedInput (..),
+                                             RegionKernel (..),
+                                             RuntimeGraph (..),
                                              RuntimeInput (..),
                                              RuntimeNode (..),
                                              RuntimeRegion (..),
-                                             ScaleRef (..))
+                                             ScaleRef (..),
+                                             kernelTag)
 import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
                                              TemplateID (..))
 import           MetaSonic.Types
@@ -375,6 +379,25 @@ foreign import ccall unsafe "rt_graph_template_add_region"
   c_rt_graph_template_add_region
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
 
+-- | Phase 4.B: kernel-aware region registration. The default-kernel
+-- path goes through 'c_rt_graph_template_add_region'; this entry
+-- is for fused-kernel regions where the Haskell side has tagged a
+-- specific shape ('RegionKernel'). The integer kernel_kind matches
+-- 'kernelTag' in @MetaSonic.Bridge.Compile@.
+foreign import ccall unsafe "rt_graph_template_add_region_kernel"
+  c_rt_graph_template_add_region_kernel
+    :: Ptr RTGraph -> CInt
+    -> CInt        -- ^ kernel_kind
+    -> CInt -> CInt -> CInt
+    -> IO ()
+
+-- | Phase 4.B introspection: 'rt_graph_region_kernel_supported'
+-- returns 1 when the runtime knows how to dispatch a region tagged
+-- with the given integer kernel kind, 0 otherwise. Used to
+-- machine-check the 'kernelTag' agreement between Haskell and C++.
+foreign import ccall unsafe "rt_graph_region_kernel_supported"
+  c_rt_graph_region_kernel_supported :: CInt -> IO CInt
+
 -- | Step C (e): mark a node in the named template as elided. The
 -- node's kernel is skipped during dispatch but its 'NodeIndex' and
 -- controls remain addressable. See 'rt_graph_template_set_node_elided'
@@ -589,10 +612,25 @@ addRegionTo g cTid r =
   case rrNodes r of
     []                 -> pure ()
     (NodeIndex h : _)  ->
-      c_rt_graph_template_add_region g cTid
-        (fromIntegral (fromEnum (rrRate r)))
-        (fromIntegral h)
-        (fromIntegral (length (rrNodes r)))
+      let cRate  = fromIntegral (fromEnum (rrRate r))
+          cFirst = fromIntegral h
+          cCount = fromIntegral (length (rrNodes r))
+      in case rrKernel r of
+           RNodeLoop ->
+             -- Default behaviour: existing entry, identical wire
+             -- format to pre-§4.B graphs.
+             c_rt_graph_template_add_region g cTid
+               cRate cFirst cCount
+           kernel ->
+             -- §4.B: fused-kernel region. The kernel tag tells the
+             -- runtime which hand-written kernel to dispatch
+             -- instead of iterating member nodes. See
+             -- 'kernelTag' / 'RegionKernel' in
+             -- "MetaSonic.Bridge.Compile" for the integer
+             -- encoding the C side dispatches on.
+             c_rt_graph_template_add_region_kernel g cTid
+               (kernelTag kernel)
+               cRate cFirst cCount
 
 -- | Cross the fused-input ABI for one consumer port. Dispatches
 -- between the single-scale and chain entry points so the loaders

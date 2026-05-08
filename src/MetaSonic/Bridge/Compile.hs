@@ -29,6 +29,8 @@ module MetaSonic.Bridge.Compile
   , AffineStep (..)
   , RuntimeNode (..)
   , RuntimeRegion (..)
+  , RegionKernel (..)
+  , kernelTag
   , RuntimeGraph (..)
   , RegionIndex (..)
   , NodeOutputUse (..)
@@ -37,6 +39,7 @@ module MetaSonic.Bridge.Compile
   , compileRuntimeGraphUnfused
   , compileRuntimeGraphFused
   , fuseRuntimeGraph
+  , selectRegionKernels
   , resolveNodeIndex
   , -- * Region formation
     RegionID (..)
@@ -48,6 +51,7 @@ module MetaSonic.Bridge.Compile
 import           Control.DeepSeq     (NFData)
 import qualified Data.Map.Strict     as M
 import qualified Data.Set            as S
+import           Foreign.C.Types     (CInt)
 import           GHC.Generics        (Generic)
 
 import           MetaSonic.Bridge.IR
@@ -720,20 +724,68 @@ the Haskell side must preserve until the C ABI grows a non-contiguous
 form.
 -}
 
+-- | Region kernel selector. Tells the runtime which dispatch
+-- strategy to use for the region: the default flat per-node loop,
+-- or a hand-written fused kernel that processes every member node
+-- of the region in one tight per-sample loop without materialising
+-- intermediate output buffers.
+--
+-- The fused-kernel variants are claimed by the post-compile
+-- 'selectRegionKernels' pass when a region's exact shape (kind
+-- sequence, single-use internal edges, no audio modulation on
+-- internal control inputs) qualifies. A region tagged for a fused
+-- kernel still keeps every member's 'NodeIndex', controls, and
+-- per-instance state alive — the fused kernel /reuses/ those
+-- existing slots rather than introducing anonymous state. That's
+-- what preserves control-write addressability and external
+-- consumer reads of the terminal node's output buffer.
+--
+-- The integer tag is part of the C ABI: 0 = NodeLoop,
+-- 1 = SawLpfGain. Keep 'kernelTag' in lockstep with the C++
+-- 'RegionKernel' enum in @rt_graph.cpp@.
+data RegionKernel
+  = RNodeLoop
+    -- ^ Default: process each member node individually, in stored
+    -- order, via the kind-dispatched per-node kernels. Used when no
+    -- fused kernel applies, including the legacy "regions empty"
+    -- fallback path.
+  | RSawLpfGain
+    -- ^ The region is exactly @[KSawOsc, KLPF, KGain]@ with
+    -- single-use internal edges (saw → lpf, lpf → gain), no audio
+    -- modulation on the gain port, and no external readers of the
+    -- saw or lpf intermediate buffers. The runtime calls one fused
+    -- per-sample kernel; saw/lpf/gain per-node kernels are skipped.
+  deriving stock    (Eq, Show, Generic, Bounded, Enum)
+  deriving anyclass (NFData)
+
+-- | C ABI tag for 'RegionKernel'. Mirrors the integer values the
+-- C++ side dispatches on in @rt_graph.cpp@'s @RegionKernel@ enum.
+-- A property test pins this against the C++ side via the
+-- @rt_graph_region_kernel_supported@ entry; do not change either
+-- value in isolation.
+kernelTag :: RegionKernel -> CInt
+kernelTag RNodeLoop   = 0
+kernelTag RSawLpfGain = 1
+
 -- | One execution region in the runtime graph: a contiguous block
 -- of nodes (in execution order) that 'formRegions' grouped together.
 --
 -- See Note [Runtime regions overlay].
 data RuntimeRegion = RuntimeRegion
-  { rrIndex :: !RegionIndex
+  { rrIndex  :: !RegionIndex
     -- ^ Dense position of this region in 'rgRuntimeRegions'.
-  , rrRate  :: !Rate
+  , rrRate   :: !Rate
     -- ^ Region execution rate (the join of member rates; see
     -- Note [Region rate compatibility]).
-  , rrNodes :: ![NodeIndex]
+  , rrNodes  :: ![NodeIndex]
     -- ^ Member nodes in execution order. Currently always contiguous
     -- (greedy 'formRegions' invariant), but the type does not encode
     -- that.
+  , rrKernel :: !RegionKernel
+    -- ^ Region kernel selector. 'RNodeLoop' on every region produced
+    -- by 'formRegions'; 'selectRegionKernels' may upgrade some
+    -- regions to a fused kernel after splitting the region to
+    -- contain only the matched members. See 'RegionKernel'.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -832,7 +884,14 @@ compileRuntimeGraph ir = do
 
   rtNodes <- mapM (compileNode indexMap classify consumerCount) (zip [0..] irNodes)
 
-  pure $! RuntimeGraph rtNodes rtRegions
+  -- §4.B region kernel selection runs as the last step of compile,
+  -- before any §4.C-style elision pass. Tagging happens here so
+  -- 'fuseRuntimeGraph' (which §4.C's 'compileRuntimeGraphFused'
+  -- runs next) can skip nodes that have already been claimed by a
+  -- fused region kernel — otherwise §4.C would elide a Gain that
+  -- the region kernel still expects to address by control slot.
+  -- See Note [Region kernel selection].
+  pure $! selectRegionKernels (RuntimeGraph rtNodes rtRegions)
 
   where
     compileNode
@@ -883,9 +942,14 @@ compileRuntimeGraph ir = do
     compileRegion indexMap (i, region) = do
       members <- mapM (lookupNodeIndex indexMap) (regNodes region)
       pure $! RuntimeRegion
-        { rrIndex = RegionIndex i
-        , rrRate  = regRate region
-        , rrNodes = members
+        { rrIndex  = RegionIndex i
+        , rrRate   = regRate region
+        , rrNodes  = members
+        , rrKernel = RNodeLoop
+          -- Default for every region produced by 'formRegions'.
+          -- 'selectRegionKernels' may upgrade some regions to a
+          -- fused kernel after splitting, before the final
+          -- 'RuntimeGraph' is returned.
         }
 
     lookupNodeIndex
@@ -910,6 +974,138 @@ compileRuntimeGraphUnfused = compileRuntimeGraph
 -- fused-aware loaders call this entry point explicitly.
 compileRuntimeGraphFused :: GraphIR -> Either String RuntimeGraph
 compileRuntimeGraphFused = fmap fuseRuntimeGraph . compileRuntimeGraph
+
+{- Note [Region kernel selection]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'formRegions' is greedy on rate compatibility, so a chain like
+@SawOsc → LPF → Gain → Out@ lands as a single region (all four
+inferred 'SampleRate'). The shape detector for a fused kernel
+('saw → lpf → gain' for §4.B's first kernel) can therefore not
+match a whole region; it has to find a contiguous /subsequence/
+inside one.
+
+'selectRegionKernels' walks each region produced by
+'compileRuntimeGraph', searches for the longest 3-node match, and
+on a hit /splits/ the region into up to three pieces:
+
+  * prefix  ('RNodeLoop')   — nodes before the match (skipped if empty)
+  * middle  ('RSawLpfGain') — exactly the matched [saw, lpf, gain]
+  * suffix  ('RNodeLoop')   — nodes after the match (skipped if empty)
+
+The runtime sees a clean "kernel tag per region" model and
+dispatches accordingly. RegionIndex is renumbered after the split
+so consumers downstream see contiguous indices.
+
+Match preconditions (the gates):
+
+  1. Three contiguous member nodes are 'KSawOsc', 'KLPF', 'KGain'
+     in that order.
+  2. None of the three is 'rnElided' (defensive — should always
+     hold pre-fusion).
+  3. 'rnConsumerCount' is exactly 1 for the saw and the lpf, and
+     each of those single consumers /is/ the next node in the
+     chain. This is the "single-use internal edges" rule and the
+     "no external escape from the saw / lpf intermediate buffers"
+     rule rolled together: the chain is the only reader of those
+     buffers, so the fused kernel can keep their per-sample value
+     in registers without materialising it.
+  4. The Gain has scalar shape @[RFrom _ _, RConst _]@ — signal
+     port wired from the LPF, gain port unwired (constant control).
+     Audio-modulated gain stays on 'RNodeLoop' just like §4.C's
+     scalar Gain fusion stays off audio-rate Gains.
+
+Step-§4.B fusion claims its members /before/ §4.C runs, so
+'fuseRuntimeGraph' must skip nodes that are members of a
+non-'RNodeLoop' region — otherwise §4.C would elide a Gain that
+the region kernel still expects to address by control slot. The
+candidate predicate in 'fuseRuntimeGraph' enforces that gate.
+-}
+
+-- | §4.B: scan every region for a fused-kernel shape match and
+-- split / re-tag accordingly. Idempotent: a second pass is a no-op
+-- because regions tagged with a fused kernel are skipped.
+--
+-- See Note [Region kernel selection].
+selectRegionKernels :: RuntimeGraph -> RuntimeGraph
+selectRegionKernels rg =
+  let nodeMap :: M.Map NodeIndex RuntimeNode
+      nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
+
+      split :: RuntimeRegion -> [RuntimeRegion]
+      split r
+        | rrKernel r /= RNodeLoop = [r]
+        | otherwise =
+            case findSawLpfGain nodeMap (rrNodes r) of
+              Nothing  -> [r]
+              Just off ->
+                let members = rrNodes r
+                    (pre, restA) = splitAt off members
+                    (mid, post)  = splitAt 3 restA
+                    -- Drop empty prefix / suffix; stamp rrIndex
+                    -- with a placeholder (renumber below) and
+                    -- inherit rrRate from the original region.
+                    placeholder = RegionIndex (-1)
+                    mkPart ks ker
+                      | null ks   = []
+                      | otherwise =
+                          [ RuntimeRegion
+                              { rrIndex  = placeholder
+                              , rrRate   = rrRate r
+                              , rrNodes  = ks
+                              , rrKernel = ker
+                              }
+                          ]
+                in mkPart pre RNodeLoop
+                ++ mkPart mid RSawLpfGain
+                ++ mkPart post RNodeLoop
+
+      splat = concatMap split (rgRuntimeRegions rg)
+
+      renumbered = zipWith setIx [0..] splat
+        where setIx i r = r { rrIndex = RegionIndex i }
+  in rg { rgRuntimeRegions = renumbered }
+
+-- | Look for the first contiguous occurrence of the saw → lpf →
+-- gain shape in a region's member list. Returns the offset at which
+-- the match starts (length is implicitly 3). 'Nothing' on no match.
+findSawLpfGain
+  :: M.Map NodeIndex RuntimeNode
+  -> [NodeIndex]
+  -> Maybe Int
+findSawLpfGain nodes = go 0
+  where
+    go !i (a : rest@(b : c : _))
+      | matchesSawLpfGain nodes a b c = Just i
+      | otherwise                     = go (i + 1) rest
+    go _ _ = Nothing
+
+matchesSawLpfGain
+  :: M.Map NodeIndex RuntimeNode
+  -> NodeIndex -> NodeIndex -> NodeIndex
+  -> Bool
+matchesSawLpfGain nodes sawIx lpfIx gainIx =
+  case (M.lookup sawIx nodes, M.lookup lpfIx nodes, M.lookup gainIx nodes) of
+    (Just saw, Just lpf, Just gain) ->
+      rnKind saw == KSawOsc
+        && rnKind lpf == KLPF
+        && rnKind gain == KGain
+        && not (rnElided saw)
+        && not (rnElided lpf)
+        && not (rnElided gain)
+        && rnConsumerCount saw == 1
+        && rnConsumerCount lpf == 1
+        && signalSourceIs sawIx lpf
+        && signalSourceIs lpfIx gain
+        && isScalarGain gain
+    _ -> False
+  where
+    signalSourceIs srcIx node = case rnInputs node of
+      RFrom s _ : _ -> s == srcIx
+      _             -> False
+
+    isScalarGain node = case rnInputs node of
+      [RFrom _ _, RConst _] -> True
+      _                     -> False
 
 {- Note [Scalar affine fusion]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1007,6 +1203,19 @@ fuseRuntimeGraph :: RuntimeGraph -> RuntimeGraph
 fuseRuntimeGraph rg =
   let nodes = rgNodes rg
 
+      -- §4.B: nodes that are members of a non-'RNodeLoop' region
+      -- have been claimed by a fused region kernel and must be
+      -- left alone here. Eliding them via §4.C would invalidate
+      -- the region kernel's per-sample loop (it expects the saw,
+      -- lpf, and gain nodes to all stay live and addressable).
+      regionFused :: S.Set NodeIndex
+      regionFused = S.fromList
+        [ ix
+        | r  <- rgRuntimeRegions rg
+        , rrKernel r /= RNodeLoop
+        , ix <- rrNodes r
+        ]
+
       -- For a candidate node, classify its incoming signal port and
       -- the affine step it contributes. Returns 'Nothing' for any
       -- node that doesn't match a candidate shape (including
@@ -1020,6 +1229,7 @@ fuseRuntimeGraph rg =
         | rnElided n                      = Nothing
         | rnOutputUse n /= RegionLocal    = Nothing
         | rnConsumerCount n /= 1          = Nothing
+        | rnIndex n `S.member` regionFused = Nothing
         | otherwise = case (rnKind n, rnInputs n) of
             (KGain, [RFrom s p, RConst _]) ->
               Just (s, p, AffScale (rnIndex n) (ControlIndex 0))

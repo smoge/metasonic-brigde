@@ -49,6 +49,7 @@ import           MetaSonic.Bridge.FFI      (c_rt_graph_instance_alive,
                                             c_rt_graph_instance_set_control,
                                             c_rt_graph_instance_status,
                                             c_rt_graph_kind_supported,
+                                            c_rt_graph_region_kernel_supported,
                                             c_rt_graph_process,
                                             c_rt_graph_read_bus,
                                             c_rt_graph_template_count,
@@ -371,6 +372,22 @@ unitTests = testGroup "Unit tests"
               <> "is missing this case")
             (ok == 1)
       | k <- [minBound .. maxBound :: NodeKind]
+      ]
+
+  , -- Phase 4.B: every Haskell RegionKernel must round-trip through
+    -- the C ABI introspection entry. Mirrors the kindTag agreement
+    -- test for node kinds. If RegionKernel grows a new constructor
+    -- without the matching C++ enum entry, this test catches the
+    -- drift before any region kernel lands silently.
+    testGroup "C ABI agrees on every RegionKernel tag"
+      [ testCase (show k) $ do
+          ok <- c_rt_graph_region_kernel_supported (kernelTag k)
+          assertBool
+            ("rt_graph_region_kernel_supported(" <> show (kernelTag k)
+              <> ") returned 0 for " <> show k
+              <> " — C++ region_kernel_from_tag is missing this case")
+            (ok == 1)
+      | k <- [minBound .. maxBound :: RegionKernel]
       ]
 
   , testGroup "Edge graphs"
@@ -1486,6 +1503,139 @@ unitTests = testGroup "Unit tests"
                       "unexpected rnInputs shape: " <> show other
                 gns -> assertFailure $
                   "expected exactly one Gain node, got " <> show (length gns)
+      ]
+
+  , -- Phase 4.B: scalar saw → lpf → gain region kernel selection.
+    -- The greedy 'formRegions' lumps the whole chain into one
+    -- region (all SampleRate); 'selectRegionKernels' splits the
+    -- region so the matched [SawOsc, LPF, Gain] becomes its own
+    -- 'RSawLpfGain' region with the Out node living in a
+    -- following 'RNodeLoop' region. This test pins the IR-level
+    -- region overlay; the FFI / C++ side is exercised by the
+    -- bit-equivalence battery below.
+    testGroup "Phase 4.B: selectRegionKernels"
+      [ testCase "saw → lpf → gain → out: middle region tagged RSawLpfGain" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              -- Exactly one fused region; everything else is RNodeLoop.
+              length [() | RSawLpfGain <- kernels] @?= 1
+              -- The fused region must be 3 nodes: saw, lpf, gain.
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RSawLpfGain] of
+                [r] -> do
+                  length (rrNodes r) @?= 3
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KSawOsc, KLPF, KGain]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- §4.C interaction: when §4.B claims the gain, §4.C must
+        -- skip it. Otherwise scalar Gain fusion would elide the
+        -- gain and the region kernel would have no live gain to
+        -- read controls from.
+        testCase "fuseRuntimeGraph: defers to region kernel on saw → lpf → gain" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              -- The Gain stays dispatched (rnElided = False) and
+              -- nobody carries an RFused — §4.B owns it.
+              let gainNode = head [n | n <- rgNodes rg, rnKind n == KGain]
+              rnElided gainNode @?= False
+              null [() | n <- rgNodes rg, RFused _ <- rnInputs n] @?= True
+
+      , -- Negative: audio-modulated gain blocks §4.B (gain port 1
+        -- is RFrom, not RConst). The region stays RNodeLoop.
+        testCase "near-miss: audio-modulated gain stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s   <- sawOsc 110.0 0.0
+                f   <- lpf s (Param 800.0) (Param 4.0)
+                lfo <- sinOsc 6.0 0.0
+                a   <- gain f lfo            -- audio-rate gain modulation
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              null [() | RSawLpfGain <- map rrKernel (rgRuntimeRegions rg)]
+                @?= True
+
+      , -- Negative: an extra consumer of the LPF intermediate
+        -- (lpf has rnConsumerCount > 1) blocks §4.B because the
+        -- fused kernel can't keep lpf's output in registers — the
+        -- second consumer needs a materialised buffer.
+        testCase "near-miss: lpf with multiple consumers stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s  <- sawOsc 110.0 0.0
+                f  <- lpf s (Param 800.0) (Param 4.0)
+                a1 <- gain f (Param 0.4)
+                a2 <- gain f (Param 0.2)     -- second consumer of lpf
+                out 0 a1
+                out 1 a2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              null [() | RSawLpfGain <- map rrKernel (rgRuntimeRegions rg)]
+                @?= True
+
+      , -- Negative: a saw whose output is also read by something
+        -- outside the chain (saw rnConsumerCount > 1) blocks §4.B.
+        -- The lpf's freq input here is wired to the saw, which is
+        -- a real audio-rate filter sweep but also makes saw a
+        -- multi-consumer node — so the fused kernel can't elide
+        -- saw's output materialisation.
+        testCase "near-miss: saw with multiple consumers stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                -- saw feeds lpf signal AND lpf cutoff (consumer count 2)
+                f <- lpf s s (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              null [() | RSawLpfGain <- map rrKernel (rgRuntimeRegions rg)]
+                @?= True
+
+      , -- Negative: non-matching kind sequence (saw → gain, no LPF)
+        -- can't possibly match, region stays RNodeLoop.
+        testCase "near-miss: saw → gain (no LPF) stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                a <- gain s (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              null [() | RSawLpfGain <- map rrKernel (rgRuntimeRegions rg)]
+                @?= True
+
+      , -- Idempotence: a second pass over an already-tagged region
+        -- must be a no-op. Pinned because 'selectRegionKernels'
+        -- recurses on splits and a regression that re-fires on
+        -- already-tagged regions would silently double-walk the
+        -- region list.
+        testCase "selectRegionKernels is idempotent" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              selectRegionKernels rg @?= rg
       ]
 
   , testCase "kindTag is injective" $
@@ -3350,10 +3500,17 @@ assertFusedEquivalent name graph = do
     Left err -> assertFailure (name <> ": compile (fused) failed: " <> err)
                   >> error "unreachable"
 
-  assertBool (name <> ": fused compile produced no RFused inputs")
-    (not (null [() | n <- rgNodes rtF, RFused _ <- rnInputs n]))
-  assertBool (name <> ": fused compile elided no nodes")
-    (any rnElided (rgNodes rtF))
+  -- Sanity gate: the fused compile must actually fuse /something/
+  -- — either §4.C single-input rewrite (RFused inputs / rnElided
+  -- nodes) or §4.B region kernel selection (a non-RNodeLoop
+  -- region). A graph whose fused render trivially equals the
+  -- unfused render because no fusion fired isn't a useful
+  -- equivalence case.
+  let hasRFused   = not (null [() | n <- rgNodes rtF, RFused _ <- rnInputs n])
+      hasElided   = any rnElided (rgNodes rtF)
+      hasFusedReg = any ((/= RNodeLoop) . rrKernel) (rgRuntimeRegions rtF)
+  assertBool (name <> ": fused compile triggered no fusion of any kind")
+    (hasRFused || hasElided || hasFusedReg)
 
   -- Walk the (unfused) graph to collect every bus index that an Out
   -- or BusOut node writes to. rnControls[0] holds the bus id by

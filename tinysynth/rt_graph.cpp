@@ -779,6 +779,27 @@ invalidate any instance — pointers into MetaDef would, instance_id +
 template_id is stable.
 */
 
+// Phase 4.B: region kernel selector. Mirrors the Haskell
+// 'RegionKernel' data constructors; integer values are part of
+// the C ABI and pinned by 'rt_graph_region_kernel_supported'.
+enum class RegionKernel : int {
+  NodeLoop   = 0,  // dispatch each member node individually
+  SawLpfGain = 1   // fused per-sample SawOsc -> LPF -> Gain kernel
+};
+
+// Validate an int from the C ABI. Returns nullopt on an unknown
+// kernel kind so the runtime can silent-no-op the registration
+// rather than tagging a region with a kernel it doesn't know how
+// to dispatch (which would produce silence at run time).
+[[nodiscard]] static std::optional<RegionKernel>
+region_kernel_from_tag(int kind) noexcept {
+  switch (kind) {
+  case 0: return RegionKernel::NodeLoop;
+  case 1: return RegionKernel::SawLpfGain;
+  default: return std::nullopt;
+  }
+}
+
 // One execution region within a template. Step A of the fusion
 // roadmap: regions are an overlay on the template's nodes vector
 // (a contiguous range, by Haskell's greedy region pass) that
@@ -794,10 +815,19 @@ template_id is stable.
 // for the current greedy `formRegions`; if a future non-greedy pass
 // produces a non-contiguous region, the C ABI grows a new entry —
 // this struct does not pretend to handle that case.
+//
+// `kernel` is the §4.B region-kernel selector. NodeLoop preserves
+// the legacy "iterate member nodes via dispatch_node" behaviour;
+// non-NodeLoop values redirect process_instance to a hand-written
+// fused per-sample kernel. The runtime validates the member kind
+// sequence on entry and falls back to NodeLoop on a mismatch, so
+// a stale or misshapen registration silently degrades rather than
+// silencing the region.
 struct RegionSpec {
   int rate       = 0;
   int first_node = 0;
   int node_count = 0;
+  RegionKernel kernel = RegionKernel::NodeLoop;
 };
 
 struct MetaDef {
@@ -2899,6 +2929,120 @@ vs runtime ordering" in CLAUDE.md.
 */
 
 // ----------------------------------------------------------------
+// Phase 4.B region kernels
+// ----------------------------------------------------------------
+
+/* Note [Region kernel: SawLpfGain]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Hand-written fused kernel for a region tagged 'RegionKernel::SawLpfGain'.
+Members are exactly three nodes in stored order: a SawOsc (saw_idx),
+a LPF (lpf_idx = saw_idx + 1), and a Gain (gain_idx = saw_idx + 2).
+
+The fused kernel does the work of process_sawosc + process_lpf +
+process_gain in one tight per-sample loop. It /reuses/ each member's
+existing OscState / LPFState / controls — there is no anonymous
+fused state introduced. That keeps every node's NodeIndex and
+control slots addressable: 'rt_graph_instance_set_control(saw_idx,
+0, x)' still drives the saw frequency, 'rt_graph_instance_set_control(
+lpf_idx, 0, x)' still drives the LPF cutoff, and so on, exactly as
+they did with the unfused kernels.
+
+Only the gain's output buffer is materialised — that's the read
+target for any external consumer (typically an Out node in a
+sibling region). Saw and LPF intermediates stay in registers. The
+'selectRegionKernels' pass on the Haskell side ensures saw/lpf
+have rnConsumerCount == 1 and that the single consumer is the
+next member of the chain, so no external code reads those
+intermediate buffers; we don't need to keep them live.
+
+Bit-equivalence with the unfused chain depends on the per-sample
+arithmetic being identical: q::saw(phase_iter), lpf->filter(...),
+multiply by gain_amount, in that order, with the same NaN
+sanitisation and the same block-rate latch for LPF freq/q. That
+is exactly what process_sawosc / process_lpf / process_gain do
+when run in sequence, so the fused output matches sample-for-sample.
+
+If the kind sequence at registration time doesn't actually match
+[SawOsc, LPF, Gain] (e.g., the spec was reconfigured after the
+region tag was committed), the dispatch site falls back to per-node
+iteration. Silent degradation is preferred to silencing.
+*/
+static void process_region_saw_lpf_gain(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t saw_idx, std::size_t lpf_idx, std::size_t gain_idx,
+    int nframes
+) noexcept {
+  auto &saw_node  = inst.nodes[saw_idx];
+  auto &lpf_node  = inst.nodes[lpf_idx];
+  auto &gain_node = inst.nodes[gain_idx];
+
+  auto out = output_span(gain_node, PortIndex{0}, nframes);
+
+  // Saw freq input. May be RFrom (audio-rate FM) or unwired
+  // (constant from controls[0]). Mirrors process_sawosc.
+  const auto saw_freq_in =
+      resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
+
+  // LPF freq + q inputs. Block-rate latch at sample 0, mirroring
+  // process_lpf so reconfigure-on-change semantics agree across
+  // fused / unfused paths.
+  const auto lpf_freq_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double lpf_freq = sanitize_finite_clamp(
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
+                           : lpf_node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double lpf_q = sanitize_finite_clamp(
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
+                        : lpf_node.controls[1],
+      kQMin, kQMax, kQFallback);
+
+  auto *osc = std::get_if<OscState>(&saw_node.state);
+  auto *lpf = std::get_if<LPFState>(&lpf_node.state);
+  if (!osc || !lpf) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
+    lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
+    lpf->last_freq = lpf_freq;
+    lpf->last_q    = lpf_q;
+  }
+
+  const float gain_amount = sanitize_finite(
+      static_cast<float>(gain_node.controls[0]), 1.0f);
+
+  if (!saw_freq_in.empty()) {
+    // Audio-rate saw frequency: per-sample increment update,
+    // mirroring process_sawosc's audio-rate branch.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const double freq = sanitize_finite(
+          static_cast<double>(saw_freq_in[fi]), 0.0);
+      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
+      const float saw_sample = q::saw(osc->phase_iter++);
+      const float lpf_sample = lpf->filter(saw_sample);
+      out[fi] = lpf_sample * gain_amount;
+    }
+  } else {
+    // Block-rate saw frequency: increment set once per block.
+    const double saw_freq = sanitize_finite(saw_node.controls[0], 0.0);
+    osc->phase_iter.set(q::frequency{saw_freq}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float saw_sample = q::saw(osc->phase_iter++);
+      const float lpf_sample = lpf->filter(saw_sample);
+      out[fi] = lpf_sample * gain_amount;
+    }
+  }
+}
+
+// ----------------------------------------------------------------
 // Lifecycle helpers (shared between the direct ABI entries and the
 // queued-drain path)
 // ----------------------------------------------------------------
@@ -3260,17 +3404,38 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
     return;
   }
 
-  // Region path: same kernels in the same order, just iterated as
-  // an overlay. The Haskell precondition is that regions cover every
-  // node exactly once with no overlap; we clamp each region's range
+  // Region path: dispatch by the region's kernel selector. The
+  // default 'NodeLoop' iterates members via dispatch_node, exactly
+  // as before §4.B. Fused-kernel regions call a hand-written kernel
+  // that does the work of every member node in one tight per-sample
+  // loop. The Haskell precondition is that regions cover every node
+  // exactly once with no overlap; we clamp each region's range
   // against node_count defensively in case construction was partial.
   for (const RegionSpec &r : def->regions) {
     const std::size_t first = static_cast<std::size_t>(r.first_node);
     const std::size_t end_excl =
         std::min(node_count, first + static_cast<std::size_t>(r.node_count));
-    for (std::size_t i = first; i < end_excl; ++i) {
-      if (def->nodes[i].elided) continue;
-      dispatch_node(g, inst, i, nframes, def->nodes[i]);
+
+    // Fused-kernel dispatch. A kind-sequence mismatch falls back
+    // to per-node iteration so a stale or misshapen tag silently
+    // degrades rather than silencing the region.
+    bool fused = false;
+    if (r.kernel == RegionKernel::SawLpfGain
+        && r.node_count == 3
+        && first + 3 <= node_count
+        && def->nodes[first    ].kind == NodeKind::SawOsc
+        && def->nodes[first + 1].kind == NodeKind::LPF
+        && def->nodes[first + 2].kind == NodeKind::Gain) {
+      process_region_saw_lpf_gain(g, inst, first, first + 1, first + 2,
+                                  nframes);
+      fused = true;
+    }
+
+    if (!fused) {
+      for (std::size_t i = first; i < end_excl; ++i) {
+        if (def->nodes[i].elided) continue;
+        dispatch_node(g, inst, i, nframes, def->nodes[i]);
+      }
     }
   }
 }
@@ -4019,6 +4184,28 @@ void rt_graph_template_add_region(
     RTGraph *g, int template_id,
     int rate, int first_node, int node_count
 ) {
+  // The kernel-aware entry takes a kernel_kind in addition to rate /
+  // first_node / node_count. Existing callers (Haskell pre-§4.B
+  // loaders, all C++ tests built directly via rt_graph_add_region)
+  // get the default NodeLoop behaviour by going through the kind=0
+  // path; that preserves their bit-identical render against the
+  // pre-§4.B world.
+  rt_graph_template_add_region_kernel(
+      g, template_id, /*kernel_kind=*/0,
+      rate, first_node, node_count);
+}
+
+// Phase 4.B: kernel-aware region registration. Same precondition
+// checks as rt_graph_template_add_region (loose; Haskell guarantees
+// contiguous coverage), plus validation that the kernel_kind is one
+// the runtime knows how to dispatch. Unknown kinds are a silent
+// no-op so a stale Haskell sender against an older runtime can't
+// silently silence the region.
+void rt_graph_template_add_region_kernel(
+    RTGraph *g, int template_id,
+    int kernel_kind,
+    int rate, int first_node, int node_count
+) {
   if (!g) return;
 
   MetaDef *def = template_at(*g, template_id);
@@ -4031,7 +4218,17 @@ void rt_graph_template_add_region(
     return;
   }
 
-  def->regions.push_back(RegionSpec{rate, first_node, node_count});
+  const auto kernel = region_kernel_from_tag(kernel_kind);
+  if (!kernel.has_value()) return;
+
+  def->regions.push_back(
+      RegionSpec{rate, first_node, node_count, *kernel});
+}
+
+// Phase 4.B introspection: pinned by the Haskell-side 'kernelTag'
+// agreement test, mirrors rt_graph_kind_supported for node kinds.
+int rt_graph_region_kernel_supported(int kernel_kind) {
+  return region_kernel_from_tag(kernel_kind).has_value() ? 1 : 0;
 }
 
 // Step C (d): mark a node as elided. Idempotent on existing state;

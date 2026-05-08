@@ -307,6 +307,47 @@ void rt_graph_template_connect_fused_affine_input(
 void rt_graph_template_add_region(RTGraph *g, int template_id,
                                   int rate, int first_node, int node_count);
 
+// [T:construction] Phase 4.B: add one region to the named template,
+// tagged with a region kernel selector. Generalises
+// rt_graph_template_add_region: the older entry registers a region
+// with kernel = 0 (NodeLoop); this entry lets the Haskell loader
+// also register fused-kernel regions.
+//
+//   kernel_kind: integer matching the Haskell RegionKernel encoding
+//                (0 = NodeLoop, 1 = SawLpfGain). Unknown values are
+//                rejected at registration time (silent no-op) so a
+//                runtime version skew between sender and resolver
+//                can't silently silence a region. Pinned by the
+//                rt_graph_region_kernel_supported introspection
+//                entry so the Haskell side can machine-check it
+//                in a property test, mirroring the kindTag pattern
+//                in §0.5.1.
+//
+// The remaining arguments mirror rt_graph_template_add_region:
+// rate is stored verbatim, first_node + node_count flatten the
+// region's contiguous member list. For a fused-kernel region the
+// caller is responsible for ensuring first_node + node_count
+// matches the kernel's expected member shape (e.g., SawLpfGain
+// expects exactly 3 contiguous nodes [Saw, LPF, Gain] in that
+// order); the runtime validates the kind sequence at dispatch
+// time and falls back to per-node iteration on any mismatch.
+//
+// NodeIndex remains the addressable identity for every control-
+// write ABI; the fused kernel reads its members' state and controls
+// rather than introducing anonymous state. Silent no-op on invalid
+// template_id, range, or kernel_kind.
+void rt_graph_template_add_region_kernel(
+    RTGraph *g, int template_id,
+    int kernel_kind,
+    int rate, int first_node, int node_count);
+
+// [T:introspection] Returns 1 if @kernel_kind@ corresponds to a
+// region kernel the runtime knows how to dispatch (including
+// 0 = NodeLoop), 0 otherwise. Pinned by the Haskell-side
+// 'kernelTag' agreement test; mirrors rt_graph_kind_supported for
+// node kinds.
+int rt_graph_region_kernel_supported(int kernel_kind);
+
 // [T:control] Spawn an instance of the named template. Returns
 // globally-unique instance_id (>= 0) or -1 on failure. Slot reuse: a
 // dead slot is reused before appending. The instance carries its
