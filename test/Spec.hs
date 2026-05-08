@@ -3783,10 +3783,7 @@ prop_fusedRenderEqualsUnfused graph =
             , v : _ <- [rnControls n]
             , v >= 0
             ] :: [Int]
-          hasRFused   = not (null [() | n <- rgNodes rtF, RFused _ <- rnInputs n])
-          hasElided   = any rnElided (rgNodes rtF)
-          hasFusedReg = any ((/= RNodeLoop) . rrKernel) (rgRuntimeRegions rtF)
-          triggered   = hasRFused || hasElided || hasFusedReg
+          triggered = fusedSomehow rtF
        in checkCoverage
         . cover 90 triggered          "fusion triggered"
         . classify (not triggered)    "no fusion (vacuous on fused path)"
@@ -3830,6 +3827,21 @@ stripRegionKernels rg = rg
       map (\r -> r { rrKernel = RNodeLoop }) (rgRuntimeRegions rg)
   }
 
+-- | A 'RuntimeGraph' has been touched by some form of fusion if it
+-- carries §4.C single-input rewrite artifacts (an 'RFused' input
+-- or an 'rnElided' node) or a §4.B region-kernel claim (any
+-- region whose 'rrKernel' is not 'RNodeLoop'). Used as the sanity
+-- gate by both 'assertFusedEquivalent' and the random
+-- 'prop_fusedRenderEqualsUnfused' so a regression in either path
+-- (or a generator that drifts toward unfusable shapes) is caught
+-- the same way. Centralised so the two call sites cannot drift
+-- as more fusion mechanisms land.
+fusedSomehow :: RuntimeGraph -> Bool
+fusedSomehow rg =
+  not (null [() | n <- rgNodes rg, RFused _ <- rnInputs n])
+    || any rnElided (rgNodes rg)
+    || any ((/= RNodeLoop) . rrKernel) (rgRuntimeRegions rg)
+
 -- | Render @graph@ through a node-loop baseline and the fused
 -- loader, asserting their outputs are bit-identical on every bus
 -- the graph writes (not only bus 0). Comparing every output bus
@@ -3857,16 +3869,11 @@ assertFusedEquivalent name graph = do
                   >> error "unreachable"
 
   -- Sanity gate: the fused compile must actually fuse /something/
-  -- — either §4.C single-input rewrite (RFused inputs / rnElided
-  -- nodes) or §4.B region kernel selection (a non-RNodeLoop
-  -- region). A graph whose fused render trivially equals the
-  -- baseline render because no fusion fired isn't a useful
-  -- equivalence case.
-  let hasRFused   = not (null [() | n <- rgNodes rtF, RFused _ <- rnInputs n])
-      hasElided   = any rnElided (rgNodes rtF)
-      hasFusedReg = any ((/= RNodeLoop) . rrKernel) (rgRuntimeRegions rtF)
+  -- — see 'fusedSomehow' for the predicate. A graph whose fused
+  -- render trivially equals the baseline render because no fusion
+  -- fired isn't a useful equivalence case.
   assertBool (name <> ": fused compile triggered no fusion of any kind")
-    (hasRFused || hasElided || hasFusedReg)
+    (fusedSomehow rtF)
 
   -- Walk the baseline graph to collect every bus index that an Out
   -- or BusOut node writes to. rnControls[0] holds the bus id by
