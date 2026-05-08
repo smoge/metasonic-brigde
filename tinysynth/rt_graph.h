@@ -311,26 +311,44 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 // tagged with a region kernel selector. Generalises
 // rt_graph_template_add_region: the older entry registers a region
 // with kernel = 0 (NodeLoop); this entry lets the Haskell loader
-// also register fused-kernel regions.
+// also register fused-kernel regions of various shapes and
+// arities.
 //
-//   kernel_kind: integer matching the Haskell RegionKernel encoding
-//                (0 = NodeLoop, 1 = SawLpfGain). Unknown values are
-//                rejected at registration time (silent no-op) so a
-//                runtime version skew between sender and resolver
-//                can't silently silence a region. Pinned by the
-//                rt_graph_region_kernel_supported introspection
-//                entry so the Haskell side can machine-check it
-//                in a property test, mirroring the kindTag pattern
-//                in §0.5.1.
+//   kernel_kind: integer matching the Haskell RegionKernel encoding.
+//                The full set of accepted tags is the source of
+//                truth on the Haskell side ('kernelTag' in
+//                MetaSonic.Bridge.Compile); current tags are
+//                  0 = NodeLoop      (per-node dispatch, any arity)
+//                  1 = SawLpfGain    (3-node buffer-terminal:
+//                                     SawOsc -> LPF -> Gain)
+//                  2 = SinGainOut    (3-node sink-terminal:
+//                                     SinOsc -> Gain -> Out)
+//                  3 = SawLpfGainOut (4-node sink-terminal:
+//                                     SawOsc -> LPF -> Gain -> Out)
+//                Unknown values are rejected at registration time
+//                (silent no-op) so a runtime version skew between
+//                sender and resolver can't silently silence a
+//                region. Callers should query
+//                'rt_graph_region_kernel_supported' before sending
+//                a tag if they need to discover the runtime's
+//                supported set; the Haskell side machine-checks
+//                tag agreement in a property test, mirroring the
+//                kindTag pattern in §0.5.1.
 //
 // The remaining arguments mirror rt_graph_template_add_region:
 // rate is stored verbatim, first_node + node_count flatten the
 // region's contiguous member list. For a fused-kernel region the
-// caller is responsible for ensuring first_node + node_count
-// matches the kernel's expected member shape (e.g., SawLpfGain
-// expects exactly 3 contiguous nodes [Saw, LPF, Gain] in that
-// order); the runtime validates the kind sequence at dispatch
-// time and falls back to per-node iteration on any mismatch.
+// caller is responsible for ensuring 'node_count' matches the
+// kernel's expected arity and that the contiguous kind sequence
+// matches the kernel's expected shape — for example:
+//   * SawLpfGain    needs node_count == 3 and kinds
+//                   [SawOsc, LPF, Gain].
+//   * SinGainOut    needs node_count == 3 and kinds
+//                   [SinOsc, Gain, Out].
+//   * SawLpfGainOut needs node_count == 4 and kinds
+//                   [SawOsc, LPF, Gain, Out].
+// The runtime validates the kind sequence at dispatch time and
+// falls back to per-node iteration on any mismatch.
 //
 // NodeIndex remains the addressable identity for every control-
 // write ABI; the fused kernel reads its members' state and controls

@@ -1030,52 +1030,87 @@ therefore not match a whole region; it has to find a contiguous
 /subsequence/ inside one.
 
 'selectRegionKernels' walks each region produced by
-'compileRuntimeGraph', searches for the leftmost 3-node match
-across every known kernel shape, and on a hit /splits/ the region
-into up to three pieces:
+'compileRuntimeGraph', searches for the leftmost match of any
+recognized shape, and on a hit /splits/ the region into up to
+three pieces:
 
-  * prefix  ('RNodeLoop')   — nodes before the match (skipped if empty)
-  * middle  (matched kernel) — the matched 3-node shape
-  * suffix  ('RNodeLoop')   — nodes after the match (recursively
-                              scanned for further matches)
+  * prefix  ('RNodeLoop')    — nodes before the match (skipped if empty)
+  * middle  (matched kernel) — exactly the matched shape, with
+                               'kernelArity'-many members
+  * suffix  ('RNodeLoop')    — nodes after the match (recursively
+                               scanned for further matches)
 
-Currently two kernel shapes are recognised:
+Match arity is /not/ implicit: 'findKernelMatch' returns a
+'KernelMatch' descriptor that carries 'kmLength' = 'kernelArity'
+'kmKernel'. Adding a kernel of any arity is a matter of extending
+'kernelArity' and the dispatch in 'findKernelMatch' — the
+splitter consumes whatever length the descriptor reports.
 
-  * 'RSawLpfGain' — buffer-terminal: @[KSawOsc, KLPF, KGain]@.
-    The gain's output buffer is materialised because some sibling
-    region reads it (typically an 'Out' in the trailing
-    'RNodeLoop' region).
-  * 'RSinGainOut' — sink-terminal: @[KSinOsc, KGain, KOut]@. The
-    'Out' is /inside/ the kernel; the bus accumulation and §2.E
-    sink-peak tracking happen inside the fused per-sample loop.
-    No buffer is materialised.
+Currently three kernel shapes are recognized:
+
+  * 'RSawLpfGain' — 3-node buffer-terminal:
+    @[KSawOsc, KLPF, KGain]@. The gain's output buffer is
+    materialized because some external consumer reads it (a
+    sibling region's 'Out' or 'BusOut').
+  * 'RSinGainOut' — 3-node sink-terminal:
+    @[KSinOsc, KGain, KOut]@. The 'Out' is /inside/ the kernel;
+    bus accumulation and §2.E sink-peak tracking happen inside
+    the fused per-sample loop. No buffer is materialized.
+  * 'RSawLpfGainOut' — 4-node sink-terminal:
+    @[KSawOsc, KLPF, KGain, KOut]@. Combines saw + LPF + gain
+    processing with the inline bus accumulation and sink-peak
+    tracking; like 'RSinGainOut' it materializes no intermediate
+    buffer.
+
+/Longest-match priority/. At each candidate offset
+'findKernelMatch' tries shapes longest-first: for example, on
+@[SawOsc, LPF, Gain, Out]@ the 4-node 'RSawLpfGainOut' wins over
+the 3-node 'RSawLpfGain' prefix that would otherwise leave the
+'Out' stranded in a trailing 'RNodeLoop' region. The 3-node
+kernel still fires whenever the longer shape's preconditions
+fail (notably when the gain has multiple consumers or the
+terminal isn't a 'KOut') — see the corresponding @matches*@
+predicates and the "fallback" tests in 'Spec.hs'.
 
 The runtime sees a clean "kernel tag per region" model and
-dispatches accordingly. RegionIndex is renumbered after the split
-so consumers downstream see contiguous indices.
+dispatches accordingly. RegionIndex is renumbered after the
+split so consumers downstream see contiguous indices.
 
-Match preconditions, common to every 3-node kernel:
+Match preconditions, common to every fused kernel (3-node and
+4-node alike):
 
-  1. Three contiguous member nodes have the kernel-specific kinds
-     in the kernel-specific order.
-  2. None of the three is 'rnElided' (defensive — should always
-     hold pre-fusion).
-  3. 'rnConsumerCount' is exactly 1 for the first two members, and
-     each of those single consumers /is/ the next node in the
-     chain. This is the "single-use internal edges" rule and the
-     "no external escape from the intermediate buffers" rule
-     rolled together: the chain is the only reader of those
-     buffers, so the fused kernel can keep their per-sample value
-     in registers without materialising it.
-  4. The Gain in the chain has scalar shape @[RFrom _ _, RConst _]@
-     — signal port wired from the previous member, gain port
-     unwired (constant control). Audio-modulated gain stays on
-     'RNodeLoop' just like §4.C's scalar Gain fusion stays off
-     audio-rate Gains.
+  1. The contiguous member nodes have the kernel-specific kinds
+     in the kernel-specific order, and exactly 'kernelArity'
+     members are consumed.
+  2. None of the matched members is 'rnElided' (defensive —
+     should always hold pre-fusion).
+  3. 'rnConsumerCount' is exactly 1 for every /non-terminal/
+     member, and each of those single consumers /is/ the next
+     node in the chain. This is the "single-use internal edges"
+     rule rolled together with "no external escape from the
+     intermediate buffers": the chain is the only reader of
+     those buffers, so the fused kernel can keep their per-
+     sample value in registers without materializing it. For
+     buffer-terminal kernels ('RSawLpfGain') the terminal node's
+     consumer count is unconstrained — its output /is/
+     materialized. For sink-terminal kernels the terminal is a
+     sink ('rnConsumerCount == 0' by construction).
+  4. The Gain in the chain has scalar shape
+     @[RFrom _ _, RConst _]@ — signal port wired from the
+     previous member, gain port unwired (constant control).
+     Audio-modulated gain stays on 'RNodeLoop' just like §4.C's
+     scalar Gain fusion stays off audio-rate Gains.
+  5. Where the kernel /absorbs/ the Gain's output (any sink-
+     terminal shape, currently 'RSinGainOut' and
+     'RSawLpfGainOut'), the Gain itself must additionally have
+     'rnConsumerCount == 1' — otherwise an external consumer
+     also reads the gain's buffer and the sink-terminal kernel
+     must not absorb it. Longest-match falls through to the
+     buffer-terminal 'RSawLpfGain' in that case.
 
-For 'RSinGainOut' there is no extra precondition on the terminal
-'Out': it is a sink ('rnConsumerCount == 0' by construction), and
-its bus index lives in 'rnControls', not 'rnInputs'.
+For sink-terminal kernels there is no extra precondition on the
+terminal 'KOut': it has no audio output, and its bus index lives
+in 'rnControls', not 'rnInputs'.
 
 Step-§4.B fusion claims its members /before/ §4.C runs, so
 'fuseRuntimeGraph' must skip nodes that are members of a
