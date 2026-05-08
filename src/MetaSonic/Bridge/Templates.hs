@@ -113,24 +113,11 @@ bus 5; only 'bfWrites' is consulted when computing precedence
 against peers.
 -}
 
--- | The bus-level interface a template exposes. Only 'bfWrites' and
--- 'bfReads' contribute to inter-template precedence; 'bfDelayedReads'
--- is recorded for diagnostics but never induces an ordering edge.
---
--- See Note [Bus footprint surface].
-data BusFootprint = BusFootprint
-  { bfWrites       :: !(S.Set Int)
-    -- ^ Bus indices written by 'Out' or 'BusOut' nodes in the template.
-  , bfReads        :: !(S.Set Int)
-    -- ^ Bus indices read live by 'BusIn' nodes in the template.
-  , bfDelayedReads :: !(S.Set Int)
-    -- ^ Bus indices read delayed by 'BusInDelayed' nodes in the
-    -- template. Not used by precedence; tracked for diagnostics.
-  } deriving stock    (Eq, Show, Generic)
-    deriving anyclass (NFData)
-
-emptyFootprint :: BusFootprint
-emptyFootprint = BusFootprint S.empty S.empty S.empty
+-- The 'BusFootprint' type and 'emptyFootprint' helper are defined in
+-- 'MetaSonic.Bridge.Compile' so the same shape can be reused at
+-- whole-template, per-region, and per-node scope (see Note [Bus
+-- footprints, template- vs region-level] in Compile). They are
+-- re-exported from this module for the existing public surface.
 
 -- | Extract a 'BusFootprint' from a lowered 'GraphIR'.
 --

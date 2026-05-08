@@ -34,6 +34,13 @@ module MetaSonic.Bridge.Compile
   , RuntimeGraph (..)
   , RegionIndex (..)
   , NodeOutputUse (..)
+  , -- * Bus footprints (see Note [Bus footprints, template- vs region-level])
+    BusFootprint (..)
+  , emptyFootprint
+  , runtimeNodeFootprint
+  , regionFootprint
+  , attachRegionFootprints
+  , regionPrecedence
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
@@ -866,6 +873,50 @@ kernelArity RNoiseGainOut    = 3
 kernelArity RBusInLpfGainOut = 4
 kernelArity RNodeLoop        = 0
 
+{- Note [Bus footprints, template- vs region-level]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'BusFootprint' is the bus-level interface a unit of execution
+exposes: the bus indices it writes, reads live, and reads delayed.
+The same shape applies at three nested scopes:
+
+  * Whole template: aggregate over every node in the template's
+    'GraphIR' (used by 'compileTemplateGraph' to derive the
+    inter-template precedence DAG).
+  * One region: aggregate over the region's member 'RuntimeNode's
+    (used by 'regionPrecedence' for intra-template region
+    ordering — first slice of §4.E.1).
+  * One node: trivially derived from 'rnKind' + 'rnControls[0]'.
+
+Reusing the type at every scope keeps the precedence rule
+("A precedes B iff bfWrites(A) ∩ bfReads(B) ≠ ∅, delayed reads
+do not contribute") identical from intra-region all the way up
+to inter-template — the only thing that changes is which set of
+nodes the fold covers.
+
+The template-level extractor lives in 'MetaSonic.Bridge.Templates'
+because it consumes 'GraphIR' (compile-time IR, not runtime).
+The region- and runtime-graph-level extractors live here in
+Compile because they consume 'RuntimeNode' values directly.
+-}
+
+-- | Bus-level interface of a unit of execution: bus indices touched,
+-- and how. Only 'bfWrites' and 'bfReads' contribute to precedence;
+-- 'bfDelayedReads' is recorded for diagnostics but never induces an
+-- ordering edge (matching intra-graph E_r and the template-level
+-- precedence rule — see 'MetaSonic.Bridge.Templates').
+data BusFootprint = BusFootprint
+  { bfWrites       :: !(S.Set Int)
+    -- ^ Bus indices written by 'KOut' or 'KBusOut' nodes.
+  , bfReads        :: !(S.Set Int)
+    -- ^ Bus indices read live by 'KBusIn' nodes.
+  , bfDelayedReads :: !(S.Set Int)
+    -- ^ Bus indices read delayed by 'KBusInDelayed' nodes.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+emptyFootprint :: BusFootprint
+emptyFootprint = BusFootprint S.empty S.empty S.empty
+
 -- | One execution region in the runtime graph: a contiguous block
 -- of nodes (in execution order) that 'formRegions' grouped together.
 --
@@ -885,6 +936,14 @@ data RuntimeRegion = RuntimeRegion
     -- by 'formRegions'; 'selectRegionKernels' may upgrade some
     -- regions to a fused kernel after splitting the region to
     -- contain only the matched members. See 'RegionKernel'.
+  , rrFootprint :: !BusFootprint
+    -- ^ Bus-level interface of this region: writes / live-reads /
+    -- delayed-reads. Computed by 'attachRegionFootprints' as the
+    -- final step of 'compileRuntimeGraph' so the same field
+    -- survives 'selectRegionKernels' splits without going stale.
+    -- §4.E.1 metadata only — does not change region execution
+    -- order today; consumed by 'regionPrecedence' for the
+    -- intra-template region ordering view.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -990,7 +1049,13 @@ compileRuntimeGraph ir = do
   -- fused region kernel — otherwise §4.C would elide a Gain that
   -- the region kernel still expects to address by control slot.
   -- See Note [Region kernel selection].
-  pure $! selectRegionKernels (RuntimeGraph rtNodes rtRegions)
+  --
+  -- 'attachRegionFootprints' runs /after/ kernel selection so the
+  -- per-region 'BusFootprint' reflects the post-split member list
+  -- — §4.E.1 metadata, no runtime behavior change.
+  pure $!
+    attachRegionFootprints
+      (selectRegionKernels (RuntimeGraph rtNodes rtRegions))
 
   where
     compileNode
@@ -1049,6 +1114,10 @@ compileRuntimeGraph ir = do
           -- 'selectRegionKernels' may upgrade some regions to a
           -- fused kernel after splitting, before the final
           -- 'RuntimeGraph' is returned.
+        , rrFootprint = emptyFootprint
+          -- Placeholder; 'attachRegionFootprints' fills this in as
+          -- the final step of 'compileRuntimeGraph' so kernel splits
+          -- don't leave stale aggregations behind.
         }
 
     lookupNodeIndex
@@ -1229,10 +1298,14 @@ selectRegionKernels rg =
         | null ks   = []
         | otherwise =
             [ RuntimeRegion
-                { rrIndex  = placeholder
-                , rrRate   = rate
-                , rrNodes  = ks
-                , rrKernel = ker
+                { rrIndex     = placeholder
+                , rrRate      = rate
+                , rrNodes     = ks
+                , rrKernel    = ker
+                , rrFootprint = emptyFootprint
+                  -- Re-derived by 'attachRegionFootprints' after
+                  -- 'selectRegionKernels' finishes splitting; safe
+                  -- to leave empty until then.
                 }
             ]
 
@@ -1258,10 +1331,12 @@ selectRegionKernels rg =
                     -- point in one pass.
                     postRegion =
                       RuntimeRegion
-                        { rrIndex  = placeholder
-                        , rrRate   = rate
-                        , rrNodes  = post
-                        , rrKernel = RNodeLoop
+                        { rrIndex     = placeholder
+                        , rrRate      = rate
+                        , rrNodes     = post
+                        , rrKernel    = RNodeLoop
+                        , rrFootprint = emptyFootprint
+                          -- See note on 'mkPart'.
                         }
                 in  mkPart rate pre RNodeLoop
                  ++ mkPart rate mid kern
@@ -1272,6 +1347,89 @@ selectRegionKernels rg =
       renumbered = zipWith setIx [0..] splat
         where setIx i r = r { rrIndex = RegionIndex i }
   in rg { rgRuntimeRegions = renumbered }
+
+-- | Bus footprint of one runtime node, derived from its kind plus
+-- the bus index in 'rnControls[0]'. Returns 'emptyFootprint' for
+-- non-bus kinds. Negative, NaN, or infinite bus indices are
+-- silently dropped (they correspond to the runtime's silence-on-
+-- invalid-bus contract — a phantom dependency on bus -1 would be
+-- noise in the precedence view, not signal).
+runtimeNodeFootprint :: RuntimeNode -> BusFootprint
+runtimeNodeFootprint n = case (rnKind n, rnControls n) of
+  (KOut,          v : _) | Just b <- finitePositive v ->
+    emptyFootprint { bfWrites       = S.singleton b }
+  (KBusOut,       v : _) | Just b <- finitePositive v ->
+    emptyFootprint { bfWrites       = S.singleton b }
+  (KBusIn,        v : _) | Just b <- finitePositive v ->
+    emptyFootprint { bfReads        = S.singleton b }
+  (KBusInDelayed, v : _) | Just b <- finitePositive v ->
+    emptyFootprint { bfDelayedReads = S.singleton b }
+  _ -> emptyFootprint
+  where
+    finitePositive :: Double -> Maybe Int
+    finitePositive v
+      | isNaN v || isInfinite v || v < 0 = Nothing
+      | otherwise                         = Just (truncate v)
+
+-- | Aggregate the 'BusFootprint' of every node in a region's
+-- member list. The set-union semantics of 'BusFootprint' make the
+-- fold order-independent.
+regionFootprint
+  :: M.Map NodeIndex RuntimeNode
+  -> [NodeIndex]
+  -> BusFootprint
+regionFootprint nodes = foldr step emptyFootprint
+  where
+    step ix acc = case M.lookup ix nodes of
+      Nothing -> acc
+      Just n  -> mergeFootprint (runtimeNodeFootprint n) acc
+
+    mergeFootprint a b = BusFootprint
+      { bfWrites       = bfWrites       a `S.union` bfWrites       b
+      , bfReads        = bfReads        a `S.union` bfReads        b
+      , bfDelayedReads = bfDelayedReads a `S.union` bfDelayedReads b
+      }
+
+-- | Decorate every region in a 'RuntimeGraph' with its
+-- 'BusFootprint'. Run as the final step of 'compileRuntimeGraph'
+-- so the footprints reflect the post-'selectRegionKernels' member
+-- lists; running earlier would leave stale aggregations on
+-- regions that 'selectRegionKernels' subsequently split.
+attachRegionFootprints :: RuntimeGraph -> RuntimeGraph
+attachRegionFootprints rg =
+  let nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
+      decorated =
+        [ r { rrFootprint = regionFootprint nodeMap (rrNodes r) }
+        | r <- rgRuntimeRegions rg
+        ]
+  in rg { rgRuntimeRegions = decorated }
+
+-- | Intra-template region precedence: for each region, the set of
+-- regions whose live writes the given region reads. A precedes B
+-- iff @bfWrites(A) ∩ bfReads(B) ≠ ∅@. Delayed reads do not
+-- contribute, matching the intra-graph E_r rule and the
+-- inter-template precedence rule.
+--
+-- §4.E.1 metadata only — does not change region execution order
+-- today. The current 'compileRuntimeGraph' produces regions in a
+-- topologically valid order via 'formRegions'; this function
+-- exposes that order's bus-dataflow rationale as a queryable view
+-- for a future scheduler.
+regionPrecedence :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
+regionPrecedence rg = M.fromList
+  [ (rrIndex r, S.fromList
+      [ rrIndex other
+      | other <- regions
+      , rrIndex other /= rrIndex r
+      , not (S.null
+              (bfWrites (rrFootprint other)
+                `S.intersection`
+               bfReads  (rrFootprint r)))
+      ])
+  | r <- regions
+  ]
+  where
+    regions = rgRuntimeRegions rg
 
 -- | Result of a successful kernel-shape lookup in
 -- 'findKernelMatch'. Carrying the matched length explicitly makes

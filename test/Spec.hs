@@ -2197,6 +2197,218 @@ unitTests = testGroup "Unit tests"
               selectRegionKernels rg @?= rg
       ]
 
+  , -- Phase 4.E.1: per-region BusFootprint metadata. The first
+    -- slice of region scheduling: every 'RuntimeRegion' carries
+    -- its own write / live-read / delayed-read sets, and
+    -- 'regionPrecedence' surfaces the intra-template ordering rule
+    -- (region A precedes region B iff A's live-writes intersect
+    -- B's live-reads). No runtime behavior change in this slice —
+    -- 'compileRuntimeGraph' still produces regions in the same
+    -- topologically valid order; the tests pin only the metadata.
+    testGroup "Phase 4.E.1: per-region BusFootprint and precedence"
+      [ -- Single-region baseline: a sin → gain → out chain claims
+        -- 'RSinGainOut' as one region. Footprint writes only the
+        -- sink bus; no reads of any kind. 'regionPrecedence' is
+        -- the empty map for this region (no other region exists
+        -- and no read sets to intersect against).
+        testCase "single-region chain: footprint writes {0}, no reads, empty precedence" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              case rgRuntimeRegions rg of
+                [r] -> do
+                  bfWrites       (rrFootprint r) @?= S.singleton 0
+                  bfReads        (rrFootprint r) @?= S.empty
+                  bfDelayedReads (rrFootprint r) @?= S.empty
+                  regionPrecedence rg @?=
+                    M.singleton (rrIndex r) S.empty
+                rs -> assertFailure $
+                  "expected exactly one region, got " <> show (length rs)
+
+      , -- Internal send/return: a sin → busOut 5 producer chain
+        -- followed by a busIn 5 → lpf → gain → out 0 consumer
+        -- chain. §4.B's longest-match priority claims the consumer
+        -- chain as 'RBusInLpfGainOut' and 'selectRegionKernels'
+        -- splits the source region into a producer 'RNodeLoop'
+        -- region (sin + busOut) and a consumer kernel region.
+        --
+        -- The footprints must reflect the split: producer writes
+        -- bus 5; consumer reads bus 5 and writes bus 0. The
+        -- precedence map must say "consumer depends on producer."
+        testCase "internal send/return: consumer region depends on producer region" $ do
+          let g = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                busOut 5 s
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              -- Identify the two regions by their kernel tags:
+              -- producer is RNodeLoop (sin + busOut not a §4.B
+              -- shape), consumer is RBusInLpfGainOut.
+              let producers = [r | r <- rgRuntimeRegions rg
+                                 , rrKernel r == RNodeLoop]
+                  consumers = [r | r <- rgRuntimeRegions rg
+                                 , rrKernel r == RBusInLpfGainOut]
+              case (producers, consumers) of
+                ([p], [c]) -> do
+                  bfWrites       (rrFootprint p) @?= S.singleton 5
+                  bfReads        (rrFootprint p) @?= S.empty
+                  bfWrites       (rrFootprint c) @?= S.singleton 0
+                  bfReads        (rrFootprint c) @?= S.singleton 5
+                  bfDelayedReads (rrFootprint c) @?= S.empty
+
+                  let prec = regionPrecedence rg
+                  M.findWithDefault S.empty (rrIndex c) prec
+                    @?= S.singleton (rrIndex p)
+                  M.findWithDefault S.empty (rrIndex p) prec
+                    @?= S.empty
+                _ -> assertFailure $
+                  "expected one RNodeLoop producer + one RBusInLpfGainOut "
+                  <> "consumer, got "
+                  <> show (length producers) <> " + "
+                  <> show (length consumers)
+
+      , -- BusInDelayed must NOT induce precedence. The graph has
+        -- a producer chain that writes bus 5 (claimed as
+        -- 'RSinGainOut' via BusOut) and a delayed-reader chain
+        -- (busInDelayed 5 → gain → out) that reads bus 5
+        -- /delayed/ rather than live. The producer region's
+        -- footprint has writes={5}; the reader region's footprint
+        -- has delayedReads={5} and writes={0}. The precedence
+        -- map must show /no/ edge from reader to producer — the
+        -- intra-graph E_r rule and the inter-template precedence
+        -- rule both exclude delayed reads, and the per-region
+        -- view must do the same.
+        testCase "BusInDelayed reader does not induce a precedence edge" $ do
+          let g = runSynth $ do
+                s1 <- sinOsc 220.0 0.0
+                g1 <- gain s1 (Param 0.3)
+                busOut 5 g1                        -- producer: §4.B claims RSinGainOut via BusOut
+                d  <- busInDelayed 5
+                g2 <- gain d (Param 0.4)
+                out 0 g2                           -- reader: 3-node, no §4.B kernel for KBusInDelayed
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions   = rgRuntimeRegions rg
+                  producers = [r | r <- regions, rrKernel r == RSinGainOut]
+                  readers   = [r | r <- regions, rrKernel r == RNodeLoop]
+              case (producers, readers) of
+                ([p], [r]) -> do
+                  bfWrites       (rrFootprint p) @?= S.singleton 5
+                  bfReads        (rrFootprint p) @?= S.empty
+                  bfDelayedReads (rrFootprint p) @?= S.empty
+
+                  bfWrites       (rrFootprint r) @?= S.singleton 0
+                  bfReads        (rrFootprint r) @?= S.empty
+                  bfDelayedReads (rrFootprint r) @?= S.singleton 5
+
+                  -- Headline assertion: no precedence edge.
+                  let prec = regionPrecedence rg
+                  M.findWithDefault S.empty (rrIndex r) prec
+                    @?= S.empty
+                  M.findWithDefault S.empty (rrIndex p) prec
+                    @?= S.empty
+                _ -> assertFailure $
+                  "expected one RSinGainOut producer + one RNodeLoop "
+                  <> "reader, got "
+                  <> show (length producers) <> " + "
+                  <> show (length readers)
+
+      , -- Independent regions must have disjoint footprints and no
+        -- precedence edges between them. Two parallel sin → gain
+        -- → out chains writing different sink buses both claim
+        -- 'RSinGainOut' but neither reads any bus, so the
+        -- precedence map is the empty-set everywhere.
+        testCase "independent regions have disjoint footprints + no precedence" $ do
+          let g = runSynth $ do
+                s1 <- sinOsc 220.0 0.0
+                a1 <- gain s1 (Param 0.4)
+                out 0 a1
+                s2 <- sinOsc 440.0 0.0
+                a2 <- gain s2 (Param 0.4)
+                out 1 a2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions = rgRuntimeRegions rg
+              length [r | r <- regions, rrKernel r == RSinGainOut] @?= 2
+              -- Each kernel region writes exactly one bus; the
+              -- two written buses are disjoint.
+              let writes = [bfWrites (rrFootprint r) | r <- regions]
+              S.unions writes @?= S.fromList [0, 1]
+              -- No region reads any bus; precedence is empty
+              -- for every region.
+              let prec = regionPrecedence rg
+              all (S.null . snd) (M.toList prec) @?= True
+
+      , -- Multi-template send/return: each template compiles to
+        -- its own RuntimeGraph through 'compileTemplateGraph',
+        -- and the per-region BusFootprint must be populated
+        -- through that pipeline (not just through the
+        -- single-graph 'compileRuntimeGraph' direct path).
+        --
+        -- The voice template's region claims RSinGainOut via
+        -- BusOut and writes bus 5; the fx template's region
+        -- claims RBusInLpfGainOut and reads bus 5 / writes bus 0.
+        -- Intra-template precedence is empty within each
+        -- (single-region per template).
+        testCase "multi-template send/return: per-region footprints survive compileTemplateGraph" $ do
+          let voice = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                a <- gain s (Param 0.4)
+                busOut 5 a
+              fx = runSynth $ do
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                out 0 a
+
+          tg <- case compileTemplateGraph
+                       [("voice", voice), ("fx", fx)] of
+            Right t  -> pure t
+            Left err -> assertFailure err >> error "unreachable"
+
+          let voiceTpl = head [t | t <- tgTemplates tg, tplName t == "voice"]
+              fxTpl    = head [t | t <- tgTemplates tg, tplName t == "fx"]
+              voiceRg  = tplGraph voiceTpl
+              fxRg     = tplGraph fxTpl
+
+          -- Voice side: one region claiming RSinGainOut, footprint
+          -- writes bus 5.
+          case rgRuntimeRegions voiceRg of
+            [r] -> do
+              rrKernel r @?= RSinGainOut
+              bfWrites (rrFootprint r) @?= S.singleton 5
+              bfReads  (rrFootprint r) @?= S.empty
+              regionPrecedence voiceRg
+                @?= M.singleton (rrIndex r) S.empty
+            rs -> assertFailure $
+              "voice template: expected one region, got "
+              <> show (length rs)
+
+          -- Fx side: one region claiming RBusInLpfGainOut,
+          -- footprint reads bus 5 and writes bus 0.
+          case rgRuntimeRegions fxRg of
+            [r] -> do
+              rrKernel r @?= RBusInLpfGainOut
+              bfWrites (rrFootprint r) @?= S.singleton 0
+              bfReads  (rrFootprint r) @?= S.singleton 5
+              regionPrecedence fxRg
+                @?= M.singleton (rrIndex r) S.empty
+            rs -> assertFailure $
+              "fx template: expected one region, got "
+              <> show (length rs)
+      ]
+
   , testCase "kindTag is injective" $
       let ks = [minBound .. maxBound :: NodeKind]
           ts = map kindTag ks
