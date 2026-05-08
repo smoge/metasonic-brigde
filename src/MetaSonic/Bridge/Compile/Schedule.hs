@@ -52,8 +52,12 @@
 module MetaSonic.Bridge.Compile.Schedule
   ( regionSchedule
   , scheduledRuntimeRegions
+  , layeredRegionSchedule
   , Segment (..)
   , segmentByBarrier
+  , SharedWriteHazard (..)
+  , FreeLayer (..)
+  , ScheduleStep (..)
   , RegionScheduleStats (..)
   , regionScheduleStats
   , emptyScheduleStats
@@ -69,7 +73,8 @@ import           MetaSonic.Bridge.Compile.Dependencies
                    , regionHasLiveBus
                    )
 import           MetaSonic.Bridge.Compile.Types
-                   ( RuntimeGraph (..)
+                   ( BusFootprint (..)
+                   , RuntimeGraph (..)
                    , RuntimeRegion (..)
                    , RegionIndex (..)
                    )
@@ -84,6 +89,35 @@ import           MetaSonic.Bridge.Compile.Types
 data Segment
   = Barrier     !RuntimeRegion
   | FreeSegment ![RuntimeRegion]
+  deriving stock (Eq, Show)
+
+-- | A same-layer write/write conflict on a shared bus. The
+-- layer is still a valid descriptive topological layer, but a
+-- runtime could not execute every listed writer concurrently
+-- against the current shared bus storage without either
+-- serialization or a later deterministic reduction policy.
+data SharedWriteHazard = SharedWriteHazard
+  { swhBus     :: !Int
+  , swhRegions :: ![RegionIndex]
+  } deriving stock (Eq, Show)
+
+-- | One free topological layer inside a non-barrier segment.
+-- 'flRegions' are unordered only in the mathematical sense; the
+-- list order is stable 'rrIndex' order. 'flSharedWriteHazards'
+-- records same-bus write conflicts within that layer.
+data FreeLayer = FreeLayer
+  { flRegions             :: ![RegionIndex]
+  , flSharedWriteHazards  :: ![SharedWriteHazard]
+  } deriving stock (Eq, Show)
+
+-- | Descriptive layered schedule representation for §4.E.
+-- Barriers remain single pinned steps; non-barrier segments are
+-- expanded into free topological layers. No runtime consumes this
+-- yet — 'regionSchedule' remains the deterministic linear
+-- fallback.
+data ScheduleStep
+  = ScheduleBarrier   !RegionIndex
+  | ScheduleFreeLayer !FreeLayer
   deriving stock (Eq, Show)
 
 -- | Walk regions in 'rrIndex' order, partitioning into a list of
@@ -164,6 +198,32 @@ scheduledRuntimeRegions rg = do
   let byIx = M.fromList
         [ (rrIndex r, r) | r <- rgRuntimeRegions rg ]
   pure [ byIx M.! ix | ix <- ixs ]
+
+-- | Descriptive layered view of the same checked schedule as
+-- 'regionSchedule'. The planner validation runs first, so this
+-- function has the same @Left@ cases as the linear fallback. On
+-- success, barriers are emitted as single steps and each
+-- non-barrier segment is expanded into topological layers.
+--
+-- This is intentionally metadata-only. It answers "where is
+-- there candidate free work, and which candidate layers have
+-- shared-write hazards?" before any threaded runtime or
+-- deterministic bus-reduction design exists.
+layeredRegionSchedule :: RuntimeGraph -> Either String [ScheduleStep]
+layeredRegionSchedule rg = do
+  _ <- regionSchedule rg
+  let deps = regionDependencies rg
+  pure $ concatMap (layerSegment deps) (segmentByBarrier rg)
+  where
+    layerSegment _    (Barrier r) =
+      [ScheduleBarrier (rrIndex r)]
+    layerSegment deps (FreeSegment members) =
+      [ ScheduleFreeLayer FreeLayer
+          { flRegions = map rrIndex layer
+          , flSharedWriteHazards = sharedWriteHazards layer
+          }
+      | layer <- segmentLayers deps members
+      ]
 
 -- | The contract is that 'rgRuntimeRegions' is in dense ascending
 -- 'rrIndex' order from 0. 'segmentByBarrier' relies on /list/
@@ -308,12 +368,31 @@ topoSortStable intraDeps = go S.empty
 --                            concurrently. A pure chain has
 --                            layer width 1 even if the segment
 --                            itself is wide.
+--   * 'rssSharedWriteHazards'
+--                          — count of same-layer same-bus write
+--                            conflicts recorded in
+--                            'flSharedWriteHazards'. Under the
+--                            current barrier policy this should be
+--                            zero for ordinary live bus writers,
+--                            but the explicit count keeps future
+--                            probe shapes honest.
+--   * 'rssMaxRunnableLayerWidth'
+--                          — widest full free layer with no
+--                            shared-write hazards; this is the
+--                            width runnable without deterministic
+--                            reduction.
+--   * 'rssMaxReductionLayerWidth'
+--                          — widest full free layer that has at
+--                            least one shared-write hazard; this
+--                            is candidate width that would need a
+--                            deterministic reduction or
+--                            serialization policy.
 --
 -- All fields are non-negative; an empty graph yields all zeros
 -- ('emptyScheduleStats'). 'addScheduleStats' aggregates across
 -- templates by summing the four counts and taking the @max@ of
--- the two width fields, which preserves the "biggest opportunity
--- in this ensemble" reading.
+-- width fields, which preserves the "biggest opportunity in this
+-- ensemble" reading.
 data RegionScheduleStats = RegionScheduleStats
   { rssTotal               :: !Int
   , rssBarriers            :: !Int
@@ -321,6 +400,11 @@ data RegionScheduleStats = RegionScheduleStats
   , rssFreeSegments        :: !Int
   , rssMaxFreeSegmentWidth :: !Int
   , rssMaxFreeLayerWidth   :: !Int
+  , rssSharedWriteHazards  :: !Int
+  , rssMaxRunnableLayerWidth
+                           :: !Int
+  , rssMaxReductionLayerWidth
+                           :: !Int
   } deriving (Eq, Show)
 
 -- | The zero stats — the identity for 'addScheduleStats'. Useful
@@ -334,6 +418,11 @@ emptyScheduleStats = RegionScheduleStats
   , rssFreeSegments        = 0
   , rssMaxFreeSegmentWidth = 0
   , rssMaxFreeLayerWidth   = 0
+  , rssSharedWriteHazards  = 0
+  , rssMaxRunnableLayerWidth
+                           = 0
+  , rssMaxReductionLayerWidth
+                           = 0
   }
 
 -- | Combine two stats records: counts add, widths take the max.
@@ -353,6 +442,12 @@ addScheduleStats a b = RegionScheduleStats
       max (rssMaxFreeSegmentWidth a) (rssMaxFreeSegmentWidth b)
   , rssMaxFreeLayerWidth   =
       max (rssMaxFreeLayerWidth   a) (rssMaxFreeLayerWidth   b)
+  , rssSharedWriteHazards  =
+      rssSharedWriteHazards a + rssSharedWriteHazards b
+  , rssMaxRunnableLayerWidth =
+      max (rssMaxRunnableLayerWidth a) (rssMaxRunnableLayerWidth b)
+  , rssMaxReductionLayerWidth =
+      max (rssMaxReductionLayerWidth a) (rssMaxReductionLayerWidth b)
   }
 
 -- | Walk a 'RuntimeGraph''s schedule and report the descriptive
@@ -367,12 +462,11 @@ addScheduleStats a b = RegionScheduleStats
 regionScheduleStats
   :: RuntimeGraph -> Either String RegionScheduleStats
 regionScheduleStats rg = do
-  -- Forward any planner diagnostic. We only need the side effect
-  -- of validation here — the layer widths derive from
-  -- 'segmentByBarrier' + 'regionDependencies' directly.
-  _ <- regionSchedule rg
+  -- Forward any planner diagnostic through 'layeredRegionSchedule',
+  -- and derive layer-facing stats from the same representation the
+  -- survey exposes.
+  steps <- layeredRegionSchedule rg
   let segments = segmentByBarrier rg
-      deps     = regionDependencies rg
 
       barriers, free :: Int
       barriers = length [() | Barrier _      <- segments]
@@ -381,8 +475,19 @@ regionScheduleStats rg = do
       freeSegs = [rs | FreeSegment rs <- segments]
       maxSegW  = maxOr0 (map length freeSegs)
 
-      layerWidths = concatMap (segmentLayerWidths deps) freeSegs
+      layers      = [l | ScheduleFreeLayer l <- steps]
+      layerWidths = map (length . flRegions) layers
       maxLayerW   = maxOr0 layerWidths
+      runnableWs  =
+        [ length (flRegions l)
+        | l <- layers
+        , null (flSharedWriteHazards l)
+        ]
+      reductionWs =
+        [ length (flRegions l)
+        | l <- layers
+        , not (null (flSharedWriteHazards l))
+        ]
 
   pure RegionScheduleStats
     { rssTotal               = length (rgRuntimeRegions rg)
@@ -391,23 +496,27 @@ regionScheduleStats rg = do
     , rssFreeSegments        = length freeSegs
     , rssMaxFreeSegmentWidth = maxSegW
     , rssMaxFreeLayerWidth   = maxLayerW
+    , rssSharedWriteHazards  = sum (map (length . flSharedWriteHazards) layers)
+    , rssMaxRunnableLayerWidth
+                             = maxOr0 runnableWs
+    , rssMaxReductionLayerWidth
+                             = maxOr0 reductionWs
     }
 
 -- | Per-layer Kahn's over a free segment's intra-segment
 -- dependencies. Each layer is the set of regions whose deps are
 -- all already in earlier layers; layer 0 is the segment's roots.
--- Returns one width per layer.
 --
 -- A degenerate fallback (no region ready in a non-empty
 -- @remaining@) emits the rest as one final "layer" so the survey
 -- doesn't loop. The schedule planner's own cycle check would have
 -- already returned 'Left' before this code runs in
 -- 'regionScheduleStats', so this branch is purely defensive.
-segmentLayerWidths
+segmentLayers
   :: M.Map RegionIndex (S.Set RegionIndex)
   -> [RuntimeRegion]
-  -> [Int]
-segmentLayerWidths deps members =
+  -> [[RuntimeRegion]]
+segmentLayers deps members =
   let memberSet = S.fromList (map rrIndex members)
       intraDeps = M.fromList
         [ (rrIndex r
@@ -416,22 +525,37 @@ segmentLayerWidths deps members =
               (M.findWithDefault S.empty (rrIndex r) deps))
         | r <- members
         ]
-  in goLayers S.empty (map rrIndex members) intraDeps
+      byIx = M.fromList [(rrIndex r, r) | r <- members]
+  in map (map (byIx M.!)) (goLayers S.empty (map rrIndex members) intraDeps)
 
 goLayers
   :: S.Set RegionIndex
   -> [RegionIndex]
   -> M.Map RegionIndex (S.Set RegionIndex)
-  -> [Int]
+  -> [[RegionIndex]]
 goLayers _    []        _    = []
 goLayers done remaining deps =
   let depsOf ix = M.findWithDefault S.empty ix deps
       ready ix  = S.null (depsOf ix `S.difference` done)
       (layer, rest) = partition ready remaining
   in if null layer
-       then [length remaining]   -- defensive cycle fallback
-       else length layer
+       then [remaining]   -- defensive cycle fallback
+       else layer
             : goLayers (foldr S.insert done layer) rest deps
+
+sharedWriteHazards :: [RuntimeRegion] -> [SharedWriteHazard]
+sharedWriteHazards layer =
+  [ SharedWriteHazard bus writers
+  | bus <- S.toList allWrites
+  , let writers =
+          [ rrIndex r
+          | r <- layer
+          , bus `S.member` bfWrites (rrFootprint r)
+          ]
+  , length writers > 1
+  ]
+  where
+    allWrites = S.unions [bfWrites (rrFootprint r) | r <- layer]
 
 maxOr0 :: [Int] -> Int
 maxOr0 [] = 0

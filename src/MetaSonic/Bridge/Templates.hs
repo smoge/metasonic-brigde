@@ -392,6 +392,12 @@ topoSortTemplates ts precedence = do
 -- conflicting writers. Designing that policy is out of scope for
 -- this descriptive stat.
 --
+-- The runnable/reduction fields split that ambiguity without
+-- choosing a policy: a full template layer with no shared writes
+-- contributes to 'tssMaxTemplateRunnableWidth'; a full layer with
+-- at least one shared-write hazard contributes to
+-- 'tssMaxTemplateReductionWidth'.
+--
 -- The C++ side still walks templates in their compile-decreed
 -- @tgTemplates@ order; nothing currently consumes the layer
 -- width.
@@ -403,6 +409,18 @@ data TemplateScheduleStats = TemplateScheduleStats
     -- 'tgPrecedence' (template precedence width). Candidate
     -- cross-template surface area, not directly schedulable
     -- parallelism — see 'TemplateScheduleStats'.
+  , tssSharedWriteHazards    :: !Int
+    -- ^ Count of same-layer same-bus write conflicts across all
+    -- template precedence layers.
+  , tssMaxTemplateRunnableWidth
+                              :: !Int
+    -- ^ Widest full template layer with no shared-write hazards:
+    -- runnable without deterministic reduction.
+  , tssMaxTemplateReductionWidth
+                              :: !Int
+    -- ^ Widest full template layer that has at least one
+    -- shared-write hazard: candidate width that needs a
+    -- deterministic reduction or serialization policy.
   , tssAggregate             :: !RegionScheduleStats
     -- ^ Per-template stats combined via 'addScheduleStats'
     -- (counts add; widths take the max).
@@ -416,25 +434,40 @@ templateScheduleStats
   :: TemplateGraph -> Either String TemplateScheduleStats
 templateScheduleStats tg = do
   perTpl <- traverse (regionScheduleStats . tplGraph) (tgTemplates tg)
-  let agg   = foldr addScheduleStats emptyScheduleStats perTpl
-      width = templateLayerMaxWidth tg
+  let agg       = foldr addScheduleStats emptyScheduleStats perTpl
+      layers    = templateLayers tg
+      widths    = map length layers
+      hazards   = map templateLayerSharedWriteHazards layers
+      runnableW =
+        [ length layer
+        | (layer, hz) <- zip layers hazards
+        , hz == 0
+        ]
+      reductionW =
+        [ length layer
+        | (layer, hz) <- zip layers hazards
+        , hz > 0
+        ]
   pure TemplateScheduleStats
-    { tssTemplateCount         = length (tgTemplates tg)
-    , tssMaxTemplateLayerWidth = width
-    , tssAggregate             = agg
+    { tssTemplateCount              = length (tgTemplates tg)
+    , tssMaxTemplateLayerWidth      = maxOr0 widths
+    , tssSharedWriteHazards         = sum hazards
+    , tssMaxTemplateRunnableWidth   = maxOr0 runnableW
+    , tssMaxTemplateReductionWidth  = maxOr0 reductionW
+    , tssAggregate                  = agg
     }
 
 -- | Kahn's by-layer over 'tgPrecedence': the width of each
 -- precedence-DAG layer is the count of templates whose
--- predecessors are all already scheduled. Returns the @max@
--- across layers, or 0 for an empty ensemble.
+-- predecessors are all already scheduled.
 --
 -- @tgPrecedence@ is keyed by the /reader/ template (the one
 -- that depends), so a template missing from the map has no
 -- predecessors and lands in layer 0.
-templateLayerMaxWidth :: TemplateGraph -> Int
-templateLayerMaxWidth tg =
+templateLayers :: TemplateGraph -> [[Template]]
+templateLayers tg =
   let tids       = map tplID (tgTemplates tg)
+      byId       = M.fromList [(tplID t, t) | t <- tgTemplates tg]
       precedence = tgPrecedence tg
       depsOf t   = M.findWithDefault S.empty t precedence
       goLayers _ [] = []
@@ -442,9 +475,27 @@ templateLayerMaxWidth tg =
         let ready t = S.null (depsOf t `S.difference` done)
             (layer, rest) = partition ready remaining
         in if null layer
-             then [length remaining]   -- defensive: cycle was
-                                       -- already rejected upstream
-             else length layer
+             then [remaining]   -- defensive: cycle was already
+                                -- rejected upstream
+             else layer
                   : goLayers (foldr S.insert done layer) rest
-      widths = goLayers S.empty tids
-  in if null widths then 0 else maximum widths
+  in map (map (byId M.!)) (goLayers S.empty tids)
+
+templateLayerSharedWriteHazards :: [Template] -> Int
+templateLayerSharedWriteHazards layer =
+  length
+    [ bus
+    | bus <- S.toList allWrites
+    , let writers =
+            [ tplID t
+            | t <- layer
+            , bus `S.member` bfWrites (tplFootprint t)
+            ]
+    , length writers > 1
+    ]
+  where
+    allWrites = S.unions [bfWrites (tplFootprint t) | t <- layer]
+
+maxOr0 :: [Int] -> Int
+maxOr0 [] = 0
+maxOr0 xs = maximum xs

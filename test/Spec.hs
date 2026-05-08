@@ -3224,6 +3224,11 @@ unitTests = testGroup "Unit tests"
                   , rssFreeSegments        = 0
                   , rssMaxFreeSegmentWidth = 0
                   , rssMaxFreeLayerWidth   = 0
+                  , rssSharedWriteHazards  = 0
+                  , rssMaxRunnableLayerWidth
+                                           = 0
+                  , rssMaxReductionLayerWidth
+                                           = 0
                   }
 
       , -- Kernel-split: free buffer + barrier tail.
@@ -3246,6 +3251,11 @@ unitTests = testGroup "Unit tests"
                   , rssFreeSegments        = 1
                   , rssMaxFreeSegmentWidth = 1
                   , rssMaxFreeLayerWidth   = 1
+                  , rssSharedWriteHazards  = 0
+                  , rssMaxRunnableLayerWidth
+                                           = 1
+                  , rssMaxReductionLayerWidth
+                                           = 0
                   }
 
       , -- Headline parallelism case: two independent free buffers
@@ -3263,23 +3273,37 @@ unitTests = testGroup "Unit tests"
                 out 0 summed
           case lowerGraph g >>= compileRuntimeGraph of
             Left err -> assertFailure $ "compile failed: " <> err
-            Right rg -> case regionScheduleStats rg of
-              Left err -> assertFailure $ "stats failed: " <> err
-              Right s ->
-                s @?= RegionScheduleStats
-                  { rssTotal               = 3
-                  , rssBarriers            = 1
-                  , rssFree                = 2
-                  , rssFreeSegments        = 1
-                  , rssMaxFreeSegmentWidth = 2
-                  , rssMaxFreeLayerWidth   = 2
-                  }
+            Right rg -> do
+              case regionScheduleStats rg of
+                Left err -> assertFailure $ "stats failed: " <> err
+                Right s ->
+                  s @?= RegionScheduleStats
+                    { rssTotal               = 3
+                    , rssBarriers            = 1
+                    , rssFree                = 2
+                    , rssFreeSegments        = 1
+                    , rssMaxFreeSegmentWidth = 2
+                    , rssMaxFreeLayerWidth   = 2
+                    , rssSharedWriteHazards  = 0
+                    , rssMaxRunnableLayerWidth
+                                             = 2
+                    , rssMaxReductionLayerWidth
+                                             = 0
+                    }
+              layeredRegionSchedule rg @?=
+                Right
+                  [ ScheduleFreeLayer FreeLayer
+                      { flRegions = [RegionIndex 0, RegionIndex 1]
+                      , flSharedWriteHazards = []
+                      }
+                  , ScheduleBarrier (RegionIndex 2)
+                  ]
 
       , -- Aggregation: empty + s = s, and (a + b) sums counts and
         -- maxes widths.
         testCase "addScheduleStats: counts add, widths max" $ do
-          let a = RegionScheduleStats 3 1 2 1 2 2
-              b = RegionScheduleStats 5 4 1 1 1 1
+          let a = RegionScheduleStats 3 1 2 1 2 2 0 2 0
+              b = RegionScheduleStats 5 4 1 1 1 1 1 1 1
           addScheduleStats emptyScheduleStats a @?= a
           addScheduleStats a emptyScheduleStats @?= a
           addScheduleStats a b @?=
@@ -3290,6 +3314,11 @@ unitTests = testGroup "Unit tests"
               , rssFreeSegments        = 2
               , rssMaxFreeSegmentWidth = 2
               , rssMaxFreeLayerWidth   = 2
+              , rssSharedWriteHazards  = 1
+              , rssMaxRunnableLayerWidth
+                                       = 2
+              , rssMaxReductionLayerWidth
+                                       = 1
               }
 
       , -- Cross-template width: a chain ensemble (voice → fx via
@@ -3312,17 +3341,42 @@ unitTests = testGroup "Unit tests"
               Right s -> do
                 tssTemplateCount         s @?= 2
                 tssMaxTemplateLayerWidth s @?= 1
+                tssSharedWriteHazards    s @?= 0
+                tssMaxTemplateRunnableWidth s @?= 1
+                tssMaxTemplateReductionWidth s @?= 0
                 rssTotal    (tssAggregate s) @?= 2
                 rssBarriers (tssAggregate s) @?= 2
+
+      , -- Two independent voices writing different buses have no
+        -- precedence on each other and no shared-write hazard, so
+        -- the full layer-0 width is runnable without reduction.
+        testCase "templateScheduleStats: disjoint writers are runnable width 2" $ do
+          let left = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                a <- gain s (Param 0.3)
+                out 0 a
+              right = runSynth $ do
+                s <- sawOsc 220.0 0.0
+                a <- gain s (Param 0.3)
+                out 1 a
+          case compileTemplateGraph [("left", left), ("right", right)] of
+            Left err -> assertFailure err
+            Right tg -> case templateScheduleStats tg of
+              Left err -> assertFailure $ "stats failed: " <> err
+              Right s -> do
+                tssTemplateCount              s @?= 2
+                tssMaxTemplateLayerWidth      s @?= 2
+                tssSharedWriteHazards         s @?= 0
+                tssMaxTemplateRunnableWidth   s @?= 2
+                tssMaxTemplateReductionWidth  s @?= 0
 
       , -- Two independent voices feeding one fx: voices have no
         -- precedence on each other (both write the same bus,
         -- neither reads from the other), so layer 0 = {voice-l,
         -- voice-r}, layer 1 = {fx}. Max template precedence
-        -- width = 2 — candidate cross-template surface area.
-        -- (Note: actual concurrent execution would still need a
-        -- deterministic policy for the shared bus-7 write; this
-        -- test only pins the precedence-DAG width.)
+        -- width = 2. Because the two voices also share bus 7,
+        -- the full layer is reduction-needed width, not runnable
+        -- width.
         testCase "templateScheduleStats: two voices + one fx → layer width 2" $ do
           let voiceL = runSynth $ do
                 s <- sawOsc 110.0 0.0
@@ -3346,8 +3400,11 @@ unitTests = testGroup "Unit tests"
             Right tg -> case templateScheduleStats tg of
               Left err -> assertFailure $ "stats failed: " <> err
               Right s -> do
-                tssTemplateCount         s @?= 3
-                tssMaxTemplateLayerWidth s @?= 2
+                tssTemplateCount              s @?= 3
+                tssMaxTemplateLayerWidth      s @?= 2
+                tssSharedWriteHazards         s @?= 1
+                tssMaxTemplateRunnableWidth   s @?= 1
+                tssMaxTemplateReductionWidth  s @?= 2
       ]
 
   , testGroup "Phase 4.D.1: rnRate carries IR-propagated rate"

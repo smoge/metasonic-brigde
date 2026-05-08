@@ -68,8 +68,12 @@ module MetaSonic.Bridge.Compile
     -- consumes.
     regionSchedule
   , scheduledRuntimeRegions
+  , layeredRegionSchedule
   , Segment (..)
   , segmentByBarrier
+  , SharedWriteHazard (..)
+  , FreeLayer (..)
+  , ScheduleStep (..)
   , RegionScheduleStats (..)
   , regionScheduleStats
   , emptyScheduleStats

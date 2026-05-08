@@ -2311,17 +2311,25 @@ scanRows rows =
 --           pure chain has layer width 1 even when the segment
 --           is wide, so a graph with @maxLW = 1@ everywhere has
 --           no parallelism a worker pool could exploit.
+--   runW  : widest full free layer with no shared-write hazards;
+--           this is runnable without deterministic reduction.
+--   redW  : widest full free layer with at least one shared-write
+--           hazard; this is width that would need deterministic
+--           reduction or serialization.
+--   haz   : count of same-layer same-bus write hazards.
 --
--- The headline number for "is a worker pool worth building yet"
--- is the survey-wide @max(maxLW)@ in the footer. If it stays at
--- 1 across demos and corpus, the graphs are sink-or-chain
--- dominated and worker threads are premature.
+-- The headline numbers for "is a worker pool worth building yet"
+-- are the survey-wide @max(runW)@ and @max(redW)@ in the footer.
+-- The former is directly runnable under the current shared-bus
+-- model; the latter is potential parallel width gated on a future
+-- deterministic reduction policy.
 printScheduleWidth :: [SurveyRow] -> IO ()
 printScheduleWidth rows = do
   putStrLn "─── Schedule width (§4.E.2c parallel-readiness) ───"
   putStrLn $ formatScheduleRow
     [ "demo", "template"
     , "total", "B", "F", "segs", "maxSW", "maxLW"
+    , "runW", "redW", "haz"
     ]
   mapM_ (putStrLn . formatScheduleRow . renderScheduleRow) rows
   putStrLn ""
@@ -2338,6 +2346,9 @@ printScheduleWidth rows = do
           <> "  segs="    <> show (rssFreeSegments        agg)
           <> "  maxSW="   <> show (rssMaxFreeSegmentWidth agg)
           <> "  maxLW="   <> show (rssMaxFreeLayerWidth   agg)
+          <> "  runW="    <> show (rssMaxRunnableLayerWidth agg)
+          <> "  redW="    <> show (rssMaxReductionLayerWidth agg)
+          <> "  haz="     <> show (rssSharedWriteHazards  agg)
 
 renderScheduleRow :: SurveyRow -> [String]
 renderScheduleRow r =
@@ -2350,12 +2361,15 @@ renderScheduleRow r =
      , show (rssFreeSegments        s)
      , show (rssMaxFreeSegmentWidth s)
      , show (rssMaxFreeLayerWidth   s)
+     , show (rssMaxRunnableLayerWidth s)
+     , show (rssMaxReductionLayerWidth s)
+     , show (rssSharedWriteHazards  s)
      ]
 
 -- Mirrors 'surveyColumnWidths' in shape but narrower — the
 -- schedule columns are all small integers.
 scheduleColumnWidths :: [Int]
-scheduleColumnWidths = [42, 14, 6, 4, 4, 5, 6, 6]
+scheduleColumnWidths = [42, 14, 6, 4, 4, 5, 6, 6, 5, 5, 4]
 
 formatScheduleRow :: [String] -> String
 formatScheduleRow cols =
@@ -2375,11 +2389,12 @@ formatScheduleRow cols =
 --                Candidate cross-template surface area: width
 --                @>= 2@ means some templates have no precedence
 --                dependency on each other in the source graph.
---                It is /not/ a direct claim that those templates
---                could run concurrently — templates at the same
---                layer may still write the same bus, which a real
---                threaded runtime would have to serialize or
---                resolve via deterministic per-worker reduction.
+--   tplRunW    : widest full template layer with no shared-write
+--                hazards; runnable without deterministic reduction.
+--   tplRedW    : widest full template layer with at least one
+--                shared-write hazard; needs deterministic reduction
+--                or serialization before it can run at full width.
+--   tplHaz     : count of same-layer same-bus template write hazards.
 --   sumTotal   : sum of 'rssTotal' across templates (all regions
 --                in the ensemble)
 --   sumF       : sum of 'rssFree' across templates
@@ -2387,21 +2402,23 @@ formatScheduleRow cols =
 --                (intra-template free-layer width, repeated here
 --                for at-a-glance comparison with tplLayerW)
 --
--- Footer reports survey-wide max @tplLayerW@. Width 1 means
--- templates form a precedence chain everywhere; width @>= 2@
--- flags ensembles where template-level scheduling has shape to
--- exploit, conditional on a separate design for shared-bus
--- writes.
+-- Footer reports survey-wide max @tplLayerW@ / @tplRunW@ /
+-- @tplRedW@. A non-zero @tplRedW@ is deliberately descriptive:
+-- it marks surface area that needs the separate deterministic bus
+-- reduction slice.
 printEnsembleScheduleWidth :: [EnsembleScheduleRow] -> IO ()
 printEnsembleScheduleWidth rows = do
   putStrLn "─── Cross-template width (§4.E.2c) ───"
   putStrLn $ formatEnsembleRow
-    [ "ensemble", "tpls", "tplLayerW"
+    [ "ensemble", "tpls", "tplLayerW", "tplRunW", "tplRedW", "tplHaz"
     , "sumTotal", "sumF", "maxLW"
     ]
   mapM_ (putStrLn . formatEnsembleRow . renderEnsembleRow) rows
   putStrLn ""
-  let maxTplLW = maxOr0 (map (tssMaxTemplateLayerWidth . esStats) rows)
+  let maxTplLW = maxOr0 (map (tssMaxTemplateLayerWidth     . esStats) rows)
+      maxTplRW = maxOr0 (map (tssMaxTemplateRunnableWidth  . esStats) rows)
+      maxTplDW = maxOr0 (map (tssMaxTemplateReductionWidth . esStats) rows)
+      sumTplHz = sum    (map (tssSharedWriteHazards        . esStats) rows)
       sumTpls  = sum    (map (tssTemplateCount        . esStats) rows)
       aggAll   = foldr addScheduleStats emptyScheduleStats
                        (map (tssAggregate . esStats) rows)
@@ -2409,6 +2426,9 @@ printEnsembleScheduleWidth rows = do
           <> "ensembles="            <> show (length rows)
           <> "  templates="          <> show sumTpls
           <> "  max(tplLayerW)="     <> show maxTplLW
+          <> "  max(tplRunW)="       <> show maxTplRW
+          <> "  max(tplRedW)="       <> show maxTplDW
+          <> "  tplHaz="             <> show sumTplHz
           <> "  total="              <> show (rssTotal               aggAll)
           <> "  F="                  <> show (rssFree                aggAll)
           <> "  max(maxLW)="         <> show (rssMaxFreeLayerWidth   aggAll)
@@ -2423,13 +2443,16 @@ renderEnsembleRow r =
   in [ esLabel r
      , show (tssTemplateCount         s)
      , show (tssMaxTemplateLayerWidth s)
+     , show (tssMaxTemplateRunnableWidth s)
+     , show (tssMaxTemplateReductionWidth s)
+     , show (tssSharedWriteHazards    s)
      , show (rssTotal               agg)
      , show (rssFree                agg)
      , show (rssMaxFreeLayerWidth   agg)
      ]
 
 ensembleColumnWidths :: [Int]
-ensembleColumnWidths = [42, 5, 10, 9, 5, 6]
+ensembleColumnWidths = [42, 5, 10, 7, 7, 7, 9, 5, 6]
 
 formatEnsembleRow :: [String] -> String
 formatEnsembleRow cols =

@@ -37,6 +37,16 @@ Major changes:
   regions as barrier regions.
 - Added `regionHasLiveBus` and `isLiveBusKind`.
 - Documented the scheduler contract before adding worker threads.
+- Added the checked deterministic linear scheduler surface:
+  `regionSchedule` and `scheduledRuntimeRegions`.
+- Added the §4.E layered schedule representation:
+  `ScheduleStep`, `FreeLayer`, `SharedWriteHazard`, and
+  `layeredRegionSchedule`. Barriers remain pinned steps; non-barrier
+  segments become stable topological free layers.
+- Extended `--fusion-survey` schedule reporting with runnable-vs-reduction
+  width columns:
+  - per-graph: `runW`, `redW`, `haz`;
+  - cross-template: `tplRunW`, `tplRedW`, `tplHaz`.
 
 Design decisions:
 
@@ -46,8 +56,12 @@ Design decisions:
   barrier path because their bus controls can be changed dynamically.
 - `KBusInDelayed` is not a live-bus barrier for same-block dependencies because
   it reads the previous block.
-- The next safe scheduler step is deterministic single-thread scheduling before
-  any worker pool or parallel bus reduction.
+- `regionSchedule` remains the deterministic linear fallback. The layered
+  representation is descriptive only; it does not authorize runtime
+  parallelism.
+- A non-zero `redW` / `tplRedW` is evidence for a later deterministic
+  bus-reduction design, not something the current runtime may execute
+  concurrently.
 
 ## 2026-05-07 to 2026-05-08: Region Kernels And Fusion Evidence
 
@@ -357,8 +371,10 @@ Design decisions:
 
 - Mechanically split the large `MetaSonic.Bridge.Compile` module while keeping
   the public facade stable.
-- Add a deterministic single-thread region scheduler that consumes
-  `regionDependencies` and honors live-bus barriers.
+- Design deterministic bus reduction for shared output-bus writes before
+  adding runtime worker threads. The current survey now distinguishes
+  immediately runnable width (`runW` / `tplRunW`) from width gated on
+  reduction (`redW` / `tplRedW`).
 - Continue using `--fusion-survey` and `rt_graph_bench` before adding kernels.
   Tri/Pulse/Add filtered-tail kernels are gated on multi-source recurrence;
   no kernel work is currently justified.
@@ -378,15 +394,9 @@ Design decisions:
   distinct kinds out of 235 `RFrom` edges. Decision: preserve
   the metadata, park a runtime block-rate execution path until
   the signal grows.
-- §4.E is the next implementation focus, but only incrementally.
-  The right next slice is not "threads"; it is a richer parallel
-  execution plan — keep `regionSchedule` as the deterministic
-  linear fallback, add a layer / step representation (barriers
-  plus free layers), surface shared-write hazards explicitly
-  (especially output-bus accumulation), and extend the survey
-  to distinguish "parallel width that is actually runnable
-  without reduction" from "width that needs deterministic
-  reduction." Deterministic bus reduction comes after that plan
-  can prove where reduction is needed.
+- §4.E should continue incrementally. The layer / step representation and
+  survey split are now in place; the next slice is deterministic bus reduction
+  design. Runtime parallelism remains later, after the reduction policy and
+  benchmark harness can prove where it is worth enabling.
 - Tri/Pulse/Add filtered-tail kernels remain parked on
   multi-source recurrence; no kernel work is currently justified.
