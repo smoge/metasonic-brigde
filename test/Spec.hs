@@ -2494,6 +2494,101 @@ unitTests = testGroup "Unit tests"
             rs -> assertFailure $
               "fx template: expected one region, got "
               <> show (length rs)
+
+      , -- §4.E.1c barrier predicate at the NodeKind level. The
+        -- three live-bus kinds (KBusIn / KOut / KBusOut) each
+        -- carry a runtime-redirectable bus index in
+        -- 'rnControls[0]', so any region containing them is a
+        -- scheduler barrier. KBusInDelayed is excluded — its
+        -- read is from the previous block's snapshot, which is
+        -- deterministic regardless of intra-block scheduling
+        -- order.
+        --
+        -- This pins the kind-level contract directly so the
+        -- graph-level tests below can rely on it for shape-
+        -- specific cases without re-arguing the policy.
+        testCase "isLiveBusKind: KBusIn / KOut / KBusOut yes; KBusInDelayed and others no" $ do
+          isLiveBusKind KBusIn        @?= True
+          isLiveBusKind KOut          @?= True
+          isLiveBusKind KBusOut       @?= True
+          isLiveBusKind KBusInDelayed @?= False
+          isLiveBusKind KSinOsc       @?= False
+          isLiveBusKind KGain         @?= False
+          isLiveBusKind KLPF          @?= False
+
+      , -- A simple sin → gain → out chain has KOut in its
+        -- single region, so 'regionHasLiveBus' must say True —
+        -- the region is a barrier. (Effectively every chain
+        -- ending in Out / BusOut is a barrier under the policy.)
+        testCase "regionHasLiveBus: chain with KOut is a barrier" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              case rgRuntimeRegions rg of
+                [r] -> regionHasLiveBus rg r @?= True
+                rs -> assertFailure $
+                  "expected exactly one region, got " <> show (length rs)
+
+      , -- §4.E.1c × kernel-split: in the canonical
+        -- @saw → lpf → gain → add → out@ split, the
+        -- 'RSawLpfGain' buffer region has /no/ live-bus node and
+        -- is therefore /not/ a barrier — its dependency is
+        -- structural (the trailing region reads its gain output
+        -- via a port edge, see the §4.E.1b test above), but the
+        -- region itself can in principle be moved by a
+        -- non-barrier-aware scheduler so long as it precedes the
+        -- consumer. The trailing 'RNodeLoop' region carrying
+        -- @[Add, Out]@ /is/ a barrier (via KOut) and stays in
+        -- compile-decreed order regardless of dependency
+        -- analysis.
+        --
+        -- Pins the discrimination: barrier-ness tracks live-bus
+        -- membership only, not dependency-graph reach.
+        testCase "regionHasLiveBus: kernel-split — buffer region not a barrier, sink region is" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions = rgRuntimeRegions rg
+                  bufs    = [r | r <- regions, rrKernel r == RSawLpfGain]
+                  tails   = [r | r <- regions, rrKernel r == RNodeLoop]
+              case (bufs, tails) of
+                ([buf], [tail_]) -> do
+                  regionHasLiveBus rg buf   @?= False
+                  regionHasLiveBus rg tail_ @?= True
+                _ -> assertFailure $
+                  "expected one RSawLpfGain region + one RNodeLoop "
+                  <> "tail, got " <> show (length bufs)
+                  <> " + " <> show (length tails)
+
+      , -- Internal send/return: both regions contain live-bus
+        -- nodes (producer has KBusOut, consumer has KBusIn and
+        -- KOut), so both are barriers. The dependency between
+        -- them ('regionBusPrecedence' edge) is incidental for the
+        -- barrier predicate — barrier-ness is per-region,
+        -- independent of whether there's an inter-region edge.
+        testCase "regionHasLiveBus: send/return — both regions are barriers" $ do
+          let g = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                busOut 5 s
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions = rgRuntimeRegions rg
+              all (regionHasLiveBus rg) regions @?= True
       ]
 
   , testCase "kindTag is injective" $

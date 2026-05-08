@@ -46,6 +46,9 @@ module MetaSonic.Bridge.Compile
   , regionBusPrecedence
   , regionStructuralPrecedence
   , regionDependencies
+  , -- * Scheduler barrier predicate (see Note [Region barrier policy])
+    isLiveBusKind
+  , regionHasLiveBus
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
@@ -1446,34 +1449,26 @@ own diagnostic value. Hiding it behind the combined view would
 make it harder to answer "is this dependency a bus dependency or
 a port dependency?" when debugging schedules.
 
-Static-vs-dynamic bus controls — open policy decision.
+Static-vs-dynamic bus controls — resolved by §4.E.1c.
 'BusFootprint' is built from each node's compile-time
 'rnControls[0]'. 'rt_graph_instance_set_control' can change a
 'KBusIn' / 'KOut' / 'KBusOut' bus index at runtime, so the
 static dependency graph stops being valid once a bus index is
-redirected. This is descriptive metadata today (the runtime
-still executes regions in compile-decreed order regardless), but
-§4.E.2 cannot consume 'regionDependencies' under a parallel
-scheduler without first picking one of:
+redirected.
 
-  1. Bus-index controls (slot 0 on KBusIn/KOut/KBusOut) become
-     /static/ — set_control on those slots is rejected. The
-     compile-time graph is then guaranteed valid for the
-     graph's lifetime.
-  2. Any node whose bus index is dynamic forces the schedule
-     onto a serialized / barrier path — the scheduler refuses
-     to parallelize across a dynamic bus boundary. Static
-     subgraphs still parallelize freely.
-  3. A bus-control change triggers a scheduler rebuild before
-     the next process_graph block — the SPSC control queue
-     drainer recomputes 'regionDependencies' and reissues a new
-     schedule when it sees a bus-redirect.
+§4.E.1c picks the barrier-path policy: regions containing any
+live-bus node ('KBusIn' / 'KOut' / 'KBusOut') are barriers and
+must execute in compile-decreed order, regardless of what
+'regionDependencies' would otherwise allow. Non-barrier regions
+are scheduled freely subject to 'regionDependencies', with
+'rrIndex' order as the tie-breaker. See Note [Region barrier
+policy] for the predicate ('regionHasLiveBus'), the rationale,
+and the alternatives that were rejected.
 
-§4.E.2 must pick one before threads land. Until then,
-'regionDependencies' is descriptive only and 'compileRuntimeGraph'
-still produces a topologically valid sequential order; this
-limitation is non-blocking for §4.E.1 / §4.E.1b but is
-load-bearing for any later parallelism work.
+This means 'regionDependencies' is the /correctness/ contract
+for non-barrier regions. The scheduler combines it with
+'regionHasLiveBus' to decide what can move; nothing about
+'regionDependencies' itself depends on the policy.
 -}
 
 -- | Source 'NodeIndex' of a 'RuntimeInput', if any.
@@ -1565,13 +1560,102 @@ regionStructuralPrecedence rg =
 -- structural-port edges. This is the view a future scheduler
 -- (§4.E.2) consumes for any "must precede" decision. See
 -- Note [Region dependency contract] for why both edge classes
--- matter and for the open policy question around dynamic bus
--- controls.
+-- matter, and Note [Region barrier policy] for how a scheduler
+-- combines this with 'regionHasLiveBus' to handle dynamic bus
+-- controls safely.
 regionDependencies :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
 regionDependencies rg =
   M.unionWith S.union
     (regionBusPrecedence rg)
     (regionStructuralPrecedence rg)
+
+{- Note [Region barrier policy]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The §4.E.1b dependency-contract note flagged that 'BusFootprint'
+is built from compile-time 'rnControls[0]' and that
+'rt_graph_instance_set_control' can change a 'KBusIn' / 'KOut' /
+'KBusOut' bus index at runtime. The static dependency graph is
+therefore only valid for as long as bus controls hold their
+compile-time values.
+
+§4.E.1c decision: dynamic-bus regions are /barriers/.
+
+A region is a barrier iff 'regionHasLiveBus' holds — i.e. it
+contains at least one 'KBusIn', 'KOut', or 'KBusOut' node.
+'KBusInDelayed' is excluded for the same reason it's excluded
+from precedence: the read is deterministic across blocks
+regardless of where it sits in the schedule, so a delayed-read
+node neither constrains nor depends on intra-block ordering.
+
+The scheduler contract (consumed by §4.E.2 onwards):
+
+  1. Barrier regions execute in their compile-decreed order
+     ('rrIndex' order). They are not reordered, not parallelized
+     across thread boundaries, and not merged with other
+     regions. A bus-redirect on any node inside them changes
+     where the live signal flows but cannot move the region
+     itself.
+  2. Non-barrier regions are scheduled freely subject to
+     'regionDependencies', with stable 'rrIndex' order as the
+     tie-breaker.
+  3. Bit-equivalence with the current single-thread executor
+     must hold under any schedule the policy permits; the
+     scheduler is the one component that has to prove this.
+
+Why not the other two policy options:
+
+  * Static bus controls (reject set_control on bus slots) would
+    break existing tests that intentionally cover live bus-index
+    redirects, including the §4.B 'set_control on RBusInLpfGainOut
+    covers busin.bus + …' coverage test. That's a real behavior
+    surface, not an artifact.
+  * Scheduler rebuild on bus-control changes is operationally
+    much larger than it sounds — per-instance redirects would
+    require recomputing the dependency graph on the audio thread
+    before the next block, with all the realtime-safety
+    constraints that implies. Defer until there's evidence the
+    cheaper barrier-path policy isn't enough.
+
+Static-bus annotations (an opt-in API marking specific bus
+controls as immutable) are a viable later relaxation: regions
+whose every bus index is annotated static lose their barrier
+status and become freely schedulable. Add when measured
+parallelism gain justifies the API surface.
+-}
+
+-- | Whether a 'NodeKind' represents a /live-bus/ node — one
+-- whose bus-index control ('rnControls[0]') can be redirected
+-- at runtime via 'rt_graph_instance_set_control', and whose
+-- bus access participates in same-block ordering. 'KBusIn' /
+-- 'KOut' / 'KBusOut' qualify; 'KBusInDelayed' does not (its
+-- read is from the previous block's snapshot, deterministic
+-- regardless of intra-block scheduling order — see
+-- 'process_busin_delayed' in @rt_graph.cpp@).
+isLiveBusKind :: NodeKind -> Bool
+isLiveBusKind KBusIn  = True
+isLiveBusKind KOut    = True
+isLiveBusKind KBusOut = True
+isLiveBusKind _       = False
+
+-- | Whether a region contains any live-bus node. Under the
+-- §4.E.1c scheduler policy (see Note [Region barrier policy])
+-- this is the predicate identifying /barrier regions/ that must
+-- execute in compile-decreed order regardless of what
+-- 'regionDependencies' would otherwise allow.
+--
+-- Defined on kinds (not on 'rrFootprint') so an invalid bus
+-- index in 'rnControls[0]' — silently excluded from the
+-- footprint by 'runtimeNodeFootprint's sanitization — still
+-- marks its region as a barrier. The point of the predicate is
+-- that the node's bus control /could/ be redirected at runtime,
+-- whether or not the current value is sane.
+regionHasLiveBus :: RuntimeGraph -> RuntimeRegion -> Bool
+regionHasLiveBus rg r =
+  let nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
+      memberIsLiveBus ix = case M.lookup ix nodeMap of
+        Just n  -> isLiveBusKind (rnKind n)
+        Nothing -> False
+  in any memberIsLiveBus (rrNodes r)
 
 -- | Result of a successful kernel-shape lookup in
 -- 'findKernelMatch'. Carrying the matched length explicitly makes
