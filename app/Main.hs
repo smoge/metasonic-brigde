@@ -958,20 +958,25 @@ printRegionLine kindOf r = do
 -- caught — i.e. shapes whose §4.B preconditions hold but whose
 -- chain wasn't claimed by any region kernel today.
 data SinkShape
-  = SinkOscGain    !NodeKind   -- producer → Gain → sink
-  | SinkOscLpfGain !NodeKind   -- producer → LPF → Gain → sink
+  = SinkOscGain     !NodeKind   -- producer → Gain → sink
+  | SinkOscLpfGain  !NodeKind   -- producer → LPF → Gain → sink
+  | SinkBusInLpfGain            -- BusIn → LPF → Gain → sink
+                                -- (return tail of a send-return)
   deriving (Eq, Show)
 
 -- The full enumeration of shapes the survey reports on. Listed in
--- a deliberate display order: 3-node sinks first (the strongest
--- fusion class per notes/fusion-strategy.md), then 4-node sinks;
--- producer kinds within each group follow 'sinkProducerKinds'.
--- Iterating this list (rather than keying a Map by SinkShape)
--- avoids needing 'Ord NodeKind' and gives stable column order.
+-- a deliberate display order: 3-node oscillator-rooted sinks first
+-- (the strongest fusion class per notes/fusion-strategy.md), then
+-- 4-node oscillator-rooted sinks, then BusIn-rooted return tails.
+-- Producer kinds within the oscillator groups follow
+-- 'sinkProducerKinds'. Iterating this list (rather than keying a
+-- Map by SinkShape) avoids needing 'Ord NodeKind' and gives stable
+-- column order.
 allKnownShapes :: [SinkShape]
 allKnownShapes =
   [SinkOscGain    k | k <- sinkProducerKinds]
   <> [SinkOscLpfGain k | k <- sinkProducerKinds]
+  <> [SinkBusInLpfGain]
 
 -- Producer kinds the survey treats as "oscillator-like" sources.
 -- Restricted to the kinds that already exist in the DSL and that
@@ -992,6 +997,7 @@ renderProducer k         = show k
 renderShape :: SinkShape -> String
 renderShape (SinkOscGain k)    = renderProducer k <> " → Gain → sink"
 renderShape (SinkOscLpfGain k) = renderProducer k <> " → LPF → Gain → sink"
+renderShape SinkBusInLpfGain   = "BusIn → LPF → Gain → sink"
 
 -- Whether the §4.B kernel set currently has a kernel that would
 -- claim this shape (independent of whether the kernel
@@ -1036,8 +1042,9 @@ windows4 _                      = []
 -- i.e. whether some kernel actually claimed it.
 scanSinkShapes :: RuntimeGraph -> [(SinkShape, Bool)]
 scanSinkShapes rt =
-     concatMap check3 (windows3 (rgNodes rt))
-  ++ concatMap check4 (windows4 (rgNodes rt))
+     concatMap check3    (windows3 (rgNodes rt))
+  ++ concatMap check4    (windows4 (rgNodes rt))
+  ++ concatMap check4Bus (windows4 (rgNodes rt))
   where
     fusedRegions = [r | r <- rgRuntimeRegions rt, rrKernel r /= RNodeLoop]
     inSameFusedRegion ixs =
@@ -1072,6 +1079,32 @@ scanSinkShapes rt =
       , not (rnElided a) && not (rnElided b)
                          && not (rnElided c) && not (rnElided d)
       = [( SinkOscLpfGain (rnKind a)
+         , inSameFusedRegion
+             [rnIndex a, rnIndex b, rnIndex c, rnIndex d] )]
+      | otherwise = []
+
+    -- BusIn-rooted return tail: BusIn → LPF → Gain → sink. Same
+    -- preconditions as 'check4' for the LPF/Gain/sink portion;
+    -- producer constraint changes from 'sinkProducerKinds' to a
+    -- direct KBusIn check (BusIn isn't an "oscillator-like" source,
+    -- it's a bus reader). No kernel claims this shape today —
+    -- 'shapeHasKernel SinkBusInLpfGain = False' — so the row tracks
+    -- a future-kernel candidate.
+    check4Bus (a, b, c, d)
+      | rnKind a == KBusIn
+      , rnKind b == KLPF
+      , rnKind c == KGain
+      , isSinkKind (rnKind d)
+      , rnConsumerCount a == 1
+      , rnConsumerCount b == 1
+      , rnConsumerCount c == 1
+      , signalSourceIsRT (rnIndex a) b
+      , signalSourceIsRT (rnIndex b) c
+      , signalSourceIsRT (rnIndex c) d
+      , isScalarGainRT c
+      , not (rnElided a) && not (rnElided b)
+                         && not (rnElided c) && not (rnElided d)
+      = [( SinkBusInLpfGain
          , inSameFusedRegion
              [rnIndex a, rnIndex b, rnIndex c, rnIndex d] )]
       | otherwise = []
