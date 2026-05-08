@@ -431,8 +431,11 @@ usage prog = unlines
   , "                   counts) and print a coverage table — per-template"
   , "                   region-kernel claims, §4.C elisions, and a sink-"
   , "                   terminal opportunity scan flagging shapes a future"
-  , "                   kernel could claim. No audio, no TUI, just the"
-  , "                   report."
+  , "                   kernel could claim. The fixed 'surveyCorpus' set"
+  , "                   of survey-only graphs (corpus:* rows) is always"
+  , "                   included regardless of demo targeting; demos and"
+  , "                   corpus get separate subtotals. No audio, no TUI,"
+  , "                   just the report."
   , ""
   , "Availavle demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
@@ -1159,6 +1162,166 @@ surveyDemo demo = case demoBody demo of
     let (_b, g, _cc) = runSynthCCs build
     in [surveySynthGraph (demoKey demo) Nothing g]
 
+-- Note [Survey corpus design]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- 'surveyCorpus' is a small, fixed set of survey-only graphs that
+-- exists to give --fusion-survey realistic patch shapes without
+-- polluting the playable demo list. Demos answer "what plays";
+-- corpus answers "what coverage do the §4.B kernels achieve on
+-- patches users will plausibly write".
+--
+-- The corpus is grouped by intent:
+--
+--   * pos/…   — chains expected to claim a §4.B kernel today, plus
+--               one "missed-opportunity" entry pointing at the next
+--               kernel candidate (Noise → LPF → Gain → sink).
+--   * multi/… — multi-branch / send-return shapes that exercise
+--               the matcher's per-chain claiming.
+--   * miss/…  — modulation-heavy or multi-consumer shapes that
+--               should /not/ claim, on purpose. They guard against
+--               matcher overreach (a future change widening the
+--               claim predicate would start firing kernels here).
+--   * neg/…   — stateful producers (Env, Smooth, Delay) explicitly
+--               excluded from §4.B candidacy by the strategy note.
+--
+-- Intent is encoded in inline comments per graph; the survey reports
+-- counts only. If a comment and the survey output disagree, that's a
+-- signal to investigate (matcher drift, strategy update, or stale
+-- comment) — not to fix the comment without thought.
+--
+-- These graphs are not run as audio. They flow only through
+-- --fusion-survey via 'surveyCorpusRows'.
+surveyCorpus :: [(String, SynthGraph)]
+surveyCorpus =
+  -- ── Positive: chains the §4.B matcher should claim ────────────
+  [ ( "pos/sin-gain-out"
+    , runSynth $ do
+        s <- sinOsc 220.0 0.0
+        a <- gain s 0.4
+        out 0 a )                            -- expect: RSinGainOut
+
+  , ( "pos/saw-gain-out"
+    , runSynth $ do
+        s <- sawOsc 110.0 0.0
+        a <- gain s 0.3
+        out 0 a )                            -- expect: RSawGainOut
+
+  , ( "pos/noise-gain-out"
+    , runSynth $ do
+        n <- noiseGen
+        a <- gain n 0.2
+        out 0 a )                            -- expect: RNoiseGainOut
+
+  , ( "pos/saw-lpf-gain-out"
+    , runSynth $ do
+        s <- sawOsc 110.0 0.0
+        f <- lpf s 1200.0 0.7
+        a <- gain f 0.4
+        out 0 a )                            -- expect: RSawLpfGainOut
+
+  , ( "pos/noise-lpf-gain-out"
+    , runSynth $ do
+        n <- noiseGen
+        f <- lpf n 800.0 0.7
+        a <- gain f 0.3
+        out 0 a )                            -- missed opportunity: no
+                                             -- Noise→LPF→Gain→sink kernel today
+
+  -- ── Multi-branch / realistic patch shapes ─────────────────────
+  , ( "multi/three-detuned-saws-summed"
+    , runSynth $ do
+        -- Each branch is independent; the runtime sums onto bus 0.
+        -- Same shape as 'detunedSawGraph' but with three voices.
+        s1 <- sawOsc 110.0 0.0; a1 <- gain s1 0.2; out 0 a1
+        s2 <- sawOsc 110.5 0.0; a2 <- gain s2 0.2; out 0 a2
+        s3 <- sawOsc 109.5 0.0; a3 <- gain s3 0.2; out 0 a3 )
+                                             -- expect: 3 × RSawGainOut
+
+  , ( "multi/additive-sin-saw-noise"
+    , runSynth $ do
+        s <- sinOsc 220.0 0.0; a1 <- gain s 0.3; out 0 a1
+        w <- sawOsc 110.0 0.0; a2 <- gain w 0.3; out 0 a2
+        n <- noiseGen;         a3 <- gain n 0.1; out 0 a3 )
+                                             -- expect: RSinGainOut + RSawGainOut + RNoiseGainOut
+
+  , ( "multi/send-return"
+    , runSynth $ do
+        -- Voice writes to bus 7; return reads, filters, scales.
+        s <- sawOsc 110.0 0.0
+        a <- gain s 0.4
+        busOut 7 a                           -- voice: RSawGainOut via BusOut sink
+        r <- busIn 7
+        f <- lpf r 1500.0 0.7
+        b <- gain f 0.8
+        out 0 b )                            -- return tail: BusIn→LPF→Gain→Out;
+                                             -- not in current producer-shape scan
+
+  -- ── Mod-heavy / intentional misses ────────────────────────────
+  , ( "miss/audio-modulated-gain"
+    , runSynth $ do
+        -- Gain amount is an audio-rate signal (LFO), not a Param;
+        -- isScalarGain blocks the match.
+        s   <- sinOsc 220.0 0.0
+        lfo <- sinOsc 4.0   0.0
+        a   <- gain s lfo
+        out 0 a )                            -- unclaimed: gain control not Param
+
+  , ( "miss/lfo-on-osc-freq"
+    , runSynth $ do
+        -- LFO feeds the carrier's freq input. The matcher only
+        -- inspects port 0 (signal flow) of Gain, so this is expected
+        -- to still claim RSinGainOut — a useful negative control
+        -- showing the matcher is narrow enough to ignore FM.
+        lfo <- sinOsc 4.0 0.0
+        s   <- sinOsc lfo 0.0
+        a   <- gain s 0.3
+        out 0 a )                            -- expect: RSinGainOut still fires
+
+  , ( "miss/shared-producer-two-gains"
+    , runSynth $ do
+        s  <- sawOsc 110.0 0.0
+        a1 <- gain s 0.3; out 0 a1
+        a2 <- gain s 0.2; out 1 a2 )
+                                             -- unclaimed: producer has multiple consumers
+
+  , ( "miss/gain-feeds-two-sinks"
+    , runSynth $ do
+        s <- sawOsc 110.0 0.0
+        a <- gain s 0.3
+        out    0 a
+        busOut 7 a )
+                                             -- unclaimed: gain has multiple consumers
+
+  -- ── Stateful negatives ────────────────────────────────────────
+  , ( "neg/env-gain-out"
+    , runSynth $ do
+        e <- env (Param 1.0) 0.0005 0.002 1.0 0.002
+        a <- gain e 0.4
+        out 0 a )                            -- unclaimed: Env excluded by strategy
+
+  , ( "neg/smooth-gain-out"
+    , runSynth $ do
+        v <- smooth 50.0 0.5
+        a <- gain v 0.4
+        out 0 a )                            -- unclaimed: Smooth excluded
+
+  , ( "neg/delay-gain-out"
+    , runSynth $ do
+        s <- sinOsc 220.0 0.0
+        d <- delayL 0.1 s 0.02
+        a <- gain d 0.4
+        out 0 a )                            -- unclaimed: Delay stateful, excluded
+  ]
+
+-- | Compile every entry in 'surveyCorpus', stamping each row's demo
+-- key with a "corpus:" prefix so the unified survey table makes the
+-- source obvious. Errors are surfaced the same way as for demos.
+surveyCorpusRows :: [Either String SurveyRow]
+surveyCorpusRows =
+  [ surveySynthGraph ("corpus:" <> name) Nothing g
+  | (name, g) <- surveyCorpus
+  ]
+
 -- Top-level entry for the --fusion-survey mode. Produces the
 -- per-template summary, a sink-terminal opportunity table, and
 -- aggregate totals. Compile failures are surfaced explicitly:
@@ -1167,18 +1330,28 @@ surveyDemo demo = case demoBody demo of
 -- failed-but-targeted graph doesn't silently lower aggregate
 -- coverage. Exits with status 1 if any survey row failed, since
 -- the resulting numbers are by definition incomplete.
+--
+-- The 'surveyCorpus' (a fixed set of survey-only graphs designed to
+-- exercise §4.B kernel coverage on realistic patches) is always
+-- included regardless of demo targeting — corpus rows exist for
+-- coverage measurement, not playback, and stripping them when the
+-- user names a specific demo would defeat their purpose.
 runFusionSurvey :: [Demo] -> IO ()
 runFusionSurvey demos = do
-  let results        = concatMap surveyDemo demos
-      (errs, rows)   = partitionEithers results
+  let demoResults              = concatMap surveyDemo demos
+      corpusResults            = surveyCorpusRows
+      (demoErrs,   demoRows)   = partitionEithers demoResults
+      (corpusErrs, corpusRows) = partitionEithers corpusResults
+      allRows                  = demoRows <> corpusRows
+      allErrs                  = demoErrs <> corpusErrs
   putStrLn ""
-  printSurveyTable rows
+  printSurveyTable allRows
   putStrLn ""
-  printOpportunityScan rows
+  printOpportunityScan allRows
   putStrLn ""
-  printSurveyTotals rows
+  printSurveyTotals demoRows corpusRows
   putStrLn ""
-  case errs of
+  case allErrs of
     [] -> putStrLn "Done."
     es -> do
       putStrLn "─── Survey failures ───"
@@ -1227,8 +1400,12 @@ formatSurveyRow cols =
       | length s >= w = s
       | otherwise     = s <> replicate (w - length s) ' '
 
+-- Column 1 is wide enough to fit the longest 'corpus:*' key in
+-- 'surveyCorpus' (~38 chars) plus a couple of characters of slack.
+-- If a future corpus entry needs a longer name, bump the first
+-- entry rather than letting the row shove later columns right.
 surveyColumnWidths :: [Int]
-surveyColumnWidths = [14, 14, 5, 5, 9, 8, 10, 11, 30]
+surveyColumnWidths = [42, 14, 5, 5, 9, 8, 10, 11, 30]
 
 -- Opportunity scan: for each known sink-terminal shape, how many
 -- candidate chains the survey saw, how many were claimed by a
@@ -1270,9 +1447,32 @@ scanRows rows =
      , found > 0 || shapeHasKernel sh
      ]
 
--- Aggregate totals across every surveyed template.
-printSurveyTotals :: [SurveyRow] -> IO ()
-printSurveyTotals rows = do
+-- Aggregate totals across every surveyed graph, plus a subtotal
+-- block that splits demo rows from corpus rows. The split lets the
+-- reader read off two questions independently:
+--
+--   * "What does §4.B coverage look like on the playable demo set?"
+--     (demo subtotals)
+--   * "What does §4.B coverage look like on the realistic-patch
+--     reference corpus?" (corpus subtotals)
+--
+-- Mixing the two would smear that signal — corpus shapes are picked
+-- to stress the matcher, so they typically claim at a higher rate
+-- than demos and would inflate the demo-subset coverage number.
+printSurveyTotals :: [SurveyRow] -> [SurveyRow] -> IO ()
+printSurveyTotals demoRows corpusRows = do
+  let allRows = demoRows <> corpusRows
+  printTotalsBlock "─── Totals (all surveyed graphs) ───" allRows
+  putStrLn ""
+  putStrLn "─── Subtotals (demos vs corpus) ───"
+  putStrLn $ formatSubtotalLine "demos:"  demoRows
+  putStrLn $ formatSubtotalLine "corpus:" corpusRows
+
+-- | Long-form totals block (multi-line). Same labels and shape as
+-- before; just lifted to a helper so the all-rows summary and any
+-- future per-subset blocks can share it.
+printTotalsBlock :: String -> [SurveyRow] -> IO ()
+printTotalsBlock header rows = do
   let totalNodes     = sum (map srNodes rows)
       totalClaimed   = sum (map srClaimedNodes rows)
       totalRegions   = sum (map srRegions rows)
@@ -1283,8 +1483,8 @@ printSurveyTotals rows = do
       shapesClaimed  =
         sum [length (filter snd (srShapes r)) | r <- rows]
       shapesMissed   = totalShapes - shapesClaimed
-  putStrLn "─── Totals ───"
-  putStrLn $ "  Templates surveyed:        " <> show (length rows)
+  putStrLn header
+  putStrLn $ "  Graphs surveyed:           " <> show (length rows)
   putStrLn $ "  Runtime nodes:             " <> show totalNodes
   putStrLn $ "  Regions (all):             " <> show totalRegions
   putStrLn $ "  §4.B fused regions:        " <> show totalFused
@@ -1298,6 +1498,23 @@ printSurveyTotals rows = do
   putStrLn $ "    claimed by a §4.B kernel:        " <> show shapesClaimed
   putStrLn $ "    missed (no kernel for the shape, or"
   putStrLn $ "             precondition didn't hold): " <> show shapesMissed
+
+-- | One-line subtotal: "<label>  N graphs, N nodes, N% §4.B coverage,
+-- shapes N/N claimed". Numbers align via fixed-width padding so the
+-- demo and corpus lines visually compare.
+formatSubtotalLine :: String -> [SurveyRow] -> String
+formatSubtotalLine label rows =
+  let nGraphs  = length rows
+      nNodes   = sum (map srNodes rows)
+      nClaim   = sum (map srClaimedNodes rows)
+      nShape   = sum (map (length . srShapes) rows)
+      nShapeOK = sum [length (filter snd (srShapes r)) | r <- rows]
+      pad8 s   = s <> replicate (max 0 (8 - length s)) ' '
+  in "  " <> pad8 label
+        <> "  graphs="  <> show nGraphs
+        <> "  nodes="   <> show nNodes
+        <> "  §4.B="    <> covPct nClaim nNodes
+        <> "  shapes="  <> show nShapeOK <> "/" <> show nShape
 
 -- Shared realtime audio entry point: start, wait for the callback
 -- to fire, accept Enter to stop, and unwind via 'finally' so the
