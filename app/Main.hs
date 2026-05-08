@@ -484,19 +484,18 @@ main = do
 
   demos <- either die pure (resolveTargets (optTargets opts))
 
+  let runDemos banner = do
+        putStrLn banner
+        forM_ demos (runDemo opts)
+        putStrLn "Done."
+
   case optMode opts of
     FusionSurvey -> do
       putStrLn "Surveying demos for §4.B / §4.C fusion coverage."
       runFusionSurvey demos
-    _ -> do
-      putStrLn $
-        case optMode opts of
-          AudioOnly      -> "Running selected demos."
-          InspectThenRun -> "Inspecting selected demos before audio."
-          InspectOnly    -> "Inspecting selected demos without audio."
-          FusionSurvey   -> "" -- handled above
-      forM_ demos (runDemo opts)
-      putStrLn "Done."
+    AudioOnly      -> runDemos "Running selected demos."
+    InspectThenRun -> runDemos "Inspecting selected demos before audio."
+    InspectOnly    -> runDemos "Inspecting selected demos without audio."
 
 -- Top-level dispatch: route a Demo to its body-specific runner. See
 -- Note [Demo body: single-graph vs multi-template].
@@ -544,6 +543,13 @@ runSingleDemo opts demo g = do
       _mRtUnfused <- printTraceSummary trace
       runSingleAudio opts g
       putStrLn ""
+
+    -- 'main' routes 'FusionSurvey' to 'runFusionSurvey' before
+    -- 'runDemo' is reached, so this branch is unreachable. Make
+    -- that intent explicit so the case is exhaustive (rather than
+    -- leaning on a wildcard that would also swallow real bugs).
+    FusionSurvey ->
+      error "runSingleDemo: FusionSurvey should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare
