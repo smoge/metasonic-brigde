@@ -61,6 +61,7 @@ Major changes:
   - `RSawGainOut`
   - `RNoiseGainOut`
   - `RBusInLpfGainOut`
+  - `RNoiseLpfGainOut`
 - Made `KBusOut` a sink terminal alongside `KOut`.
 - Added longest-match selection and support for both 3-node and 4-node kernels.
 - Added stripped node-loop baselines for bit-equivalence tests, so a broken
@@ -71,10 +72,20 @@ Major changes:
   execution.
 - Added `--fusion-survey` and CLI/TUI reporting for selected region kernels,
   missed kernel opportunities, and coverage over demos plus a fixed corpus.
+- Reorganized the survey corpus around `shape/`, `mod/`, `neg/`, and `ens/`
+  categories with a separate `surveyShapeProbes` / `surveyEnsembleCorpus`
+  split, and extended the opportunity scan into a ranked missed-shape table
+  with `sources`, `status`, and `next` columns plus an explicit
+  `missed ≥ 3 ∧ sources ≥ 3` candidate gate.
 - Used survey data to add `RSawGainOut`, `RNoiseGainOut`, and
-  `RBusInLpfGainOut`.
-- Parked `RNoiseLpfGainOut` because the survey signal is still weaker than the
-  BusIn-rooted filtered-tail case.
+  `RBusInLpfGainOut`. After the corpus expansion the ranked table promoted
+  `Noise → LPF → Gain → sink` past the gate (`missed=4, sources=4`) and
+  `RNoiseLpfGainOut` was unparked; benchmark median ~1.25x cleared the
+  sink-kernel win threshold.
+- Tri/Pulse/Add filtered-tail shapes (`SinkAddLpfGain` was added to the
+  classifier so the Add probe is formally visible) remain parked as
+  singleton-source `no-signal` rows in the same scan; no kernel was added
+  on speculation.
 
 Design decisions:
 
@@ -348,6 +359,12 @@ Design decisions:
   the public facade stable.
 - Add a deterministic single-thread region scheduler that consumes
   `regionDependencies` and honors live-bus barriers.
-- Keep `RNoiseLpfGainOut` parked until real patches or corpus surveys justify
-  it.
 - Continue using `--fusion-survey` and `rt_graph_bench` before adding kernels.
+  Tri/Pulse/Add filtered-tail kernels are gated on multi-source recurrence;
+  no kernel work is currently justified.
+- Move into §4.D rate / control-rate classification: rate inference today
+  marks everything `SampleRate`, so block-rate and control-rate regions
+  can't emerge yet. A read-only first slice (metadata + survey counts,
+  no runtime behavior change) is the natural next descriptive step,
+  parallel to how §4.E.1 introduced the parallel-readiness counts before
+  any scheduler change.
