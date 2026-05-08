@@ -362,9 +362,17 @@ Design decisions:
 - Continue using `--fusion-survey` and `rt_graph_bench` before adding kernels.
   Tri/Pulse/Add filtered-tail kernels are gated on multi-source recurrence;
   no kernel work is currently justified.
-- Move into §4.D rate / control-rate classification: rate inference today
-  marks everything `SampleRate`, so block-rate and control-rate regions
-  can't emerge yet. A read-only first slice (metadata + survey counts,
-  no runtime behavior change) is the natural next descriptive step,
-  parallel to how §4.E.1 introduced the parallel-readiness counts before
-  any scheduler change.
+- §4.D.1 (read-only carry of the IR-propagated `rnRate` into
+  `RuntimeNode` plus a survey rate-distribution section) landed and
+  reported 100% `SampleRate` across the surveyed corpus. The result
+  is not that rate inference is broken — `propagateRates` is coherent
+  — but that per-node *output* rate is too coarse to license
+  block-rate regions on practical graphs.
+- Move into §4.D.2 next: a descriptive edge-rate survey that
+  measures per-input *consumption* policy at the destination port
+  (e.g., LPF freq/q are block-latched even when wired sample-rate),
+  joins each runtime input edge against the source's `rnRate`, and
+  reports "sample-rate producers consumed only by non-sample-rate
+  ports" as the headline opportunity number. Read-only; runtime
+  behavior unchanged. Decide whether block-rate regions are worth
+  implementing only after that survey produces a real signal.
