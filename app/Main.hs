@@ -1238,6 +1238,10 @@ surveyDemo demo = case demoBody demo of
 --
 -- These graphs are not run as audio. They flow only through
 -- --fusion-survey via 'surveyCorpusRows'.
+--
+-- Multi-template ensembles (cross-template send / return topology)
+-- live in 'surveyTemplateCorpus'; see Note [Template corpus] below
+-- for why they're a separate list rather than a sum-typed body.
 surveyCorpus :: [(String, SynthGraph)]
 surveyCorpus =
   -- ── Positive: chains the §4.B matcher should claim ────────────
@@ -1288,10 +1292,12 @@ surveyCorpus =
 
   , ( "pos/busIn-lpf-gain-busOut"
     , runSynth $ do
-        -- Fully-internal return tail: BusIn → LPF → Gain → BusOut.
-        -- Adds a second instance of BusIn→LPF→Gain→sink, again via
-        -- BusOut rather than Out, to test whether the BusIn-rooted
-        -- candidate is robust across sink terminals.
+        -- Shape probe: BusIn → LPF → Gain → BusOut. Bus 3 has no
+        -- writer in this single-graph corpus, so the BusIn reads
+        -- silence at runtime — this entry exercises the matcher on
+        -- the shape, /not/ a complete send/return topology.
+        -- Real send/return topology lives in 'surveyTemplateCorpus'
+        -- (cross-template writer + reader pair).
         r <- busIn 3
         f <- lpf r 2000.0 0.6
         a <- gain f 0.7
@@ -1438,6 +1444,125 @@ surveyCorpusRows =
   | (name, g) <- surveyCorpus
   ]
 
+-- Note [Template corpus]
+-- ~~~~~~~~~~~~~~~~~~~~~~
+-- 'surveyTemplateCorpus' is the multi-template counterpart of
+-- 'surveyCorpus'. Each entry is a named ensemble of (template-name,
+-- SynthGraph) pairs that mirrors how a real cross-template send /
+-- return ensemble compiles: voice templates write to a shared bus,
+-- fx templates read from it. This is the topology that BusIn-rooted
+-- chains naturally arise from in practice.
+--
+-- Why a separate list rather than wrapping 'surveyCorpus' in a
+-- sum-type body: keeping single-graph and multi-template entries
+-- in two parallel lists means existing 'surveyCorpus' entries
+-- stay untouched, and the survey driver concatenates rows from
+-- both. The trade-off is one extra type signature; the upside is
+-- zero churn on the 20 single-graph entries.
+--
+-- Per-row keying: each template inside an ensemble produces one
+-- 'SurveyRow' with demo = "corpus:<ensemble-name>" and template =
+-- Just <template-name>. That mirrors how the existing send-return
+-- demo already shows up in the per-row table (one row per
+-- template, sharing a demo key).
+--
+-- Like 'surveyCorpus', these graphs are not run as audio. Each
+-- template is compiled as a standalone 'SynthGraph' for the
+-- survey, so a voice template's BusOut writes to "nowhere" and an
+-- fx template's BusIn reads silence. That's the same trick
+-- 'surveyDemo' uses for the playable send-return demo — the
+-- matcher only inspects per-template structure, not cross-template
+-- runtime values.
+surveyTemplateCorpus :: [(String, [(String, SynthGraph)])]
+surveyTemplateCorpus =
+  [ ( "two-voices-one-fx"
+    , [ ( "voice-low"
+        , runSynth $ do
+            s <- sawOsc 110.0 0.0
+            a <- gain s 0.3
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+
+      , ( "voice-high"
+        , runSynth $ do
+            s <- sawOsc 220.0 0.0
+            a <- gain s 0.3
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+
+      , ( "fx"
+        , runSynth $ do
+            r <- busIn 7
+            f <- lpf r 1200.0 0.7
+            a <- gain f 0.6
+            out 0 a )                        -- BusIn→LPF→Gain→sink candidate
+      ]
+    )
+
+  , ( "voice-parallel-fx"
+    , [ ( "voice"
+        , runSynth $ do
+            s <- sawOsc 110.0 0.0
+            a <- gain s 0.4
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+
+      , ( "fx-low"
+        , runSynth $ do
+            r <- busIn 7
+            f <- lpf r 800.0 0.7
+            a <- gain f 0.6
+            out 0 a )                        -- BusIn→LPF→Gain→sink candidate
+
+      , ( "fx-high"
+        , runSynth $ do
+            r <- busIn 7
+            f <- lpf r 2400.0 0.7
+            a <- gain f 0.6
+            out 1 a )                        -- BusIn→LPF→Gain→sink candidate
+      ]
+    )
+
+  , ( "stereo-send-return"
+    , [ ( "voice-l"
+        , runSynth $ do
+            s <- sawOsc 110.0 0.0
+            a <- gain s 0.3
+            busOut 7 a )                     -- claims RSawGainOut via BusOut
+
+      , ( "voice-r"
+        , runSynth $ do
+            s <- sawOsc 110.5 0.0
+            a <- gain s 0.3
+            busOut 8 a )                     -- claims RSawGainOut via BusOut
+
+      , ( "fx-l"
+        , runSynth $ do
+            r <- busIn 7
+            f <- lpf r 1200.0 0.7
+            a <- gain f 0.6
+            out 0 a )                        -- BusIn→LPF→Gain→sink candidate
+
+      , ( "fx-r"
+        , runSynth $ do
+            r <- busIn 8
+            f <- lpf r 1200.0 0.7
+            a <- gain f 0.6
+            out 1 a )                        -- BusIn→LPF→Gain→sink candidate
+      ]
+    )
+  ]
+
+-- | Compile every (ensemble, template) pair in
+-- 'surveyTemplateCorpus' into a 'SurveyRow', stamping the demo key
+-- with "corpus:" and the ensemble name, and putting the template
+-- name in the template column. One row per template; ensembles are
+-- not summarized — the per-template granularity is what makes
+-- BusIn-rooted return tails legible.
+surveyTemplateCorpusRows :: [Either String SurveyRow]
+surveyTemplateCorpusRows =
+  [ surveySynthGraph ("corpus:" <> ensembleName) (Just templateName) g
+  | (ensembleName, templates) <- surveyTemplateCorpus
+  , (templateName, g)         <- templates
+  ]
+
 -- Top-level entry for the --fusion-survey mode. Produces the
 -- per-template summary, a sink-terminal opportunity table, and
 -- aggregate totals. Compile failures are surfaced explicitly:
@@ -1447,15 +1572,18 @@ surveyCorpusRows =
 -- coverage. Exits with status 1 if any survey row failed, since
 -- the resulting numbers are by definition incomplete.
 --
--- The 'surveyCorpus' (a fixed set of survey-only graphs designed to
--- exercise §4.B kernel coverage on realistic patches) is always
--- included regardless of demo targeting — corpus rows exist for
--- coverage measurement, not playback, and stripping them when the
--- user names a specific demo would defeat their purpose.
+-- The corpus ('surveyCorpus' + 'surveyTemplateCorpus' — fixed sets
+-- of survey-only graphs designed to exercise §4.B kernel coverage on
+-- realistic patches) is always included regardless of demo
+-- targeting. Corpus rows exist for coverage measurement, not
+-- playback, and stripping them when the user names a specific demo
+-- would defeat their purpose. Template-corpus ensembles contribute
+-- one row per template and roll up into the corpus subtotal.
 runFusionSurvey :: [Demo] -> IO ()
 runFusionSurvey demos = do
   let demoResults              = concatMap surveyDemo demos
-      corpusResults            = surveyCorpusRows
+      corpusResults            =
+        surveyCorpusRows <> surveyTemplateCorpusRows
       (demoErrs,   demoRows)   = partitionEithers demoResults
       (corpusErrs, corpusRows) = partitionEithers corpusResults
       allRows                  = demoRows <> corpusRows
