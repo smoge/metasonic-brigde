@@ -362,17 +362,31 @@ Design decisions:
 - Continue using `--fusion-survey` and `rt_graph_bench` before adding kernels.
   Tri/Pulse/Add filtered-tail kernels are gated on multi-source recurrence;
   no kernel work is currently justified.
-- §4.D.1 (read-only carry of the IR-propagated `rnRate` into
-  `RuntimeNode` plus a survey rate-distribution section) landed and
-  reported 100% `SampleRate` across the surveyed corpus. The result
-  is not that rate inference is broken — `propagateRates` is coherent
-  — but that per-node *output* rate is too coarse to license
-  block-rate regions on practical graphs.
-- Move into §4.D.2 next: a descriptive edge-rate survey that
-  measures per-input *consumption* policy at the destination port
-  (e.g., LPF freq/q are block-latched even when wired sample-rate),
-  joins each runtime input edge against the source's `rnRate`, and
-  reports "sample-rate producers consumed only by non-sample-rate
-  ports" as the headline opportunity number. Read-only; runtime
-  behavior unchanged. Decide whether block-rate regions are worth
-  implementing only after that survey produces a real signal.
+- §4.D landed as descriptive infrastructure (no runtime behavior
+  change). §4.D.1 carried the IR-propagated `rnRate` into
+  `RuntimeNode` and added a survey rate-distribution section; the
+  100% `SampleRate` result confirmed that per-node *output* rate
+  alone is too coarse to license block-rate regions on practical
+  graphs (not that rate inference is broken — `propagateRates`
+  is coherent). §4.D.2 added per-kind / per-port consumption
+  metadata (`PortConsumptionRate` / `PortInfo` / `portInfo` in
+  `MetaSonic.Types`; helpers in
+  `MetaSonic.Bridge.Compile.EdgeRates`) and a producer-grouped
+  opportunity headline that qualifies a sample-rate producer
+  only when every active consumer port is non-sample-accurate.
+  Empirical signal: 4 sample-rate producer nodes across 4
+  distinct kinds out of 235 `RFrom` edges. Decision: preserve
+  the metadata, park a runtime block-rate execution path until
+  the signal grows.
+- §4.E is the next implementation focus, but only incrementally.
+  The right next slice is not "threads"; it is a richer parallel
+  execution plan — keep `regionSchedule` as the deterministic
+  linear fallback, add a layer / step representation (barriers
+  plus free layers), surface shared-write hazards explicitly
+  (especially output-bus accumulation), and extend the survey
+  to distinguish "parallel width that is actually runnable
+  without reduction" from "width that needs deterministic
+  reduction." Deterministic bus reduction comes after that plan
+  can prove where reduction is needed.
+- Tri/Pulse/Add filtered-tail kernels remain parked on
+  multi-source recurrence; no kernel work is currently justified.
