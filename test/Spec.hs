@@ -3463,9 +3463,9 @@ fusedEquivalenceCases =
   ]
 
 -- | QuickCheck property: for any deterministic, renderable graph
--- produced by 'genFusableRenderableGraph', the fused and unfused
--- runtime paths must render bit-identical samples on every bus the
--- graph writes.
+-- produced by 'genFusableRenderableGraph', the fused runtime path
+-- must render bit-identical samples to a node-loop baseline on
+-- every bus the graph writes.
 --
 -- The point of this property is /not/ to hand-check more topology
 -- shapes than the structural unit tests already do; it's to exercise
@@ -3476,20 +3476,32 @@ fusedEquivalenceCases =
 -- resolver, and the affine resolver all use the same NaN-sanitised
 -- @float@ casts, so any difference is a bug.
 --
+-- The baseline side applies 'stripRegionKernels' before render so
+-- 'loadRuntimeGraph' takes the per-node dispatch path on every
+-- region, even ones §4.B would have claimed. Without the strip,
+-- 'compileRuntimeGraph' itself would have already tagged matching
+-- regions with kernels and a broken 'process_region_*' could pass
+-- by matching itself — same blind spot the named-case helper
+-- 'assertFusedEquivalent' avoids.
+--
 -- 'cover' gates the fraction of cases that actually exercise fusion
 -- (an 'rnElided' node on the fused path). This protects the property
--- from degenerating into a sanity check on two unfused-equivalent
--- loader paths if the generator later drifts away from fusable shapes.
+-- from degenerating into a sanity check on two equivalent loader
+-- paths if the generator later drifts away from fusable shapes.
 -- A trivial 'True' is returned for graphs that compile cleanly but
 -- write no comparable buses, classified separately.
 prop_fusedRenderEqualsUnfused :: SynthGraph -> Property
 prop_fusedRenderEqualsUnfused graph =
   case (lowerGraph graph >>= compileRuntimeGraph,
         lowerGraph graph >>= compileRuntimeGraphFused) of
-    (Left e,  _      ) -> counterexample ("unfused compile failed: " <> e) False
-    (_,       Left e ) -> counterexample ("fused compile failed: "   <> e) False
-    (Right rtUn, Right rtF) ->
-      let buses = nub
+    (Left e,  _      ) -> counterexample ("baseline compile failed: " <> e) False
+    (_,       Left e ) -> counterexample ("fused compile failed: "    <> e) False
+    (Right rtUn0, Right rtF) ->
+      -- Strip region kernels from the baseline so its render takes
+      -- the per-node dispatch path; rgNodes/controls are unchanged,
+      -- so the bus walk below still sees every Out/BusOut.
+      let rtUn  = stripRegionKernels rtUn0
+          buses = nub
             [ truncate v
             | n <- rgNodes rtUn
             , rnKind n == KOut || rnKind n == KBusOut
@@ -3497,32 +3509,32 @@ prop_fusedRenderEqualsUnfused graph =
             , v >= 0
             ] :: [Int]
           triggered = any rnElided (rgNodes rtF)
-      in checkCoverage
-       . cover 90 triggered          "fusion triggered"
-       . classify (not triggered)    "no fusion (vacuous on fused path)"
-       . classify (null buses)       "no comparable bus (vacuous render)"
-       $ ioProperty $
-         if null buses
-           then pure (property True)
-           else do
-             let nframes = 64
-                 sizeOfFloat = 4
-                 cap = max 1 (length (rgNodes rtUn))
-                 render loader rt =
-                   withRTGraph cap nframes $ \handle -> do
-                     _ <- loader handle rt
-                     c_rt_graph_process handle (fromIntegral nframes)
-                     allocaBytes (nframes * sizeOfFloat) $ \buf ->
-                       traverse (readBus handle buf) buses
-                 readBus handle buf bus = do
-                   _ <- c_rt_graph_read_bus handle (fromIntegral bus)
-                                            (fromIntegral nframes) (castPtr buf)
-                   cs <- peekArray nframes (buf :: PtrCFloat)
-                   pure (bus, map (\(CFloat x) -> x) cs)
-             unfused <- render loadRuntimeGraph      rtUn
-             fused   <- render loadRuntimeGraphFused rtF
-             pure $ counterexample ("buses compared: " <> show buses)
-                  $ unfused === fused
+       in checkCoverage
+        . cover 90 triggered          "fusion triggered"
+        . classify (not triggered)    "no fusion (vacuous on fused path)"
+        . classify (null buses)       "no comparable bus (vacuous render)"
+        $ ioProperty $
+          if null buses
+            then pure (property True)
+            else do
+              let nframes = 64
+                  sizeOfFloat = 4
+                  cap = max 1 (length (rgNodes rtUn))
+                  render loader rt =
+                    withRTGraph cap nframes $ \handle -> do
+                      _ <- loader handle rt
+                      c_rt_graph_process handle (fromIntegral nframes)
+                      allocaBytes (nframes * sizeOfFloat) $ \buf ->
+                        traverse (readBus handle buf) buses
+                  readBus handle buf bus = do
+                    _ <- c_rt_graph_read_bus handle (fromIntegral bus)
+                                             (fromIntegral nframes) (castPtr buf)
+                    cs <- peekArray nframes (buf :: PtrCFloat)
+                    pure (bus, map (\(CFloat x) -> x) cs)
+              baseline <- render loadRuntimeGraph      rtUn
+              fused    <- render loadRuntimeGraphFused rtF
+              pure $ counterexample ("buses compared: " <> show buses)
+                   $ baseline === fused
 
 -- | Force every region in a 'RuntimeGraph' back to 'RNodeLoop'.
 -- 'compileRuntimeGraph' runs 'selectRegionKernels' unconditionally,
