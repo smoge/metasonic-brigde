@@ -230,6 +230,10 @@ compileRuntimeGraph ir = do
           -- compileRuntimeGraph never elides; only fuseRuntimeGraph
           -- (Step C) flips this to True for nodes absorbed by a
           -- fused consumer input. See Note [Fused inputs].
+        , rnRate          = irRate node
+          -- §4.D.1 descriptive metadata: the IR-level propagated
+          -- rate from 'propagateRates'. Carried verbatim — the
+          -- C++ runtime does not consume it.
         }
 
     -- Rewrite a symbolic InputConn to a dense RuntimeInput.

@@ -344,6 +344,23 @@ data RuntimeNode = RuntimeNode
     -- elided node all keep working — the only thing that changes
     -- is that 'process_instance' skips dispatch for the elided
     -- slot. See Note [Fused inputs].
+  , rnRate :: !Rate
+    -- ^ Propagated output rate from IR lowering. Descriptive
+    -- metadata; the C++ runtime does not consume it. Populated
+    -- from 'IRNode.irRate' (the join of the kind floor with the
+    -- input rates, computed by 'MetaSonic.Bridge.IR.propagateRates')
+    -- and preserved across the IR → Runtime boundary so that
+    -- '--fusion-survey' and any future descriptive analysis can
+    -- ask rate-distribution questions without re-running rate
+    -- inference.
+    --
+    -- This is a per-node /output/ rate, not a per-input
+    -- consumption policy. A 'KGain' fed by an oscillator carries
+    -- 'SampleRate' here even when its amount input is a scalar
+    -- 'CompileRate' constant; the per-input latch classification
+    -- (whether the runtime samples a control once per block or
+    -- per sample) is a separate concern, deferred to a later
+    -- §4.D slice.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 

@@ -3350,6 +3350,135 @@ unitTests = testGroup "Unit tests"
                 tssMaxTemplateLayerWidth s @?= 2
       ]
 
+  , testGroup "Phase 4.D.1: rnRate carries IR-propagated rate"
+      [ -- The runtime graph must preserve every IR node's
+        -- propagated 'irRate' on the corresponding 'rnRate'. This
+        -- is the load-bearing pin for §4.D.1: the descriptive
+        -- view's whole job is to keep IR rate inference
+        -- observable through the runtime boundary, so any drift
+        -- between the two would silently break the survey's
+        -- distribution counts and make rate-shaped optimization
+        -- decisions unsound.
+        testCase "rnRate matches irRate for every node (mixed osc + transform)" $ do
+          let g = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                a <- gain s (Param 0.4)
+                out 0 a
+          ir <- case lowerGraph g of
+            Right x  -> pure x
+            Left err -> assertFailure ("lowerGraph failed: " <> err)
+                          >> error "unreachable"
+          rt <- case compileRuntimeGraph ir of
+            Right x  -> pure x
+            Left err -> assertFailure ("compile failed: " <> err)
+                          >> error "unreachable"
+          let irByID =
+                M.fromList [(irNodeID n, irRate n) | n <- giNodes ir]
+              checkOne n = case M.lookup (rnOriginalID n) irByID of
+                Just r ->
+                  assertEqual ("rnRate vs irRate for " <> show (rnIndex n))
+                              r (rnRate n)
+                Nothing ->
+                  assertFailure $ "missing IR rate for "
+                               <> show (rnOriginalID n)
+          mapM_ checkOne (rgNodes rt)
+
+      , -- Pure-literal subgraph: 'KOut' has a 'CompileRate' kind
+        -- floor, its only input is a 'Literal' (also 'CompileRate'),
+        -- and propagation joins to 'CompileRate'. This is the
+        -- "stays low where possible" pin — any future regression
+        -- that always lifts to 'SampleRate' would fire it.
+        testCase "constant-only graph (out (Param 0.0)) stays at CompileRate" $ do
+          let g = runSynth (out 0 (Param 0.0))
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let rates = map rnRate (rgNodes rt)
+              assertBool ("expected all CompileRate, got " <> show rates)
+                         (all (== CompileRate) rates)
+
+      , -- Oscillator chain: the 'KSinOsc' floor is 'SampleRate',
+        -- and propagation lifts every downstream node to match.
+        -- This is the dual of the constant-only test: when an
+        -- audio producer is in the graph, the join must reach
+        -- every reachable consumer.
+        testCase "oscillator chain lifts every downstream node to SampleRate" $ do
+          let g = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                a <- gain s (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let kindRates =
+                    [(rnKind n, rnRate n) | n <- rgNodes rt]
+              assertEqual "kind/rate pairs"
+                [(KSinOsc, SampleRate)
+                ,(KGain,   SampleRate)
+                ,(KOut,    SampleRate)
+                ]
+                kindRates
+
+      , -- Region rate consistency: for every region produced by
+        -- 'compileRuntimeGraph', the region's 'rrRate' must equal
+        -- the max of its members' 'rnRate'. 'formRegions' already
+        -- computes 'regRate' as the join over members at the IR
+        -- level; this test pins that the runtime's per-node and
+        -- per-region rate views stay in agreement after lowering,
+        -- so the descriptive survey can't end up reporting a
+        -- region rate that no member node actually claims.
+        testCase "every rrRate equals max of member rnRates" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let nodeMap =
+                    M.fromList [(rnIndex n, rnRate n) | n <- rgNodes rt]
+                  memberRate ix =
+                    M.findWithDefault CompileRate ix nodeMap
+              sequence_
+                [ assertEqual
+                    ("region " <> show (rrIndex r) <> " rrRate vs join")
+                    (maximum (CompileRate : map memberRate (rrNodes r)))
+                    (rrRate r)
+                | r <- rgRuntimeRegions rt
+                ]
+
+      , -- Bucket-count integrity: a per-rate histogram of all
+        -- runtime nodes must sum to the node count exactly. The
+        -- survey footer divides 'rdSample' by this total to
+        -- compute @S%@; if the bucket counts and the node count
+        -- could ever disagree (double-counting, missing rate
+        -- value, off-by-one), the headline percentage would be
+        -- wrong. Walking 'rgNodes' once and binning by 'rnRate'
+        -- here mirrors what 'rateDistribution' does in the survey
+        -- driver.
+        testCase "rate-bucket counts sum to total node count" $ do
+          let g = runSynth $ do
+                s1 <- sinOsc 220.0 0.0; a1 <- gain s1 (Param 0.3); out 0 a1
+                s2 <- sawOsc 110.0 0.0; a2 <- gain s2 (Param 0.3); out 1 a2
+                n  <- noiseGen;         a3 <- gain n  (Param 0.1); out 0 a3
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let nodes = rgNodes rt
+                  total = length nodes
+                  countAt r = length (filter ((== r) . rnRate) nodes)
+                  c = countAt CompileRate
+                  i = countAt InitRate
+                  b = countAt BlockRate
+                  s = countAt SampleRate
+              assertEqual "bucket sum vs total" total (c + i + b + s)
+              -- Sanity: this graph is osc/noise dominated, so
+              -- every node must end up at SampleRate.
+              assertEqual "all nodes SampleRate on osc-only graph"
+                          total s
+      ]
+
   , testCase "kindTag is injective" $
       let ks = [minBound .. maxBound :: NodeKind]
           ts = map kindTag ks

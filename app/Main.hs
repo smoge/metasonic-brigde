@@ -24,7 +24,7 @@ import           MetaSonic.Bridge.MidiDemo  (CCMapping (..),
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Types            (NodeIndex (..), NodeKind (..),
-                                             PortIndex (..))
+                                             PortIndex (..), Rate (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
 import           MetaSonic.Visualize.TUI    (launchInspector)
@@ -1156,6 +1156,61 @@ scanSinkShapes rt =
              [rnIndex a, rnIndex b, rnIndex c, rnIndex d] )]
       | otherwise = []
 
+-- §4.D.1 read-only descriptive aggregate. Counts of each
+-- propagated node output rate ('rnRate') across a runtime graph.
+-- The four fields cover the full 'Rate' lattice; their sum equals
+-- the total node count for the graph.
+--
+-- This is a /node output rate/ histogram, not a per-input
+-- consumption-policy classification. A 'KGain' fed by an
+-- oscillator counts as 'rdSample' here even when its amount input
+-- is a scalar 'CompileRate' constant; the per-input latch view
+-- (whether the runtime samples a control once per block or per
+-- sample) is a separate concern, deferred to a later §4.D slice.
+data RateDistribution = RateDistribution
+  { rdCompile :: !Int
+    -- ^ Nodes with @rnRate = CompileRate@.
+  , rdInit    :: !Int
+    -- ^ Nodes with @rnRate = InitRate@.
+  , rdBlock   :: !Int
+    -- ^ Nodes with @rnRate = BlockRate@.
+  , rdSample  :: !Int
+    -- ^ Nodes with @rnRate = SampleRate@.
+  } deriving (Eq, Show)
+
+emptyRateDistribution :: RateDistribution
+emptyRateDistribution = RateDistribution 0 0 0 0
+
+-- | Compose two distributions by per-bucket addition. Used to
+-- aggregate per-row counts into the survey-wide footer.
+addRateDistribution :: RateDistribution -> RateDistribution -> RateDistribution
+addRateDistribution a b = RateDistribution
+  { rdCompile = rdCompile a + rdCompile b
+  , rdInit    = rdInit    a + rdInit    b
+  , rdBlock   = rdBlock   a + rdBlock   b
+  , rdSample  = rdSample  a + rdSample  b
+  }
+
+-- | Total nodes counted (equals the graph's node count for a
+-- 'rateDistribution' result).
+rateDistributionTotal :: RateDistribution -> Int
+rateDistributionTotal d =
+  rdCompile d + rdInit d + rdBlock d + rdSample d
+
+-- | Walk a 'RuntimeGraph' and bin each node by 'rnRate'. Elided
+-- nodes are counted: they remain in 'rgNodes' with a stable
+-- 'NodeIndex', and the rate they carry from IR lowering is what
+-- the descriptive view reports.
+rateDistribution :: RuntimeGraph -> RateDistribution
+rateDistribution rt =
+  foldr bump emptyRateDistribution (rgNodes rt)
+  where
+    bump n d = case rnRate n of
+      CompileRate -> d { rdCompile = rdCompile d + 1 }
+      InitRate    -> d { rdInit    = rdInit    d + 1 }
+      BlockRate   -> d { rdBlock   = rdBlock   d + 1 }
+      SampleRate  -> d { rdSample  = rdSample  d + 1 }
+
 -- Per-template summary row.
 data SurveyRow = SurveyRow
   { srDemo         :: !String
@@ -1171,6 +1226,12 @@ data SurveyRow = SurveyRow
   , srSchedStats   :: !RegionScheduleStats
     -- ^ §4.E.2c parallel-readiness counts. Read-only; surfaces in
     -- the schedule-width section of '--fusion-survey'.
+  , srRateDist     :: !RateDistribution
+    -- ^ §4.D.1 rate distribution. Counts of each propagated node
+    -- output rate ('rnRate') across this row's runtime nodes.
+    -- Read-only descriptive metadata; the C++ runtime does not
+    -- consume it, and the survey reports it without changing
+    -- compilation or execution behavior.
   } deriving (Eq, Show)
 
 -- Build a SurveyRow from /two/ compiled 'RuntimeGraph's of the
@@ -1224,6 +1285,7 @@ surveyRuntimeGraph d t rt rtF stats =
        , srRFused       = length [() | n <- rgNodes rtF, RFused _ <- rnInputs n]
        , srShapes       = scanSinkShapes rt
        , srSchedStats   = stats
+       , srRateDist     = rateDistribution rt
        }
 
 -- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
@@ -1942,6 +2004,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printEnsembleScheduleWidth ensembleRows
   putStrLn ""
+  printRateDistribution allRows
+  putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
   case allErrs of
@@ -2267,6 +2331,82 @@ ensembleColumnWidths = [42, 5, 10, 9, 5, 6]
 formatEnsembleRow :: [String] -> String
 formatEnsembleRow cols =
   intercalate "  " (zipWith pad ensembleColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+-- §4.D.1 rate distribution section. One row per surveyed graph,
+-- plus a footer with aggregate counts and the survey-wide
+-- SampleRate share. This reports the /propagated node output rate/
+-- — the rate each runtime node carries after IR-level
+-- 'propagateRates' joins each node's kind floor with its inputs.
+-- It is /not/ a per-input consumption-policy view: a 'KGain' fed
+-- by an oscillator counts as @S@ here even when its amount input
+-- is a scalar 'CompileRate' constant. The per-port latch view
+-- (whether the runtime samples each control once per block or per
+-- sample) is a separate, deferred §4.D slice.
+--
+-- Columns:
+--   C   : nodes at 'CompileRate' (literal-only stateless transforms)
+--   I   : nodes at 'InitRate'    (computed once at graph init)
+--   B   : nodes at 'BlockRate'   (recomputed once per audio block)
+--   S   : nodes at 'SampleRate'  (recomputed every sample)
+--   S%  : SampleRate share of the row's nodes, rounded to whole %
+--
+-- The headline number for "is per-node output rate too coarse to
+-- drive optimization yet" is the survey-wide @S%@ in the footer.
+-- If it stays near 100%, the node-output-rate view alone won't
+-- license block-rate regions, and the next refinement is
+-- per-input consumption policy.
+printRateDistribution :: [SurveyRow] -> IO ()
+printRateDistribution rows = do
+  putStrLn "─── Rate distribution (§4.D.1, propagated node output rates) ───"
+  putStrLn $ formatRateRow
+    [ "demo", "template", "C", "I", "B", "S", "S%" ]
+  mapM_ (putStrLn . formatRateRow . renderRateRow) rows
+  putStrLn ""
+  let agg = foldr addRateDistribution emptyRateDistribution
+              (map srRateDist rows)
+      total = rateDistributionTotal agg
+      sharePct :: Int
+      sharePct
+        | total == 0 = 0
+        | otherwise  = (rdSample agg * 100) `div` total
+  putStrLn $ "  totals: "
+          <> "graphs="  <> show (length rows)
+          <> "  C="     <> show (rdCompile agg)
+          <> "  I="     <> show (rdInit    agg)
+          <> "  B="     <> show (rdBlock   agg)
+          <> "  S="     <> show (rdSample  agg)
+          <> "  total=" <> show total
+          <> "  S%="    <> show sharePct <> "%"
+
+renderRateRow :: SurveyRow -> [String]
+renderRateRow r =
+  let d   = srRateDist r
+      tot = rateDistributionTotal d
+      pct :: Int
+      pct
+        | tot == 0  = 0
+        | otherwise = (rdSample d * 100) `div` tot
+  in [ srDemo r
+     , maybe "" id (srTemplate r)
+     , show (rdCompile d)
+     , show (rdInit    d)
+     , show (rdBlock   d)
+     , show (rdSample  d)
+     , show pct <> "%"
+     ]
+
+-- Mirrors 'scheduleColumnWidths' in shape; the per-bucket counts
+-- are small integers, S% is a 4-character percent.
+rateColumnWidths :: [Int]
+rateColumnWidths = [42, 14, 4, 4, 4, 4, 5]
+
+formatRateRow :: [String] -> String
+formatRateRow cols =
+  intercalate "  " (zipWith pad rateColumnWidths cols)
   where
     pad w s
       | length s >= w = s
