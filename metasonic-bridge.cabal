@@ -22,6 +22,11 @@ library
       MetaSonic.Bridge.Validate
       MetaSonic.Bridge.IR
       MetaSonic.Bridge.Compile
+      MetaSonic.Bridge.Compile.Types
+      MetaSonic.Bridge.Compile.Regions
+      MetaSonic.Bridge.Compile.RegionKernels
+      MetaSonic.Bridge.Compile.Dependencies
+      MetaSonic.Bridge.Compile.Fusion
       MetaSonic.Bridge.Templates
       MetaSonic.Bridge.FFI
       MetaSonic.Bridge.MidiDemo
