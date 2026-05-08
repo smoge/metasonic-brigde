@@ -2197,21 +2197,25 @@ unitTests = testGroup "Unit tests"
               selectRegionKernels rg @?= rg
       ]
 
-  , -- Phase 4.E.1: per-region BusFootprint metadata. The first
-    -- slice of region scheduling: every 'RuntimeRegion' carries
-    -- its own write / live-read / delayed-read sets, and
-    -- 'regionPrecedence' surfaces the intra-template ordering rule
-    -- (region A precedes region B iff A's live-writes intersect
-    -- B's live-reads). No runtime behavior change in this slice —
-    -- 'compileRuntimeGraph' still produces regions in the same
-    -- topologically valid order; the tests pin only the metadata.
-    testGroup "Phase 4.E.1: per-region BusFootprint and precedence"
+  , -- Phase 4.E.1 + 4.E.1b: per-region BusFootprint metadata plus
+    -- the dependency views consumed by future scheduling work.
+    -- 'regionBusPrecedence' is the bus-only edge subgraph;
+    -- 'regionStructuralPrecedence' is the cross-region port edges
+    -- introduced by 'selectRegionKernels' splits;
+    -- 'regionDependencies' is the union — the actual "must
+    -- precede" relation. No runtime behavior change in either
+    -- slice — 'compileRuntimeGraph' still produces regions in the
+    -- same topologically valid order; the tests pin the metadata
+    -- only. See Note [Region dependency contract] in
+    -- 'MetaSonic.Bridge.Compile' for why both edge classes
+    -- matter.
+    testGroup "Phase 4.E.1: per-region BusFootprint and dependencies"
       [ -- Single-region baseline: a sin → gain → out chain claims
         -- 'RSinGainOut' as one region. Footprint writes only the
-        -- sink bus; no reads of any kind. 'regionPrecedence' is
-        -- the empty map for this region (no other region exists
-        -- and no read sets to intersect against).
-        testCase "single-region chain: footprint writes {0}, no reads, empty precedence" $ do
+        -- sink bus; no reads of any kind. Both views are empty
+        -- for this region (no other region exists, no port edges
+        -- to cross, no read sets to intersect against).
+        testCase "single-region chain: footprint writes {0}, no reads, empty deps" $ do
           let g = runSynth $ do
                 s <- sinOsc 440.0 0.0
                 a <- gain s (Param 0.5)
@@ -2224,7 +2228,7 @@ unitTests = testGroup "Unit tests"
                   bfWrites       (rrFootprint r) @?= S.singleton 0
                   bfReads        (rrFootprint r) @?= S.empty
                   bfDelayedReads (rrFootprint r) @?= S.empty
-                  regionPrecedence rg @?=
+                  regionDependencies rg @?=
                     M.singleton (rrIndex r) S.empty
                 rs -> assertFailure $
                   "expected exactly one region, got " <> show (length rs)
@@ -2238,8 +2242,12 @@ unitTests = testGroup "Unit tests"
         --
         -- The footprints must reflect the split: producer writes
         -- bus 5; consumer reads bus 5 and writes bus 0. The
-        -- precedence map must say "consumer depends on producer."
-        testCase "internal send/return: consumer region depends on producer region" $ do
+        -- consumer's dependency on the producer is /bus-borne/
+        -- here — there's no port edge crossing the region
+        -- boundary (the consumer's first node is BusIn, which has
+        -- no audio inputs). 'regionBusPrecedence' must capture
+        -- the edge; 'regionDependencies' must agree.
+        testCase "internal send/return: consumer region depends on producer (bus edge)" $ do
           let g = runSynth $ do
                 s <- sinOsc 220.0 0.0
                 busOut 5 s
@@ -2265,10 +2273,20 @@ unitTests = testGroup "Unit tests"
                   bfReads        (rrFootprint c) @?= S.singleton 5
                   bfDelayedReads (rrFootprint c) @?= S.empty
 
-                  let prec = regionPrecedence rg
-                  M.findWithDefault S.empty (rrIndex c) prec
+                  let busPrec = regionBusPrecedence rg
+                      structPrec = regionStructuralPrecedence rg
+                      deps = regionDependencies rg
+                  -- Bus edge present.
+                  M.findWithDefault S.empty (rrIndex c) busPrec
                     @?= S.singleton (rrIndex p)
-                  M.findWithDefault S.empty (rrIndex p) prec
+                  -- BusIn has no audio inputs, so no port edge
+                  -- crosses from producer to consumer.
+                  M.findWithDefault S.empty (rrIndex c) structPrec
+                    @?= S.empty
+                  -- Union (the headline view) carries the bus edge.
+                  M.findWithDefault S.empty (rrIndex c) deps
+                    @?= S.singleton (rrIndex p)
+                  M.findWithDefault S.empty (rrIndex p) deps
                     @?= S.empty
                 _ -> assertFailure $
                   "expected one RNodeLoop producer + one RBusInLpfGainOut "
@@ -2276,18 +2294,83 @@ unitTests = testGroup "Unit tests"
                   <> show (length producers) <> " + "
                   <> show (length consumers)
 
+      , -- §4.E.1b regression: kernel-split structural edges.
+        -- @saw → lpf → gain → add → out@ is the canonical case
+        -- 'regionBusPrecedence' alone would miss. 'RSawLpfGain'
+        -- (buffer-terminal) claims @[Saw, LPF, Gain]@; the
+        -- trailing @[Add, Out]@ stays 'RNodeLoop'. The trailing
+        -- region reads the materialized gain output through a
+        -- port edge (Add's signal input is RFrom Gain). No bus
+        -- is involved, so 'regionBusPrecedence' is empty — but
+        -- the trailing region absolutely cannot run before
+        -- 'RSawLpfGain', and a parallel scheduler that consumed
+        -- only the bus view would happily race them.
+        --
+        -- This is the load-bearing pin for
+        -- 'regionStructuralPrecedence' / 'regionDependencies'.
+        -- See Note [Region dependency contract].
+        testCase "kernel-split chain: structural port edge across region boundary" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)        -- non-sink consumer of Gain;
+                                              -- blocks RSawLpfGainOut
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let regions = rgRuntimeRegions rg
+                  bufs    = [r | r <- regions, rrKernel r == RSawLpfGain]
+                  tails   = [r | r <- regions, rrKernel r == RNodeLoop]
+              case (bufs, tails) of
+                ([buf], [tail_]) -> do
+                  -- Footprints: producer writes nothing (gain
+                  -- materializes a buffer, not a bus); consumer
+                  -- writes bus 0 via Out, reads no bus.
+                  bfWrites       (rrFootprint buf)   @?= S.empty
+                  bfReads        (rrFootprint buf)   @?= S.empty
+                  bfWrites       (rrFootprint tail_) @?= S.singleton 0
+                  bfReads        (rrFootprint tail_) @?= S.empty
+
+                  -- Bus view alone misses the dependency (no bus
+                  -- writes / reads intersect).
+                  let busPrec = regionBusPrecedence rg
+                  M.findWithDefault S.empty (rrIndex tail_) busPrec
+                    @?= S.empty
+
+                  -- Structural view catches it: Add (in tail
+                  -- region) has RFrom pointing into the buffer
+                  -- region.
+                  let structPrec = regionStructuralPrecedence rg
+                  M.findWithDefault S.empty (rrIndex tail_) structPrec
+                    @?= S.singleton (rrIndex buf)
+
+                  -- Headline: the union carries the structural
+                  -- edge. Anyone consulting 'regionDependencies'
+                  -- sees the dependency that 'regionBusPrecedence'
+                  -- alone would miss.
+                  let deps = regionDependencies rg
+                  M.findWithDefault S.empty (rrIndex tail_) deps
+                    @?= S.singleton (rrIndex buf)
+                  M.findWithDefault S.empty (rrIndex buf) deps
+                    @?= S.empty
+                _ -> assertFailure $
+                  "expected one RSawLpfGain region + one RNodeLoop tail, got "
+                  <> show (length bufs) <> " + " <> show (length tails)
+
       , -- BusInDelayed must NOT induce precedence. The graph has
         -- a producer chain that writes bus 5 (claimed as
         -- 'RSinGainOut' via BusOut) and a delayed-reader chain
         -- (busInDelayed 5 → gain → out) that reads bus 5
         -- /delayed/ rather than live. The producer region's
         -- footprint has writes={5}; the reader region's footprint
-        -- has delayedReads={5} and writes={0}. The precedence
-        -- map must show /no/ edge from reader to producer — the
-        -- intra-graph E_r rule and the inter-template precedence
-        -- rule both exclude delayed reads, and the per-region
-        -- view must do the same.
-        testCase "BusInDelayed reader does not induce a precedence edge" $ do
+        -- has delayedReads={5} and writes={0}. Both
+        -- 'regionBusPrecedence' (delayed reads excluded by rule)
+        -- and 'regionStructuralPrecedence' (BusInDelayed has no
+        -- audio inputs, so no port edge) report no edge — and
+        -- therefore 'regionDependencies' must be empty.
+        testCase "BusInDelayed reader does not induce a dependency edge" $ do
           let g = runSynth $ do
                 s1 <- sinOsc 220.0 0.0
                 g1 <- gain s1 (Param 0.3)
@@ -2311,12 +2394,14 @@ unitTests = testGroup "Unit tests"
                   bfReads        (rrFootprint r) @?= S.empty
                   bfDelayedReads (rrFootprint r) @?= S.singleton 5
 
-                  -- Headline assertion: no precedence edge.
-                  let prec = regionPrecedence rg
-                  M.findWithDefault S.empty (rrIndex r) prec
-                    @?= S.empty
-                  M.findWithDefault S.empty (rrIndex p) prec
-                    @?= S.empty
+                  -- Headline assertion: no edge in any view.
+                  let busPrec    = regionBusPrecedence rg
+                      structPrec = regionStructuralPrecedence rg
+                      deps       = regionDependencies rg
+                  M.findWithDefault S.empty (rrIndex r) busPrec    @?= S.empty
+                  M.findWithDefault S.empty (rrIndex r) structPrec @?= S.empty
+                  M.findWithDefault S.empty (rrIndex r) deps       @?= S.empty
+                  M.findWithDefault S.empty (rrIndex p) deps       @?= S.empty
                 _ -> assertFailure $
                   "expected one RSinGainOut producer + one RNodeLoop "
                   <> "reader, got "
@@ -2326,9 +2411,10 @@ unitTests = testGroup "Unit tests"
       , -- Independent regions must have disjoint footprints and no
         -- precedence edges between them. Two parallel sin → gain
         -- → out chains writing different sink buses both claim
-        -- 'RSinGainOut' but neither reads any bus, so the
-        -- precedence map is the empty-set everywhere.
-        testCase "independent regions have disjoint footprints + no precedence" $ do
+        -- 'RSinGainOut' but neither reads any bus and neither
+        -- consumes the other's output — so every dependency view
+        -- is empty everywhere.
+        testCase "independent regions have disjoint footprints + no deps" $ do
           let g = runSynth $ do
                 s1 <- sinOsc 220.0 0.0
                 a1 <- gain s1 (Param 0.4)
@@ -2345,10 +2431,9 @@ unitTests = testGroup "Unit tests"
               -- two written buses are disjoint.
               let writes = [bfWrites (rrFootprint r) | r <- regions]
               S.unions writes @?= S.fromList [0, 1]
-              -- No region reads any bus; precedence is empty
-              -- for every region.
-              let prec = regionPrecedence rg
-              all (S.null . snd) (M.toList prec) @?= True
+              -- Every dependency view is empty for every region.
+              let deps = regionDependencies rg
+              all (S.null . snd) (M.toList deps) @?= True
 
       , -- Multi-template send/return: each template compiles to
         -- its own RuntimeGraph through 'compileTemplateGraph',
@@ -2359,8 +2444,10 @@ unitTests = testGroup "Unit tests"
         -- The voice template's region claims RSinGainOut via
         -- BusOut and writes bus 5; the fx template's region
         -- claims RBusInLpfGainOut and reads bus 5 / writes bus 0.
-        -- Intra-template precedence is empty within each
-        -- (single-region per template).
+        -- Intra-template dependencies are empty within each
+        -- (single-region per template; cross-template ordering is
+        -- handled by 'compileTemplateGraph', not by the
+        -- per-region view).
         testCase "multi-template send/return: per-region footprints survive compileTemplateGraph" $ do
           let voice = runSynth $ do
                 s <- sinOsc 220.0 0.0
@@ -2389,7 +2476,7 @@ unitTests = testGroup "Unit tests"
               rrKernel r @?= RSinGainOut
               bfWrites (rrFootprint r) @?= S.singleton 5
               bfReads  (rrFootprint r) @?= S.empty
-              regionPrecedence voiceRg
+              regionDependencies voiceRg
                 @?= M.singleton (rrIndex r) S.empty
             rs -> assertFailure $
               "voice template: expected one region, got "
@@ -2402,7 +2489,7 @@ unitTests = testGroup "Unit tests"
               rrKernel r @?= RBusInLpfGainOut
               bfWrites (rrFootprint r) @?= S.singleton 0
               bfReads  (rrFootprint r) @?= S.singleton 5
-              regionPrecedence fxRg
+              regionDependencies fxRg
                 @?= M.singleton (rrIndex r) S.empty
             rs -> assertFailure $
               "fx template: expected one region, got "

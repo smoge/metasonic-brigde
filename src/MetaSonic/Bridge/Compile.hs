@@ -40,7 +40,12 @@ module MetaSonic.Bridge.Compile
   , runtimeNodeFootprint
   , regionFootprint
   , attachRegionFootprints
-  , regionPrecedence
+  , -- * Region dependency views (see Note [Region dependency contract])
+    inputSourceIndex
+  , fusedInputSource
+  , regionBusPrecedence
+  , regionStructuralPrecedence
+  , regionDependencies
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
@@ -883,8 +888,8 @@ The same shape applies at three nested scopes:
     'GraphIR' (used by 'compileTemplateGraph' to derive the
     inter-template precedence DAG).
   * One region: aggregate over the region's member 'RuntimeNode's
-    (used by 'regionPrecedence' for intra-template region
-    ordering — first slice of §4.E.1).
+    (used by 'regionBusPrecedence' / 'regionDependencies' for
+    intra-template region ordering — §4.E.1 / §4.E.1b).
   * One node: trivially derived from 'rnKind' + 'rnControls[0]'.
 
 Reusing the type at every scope keeps the precedence rule
@@ -941,9 +946,10 @@ data RuntimeRegion = RuntimeRegion
     -- delayed-reads. Computed by 'attachRegionFootprints' as the
     -- final step of 'compileRuntimeGraph' so the same field
     -- survives 'selectRegionKernels' splits without going stale.
-    -- §4.E.1 metadata only — does not change region execution
-    -- order today; consumed by 'regionPrecedence' for the
-    -- intra-template region ordering view.
+    -- §4.E.1 / §4.E.1b metadata only — does not change region
+    -- execution order today; consumed by 'regionBusPrecedence'
+    -- and (in union with structural cross-region edges)
+    -- 'regionDependencies'.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -1404,19 +1410,102 @@ attachRegionFootprints rg =
         ]
   in rg { rgRuntimeRegions = decorated }
 
--- | Intra-template region precedence: for each region, the set of
--- regions whose live writes the given region reads. A precedes B
--- iff @bfWrites(A) ∩ bfReads(B) ≠ ∅@. Delayed reads do not
--- contribute, matching the intra-graph E_r rule and the
--- inter-template precedence rule.
+{- Note [Region dependency contract]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A future scheduler (§4.E.2 onwards) needs the /full/ region
+dependency graph: which regions must execute before which others.
+That graph has two independent edge sources:
+
+  * Bus dataflow ('regionBusPrecedence'): A precedes B iff
+    @bfWrites(A) ∩ bfReads(B) ≠ ∅@. Delayed reads do not
+    contribute, matching the intra-graph E_r rule and the
+    inter-template precedence rule.
+
+  * Structural cross-region ports ('regionStructuralPrecedence'):
+    A precedes B iff some node in B has a 'RuntimeInput' whose
+    source ('RFrom' or the 'fiSourceNode' / 'fcSourceNode' /
+    'faSourceNode' field of 'RFused') lives in A. This is the
+    edge class kernel-splitting introduces — e.g.
+    @saw → lpf → gain → add → out@ splits into an 'RSawLpfGain'
+    region plus a trailing 'RNodeLoop' region containing
+    @[Add, Out]@. The trailing region reads the gain's
+    materialized output buffer (a port edge), but no bus is
+    involved, so 'regionBusPrecedence' would say there is no
+    edge. Treating bus precedence alone as the dependency graph
+    would let a parallel scheduler run the two regions
+    concurrently, which is wrong.
+
+'regionDependencies' is the @M.unionWith S.union@ of the two
+views. Use it for any "what must run before this region" question;
+the narrower views are exposed only for diagnostics and
+testability.
+
+The dual naming is deliberate. The bus view answers a question
+('how does this region depend on the bus pool?') that has its
+own diagnostic value. Hiding it behind the combined view would
+make it harder to answer "is this dependency a bus dependency or
+a port dependency?" when debugging schedules.
+
+Static-vs-dynamic bus controls — open policy decision.
+'BusFootprint' is built from each node's compile-time
+'rnControls[0]'. 'rt_graph_instance_set_control' can change a
+'KBusIn' / 'KOut' / 'KBusOut' bus index at runtime, so the
+static dependency graph stops being valid once a bus index is
+redirected. This is descriptive metadata today (the runtime
+still executes regions in compile-decreed order regardless), but
+§4.E.2 cannot consume 'regionDependencies' under a parallel
+scheduler without first picking one of:
+
+  1. Bus-index controls (slot 0 on KBusIn/KOut/KBusOut) become
+     /static/ — set_control on those slots is rejected. The
+     compile-time graph is then guaranteed valid for the
+     graph's lifetime.
+  2. Any node whose bus index is dynamic forces the schedule
+     onto a serialized / barrier path — the scheduler refuses
+     to parallelize across a dynamic bus boundary. Static
+     subgraphs still parallelize freely.
+  3. A bus-control change triggers a scheduler rebuild before
+     the next process_graph block — the SPSC control queue
+     drainer recomputes 'regionDependencies' and reissues a new
+     schedule when it sees a bus-redirect.
+
+§4.E.2 must pick one before threads land. Until then,
+'regionDependencies' is descriptive only and 'compileRuntimeGraph'
+still produces a topologically valid sequential order; this
+limitation is non-blocking for §4.E.1 / §4.E.1b but is
+load-bearing for any later parallelism work.
+-}
+
+-- | Source 'NodeIndex' of a 'RuntimeInput', if any.
+-- 'RConst' has no source; 'RFrom' carries it directly; 'RFused'
+-- carries it inside the 'FusedInput' constructor. Used by the
+-- structural-precedence view to walk cross-region port edges.
+inputSourceIndex :: RuntimeInput -> Maybe NodeIndex
+inputSourceIndex (RConst _)    = Nothing
+inputSourceIndex (RFrom ix _)  = Just ix
+inputSourceIndex (RFused fi)   = Just (fusedInputSource fi)
+
+-- | The non-elided producer 'NodeIndex' that ultimately feeds a
+-- 'FusedInput'. The dispatching field name differs across
+-- constructors — keep this helper in sync with 'FusedInput'.
+fusedInputSource :: FusedInput -> NodeIndex
+fusedInputSource FScaleFrom{ fiSourceNode = ix }      = ix
+fusedInputSource FScaleChainFrom{ fcSourceNode = ix } = ix
+fusedInputSource FAffineFrom{ faSourceNode = ix }     = ix
+
+-- | Bus-dataflow region precedence: for each region, the set of
+-- regions whose live writes the given region reads via a
+-- 'KBusIn'. A precedes B iff @bfWrites(A) ∩ bfReads(B) ≠ ∅@.
+-- Delayed reads do not contribute, matching the intra-graph
+-- E_r rule and the inter-template precedence rule.
 --
--- §4.E.1 metadata only — does not change region execution order
--- today. The current 'compileRuntimeGraph' produces regions in a
--- topologically valid order via 'formRegions'; this function
--- exposes that order's bus-dataflow rationale as a queryable view
--- for a future scheduler.
-regionPrecedence :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
-regionPrecedence rg = M.fromList
+-- This is /not/ the full region dependency graph — see
+-- 'regionDependencies' and Note [Region dependency contract].
+-- Use this only when you specifically want the bus-edge
+-- subgraph for diagnostics; otherwise 'regionDependencies' is
+-- the right starting point for any "must precede" question.
+regionBusPrecedence :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
+regionBusPrecedence rg = M.fromList
   [ (rrIndex r, S.fromList
       [ rrIndex other
       | other <- regions
@@ -1430,6 +1519,59 @@ regionPrecedence rg = M.fromList
   ]
   where
     regions = rgRuntimeRegions rg
+
+-- | Structural cross-region precedence: for each region, the set
+-- of regions that produce a 'NodeIndex' that this region's nodes
+-- read through a 'RuntimeInput'. Captures the port-edge
+-- dependencies that 'selectRegionKernels' splits introduce when
+-- a kernel-claimed prefix's terminal output is consumed by a
+-- node in the trailing 'RNodeLoop' region (the canonical example
+-- being @saw → lpf → gain → add → out@: the trailing
+-- @[Add, Out]@ region reads the materialized gain output of the
+-- @[Saw, LPF, Gain]@ region — no bus involved).
+--
+-- Self-loops are filtered out (a node-input that points to a
+-- node in the same region is intra-region, not a precedence
+-- edge). Every region appears in the result, even if its
+-- dependency set is empty, so consumers can iterate keys
+-- without 'M.findWithDefault' churn.
+regionStructuralPrecedence
+  :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
+regionStructuralPrecedence rg =
+  let regions      = rgRuntimeRegions rg
+      regionOfNode = M.fromList
+        [ (ix, rrIndex r)
+        | r  <- regions
+        , ix <- rrNodes r
+        ]
+      nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
+
+      -- For one consumer region, the set of producer regions it
+      -- structurally depends on. Walk every member node's inputs;
+      -- resolve each input's source 'NodeIndex' to its region;
+      -- discard edges that stay inside the same region.
+      depsFor consumer = S.fromList
+        [ producerIx
+        | consumerIx <- rrNodes consumer
+        , Just node  <- [M.lookup consumerIx nodeMap]
+        , inp        <- rnInputs node
+        , Just src   <- [inputSourceIndex inp]
+        , Just producerIx <- [M.lookup src regionOfNode]
+        , producerIx /= rrIndex consumer
+        ]
+  in M.fromList [(rrIndex r, depsFor r) | r <- regions]
+
+-- | Full region dependency graph: the union of bus-dataflow and
+-- structural-port edges. This is the view a future scheduler
+-- (§4.E.2) consumes for any "must precede" decision. See
+-- Note [Region dependency contract] for why both edge classes
+-- matter and for the open policy question around dynamic bus
+-- controls.
+regionDependencies :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
+regionDependencies rg =
+  M.unionWith S.union
+    (regionBusPrecedence rg)
+    (regionStructuralPrecedence rg)
 
 -- | Result of a successful kernel-shape lookup in
 -- 'findKernelMatch'. Carrying the matched length explicitly makes
