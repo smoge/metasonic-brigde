@@ -213,7 +213,8 @@ drawNodePanel st =
 
       TraceRuntime ->
         maybe [notReached]
-              (zipWith (nodeRow sel) [0 ..] . map fmtDense . rgNodes)
+              (\rt -> zipWith (nodeRow sel) [0 ..]
+                              (map (fmtDense rt) (rgNodes rt)))
               (ctRuntime ct)
 
 fmtOrderRows :: [NodeID] -> [String]
@@ -281,12 +282,39 @@ fmtRegionDeps deps
   | S.null deps = "{}"
   | otherwise   = "{" <> unwords (map showRegionID (S.toList deps)) <> "}"
 
-fmtDense :: RuntimeNode -> String
-fmtDense n =
-  "[" <> showNodeIndex (rnIndex n) <> "] "
-    <> show (rnKind n)
-    <> "  ← "
-    <> unwords (map fmtRtInput (rnInputs n))
+-- | Render a single 'RuntimeNode' as a Dense-tab row.
+--
+-- The 'RuntimeGraph' argument is used solely to look up which
+-- runtime region (if any) claims this node. When the node lives
+-- in a non-'RNodeLoop' region — i.e., a §4.B fused kernel claimed
+-- it — the row gets a trailing @{Kernel}@ tag so the inspector
+-- shows the kernel selection at a glance. Nodes in 'RNodeLoop'
+-- regions render unchanged.
+fmtDense :: RuntimeGraph -> RuntimeNode -> String
+fmtDense rt n =
+  let suffix = case lookupRuntimeKernel rt (rnIndex n) of
+        Just k | k /= RNodeLoop -> "  {" <> show k <> "}"
+        _                       -> ""
+  in "[" <> showNodeIndex (rnIndex n) <> "] "
+       <> show (rnKind n)
+       <> "  ← "
+       <> unwords (map fmtRtInput (rnInputs n))
+       <> suffix
+
+-- | Find the runtime region that owns @ix@, if any. Returns the
+-- region's kernel tag for use in row / detail rendering.
+lookupRuntimeKernel :: RuntimeGraph -> NodeIndex -> Maybe RegionKernel
+lookupRuntimeKernel rt ix =
+  case lookupRuntimeRegion rt ix of
+    Just r  -> Just (rrKernel r)
+    Nothing -> Nothing
+
+-- | Find the runtime region that owns @ix@, if any.
+lookupRuntimeRegion :: RuntimeGraph -> NodeIndex -> Maybe RuntimeRegion
+lookupRuntimeRegion rt ix =
+  case [r | r <- rgRuntimeRegions rt, ix `elem` rrNodes r] of
+    (r : _) -> Just r
+    []      -> Nothing
 
 fmtRtInput :: RuntimeInput -> String
 fmtRtInput (RFrom ix (PortIndex p)) = "[" <> showNodeIndex ix <> "]:" <> show p
@@ -514,10 +542,41 @@ detailDense ct rt n =
               | (cix, port) <- cs
               ]
       , str ""
+      , drawRuntimeRegion rt n
+      , str ""
       , case (ctIR ct, ctRegions ct) of
           (Just ir, Just rg) -> drawNodeHistory ir rg n
           _                  -> emptyWidget
       ]
+
+-- | Detail-panel section showing which runtime region claims the
+-- selected node and which §4.B kernel (if any) is dispatched on
+-- it. The 'RegionGraph' / 'rgNodeMap' shown by 'drawNodeHistory'
+-- is the IR-level region overlay produced by 'formRegions';
+-- 'selectRegionKernels' may have split that region further when
+-- producing 'rgRuntimeRegions', so the runtime region a node
+-- ends up in can differ from its IR region — and is the form
+-- the FFI loader actually ships. Emits nothing for nodes that
+-- aren't in any registered runtime region (shouldn't happen
+-- post-'compileRuntimeGraph', but rendering nothing is the right
+-- silent fallback).
+drawRuntimeRegion :: RuntimeGraph -> RuntimeNode -> Widget Name
+drawRuntimeRegion rt n =
+  case lookupRuntimeRegion rt (rnIndex n) of
+    Nothing -> emptyWidget
+    Just r ->
+      let RegionIndex ri = rrIndex r
+          members        = rrNodes r
+          kernel         = rrKernel r
+          membersStr =
+            unwords [ "[" <> showNodeIndex ix <> "]" | ix <- members ]
+      in vBox
+           [ withAttr titleAttr $ str "Runtime region (post-selectRegionKernels)"
+           , section "  Index"   (show ri)
+           , section "  Rate"    (show (rrRate r))
+           , section "  Kernel"  (show kernel)
+           , section "  Members" membersStr
+           ]
 
 rtConsumers :: [RuntimeNode] -> NodeIndex -> [(NodeIndex, Int)]
 rtConsumers nodes nix =

@@ -404,8 +404,13 @@ usage prog = unlines
   , "If no demo names are given, all demos are run."
   , ""
   , "Flags:"
-  , "  --fused          Compile and load via the Step-C fused path"
-  , "                   (compileRuntimeGraphFused / loadRuntimeGraphFused)."
+  , "  --fused          Use the §4.C fused-input loader path"
+  , "                   (compileRuntimeGraphFused / loadRuntimeGraphFused),"
+  , "                   which adds elision of single-edge scalar Gain / Add"
+  , "                   chains. The §4.B region kernels (RSawLpfGain,"
+  , "                   RSinGainOut, RSawLpfGainOut, ...) run on every"
+  , "                   compile path and are not gated by this flag —"
+  , "                   the [Fusion ...] line reports what fired regardless."
   , "                   Single-graph and multi-template demos only;"
   , "                   the live-MIDI poly demo always runs unfused."
   , ""
@@ -479,11 +484,14 @@ runDemo opts demo = case demoBody demo of
 --
 -- When 'optFused opts' is True, the audio path takes the
 -- 'compileRuntimeGraphFused' + 'loadRuntimeGraphFused' route
--- instead. The inspector still walks the unfused IR / region trace
--- — those passes give the most informative view of the source
--- graph and are unaffected by Step C. A 'printFusionSummary' line
--- is emitted on the fused path so callers can see the rewrite's
--- effect at a glance.
+-- instead, which layers §4.C single-input rewrites (elided
+-- scalar Gain / Add nodes, 'RFused' inputs on the consumer) on
+-- top of the §4.B region-kernel selection that
+-- 'compileRuntimeGraph' already runs. The inspector still walks
+-- the unfused IR / region trace — those passes give the most
+-- informative view of the source graph and are unaffected by
+-- §4.C. A 'printFusionSummary' line is emitted on every path so
+-- callers can compare what each mechanism claimed at a glance.
 runSingleDemo :: Options -> Demo -> SynthGraph -> IO ()
 runSingleDemo opts demo g = do
   let !trace = traceCompile g
@@ -852,26 +860,59 @@ runTemplateAudioFused capacity tg =
     loadTemplateGraphFused rt tg
     runRealtimeBracket rt
 
--- Print a one-line fusion summary for a compiled 'RuntimeGraph'.
--- Useful for both unfused and fused runs: an unfused compile shows
--- elided=0 and fused-inputs=0, which makes it obvious at a glance
--- whether a graph went through the Step-C rewrite.
+-- Print a fusion summary for a compiled 'RuntimeGraph'. The
+-- one-line header reports counts that distinguish §4.C
+-- single-input fusion ('elided' / 'fused-inputs') from §4.B
+-- region-kernel selection ('region-kernels'), so an at-a-glance
+-- read shows which mechanism actually fired. §4.C runs only on
+-- the 'compileRuntimeGraphFused' path; §4.B runs unconditionally
+-- inside 'compileRuntimeGraph' (via 'selectRegionKernels'), so a
+-- non-zero region-kernels count can show up on a graph that was
+-- never asked for "fused" at the command line — that's intended.
+--
+-- When at least one region was claimed by a fused kernel, the
+-- summary continues with one indented line per claimed region,
+-- listing its 'rrIndex', kernel tag, [first..last] dense node
+-- range, and member kind sequence. Useful for spotting whether a
+-- demo actually exercises the new kernels at all.
 printFusionSummary :: String -> RuntimeGraph -> IO ()
 printFusionSummary label rg = do
-  let nodes  = length (rgNodes rg)
-      elidedN = length (filter rnElided (rgNodes rg))
-      fusedN  = length [() | n <- rgNodes rg, RFused _ <- rnInputs n]
-      buses   = sort $ nub
+  let nodes        = length (rgNodes rg)
+      elidedN      = length (filter rnElided (rgNodes rg))
+      fusedN       = length [() | n <- rgNodes rg, RFused _ <- rnInputs n]
+      fusedRegions = [r | r <- rgRuntimeRegions rg, rrKernel r /= RNodeLoop]
+      buses        = sort $ nub
         [ truncate v :: Int
         | n <- rgNodes rg
         , rnKind n == KOut || rnKind n == KBusOut
         , v : _ <- [rnControls n]
         , v >= 0
         ]
+      kindOf = (`lookup` [(rnIndex n, rnKind n) | n <- rgNodes rg])
   putStrLn $ "  [Fusion " <> label <> "] nodes=" <> show nodes
           <> " elided=" <> show elidedN
           <> " fused-inputs=" <> show fusedN
+          <> " region-kernels=" <> show (length fusedRegions)
           <> " buses=" <> show buses
+  mapM_ (printRegionLine kindOf) fusedRegions
+
+-- One indented detail line per claimed §4.B region.
+printRegionLine
+  :: (NodeIndex -> Maybe NodeKind) -> RuntimeRegion -> IO ()
+printRegionLine kindOf r = do
+  let RegionIndex ri = rrIndex r
+      members        = rrNodes r
+      kinds          = [show k | ix <- members, Just k <- [kindOf ix]]
+      rangeShown     = case members of
+        []       -> "[]"
+        [NodeIndex i] -> "[" <> show i <> "]"
+        (NodeIndex i : _) ->
+          let NodeIndex j = last members
+          in "[" <> show i <> ".." <> show j <> "]"
+  putStrLn $ "    region " <> show ri
+          <> ": " <> show (rrKernel r)
+          <> " " <> rangeShown
+          <> " kinds=[" <> intercalate "," kinds <> "]"
 
 -- Shared realtime audio entry point: start, wait for the callback
 -- to fire, accept Enter to stop, and unwind via 'finally' so the
