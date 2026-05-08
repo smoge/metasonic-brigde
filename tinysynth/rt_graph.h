@@ -361,9 +361,13 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //   * SawLpfGain    needs node_count == 3 and kinds
 //                   [SawOsc, LPF, Gain].
 //   * SinGainOut    needs node_count == 3 and kinds
-//                   [SinOsc, Gain, Out].
+//                   [SinOsc, Gain, /sink/] where /sink/ is
+//                   either Out or BusOut. Both are operationally
+//                   identical sinks (see Note [Bus model]); the
+//                   kernel body absorbs them the same way.
 //   * SawLpfGainOut needs node_count == 4 and kinds
-//                   [SawOsc, LPF, Gain, Out].
+//                   [SawOsc, LPF, Gain, /sink/] with the same
+//                   Out/BusOut rule as SinGainOut.
 // The runtime validates the kind sequence at dispatch time and
 // falls back to per-node iteration on any mismatch.
 //

@@ -768,24 +768,28 @@ data RegionKernel
     -- consumers.
   | RSinGainOut
     -- ^ Sink-terminal kernel. The region is exactly
-    -- @[KSinOsc, KGain, KOut]@ with single-use internal edges
-    -- (sin → gain, gain → out), no audio modulation on the gain
-    -- port, and no external readers of the sin or gain
-    -- intermediate buffers. Unlike 'RSawLpfGain' the terminal
-    -- node is a sink ('Out'), so the kernel accumulates directly
-    -- into 'g.server.output_buses[bus]' and updates
-    -- 'inst.block_sink_peak' for §2.E release-then-free silence
-    -- detection — no intermediate buffer is materialised.
+    -- @[KSinOsc, KGain, /sink/]@ with single-use internal edges
+    -- (sin → gain, gain → /sink/), no audio modulation on the
+    -- gain port, and no external readers of the sin or gain
+    -- intermediate buffers. The /sink/ is either 'KOut' or
+    -- 'KBusOut' — both dispatch to 'process_out' on the C++ side
+    -- and read their bus index from @rnControls[0]@. Unlike
+    -- 'RSawLpfGain' the terminal node is absorbed by the kernel,
+    -- so it accumulates directly into 'g.server.output_buses[bus]'
+    -- and updates 'inst.block_sink_peak' for §2.E release-then-
+    -- free silence detection — no intermediate buffer is
+    -- materialized.
   | RSawLpfGainOut
     -- ^ Sink-terminal kernel for the full 4-node chain
-    -- @[KSawOsc, KLPF, KGain, KOut]@. Combines the saw + LPF +
+    -- @[KSawOsc, KLPF, KGain, /sink/]@. Combines the saw + LPF +
     -- gain processing of 'RSawLpfGain' with the bus accumulation
-    -- and 'inst.block_sink_peak' update of 'RSinGainOut'. Single-
-    -- use internal edges and scalar-gain rules apply, plus an
-    -- explicit @rnConsumerCount gain == 1@ requirement (the gain
-    -- output must escape only via the inner 'Out'; otherwise the
+    -- and 'inst.block_sink_peak' update of 'RSinGainOut'. The
+    -- /sink/ is either 'KOut' or 'KBusOut'. Single-use internal
+    -- edges and scalar-gain rules apply, plus an explicit
+    -- @rnConsumerCount gain == 1@ requirement (the gain output
+    -- must escape only via the absorbed sink; otherwise the
     -- 3-node 'RSawLpfGain' fires and the gain's buffer is
-    -- materialised for the external readers).
+    -- materialized for the external readers).
   deriving stock    (Eq, Show, Generic, Bounded, Enum)
   deriving anyclass (NFData)
 
@@ -1046,21 +1050,28 @@ Match arity is /not/ implicit: 'findKernelMatch' returns a
 'kernelArity' and the dispatch in 'findKernelMatch' — the
 splitter consumes whatever length the descriptor reports.
 
-Currently three kernel shapes are recognized:
+Currently three kernel shapes are recognized. The sink-terminal
+kernels accept either 'KOut' or 'KBusOut' at the terminal slot;
+both dispatch to the same per-node kernel ('process_out' on the
+C++ side) and read their bus index from @rnControls[0]@, so the
+fused kernel body absorbs them identically. See 'isSinkTerminal'.
 
   * 'RSawLpfGain' — 3-node buffer-terminal:
     @[KSawOsc, KLPF, KGain]@. The gain's output buffer is
-    materialized because some external consumer reads it (a
-    sibling region's 'Out' or 'BusOut').
+    materialized because some external consumer reads it
+    (typically a separate sink in the trailing 'RNodeLoop'
+    region, or an 'Add' / 'KGain' / 'BusIn' in a downstream
+    chain).
   * 'RSinGainOut' — 3-node sink-terminal:
-    @[KSinOsc, KGain, KOut]@. The 'Out' is /inside/ the kernel;
-    bus accumulation and §2.E sink-peak tracking happen inside
-    the fused per-sample loop. No buffer is materialized.
+    @[KSinOsc, KGain, /sink/]@ where /sink/ is 'KOut' or
+    'KBusOut'. The sink is /inside/ the kernel; bus accumulation
+    and §2.E sink-peak tracking happen inside the fused per-
+    sample loop. No buffer is materialized.
   * 'RSawLpfGainOut' — 4-node sink-terminal:
-    @[KSawOsc, KLPF, KGain, KOut]@. Combines saw + LPF + gain
+    @[KSawOsc, KLPF, KGain, /sink/]@. Combines saw + LPF + gain
     processing with the inline bus accumulation and sink-peak
     tracking; like 'RSinGainOut' it materializes no intermediate
-    buffer.
+    buffer and accepts either sink kind at the terminal slot.
 
 /Longest-match priority/. At each candidate offset
 'findKernelMatch' tries shapes longest-first: for example, on
@@ -1068,9 +1079,11 @@ Currently three kernel shapes are recognized:
 the 3-node 'RSawLpfGain' prefix that would otherwise leave the
 'Out' stranded in a trailing 'RNodeLoop' region. The 3-node
 kernel still fires whenever the longer shape's preconditions
-fail (notably when the gain has multiple consumers or the
-terminal isn't a 'KOut') — see the corresponding @matches*@
-predicates and the "fallback" tests in 'Spec.hs'.
+fail — notably when the gain has multiple consumers, or its
+single consumer is something other than a sink terminal (e.g. an
+'Add' or another 'Gain' on a downstream chain). See the
+corresponding @matches*@ predicates and the "fallback" tests in
+'Spec.hs'.
 
 The runtime sees a clean "kernel tag per region" model and
 dispatches accordingly. RegionIndex is renumbered after the
@@ -1109,8 +1122,8 @@ Match preconditions, common to every fused kernel (3-node and
      buffer-terminal 'RSawLpfGain' in that case.
 
 For sink-terminal kernels there is no extra precondition on the
-terminal 'KOut': it has no audio output, and its bus index lives
-in 'rnControls', not 'rnInputs'.
+terminal sink ('KOut' or 'KBusOut'): it has no audio output, and
+its bus index lives in 'rnControls', not 'rnInputs'.
 
 Step-§4.B fusion claims its members /before/ §4.C runs, so
 'fuseRuntimeGraph' must skip nodes that are members of a
@@ -1273,11 +1286,15 @@ matchesSawLpfGain nodes sawIx lpfIx gainIx =
         && isScalarGain gain
     _ -> False
 
--- | The sink-terminal shape: KSinOsc → KGain → KOut with the same
+-- | The sink-terminal shape: KSinOsc → KGain → /sink/ with the same
 -- single-use internal-edge / scalar-gain rules as 'matchesSawLpfGain'.
--- 'Out' is a sink with 'rnConsumerCount == 0' and its bus index in
--- 'rnControls', not 'rnInputs', so the only constraint on the
--- terminal is that the gain feeds it through port 0.
+-- The terminal sink can be either 'KOut' or 'KBusOut' — both
+-- dispatch to the same per-node kernel ('process_out' on the C++
+-- side) and read their bus index from 'rnControls[0]', so the
+-- kernel body absorbs them identically. The terminal node has
+-- 'rnConsumerCount == 0' by construction (sinks have no
+-- downstream readers), so the only constraint on it is that the
+-- gain feeds it through port 0.
 matchesSinGainOut
   :: M.Map NodeIndex RuntimeNode
   -> NodeIndex -> NodeIndex -> NodeIndex
@@ -1287,7 +1304,7 @@ matchesSinGainOut nodes sinIx gainIx outIx =
     (Just sin_, Just gain, Just out_) ->
       rnKind sin_ == KSinOsc
         && rnKind gain == KGain
-        && rnKind out_ == KOut
+        && isSinkTerminal (rnKind out_)
         && not (rnElided sin_)
         && not (rnElided gain)
         && not (rnElided out_)
@@ -1298,16 +1315,19 @@ matchesSinGainOut nodes sinIx gainIx outIx =
         && isScalarGain gain
     _ -> False
 
--- | The 4-node sink-terminal shape: KSawOsc → KLPF → KGain → KOut.
+-- | The 4-node sink-terminal shape: KSawOsc → KLPF → KGain → /sink/.
 -- Combines the buffer-terminal saw/lpf/gain processing of
--- 'matchesSawLpfGain' with the sink-terminal Out absorption of
--- 'matchesSinGainOut'. Adds an explicit
+-- 'matchesSawLpfGain' with the sink-terminal absorption of
+-- 'matchesSinGainOut'. The terminal can be either 'KOut' or
+-- 'KBusOut' — same reasoning as 'matchesSinGainOut': both
+-- dispatch to 'process_out' on the C++ side and the kernel body
+-- absorbs them identically. Adds an explicit
 -- @rnConsumerCount gain == 1@ requirement on top of the 3-node
--- kernel: when that holds, the gain's output buffer is unread by
--- anything outside the chain and the kernel is free to inline the
--- bus accumulation. When it doesn't, longest-match falls through
--- to 'matchesSawLpfGain' (which materialises the gain's buffer for
--- external readers).
+-- buffer-terminal kernel: when that holds, the gain's output
+-- buffer is unread by anything outside the chain and the kernel
+-- is free to inline the bus accumulation. When it doesn't,
+-- longest-match falls through to 'matchesSawLpfGain' (which
+-- materializes the gain's buffer for external readers).
 matchesSawLpfGainOut
   :: M.Map NodeIndex RuntimeNode
   -> NodeIndex -> NodeIndex -> NodeIndex -> NodeIndex
@@ -1321,7 +1341,7 @@ matchesSawLpfGainOut nodes sawIx lpfIx gainIx outIx =
       rnKind saw  == KSawOsc
         && rnKind lpf  == KLPF
         && rnKind gain == KGain
-        && rnKind out_ == KOut
+        && isSinkTerminal (rnKind out_)
         && not (rnElided saw)
         && not (rnElided lpf)
         && not (rnElided gain)
@@ -1334,6 +1354,20 @@ matchesSawLpfGainOut nodes sawIx lpfIx gainIx outIx =
         && signalSourceIs gainIx out_
         && isScalarGain gain
     _ -> False
+
+-- | Sink-terminal classifier. Both 'KOut' and 'KBusOut' dispatch to
+-- the same per-node kernel ('process_out' on the C++ side) and read
+-- their bus index from @rnControls[0]@, so the §4.B sink-terminal
+-- kernels accept either as the absorbed terminal. The kernel body
+-- is bus-kind-agnostic: the difference between 'KOut' and 'KBusOut'
+-- lives at the source level (final hardware output vs intermediate
+-- audio bus) and the audio callback routes them identically once
+-- they land in the shared bus pool. See @Note [Bus model]@ near the
+-- @NodeKind@ enum in @rt_graph.cpp@.
+isSinkTerminal :: NodeKind -> Bool
+isSinkTerminal KOut    = True
+isSinkTerminal KBusOut = True
+isSinkTerminal _       = False
 
 -- | Shared between every 'matches*' kernel predicate: the
 -- principal audio input of @node@ — port 0 — must be wired to

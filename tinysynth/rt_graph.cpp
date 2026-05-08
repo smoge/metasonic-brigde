@@ -384,6 +384,18 @@ enum class NodeKind : int {
   Notch        = 19,
 };
 
+// Sink-terminal classifier. Both 'Out' and 'BusOut' are pure sinks
+// — they accumulate their input into the shared bus pool keyed by
+// 'controls[0]', have no audio output port, and dispatch to the
+// same per-node kernel ('process_out'). The §4.B sink-terminal
+// region kernels (SinGainOut, SawLpfGainOut) absorb either kind
+// at the terminal slot of their member sequence; the kernel body
+// is bus-kind-agnostic. Mirrors 'isSinkTerminal' in the Haskell-
+// side 'matchesSinGainOut' / 'matchesSawLpfGainOut'.
+[[nodiscard]] static constexpr bool is_sink_terminal(NodeKind k) noexcept {
+  return k == NodeKind::Out || k == NodeKind::BusOut;
+}
+
 // Single source of truth for the integer-tag → NodeKind mapping.
 // Both rt_graph_add_node and rt_graph_kind_supported go through this,
 // so the C ABI's "is this tag known" answer cannot drift from the
@@ -3165,15 +3177,19 @@ static void process_region_saw_lpf_gain(
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Hand-written fused kernel for a region tagged 'RegionKernel::SinGainOut'.
 Members are exactly three nodes in stored order: a SinOsc (sin_idx),
-a Gain (gain_idx = sin_idx + 1), and an Out (out_idx = sin_idx + 2).
+a Gain (gain_idx = sin_idx + 1), and a sink terminal — either Out
+or BusOut — at out_idx = sin_idx + 2. The dispatch guard accepts
+either kind via 'is_sink_terminal'; both dispatch to 'process_out'
+on the per-node path and read their bus index from controls[0],
+so the kernel body absorbs them identically.
 
 This is the /sink-terminal/ counterpart to SawLpfGain. SawLpfGain
-materialises the gain's output buffer because some sibling region
-reads it; here, the chain ends in 'Out', and 'Out' is a sink — it
-writes nothing to its own output port. Instead, the kernel does
-exactly what process_out would have done after process_sinosc and
-process_gain: per sample, compute @sin * gain_amount@, accumulate
-into 'g.server.output_buses[bus]', and update 'inst.block_sink_peak'.
+materializes the gain's output buffer because some sibling region
+reads it; here, the chain ends in a sink that writes nothing to
+its own output port. Instead, the kernel does exactly what
+process_out would have done after process_sinosc and process_gain:
+per sample, compute @sin * gain_amount@, accumulate into
+'g.server.output_buses[bus]', and update 'inst.block_sink_peak'.
 
 That last step is load-bearing for §2.E release-then-free. The
 parent voice's silence detection reads block_sink_peak after the
@@ -3190,17 +3206,19 @@ Semantics held in lockstep with the unfused chain:
     NaN, mirroring process_gain's scalar branch. Audio-modulated
     gain blocks the kernel on the Haskell side, so we never need
     the per-sample gain branch here.
-  * Out: bus index from out_node.controls[0], sanitised the same way
-    process_out sanitises (finite, non-negative, < bus pool size). On
-    invalid bus the kernel still consumes the per-sample sin output
-    so phase advancement and the block_sink_peak update are the same
-    side-effects as the unfused chain — except the sink-peak
-    contribution from a discarded output is zero (matching process_out
-    which returns early on invalid bus before ever touching peak).
+  * Sink (Out or BusOut): bus index from out_node.controls[0],
+    sanitized the same way process_out sanitizes (finite,
+    non-negative, < bus pool size). On invalid bus the kernel
+    still consumes the per-sample sin output so phase advancement
+    and the block_sink_peak update are the same side-effects as
+    the unfused chain — except the sink-peak contribution from
+    a discarded output is zero (matching process_out which
+    returns early on invalid bus before ever touching peak).
 
 If the kind sequence at registration time doesn't actually match
-[SinOsc, Gain, Out], the dispatch site falls back to per-node
-iteration. Same silent-degradation discipline as SawLpfGain.
+[SinOsc, Gain, sink-terminal], the dispatch site falls back to
+per-node iteration. Same silent-degradation discipline as
+SawLpfGain.
 */
 static void process_region_sin_gain_out(
     RTGraph &g, GraphInstance &inst,
@@ -3255,7 +3273,10 @@ accumulation + 'inst.block_sink_peak' update of
                 non-fused process_lpf)
   * gain_idx — KGain (scalar control on port 1; audio modulation
                 blocks the kernel at match time)
-  * out_idx  — KOut sink (bus index in controls[0])
+  * out_idx  — sink terminal: KOut or KBusOut (bus index in
+                controls[0]). The dispatch guard validates either
+                kind via 'is_sink_terminal'; the kernel body is
+                bus-kind-agnostic.
 
 The Haskell-side gate ('matchesSawLpfGainOut' /
 'findKernelMatch') ensures the gain has 'rnConsumerCount == 1' so
@@ -3263,14 +3284,14 @@ its output buffer is unread by anything outside the chain — that
 single-edge invariant is what justifies skipping
 'output_span(gain_node, ...)' here. The 3-node 'RSawLpfGain'
 kernel still fires for shapes where the gain is read by multiple
-consumers (its output buffer must then be materialised for those
+consumers (its output buffer must then be materialized for those
 external readers).
 
 Float-rounding identity with the unfused chain: per-sample we do
 exactly what process_sawosc + process_lpf + process_gain +
 process_out would do (q::saw -> filter -> *gain_amount ->
 accumulate into bus[bus] -> peak = max(peak, |s|)). Same
-NaN-sanitisation, same block-rate latch on LPF freq/q, same bus
+NaN-sanitization, same block-rate latch on LPF freq/q, same bus
 index validation in the double domain before casting. A
 kind-sequence mismatch at dispatch time falls back to per-node
 iteration — silent degradation discipline shared with the other
@@ -3729,7 +3750,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && first + 3 <= node_count
         && def->nodes[first    ].kind == NodeKind::SinOsc
         && def->nodes[first + 1].kind == NodeKind::Gain
-        && def->nodes[first + 2].kind == NodeKind::Out) {
+        && is_sink_terminal(def->nodes[first + 2].kind)) {
       process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
                                   nframes);
       fused = true;
@@ -3739,7 +3760,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first    ].kind == NodeKind::SawOsc
         && def->nodes[first + 1].kind == NodeKind::LPF
         && def->nodes[first + 2].kind == NodeKind::Gain
-        && def->nodes[first + 3].kind == NodeKind::Out) {
+        && is_sink_terminal(def->nodes[first + 3].kind)) {
       process_region_saw_lpf_gain_out(g, inst,
                                       first, first + 1,
                                       first + 2, first + 3,

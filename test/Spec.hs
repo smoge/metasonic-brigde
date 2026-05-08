@@ -1552,21 +1552,53 @@ unitTests = testGroup "Unit tests"
                 rs -> assertFailure $
                   "expected exactly one fused region, got " <> show (length rs)
 
-      , -- 3-node buffer-terminal claim. With a non-'Out' terminal
-        -- ('busOut' here) the 4-node 'RSawLpfGainOut' shape can't
-        -- match (its terminal kind is fixed to KOut), so the
-        -- selector falls through to 'RSawLpfGain' on the 3-node
-        -- prefix. The BusOut sits in a trailing 'RNodeLoop'
-        -- region. This is the test that pins 'RSawLpfGain' is
-        -- still alive and well after longest-match priority
-        -- redirected the canonical sin → gain → out fixture to
-        -- the 4-node kernel.
-        testCase "saw → lpf → gain → busOut: middle region tagged RSawLpfGain" $ do
+      , -- BusOut as sink terminal. The 4-node 'RSawLpfGainOut'
+        -- shape accepts either 'KOut' or 'KBusOut' at the
+        -- terminal slot — same reasoning as the 3-node sink
+        -- variant. Pins that the kind-sequence assertion still
+        -- tags as RSawLpfGainOut and that no buffer-terminal
+        -- 'RSawLpfGain' fallback sneaks in.
+        testCase "saw → lpf → gain → busOut: full region tagged RSawLpfGainOut" $ do
           let g = runSynth $ do
                 s <- sawOsc 110.0 0.0
                 f <- lpf s (Param 800.0) (Param 4.0)
                 a <- gain f (Param 0.4)
                 busOut 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RSawLpfGainOut <- kernels] @?= 1
+              length [() | RSawLpfGain    <- kernels] @?= 0
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RSawLpfGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 4
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KSawOsc, KLPF, KGain, KBusOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- 3-node buffer-terminal claim with a non-sink consumer.
+        -- The chain feeds the gain into an 'Add' instead of into
+        -- a sink ('KOut' or 'KBusOut'), so the 4-node
+        -- 'RSawLpfGainOut' shape's @rnKind out_ ∈ {KOut, KBusOut}@
+        -- gate fails. Longest-match falls through to 'RSawLpfGain'
+        -- on the 3-node prefix; the Add and Out land in a
+        -- trailing 'RNodeLoop' region. Pins that 'RSawLpfGain' is
+        -- still alive after longest-match priority redirected the
+        -- saw → lpf → gain → out fixture to the 4-node kernel,
+        -- and that the test fixture is robust to sink-class
+        -- generalizations like @busOut@ joining @out@ as a sink
+        -- terminal.
+        testCase "saw → lpf → gain → add → out: middle region tagged RSawLpfGain" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)        -- non-sink consumer of gain
+                out 0 b
           case lowerGraph g >>= compileRuntimeGraph of
             Left err -> assertFailure $ "compile failed: " <> err
             Right rg -> do
@@ -1755,6 +1787,33 @@ unitTests = testGroup "Unit tests"
                               | ix <- rrNodes r
                               , n <- rgNodes rg, rnIndex n == ix ]
                   kinds @?= [KSinOsc, KGain, KOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- BusOut as sink terminal. 'RSinGainOut' accepts either
+        -- 'KOut' or 'KBusOut' at the terminal slot — both
+        -- dispatch to 'process_out' on the C++ side and read the
+        -- bus index from @rnControls[0]@, so the kernel body
+        -- absorbs them identically. Pins that the Haskell-side
+        -- 'isSinkTerminal' gate accepts BusOut and that the
+        -- region's kind sequence still tags as RSinGainOut.
+        testCase "sin → gain → busOut: middle region tagged RSinGainOut" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                busOut 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RSinGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RSinGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 3
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KSinOsc, KGain, KBusOut]
                 rs -> assertFailure $
                   "expected exactly one fused region, got " <> show (length rs)
 
@@ -3834,6 +3893,26 @@ fusedEquivalenceCases =
        f <- lpf s (Param 800.0) (Param 4.0)
        a <- gain f (Param 0.4)
        out 0 a)
+
+    -- BusOut as sink terminal. The §4.B sink-terminal kernels
+    -- ('RSinGainOut' / 'RSawLpfGainOut') accept either KOut or
+    -- KBusOut at the terminal slot. Both render paths (kernel
+    -- fused vs stripRegionKernels node-loop baseline) read the
+    -- bus index from controls[0] and accumulate into the same
+    -- bus pool, so bit-equivalence on the resulting bus is the
+    -- structural pin that the kernel body really is bus-kind-
+    -- agnostic (i.e. that the dispatch guard and the kernel
+    -- agree on what "sink" means).
+  , ("§4.B sink-terminal via busOut: sin → gain → busOut", runSynth $ do
+       o <- sinOsc 440.0 0.0
+       a <- gain o (Param 0.5)
+       busOut 0 a)
+
+  , ("§4.B sink-terminal via busOut: saw → lpf → gain → busOut", runSynth $ do
+       s <- sawOsc 110.0 0.0
+       f <- lpf s (Param 800.0) (Param 4.0)
+       a <- gain f (Param 0.4)
+       busOut 0 a)
 
   , ("ring mod (audio-mod gain stays dispatched, output gain fuses)", runSynth $ do
        c <- sinOsc 440.0 0.0
