@@ -2547,11 +2547,23 @@ formatRateRow cols =
 --                         the first edge encountered in source
 --                         order
 --
--- Headline: edges where source = 'SampleRate' and dest policy
--- ∈ {'PortBlockLatched', 'PortInitOnly'}. If that number is
--- zero, the consumer-side view doesn't license block-rate
--- regions either; if it is non-trivial, it identifies the
--- specific edge classes a block-rate execution path would target.
+-- Headline: producer /nodes/ — not edges — qualifying as
+-- opportunities. Computed by 'sampleRateOpportunityProducers'
+-- per graph and concatenated across rows: a sample-rate producer
+-- counts only when /every/ active audio-input consumer port is
+-- non-sample-accurate. A producer feeding both 'PortBlockLatched'
+-- and 'PortSampleAccurate' must remain sample-rate to serve the
+-- sample-accurate consumer, so it is /not/ an opportunity even
+-- though one of its edges lands in a non-sample-accurate bucket.
+-- 'PortIgnored' consumers (currently: oscillator phase ports)
+-- are filtered out before the check — they represent no
+-- consumption to demote.
+--
+-- If the producer-node count is zero, the consumer-side view
+-- doesn't license block-rate regions either; if it is non-
+-- trivial, the distinct producer-kind count tells whether the
+-- opportunity is concentrated in one producer family or spans
+-- several.
 printEdgeRateDistribution :: [SurveyRow] -> IO ()
 printEdgeRateDistribution rows = do
   putStrLn "─── Edge-rate distribution (§4.D.2, source rnRate × dest port consumption) ───"
