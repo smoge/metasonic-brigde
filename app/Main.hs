@@ -1274,6 +1274,29 @@ surveyCorpus =
         out 0 a )                            -- missed opportunity: no
                                              -- Noise→LPF→Gain→sink kernel today
 
+  , ( "pos/noise-lpf-gain-busOut"
+    , runSynth $ do
+        -- BusOut counterpart of pos/noise-lpf-gain-out. Adds a
+        -- second instance of Noise→LPF→Gain→sink against the same
+        -- (still-missing) kernel; tests whether the recurring shape
+        -- is robust to sink-terminal variation, not just hand-
+        -- authored against KOut.
+        n <- noiseGen
+        f <- lpf n 1200.0 0.6
+        a <- gain f 0.25
+        busOut 0 a )                         -- missed opportunity: same shape via BusOut
+
+  , ( "pos/busIn-lpf-gain-busOut"
+    , runSynth $ do
+        -- Fully-internal return tail: BusIn → LPF → Gain → BusOut.
+        -- Adds a second instance of BusIn→LPF→Gain→sink, again via
+        -- BusOut rather than Out, to test whether the BusIn-rooted
+        -- candidate is robust across sink terminals.
+        r <- busIn 3
+        f <- lpf r 2000.0 0.6
+        a <- gain f 0.7
+        busOut 0 a )                         -- missed opportunity: BusIn→LPF→Gain→BusOut
+
   -- ── Multi-branch / realistic patch shapes ─────────────────────
   , ( "multi/three-detuned-saws-summed"
     , runSynth $ do
@@ -1300,8 +1323,29 @@ surveyCorpus =
         r <- busIn 7
         f <- lpf r 1500.0 0.7
         b <- gain f 0.8
-        out 0 b )                            -- return tail: BusIn→LPF→Gain→Out;
-                                             -- not in current producer-shape scan
+        out 0 b )                            -- return tail: tracked as BusIn→LPF→Gain→sink
+                                             -- (a future-kernel candidate, no kernel today)
+
+  , ( "multi/send-return-two-tails"
+    , runSynth $ do
+        -- Single voice, two independent filtered return paths
+        -- reading the same bus. Each return tail is its own
+        -- BusIn→LPF→Gain→sink, so this contributes /two/ rows to
+        -- the BusIn-rooted opportunity scan. Realistic stereo /
+        -- parallel-FX patch shape.
+        s <- sawOsc 110.0 0.0
+        a <- gain s 0.4
+        busOut 7 a                           -- voice: RSawGainOut via BusOut sink
+
+        r1 <- busIn 7
+        f1 <- lpf r1 800.0 0.7
+        b1 <- gain f1 0.6
+        out 0 b1                             -- return tail 1: BusIn→LPF→Gain→Out
+
+        r2 <- busIn 7
+        f2 <- lpf r2 2400.0 0.7
+        b2 <- gain f2 0.6
+        out 1 b2 )                           -- return tail 2: BusIn→LPF→Gain→Out
 
   -- ── Mod-heavy / intentional misses ────────────────────────────
   , ( "miss/audio-modulated-gain"
@@ -1338,6 +1382,31 @@ surveyCorpus =
         out    0 a
         busOut 7 a )
                                              -- unclaimed: gain has multiple consumers
+
+  , ( "miss/shared-lpf-feeds-two-gains"
+    , runSynth $ do
+        -- Filtered-tail analogue of miss/shared-producer-two-gains:
+        -- one LPF feeds two parallel Gain→Out chains. The LPF's
+        -- multi-consumer count must block the 4-node match on both
+        -- chains. If a future change relaxes the single-consumer
+        -- precondition for the filter node, this row starts firing.
+        n  <- noiseGen
+        f  <- lpf n 1000.0 0.7
+        a1 <- gain f 0.3; out 0 a1
+        a2 <- gain f 0.2; out 1 a2 )
+                                             -- unclaimed: LPF multi-consumer blocks classification
+
+  , ( "miss/filtered-tail-audio-mod-gain"
+    , runSynth $ do
+        -- Filtered-tail analogue of miss/audio-modulated-gain:
+        -- audio-rate signal feeds the gain's amount in a 4-node
+        -- chain. isScalarGain must block the match exactly the
+        -- same way it does in the 3-node case.
+        n   <- noiseGen
+        f   <- lpf n 1000.0 0.7
+        lfo <- sinOsc 4.0 0.0
+        a   <- gain f lfo
+        out 0 a )                            -- unclaimed: gain control not Param
 
   -- ── Stateful negatives ────────────────────────────────────────
   , ( "neg/env-gain-out"
