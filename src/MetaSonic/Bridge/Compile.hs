@@ -74,6 +74,11 @@ module MetaSonic.Bridge.Compile
   , regionScheduleStats
   , emptyScheduleStats
   , addScheduleStats
+  , -- * Edge-rate survey (§4.D.2)
+    EdgeRateBucket (..)
+  , EdgeRateKey
+  , edgeRateBuckets
+  , addEdgeRateBuckets
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
@@ -101,6 +106,7 @@ import           MetaSonic.Bridge.Compile.RegionKernels
 import           MetaSonic.Bridge.Compile.Dependencies
 import           MetaSonic.Bridge.Compile.Fusion
 import           MetaSonic.Bridge.Compile.Schedule
+import           MetaSonic.Bridge.Compile.EdgeRates
 
 -- | Look up the dense 'NodeIndex' that a given symbolic 'NodeID'
 -- compiled to. Returns 'Nothing' if the 'NodeID' isn't present in

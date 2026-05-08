@@ -3479,6 +3479,134 @@ unitTests = testGroup "Unit tests"
                           total s
       ]
 
+  , testGroup "Phase 4.D.2: portInfo metadata"
+      [ -- Totality: for every 'NodeKind', 'portInfo' must return
+        -- 'Just' on every port in @[0 .. ksAudioArity - 1]@ and
+        -- 'Nothing' on the next index past that range. This is the
+        -- drift guard between 'kindSpec' (which the §4.B / §4.D
+        -- code paths already trust) and the new per-port table.
+        -- Without it, adding an audio input to a 'UGen' constructor
+        -- could leave 'portInfo' stale and silently drop edges
+        -- from the §4.D.2 edge-rate survey.
+        testCase "portInfo is total over the declared audio-input range" $
+          sequence_
+            [ do
+                let arity = ksAudioArity (kindSpec k)
+                sequence_
+                  [ assertBool
+                      (show k <> " port " <> show i
+                       <> " should have a PortInfo entry")
+                      (case portInfo k (PortIndex i) of
+                         Just _  -> True
+                         Nothing -> False)
+                  | i <- [0 .. arity - 1]
+                  ]
+                assertEqual
+                  (show k <> " port " <> show arity
+                   <> " (one past the declared arity) must be Nothing")
+                  Nothing
+                  (portInfo k (PortIndex arity))
+            | k <- [minBound .. maxBound :: NodeKind]
+            ]
+
+      , -- Pin the load-bearing classifications. These three
+        -- entries are the survey's whole reason to exist:
+        --   * Filter freq / q are block-latched (sample 0 only).
+        --   * Oscillator phase is init-only (never resolved per
+        --     block).
+        --   * Gain.amount is sample-accurate (counter-example for
+        --     the handoff-doc claim that "scalar gain amount is a
+        --     block-latch opportunity" — it is not, when wired).
+        -- Any drift in these specific rows would invalidate the
+        -- §4.D.2 opportunity number directly, so they're pinned
+        -- by name rather than by enumeration.
+        testCase "filter freq/q are PortBlockLatched, named freq/q" $ do
+          portInfo KLPF (PortIndex 1)
+            @?= Just (PortInfo PortBlockLatched "freq")
+          portInfo KLPF (PortIndex 2)
+            @?= Just (PortInfo PortBlockLatched "q")
+          portInfo KHPF (PortIndex 1)
+            @?= Just (PortInfo PortBlockLatched "freq")
+          portInfo KBPF (PortIndex 2)
+            @?= Just (PortInfo PortBlockLatched "q")
+          portInfo KNotch (PortIndex 1)
+            @?= Just (PortInfo PortBlockLatched "freq")
+
+      , testCase "oscillator phase ports are PortInitOnly, named phase" $ do
+          portInfo KSinOsc   (PortIndex 1)
+            @?= Just (PortInfo PortInitOnly "phase")
+          portInfo KSawOsc   (PortIndex 1)
+            @?= Just (PortInfo PortInitOnly "phase")
+          portInfo KTriOsc   (PortIndex 1)
+            @?= Just (PortInfo PortInitOnly "phase")
+          portInfo KPulseOsc (PortIndex 1)
+            @?= Just (PortInfo PortInitOnly "phase")
+
+      , testCase "Gain.amount is PortSampleAccurate (not block-latched)" $ do
+          portInfo KGain (PortIndex 1)
+            @?= Just (PortInfo PortSampleAccurate "amount")
+          -- Spot-check sibling sample-accurate rows so a future
+          -- change that flips Gain.amount accidentally also
+          -- flips at least one of these.
+          portInfo KPulseOsc (PortIndex 2)
+            @?= Just (PortInfo PortSampleAccurate "width")
+          portInfo KDelay   (PortIndex 1)
+            @?= Just (PortInfo PortSampleAccurate "time")
+          portInfo KSmooth  (PortIndex 0)
+            @?= Just (PortInfo PortSampleAccurate "target")
+
+      , testCase "kinds with no audio inputs return Nothing on every port" $
+          sequence_
+            [ assertEqual
+                (show k <> " port 0 should be Nothing")
+                Nothing
+                (portInfo k (PortIndex 0))
+            | k <- [KNoiseGen, KBusIn, KBusInDelayed]
+            ]
+
+      , -- Integration of 'edgeRateBuckets' with 'portInfo'. An
+        -- Env-driven LPF cutoff is the canonical §4.D.2
+        -- opportunity edge: the 'KEnv' source has 'rnRate =
+        -- SampleRate' (kind floor), and 'KLPF' port 1 has
+        -- consumption policy 'PortBlockLatched'. The bucket lookup
+        -- must produce exactly one such edge with the expected
+        -- producer kind and example string. Catches drift where a
+        -- future change to either the kind floors, 'propagateRates',
+        -- the unfused-graph contract of 'compileRuntimeGraph', or
+        -- the 'portInfo' table would silently re-classify the edge.
+        testCase "edgeRateBuckets: Env → LPF.freq lands in (SampleRate, PortBlockLatched)" $ do
+          let g = runSynth $ do
+                e <- env (Param 1.0) 0.005 0.05 0.7 0.5
+                n <- noiseGen
+                f <- lpf n e (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let buckets = edgeRateBuckets rt
+                  key     = (SampleRate, PortBlockLatched)
+              case M.lookup key buckets of
+                Nothing ->
+                  assertFailure $
+                    "expected a bucket at " <> show key
+                    <> ", got " <> show (M.keys buckets)
+                Just b -> do
+                  -- Exactly one Env → LPF.freq edge.
+                  erbEdgeCount b @?= 1
+                  -- Producer kind = Env.
+                  KEnv `elem` erbProducerKinds b @?= True
+                  -- Example string ends with the LPF.freq
+                  -- destination so survey output is legible.
+                  case erbExample b of
+                    Just s ->
+                      assertBool
+                        ("example should mention LPF.freq, got: " <> s)
+                        ("KLPF.freq" `isInfixOf` s)
+                    Nothing ->
+                      assertFailure "bucket missing example"
+      ]
+
   , testCase "kindTag is injective" $
       let ks = [minBound .. maxBound :: NodeKind]
           ts = map kindTag ks

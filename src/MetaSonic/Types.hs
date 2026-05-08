@@ -63,6 +63,10 @@ module MetaSonic.Types
   , kindSpec
   , -- * Rate discipline
     Rate (..)
+  , -- * Per-input-port consumption policy (§4.D.2)
+    PortConsumptionRate (..)
+  , PortInfo (..)
+  , portInfo
   , -- * Resource effects
     Eff (..)
   ) where
@@ -452,6 +456,145 @@ data Rate
   | SampleRate    -- ^ Recomputed every sample
   deriving stock    (Eq, Ord, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
+
+{- Note [Per-input-port consumption policy]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'PortConsumptionRate' describes how the C++ runtime samples the
+incoming audio buffer at a specific input port of a specific
+'NodeKind'. It is /per-port/ and /destination-side/: a separate
+axis from 'Rate', which is the /per-node/ /producer-side/ rate
+the IR computes via 'propagateRates'.
+
+The two are intentionally distinct:
+
+  * A 'Rate' tells you what the producer node /generates/.
+  * A 'PortConsumptionRate' tells you how a destination port
+    /reads/ what was generated.
+
+The opportunity question §4.D.2 measures lives at the join: a
+'SampleRate' producer wired into a 'PortBlockLatched' or
+'PortInitOnly' destination port writes 'nframes' samples that
+the consumer will discard. That edge is where block-rate region
+optimization could save work.
+
+The metadata is conservative: when in doubt, the table claims
+'PortSampleAccurate' so the survey never overstates a block-rate
+opportunity that the runtime doesn't actually take. Each non-
+sample-accurate classification is pinned by a comment to the
+specific runtime kernel that block-latches or init-reads the
+port.
+
+This metadata is /descriptive/. Nothing in the runtime consumes
+it; it exists so '--fusion-survey' can measure how many edges
+in real graphs would benefit from a block-rate execution path
+before any such path is implemented.
+-}
+
+-- | How the runtime reads a specific input port of a specific
+-- 'NodeKind'. See Note [Per-input-port consumption policy].
+data PortConsumptionRate
+  = PortSampleAccurate
+    -- ^ Read once per sample. Per-block work scales with @nframes@.
+    -- This is the conservative default: most audio inputs and most
+    -- ports that haven't been audited or block-latched on the C++
+    -- side fall here.
+  | PortBlockLatched
+    -- ^ Read only at sample 0 of each block. The destination
+    -- discards @nframes - 1@ samples of the source per block.
+    -- Currently: the @freq@ and @q@ ports of the biquad family
+    -- ('KLPF', 'KHPF', 'KBPF', 'KNotch'). The C++ kernels
+    -- explicitly take only @freq_in[0]@ and @q_in[0]@ before
+    -- reconfiguring the filter once per block.
+  | PortInitOnly
+    -- ^ Read only at instance configuration / construction. Never
+    -- sampled in the per-block audio loop. Currently: the @phase@
+    -- port (port 1) of the oscillator family ('KSinOsc',
+    -- 'KSawOsc', 'KTriOsc', 'KPulseOsc'). The C++ kernels never
+    -- 'resolve_input' on port 1; the initial phase is folded into
+    -- 'OscState' once.
+  deriving stock    (Eq, Ord, Show, Generic, Enum, Bounded)
+  deriving anyclass (NFData)
+
+-- | Bundle a port's consumption rate with a human-readable name
+-- so the §4.D.2 survey can produce legible "kind.port" examples
+-- without a separate lookup table.
+data PortInfo = PortInfo
+  { piPolicy :: !PortConsumptionRate
+    -- ^ How the runtime reads this port.
+  , piName   :: !String
+    -- ^ Short port name used in survey output (e.g. @"freq"@,
+    -- @"sig"@, @"amount"@). Matches the source-DSL builder
+    -- argument name where one exists.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Per-kind, per-port consumption policy. Returns 'Nothing' for
+-- ports outside the kind's audio-input range; the audio-input
+-- range itself comes from 'kindSpec'\'s 'ksAudioArity' field, so
+-- this function is total over the declared port range.
+--
+-- Cross-checked against 'kindSpec' / 'ugenView' by a property
+-- test in @test/Spec.hs@: every kind's declared audio-input
+-- count must agree with the highest port index 'portInfo'
+-- claims, and every port in @[0 .. ksAudioArity - 1]@ must
+-- return 'Just'.
+portInfo :: NodeKind -> PortIndex -> Maybe PortInfo
+portInfo k (PortIndex i) = case k of
+  KSinOsc       -> oscPort i
+  KSawOsc       -> oscPort i
+  KTriOsc       -> oscPort i
+  KPulseOsc     -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "freq")
+    1 -> Just (PortInfo PortInitOnly       "phase")
+    2 -> Just (PortInfo PortSampleAccurate "width")
+    _ -> Nothing
+  KNoiseGen     -> Nothing
+  KLPF          -> filterPort i
+  KHPF          -> filterPort i
+  KBPF          -> filterPort i
+  KNotch        -> filterPort i
+  KGain         -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "sig")
+    1 -> Just (PortInfo PortSampleAccurate "amount")
+    _ -> Nothing
+  KAdd          -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "a")
+    1 -> Just (PortInfo PortSampleAccurate "b")
+    _ -> Nothing
+  KEnv          -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "gate")
+    _ -> Nothing
+  KOut          -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "sig")
+    _ -> Nothing
+  KBusOut       -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "sig")
+    _ -> Nothing
+  KBusIn        -> Nothing
+  KBusInDelayed -> Nothing
+  KDelay        -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "sig")
+    1 -> Just (PortInfo PortSampleAccurate "time")
+    _ -> Nothing
+  KSmooth       -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "target")
+    _ -> Nothing
+  where
+    -- Oscillator family: port 0 = freq (sample-accurate FM when
+    -- wired), port 1 = phase (init-only; never resolved in the
+    -- per-block loop).
+    oscPort 0 = Just (PortInfo PortSampleAccurate "freq")
+    oscPort 1 = Just (PortInfo PortInitOnly       "phase")
+    oscPort _ = Nothing
+
+    -- Biquad family: signal sample-accurate, freq + q
+    -- block-latched (read at sample 0, then reconfigure once per
+    -- block). The kernel comment in @rt_graph.cpp@'s
+    -- @process_lpf@ pins this contract.
+    filterPort 0 = Just (PortInfo PortSampleAccurate "sig")
+    filterPort 1 = Just (PortInfo PortBlockLatched   "freq")
+    filterPort 2 = Just (PortInfo PortBlockLatched   "q")
+    filterPort _ = Nothing
 -- | The derived 'Enum' instance is part of the C ABI for
 -- 'rt_graph_template_add_region': the marshalled int is
 -- @fromEnum :: Rate -> Int@, i.e. constructor declaration order

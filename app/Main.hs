@@ -10,6 +10,7 @@ import           Data.Char                  (toLower)
 import           Data.Either                (partitionEithers)
 import           Data.List                  (find, intercalate, nub, sort,
                                              sortOn)
+import qualified Data.Map.Strict            as M
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
 import           System.Environment         (getArgs, getProgName)
@@ -24,6 +25,7 @@ import           MetaSonic.Bridge.MidiDemo  (CCMapping (..),
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Types            (NodeIndex (..), NodeKind (..),
+                                             PortConsumptionRate (..),
                                              PortIndex (..), Rate (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
@@ -1232,6 +1234,12 @@ data SurveyRow = SurveyRow
     -- Read-only descriptive metadata; the C++ runtime does not
     -- consume it, and the survey reports it without changing
     -- compilation or execution behavior.
+  , srEdgeBuckets  :: !(M.Map EdgeRateKey EdgeRateBucket)
+    -- ^ §4.D.2 edge-rate buckets. One entry per
+    -- @(sourceRate, destPolicy)@ pair that has at least one
+    -- 'RFrom' edge in this row's /unfused/ runtime graph. Used by
+    -- 'printEdgeRateDistribution' to aggregate the survey-wide
+    -- edge view and the headline opportunity count.
   } deriving (Eq, Show)
 
 -- Build a SurveyRow from /two/ compiled 'RuntimeGraph's of the
@@ -1286,6 +1294,11 @@ surveyRuntimeGraph d t rt rtF stats =
        , srShapes       = scanSinkShapes rt
        , srSchedStats   = stats
        , srRateDist     = rateDistribution rt
+       , srEdgeBuckets  = edgeRateBuckets rt
+         -- §4.D.2: read from the unfused graph deliberately. The
+         -- §4.C fused view replaces 'RFrom' with 'RFused' for
+         -- elided producers, which would silently drop the very
+         -- edges the survey is meant to count.
        }
 
 -- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
@@ -1616,6 +1629,84 @@ surveyShapeProbes =
         lfo <- sinOsc 4.0 0.0
         a   <- gain f lfo
         out 0 a )                            -- unclaimed: gain control not Param
+
+  -- ── mod/: §4.D.2 edge-rate survey shaping (not kernel evidence) ─
+  --
+  -- These four entries exist to populate the §4.D.2 edge-rate
+  -- buckets with realistic modulation patterns. They are not meant
+  -- to drive kernel decisions — Tri/Pulse/Add-style §4.B kernel
+  -- additions are gated on the missed-shape table, which is a
+  -- different signal. The point here is to shape the input-
+  -- consumption survey: how often does a sample-rate producer
+  -- land at a block-latched (LPF freq/q) or init-only port?
+
+  , ( "mod/env-cutoff-noise-lpf-gain-out"
+    , runSynth $ do
+        -- Filter envelope sweep: an Env's gate-driven output is
+        -- treated as a sample-rate producer by 'propagateRates'
+        -- (KEnv floor is SampleRate), but the LPF reads its cutoff
+        -- only at sample 0 of each block. The Env→LPF.freq edge is
+        -- the textbook §4.D.2 SampleRate→PortBlockLatched bucket
+        -- entry. Per-block work cost: nframes of Env state
+        -- advance for one cutoff value the runtime actually
+        -- consumes — exactly the discrepancy the survey is
+        -- designed to surface.
+        e <- env (Param 1.0) 0.005 0.05 0.7 0.5
+        n <- noiseGen
+        f <- lpf n e (Param 4.0)
+        a <- gain f (Param 0.4)
+        out 0 a )
+
+  , ( "mod/smooth-cutoff-saw-lpf-gain-out"
+    , runSynth $ do
+        -- Smooth-driven cutoff sweep. 'smooth' takes a base
+        -- frequency and a target value; its output is sample-rate
+        -- (KSmooth floor) but, like the env case, the LPF only
+        -- reads cutoff at sample 0. Same SampleRate→PortBlockLatched
+        -- shape as the env probe but driven by a different
+        -- producer kind, so the survey can tell whether the
+        -- block-latched-cutoff opportunity comes from one
+        -- producer family or several.
+        c <- smooth 30.0 1200.0
+        s <- sawOsc 110.0 0.0
+        f <- lpf s c (Param 4.0)
+        a <- gain f (Param 0.4)
+        out 0 a )
+
+  , ( "mod/tremolo-gain-biased-lfo"
+    , runSynth $ do
+        -- Realistic tremolo: a bipolar LFO, biased and scaled into
+        -- the [0, 1] range, modulating Gain.amount. Gain.amount is
+        -- /sample-accurate/ when wired (PortSampleAccurate per
+        -- §4.D.2), so this produces a SampleRate→SampleRate edge
+        -- regardless of how block-latched-looking the patch shape
+        -- feels. The contrast with the cutoff cases above pins
+        -- the per-port-policy distinction the survey measures:
+        -- "modulation by an LFO" doesn't imply "block-latched
+        -- consumption" — that's a destination property.
+        lfo    <- sinOsc 5.0 0.0
+        scaled <- gain  lfo (Param 0.4)        -- ±0.4 around 0
+        depth  <- add   scaled (Param 0.5)     -- bias into [0.1, 0.9]
+        s      <- sawOsc 110.0 0.0
+        a      <- gain s depth
+        out 0 a )
+
+  , ( "mod/pwm-lfo-into-pulsewidth"
+    , runSynth $ do
+        -- Pulse-width modulation: an LFO drives a pulse osc's
+        -- width input. PulseOsc.width is sample-accurate when
+        -- wired (PortSampleAccurate), so this is another
+        -- SampleRate→SampleRate edge — useful as a paired
+        -- counter-example to the env/smooth → LPF.freq cases.
+        -- Width = bipolar LFO biased into [0.1, 0.9]; same biasing
+        -- pattern as the tremolo probe so the modulation chain is
+        -- musically realistic.
+        lfo    <- sinOsc 0.7 0.0
+        scaled <- gain  lfo (Param 0.4)
+        wmod   <- add   scaled (Param 0.5)
+        p      <- pulseOsc 110.0 0.0 wmod
+        a      <- gain p (Param 0.3)
+        out 0 a )
 
   -- ── neg/: structural negatives ────────────────────────────────
   , ( "neg/shared-producer-two-gains"
@@ -2005,6 +2096,8 @@ runFusionSurvey demos = do
   printEnsembleScheduleWidth ensembleRows
   putStrLn ""
   printRateDistribution allRows
+  putStrLn ""
+  printEdgeRateDistribution allRows
   putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
@@ -2407,6 +2500,108 @@ rateColumnWidths = [42, 14, 4, 4, 4, 4, 5]
 formatRateRow :: [String] -> String
 formatRateRow cols =
   intercalate "  " (zipWith pad rateColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+-- §4.D.2 edge-rate distribution. One row per @(sourceRate,
+-- destPolicy)@ bucket that has at least one 'RFrom' edge across
+-- the survey, plus a footer with the headline opportunity number.
+--
+-- This is the descriptive complement to §4.D.1: §4.D.1 reported
+-- /producer/ output rates and showed the corpus is
+-- 100% 'SampleRate' on the per-node view, which by itself doesn't
+-- license block-rate regions. §4.D.2 reports the
+-- /consumer/-side read policy at each input port, and asks how
+-- many sample-rate producer edges land at a destination that
+-- only reads at block rate or init time. Those edges are where
+-- block-rate execution could save work; the count is the only
+-- evidence that should drive a future block-rate execution
+-- decision.
+--
+-- The survey reads the /unfused/ runtime graph (output of
+-- 'compileRuntimeGraph'). The §4.C fused view rewrites 'RFrom'
+-- producer edges into 'RFused' descriptors when the producer is
+-- a single-consumer scalar, which would shrink the edge
+-- population the survey is supposed to measure.
+--
+-- Columns:
+--   source-rate         : producer 'rnRate'
+--   dest-consumption    : destination port 'PortConsumptionRate'
+--   edges               : total 'RFrom' edges in this bucket
+--   producer-kinds      : count of distinct 'NodeKind's feeding
+--                         the bucket (a kind that fan-outs into
+--                         many destinations counts once)
+--   example             : @"sourceKind → destKind.portName"@ from
+--                         the first edge encountered in source
+--                         order
+--
+-- Headline: edges where source = 'SampleRate' and dest policy
+-- ∈ {'PortBlockLatched', 'PortInitOnly'}. If that number is
+-- zero, the consumer-side view doesn't license block-rate
+-- regions either; if it is non-trivial, it identifies the
+-- specific edge classes a block-rate execution path would target.
+printEdgeRateDistribution :: [SurveyRow] -> IO ()
+printEdgeRateDistribution rows = do
+  putStrLn "─── Edge-rate distribution (§4.D.2, source rnRate × dest port consumption) ───"
+  putStrLn $ formatEdgeRateRow
+    [ "source-rate", "dest-consumption", "edges"
+    , "producer-kinds", "example"
+    ]
+  let aggMap =
+        foldr addEdgeRateBuckets M.empty (map srEdgeBuckets rows)
+      orderedKeys =
+        [ (sr, pp)
+        | sr <- [minBound .. maxBound :: Rate]
+        , pp <- [minBound .. maxBound :: PortConsumptionRate]
+        ]
+      visibleRows =
+        [ (sr, pp, b)
+        | (sr, pp) <- orderedKeys
+        , Just b   <- [M.lookup (sr, pp) aggMap]
+        , erbEdgeCount b > 0
+        ]
+  mapM_ (putStrLn . formatEdgeRateRow . renderEdgeRateRow) visibleRows
+  putStrLn ""
+  let totalEdges = sum (map erbEdgeCount (M.elems aggMap))
+      oppEdges =
+        sum [ erbEdgeCount b
+            | ((sr, pp), b) <- M.toList aggMap
+            , sr == SampleRate
+            , pp /= PortSampleAccurate
+            ]
+      oppKinds =
+        length . nub $
+          [ k
+          | ((sr, pp), b) <- M.toList aggMap
+          , sr == SampleRate
+          , pp /= PortSampleAccurate
+          , k <- erbProducerKinds b
+          ]
+  putStrLn $ "  totals: "
+          <> "edges="            <> show totalEdges
+          <> "  opportunity="    <> show oppEdges
+          <> " (sample-rate producers wired into "
+          <> "non-sample-rate ports)"
+  putStrLn $ "          opportunity producer kinds: "
+          <> show oppKinds
+
+renderEdgeRateRow :: (Rate, PortConsumptionRate, EdgeRateBucket) -> [String]
+renderEdgeRateRow (sr, pp, b) =
+  [ show sr
+  , show pp
+  , show (erbEdgeCount b)
+  , show (length (erbProducerKinds b))
+  , maybe "" id (erbExample b)
+  ]
+
+edgeRateColumnWidths :: [Int]
+edgeRateColumnWidths = [13, 19, 6, 15, 32]
+
+formatEdgeRateRow :: [String] -> String
+formatEdgeRateRow cols =
+  intercalate "  " (zipWith pad edgeRateColumnWidths cols)
   where
     pad w s
       | length s >= w = s

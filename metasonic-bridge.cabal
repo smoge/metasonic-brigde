@@ -28,6 +28,7 @@ library
       MetaSonic.Bridge.Compile.Dependencies
       MetaSonic.Bridge.Compile.Fusion
       MetaSonic.Bridge.Compile.Schedule
+      MetaSonic.Bridge.Compile.EdgeRates
       MetaSonic.Bridge.Templates
       MetaSonic.Bridge.FFI
       MetaSonic.Bridge.MidiDemo
