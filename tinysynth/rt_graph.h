@@ -325,15 +325,32 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //                                     SinOsc -> Gain -> Out)
 //                  3 = SawLpfGainOut (4-node sink-terminal:
 //                                     SawOsc -> LPF -> Gain -> Out)
-//                Unknown values are rejected at registration time
-//                (silent no-op) so a runtime version skew between
-//                sender and resolver can't silently silence a
-//                region. Callers should query
-//                'rt_graph_region_kernel_supported' before sending
-//                a tag if they need to discover the runtime's
-//                supported set; the Haskell side machine-checks
-//                tag agreement in a property test, mirroring the
-//                kindTag pattern in §0.5.1.
+//                The Haskell side machine-checks tag agreement in a
+//                property test (mirroring the kindTag pattern in
+//                §0.5.1) so this set cannot drift between aligned
+//                sender and resolver builds.
+//
+//   Caller responsibility on version skew. The implementation is
+//   /not/ self-healing on an unknown kernel_kind: when the tag is
+//   not recognized the call returns without pushing a RegionSpec.
+//   That looks innocuous in isolation, but if the template already
+//   carries other regions, 'process_instance' takes the
+//   region-iterating dispatch path (regions list is non-empty),
+//   and the unregistered range silently goes unprocessed — the
+//   would-be region's nodes never run. There is no implicit
+//   NodeLoop fallback today.
+//
+//   To safely target a kernel that may not exist in the resolver:
+//     * Query 'rt_graph_region_kernel_supported(tag)' first and
+//       fall back to 'rt_graph_template_add_region' (NodeLoop)
+//       when it returns 0.
+//     * Or register every kernel range as NodeLoop first via
+//       'rt_graph_template_add_region', then upgrade tags
+//       opportunistically — same effect, costs one extra entry.
+//   Either approach guarantees every node lives in /some/ region.
+//   If a future revision wants the stronger "rejected tag still
+//   produces a valid NodeLoop region" guarantee, that has to be
+//   an explicit fallback inside the implementation, not a comment.
 //
 // The remaining arguments mirror rt_graph_template_add_region:
 // rate is stored verbatim, first_node + node_count flatten the
