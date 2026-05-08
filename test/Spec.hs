@@ -2799,18 +2799,18 @@ unitTests = testGroup "Unit tests"
           regionSchedule (tplGraph voiceTpl) @?= Right [RegionIndex 0]
           regionSchedule (tplGraph fxTpl)    @?= Right [RegionIndex 0]
 
-      , -- Fail-loud planner: when 'rgRuntimeRegions' is in an
-        -- order that doesn't satisfy 'regionDependencies'
-        -- (forward cross-segment edge), 'regionSchedule' must
-        -- return @Left@ rather than silently dropping the dep.
+      , -- Fail-loud planner, list-order contract:
+        -- 'rgRuntimeRegions' must be dense ascending by 'rrIndex'
+        -- from 0. 'segmentByBarrier' walks the list in /list/
+        -- order and 'topoSortStable' uses list order as the
+        -- stable tie-breaker, so the documented "barriers stay in
+        -- rrIndex order, free regions tie-break by rrIndex"
+        -- contract only holds when the list /is/ rrIndex order.
         --
-        -- We construct the violation by reversing the kernel-split
-        -- region list: the trailing 'RNodeLoop' barrier (which
-        -- depends on the 'RSawLpfGain' buffer region via the
-        -- structural cross-region edge) ends up scheduled first,
-        -- with its dep not yet satisfied. The planner must catch
-        -- this and refuse.
-        testCase "rejects forward cross-segment edge with diagnostic" $ do
+        -- Reversing the kernel-split region list produces a
+        -- non-ascending sequence; the planner must reject it
+        -- before scheduling.
+        testCase "rejects non-ascending rgRuntimeRegions order" $ do
           let g = runSynth $ do
                 s <- sawOsc 110.0 0.0
                 f <- lpf s (Param 800.0) (Param 4.0)
@@ -2824,17 +2824,43 @@ unitTests = testGroup "Unit tests"
                                reverse (rgRuntimeRegions rg) }
               case regionSchedule bad of
                 Left msg ->
-                  -- Diagnostic mentions the broken contract; we
-                  -- don't pin the exact wording, just that the
-                  -- failure is surfaced.
                   assertBool
-                    ("expected mention of cross-segment edge in: "
+                    ("expected mention of dense ascending in: "
                      <> msg)
-                    ("cross-segment" `isInfixOf` msg)
+                    ("dense" `isInfixOf` msg)
                 Right ixs ->
                   assertFailure $
                     "regionSchedule should have rejected the "
                     <> "reversed graph; got " <> show ixs
+
+      , -- Fail-loud planner, duplicate-index variant: hand-build
+        -- a 'rgRuntimeRegions' with the same 'rrIndex' twice.
+        -- This exercises the dense-ascending check on a malformed
+        -- list that's not just a reversal — duplicates and gaps
+        -- should also be rejected.
+        testCase "rejects duplicate rrIndex in rgRuntimeRegions" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> case rgRuntimeRegions rg of
+              [r] -> do
+                let bad = rg { rgRuntimeRegions = [r, r] }
+                case regionSchedule bad of
+                  Left msg ->
+                    assertBool
+                      ("expected dense-ascending diagnostic in: "
+                       <> msg)
+                      ("dense" `isInfixOf` msg)
+                  Right ixs ->
+                    assertFailure $
+                      "regionSchedule should have rejected the "
+                      <> "duplicate-index graph; got " <> show ixs
+              rs -> assertFailure $
+                "expected a single region, got "
+                <> show (length rs)
       ]
 
   , testCase "kindTag is injective" $

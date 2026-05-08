@@ -32,11 +32,20 @@
 -- identity property; the scheduler-side bit-equivalence test
 -- (when §4.E.2b lands) will catch any future divergence.
 --
--- The planner is /checked/: cycles in 'regionDependencies' and
--- cross-segment edges that point to a not-yet-scheduled region
--- are reported as @Left@. This is the whole point of having a
--- planner before §4.E.2b — silent fallback would let the runtime
--- start trusting a broken contract.
+-- The planner is /checked/: it rejects ('Left') any of —
+--
+--   * 'rgRuntimeRegions' that is not dense-ascending by 'rrIndex'
+--     from 0 (this is the contract; both 'segmentByBarrier' and
+--     'topoSortStable' walk the list in /list/ order and use
+--     'rrIndex' as the stable tie-breaker, so the two only agree
+--     when the list /is/ already 'rrIndex' order),
+--   * cycles in 'regionDependencies' inside a free segment, and
+--   * cross-segment edges that point to a not-yet-scheduled
+--     region.
+--
+-- This is the whole point of having a planner before §4.E.2b —
+-- silent fallback would let the runtime start trusting a broken
+-- contract.
 --
 -- See Note [Region barrier policy] and Note [Region dependency
 -- contract] in 'MetaSonic.Bridge.Compile.Dependencies'.
@@ -56,7 +65,7 @@ import           MetaSonic.Bridge.Compile.Dependencies
 import           MetaSonic.Bridge.Compile.Types
                    ( RuntimeGraph (..)
                    , RuntimeRegion (..)
-                   , RegionIndex
+                   , RegionIndex (..)
                    )
 
 -- | One slice of the schedule. Either a single 'Barrier' region
@@ -101,9 +110,11 @@ segmentByBarrier rg = go [] (rgRuntimeRegions rg)
 -- the full contract.
 --
 -- Returns @Right@ with a list of 'RegionIndex' in execution order
--- when 'regionDependencies' is well-formed. Returns @Left@ with a
+-- when the inputs are well-formed. Returns @Left@ with a
 -- diagnostic when:
 --
+--   * 'rgRuntimeRegions' is not dense-ascending by 'rrIndex' from
+--     0 (duplicate, missing, or non-ascending),
 --   * a free segment contains a dependency cycle, or
 --   * any region's dependencies point to a region that has not
 --     yet been scheduled by the time that segment runs (a
@@ -111,10 +122,12 @@ segmentByBarrier rg = go [] (rgRuntimeRegions rg)
 --     later barrier or free segment).
 --
 -- §4.E.2b will consume @Right@ values directly; the @Left@ paths
--- exist so a future change that breaks 'regionDependencies' is
+-- exist so a future change that breaks the input contract is
 -- caught here, not by silent reordering at runtime.
 regionSchedule :: RuntimeGraph -> Either String [RegionIndex]
-regionSchedule rg = go S.empty (segmentByBarrier rg)
+regionSchedule rg = do
+  validateRegionOrder (rgRuntimeRegions rg)
+  go S.empty (segmentByBarrier rg)
   where
     deps = regionDependencies rg
 
@@ -123,6 +136,29 @@ regionSchedule rg = go S.empty (segmentByBarrier rg)
       ixs <- scheduleSegment deps done seg
       let done' = foldr S.insert done ixs
       (ixs ++) <$> go done' rest
+
+-- | The contract is that 'rgRuntimeRegions' is in dense ascending
+-- 'rrIndex' order from 0. 'segmentByBarrier' relies on /list/
+-- order to position barriers and free segments, and
+-- 'topoSortStable' uses /list/ order as the stable tie-breaker
+-- inside a free segment — so the two only agree with the
+-- documented rrIndex-stable contract when the list /is/ rrIndex
+-- order.
+--
+-- Reject duplicates, gaps, and non-ascending list order with a
+-- specific diagnostic so a future bug that produces, say, a
+-- region list with a missing index or a swapped pair is caught
+-- here.
+validateRegionOrder :: [RuntimeRegion] -> Either String ()
+validateRegionOrder rs =
+  let ixs      = map rrIndex rs
+      expected = [RegionIndex i | i <- [0 .. length rs - 1]]
+  in if ixs == expected
+       then Right ()
+       else Left $
+         "regionSchedule: rgRuntimeRegions must be dense "
+         <> "ascending by rrIndex from 0; got "
+         <> show ixs <> ", expected " <> show expected
 
 -- | Schedule one segment.
 --
