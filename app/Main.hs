@@ -8,7 +8,8 @@ import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
 import           Data.Char                  (toLower)
 import           Data.Either                (partitionEithers)
-import           Data.List                  (find, intercalate, nub, sort)
+import           Data.List                  (find, intercalate, nub, sort,
+                                             sortOn)
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
 import           System.Environment         (getArgs, getProgName)
@@ -971,21 +972,27 @@ data SinkShape
   | SinkOscLpfGain  !NodeKind   -- producer → LPF → Gain → sink
   | SinkBusInLpfGain            -- BusIn → LPF → Gain → sink
                                 -- (return tail of a send-return)
+  | SinkAddLpfGain              -- Add   → LPF → Gain → sink
+                                -- (post-mix filtered tail; no
+                                -- producer constraint on Add's
+                                -- inputs, only the LPF/Gain/sink
+                                -- portion is matched)
   deriving (Eq, Show)
 
 -- The full enumeration of shapes the survey reports on. Listed in
 -- a deliberate display order: 3-node oscillator-rooted sinks first
 -- (the strongest fusion class per notes/fusion-strategy.md), then
--- 4-node oscillator-rooted sinks, then BusIn-rooted return tails.
--- Producer kinds within the oscillator groups follow
--- 'sinkProducerKinds'. Iterating this list (rather than keying a
--- Map by SinkShape) avoids needing 'Ord NodeKind' and gives stable
--- column order.
+-- 4-node oscillator-rooted sinks, then BusIn-rooted return tails,
+-- then Add-rooted post-mix tails. Producer kinds within the
+-- oscillator groups follow 'sinkProducerKinds'. Iterating this
+-- list (rather than keying a Map by SinkShape) avoids needing
+-- 'Ord NodeKind' and gives stable column order.
 allKnownShapes :: [SinkShape]
 allKnownShapes =
   [SinkOscGain    k | k <- sinkProducerKinds]
   <> [SinkOscLpfGain k | k <- sinkProducerKinds]
   <> [SinkBusInLpfGain]
+  <> [SinkAddLpfGain]
 
 -- Producer kinds the survey treats as "oscillator-like" sources.
 -- Restricted to the kinds that already exist in the DSL and that
@@ -1007,6 +1014,7 @@ renderShape :: SinkShape -> String
 renderShape (SinkOscGain k)    = renderProducer k <> " → Gain → sink"
 renderShape (SinkOscLpfGain k) = renderProducer k <> " → LPF → Gain → sink"
 renderShape SinkBusInLpfGain   = "BusIn → LPF → Gain → sink"
+renderShape SinkAddLpfGain     = "Add → LPF → Gain → sink"
 
 -- Whether the §4.B kernel set currently has a kernel that would
 -- claim this shape (independent of whether the kernel
@@ -1055,6 +1063,7 @@ scanSinkShapes rt =
      concatMap check3    (windows3 (rgNodes rt))
   ++ concatMap check4    (windows4 (rgNodes rt))
   ++ concatMap check4Bus (windows4 (rgNodes rt))
+  ++ concatMap check4Add (windows4 (rgNodes rt))
   where
     fusedRegions = [r | r <- rgRuntimeRegions rt, rrKernel r /= RNodeLoop]
     inSameFusedRegion ixs =
@@ -1115,6 +1124,33 @@ scanSinkShapes rt =
       , not (rnElided a) && not (rnElided b)
                          && not (rnElided c) && not (rnElided d)
       = [( SinkBusInLpfGain
+         , inSameFusedRegion
+             [rnIndex a, rnIndex b, rnIndex c, rnIndex d] )]
+      | otherwise = []
+
+    -- Add-rooted post-mix tail: Add → LPF → Gain → sink. Same
+    -- preconditions as 'check4Bus' for the LPF/Gain/sink portion;
+    -- producer constraint becomes a direct KAdd check. Add's own
+    -- inputs are unconstrained — the kernel-decision question
+    -- this row answers is "is post-mix filtered tail a recurring
+    -- shape", which is independent of how the mix was built. No
+    -- kernel claims this shape today; 'shapeHasKernel
+    -- SinkAddLpfGain = False'.
+    check4Add (a, b, c, d)
+      | rnKind a == KAdd
+      , rnKind b == KLPF
+      , rnKind c == KGain
+      , isSinkKind (rnKind d)
+      , rnConsumerCount a == 1
+      , rnConsumerCount b == 1
+      , rnConsumerCount c == 1
+      , signalSourceIsRT (rnIndex a) b
+      , signalSourceIsRT (rnIndex b) c
+      , signalSourceIsRT (rnIndex c) d
+      , isScalarGainRT c
+      , not (rnElided a) && not (rnElided b)
+                         && not (rnElided c) && not (rnElided d)
+      = [( SinkAddLpfGain
          , inSameFusedRegion
              [rnIndex a, rnIndex b, rnIndex c, rnIndex d] )]
       | otherwise = []
@@ -1963,16 +1999,37 @@ formatSurveyRow cols =
 surveyColumnWidths :: [Int]
 surveyColumnWidths = [42, 14, 5, 5, 9, 8, 10, 11, 30]
 
--- Opportunity scan: for each known sink-terminal shape, how many
--- candidate chains the survey saw, how many were claimed by a
--- §4.B kernel, and how many were missed. Shapes with no kernel
--- today appear with a "kernel? —" marker; those rows are the
--- raw signal for "is it worth adding a Tri / Pulse / etc.
--- kernel".
+-- Ranked sink-terminal opportunity scan. For each 'SinkShape' in
+-- 'allKnownShapes', the survey reports:
+--
+--   found     total occurrences across all surveyed graphs
+--   claimed   occurrences where the chain landed in a §4.B fused region
+--   missed    found − claimed
+--   sources   number of distinct demo / corpus / ensemble entries
+--             ('srDemo') that contained at least one instance. Multi-
+--             template ensembles count as /one/ source even if several
+--             templates contribute the same shape — three misses from
+--             one synthetic graph is weaker signal than three misses
+--             from three independent patch families (per the candidate
+--             gate in notes/fusion-strategy.md).
+--   status    'covered' (kernel exists), 'candidate' (no kernel; gate
+--             passed: missed ≥ 3 ∧ sources ≥ 3), or 'no-signal' (no
+--             kernel; gate not yet met).
+--   next      the action implied by the status. 'already-covered',
+--             'benchmark' (start kernel evaluation), 'grow-corpus'
+--             (need more independent shape sources before deciding),
+--             or 'investigate' (kernel exists but didn't claim — a
+--             §4.B precondition surprise that warrants a look).
+--
+-- Rows are ordered candidate → no-signal → covered, then by missed
+-- desc, then by sources desc, then by 'allKnownShapes' display index.
+-- Rows with @found = 0@ are dropped /unless/ a kernel exists, so the
+-- existing kernel set always shows up even when nothing exercises it.
 printOpportunityScan :: [SurveyRow] -> IO ()
 printOpportunityScan rows = do
-  putStrLn "─── Sink-terminal opportunity scan ───"
-  putStrLn $ formatScanRow ["shape", "found", "claimed", "missed", "kernel?"]
+  putStrLn "─── Ranked missed-shape table ───"
+  putStrLn $ formatScanRow
+    ["shape", "found", "claimed", "missed", "sources", "status", "next"]
   mapM_ (putStrLn . formatScanRow) (scanRows rows)
   where
     formatScanRow cols =
@@ -1982,26 +2039,95 @@ printOpportunityScan rows = do
       | otherwise     = s <> replicate (w - length s) ' '
 
 scanColumnWidths :: [Int]
-scanColumnWidths = [32, 6, 8, 7, 8]
+scanColumnWidths = [32, 6, 8, 7, 8, 10, 16]
+
+-- 'ScanStat' is the per-shape aggregate that drives the ranked
+-- table. Built once and reused for the row, the gate evaluation,
+-- and the sort key, so sort order and rendered status can never
+-- disagree.
+data ScanStat = ScanStat
+  { scShape   :: !SinkShape
+  , scFound   :: !Int
+  , scClaimed :: !Int
+  , scMissed  :: !Int
+  , scSources :: !Int
+  } deriving (Eq, Show)
+
+scanStats :: [SurveyRow] -> [ScanStat]
+scanStats rows =
+  [ ScanStat
+      { scShape   = sh
+      , scFound   = length matching
+      , scClaimed = length [c | (c, _) <- matching, c]
+      , scMissed  = length [c | (c, _) <- matching, not c]
+      , scSources = length (nub [demo | (_, demo) <- matching])
+      }
+  | sh <- allKnownShapes
+  , let matching =
+          [ (claimed, srDemo r)
+          | r <- rows
+          , (s, claimed) <- srShapes r
+          , s == sh
+          ]
+  ]
+
+-- Status: 'covered' is purely a kernel-existence statement; the
+-- candidate gate from notes/fusion-strategy.md applies only when
+-- no kernel claims the shape. 'no-signal' covers both "shape never
+-- appeared" (kept in the table only when a kernel exists) and
+-- "shape appeared but the gate didn't pass yet".
+scanStatus :: ScanStat -> String
+scanStatus st
+  | shapeHasKernel (scShape st)                      = "covered"
+  | scMissed st >= 3 && scSources st >= 3            = "candidate"
+  | otherwise                                        = "no-signal"
+
+-- Next action is mostly a dispatch on status, with one exception:
+-- 'covered' rows whose kernel didn't claim every instance get
+-- 'investigate', because that means a §4.B precondition slipped
+-- past the scanner's preconditions on at least one chain.
+scanNext :: ScanStat -> String
+scanNext st = case scanStatus st of
+  "covered"
+    | scMissed st > 0 -> "investigate"
+    | otherwise       -> "already-covered"
+  "candidate"         -> "benchmark"
+  _                   -> "grow-corpus"
 
 scanRows :: [SurveyRow] -> [[String]]
 scanRows rows =
-  let allShapes = concatMap srShapes rows
-      countFor sh =
-        let matching = [c | (s, c) <- allShapes, s == sh]
-            claimed  = length (filter id matching)
-            found    = length matching
-        in (found, claimed, found - claimed)
-  in [ [ renderShape sh
-       , show found
-       , show claimed
-       , show missed
-       , if shapeHasKernel sh then "yes" else "—"
-       ]
-     | sh <- allKnownShapes
-     , let (found, claimed, missed) = countFor sh
-     , found > 0 || shapeHasKernel sh
-     ]
+  [ [ renderShape (scShape st)
+    , show (scFound   st)
+    , show (scClaimed st)
+    , show (scMissed  st)
+    , show (scSources st)
+    , scanStatus st
+    , scanNext   st
+    ]
+  | st <- sortRanked
+            [ st
+            | st <- scanStats rows
+            , scFound st > 0 || shapeHasKernel (scShape st)
+            ]
+  ]
+  where
+    statusRank st = case scanStatus st of
+      "candidate" -> 0
+      "no-signal" -> 1
+      _           -> 2  -- "covered"
+    -- Display index from 'allKnownShapes' so ties resolve to the
+    -- documented family order (3-node oscs, 4-node oscs, BusIn,
+    -- Add).
+    displayIx sh = case lookup sh (zip allKnownShapes [0 :: Int ..]) of
+      Just i  -> i
+      Nothing -> length allKnownShapes
+    sortRanked =
+      sortOn $ \st ->
+        ( statusRank st
+        , negate (scMissed  st)
+        , negate (scSources st)
+        , displayIx (scShape st)
+        )
 
 -- §4.E.2c parallel-readiness section. One row per surveyed graph,
 -- plus a footer with aggregate counts and the maximum free-segment
