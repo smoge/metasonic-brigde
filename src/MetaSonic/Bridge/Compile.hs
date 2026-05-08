@@ -742,8 +742,8 @@ form.
 --
 -- The integer tag is part of the C ABI: 0 = NodeLoop,
 -- 1 = SawLpfGain, 2 = SinGainOut, 3 = SawLpfGainOut,
--- 4 = SawGainOut. Keep 'kernelTag' in lockstep with the C++
--- 'RegionKernel' enum in @rt_graph.cpp@.
+-- 4 = SawGainOut, 5 = NoiseGainOut. Keep 'kernelTag' in lockstep
+-- with the C++ 'RegionKernel' enum in @rt_graph.cpp@.
 data RegionKernel
   = RNodeLoop
     -- ^ Default: process each member node individually, in stored
@@ -801,6 +801,17 @@ data RegionKernel
     -- per-sample DSP body is just @q::saw -> *gain_amount@,
     -- exactly the SinGainOut kernel with @q::saw@ in place of
     -- @q::sin@.
+  | RNoiseGainOut
+    -- ^ Sink-terminal kernel for @[KNoiseGen, KGain, /sink/]@.
+    -- Mechanically the noise counterpart of 'RSinGainOut' /
+    -- 'RSawGainOut', but covers a different state class: noise
+    -- carries a 'q::white_noise_gen' xorshift PRNG instead of
+    -- a 'q::phase_iterator'. NoiseGen has no audio inputs and
+    -- no controls, so the kernel body is the simplest of the
+    -- sink-terminal set — pull one PRNG sample, recenter to
+    -- bipolar, multiply by the gain control, accumulate into
+    -- the bus. Reuses 'SinkAccumulator' but /not/
+    -- 'drive_oscillator' (no freq port to branch on).
   deriving stock    (Eq, Show, Generic, Bounded, Enum)
   deriving anyclass (NFData)
 
@@ -815,6 +826,7 @@ kernelTag RSawLpfGain    = 1
 kernelTag RSinGainOut    = 2
 kernelTag RSawLpfGainOut = 3
 kernelTag RSawGainOut    = 4
+kernelTag RNoiseGainOut  = 5
 
 -- | Number of contiguous member nodes a fused kernel claims when
 -- it matches. 'RNodeLoop' has no fixed arity — a NodeLoop region
@@ -828,6 +840,7 @@ kernelArity RSawLpfGain    = 3
 kernelArity RSinGainOut    = 3
 kernelArity RSawLpfGainOut = 4
 kernelArity RSawGainOut    = 3
+kernelArity RNoiseGainOut  = 3
 kernelArity RNodeLoop      = 0
 
 -- | One execution region in the runtime graph: a contiguous block
@@ -1063,7 +1076,7 @@ Match arity is /not/ implicit: 'findKernelMatch' returns a
 'kernelArity' and the dispatch in 'findKernelMatch' — the
 splitter consumes whatever length the descriptor reports.
 
-Currently four kernel shapes are recognized. The sink-terminal
+Currently five kernel shapes are recognized. The sink-terminal
 kernels accept either 'KOut' or 'KBusOut' at the terminal slot;
 both dispatch to the same per-node kernel ('process_out' on the
 C++ side) and read their bus index from @rnControls[0]@, so the
@@ -1086,6 +1099,14 @@ fused kernel body absorbs them identically. See 'isSinkTerminal'.
     @q::sin@ in the per-sample body. Added after the
     @--fusion-survey@ scan flagged @Saw → Gain → sink@ as the
     most-missed shape on the demo set.
+  * 'RNoiseGainOut' — 3-node sink-terminal:
+    @[KNoiseGen, KGain, /sink/]@. Different state class from the
+    oscillator sink kernels: NoiseGen carries a
+    'q::white_noise_gen' xorshift PRNG (no phase iterator, no
+    freq port, no controls), so the C++ kernel body is one PRNG
+    read per sample × scalar gain — no 'drive_oscillator' wrap.
+    Bit-equivalence depends on advancing the PRNG once per
+    sample exactly as 'process_noisegen' does.
   * 'RSawLpfGainOut' — 4-node sink-terminal:
     @[KSawOsc, KLPF, KGain, /sink/]@. Combines saw + LPF + gain
     processing with the inline bus accumulation and sink-peak
@@ -1273,9 +1294,10 @@ findKernelMatch nodes = go 0
 
     match3 ixs = case ixs of
       a : b : c : _
-        | matchesSawLpfGain nodes a b c -> Just (mkMatch RSawLpfGain)
-        | matchesSinGainOut nodes a b c -> Just (mkMatch RSinGainOut)
-        | matchesSawGainOut nodes a b c -> Just (mkMatch RSawGainOut)
+        | matchesSawLpfGain   nodes a b c -> Just (mkMatch RSawLpfGain)
+        | matchesSinGainOut   nodes a b c -> Just (mkMatch RSinGainOut)
+        | matchesSawGainOut   nodes a b c -> Just (mkMatch RSawGainOut)
+        | matchesNoiseGainOut nodes a b c -> Just (mkMatch RNoiseGainOut)
       _ -> Nothing
 
     -- 'kmOffset = -1' is a placeholder; 'go' fills in the real
@@ -1358,6 +1380,35 @@ matchesSawGainOut nodes sawIx gainIx outIx =
         && rnConsumerCount gain == 1
         && signalSourceIs sawIx  gain
         && signalSourceIs gainIx out_
+        && isScalarGain gain
+    _ -> False
+
+-- | The noise counterpart of 'matchesSinGainOut': KNoiseGen →
+-- KGain → /sink/. Same shape gates as the oscillator sink-terminal
+-- predicates, but covers a different state class — NoiseGen
+-- carries a 'q::white_noise_gen' xorshift PRNG rather than a
+-- 'q::phase_iterator', and has no audio inputs and no controls
+-- of its own. The matcher's preconditions don't change because
+-- they only constrain edges, kinds, and consumer counts; the
+-- per-sample DSP body on the C++ side is what differs (one PRNG
+-- read instead of an oscillator phase advance).
+matchesNoiseGainOut
+  :: M.Map NodeIndex RuntimeNode
+  -> NodeIndex -> NodeIndex -> NodeIndex
+  -> Bool
+matchesNoiseGainOut nodes noiseIx gainIx outIx =
+  case (M.lookup noiseIx nodes, M.lookup gainIx nodes, M.lookup outIx nodes) of
+    (Just noise, Just gain, Just out_) ->
+      rnKind noise == KNoiseGen
+        && rnKind gain == KGain
+        && isSinkTerminal (rnKind out_)
+        && not (rnElided noise)
+        && not (rnElided gain)
+        && not (rnElided out_)
+        && rnConsumerCount noise == 1
+        && rnConsumerCount gain  == 1
+        && signalSourceIs noiseIx gain
+        && signalSourceIs gainIx  out_
         && isScalarGain gain
     _ -> False
 

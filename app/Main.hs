@@ -988,10 +988,11 @@ renderShape (SinkOscLpfGain k) = renderProducer k <> " → LPF → Gain → sink
 -- claim this shape (independent of whether the kernel
 -- preconditions hold on any specific instance).
 shapeHasKernel :: SinkShape -> Bool
-shapeHasKernel (SinkOscGain    KSinOsc) = True   -- RSinGainOut
-shapeHasKernel (SinkOscGain    KSawOsc) = True   -- RSawGainOut
-shapeHasKernel (SinkOscLpfGain KSawOsc) = True   -- RSawLpfGainOut
-shapeHasKernel _                        = False
+shapeHasKernel (SinkOscGain    KSinOsc)   = True   -- RSinGainOut
+shapeHasKernel (SinkOscGain    KSawOsc)   = True   -- RSawGainOut
+shapeHasKernel (SinkOscGain    KNoiseGen) = True   -- RNoiseGainOut
+shapeHasKernel (SinkOscLpfGain KSawOsc)   = True   -- RSawLpfGainOut
+shapeHasKernel _                          = False
 
 -- Sink-terminal classifier: matches NodeKind.{Out,BusOut} on the
 -- C++ side / 'isSinkTerminal' on the Haskell matcher side.

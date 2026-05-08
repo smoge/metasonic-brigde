@@ -802,8 +802,11 @@ enum class RegionKernel : int {
                       // (sink-terminal: bus accumulate + sink-peak)
   SawLpfGainOut = 3,  // fused per-sample SawOsc -> LPF -> Gain -> Out
                       // (4-node sink-terminal)
-  SawGainOut    = 4   // fused per-sample SawOsc -> Gain -> Out
+  SawGainOut    = 4,  // fused per-sample SawOsc -> Gain -> Out
                       // (3-node sink-terminal; SinGainOut counterpart)
+  NoiseGainOut  = 5   // fused per-sample NoiseGen -> Gain -> Out
+                      // (3-node sink-terminal; PRNG-state class —
+                      //  no freq port, no phase iterator)
 };
 
 // Validate an int from the C ABI. Returns nullopt on an unknown
@@ -818,6 +821,7 @@ region_kernel_from_tag(int kind) noexcept {
   case 2: return RegionKernel::SinGainOut;
   case 3: return RegionKernel::SawLpfGainOut;
   case 4: return RegionKernel::SawGainOut;
+  case 5: return RegionKernel::NoiseGainOut;
   default: return std::nullopt;
   }
 }
@@ -3317,6 +3321,71 @@ static void process_region_saw_gain_out(
   sink.flush_to(inst);
 }
 
+/* Note [Region kernel: NoiseGainOut]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+3-node sink-terminal kernel for [NoiseGen, Gain, sink]. Same
+SinkAccumulator discipline as the oscillator-based sink kernels,
+but a different state class on the producer side: NoiseGen
+carries a 'q::white_noise_gen' xorshift PRNG instead of a phase
+iterator, has no audio inputs, and no controls of its own. The
+per-sample loop is the simplest of the §4.B sink kernels —
+@(noisegen->noise() - 1.0f) * gain_amount@, accumulated into the
+bus, with the same block_sink_peak tracking.
+
+Bit-equivalence with the unfused chain ('process_noisegen' +
+'process_gain' + 'process_out') depends on advancing the
+'q::white_noise_gen' /once per sample/, in the same order, with
+the same recentering subtract. The fused body calls 'noisegen->
+noise()' exactly once per output sample, exactly as the unfused
+'process_noisegen' does, so the PRNG stream stays bit-identical
+across the fused / per-node split. (This is the load-bearing
+correctness pin for the noise kernel — the equivalence test in
+'fusedEquivalenceCases' compares the kernel render against a
+'stripRegionKernels' baseline that drives the same PRNG instance
+through 'process_noisegen' frame-for-frame.)
+
+This kernel intentionally does NOT use 'drive_oscillator': there
+is no freq port to branch on and no phase iterator to advance.
+The body is just a tight per-sample loop.
+
+If the kind sequence at registration time doesn't match
+[NoiseGen, Gain, sink-terminal], the dispatch site falls back to
+per-node iteration. Same silent-degradation discipline as the
+other §4.B kernels.
+*/
+static void process_region_noise_gain_out(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t noise_idx, std::size_t gain_idx, std::size_t out_idx,
+    int nframes
+) noexcept {
+  auto &noise_node = inst.nodes[noise_idx];
+  auto &gain_node  = inst.nodes[gain_idx];
+  auto &out_node   = inst.nodes[out_idx];
+
+  auto *noisegen = std::get_if<NoiseGenState>(&noise_node.state);
+  if (!noisegen) {
+    // Defensive: no PRNG state means we can't produce samples.
+    // Silent no-op (block_sink_peak unchanged, bus untouched).
+    return;
+  }
+
+  const float gain_amount = sanitize_finite(
+      static_cast<float>(gain_node.controls[0]), 1.0f);
+
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    // Mirror process_noisegen exactly: pull one PRNG sample,
+    // recenter from [0,2] to bipolar [-1,1], then multiply by
+    // the gain. Calling 'noise()' here advances the PRNG state
+    // once per sample — same cadence as the per-node kernel,
+    // so the stream stays bit-identical to the unfused render.
+    const float noise_sample = noisegen->noise() - 1.0f;
+    sink.push(fi, noise_sample * gain_amount);
+  }
+  sink.flush_to(inst);
+}
+
 /* Note [Region kernel: SawLpfGainOut]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 4-node sink-terminal kernel. Combines the saw + LPF + gain
@@ -3829,6 +3898,15 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && is_sink_terminal(def->nodes[first + 2].kind)) {
       process_region_saw_gain_out(g, inst, first, first + 1, first + 2,
                                   nframes);
+      fused = true;
+    } else if (r.kernel == RegionKernel::NoiseGainOut
+        && r.node_count == 3
+        && first + 3 <= node_count
+        && def->nodes[first    ].kind == NodeKind::NoiseGen
+        && def->nodes[first + 1].kind == NodeKind::Gain
+        && is_sink_terminal(def->nodes[first + 2].kind)) {
+      process_region_noise_gain_out(g, inst, first, first + 1, first + 2,
+                                    nframes);
       fused = true;
     }
 

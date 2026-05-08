@@ -1755,6 +1755,69 @@ unitTests = testGroup "Unit tests"
               rnElided gainNode @?= False
               null [() | n <- rgNodes rg, RFused _ <- rnInputs n] @?= True
 
+      , -- 3-node sink-terminal noise kernel: NoiseGen → Gain →
+        -- Out. Different state class from the oscillator sink
+        -- kernels (xorshift PRNG, no audio inputs, no controls
+        -- on the producer), but the matcher's structural gates
+        -- are identical — only the producer kind changes.
+        testCase "noise → gain → out: middle region tagged RNoiseGainOut" $ do
+          let g = runSynth $ do
+                n <- noiseGen
+                a <- gain n (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RNoiseGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RNoiseGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 3
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KNoiseGen, KGain, KOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- BusOut as sink terminal for the noise 3-node kernel —
+        -- mirrors the Sin and Saw busOut variants.
+        testCase "noise → gain → busOut: middle region tagged RNoiseGainOut" $ do
+          let g = runSynth $ do
+                n <- noiseGen
+                a <- gain n (Param 0.4)
+                busOut 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RNoiseGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RNoiseGainOut] of
+                [r] -> do
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KNoiseGen, KGain, KBusOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- §4.C deferral on the noise kernel: with §4.B claiming
+        -- the chain, §4.C must skip the Gain. Mirrors the Sin /
+        -- Saw deferral tests; the kernel's per-block read of
+        -- @gain_node.controls[0]@ depends on the gain staying
+        -- live in the runtime graph.
+        testCase "fuseRuntimeGraph: defers to §4.B kernel on noise → gain → out" $ do
+          let g = runSynth $ do
+                n <- noiseGen
+                a <- gain n (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let gainNode = head [n | n <- rgNodes rg, rnKind n == KGain]
+              rnElided gainNode @?= False
+              null [() | n <- rgNodes rg, RFused _ <- rnInputs n] @?= True
+
       , -- 4-node-specific gate: 'matchesSawLpfGainOut' adds
         -- 'rnConsumerCount gain == 1' on top of 'matchesSawLpfGain'.
         -- A graph where the gain feeds two Outs satisfies the
@@ -3989,6 +4052,27 @@ fusedEquivalenceCases =
   , ("§4.B sink-terminal via busOut: saw → gain → busOut", runSynth $ do
        s <- sawOsc 110.0 0.0
        a <- gain s (Param 0.4)
+       busOut 0 a)
+
+    -- 'RNoiseGainOut' coverage. Different state class than the
+    -- oscillator kernels: NoiseGen carries a 'q::white_noise_gen'
+    -- xorshift PRNG. The kernel calls 'noise()' once per output
+    -- sample — same cadence as 'process_noisegen' — so two
+    -- compiles of the same graph see identical PRNG sequences.
+    -- 'assertFusedEquivalent' compares against a
+    -- 'stripRegionKernels' baseline that drives the same fresh
+    -- 'NoiseGenState' through 'process_noisegen', so any drift
+    -- in PRNG-advance cadence between the kernel and per-node
+    -- paths shows up as a sample-level diff. This is the
+    -- load-bearing equivalence pin for the noise kernel.
+  , ("§4.B sink-terminal: noise → gain → out", runSynth $ do
+       n <- noiseGen
+       a <- gain n (Param 0.4)
+       out 0 a)
+
+  , ("§4.B sink-terminal via busOut: noise → gain → busOut", runSynth $ do
+       n <- noiseGen
+       a <- gain n (Param 0.4)
        busOut 0 a)
 
   , ("ring mod (audio-mod gain stays dispatched, output gain fuses)", runSynth $ do

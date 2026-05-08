@@ -327,6 +327,8 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //                                     SawOsc -> LPF -> Gain -> Out)
 //                  4 = SawGainOut    (3-node sink-terminal:
 //                                     SawOsc -> Gain -> Out)
+//                  5 = NoiseGainOut  (3-node sink-terminal:
+//                                     NoiseGen -> Gain -> Out)
 //                The Haskell side machine-checks tag agreement in a
 //                property test (mirroring the kindTag pattern in
 //                §0.5.1) so this set cannot drift between aligned
@@ -373,6 +375,14 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //   * SawGainOut    needs node_count == 3 and kinds
 //                   [SawOsc, Gain, /sink/] (the saw counterpart
 //                   of SinGainOut; same Out/BusOut rule).
+//   * NoiseGainOut  needs node_count == 3 and kinds
+//                   [NoiseGen, Gain, /sink/]. NoiseGen is a
+//                   different state class (xorshift PRNG, no
+//                   audio inputs, no controls), so the kernel
+//                   body is unlike the oscillator sink kernels —
+//                   one PRNG read per sample × scalar gain →
+//                   bus accumulation. Same Out/BusOut rule on
+//                   the terminal slot.
 // The runtime validates the kind sequence at dispatch time and
 // falls back to per-node iteration on any mismatch.
 //
