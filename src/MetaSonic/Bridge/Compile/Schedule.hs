@@ -32,6 +32,12 @@
 -- identity property; the scheduler-side bit-equivalence test
 -- (when §4.E.2b lands) will catch any future divergence.
 --
+-- The planner is /checked/: cycles in 'regionDependencies' and
+-- cross-segment edges that point to a not-yet-scheduled region
+-- are reported as @Left@. This is the whole point of having a
+-- planner before §4.E.2b — silent fallback would let the runtime
+-- start trusting a broken contract.
+--
 -- See Note [Region barrier policy] and Note [Region dependency
 -- contract] in 'MetaSonic.Bridge.Compile.Dependencies'.
 module MetaSonic.Bridge.Compile.Schedule
@@ -94,31 +100,68 @@ segmentByBarrier rg = go [] (rgRuntimeRegions rg)
 -- under the §4.E.1c barrier policy. See module-level haddock for
 -- the full contract.
 --
--- Output is a list of 'RegionIndex' in execution order.
-regionSchedule :: RuntimeGraph -> [RegionIndex]
-regionSchedule rg =
-  let deps     = regionDependencies rg
-      segments = segmentByBarrier rg
-  in concatMap (scheduleSegment deps) segments
+-- Returns @Right@ with a list of 'RegionIndex' in execution order
+-- when 'regionDependencies' is well-formed. Returns @Left@ with a
+-- diagnostic when:
+--
+--   * a free segment contains a dependency cycle, or
+--   * any region's dependencies point to a region that has not
+--     yet been scheduled by the time that segment runs (a
+--     forward cross-segment edge — the dependency points into a
+--     later barrier or free segment).
+--
+-- §4.E.2b will consume @Right@ values directly; the @Left@ paths
+-- exist so a future change that breaks 'regionDependencies' is
+-- caught here, not by silent reordering at runtime.
+regionSchedule :: RuntimeGraph -> Either String [RegionIndex]
+regionSchedule rg = go S.empty (segmentByBarrier rg)
+  where
+    deps = regionDependencies rg
+
+    go _    []           = Right []
+    go done (seg : rest) = do
+      ixs <- scheduleSegment deps done seg
+      let done' = foldr S.insert done ixs
+      (ixs ++) <$> go done' rest
 
 -- | Schedule one segment.
 --
--- 'Barrier' segments emit their single region's index verbatim;
--- 'FreeSegment's topologically order their members against
--- /intra-segment/ dependencies (the scheduler doesn't need to
--- resort dependencies that point outside the segment — those
--- have already been satisfied by the linear segment-by-segment
--- execution).
+-- 'Barrier' segments emit their single region's index after
+-- checking that the barrier's dependencies are all already done
+-- (a dependency on a region that hasn't run yet is a forward
+-- edge — caller's invariant is broken).
+--
+-- 'FreeSegment's split each member's dependencies into intra- and
+-- cross-segment sets. Cross-segment deps must already be in
+-- 'done'; otherwise the planner returns @Left@. Intra-segment
+-- deps drive a stable topological sort ('topoSortStable'), which
+-- itself returns @Left@ on a cycle.
 scheduleSegment
   :: M.Map RegionIndex (S.Set RegionIndex)
+  -> S.Set RegionIndex
   -> Segment
-  -> [RegionIndex]
-scheduleSegment _    (Barrier r)            = [rrIndex r]
-scheduleSegment deps (FreeSegment members)  =
-  let memberSet = S.fromList (map rrIndex members)
-      -- Restrict each region's deps to the segment. Cross-segment
-      -- edges (to earlier barriers or earlier free segments) are
-      -- guaranteed satisfied by the time this segment runs.
+  -> Either String [RegionIndex]
+scheduleSegment deps done (Barrier r) =
+  let ix       = rrIndex r
+      depsHere = M.findWithDefault S.empty ix deps
+      missing  = depsHere `S.difference` done
+  in if S.null missing
+       then Right [ix]
+       else Left $
+         "regionSchedule: barrier region " <> show ix
+         <> " depends on un-scheduled region(s) "
+         <> show (S.toList missing)
+         <> " (forward cross-segment edge in regionDependencies)"
+scheduleSegment deps done (FreeSegment members) =
+  let memberSet  = S.fromList (map rrIndex members)
+      crossErrs  =
+        [ (rrIndex r, S.toList missing)
+        | r <- members
+        , let allDeps   = M.findWithDefault S.empty (rrIndex r) deps
+              crossDeps = allDeps `S.difference` memberSet
+              missing   = crossDeps `S.difference` done
+        , not (S.null missing)
+        ]
       intraDeps = M.fromList
         [ (rrIndex r
           , S.intersection
@@ -126,7 +169,12 @@ scheduleSegment deps (FreeSegment members)  =
               (M.findWithDefault S.empty (rrIndex r) deps))
         | r <- members
         ]
-  in topoSortStable intraDeps (map rrIndex members)
+  in case crossErrs of
+       [] -> topoSortStable intraDeps (map rrIndex members)
+       _  -> Left $
+         "regionSchedule: free-segment region(s) depend on "
+         <> "un-scheduled region(s): " <> show crossErrs
+         <> " (forward cross-segment edge in regionDependencies)"
 
 -- | Stable topological sort: of all regions whose intra-segment
 -- dependencies are already in 'done', emit the lowest-rrIndex
@@ -140,26 +188,25 @@ scheduleSegment deps (FreeSegment members)  =
 -- first ready region. O(N²) on the segment size, acceptable for
 -- the small region counts typical of MetaSonic graphs.
 --
--- Cycle defense: if no region is ready (which would indicate a
--- cycle in 'regionDependencies' — impossible today because
--- 'rrIndex' is a topological order, but the planner shouldn't
--- crash if a future change broke that), the remaining regions
--- are emitted in their input ('rrIndex') order. This is silent
--- degradation, not a correctness fix; a separate test should
--- catch the cycle if it ever arises.
+-- A cycle inside the segment is reported as @Left@ — by
+-- construction (compileRuntimeGraph yields topological 'rrIndex'
+-- order) this should never trigger today, but the planner
+-- shouldn't silently fall back if a future change introduces one.
 topoSortStable
   :: M.Map RegionIndex (S.Set RegionIndex)
   -> [RegionIndex]
-  -> [RegionIndex]
+  -> Either String [RegionIndex]
 topoSortStable intraDeps = go S.empty
   where
-    go _    []        = []
+    go _    []        = Right []
     go done remaining =
       let depsOf ix = M.findWithDefault S.empty ix intraDeps
           ready ix  = S.null (depsOf ix `S.difference` done)
       in case break ready remaining of
            (skipped, ix : rest) ->
-             ix : go (S.insert ix done) (skipped ++ rest)
+             (ix :) <$> go (S.insert ix done) (skipped ++ rest)
            (_, []) ->
-             -- No region is ready; cycle defense (see haddock).
-             remaining
+             Left $
+               "regionSchedule: cycle in intra-segment "
+               <> "regionDependencies among regions "
+               <> show remaining

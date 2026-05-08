@@ -2623,7 +2623,7 @@ unitTests = testGroup "Unit tests"
                 out 0 a
           case lowerGraph g >>= compileRuntimeGraph of
             Left err -> assertFailure $ "compile failed: " <> err
-            Right rg -> regionSchedule rg @?= [RegionIndex 0]
+            Right rg -> regionSchedule rg @?= Right [RegionIndex 0]
 
       , -- Internal send/return: producer (KBusOut) and consumer
         -- (RBusInLpfGainOut, contains KBusIn + KOut) are both
@@ -2653,7 +2653,7 @@ unitTests = testGroup "Unit tests"
                     Barrier _ -> True
                     _         -> False
               all isBarrier segments @?= True
-              regionSchedule rg @?= map rrIndex regions
+              regionSchedule rg @?= Right (map rrIndex regions)
 
       , -- Kernel-split structural-edge case: 'RSawLpfGain'
         -- buffer region (no live-bus, free) precedes the
@@ -2691,7 +2691,7 @@ unitTests = testGroup "Unit tests"
                                           , Barrier tail_
                                           ]
                   -- Schedule equals rrIndex order.
-                  regionSchedule rg @?= [rrIndex buf, rrIndex tail_]
+                  regionSchedule rg @?= Right [rrIndex buf, rrIndex tail_]
                 _ -> assertFailure $
                   "expected one RSawLpfGain region + one RNodeLoop "
                   <> "tail, got " <> show (length bufs)
@@ -2718,7 +2718,7 @@ unitTests = testGroup "Unit tests"
             Right rg -> do
               let regions = rgRuntimeRegions rg
               all (regionHasLiveBus rg) regions @?= True
-              regionSchedule rg @?= map rrIndex regions
+              regionSchedule rg @?= Right (map rrIndex regions)
 
       , -- Independent non-barrier reordering: a graph with /two/
         -- 'RSawLpfGain' free regions adjacent in 'rrIndex' order,
@@ -2764,7 +2764,7 @@ unitTests = testGroup "Unit tests"
                   -- Schedule emits both free regions in rrIndex
                   -- order, then the barrier.
                   regionSchedule rg
-                    @?= [ rrIndex b1, rrIndex b2, rrIndex tail_ ]
+                    @?= Right [ rrIndex b1, rrIndex b2, rrIndex tail_ ]
                 _ -> assertFailure $
                   "expected two RSawLpfGain regions + one RNodeLoop "
                   <> "tail, got "
@@ -2796,8 +2796,45 @@ unitTests = testGroup "Unit tests"
           let voiceTpl = head [t | t <- tgTemplates tg, tplName t == "voice"]
               fxTpl    = head [t | t <- tgTemplates tg, tplName t == "fx"]
 
-          regionSchedule (tplGraph voiceTpl) @?= [RegionIndex 0]
-          regionSchedule (tplGraph fxTpl)    @?= [RegionIndex 0]
+          regionSchedule (tplGraph voiceTpl) @?= Right [RegionIndex 0]
+          regionSchedule (tplGraph fxTpl)    @?= Right [RegionIndex 0]
+
+      , -- Fail-loud planner: when 'rgRuntimeRegions' is in an
+        -- order that doesn't satisfy 'regionDependencies'
+        -- (forward cross-segment edge), 'regionSchedule' must
+        -- return @Left@ rather than silently dropping the dep.
+        --
+        -- We construct the violation by reversing the kernel-split
+        -- region list: the trailing 'RNodeLoop' barrier (which
+        -- depends on the 'RSawLpfGain' buffer region via the
+        -- structural cross-region edge) ends up scheduled first,
+        -- with its dep not yet satisfied. The planner must catch
+        -- this and refuse.
+        testCase "rejects forward cross-segment edge with diagnostic" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let bad = rg { rgRuntimeRegions =
+                               reverse (rgRuntimeRegions rg) }
+              case regionSchedule bad of
+                Left msg ->
+                  -- Diagnostic mentions the broken contract; we
+                  -- don't pin the exact wording, just that the
+                  -- failure is surfaced.
+                  assertBool
+                    ("expected mention of cross-segment edge in: "
+                     <> msg)
+                    ("cross-segment" `isInfixOf` msg)
+                Right ixs ->
+                  assertFailure $
+                    "regionSchedule should have rejected the "
+                    <> "reversed graph; got " <> show ixs
       ]
 
   , testCase "kindTag is injective" $
