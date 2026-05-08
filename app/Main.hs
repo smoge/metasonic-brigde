@@ -1398,8 +1398,16 @@ surveyShapeProbes =
         -- filtered/scaled/sunk. Same "filtered tail" shape as the
         -- saw/noise-rooted variants, but with an Add node ahead of
         -- the LPF, so producer-specific kernels can't claim it.
-        -- Tells us whether post-mix filtered tails are a recurring
-        -- family worth a producer-agnostic kernel.
+        -- Exploratory probe only: the current opportunity scanner
+        -- ('scanSinkShapes') recognizes SinkOscLpfGain and
+        -- SinkBusInLpfGain but has no SinkAddLpfGain row, so this
+        -- shape is not classified by the formal candidate gate.
+        -- A missed-shape table will only surface this row through
+        -- per-graph §4.B coverage, not through the structured
+        -- shape census, until the classifier grows an Add-rooted
+        -- entry. Useful for asking "does post-mix filtered tail
+        -- recur in the corpus?" — kernel decisions still need an
+        -- explicit classifier extension.
         s <- sawOsc 110.0 0.0
         n <- noiseGen
         m <- add s n
@@ -1474,15 +1482,19 @@ surveyShapeProbes =
     , runSynth $ do
         -- LFO drives the LPF cutoff. The biquad treats cutoff as
         -- block-rate (zipper artifacts on audio-rate sweeps; see
-        -- the note on 'lpf' in Bridge/Source.hs), so this exercises
-        -- whether the matcher accepts a non-Param cutoff. Likely a
-        -- miss today; a useful "is cutoff modulation a recurring
-        -- shape" probe.
+        -- the note on 'lpf' in Bridge/Source.hs). The current
+        -- matcher inspects port 0 (signal flow) of LPF, not the
+        -- cutoff input, so this is expected to /still/ claim
+        -- RSawLpfGainOut — verified in --fusion-survey output.
+        -- Useful negative control: confirms non-Param cutoff does
+        -- not block this kernel. If a future change adds an
+        -- LPF-control gate to the kernel match, this row stops
+        -- claiming.
         lfo <- sinOsc 4.0 0.0
         s   <- sawOsc 110.0 0.0
         f   <- lpf s lfo 0.7
         a   <- gain f 0.4
-        out 0 a )                            -- probe: cutoff is non-Param
+        out 0 a )                            -- expect: RSawLpfGainOut still fires
 
   , ( "mod/audio-rate-gain-control"
     , runSynth $ do
@@ -1726,13 +1738,21 @@ surveyEnsembleCorpus =
       ]
     )
 
-  , ( "ens/layered-direct-outs"
-    , -- Three independent voice templates writing direct to Out
-      -- (no shared bus, no fx). Stresses sink-kernel claims in
-      -- every template. Template precedence DAG has no edges, so
-      -- precedence width = template count = 3. Cross-template
-      -- audio reaches the user via the runtime's per-channel bus
-      -- accumulation, not bus dataflow visible to the compiler.
+  , -- Three independent voice templates writing direct to Out
+    -- (no fx, no internal-bus dataflow). Stresses sink-kernel
+    -- claims in every template. Template precedence DAG has no
+    -- edges (no template reads what another writes), so
+    -- precedence width = template count = 3. /Caveat for any
+    -- future parallel runtime/: voice-sin and voice-saw both
+    -- write @out 0@; that is a shared write target, just at the
+    -- hardware-output bus rather than an internal bus. Same-layer
+    -- sink writes still need either serialization or per-worker
+    -- accumulation with deterministic reduction. The "no live-
+    -- read precedence between same-layer templates" fact is what
+    -- the precedence-DAG width measures; the "no shared write
+    -- target" property does not hold here.
+    ( "ens/layered-direct-outs"
+    ,
       [ ( "voice-sin"
         , runSynth $ do
             s <- sinOsc 220.0 0.0
@@ -1751,16 +1771,23 @@ surveyEnsembleCorpus =
       ]
     )
 
-  , ( "ens/layered-bus-sends"
-    , -- Three voice/return pairs on three distinct buses
-      -- (7, 8, 9). No template depends on another's bus, so each
-      -- pair is its own precedence chain (voice→fx) and the three
-      -- pairs sit at the same precedence layer. Stresses parallel
-      -- bus-write/bus-read fan-out that a future template-level
-      -- scheduler with deterministic shared-bus reduction would
-      -- have to handle (here, no shared write target makes the
-      -- "deterministic reduction" question moot — a clean
-      -- counterpoint to ens/four-voices-one-fx).
+  , -- Three voice/return pairs on three distinct internal buses
+    -- (7, 8, 9). No template depends on another's bus, so each
+    -- pair is its own precedence chain (voice→fx) and the three
+    -- pairs sit at the same precedence layer. Stresses parallel
+    -- bus-write/bus-read fan-out across independent internal-bus
+    -- targets — a clean counterpoint to ens/four-voices-one-fx,
+    -- where four voices /share/ bus 7. /Caveat for any future
+    -- parallel runtime/: fx-a and fx-b both write @out 0@, so
+    -- the shared-write-target problem is not absent from this
+    -- ensemble — it just shows up at the hardware-output bus
+    -- rather than an internal bus. Same-layer sink writes still
+    -- need serialization or per-worker accumulation with
+    -- deterministic reduction; the precedence DAG only proves
+    -- the absence of /live-read/ precedence between same-layer
+    -- templates.
+    ( "ens/layered-bus-sends"
+    ,
       [ ( "voice-a"
         , runSynth $ do
             s <- sawOsc 110.0 0.0
