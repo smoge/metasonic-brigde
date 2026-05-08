@@ -555,6 +555,28 @@ data RegionKernel
     -- @BusIn → LPF → Gain → sink@ as the strongest recurring
     -- missed shape — 9 misses across template ensembles vs. 3
     -- for the noise-rooted alternative.
+  | RNoiseLpfGainOut
+    -- ^ Sink-terminal kernel for @[KNoiseGen, KLPF, KGain, /sink/]@.
+    -- Mechanically the noise counterpart of 'RSawLpfGainOut':
+    -- replace the saw oscillator at the head with a 'q::white_noise_gen'
+    -- xorshift PRNG, keep the LPF / scalar Gain / SinkAccumulator
+    -- pipeline. No 'drive_oscillator' (no phase iterator); no
+    -- 'output_buses' read (no bus source); the producer state is
+    -- a PRNG whose next sample arrives via @noisegen->noise()@.
+    --
+    -- Bit-equivalence with the unfused chain rests on PRNG cadence
+    -- parity: the kernel must call @noisegen->noise()@ /once per
+    -- output sample/, in the same order, with the same recentering
+    -- subtract that 'process_noisegen' applies. The
+    -- 'fusedEquivalenceCases' suite pins this.
+    --
+    -- Added after the post-step-2 ranked missed-shape table
+    -- crossed the kernel-add gate from
+    -- @notes/fusion-strategy.md@: @missed=4, sources=4@,
+    -- producer in the proven sink-terminal family, kernel body
+    -- absorbs the sink and avoids materializing NoiseGen / LPF /
+    -- Gain output buffers in sequence. Tri / Pulse / Add filtered
+    -- tails stay parked — they are single-source signals.
   deriving stock    (Eq, Show, Generic, Bounded, Enum)
   deriving anyclass (NFData)
 
@@ -564,13 +586,14 @@ data RegionKernel
 -- @rt_graph_region_kernel_supported@ entry; do not change either
 -- value in isolation.
 kernelTag :: RegionKernel -> CInt
-kernelTag RNodeLoop        = 0
-kernelTag RSawLpfGain      = 1
-kernelTag RSinGainOut      = 2
-kernelTag RSawLpfGainOut   = 3
-kernelTag RSawGainOut      = 4
-kernelTag RNoiseGainOut    = 5
-kernelTag RBusInLpfGainOut = 6
+kernelTag RNodeLoop         = 0
+kernelTag RSawLpfGain       = 1
+kernelTag RSinGainOut       = 2
+kernelTag RSawLpfGainOut    = 3
+kernelTag RSawGainOut       = 4
+kernelTag RNoiseGainOut     = 5
+kernelTag RBusInLpfGainOut  = 6
+kernelTag RNoiseLpfGainOut  = 7
 
 -- | Number of contiguous member nodes a fused kernel claims when
 -- it matches. 'RNodeLoop' has no fixed arity — a NodeLoop region
@@ -580,13 +603,14 @@ kernelTag RBusInLpfGainOut = 6
 -- ever ask about successfully-matched fused kernels, so the
 -- 'RNodeLoop' branch is never exercised in production paths.
 kernelArity :: RegionKernel -> Int
-kernelArity RSawLpfGain      = 3
-kernelArity RSinGainOut      = 3
-kernelArity RSawLpfGainOut   = 4
-kernelArity RSawGainOut      = 3
-kernelArity RNoiseGainOut    = 3
-kernelArity RBusInLpfGainOut = 4
-kernelArity RNodeLoop        = 0
+kernelArity RSawLpfGain       = 3
+kernelArity RSinGainOut       = 3
+kernelArity RSawLpfGainOut    = 4
+kernelArity RSawGainOut       = 3
+kernelArity RNoiseGainOut     = 3
+kernelArity RBusInLpfGainOut  = 4
+kernelArity RNoiseLpfGainOut  = 4
+kernelArity RNodeLoop         = 0
 
 {- Note [Bus footprints, template- vs region-level]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

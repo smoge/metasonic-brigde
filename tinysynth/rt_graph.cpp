@@ -807,10 +807,17 @@ enum class RegionKernel : int {
   NoiseGainOut    = 5,  // fused per-sample NoiseGen -> Gain -> Out
                         // (3-node sink-terminal; PRNG-state class —
                         //  no freq port, no phase iterator)
-  BusInLpfGainOut = 6   // fused per-sample BusIn -> LPF -> Gain -> Out
+  BusInLpfGainOut = 6,  // fused per-sample BusIn -> LPF -> Gain -> Out
                         // (4-node sink-terminal; first non-oscillator
                         //  producer kernel — reads output_buses[busin_bus]
                         //  inline instead of stepping a phase iterator)
+  NoiseLpfGainOut = 7   // fused per-sample NoiseGen -> LPF -> Gain -> Out
+                        // (4-node sink-terminal; noise counterpart of
+                        //  SawLpfGainOut — pulls samples from a
+                        //  q::white_noise_gen PRNG instead of a phase
+                        //  iterator. PRNG-cadence parity with the
+                        //  per-node baseline pinned by
+                        //  fusedEquivalenceCases.)
 };
 
 // Validate an int from the C ABI. Returns nullopt on an unknown
@@ -827,6 +834,7 @@ region_kernel_from_tag(int kind) noexcept {
   case 4: return RegionKernel::SawGainOut;
   case 5: return RegionKernel::NoiseGainOut;
   case 6: return RegionKernel::BusInLpfGainOut;
+  case 7: return RegionKernel::NoiseLpfGainOut;
   default: return std::nullopt;
   }
 }
@@ -3636,6 +3644,111 @@ static void process_region_busin_lpf_gain_out(
   sink.flush_to(inst);
 }
 
+/* Note [Region kernel: NoiseLpfGainOut]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+4-node sink-terminal kernel for [NoiseGen, LPF, Gain, sink]. The
+noise counterpart of RSawLpfGainOut: same LPF + scalar Gain +
+SinkAccumulator pipeline, but the producer at the head is a
+'q::white_noise_gen' xorshift PRNG instead of a 'q::saw' phase
+iterator. Member layout:
+  * noise_idx — KNoiseGen (no controls of its own; PRNG state
+                  carried in 'NoiseGenState')
+  * lpf_idx   — KLPF   (block-rate latch on freq/q like
+                        RSawLpfGainOut / RBusInLpfGainOut)
+  * gain_idx  — KGain  (scalar control on port 1; audio modulation
+                        blocks the kernel at match time)
+  * out_idx   — sink terminal: KOut or KBusOut
+                (controls[0] = destination bus index). Validated
+                via 'is_sink_terminal' at dispatch time.
+
+Bit equivalence with the unfused chain rests on PRNG-cadence
+parity: per-sample we do exactly what process_noisegen +
+process_lpf + process_gain + process_out would have done, in the
+same order. The unfused 'process_noisegen' calls 'noisegen->noise()'
+once per sample and subtracts 1.0f to recenter from [0,2] to
+[-1,1]; the kernel does the identical pull + recenter, exactly
+once per output sample, before feeding the LPF. Skipping or
+double-pulling the PRNG would desynchronize the noise stream
+relative to the per-node baseline — same load-bearing constraint
+as RNoiseGainOut, but with the LPF state riding alongside.
+
+LPF state advances every sample. Unlike RBusInLpfGainOut there is
+no "invalid source" branch — NoiseGen always has a sample to
+yield (or the kernel silent-no-ops if the PRNG state is missing,
+mirroring RNoiseGainOut's defensive check).
+
+Same-block ordering: NoiseGen has no bus reads, so this kernel
+has no inter-template ordering constraint beyond what the chain
+itself imposes (sink writes go through SinkAccumulator into
+output_buses[bus]).
+*/
+static void process_region_noise_lpf_gain_out(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t noise_idx, std::size_t lpf_idx,
+    std::size_t gain_idx, std::size_t out_idx,
+    int nframes
+) noexcept {
+  auto &noise_node = inst.nodes[noise_idx];
+  auto &lpf_node   = inst.nodes[lpf_idx];
+  auto &gain_node  = inst.nodes[gain_idx];
+  auto &out_node   = inst.nodes[out_idx];
+
+  // PRNG state. Mirrors RNoiseGainOut: silent no-op on a missing
+  // generator (no PRNG to pull, can't produce samples). Sink-bus
+  // and block_sink_peak stay untouched, matching what the per-node
+  // baseline would do if process_noisegen returned without filling
+  // its output buffer.
+  auto *noisegen = std::get_if<NoiseGenState>(&noise_node.state);
+  if (!noisegen) {
+    return;
+  }
+
+  // LPF freq/q resolution + block-rate latch. Identical to
+  // RSawLpfGainOut and RBusInLpfGainOut — the LPF state machine
+  // doesn't care what feeds its signal port, just that freq/q
+  // reach the right q::lowpass configure call.
+  const auto lpf_freq_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double lpf_freq = sanitize_finite_clamp(
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
+                           : lpf_node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double lpf_q = sanitize_finite_clamp(
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
+                        : lpf_node.controls[1],
+      kQMin, kQMax, kQFallback);
+
+  auto *lpf = std::get_if<LPFState>(&lpf_node.state);
+  if (!lpf) {
+    return;
+  }
+
+  if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
+    lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
+    lpf->last_freq = lpf_freq;
+    lpf->last_q    = lpf_q;
+  }
+
+  const float gain_amount = sanitize_finite(
+      static_cast<float>(gain_node.controls[0]), 1.0f);
+
+  // Sink-terminal accumulate. PRNG pull + recenter per sample,
+  // identical to process_noisegen, then through the LPF + scalar
+  // gain before SinkAccumulator handles bus + block_sink_peak.
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    const float noise_sample = noisegen->noise() - 1.0f;
+    const float lpf_sample = lpf->filter(noise_sample);
+    sink.push(fi, lpf_sample * gain_amount);
+  }
+  sink.flush_to(inst);
+}
+
 // ----------------------------------------------------------------
 // Lifecycle helpers (shared between the direct ABI entries and the
 // queued-drain path)
@@ -4070,6 +4183,18 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first + 2].kind == NodeKind::Gain
         && is_sink_terminal(def->nodes[first + 3].kind)) {
       process_region_busin_lpf_gain_out(g, inst,
+                                        first, first + 1,
+                                        first + 2, first + 3,
+                                        nframes);
+      fused = true;
+    } else if (r.kernel == RegionKernel::NoiseLpfGainOut
+        && r.node_count == 4
+        && first + 4 <= node_count
+        && def->nodes[first    ].kind == NodeKind::NoiseGen
+        && def->nodes[first + 1].kind == NodeKind::LPF
+        && def->nodes[first + 2].kind == NodeKind::Gain
+        && is_sink_terminal(def->nodes[first + 3].kind)) {
+      process_region_noise_lpf_gain_out(g, inst,
                                         first, first + 1,
                                         first + 2, first + 3,
                                         nframes);

@@ -1024,6 +1024,7 @@ shapeHasKernel (SinkOscGain    KSinOsc)   = True   -- RSinGainOut
 shapeHasKernel (SinkOscGain    KSawOsc)   = True   -- RSawGainOut
 shapeHasKernel (SinkOscGain    KNoiseGen) = True   -- RNoiseGainOut
 shapeHasKernel (SinkOscLpfGain KSawOsc)   = True   -- RSawLpfGainOut
+shapeHasKernel (SinkOscLpfGain KNoiseGen) = True   -- RNoiseLpfGainOut
 shapeHasKernel SinkBusInLpfGain           = True   -- RBusInLpfGainOut
 shapeHasKernel _                          = False
 

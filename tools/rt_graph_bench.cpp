@@ -20,6 +20,13 @@
 //                       and do the same arithmetic — the time delta
 //                       captures the per-node-dispatch vs. fused-loop
 //                       structural cost, not filter-on-real-signal cost.
+//   * NoiseLpfGainOut — sink-terminal: kernel covers [NoiseGen, LPF, Gain, Out].
+//                       The producer is a 'q::white_noise_gen' PRNG —
+//                       both fused and baseline pull one sample per
+//                       output sample, so the PRNG cadence matches
+//                       across modes and the time delta isolates the
+//                       per-node-dispatch vs. fused-loop structural
+//                       cost on a real (non-zero) input stream.
 //
 // For each shape × block_size × voice_count × mode, render N blocks
 // and report ns/sample. The "fused" line of each row also reports
@@ -47,12 +54,13 @@ namespace {
 // ----------------------------------------------------------------
 
 // NodeKind ints — must match kind_from_int in rt_graph.cpp.
-constexpr int kNkSinOsc = 1;
-constexpr int kNkOut    = 2;
-constexpr int kNkGain   = 3;
-constexpr int kNkSawOsc = 5;
-constexpr int kNkLPF    = 7;
-constexpr int kNkBusIn  = 11;
+constexpr int kNkSinOsc   = 1;
+constexpr int kNkOut      = 2;
+constexpr int kNkGain     = 3;
+constexpr int kNkSawOsc   = 5;
+constexpr int kNkNoiseGen = 6;
+constexpr int kNkLPF      = 7;
+constexpr int kNkBusIn    = 11;
 
 // Rate ints — value 3 corresponds to SampleRate.
 constexpr int kRateSampleRate = 3;
@@ -64,6 +72,7 @@ constexpr int kKernelSawLpfGain      = 1;
 constexpr int kKernelSinGainOut      = 2;
 constexpr int kKernelSawLpfGainOut   = 3;
 constexpr int kKernelBusInLpfGainOut = 6;
+constexpr int kKernelNoiseLpfGainOut = 7;
 
 constexpr int kSampleRate    = 48000;
 constexpr int kCapacity      = 64;
@@ -196,6 +205,37 @@ void register_busin_lpf_gain_out_regions(RTGraph *g, bool fused) {
                                       kRateSampleRate, 0, 4);
 }
 
+// Build [NoiseGen, LPF, Gain, Out] in template 0 with sample-rate
+// defaults. NoiseGen has no inputs and no controls of its own; the
+// kernel and per-node baseline both pull from the same q::white_noise_gen
+// PRNG instance, so the time delta isolates per-node-dispatch vs.
+// fused-loop structural cost on a real (non-zero) input stream.
+void build_noise_lpf_gain_out_chain(RTGraph *g) {
+  rt_graph_template_add_node(g, 0, 0, kNkNoiseGen);
+  rt_graph_template_add_node(g, 0, 1, kNkLPF);
+  rt_graph_template_add_node(g, 0, 2, kNkGain);
+  rt_graph_template_add_node(g, 0, 3, kNkOut);
+
+  rt_graph_template_connect(g, 0, 0, 0, 1, 0);  // noise -> lpf signal
+  rt_graph_template_connect(g, 0, 1, 0, 2, 0);  // lpf   -> gain signal
+  rt_graph_template_connect(g, 0, 2, 0, 3, 0);  // gain  -> out signal
+
+  // NoiseGen has no controls. LPF/Gain/Out match the saw-rooted
+  // bench shape so cross-row comparisons are apples-to-apples.
+  rt_graph_template_set_default(g, 0, 1, 0, 1200.0); // lpf freq
+  rt_graph_template_set_default(g, 0, 1, 1, 4.0);    // lpf q
+  rt_graph_template_set_default(g, 0, 2, 0, 0.4);    // gain amount
+  rt_graph_template_set_default(g, 0, 3, 0, kBenchBus); // out bus
+}
+
+// Register a single 4-node region covering the whole template,
+// tagged either NoiseLpfGainOut (fused) or NodeLoop (baseline).
+void register_noise_lpf_gain_out_regions(RTGraph *g, bool fused) {
+  const int kernel_tag = fused ? kKernelNoiseLpfGainOut : kKernelNodeLoop;
+  rt_graph_template_add_region_kernel(g, 0, kernel_tag,
+                                      kRateSampleRate, 0, 4);
+}
+
 // ----------------------------------------------------------------
 // Bench harness
 // ----------------------------------------------------------------
@@ -212,6 +252,7 @@ const ShapeSpec kShapes[] = {
   { "SinGainOut",      3, &build_sin_gain_out_chain,       &register_sin_gain_out_regions       },
   { "SawLpfGainOut",   4, &build_saw_lpf_gain_out_chain,   &register_saw_lpf_gain_out_regions   },
   { "BusInLpfGainOut", 4, &build_busin_lpf_gain_out_chain, &register_busin_lpf_gain_out_regions },
+  { "NoiseLpfGainOut", 4, &build_noise_lpf_gain_out_chain, &register_noise_lpf_gain_out_regions },
 };
 
 constexpr int kBlockSizes[]  = { 64, 128, 512 };

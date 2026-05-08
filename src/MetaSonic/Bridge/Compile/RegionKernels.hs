@@ -278,6 +278,8 @@ findKernelMatch nodes = go 0
             Just (mkMatch RSawLpfGainOut)
         | matchesBusInLpfGainOut nodes a b c d ->
             Just (mkMatch RBusInLpfGainOut)
+        | matchesNoiseLpfGainOut nodes a b c d ->
+            Just (mkMatch RNoiseLpfGainOut)
       _ -> match3 ixs
 
     match3 ixs = case ixs of
@@ -479,6 +481,47 @@ matchesBusInLpfGainOut nodes businIx lpfIx gainIx outIx =
         && rnConsumerCount lpf   == 1
         && rnConsumerCount gain  == 1
         && signalSourceIs businIx lpf
+        && signalSourceIs lpfIx   gain
+        && signalSourceIs gainIx  out_
+        && isScalarGain gain
+    _ -> False
+
+-- | The 4-node Noise-rooted sink-terminal shape: KNoiseGen → KLPF
+-- → KGain → /sink/. Mechanically the noise counterpart of
+-- 'matchesSawLpfGainOut' / 'matchesBusInLpfGainOut': swap the
+-- producer kind at the head, keep every other gate. NoiseGen has
+-- no audio inputs of its own (the kernel pulls samples directly
+-- from the producer's PRNG state), so the only producer-side
+-- precondition is the single-consumer requirement that licenses
+-- skipping the materialized noise output buffer.
+--
+-- The matcher imposes no rule on the producer's PRNG state (it's
+-- a runtime fact); the equivalence pin between kernel and
+-- per-node baseline lives in 'process_region_noise_lpf_gain_out',
+-- which calls 'noisegen->noise()' once per output sample in the
+-- same order 'process_noisegen' would have.
+matchesNoiseLpfGainOut
+  :: M.Map NodeIndex RuntimeNode
+  -> NodeIndex -> NodeIndex -> NodeIndex -> NodeIndex
+  -> Bool
+matchesNoiseLpfGainOut nodes noiseIx lpfIx gainIx outIx =
+  case ( M.lookup noiseIx nodes
+       , M.lookup lpfIx   nodes
+       , M.lookup gainIx  nodes
+       , M.lookup outIx   nodes ) of
+    (Just noise_, Just lpf, Just gain, Just out_) ->
+      rnKind noise_ == KNoiseGen
+        && rnKind lpf  == KLPF
+        && rnKind gain == KGain
+        && isSinkTerminal (rnKind out_)
+        && not (rnElided noise_)
+        && not (rnElided lpf)
+        && not (rnElided gain)
+        && not (rnElided out_)
+        && rnConsumerCount noise_ == 1
+        && rnConsumerCount lpf    == 1
+        && rnConsumerCount gain   == 1
+        && signalSourceIs noiseIx lpf
         && signalSourceIs lpfIx   gain
         && signalSourceIs gainIx  out_
         && isScalarGain gain

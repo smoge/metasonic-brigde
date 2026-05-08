@@ -1998,6 +1998,146 @@ unitTests = testGroup "Unit tests"
                     [rnKind n | n <- rgNodes rg, rnElided n]
               KGain `elem` elidedKinds @?= False
 
+      , -- §4.B Noise-rooted 4-node sink-terminal claim. The noise
+        -- counterpart of 'RSawLpfGainOut' / 'RBusInLpfGainOut': same
+        -- LPF/Gain/sink pipeline, but the producer is a PRNG-state
+        -- generator, not a phase iterator or bus reader. Pins that
+        -- 'matchesNoiseLpfGainOut' fires on @[NoiseGen, LPF, Gain,
+        -- Out]@ and that the whole chain becomes one region tagged
+        -- 'RNoiseLpfGainOut'.
+        testCase "noise → lpf → gain → out: full region tagged RNoiseLpfGainOut" $ do
+          let g = runSynth $ do
+                n <- noiseGen
+                f <- lpf n (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RNoiseLpfGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg
+                      , rrKernel r == RNoiseLpfGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 4
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KNoiseGen, KLPF, KGain, KOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got "
+                  <> show (length rs)
+
+      , -- BusOut as sink terminal for the Noise-rooted shape. Same
+        -- bus-kind-agnostic claim the kernel makes on the C++ side.
+        testCase "noise → lpf → gain → busOut: full region tagged RNoiseLpfGainOut" $ do
+          let g = runSynth $ do
+                n <- noiseGen
+                f <- lpf n (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                busOut 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RNoiseLpfGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg
+                      , rrKernel r == RNoiseLpfGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 4
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KNoiseGen, KLPF, KGain, KBusOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got "
+                  <> show (length rs)
+
+      , -- Near-miss: NoiseGen feeds two consumers, breaking the
+        -- single-use-edge gate at the head. The 4-node kernel is
+        -- rejected; with no Noise-rooted fallback the chain stays
+        -- 'RNodeLoop'. Pins that the multi-consumer gate is the
+        -- noise counterpart of the saw / busin rule.
+        testCase "near-miss: multi-consumer NoiseGen blocks RNoiseLpfGainOut" $ do
+          let g = runSynth $ do
+                n  <- noiseGen
+                f1 <- lpf n (Param 800.0)  (Param 4.0)
+                f2 <- lpf n (Param 2400.0) (Param 4.0)   -- second consumer of noise
+                a1 <- gain f1 (Param 0.4); out 0 a1
+                a2 <- gain f2 (Param 0.4); out 1 a2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RNoiseLpfGainOut <- kernels] @?= True
+
+      , -- Near-miss: LPF feeds two Gains. Same 'rnConsumerCount lpf
+        -- == 1' precondition that blocks the saw-rooted variant.
+        testCase "near-miss (Noise): multi-consumer LPF blocks RNoiseLpfGainOut" $ do
+          let g = runSynth $ do
+                n  <- noiseGen
+                f  <- lpf n (Param 1000.0) (Param 4.0)
+                a1 <- gain f (Param 0.3); out 0 a1
+                a2 <- gain f (Param 0.2); out 1 a2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RNoiseLpfGainOut <- kernels] @?= True
+
+      , -- Near-miss: audio-modulated gain in a Noise-rooted chain.
+        -- 'isScalarGain' fails on the gain, the 4-node kernel
+        -- doesn't fire. Mirrors the audio-mod near-miss pinned for
+        -- the saw / busin variants.
+        testCase "near-miss (Noise): audio-modulated gain stays RNodeLoop" $ do
+          let g = runSynth $ do
+                n   <- noiseGen
+                f   <- lpf n (Param 1500.0) (Param 4.0)
+                lfo <- sinOsc 6.0 0.0
+                a   <- gain f lfo                    -- audio-rate gain modulation
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RNoiseLpfGainOut <- kernels] @?= True
+
+      , -- Near-miss: chain ends at a non-sink consumer (Add). The
+        -- sink-class gate fails; without a Noise-rooted buffer-
+        -- terminal kernel the chain stays 'RNodeLoop'. Mirrors the
+        -- non-sink near-miss pinned for the busin variant.
+        testCase "near-miss (Noise): non-sink terminal stays RNodeLoop" $ do
+          let g = runSynth $ do
+                n <- noiseGen
+                f <- lpf n (Param 1500.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                b <- add a (Param 0.0)              -- non-sink consumer
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RNoiseLpfGainOut <- kernels] @?= True
+
+      , -- §4.C interaction (Noise-rooted 4-node kernel): same Gain-
+        -- elision deferral as 'RSawLpfGainOut' / 'RBusInLpfGainOut'.
+        -- The kernel reads gain 'controls[0]', so §4.C must leave
+        -- the Gain in place when the kernel claims the chain.
+        testCase "fuseRuntimeGraph: defers to RNoiseLpfGainOut on noise → lpf → gain → out" $ do
+          let g = runSynth $ do
+                n <- noiseGen
+                f <- lpf n (Param 1500.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "fused compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RNoiseLpfGainOut <- kernels] @?= 1
+              let elidedKinds =
+                    [rnKind n | n <- rgNodes rg, rnElided n]
+              KGain `elem` elidedKinds @?= False
+
       , -- Idempotence: a second pass over an already-tagged region
         -- must be a no-op. Pinned because 'selectRegionKernels'
         -- recurses on splits and a regression that re-fires on
@@ -4687,6 +4827,90 @@ crossCuttingTests = testGroup "End-to-end FFI"
         ("expected LPF to warm up on the valid bus, peak=" <> show warmPeak)
         (warmPeak > 0.05)
 
+  , -- Phase 4.B: 'RNoiseLpfGainOut' control identity. NoiseGen has
+    -- no controls of its own (the PRNG state isn't redirectable by
+    -- a set_control write; it's owned by 'NoiseGenState'), so the
+    -- live-control surface is just lpf.freq, lpf.q, gain.amount,
+    -- and out.bus. Bit-equivalence with the stripped node-loop
+    -- baseline pins three things at once:
+    --
+    --   * the kernel reads each LPF / Gain / Out control fresh on
+    --     every block, just like 'process_lpf' / 'process_gain' /
+    --     'process_out' do;
+    --   * the LPF block-rate freq/q latch matches the per-node
+    --     latch under control writes;
+    --   * the kernel and per-node paths advance the
+    --     'q::white_noise_gen' state at the same rate (one pull
+    --     per output sample) — the load-bearing PRNG-cadence
+    --     parity.
+    testCase "Phase 4.B: set_control on RNoiseLpfGainOut covers lpf.freq/q + gain + out.bus" $ do
+      let nframes = 256
+          chain = runSynth $ do
+            n <- noiseGen
+            f <- lpf n (Param 800.0) (Param 4.0)
+            a <- gain f (Param 0.4)
+            out 0 a
+          newLpfFreq = 1500.0 :: Double
+          newLpfQ    = 6.0    :: Double
+          newGain    = 0.3    :: Double
+          newSinkBus = 2      :: Int
+
+      rtUnRaw <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      assertBool "Phase 4.B: fused compile has no RNoiseLpfGainOut region"
+        (any ((== RNoiseLpfGainOut) . rrKernel) (rgRuntimeRegions rtF))
+
+      let rtUn = stripRegionKernels rtUnRaw
+
+          ixOf k rg =
+            let NodeIndex i = head [rnIndex n | n <- rgNodes rg, rnKind n == k]
+            in i
+          lpfIx  = ixOf KLPF  rtF
+          gainIx = ixOf KGain rtF
+          outIx  = ixOf KOut  rtF
+
+      let sizeOfFloat' = 4 :: Int
+          renderBus loader rt readBus =
+            withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+              loader handle rt
+              c_rt_graph_ensure_bus handle (fromIntegral newSinkBus)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral lpfIx)  0 (CDouble newLpfFreq)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral lpfIx)  1 (CDouble newLpfQ)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral gainIx) 0 (CDouble newGain)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral outIx)  0 (CDouble (fromIntegral newSinkBus))
+              c_rt_graph_process handle (fromIntegral nframes)
+              allocaBytes (nframes * sizeOfFloat') $ \buf -> do
+                _ <- c_rt_graph_read_bus handle (fromIntegral readBus)
+                                         (fromIntegral nframes) (castPtr buf)
+                cs <- peekArray nframes (buf :: PtrCFloat)
+                pure (map (\(CFloat x) -> x) cs)
+
+      baselineSamples <- renderBus loadRuntimeGraph      rtUn newSinkBus
+      fusedSamples    <- renderBus loadRuntimeGraphFused rtF  newSinkBus
+
+      length baselineSamples @?= length fusedSamples
+      assertBool
+        ("Phase 4.B: RNoiseLpfGainOut set_control divergence on bus "
+         <> show newSinkBus)
+        (baselineSamples == fusedSamples)
+
+      -- Sanity: filtered noise scaled by 0.3 through an LPF at
+      -- 1500 Hz must produce non-silent output on the redirected
+      -- bus. Same loose-peak threshold as the BusIn variant.
+      let peak = maximum (map abs baselineSamples)
+      assertBool ("expected non-silent render on bus " <> show newSinkBus
+                  <> ", got peak " <> show peak)
+                 (peak > 0.05)
+
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
       -- read is gain-attenuated and sent to hardware bus 0. We then
@@ -5542,6 +5766,29 @@ fusedEquivalenceCases =
        f <- lpf r (Param 1500.0) (Param 4.0)
        a <- gain f (Param 0.6)
        busOut 1 a)                             -- BusOut as absorbed terminal
+
+    -- 'RNoiseLpfGainOut' coverage. PRNG-cadence parity is the
+    -- load-bearing invariant: 'process_region_noise_lpf_gain_out'
+    -- calls 'noisegen->noise()' exactly once per output sample, in
+    -- the same order 'process_noisegen' does, before recentering
+    -- and feeding the LPF. The stripped baseline drives the same
+    -- fresh 'NoiseGenState' through 'process_noisegen' frame-by-
+    -- frame, so any drift in PRNG-advance cadence between fused
+    -- and per-node paths shows up as a sample-level diff in the
+    -- bus accumulation. This is the equivalence pin that catches
+    -- a future change accidentally double-pulling, skipping, or
+    -- reordering the PRNG step relative to the LPF transition.
+  , ("§4.B sink-terminal: noise → lpf → gain → out", runSynth $ do
+       n <- noiseGen
+       f <- lpf n (Param 1200.0) (Param 4.0)
+       a <- gain f (Param 0.3)
+       out 0 a)
+
+  , ("§4.B sink-terminal via busOut: noise → lpf → gain → busOut", runSynth $ do
+       n <- noiseGen
+       f <- lpf n (Param 1200.0) (Param 4.0)
+       a <- gain f (Param 0.3)
+       busOut 0 a)                             -- BusOut as absorbed terminal
 
   , ("ring mod (audio-mod gain stays dispatched, output gain fuses)", runSynth $ do
        c <- sinOsc 440.0 0.0
