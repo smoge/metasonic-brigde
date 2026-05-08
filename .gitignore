@@ -153,4 +153,12 @@ docs/_site/
 drafts/
 build/
 build-cpp/
+build-cpp-release/
 draft/
+notes/
+CMakeLists.txt.user
+*.cmake.user
+*.cmake.user~
+AGENTS.md
+CLAUDE.md
+.gitignore

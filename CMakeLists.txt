@@ -55,6 +55,17 @@ add_executable(rt_graph_smoke
 
 target_link_libraries(rt_graph_smoke PRIVATE tinysynth_rt)
 
+# Phase 4.B microbench: compares node-loop dispatch against the
+# fused kernel for each known shape. Numbers are only meaningful
+# in a Release / RelWithDebInfo build — debug timings are
+# dominated by libstdc++ assertion overhead and obscure the
+# kernel-vs-loop ratio.
+add_executable(rt_graph_bench
+    tools/rt_graph_bench.cpp
+)
+
+target_link_libraries(rt_graph_bench PRIVATE tinysynth_rt)
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------

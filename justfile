@@ -42,4 +42,20 @@ cpp-run: cpp-build
 cpp-test: cpp-build
     ctest --test-dir {{cpp_build_dir}} --output-on-failure
 
+# §4.B kernel microbench. Configures and builds in a separate
+# RelWithDebInfo tree so the numbers aren't dominated by
+# libstdc++ assertion overhead from the Debug `cpp-build`.
+cpp_bench_dir := "build-cpp-release"
+
+cpp-bench-configure:
+    cmake -S . -B {{cpp_bench_dir}} -G Ninja \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DMETASONIC_BUILD_TESTS=OFF
+
+cpp-bench-build: cpp-bench-configure
+    cmake --build {{cpp_bench_dir}} --target rt_graph_bench
+
+cpp-bench: cpp-bench-build
+    ./{{cpp_bench_dir}}/rt_graph_bench
+
 build: stack-build cpp-build
