@@ -3751,11 +3751,20 @@ fusedEquivalenceCases =
 -- 'assertFusedEquivalent' avoids.
 --
 -- 'cover' gates the fraction of cases that actually exercise fusion
--- (an 'rnElided' node on the fused path). This protects the property
--- from degenerating into a sanity check on two equivalent loader
--- paths if the generator later drifts away from fusable shapes.
--- A trivial 'True' is returned for graphs that compile cleanly but
--- write no comparable buses, classified separately.
+-- on the fused path. The predicate mirrors 'assertFusedEquivalent':
+-- a graph counts as fused if the fused compile produced any of (a)
+-- an 'RFused' input, (b) an 'rnElided' node, or (c) a non-'RNodeLoop'
+-- region. Each prong is a distinct fusion mechanism — §4.C single-
+-- input rewrites contribute (a) and (b), §4.B region kernels
+-- contribute (c). A predicate that only checked rnElided would
+-- mis-classify minimal §4.B-only cases (e.g. sin → gain → out, which
+-- the 'RSinGainOut' kernel claims before §4.C can elide the gain) as
+-- "no fusion," even though they are real fused-kernel-vs-baseline
+-- comparisons. This protects the property from degenerating into a
+-- sanity check on two equivalent loader paths if the generator
+-- later drifts away from fusable shapes. A trivial 'True' is
+-- returned for graphs that compile cleanly but write no comparable
+-- buses, classified separately.
 prop_fusedRenderEqualsUnfused :: SynthGraph -> Property
 prop_fusedRenderEqualsUnfused graph =
   case (lowerGraph graph >>= compileRuntimeGraph,
@@ -3774,7 +3783,10 @@ prop_fusedRenderEqualsUnfused graph =
             , v : _ <- [rnControls n]
             , v >= 0
             ] :: [Int]
-          triggered = any rnElided (rgNodes rtF)
+          hasRFused   = not (null [() | n <- rgNodes rtF, RFused _ <- rnInputs n])
+          hasElided   = any rnElided (rgNodes rtF)
+          hasFusedReg = any ((/= RNodeLoop) . rrKernel) (rgRuntimeRegions rtF)
+          triggered   = hasRFused || hasElided || hasFusedReg
        in checkCoverage
         . cover 90 triggered          "fusion triggered"
         . classify (not triggered)    "no fusion (vacuous on fused path)"
