@@ -507,11 +507,29 @@ data PortConsumptionRate
     -- reconfiguring the filter once per block.
   | PortInitOnly
     -- ^ Read only at instance configuration / construction. Never
-    -- sampled in the per-block audio loop. Currently: the @phase@
-    -- port (port 1) of the oscillator family ('KSinOsc',
-    -- 'KSawOsc', 'KTriOsc', 'KPulseOsc'). The C++ kernels never
-    -- 'resolve_input' on port 1; the initial phase is folded into
-    -- 'OscState' once.
+    -- sampled in the per-block audio loop. Currently no kind has
+    -- a port classified this way for 'RFrom' edges — kept as a
+    -- distinct policy because "consumed once at init" is
+    -- semantically different from "never consumed at all"
+    -- ('PortIgnored') and from "consumed at block rate"
+    -- ('PortBlockLatched'). A future kind whose runtime kernel
+    -- reads an audio-input port exactly once at configure time
+    -- would land here.
+  | PortIgnored
+    -- ^ The runtime silently discards 'RFrom' edges to this port.
+    -- Currently: the @phase@ port (port 1) of the oscillator
+    -- family ('KSinOsc', 'KSawOsc', 'KTriOsc', 'KPulseOsc').
+    -- @process_sinosc@ / @process_sawosc@ / @process_triosc@ /
+    -- @process_pulse_osc@ never call 'resolve_input' on port 1
+    -- inside the audio loop; the initial phase is taken from
+    -- 'rnControls[1]' at instance construction, so a wired
+    -- 'RFrom' source is dropped without affecting output.
+    --
+    -- Excluded from the §4.D.2 opportunity count: an ignored
+    -- consumer represents no work the runtime is doing, so
+    -- block-rate scheduling can't save anything by demoting the
+    -- producer. (Dead-input elimination is a separate
+    -- optimization concern.)
   deriving stock    (Eq, Ord, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -545,7 +563,7 @@ portInfo k (PortIndex i) = case k of
   KTriOsc       -> oscPort i
   KPulseOsc     -> case i of
     0 -> Just (PortInfo PortSampleAccurate "freq")
-    1 -> Just (PortInfo PortInitOnly       "phase")
+    1 -> Just (PortInfo PortIgnored        "phase")
     2 -> Just (PortInfo PortSampleAccurate "width")
     _ -> Nothing
   KNoiseGen     -> Nothing
@@ -581,10 +599,12 @@ portInfo k (PortIndex i) = case k of
     _ -> Nothing
   where
     -- Oscillator family: port 0 = freq (sample-accurate FM when
-    -- wired), port 1 = phase (init-only; never resolved in the
-    -- per-block loop).
+    -- wired), port 1 = phase (the initial phase is taken from
+    -- 'rnControls[1]' at construction; the kernel never resolves
+    -- port 1 in the audio loop, so an 'RFrom' source there is
+    -- silently ignored — see 'PortIgnored').
     oscPort 0 = Just (PortInfo PortSampleAccurate "freq")
-    oscPort 1 = Just (PortInfo PortInitOnly       "phase")
+    oscPort 1 = Just (PortInfo PortIgnored        "phase")
     oscPort _ = Nothing
 
     -- Biquad family: signal sample-accurate, freq + q

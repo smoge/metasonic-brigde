@@ -1238,8 +1238,17 @@ data SurveyRow = SurveyRow
     -- ^ §4.D.2 edge-rate buckets. One entry per
     -- @(sourceRate, destPolicy)@ pair that has at least one
     -- 'RFrom' edge in this row's /unfused/ runtime graph. Used by
-    -- 'printEdgeRateDistribution' to aggregate the survey-wide
-    -- edge view and the headline opportunity count.
+    -- 'printEdgeRateDistribution' for the descriptive bucket
+    -- table.
+  , srOppProducers :: ![NodeKind]
+    -- ^ §4.D.2 headline opportunity: 'NodeKind' of every
+    -- 'SampleRate' producer in this row whose every active audio-
+    -- input consumer port is non-sample-accurate. Per-graph: a
+    -- producer feeding both 'PortSampleAccurate' /and/
+    -- 'PortBlockLatched' ports does /not/ qualify (it must remain
+    -- sample-rate to serve its sample-accurate consumer). Stored
+    -- as a flat list rather than a count so cross-row
+    -- aggregation can also report distinct-kind diversity.
   } deriving (Eq, Show)
 
 -- Build a SurveyRow from /two/ compiled 'RuntimeGraph's of the
@@ -1299,6 +1308,7 @@ surveyRuntimeGraph d t rt rtF stats =
          -- §4.C fused view replaces 'RFrom' with 'RFused' for
          -- elided producers, which would silently drop the very
          -- edges the survey is meant to count.
+       , srOppProducers = sampleRateOpportunityProducers rt
        }
 
 -- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
@@ -2564,28 +2574,27 @@ printEdgeRateDistribution rows = do
         ]
   mapM_ (putStrLn . formatEdgeRateRow . renderEdgeRateRow) visibleRows
   putStrLn ""
-  let totalEdges = sum (map erbEdgeCount (M.elems aggMap))
-      oppEdges =
-        sum [ erbEdgeCount b
-            | ((sr, pp), b) <- M.toList aggMap
-            , sr == SampleRate
-            , pp /= PortSampleAccurate
-            ]
-      oppKinds =
-        length . nub $
-          [ k
-          | ((sr, pp), b) <- M.toList aggMap
-          , sr == SampleRate
-          , pp /= PortSampleAccurate
-          , k <- erbProducerKinds b
-          ]
+  -- The bucket table above shows the per-edge distribution. The
+  -- headline opportunity is a /per-producer/ measurement: a
+  -- sample-rate producer counts only when /all/ its active
+  -- consumer ports are non-sample-accurate. Counting edges would
+  -- over-report — a producer feeding both LPF.freq and a
+  -- sample-accurate port must remain sample-rate, so it isn't an
+  -- opportunity even though one of its edges lands in
+  -- 'PortBlockLatched'. 'sampleRateOpportunityProducers' applies
+  -- the per-producer rule per graph; we concat across rows.
+  let totalEdges     = sum (map erbEdgeCount (M.elems aggMap))
+      oppProducers   = concatMap srOppProducers rows
+      oppNodeCount   = length oppProducers
+      oppKindCount   = length (nub oppProducers)
   putStrLn $ "  totals: "
-          <> "edges="            <> show totalEdges
-          <> "  opportunity="    <> show oppEdges
-          <> " (sample-rate producers wired into "
-          <> "non-sample-rate ports)"
-  putStrLn $ "          opportunity producer kinds: "
-          <> show oppKinds
+          <> "edges="    <> show totalEdges
+          <> "  buckets=" <> show (length visibleRows)
+  putStrLn $ "  opportunity: "
+          <> show oppNodeCount  <> " producer node(s) across "
+          <> show oppKindCount  <> " distinct kind(s)"
+  putStrLn   "  (sample-rate producers whose every active consumer port"
+  putStrLn   "   is non-sample-accurate; PortIgnored ports excluded)"
 
 renderEdgeRateRow :: (Rate, PortConsumptionRate, EdgeRateBucket) -> [String]
 renderEdgeRateRow (sr, pp, b) =

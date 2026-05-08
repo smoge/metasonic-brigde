@@ -3532,15 +3532,22 @@ unitTests = testGroup "Unit tests"
           portInfo KNotch (PortIndex 1)
             @?= Just (PortInfo PortBlockLatched "freq")
 
-      , testCase "oscillator phase ports are PortInitOnly, named phase" $ do
+      , -- Phase ports are 'PortIgnored', not 'PortInitOnly': the
+        -- C++ kernels never resolve port 1 in the audio loop, so a
+        -- wired 'RFrom' source is silently dropped (the kernel
+        -- takes the initial phase from 'rnControls[1]' at
+        -- construction). This distinction matters for the
+        -- §4.D.2 opportunity count — 'PortIgnored' edges are
+        -- excluded because there is no consumption to demote.
+        testCase "oscillator phase ports are PortIgnored, named phase" $ do
           portInfo KSinOsc   (PortIndex 1)
-            @?= Just (PortInfo PortInitOnly "phase")
+            @?= Just (PortInfo PortIgnored "phase")
           portInfo KSawOsc   (PortIndex 1)
-            @?= Just (PortInfo PortInitOnly "phase")
+            @?= Just (PortInfo PortIgnored "phase")
           portInfo KTriOsc   (PortIndex 1)
-            @?= Just (PortInfo PortInitOnly "phase")
+            @?= Just (PortInfo PortIgnored "phase")
           portInfo KPulseOsc (PortIndex 1)
-            @?= Just (PortInfo PortInitOnly "phase")
+            @?= Just (PortInfo PortIgnored "phase")
 
       , testCase "Gain.amount is PortSampleAccurate (not block-latched)" $ do
           portInfo KGain (PortIndex 1)
@@ -3563,6 +3570,74 @@ unitTests = testGroup "Unit tests"
                 (portInfo k (PortIndex 0))
             | k <- [KNoiseGen, KBusIn, KBusInDelayed]
             ]
+
+      , -- Producer-grouped headline (§4.D.2 'opportunity' count).
+        -- An LFO that feeds /both/ LPF.freq (PortBlockLatched) and
+        -- Gain.amount (PortSampleAccurate) is /not/ an opportunity:
+        -- it must remain sample-rate to serve its sample-accurate
+        -- consumer, even though one of its edges lands in a
+        -- block-latched bucket. Counting edges instead of producers
+        -- would over-report this case — 1 producer node would show
+        -- as 2 opportunity edges.
+        testCase "sampleRateOpportunityProducers: shared LFO is NOT an opportunity" $ do
+          let g = runSynth $ do
+                lfo <- sinOsc 4.0 0.0
+                s   <- sawOsc 110.0 0.0
+                f   <- lpf s lfo (Param 4.0)   -- LFO → lpf.freq (block-latched)
+                a   <- gain f lfo              -- LFO → gain.amount (sample-acc.)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let ops = sampleRateOpportunityProducers rt
+              assertBool
+                ("LFO with mixed-policy consumers must not be flagged "
+                 <> "as an opportunity, got: " <> show ops)
+                (KSinOsc `notElem` ops)
+
+      , -- Counter-pin to the shared-LFO test: a sample-rate
+        -- producer whose /every/ active consumer is non-sample-
+        -- accurate (here, an LFO feeding only LPF.freq) does
+        -- qualify as an opportunity.
+        testCase "sampleRateOpportunityProducers: LFO → LPF.freq alone IS an opportunity" $ do
+          let g = runSynth $ do
+                lfo <- sinOsc 4.0 0.0
+                s   <- sawOsc 110.0 0.0
+                f   <- lpf s lfo (Param 4.0)
+                a   <- gain f (Param 0.4)      -- gain.amount is constant
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let ops = sampleRateOpportunityProducers rt
+              assertBool
+                ("LFO with only block-latched consumer must be "
+                 <> "flagged, got: " <> show ops)
+                (KSinOsc `elem` ops)
+
+      , -- Phase-port edges must not inflate the opportunity count.
+        -- An LFO wired to the phase port of a sin oscillator is
+        -- silently dropped by the runtime (PortIgnored), so the
+        -- LFO has /no/ active consumers in this graph and is not
+        -- an opportunity — even though "the LFO has only non-
+        -- sample-accurate consumers" looks superficially true.
+        testCase "sampleRateOpportunityProducers: PortIgnored consumers don't qualify" $ do
+          let g = runSynth $ do
+                lfo <- sinOsc 4.0 0.0
+                s   <- sinOsc 220.0 lfo        -- LFO → sin.phase (PortIgnored)
+                a   <- gain s (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rt -> do
+              let ops = sampleRateOpportunityProducers rt
+              -- The LFO has only an ignored consumer (sin.phase);
+              -- the carrier sin has only sample-accurate consumers
+              -- (gain.sig); neither qualifies.
+              assertEqual
+                ("expected no opportunity producers in "
+                 <> "phase-mod-only graph, got: " <> show ops)
+                [] ops
 
       , -- Integration of 'edgeRateBuckets' with 'portInfo'. An
         -- Env-driven LPF cutoff is the canonical §4.D.2

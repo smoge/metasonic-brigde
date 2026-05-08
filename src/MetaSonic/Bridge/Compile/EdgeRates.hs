@@ -31,6 +31,7 @@ module MetaSonic.Bridge.Compile.EdgeRates
   , EdgeRateKey
   , edgeRateBuckets
   , addEdgeRateBuckets
+  , sampleRateOpportunityProducers
   ) where
 
 import           Data.List              (foldl', nub)
@@ -41,10 +42,10 @@ import           MetaSonic.Bridge.Compile.Types
                                         , RuntimeNode (..)
                                         )
 import           MetaSonic.Types        ( NodeKind
-                                        , PortConsumptionRate
+                                        , PortConsumptionRate (..)
                                         , PortIndex (..)
                                         , PortInfo (..)
-                                        , Rate
+                                        , Rate (..)
                                         , portInfo
                                         )
 
@@ -110,7 +111,12 @@ edgeRateBuckets rg =
           Just (show srcKind <> " → " <> show destKind <> "." <> pname)
       }
 
-    addEdge !m (k, b) = M.insertWith mergeBucket k b m
+    -- 'M.insertWith f new old' calls @f new old@. We want the
+    -- /first/ inserted bucket's example to stick (the documented
+    -- "first edge encountered in source order" contract), so flip
+    -- the args: 'mergeBucket old new' keeps @old@'s example since
+    -- 'mergeBucket' prefers the left-hand value.
+    addEdge !m (k, b) = M.insertWith (flip mergeBucket) k b m
 
 -- | Aggregate two bucket maps with per-key merging. Producer-kind
 -- lists union (via 'nub') so the result counts each kind once
@@ -133,3 +139,44 @@ mergeBucket a b = EdgeRateBucket
         Just _  -> erbExample a
         Nothing -> erbExample b
   }
+
+-- | Producer nodes whose every /active/ audio-input consumer port
+-- is non-sample-accurate. Returned as a flat list of 'NodeKind's:
+-- one entry per qualifying producer node, in node order.
+--
+-- This is the disciplined counterpart to the per-edge
+-- 'edgeRateBuckets'. The bucket view answers "where do edges
+-- land?"; this function answers the strictly stronger
+-- "which producers could a block-rate execution path /actually/
+-- demote?" — a sample-rate producer with at least one
+-- 'PortSampleAccurate' consumer must remain sample-rate, even if
+-- it /also/ feeds 'PortBlockLatched' or 'PortInitOnly' ports
+-- elsewhere. Counting the per-edge headline would over-report
+-- those producers.
+--
+-- "Active" means /not/ 'PortIgnored': the runtime drops 'RFrom'
+-- edges to ignored ports, so they represent no consumption to
+-- demote. A producer whose only consumers are ignored is dead
+-- input, not an opportunity (a separate optimization concern).
+--
+-- Cross-graph aggregation: 'NodeIndex' is graph-local so the
+-- result returns 'NodeKind' only. Callers concatenate per-graph
+-- lists; @length@ gives the producer-node count, @nub@ gives
+-- the distinct-kind count.
+sampleRateOpportunityProducers :: RuntimeGraph -> [NodeKind]
+sampleRateOpportunityProducers rg =
+  [ rnKind src
+  | src <- rgNodes rg
+  , rnRate src == SampleRate
+  , let activePolicies =
+          [ piPolicy info
+          | dst <- rgNodes rg
+          , (port, RFrom srcIx _) <-
+              zip (map PortIndex [0 ..]) (rnInputs dst)
+          , srcIx == rnIndex src
+          , Just info <- [portInfo (rnKind dst) port]
+          , piPolicy info /= PortIgnored
+          ]
+  , not (null activePolicies)
+  , all (/= PortSampleAccurate) activePolicies
+  ]

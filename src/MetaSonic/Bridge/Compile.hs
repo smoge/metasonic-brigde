@@ -79,6 +79,7 @@ module MetaSonic.Bridge.Compile
   , EdgeRateKey
   , edgeRateBuckets
   , addEdgeRateBuckets
+  , sampleRateOpportunityProducers
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
