@@ -21,7 +21,8 @@ import           MetaSonic.Bridge.MidiDemo  (CCMapping (..),
                                              VoiceMapping (..), withMidiDemo)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
-import           MetaSonic.Types            (NodeIndex (..), NodeKind (..))
+import           MetaSonic.Types            (NodeIndex (..), NodeKind (..),
+                                             PortIndex (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
 import           MetaSonic.Visualize.TUI    (launchInspector)
@@ -337,6 +338,12 @@ data RunMode
   = AudioOnly
   | InspectThenRun
   | InspectOnly
+  | FusionSurvey
+    -- ^ Non-audio reporting mode (--fusion-survey). Compiles every
+    -- demo through 'compileRuntimeGraphFused' and prints a coverage
+    -- table: per-template fusion stats, a sink-terminal opportunity
+    -- scan that flags shapes a future kernel could claim, and
+    -- aggregate totals. Exits without opening audio or the TUI.
   deriving (Eq, Show)
 
 data Options = Options
@@ -372,6 +379,8 @@ parseArgs = go defaultOptions
       go opts { optMode = AudioOnly } xs
     go opts ("--fused" : xs) =
       go opts { optFused = True } xs
+    go opts ("--fusion-survey" : xs) =
+      go opts { optMode = FusionSurvey } xs
     go opts (x : xs)
       | "--" `prefixOf` x = Left ("Unknown option: " <> x)
       | otherwise         = go opts { optTargets = optTargets opts <> [x] } xs
@@ -400,6 +409,7 @@ usage prog = unlines
   , "  " <> prog <> " [--audio-only] [--fused] [DEMO ...]"
   , "  " <> prog <> " --inspect [--fused] [DEMO ...]"
   , "  " <> prog <> " --inspect-only [--fused] [DEMO ...]"
+  , "  " <> prog <> " --fusion-survey [DEMO ...]"
   , ""
   , "If no demo names are given, all demos are run."
   , ""
@@ -413,6 +423,11 @@ usage prog = unlines
   , "                   the [Fusion ...] line reports what fired regardless."
   , "                   Single-graph and multi-template demos only;"
   , "                   the live-MIDI poly demo always runs unfused."
+  , "  --fusion-survey  Compile every demo through compileRuntimeGraphFused"
+  , "                   and print a coverage table — per-template region-"
+  , "                   kernel claims, §4.C elisions, and a sink-terminal"
+  , "                   opportunity scan flagging shapes a future kernel"
+  , "                   could claim. No audio, no TUI, just the report."
   , ""
   , "Availavle demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
@@ -461,15 +476,19 @@ main = do
 
   demos <- either die pure (resolveTargets (optTargets opts))
 
-  putStrLn $
-    case optMode opts of
-      AudioOnly      -> "Running selected demos."
-      InspectThenRun -> "Inspecting selected demos before audio."
-      InspectOnly    -> "Inspecting selected demos without audio."
-
-  forM_ demos (runDemo opts)
-
-  putStrLn "Done."
+  case optMode opts of
+    FusionSurvey -> do
+      putStrLn "Surveying demos for §4.B / §4.C fusion coverage."
+      runFusionSurvey demos
+    _ -> do
+      putStrLn $
+        case optMode opts of
+          AudioOnly      -> "Running selected demos."
+          InspectThenRun -> "Inspecting selected demos before audio."
+          InspectOnly    -> "Inspecting selected demos without audio."
+          FusionSurvey   -> "" -- handled above
+      forM_ demos (runDemo opts)
+      putStrLn "Done."
 
 -- Top-level dispatch: route a Demo to its body-specific runner. See
 -- Note [Demo body: single-graph vs multi-template].
@@ -913,6 +932,340 @@ printRegionLine kindOf r = do
           <> ": " <> show (rrKernel r)
           <> " " <> rangeShown
           <> " kinds=[" <> intercalate "," kinds <> "]"
+
+--------------------------------------------------------------------------------
+-- §4.B / §4.C fusion-coverage survey (--fusion-survey)
+--------------------------------------------------------------------------------
+
+-- Canonical sink-terminal shape the survey scans for in dense
+-- 'RuntimeNode' order. The opportunity scan reports one row per
+-- (shape, found, claimed) triple so we can read off both what the
+-- current kernel set catches and what a future kernel would have
+-- caught — i.e. shapes whose §4.B preconditions hold but whose
+-- chain wasn't claimed by any region kernel today.
+data SinkShape
+  = SinkOscGain    !NodeKind   -- producer → Gain → sink
+  | SinkOscLpfGain !NodeKind   -- producer → LPF → Gain → sink
+  deriving (Eq, Show)
+
+-- The full enumeration of shapes the survey reports on. Listed in
+-- a deliberate display order: 3-node sinks first (the strongest
+-- fusion class per notes/fusion-strategy.md), then 4-node sinks;
+-- producer kinds within each group follow 'sinkProducerKinds'.
+-- Iterating this list (rather than keying a Map by SinkShape)
+-- avoids needing 'Ord NodeKind' and gives stable column order.
+allKnownShapes :: [SinkShape]
+allKnownShapes =
+  [SinkOscGain    k | k <- sinkProducerKinds]
+  <> [SinkOscLpfGain k | k <- sinkProducerKinds]
+
+-- Producer kinds the survey treats as "oscillator-like" sources.
+-- Restricted to the kinds that already exist in the DSL and that
+-- a §4.B kernel could plausibly absorb; multi-input nodes (Add,
+-- Gain) and stateful processors (Env, LPF, Smooth) are outside
+-- this set.
+sinkProducerKinds :: [NodeKind]
+sinkProducerKinds = [KSinOsc, KSawOsc, KTriOsc, KPulseOsc, KNoiseGen]
+
+renderProducer :: NodeKind -> String
+renderProducer KSinOsc   = "Sin"
+renderProducer KSawOsc   = "Saw"
+renderProducer KTriOsc   = "Tri"
+renderProducer KPulseOsc = "Pulse"
+renderProducer KNoiseGen = "Noise"
+renderProducer k         = show k
+
+renderShape :: SinkShape -> String
+renderShape (SinkOscGain k)    = renderProducer k <> " → Gain → sink"
+renderShape (SinkOscLpfGain k) = renderProducer k <> " → LPF → Gain → sink"
+
+-- Whether the §4.B kernel set currently has a kernel that would
+-- claim this shape (independent of whether the kernel
+-- preconditions hold on any specific instance).
+shapeHasKernel :: SinkShape -> Bool
+shapeHasKernel (SinkOscGain    KSinOsc) = True   -- RSinGainOut
+shapeHasKernel (SinkOscLpfGain KSawOsc) = True   -- RSawLpfGainOut
+shapeHasKernel _                        = False
+
+-- Sink-terminal classifier: matches NodeKind.{Out,BusOut} on the
+-- C++ side / 'isSinkTerminal' on the Haskell matcher side.
+isSinkKind :: NodeKind -> Bool
+isSinkKind k = k == KOut || k == KBusOut
+
+-- Mirror the §4.B 'signalSourceIs' / 'isScalarGain' precondition
+-- helpers — kept inline rather than imported because the matcher
+-- helpers in 'MetaSonic.Bridge.Compile' aren't exported (they
+-- shouldn't leak into the public API).
+signalSourceIsRT :: NodeIndex -> RuntimeNode -> Bool
+signalSourceIsRT srcIx node = case rnInputs node of
+  RFrom s (PortIndex 0) : _ -> s == srcIx
+  _                         -> False
+
+isScalarGainRT :: RuntimeNode -> Bool
+isScalarGainRT node = case rnInputs node of
+  [RFrom _ _, RConst _] -> True
+  _                     -> False
+
+windows3 :: [a] -> [(a, a, a)]
+windows3 (a : b : c : rest) = (a, b, c) : windows3 (b : c : rest)
+windows3 _                  = []
+
+windows4 :: [a] -> [(a, a, a, a)]
+windows4 (a : b : c : d : rest) = (a, b, c, d) : windows4 (b : c : d : rest)
+windows4 _                      = []
+
+-- Walk a 'RuntimeGraph' in dense order, collecting each contiguous
+-- sub-sequence whose §4.B preconditions hold. Each result carries
+-- whether the chain ended up in a single non-RNodeLoop region —
+-- i.e. whether some kernel actually claimed it.
+scanSinkShapes :: RuntimeGraph -> [(SinkShape, Bool)]
+scanSinkShapes rt =
+     concatMap check3 (windows3 (rgNodes rt))
+  ++ concatMap check4 (windows4 (rgNodes rt))
+  where
+    fusedRegions = [r | r <- rgRuntimeRegions rt, rrKernel r /= RNodeLoop]
+    inSameFusedRegion ixs =
+      any (\r -> all (`elem` rrNodes r) ixs) fusedRegions
+
+    check3 (a, b, c)
+      | rnKind a `elem` sinkProducerKinds
+      , rnKind b == KGain
+      , isSinkKind (rnKind c)
+      , rnConsumerCount a == 1
+      , rnConsumerCount b == 1
+      , signalSourceIsRT (rnIndex a) b
+      , signalSourceIsRT (rnIndex b) c
+      , isScalarGainRT b
+      , not (rnElided a) && not (rnElided b) && not (rnElided c)
+      = [( SinkOscGain (rnKind a)
+         , inSameFusedRegion [rnIndex a, rnIndex b, rnIndex c] )]
+      | otherwise = []
+
+    check4 (a, b, c, d)
+      | rnKind a `elem` sinkProducerKinds
+      , rnKind b == KLPF
+      , rnKind c == KGain
+      , isSinkKind (rnKind d)
+      , rnConsumerCount a == 1
+      , rnConsumerCount b == 1
+      , rnConsumerCount c == 1
+      , signalSourceIsRT (rnIndex a) b
+      , signalSourceIsRT (rnIndex b) c
+      , signalSourceIsRT (rnIndex c) d
+      , isScalarGainRT c
+      , not (rnElided a) && not (rnElided b)
+                         && not (rnElided c) && not (rnElided d)
+      = [( SinkOscLpfGain (rnKind a)
+         , inSameFusedRegion
+             [rnIndex a, rnIndex b, rnIndex c, rnIndex d] )]
+      | otherwise = []
+
+-- Per-template summary row.
+data SurveyRow = SurveyRow
+  { srDemo         :: !String
+  , srTemplate     :: !(Maybe String)
+  , srNodes        :: !Int
+  , srRegions      :: !Int
+  , srFusedRegions :: !Int
+  , srClaimedNodes :: !Int
+  , srKernels      :: ![(RegionKernel, Int)]
+  , srElided       :: !Int
+  , srRFused       :: !Int
+  , srShapes       :: ![(SinkShape, Bool)]
+  } deriving (Eq, Show)
+
+-- Build a SurveyRow from /two/ compiled 'RuntimeGraph's of the
+-- same source 'SynthGraph':
+--
+--   * 'rt'    — produced by 'compileRuntimeGraph'. This already
+--               contains §4.B's region kernel selection (because
+--               'selectRegionKernels' runs unconditionally inside
+--               compileRuntimeGraph), but no §4.C elision. The
+--               §4.B counts and the sink-shape scan run against
+--               this graph.
+--   * 'rtF'   — produced by 'compileRuntimeGraphFused' (the same
+--               'rt' with §4.C single-input rewrites layered on
+--               top). The §4.C 'elided' and 'RFused' counts come
+--               from this graph.
+--
+-- Running the shape scan against 'rt' rather than 'rtF' is
+-- load-bearing: §4.C elides scalar gains in chains §4.B didn't
+-- claim (the same chains the survey is trying to flag as
+-- "missed kernel opportunities"), and elided gains fail the
+-- shape predicate. Scanning 'rtF' would silently zero out
+-- exactly the rows the survey exists to surface.
+surveyRuntimeGraph
+  :: String -> Maybe String -> RuntimeGraph -> RuntimeGraph -> SurveyRow
+surveyRuntimeGraph d t rt rtF =
+  let allRegions  = rgRuntimeRegions rt
+      fused       = [r | r <- allRegions, rrKernel r /= RNodeLoop]
+      -- Enumerate kernel kinds via Bounded/Enum rather than keying
+      -- a Map by RegionKernel (which has no Ord instance), and
+      -- drop empty rows. Stable display order = constructor order.
+      kernelTally = [ (k, n)
+                    | k <- [minBound .. maxBound :: RegionKernel]
+                    , k /= RNodeLoop
+                    , let n = length (filter ((== k) . rrKernel) fused)
+                    , n > 0
+                    ]
+  in SurveyRow
+       { srDemo         = d
+       , srTemplate     = t
+       , srNodes        = length (rgNodes rt)
+       , srRegions      = length allRegions
+       , srFusedRegions = length fused
+       , srClaimedNodes = sum (map (length . rrNodes) fused)
+       , srKernels      = kernelTally
+       , srElided       = length (filter rnElided (rgNodes rtF))
+       , srRFused       = length [() | n <- rgNodes rtF, RFused _ <- rnInputs n]
+       , srShapes       = scanSinkShapes rt
+       }
+
+surveySynthGraph :: String -> Maybe String -> SynthGraph -> Maybe SurveyRow
+surveySynthGraph d t g = do
+  rt  <- either (const Nothing) Just (lowerGraph g >>= compileRuntimeGraph)
+  rtF <- either (const Nothing) Just (lowerGraph g >>= compileRuntimeGraphFused)
+  Just (surveyRuntimeGraph d t rt rtF)
+
+surveyDemo :: Demo -> [SurveyRow]
+surveyDemo demo = case demoBody demo of
+  SingleGraph g ->
+    maybe [] (: []) (surveySynthGraph (demoKey demo) Nothing g)
+  MultiTemplate tpls ->
+    [ row
+    | (name, g) <- tpls
+    , Just row  <- [surveySynthGraph (demoKey demo) (Just name) g]
+    ]
+  MidiPoly _ build ->
+    let (_b, g, _cc) = runSynthCCs build
+    in maybe [] (: []) (surveySynthGraph (demoKey demo) Nothing g)
+
+-- Top-level entry for the --fusion-survey mode. Produces the
+-- per-template summary, a sink-terminal opportunity table, and
+-- aggregate totals — no audio, no TUI.
+runFusionSurvey :: [Demo] -> IO ()
+runFusionSurvey demos = do
+  let rows = concatMap surveyDemo demos
+  putStrLn ""
+  printSurveyTable rows
+  putStrLn ""
+  printOpportunityScan rows
+  putStrLn ""
+  printSurveyTotals rows
+  putStrLn ""
+  putStrLn "Done."
+
+-- Per-template table.
+printSurveyTable :: [SurveyRow] -> IO ()
+printSurveyTable rows = do
+  putStrLn "─── Per-template fusion summary ───"
+  putStrLn $ formatSurveyRow
+    [ "demo", "template", "nodes", "regs"
+    , "§4.B-regs", "§4.B-cov", "§4.C-elide", "§4.C-RFused", "kernels"
+    ]
+  mapM_ (putStrLn . formatSurveyRow . renderSurveyRow) rows
+
+renderSurveyRow :: SurveyRow -> [String]
+renderSurveyRow r =
+  [ srDemo r
+  , maybe "" id (srTemplate r)
+  , show (srNodes r)
+  , show (srRegions r)
+  , show (srFusedRegions r)
+  , covPct (srClaimedNodes r) (srNodes r)
+  , show (srElided r)
+  , show (srRFused r)
+  , kernelTallyText (srKernels r)
+  ]
+
+covPct :: Int -> Int -> String
+covPct _ 0 = "—"
+covPct c n = show ((c * 100) `div` n) <> "%"
+
+kernelTallyText :: [(RegionKernel, Int)] -> String
+kernelTallyText [] = "—"
+kernelTallyText xs =
+  intercalate ", " [show k <> "×" <> show n | (k, n) <- xs]
+
+formatSurveyRow :: [String] -> String
+formatSurveyRow cols =
+  intercalate "  " (zipWith pad surveyColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+surveyColumnWidths :: [Int]
+surveyColumnWidths = [14, 14, 5, 5, 9, 8, 10, 11, 30]
+
+-- Opportunity scan: for each known sink-terminal shape, how many
+-- candidate chains the survey saw, how many were claimed by a
+-- §4.B kernel, and how many were missed. Shapes with no kernel
+-- today appear with a "kernel? —" marker; those rows are the
+-- raw signal for "is it worth adding a Tri / Pulse / etc.
+-- kernel".
+printOpportunityScan :: [SurveyRow] -> IO ()
+printOpportunityScan rows = do
+  putStrLn "─── Sink-terminal opportunity scan ───"
+  putStrLn $ formatScanRow ["shape", "found", "claimed", "missed", "kernel?"]
+  mapM_ (putStrLn . formatScanRow) (scanRows rows)
+  where
+    formatScanRow cols =
+      intercalate "  " (zipWith padCell scanColumnWidths cols)
+    padCell w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+scanColumnWidths :: [Int]
+scanColumnWidths = [32, 6, 8, 7, 8]
+
+scanRows :: [SurveyRow] -> [[String]]
+scanRows rows =
+  let allShapes = concatMap srShapes rows
+      countFor sh =
+        let matching = [c | (s, c) <- allShapes, s == sh]
+            claimed  = length (filter id matching)
+            found    = length matching
+        in (found, claimed, found - claimed)
+  in [ [ renderShape sh
+       , show found
+       , show claimed
+       , show missed
+       , if shapeHasKernel sh then "yes" else "—"
+       ]
+     | sh <- allKnownShapes
+     , let (found, claimed, missed) = countFor sh
+     , found > 0 || shapeHasKernel sh
+     ]
+
+-- Aggregate totals across every surveyed template.
+printSurveyTotals :: [SurveyRow] -> IO ()
+printSurveyTotals rows = do
+  let totalNodes     = sum (map srNodes rows)
+      totalClaimed   = sum (map srClaimedNodes rows)
+      totalRegions   = sum (map srRegions rows)
+      totalFused     = sum (map srFusedRegions rows)
+      totalElided    = sum (map srElided rows)
+      totalRFused    = sum (map srRFused rows)
+      totalShapes    = sum (map (length . srShapes) rows)
+      shapesClaimed  =
+        sum [length (filter snd (srShapes r)) | r <- rows]
+      shapesMissed   = totalShapes - shapesClaimed
+  putStrLn "─── Totals ───"
+  putStrLn $ "  Templates surveyed:        " <> show (length rows)
+  putStrLn $ "  Runtime nodes:             " <> show totalNodes
+  putStrLn $ "  Regions (all):             " <> show totalRegions
+  putStrLn $ "  §4.B fused regions:        " <> show totalFused
+  putStrLn $ "  Nodes in fused regions:    "
+          <> show totalClaimed <> " / " <> show totalNodes
+          <> " (" <> covPct totalClaimed totalNodes <> ")"
+  putStrLn $ "  §4.C elided nodes:         " <> show totalElided
+  putStrLn $ "  §4.C RFused inputs:        " <> show totalRFused
+  putStrLn ""
+  putStrLn $ "  Sink-terminal candidate chains:    " <> show totalShapes
+  putStrLn $ "    claimed by a §4.B kernel:        " <> show shapesClaimed
+  putStrLn $ "    missed (no kernel for the shape, or"
+  putStrLn $ "             precondition didn't hold): " <> show shapesMissed
 
 -- Shared realtime audio entry point: start, wait for the callback
 -- to fire, accept Enter to stop, and unwind via 'finally' so the
