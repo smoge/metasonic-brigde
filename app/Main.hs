@@ -1823,22 +1823,27 @@ formatScheduleRow cols =
 --
 --   tpls       : number of templates in the ensemble
 --   tplLayerW  : max count of templates at any topological layer
---                of 'tgPrecedence'. The headline number for "is
---                there cross-template parallelism here?" — width
+--                of 'tgPrecedence' (/template precedence width/).
+--                Candidate cross-template surface area: width
 --                @>= 2@ means some templates have no precedence
---                dependency on each other and could run
---                concurrently if a future scheduler exploited it.
+--                dependency on each other in the source graph.
+--                It is /not/ a direct claim that those templates
+--                could run concurrently — templates at the same
+--                layer may still write the same bus, which a real
+--                threaded runtime would have to serialize or
+--                resolve via deterministic per-worker reduction.
 --   sumTotal   : sum of 'rssTotal' across templates (all regions
 --                in the ensemble)
 --   sumF       : sum of 'rssFree' across templates
 --   maxLW      : max of 'rssMaxFreeLayerWidth' across templates
---                (intra-template parallel work, repeated here
+--                (intra-template free-layer width, repeated here
 --                for at-a-glance comparison with tplLayerW)
 --
--- Footer reports survey-wide max @tplLayerW@. If that stays at 1,
--- not even template-level scheduling has surface area; if it
--- exceeds 1, cross-template width exists even when intra-template
--- width does not.
+-- Footer reports survey-wide max @tplLayerW@. Width 1 means
+-- templates form a precedence chain everywhere; width @>= 2@
+-- flags ensembles where template-level scheduling has shape to
+-- exploit, conditional on a separate design for shared-bus
+-- writes.
 printEnsembleScheduleWidth :: [EnsembleScheduleRow] -> IO ()
 printEnsembleScheduleWidth rows = do
   putStrLn "─── Cross-template width (§4.E.2c) ───"

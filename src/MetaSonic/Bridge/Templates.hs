@@ -376,23 +376,33 @@ topoSortTemplates ts precedence = do
 --
 -- The precedence-layer width is the natural cross-template
 -- analogue of 'rssMaxFreeLayerWidth' inside a single graph: how
--- many templates have no precedence dependency on each other at
--- some topological layer of 'tgPrecedence', i.e. how many could
--- run concurrently if a future scheduler exploited cross-template
--- parallelism. Width 1 means templates form a chain; width @>= 2@
--- means there is real cross-template surface area even if every
--- template is internally barrier-dominated.
+-- many templates land at the same topological layer of
+-- 'tgPrecedence' — i.e. have no precedence dependency on each
+-- other through bus dataflow. Width 1 means templates form a
+-- precedence chain; width @>= 2@ means the precedence DAG has
+-- candidate cross-template surface area even when each template
+-- is internally barrier-dominated.
 --
--- This is a /descriptive/ measure for the survey, not a runtime
--- contract. The C++ side still walks templates in their
--- compile-decreed @tgTemplates@ order; nothing currently consumes
--- the layer width.
+-- This is /template precedence width/, not direct schedulable
+-- parallelism. Two templates at the same layer may still both
+-- write the same bus (no read-after-write between them, but a
+-- write-write conflict on shared state). Actually executing them
+-- concurrently would require either per-worker bus accumulation
+-- with a deterministic reduction step, or serialization of
+-- conflicting writers. Designing that policy is out of scope for
+-- this descriptive stat.
+--
+-- The C++ side still walks templates in their compile-decreed
+-- @tgTemplates@ order; nothing currently consumes the layer
+-- width.
 data TemplateScheduleStats = TemplateScheduleStats
   { tssTemplateCount         :: !Int
     -- ^ Total templates in the ensemble.
   , tssMaxTemplateLayerWidth :: !Int
     -- ^ Max count of templates at any topological layer of
-    -- 'tgPrecedence'.
+    -- 'tgPrecedence' (template precedence width). Candidate
+    -- cross-template surface area, not directly schedulable
+    -- parallelism — see 'TemplateScheduleStats'.
   , tssAggregate             :: !RegionScheduleStats
     -- ^ Per-template stats combined via 'addScheduleStats'
     -- (counts add; widths take the max).

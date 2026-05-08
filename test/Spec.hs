@@ -3178,8 +3178,11 @@ unitTests = testGroup "Unit tests"
       , -- Two independent voices feeding one fx: voices have no
         -- precedence on each other (both write the same bus,
         -- neither reads from the other), so layer 0 = {voice-l,
-        -- voice-r}, layer 1 = {fx}. Max layer width = 2 — the
-        -- headline cross-template parallelism case.
+        -- voice-r}, layer 1 = {fx}. Max template precedence
+        -- width = 2 — candidate cross-template surface area.
+        -- (Note: actual concurrent execution would still need a
+        -- deterministic policy for the shared bus-7 write; this
+        -- test only pins the precedence-DAG width.)
         testCase "templateScheduleStats: two voices + one fx → layer width 2" $ do
           let voiceL = runSynth $ do
                 s <- sawOsc 110.0 0.0
