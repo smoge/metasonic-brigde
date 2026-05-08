@@ -784,7 +784,9 @@ template_id is stable.
 // the C ABI and pinned by 'rt_graph_region_kernel_supported'.
 enum class RegionKernel : int {
   NodeLoop   = 0,  // dispatch each member node individually
-  SawLpfGain = 1   // fused per-sample SawOsc -> LPF -> Gain kernel
+  SawLpfGain = 1,  // fused per-sample SawOsc -> LPF -> Gain kernel
+  SinGainOut = 2   // fused per-sample SinOsc -> Gain -> Out kernel
+                   // (sink-terminal: bus accumulate + sink-peak)
 };
 
 // Validate an int from the C ABI. Returns nullopt on an unknown
@@ -796,6 +798,7 @@ region_kernel_from_tag(int kind) noexcept {
   switch (kind) {
   case 0: return RegionKernel::NodeLoop;
   case 1: return RegionKernel::SawLpfGain;
+  case 2: return RegionKernel::SinGainOut;
   default: return std::nullopt;
   }
 }
@@ -3042,6 +3045,132 @@ static void process_region_saw_lpf_gain(
   }
 }
 
+/* Note [Region kernel: SinGainOut]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Hand-written fused kernel for a region tagged 'RegionKernel::SinGainOut'.
+Members are exactly three nodes in stored order: a SinOsc (sin_idx),
+a Gain (gain_idx = sin_idx + 1), and an Out (out_idx = sin_idx + 2).
+
+This is the /sink-terminal/ counterpart to SawLpfGain. SawLpfGain
+materialises the gain's output buffer because some sibling region
+reads it; here, the chain ends in 'Out', and 'Out' is a sink — it
+writes nothing to its own output port. Instead, the kernel does
+exactly what process_out would have done after process_sinosc and
+process_gain: per sample, compute @sin * gain_amount@, accumulate
+into 'g.server.output_buses[bus]', and update 'inst.block_sink_peak'.
+
+That last step is load-bearing for §2.E release-then-free. The
+parent voice's silence detection reads block_sink_peak after the
+instance finishes, so a fused kernel that elides it would cause
+Releasing voices to never get freed once the kernel becomes the
+only sink path. The kernel mirrors process_out's peak update line
+for line.
+
+Semantics held in lockstep with the unfused chain:
+
+  * Sin freq: RFrom (audio-rate FM) per-sample, else RConst block-rate
+    increment, mirroring process_sinosc.
+  * Gain: scalar from gain_node.controls[0], sanitised to 1.0 on
+    NaN, mirroring process_gain's scalar branch. Audio-modulated
+    gain blocks the kernel on the Haskell side, so we never need
+    the per-sample gain branch here.
+  * Out: bus index from out_node.controls[0], sanitised the same way
+    process_out sanitises (finite, non-negative, < bus pool size). On
+    invalid bus the kernel still consumes the per-sample sin output
+    so phase advancement and the block_sink_peak update are the same
+    side-effects as the unfused chain — except the sink-peak
+    contribution from a discarded output is zero (matching process_out
+    which returns early on invalid bus before ever touching peak).
+
+If the kind sequence at registration time doesn't actually match
+[SinOsc, Gain, Out], the dispatch site falls back to per-node
+iteration. Same silent-degradation discipline as SawLpfGain.
+*/
+static void process_region_sin_gain_out(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t sin_idx, std::size_t gain_idx, std::size_t out_idx,
+    int nframes
+) noexcept {
+  auto &sin_node  = inst.nodes[sin_idx];
+  auto &gain_node = inst.nodes[gain_idx];
+  auto &out_node  = inst.nodes[out_idx];
+
+  // Sin freq input. May be RFrom (audio-rate FM) or unwired
+  // (constant from controls[0]). Mirrors process_sinosc.
+  const auto sin_freq_in =
+      resolve_input(g, inst, sin_idx, PortIndex{0}, nframes);
+
+  auto *osc = std::get_if<OscState>(&sin_node.state);
+  if (!osc) {
+    // Defensive: no oscillator state means we can't advance phase.
+    // Silent degradation matches process_sinosc's assert-then-fill
+    // branch at NDEBUG (no out buffer to fill here, but also no
+    // bus contribution to make). block_sink_peak unchanged.
+    return;
+  }
+
+  // Sanitise the gain control once per block. Audio-rate gain is
+  // disallowed at the Haskell match level, so this scalar value
+  // is the only path to compute the per-sample product.
+  const float gain_amount = sanitize_finite(
+      static_cast<float>(gain_node.controls[0]), 1.0f);
+
+  // Validate the bus index in the double domain BEFORE casting to
+  // int. Mirrors process_out's pathological-input sanitation.
+  const double bus_d   = out_node.controls[0];
+  const double bus_lim =
+      static_cast<double>(g.server.output_buses.size());
+  const bool bus_ok =
+      std::isfinite(bus_d) && bus_d >= 0.0 && bus_d < bus_lim;
+  const int  bus     = bus_ok ? static_cast<int>(bus_d) : -1;
+  std::vector<float> *dst =
+      bus_ok ? &g.server.output_buses[static_cast<std::size_t>(bus)]
+             : nullptr;
+
+  // Pull the sink-peak running max into a register for the inner
+  // loop, then write back once. process_instance reset this to 0
+  // at block start; multiple Out / BusOut nodes in the same instance
+  // contribute to the same max, so we read-modify-write rather than
+  // overwrite.
+  float peak = inst.block_sink_peak;
+
+  if (!sin_freq_in.empty()) {
+    // Audio-rate sin frequency: per-sample increment update,
+    // mirroring process_sinosc's audio-rate branch.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const double freq = sanitize_finite(
+          static_cast<double>(sin_freq_in[fi]), 0.0);
+      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
+      const float sin_sample = q::sin(osc->phase_iter++);
+      const float s          = sin_sample * gain_amount;
+      if (dst) {
+        (*dst)[fi] += s;
+        const float a = std::fabs(s);
+        if (a > peak) peak = a;
+      }
+    }
+  } else {
+    // Block-rate sin frequency: increment set once per block.
+    const double sin_freq = sanitize_finite(sin_node.controls[0], 0.0);
+    osc->phase_iter.set(q::frequency{sin_freq}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float sin_sample = q::sin(osc->phase_iter++);
+      const float s          = sin_sample * gain_amount;
+      if (dst) {
+        (*dst)[fi] += s;
+        const float a = std::fabs(s);
+        if (a > peak) peak = a;
+      }
+    }
+  }
+
+  if (dst) {
+    inst.block_sink_peak = peak;
+  }
+}
+
 // ----------------------------------------------------------------
 // Lifecycle helpers (shared between the direct ABI entries and the
 // queued-drain path)
@@ -3427,6 +3556,15 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first + 1].kind == NodeKind::LPF
         && def->nodes[first + 2].kind == NodeKind::Gain) {
       process_region_saw_lpf_gain(g, inst, first, first + 1, first + 2,
+                                  nframes);
+      fused = true;
+    } else if (r.kernel == RegionKernel::SinGainOut
+        && r.node_count == 3
+        && first + 3 <= node_count
+        && def->nodes[first    ].kind == NodeKind::SinOsc
+        && def->nodes[first + 1].kind == NodeKind::Gain
+        && def->nodes[first + 2].kind == NodeKind::Out) {
+      process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
                                   nframes);
       fused = true;
     }

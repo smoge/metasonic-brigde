@@ -43,7 +43,8 @@ import           Test.Tasty.HUnit
 import           Test.Tasty.QuickCheck     as QC
 
 import           MetaSonic.Bridge.Compile
-import           MetaSonic.Bridge.FFI      (c_rt_graph_instance_alive,
+import           MetaSonic.Bridge.FFI      (c_rt_graph_ensure_bus,
+                                            c_rt_graph_instance_alive,
                                             c_rt_graph_instance_count,
                                             c_rt_graph_instance_release,
                                             c_rt_graph_instance_set_control,
@@ -1069,8 +1070,16 @@ unitTests = testGroup "Unit tests"
         --   * SinOsc and Out keep rnElided = False.
         -- See Note [Single-edge Gain fusion].
         testCase "fuseRuntimeGraph: linear chain elides Gain, redirects Out" $ do
+          -- Uses 'sawOsc' rather than 'sinOsc' because §4.B's
+          -- 'RSinGainOut' region kernel claims a [SinOsc, Gain, Out]
+          -- chain before 'fuseRuntimeGraph' runs, leaving the Gain
+          -- in the kernel and never elided. SawOsc → Gain → Out is
+          -- not a recognised kernel shape (no LPF), so §4.C still
+          -- gets to do its single-edge Gain elision here. The
+          -- mechanism under test is the same; only the canonical
+          -- producer kind differs.
           let g = runSynth $ do
-                o <- sinOsc 440.0 0.0
+                o <- sawOsc 440.0 0.0
                 a <- gain o (Param 0.5)
                 out 0 a
           case lowerGraph g >>= compileRuntimeGraphFused of
@@ -1078,13 +1087,13 @@ unitTests = testGroup "Unit tests"
             Right rg -> do
               length (rgNodes rg) @?= 3
               let gainNode = head [n | n <- rgNodes rg, rnKind n == KGain]
-                  sinNode  = head [n | n <- rgNodes rg, rnKind n == KSinOsc]
+                  sawNode  = head [n | n <- rgNodes rg, rnKind n == KSawOsc]
                   outNode  = head [n | n <- rgNodes rg, rnKind n == KOut]
               rnElided gainNode @?= True
-              rnElided sinNode  @?= False
+              rnElided sawNode  @?= False
               rnElided outNode  @?= False
               rnInputs outNode @?=
-                [ RFused (FScaleFrom (rnIndex sinNode) (PortIndex 0)
+                [ RFused (FScaleFrom (rnIndex sawNode) (PortIndex 0)
                                      (rnIndex gainNode) (ControlIndex 0))
                 ]
 
@@ -1636,6 +1645,105 @@ unitTests = testGroup "Unit tests"
             Left err -> assertFailure $ "compile failed: " <> err
             Right rg ->
               selectRegionKernels rg @?= rg
+
+      , -- Phase 4.B sink-terminal: SinOsc → Gain → Out is the second
+        -- recognised kernel shape. Distinct protocol axis from
+        -- 'RSawLpfGain' (which is buffer-terminal): the 'Out' node
+        -- lives /inside/ the fused region, so the kernel does the
+        -- bus accumulation and §2.E sink-peak update inline rather
+        -- than materialising an intermediate buffer.
+        testCase "sin → gain → out: middle region tagged RSinGainOut" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              -- Exactly one fused region and it covers the whole
+              -- chain (no trailing 'RNodeLoop' region for an
+              -- external Out, because the Out is now a kernel
+              -- member).
+              length [() | RSinGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RSinGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 3
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KSinOsc, KGain, KOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- §4.C interaction: §4.B claims this shape /before/ §4.C
+        -- runs. Without that claim, §4.C would elide the Gain into
+        -- an 'FScaleFrom' on Out's input (the original §4.C
+        -- behaviour for sin → gain → out). Pinned because the
+        -- region kernel needs the Gain's control slot still
+        -- addressable, so eliding it would silently break
+        -- 'process_region_sin_gain_out''s read of
+        -- @gain_node.controls[0]@.
+        testCase "fuseRuntimeGraph: defers to §4.B kernel on sin → gain → out" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let gainNode = head [n | n <- rgNodes rg, rnKind n == KGain]
+              rnElided gainNode @?= False
+              null [() | n <- rgNodes rg, RFused _ <- rnInputs n] @?= True
+
+      , -- Negative: audio-modulated gain blocks the kernel for the
+        -- same reason it blocks 'RSawLpfGain' — the per-sample
+        -- arithmetic can no longer be folded into the same float
+        -- rounding sequence as the unfused chain.
+        testCase "near-miss (sin chain): audio-modulated gain stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s   <- sinOsc 440.0 0.0
+                lfo <- sinOsc 6.0 0.0
+                a   <- gain s lfo            -- audio-rate gain modulation
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              null [() | RSinGainOut <- map rrKernel (rgRuntimeRegions rg)]
+                @?= True
+
+      , -- Negative: a SinOsc with multiple consumers can't be
+        -- claimed by the kernel because the second consumer needs
+        -- the SinOsc's output materialised, but the kernel keeps
+        -- it in registers.
+        testCase "near-miss (sin chain): multi-consumer sin stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s  <- sinOsc 440.0 0.0
+                a1 <- gain s (Param 0.5)
+                a2 <- gain s (Param 0.3)     -- second consumer of sin
+                out 0 a1
+                out 1 a2
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              null [() | RSinGainOut <- map rrKernel (rgRuntimeRegions rg)]
+                @?= True
+
+      , -- Negative: a Gain whose output feeds two Outs has consumer
+        -- count 2 — the kernel's "single internal edge" rule
+        -- rejects it, exactly the way 'RSawLpfGain' rejects an LPF
+        -- with multiple consumers.
+        testCase "near-miss (sin chain): multi-consumer gain stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                out 0 a
+                out 1 a                       -- second consumer of gain
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg ->
+              null [() | RSinGainOut <- map rrKernel (rgRuntimeRegions rg)]
+                @?= True
 
       , -- Multi-match: two independent saw → lpf → gain chains in
         -- one original region must both be tagged in a single
@@ -2459,8 +2567,11 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- not miswire silently. This pins the contract until Step C (e)
     -- adds a fused-aware loader.
     testCase "loadRuntimeGraph rejects RFused inputs with the documented error" $ do
+      -- 'sawOsc' (not 'sinOsc') so the §4.B 'RSinGainOut' kernel
+      -- doesn't claim this chain — we need §4.C to actually emit
+      -- an 'RFused' input for the loader-rejection check to fire.
       let graph = runSynth $ do
-            o <- sinOsc 440.0 0.0
+            o <- sawOsc 440.0 0.0
             a <- gain o (Param 0.5)
             out 0 a
       rt <- case lowerGraph graph >>= compileRuntimeGraphFused of
@@ -2487,9 +2598,13 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- audio path produces non-silent output. Bit-identical
     -- equivalence with the unfused render is pinned in Step C (f).
     testCase "loadRuntimeGraphFused: fused graph renders non-silent audio" $ do
+      -- 'sawOsc' (not 'sinOsc') so the §4.B 'RSinGainOut' kernel
+      -- doesn't claim this chain — this test is specifically
+      -- about §4.C's RFused-input loader path, which only runs
+      -- on shapes §4.B leaves alone.
       let nframes = 256
           graph = runSynth $ do
-            o <- sinOsc 440.0 0.0
+            o <- sawOsc 440.0 0.0
             a <- gain o (Param 0.5)
             out 0 a
       rt <- case lowerGraph graph >>= compileRuntimeGraphFused of
@@ -2513,11 +2628,12 @@ crossCuttingTests = testGroup "End-to-end FFI"
           pure (map (\(CFloat x) -> x) cs)
 
       let peak = maximum (map abs samples)
-      -- 440 Hz at 0.5 gain ⇒ peak ≈ 0.5. Non-silent confirms the
+      -- 440 Hz saw at 0.5 gain ⇒ peak ≈ 0.5 (q::saw is band-limited
+      -- with small BLEP overshoot). Non-silent confirms the
       -- fused-input scratch materialisation reached the consumer
       -- and the elided Gain didn't break dispatch.
       assertBool ("expected non-silent fused render, peak = " <> show peak)
-                 (peak > 0.4 && peak < 0.55)
+                 (peak > 0.4 && peak < 0.6)
 
   , -- Step C (f): bit-equivalence battery. For every graph in
     -- 'fusedEquivalenceCases' the unfused render (loadRuntimeGraph
@@ -2770,6 +2886,90 @@ crossCuttingTests = testGroup "End-to-end FFI"
       let peak = maximum (map abs unfusedSamples)
       assertBool ("expected peak ≈ 0.75 after set_control on scale+bias, got " <> show peak)
                  (peak > 0.7 && peak < 0.78)
+
+  , -- Phase 4.B kernel control identity. Live 'set_control' on
+    -- every control slot the SinGainOut kernel reads — sin.freq,
+    -- gain.amount, out.bus — must steer the fused render exactly
+    -- as it steers a node-loop baseline. A regression where the
+    -- kernel cached any of these once at load time (rather than
+    -- reading 'inst.nodes[i].controls[k]' live each block) would
+    -- silently ignore later set_control writes; a regression
+    -- where the wrong slot was wired would shift the bug from
+    -- "ignored" to "applied to the wrong control."
+    --
+    -- The baseline strips the region-kernel tags so the same
+    -- compiled graph dispatches via 'process_sinosc' /
+    -- 'process_gain' / 'process_out' instead of the kernel —
+    -- without that strip, both sides would dispatch through the
+    -- kernel and the test would compare identical paths.
+    testCase "Phase 4.B: set_control on kernel freq/gain/bus matches node-loop baseline" $ do
+      let nframes = 256
+          chain = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            a <- gain s (Param 0.5)
+            out 0 a                       -- initial bus: 0
+          newFreq = 330.0 :: Double
+          newGain = 0.3   :: Double
+          newBus  = 2     :: Int          -- redirect to bus 2
+
+      rtUnRaw <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- Sanity: the fused side carries an RSinGainOut region (else
+      -- the test isn't testing what it claims).
+      assertBool "Phase 4.B: fused compile has no RSinGainOut region"
+        (any ((== RSinGainOut) . rrKernel) (rgRuntimeRegions rtF))
+
+      -- Strip kernels on the baseline so its render takes the
+      -- per-node dispatch path on the same compiled graph.
+      let rtUn = stripRegionKernels rtUnRaw
+
+          ixOf k rg =
+            let NodeIndex i = head [rnIndex n | n <- rgNodes rg, rnKind n == k]
+            in i
+          sinIx  = ixOf KSinOsc rtF
+          gainIx = ixOf KGain   rtF
+          outIx  = ixOf KOut    rtF
+
+      let sizeOfFloat' = 4 :: Int
+          renderBus loader rt readBus =
+            withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+              loader handle rt
+              -- Grow the bus pool to cover the redirected target.
+              -- Post-§2.E ABI: 'rt_graph_instance_set_control' no
+              -- longer side-effects bus growth; explicit
+              -- 'rt_graph_ensure_bus' is required.
+              c_rt_graph_ensure_bus handle (fromIntegral newBus)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral sinIx)  0 (CDouble newFreq)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral gainIx) 0 (CDouble newGain)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral outIx)  0 (CDouble (fromIntegral newBus))
+              c_rt_graph_process handle (fromIntegral nframes)
+              allocaBytes (nframes * sizeOfFloat') $ \buf -> do
+                _ <- c_rt_graph_read_bus handle (fromIntegral readBus)
+                                         (fromIntegral nframes) (castPtr buf)
+                cs <- peekArray nframes (buf :: PtrCFloat)
+                pure (map (\(CFloat x) -> x) cs)
+
+      -- Render the redirected bus on both sides.
+      baselineSamples <- renderBus loadRuntimeGraph      rtUn newBus
+      fusedSamples    <- renderBus loadRuntimeGraphFused rtF  newBus
+
+      length baselineSamples @?= length fusedSamples
+      assertBool
+        ("Phase 4.B: kernel set_control divergence on bus " <> show newBus)
+        (baselineSamples == fusedSamples)
+
+      -- Sanity: 330 Hz sin at 0.3 gain ⇒ peak ≈ 0.3.
+      let peak = maximum (map abs baselineSamples)
+      assertBool ("expected peak ≈ 0.3 after set_control, got " <> show peak)
+                 (peak > 0.25 && peak < 0.35)
 
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that
@@ -3104,9 +3304,13 @@ crossCuttingTests = testGroup "End-to-end FFI"
     --     picks up the spec's full fused_input_count.
     --   * Elision marking against template id 0.
     testCase "loadTemplateGraphFused: single-template ensemble matches loadRuntimeGraphFused" $ do
+      -- 'sawOsc' (not 'sinOsc') so the §4.B 'RSinGainOut' kernel
+      -- doesn't claim this chain — the test specifically wants
+      -- §4.C's RFused-on-Out wiring exercised through the
+      -- single-template ensemble path.
       let nframes = 256
           fusedChain = runSynth $ do
-            o <- sinOsc 440.0 0.0
+            o <- sawOsc 440.0 0.0
             a <- gain o (Param 0.5)
             out 0 a
 
@@ -3348,6 +3552,68 @@ crossCuttingTests = testGroup "End-to-end FFI"
         -- Post-free: status is -1 (dead/invalid).
         s2 <- c_rt_graph_instance_status handle 0
         s2 @?= (-1)
+
+  , -- Phase 4.B sink-terminal kernel × §2.E release lifecycle.
+    -- The 'process_region_sin_gain_out' kernel takes over the bus
+    -- accumulation /and/ the per-block 'inst.block_sink_peak'
+    -- update from 'process_out'. §2.E silence detection reads
+    -- block_sink_peak after each instance runs; a kernel that
+    -- forgot to update it would either free voices too early
+    -- (peak under-reported) or never (peak stuck at the last
+    -- value).
+    --
+    -- Both variants register an RSinGainOut region and an Env on
+    -- a separate bus. The Env's release decay drives the §2.E
+    -- state machine; the kernel's gain control determines whether
+    -- the fused chain contributes to peak.
+    --
+    --   variantA: gain = 0.0  → kernel writes silence; once Env
+    --             tail decays, peak < threshold, voice frees.
+    --   variantB: gain = 0.5  → kernel writes |sin|·0.5 ≈ 0.5
+    --             every block, /forever/. Even after Env decays,
+    --             the kernel's contribution keeps peak above the
+    --             silence threshold and the voice never frees.
+    --
+    -- A bug where the kernel didn't update block_sink_peak at all
+    -- would flip variantB to "frees" — caught here.
+    testCase "Phase 4.B kernel: sink-peak tracking gates §2.E release-then-free" $ do
+      let mkVoice scalarGain = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            a <- gain s (Param scalarGain)
+            out 1 a                      -- kernel chain on bus 1
+            e <- env 1.0 0.0005 0.002 0.5 0.002
+            out 0 e                       -- env on bus 0
+
+          driveAndDrain g maxBlocks = do
+            let rg = case lowerGraph g >>= compileRuntimeGraph of
+                  Right r  -> r
+                  Left err -> error err
+                totalNodes = length (rgNodes rg)
+            -- Sanity: §4.B is actually claiming the kernel chain.
+            assertBool "voice does not contain RSinGainOut region"
+              (any ((== RSinGainOut) . rrKernel) (rgRuntimeRegions rg))
+            withRTGraph totalNodes 256 $ \handle -> do
+              loadRuntimeGraph handle rg
+              -- One block to leave envelope-idle and reach sustain.
+              c_rt_graph_process handle 256
+              c_rt_graph_instance_release handle 0
+              let drain n
+                    | n <= 0    = pure False
+                    | otherwise = do
+                        c_rt_graph_process handle 256
+                        alive <- c_rt_graph_instance_alive handle 0
+                        if alive == 0 then pure True else drain (n - 1)
+              drain maxBlocks
+
+      freedSilent <- driveAndDrain (mkVoice 0.0) 64
+      assertBool
+        "variantA (silent kernel + Env): voice should auto-free within 64 blocks"
+        freedSilent
+
+      freedAudible <- driveAndDrain (mkVoice 0.5) 64
+      assertBool
+        "variantB (audible kernel + Env): voice must NOT free — kernel keeps sink-peak above threshold"
+        (not freedAudible)
   ]
   where
     sizeOfFloat = 4 :: Int
