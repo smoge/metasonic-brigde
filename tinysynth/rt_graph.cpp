@@ -797,11 +797,13 @@ template_id is stable.
 enum class RegionKernel : int {
   NodeLoop      = 0,  // dispatch each member node individually
   SawLpfGain    = 1,  // fused per-sample SawOsc -> LPF -> Gain
-                      // (buffer-terminal: gain output materialised)
+                      // (buffer-terminal: gain output materialized)
   SinGainOut    = 2,  // fused per-sample SinOsc -> Gain -> Out
                       // (sink-terminal: bus accumulate + sink-peak)
-  SawLpfGainOut = 3   // fused per-sample SawOsc -> LPF -> Gain -> Out
+  SawLpfGainOut = 3,  // fused per-sample SawOsc -> LPF -> Gain -> Out
                       // (4-node sink-terminal)
+  SawGainOut    = 4   // fused per-sample SawOsc -> Gain -> Out
+                      // (3-node sink-terminal; SinGainOut counterpart)
 };
 
 // Validate an int from the C ABI. Returns nullopt on an unknown
@@ -815,6 +817,7 @@ region_kernel_from_tag(int kind) noexcept {
   case 1: return RegionKernel::SawLpfGain;
   case 2: return RegionKernel::SinGainOut;
   case 3: return RegionKernel::SawLpfGainOut;
+  case 4: return RegionKernel::SawGainOut;
   default: return std::nullopt;
   }
 }
@@ -3262,6 +3265,58 @@ static void process_region_sin_gain_out(
   sink.flush_to(inst);
 }
 
+/* Note [Region kernel: SawGainOut]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+3-node sink-terminal kernel for [SawOsc, Gain, sink]. The saw
+counterpart of SinGainOut: same SinkAccumulator + drive_oscillator
+shape, just q::saw in place of q::sin. Added after the
+--fusion-survey scan flagged Saw → Gain → sink as the most-missed
+shape across the demo set; per-sample work is just one BLEP saw
+sample × scalar gain, accumulated into the bus, with the same
+block_sink_peak tracking as the other sink-terminal kernels.
+
+The Haskell-side gate ('matchesSawGainOut' / 'findKernelMatch')
+holds the same single-edge / scalar-gain / sink-class invariants
+as 'matchesSinGainOut'; the kernel body is bus-kind-agnostic and
+absorbs Out or BusOut identically.
+
+If the kind sequence at registration time doesn't actually match
+[SawOsc, Gain, sink-terminal], the dispatch site falls back to
+per-node iteration. Same silent-degradation discipline as the
+other §4.B kernels.
+*/
+static void process_region_saw_gain_out(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t saw_idx, std::size_t gain_idx, std::size_t out_idx,
+    int nframes
+) noexcept {
+  auto &saw_node  = inst.nodes[saw_idx];
+  auto &gain_node = inst.nodes[gain_idx];
+  auto &out_node  = inst.nodes[out_idx];
+
+  const auto saw_freq_in =
+      resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
+
+  auto *osc = std::get_if<OscState>(&saw_node.state);
+  if (!osc) {
+    // Defensive: no oscillator state; silent no-op (mirrors the
+    // SinGainOut early return — block_sink_peak unchanged, bus
+    // untouched).
+    return;
+  }
+
+  const float gain_amount = sanitize_finite(
+      static_cast<float>(gain_node.controls[0]), 1.0f);
+
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
+                   nframes, q::saw,
+    [&](std::size_t fi, float saw_sample) noexcept {
+      sink.push(fi, saw_sample * gain_amount);
+    });
+  sink.flush_to(inst);
+}
+
 /* Note [Region kernel: SawLpfGainOut]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 4-node sink-terminal kernel. Combines the saw + LPF + gain
@@ -3765,6 +3820,15 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
                                       first, first + 1,
                                       first + 2, first + 3,
                                       nframes);
+      fused = true;
+    } else if (r.kernel == RegionKernel::SawGainOut
+        && r.node_count == 3
+        && first + 3 <= node_count
+        && def->nodes[first    ].kind == NodeKind::SawOsc
+        && def->nodes[first + 1].kind == NodeKind::Gain
+        && is_sink_terminal(def->nodes[first + 2].kind)) {
+      process_region_saw_gain_out(g, inst, first, first + 1, first + 2,
+                                  nframes);
       fused = true;
     }
 

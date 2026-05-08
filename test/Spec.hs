@@ -1070,16 +1070,17 @@ unitTests = testGroup "Unit tests"
         --   * SinOsc and Out keep rnElided = False.
         -- See Note [Single-edge Gain fusion].
         testCase "fuseRuntimeGraph: linear chain elides Gain, redirects Out" $ do
-          -- Uses 'sawOsc' rather than 'sinOsc' because §4.B's
-          -- 'RSinGainOut' region kernel claims a [SinOsc, Gain, Out]
-          -- chain before 'fuseRuntimeGraph' runs, leaving the Gain
-          -- in the kernel and never elided. SawOsc → Gain → Out is
-          -- not a recognised kernel shape (no LPF), so §4.C still
-          -- gets to do its single-edge Gain elision here. The
-          -- mechanism under test is the same; only the canonical
-          -- producer kind differs.
+          -- Uses an 'Env' source rather than any oscillator because
+          -- §4.B's growing kernel set claims every contiguous
+          -- @{Sin,Saw} → Gain → sink@ shape today, and (per
+          -- 'notes/fusion-strategy.md') is the part of the design
+          -- expected to expand. Env is stateful and explicitly
+          -- excluded from kernel candidacy in that note, so §4.B
+          -- can't claim @Env → Gain → Out@ now or later, and §4.C
+          -- gets to do its single-edge Gain elision. The mechanism
+          -- under test is unchanged; only the source kind differs.
           let g = runSynth $ do
-                o <- sawOsc 440.0 0.0
+                o <- env (Param 1.0) 0.0005 0.002 1.0 0.002
                 a <- gain o (Param 0.5)
                 out 0 a
           case lowerGraph g >>= compileRuntimeGraphFused of
@@ -1087,13 +1088,13 @@ unitTests = testGroup "Unit tests"
             Right rg -> do
               length (rgNodes rg) @?= 3
               let gainNode = head [n | n <- rgNodes rg, rnKind n == KGain]
-                  sawNode  = head [n | n <- rgNodes rg, rnKind n == KSawOsc]
+                  envNode  = head [n | n <- rgNodes rg, rnKind n == KEnv]
                   outNode  = head [n | n <- rgNodes rg, rnKind n == KOut]
               rnElided gainNode @?= True
-              rnElided sawNode  @?= False
+              rnElided envNode  @?= False
               rnElided outNode  @?= False
               rnInputs outNode @?=
-                [ RFused (FScaleFrom (rnIndex sawNode) (PortIndex 0)
+                [ RFused (FScaleFrom (rnIndex envNode) (PortIndex 0)
                                      (rnIndex gainNode) (ControlIndex 0))
                 ]
 
@@ -1687,18 +1688,72 @@ unitTests = testGroup "Unit tests"
               null [() | RSawLpfGain <- map rrKernel (rgRuntimeRegions rg)]
                 @?= True
 
-      , -- Negative: non-matching kind sequence (saw → gain, no LPF)
-        -- can't possibly match, region stays RNodeLoop.
-        testCase "near-miss: saw → gain (no LPF) stays RNodeLoop" $ do
+      , -- 3-node sink-terminal saw kernel: SawOsc → Gain → Out is
+        -- the saw counterpart of 'RSinGainOut'. Same single-edge,
+        -- scalar-gain rules; same Out-or-BusOut sink class. Pinned
+        -- because the previous "near-miss: saw → gain (no LPF)"
+        -- test asserted /no/ kernel claimed this shape — that
+        -- assertion was the right contract before 'RSawGainOut'
+        -- existed and is now exactly inverted.
+        testCase "saw → gain → out: middle region tagged RSawGainOut" $ do
           let g = runSynth $ do
                 s <- sawOsc 110.0 0.0
                 a <- gain s (Param 0.4)
                 out 0 a
           case lowerGraph g >>= compileRuntimeGraph of
             Left err -> assertFailure $ "compile failed: " <> err
-            Right rg ->
-              null [() | RSawLpfGain <- map rrKernel (rgRuntimeRegions rg)]
-                @?= True
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RSawGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RSawGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 3
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KSawOsc, KGain, KOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- BusOut as sink terminal for the saw 3-node kernel —
+        -- mirrors the parallel test for 'RSinGainOut'. Pins that
+        -- 'isSinkTerminal' / 'is_sink_terminal' propagates to the
+        -- new kernel's gate.
+        testCase "saw → gain → busOut: middle region tagged RSawGainOut" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                a <- gain s (Param 0.4)
+                busOut 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RSawGainOut <- kernels] @?= 1
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RSawGainOut] of
+                [r] -> do
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KSawOsc, KGain, KBusOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- §4.C deferral on the new kernel: with §4.B claiming the
+        -- whole chain, §4.C must skip the Gain. Otherwise scalar
+        -- Gain fusion would elide it and 'process_region_saw_gain_out'
+        -- would lose its live read of @gain_node.controls[0]@.
+        -- Mirrors the SinGainOut deferral test.
+        testCase "fuseRuntimeGraph: defers to §4.B kernel on saw → gain → out" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                a <- gain s (Param 0.4)
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let gainNode = head [n | n <- rgNodes rg, rnKind n == KGain]
+              rnElided gainNode @?= False
+              null [() | n <- rgNodes rg, RFused _ <- rnInputs n] @?= True
 
       , -- 4-node-specific gate: 'matchesSawLpfGainOut' adds
         -- 'rnConsumerCount gain == 1' on top of 'matchesSawLpfGain'.
@@ -2721,11 +2776,12 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- not miswire silently. This pins the contract until Step C (e)
     -- adds a fused-aware loader.
     testCase "loadRuntimeGraph rejects RFused inputs with the documented error" $ do
-      -- 'sawOsc' (not 'sinOsc') so the §4.B 'RSinGainOut' kernel
-      -- doesn't claim this chain — we need §4.C to actually emit
-      -- an 'RFused' input for the loader-rejection check to fire.
+      -- 'Env' source: durable §4.C-only fixture (no §4.B kernel
+      -- candidate, per notes/fusion-strategy.md). We need §4.C to
+      -- actually emit an 'RFused' input for the loader-rejection
+      -- check to fire.
       let graph = runSynth $ do
-            o <- sawOsc 440.0 0.0
+            o <- env (Param 1.0) 0.0005 0.002 1.0 0.002
             a <- gain o (Param 0.5)
             out 0 a
       rt <- case lowerGraph graph >>= compileRuntimeGraphFused of
@@ -2752,13 +2808,14 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- audio path produces non-silent output. Bit-identical
     -- equivalence with the unfused render is pinned in Step C (f).
     testCase "loadRuntimeGraphFused: fused graph renders non-silent audio" $ do
-      -- 'sawOsc' (not 'sinOsc') so the §4.B 'RSinGainOut' kernel
-      -- doesn't claim this chain — this test is specifically
-      -- about §4.C's RFused-input loader path, which only runs
-      -- on shapes §4.B leaves alone.
+      -- 'Env' source: durable §4.C-only fixture. With gate=1 and
+      -- sustain=1 the envelope settles at ~1.0 within a few ms
+      -- (well under the 256-frame block), so peak after the 0.5
+      -- gain is ~0.5 — same expected magnitude the previous saw
+      -- fixture targeted, just from a different source.
       let nframes = 256
           graph = runSynth $ do
-            o <- sawOsc 440.0 0.0
+            o <- env (Param 1.0) 0.0005 0.002 1.0 0.002
             a <- gain o (Param 0.5)
             out 0 a
       rt <- case lowerGraph graph >>= compileRuntimeGraphFused of
@@ -2782,10 +2839,9 @@ crossCuttingTests = testGroup "End-to-end FFI"
           pure (map (\(CFloat x) -> x) cs)
 
       let peak = maximum (map abs samples)
-      -- 440 Hz saw at 0.5 gain ⇒ peak ≈ 0.5 (q::saw is band-limited
-      -- with small BLEP overshoot). Non-silent confirms the
-      -- fused-input scratch materialisation reached the consumer
-      -- and the elided Gain didn't break dispatch.
+      -- Env at sustain=1 × 0.5 gain ⇒ peak ≈ 0.5. Non-silent
+      -- confirms the fused-input scratch materialization reached
+      -- the consumer and the elided Gain didn't break dispatch.
       assertBool ("expected non-silent fused render, peak = " <> show peak)
                  (peak > 0.4 && peak < 0.6)
 
@@ -3544,13 +3600,13 @@ crossCuttingTests = testGroup "End-to-end FFI"
     --     picks up the spec's full fused_input_count.
     --   * Elision marking against template id 0.
     testCase "loadTemplateGraphFused: single-template ensemble matches loadRuntimeGraphFused" $ do
-      -- 'sawOsc' (not 'sinOsc') so the §4.B 'RSinGainOut' kernel
-      -- doesn't claim this chain — the test specifically wants
-      -- §4.C's RFused-on-Out wiring exercised through the
-      -- single-template ensemble path.
+      -- 'Env' source: durable §4.C-only fixture. The test
+      -- specifically wants §4.C's RFused-on-Out wiring exercised
+      -- through the single-template ensemble path, with no
+      -- chance of §4.B claiming the chain instead.
       let nframes = 256
           fusedChain = runSynth $ do
-            o <- sawOsc 440.0 0.0
+            o <- env (Param 1.0) 0.0005 0.002 1.0 0.002
             a <- gain o (Param 0.5)
             out 0 a
 
@@ -3918,6 +3974,21 @@ fusedEquivalenceCases =
        s <- sawOsc 110.0 0.0
        f <- lpf s (Param 800.0) (Param 4.0)
        a <- gain f (Param 0.4)
+       busOut 0 a)
+
+    -- 'RSawGainOut' coverage: the saw counterpart of the
+    -- 'RSinGainOut' chain case. q::saw with poly-BLEP × scalar
+    -- gain → bus accumulation. Bit-identical to the per-node
+    -- chain (process_sawosc + process_gain + process_out) by
+    -- construction.
+  , ("§4.B sink-terminal: saw → gain → out", runSynth $ do
+       s <- sawOsc 110.0 0.0
+       a <- gain s (Param 0.4)
+       out 0 a)
+
+  , ("§4.B sink-terminal via busOut: saw → gain → busOut", runSynth $ do
+       s <- sawOsc 110.0 0.0
+       a <- gain s (Param 0.4)
        busOut 0 a)
 
   , ("ring mod (audio-mod gain stays dispatched, output gain fuses)", runSynth $ do

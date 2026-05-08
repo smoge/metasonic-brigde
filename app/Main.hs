@@ -985,6 +985,7 @@ renderShape (SinkOscLpfGain k) = renderProducer k <> " → LPF → Gain → sink
 -- preconditions hold on any specific instance).
 shapeHasKernel :: SinkShape -> Bool
 shapeHasKernel (SinkOscGain    KSinOsc) = True   -- RSinGainOut
+shapeHasKernel (SinkOscGain    KSawOsc) = True   -- RSawGainOut
 shapeHasKernel (SinkOscLpfGain KSawOsc) = True   -- RSawLpfGainOut
 shapeHasKernel _                        = False
 

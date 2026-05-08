@@ -325,6 +325,8 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //                                     SinOsc -> Gain -> Out)
 //                  3 = SawLpfGainOut (4-node sink-terminal:
 //                                     SawOsc -> LPF -> Gain -> Out)
+//                  4 = SawGainOut    (3-node sink-terminal:
+//                                     SawOsc -> Gain -> Out)
 //                The Haskell side machine-checks tag agreement in a
 //                property test (mirroring the kindTag pattern in
 //                §0.5.1) so this set cannot drift between aligned
@@ -368,6 +370,9 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //   * SawLpfGainOut needs node_count == 4 and kinds
 //                   [SawOsc, LPF, Gain, /sink/] with the same
 //                   Out/BusOut rule as SinGainOut.
+//   * SawGainOut    needs node_count == 3 and kinds
+//                   [SawOsc, Gain, /sink/] (the saw counterpart
+//                   of SinGainOut; same Out/BusOut rule).
 // The runtime validates the kind sequence at dispatch time and
 // falls back to per-node iteration on any mismatch.
 //

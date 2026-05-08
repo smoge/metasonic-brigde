@@ -741,9 +741,9 @@ form.
 -- consumer reads of the terminal node's output buffer.
 --
 -- The integer tag is part of the C ABI: 0 = NodeLoop,
--- 1 = SawLpfGain, 2 = SinGainOut, 3 = SawLpfGainOut. Keep
--- 'kernelTag' in lockstep with the C++ 'RegionKernel' enum in
--- @rt_graph.cpp@.
+-- 1 = SawLpfGain, 2 = SinGainOut, 3 = SawLpfGainOut,
+-- 4 = SawGainOut. Keep 'kernelTag' in lockstep with the C++
+-- 'RegionKernel' enum in @rt_graph.cpp@.
 data RegionKernel
   = RNodeLoop
     -- ^ Default: process each member node individually, in stored
@@ -792,6 +792,15 @@ data RegionKernel
     -- must escape only via the absorbed sink; otherwise the
     -- 3-node 'RSawLpfGain' fires and the gain's buffer is
     -- materialized for the external readers).
+  | RSawGainOut
+    -- ^ Sink-terminal kernel for @[KSawOsc, KGain, /sink/]@:
+    -- the saw counterpart of 'RSinGainOut'. Same single-use
+    -- internal-edge / scalar-gain / sink-class rules. Added
+    -- after the @--fusion-survey@ scan flagged @Saw → Gain →
+    -- sink@ as the most-missed shape on the demo set; the
+    -- per-sample DSP body is just @q::saw -> *gain_amount@,
+    -- exactly the SinGainOut kernel with @q::saw@ in place of
+    -- @q::sin@.
   deriving stock    (Eq, Show, Generic, Bounded, Enum)
   deriving anyclass (NFData)
 
@@ -805,6 +814,7 @@ kernelTag RNodeLoop      = 0
 kernelTag RSawLpfGain    = 1
 kernelTag RSinGainOut    = 2
 kernelTag RSawLpfGainOut = 3
+kernelTag RSawGainOut    = 4
 
 -- | Number of contiguous member nodes a fused kernel claims when
 -- it matches. 'RNodeLoop' has no fixed arity — a NodeLoop region
@@ -817,6 +827,7 @@ kernelArity :: RegionKernel -> Int
 kernelArity RSawLpfGain    = 3
 kernelArity RSinGainOut    = 3
 kernelArity RSawLpfGainOut = 4
+kernelArity RSawGainOut    = 3
 kernelArity RNodeLoop      = 0
 
 -- | One execution region in the runtime graph: a contiguous block
@@ -1052,7 +1063,7 @@ Match arity is /not/ implicit: 'findKernelMatch' returns a
 'kernelArity' and the dispatch in 'findKernelMatch' — the
 splitter consumes whatever length the descriptor reports.
 
-Currently three kernel shapes are recognized. The sink-terminal
+Currently four kernel shapes are recognized. The sink-terminal
 kernels accept either 'KOut' or 'KBusOut' at the terminal slot;
 both dispatch to the same per-node kernel ('process_out' on the
 C++ side) and read their bus index from @rnControls[0]@, so the
@@ -1069,6 +1080,12 @@ fused kernel body absorbs them identically. See 'isSinkTerminal'.
     'KBusOut'. The sink is /inside/ the kernel; bus accumulation
     and §2.E sink-peak tracking happen inside the fused per-
     sample loop. No buffer is materialized.
+  * 'RSawGainOut' — 3-node sink-terminal:
+    @[KSawOsc, KGain, /sink/]@. The saw counterpart of
+    'RSinGainOut'; identical structure with @q::saw@ in place of
+    @q::sin@ in the per-sample body. Added after the
+    @--fusion-survey@ scan flagged @Saw → Gain → sink@ as the
+    most-missed shape on the demo set.
   * 'RSawLpfGainOut' — 4-node sink-terminal:
     @[KSawOsc, KLPF, KGain, /sink/]@. Combines saw + LPF + gain
     processing with the inline bus accumulation and sink-peak
@@ -1258,6 +1275,7 @@ findKernelMatch nodes = go 0
       a : b : c : _
         | matchesSawLpfGain nodes a b c -> Just (mkMatch RSawLpfGain)
         | matchesSinGainOut nodes a b c -> Just (mkMatch RSinGainOut)
+        | matchesSawGainOut nodes a b c -> Just (mkMatch RSawGainOut)
       _ -> Nothing
 
     -- 'kmOffset = -1' is a placeholder; 'go' fills in the real
@@ -1313,6 +1331,32 @@ matchesSinGainOut nodes sinIx gainIx outIx =
         && rnConsumerCount sin_  == 1
         && rnConsumerCount gain == 1
         && signalSourceIs sinIx gain
+        && signalSourceIs gainIx out_
+        && isScalarGain gain
+    _ -> False
+
+-- | The saw counterpart of 'matchesSinGainOut': KSawOsc → KGain
+-- → /sink/ with the same single-use internal-edge / scalar-gain
+-- rules. The /sink/ is either 'KOut' or 'KBusOut'. Identical
+-- preconditions to 'matchesSinGainOut' modulo the producer kind;
+-- the C++ side reuses 'drive_oscillator' with @q::saw@ in place
+-- of @q::sin@ and the same 'SinkAccumulator'.
+matchesSawGainOut
+  :: M.Map NodeIndex RuntimeNode
+  -> NodeIndex -> NodeIndex -> NodeIndex
+  -> Bool
+matchesSawGainOut nodes sawIx gainIx outIx =
+  case (M.lookup sawIx nodes, M.lookup gainIx nodes, M.lookup outIx nodes) of
+    (Just saw, Just gain, Just out_) ->
+      rnKind saw  == KSawOsc
+        && rnKind gain == KGain
+        && isSinkTerminal (rnKind out_)
+        && not (rnElided saw)
+        && not (rnElided gain)
+        && not (rnElided out_)
+        && rnConsumerCount saw  == 1
+        && rnConsumerCount gain == 1
+        && signalSourceIs sawIx  gain
         && signalSourceIs gainIx out_
         && isScalarGain gain
     _ -> False
