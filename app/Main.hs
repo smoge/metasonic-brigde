@@ -500,10 +500,18 @@ main = do
 -- Top-level dispatch: route a Demo to its body-specific runner. See
 -- Note [Demo body: single-graph vs multi-template].
 runDemo :: Options -> Demo -> IO ()
-runDemo opts demo = case demoBody demo of
-  SingleGraph    g          -> runSingleDemo   opts demo g
-  MultiTemplate  tpls       -> runTemplateDemo opts demo tpls
-  MidiPoly       poly build -> runMidiPolyDemo opts demo poly build
+runDemo opts demo
+  -- 'main' routes 'FusionSurvey' to 'runFusionSurvey' before
+  -- 'runDemo' is reached. Guard the dispatch boundary explicitly
+  -- so a future re-routing mistake fails loudly here, rather than
+  -- silently running a demo's audio path under --fusion-survey.
+  -- The single guard covers all three body-specific runners.
+  | optMode opts == FusionSurvey =
+      error "runDemo: FusionSurvey should be handled by main, never reach here"
+  | otherwise = case demoBody demo of
+      SingleGraph    g          -> runSingleDemo   opts demo g
+      MultiTemplate  tpls       -> runTemplateDemo opts demo tpls
+      MidiPoly       poly build -> runMidiPolyDemo opts demo poly build
 
 -- Single-template demo runner. Identical to the pre-§2.D.3 path:
 -- traceCompile → optional inspector → loadRuntimeGraph → audio.
