@@ -783,10 +783,13 @@ template_id is stable.
 // 'RegionKernel' data constructors; integer values are part of
 // the C ABI and pinned by 'rt_graph_region_kernel_supported'.
 enum class RegionKernel : int {
-  NodeLoop   = 0,  // dispatch each member node individually
-  SawLpfGain = 1,  // fused per-sample SawOsc -> LPF -> Gain kernel
-  SinGainOut = 2   // fused per-sample SinOsc -> Gain -> Out kernel
-                   // (sink-terminal: bus accumulate + sink-peak)
+  NodeLoop      = 0,  // dispatch each member node individually
+  SawLpfGain    = 1,  // fused per-sample SawOsc -> LPF -> Gain
+                      // (buffer-terminal: gain output materialised)
+  SinGainOut    = 2,  // fused per-sample SinOsc -> Gain -> Out
+                      // (sink-terminal: bus accumulate + sink-peak)
+  SawLpfGainOut = 3   // fused per-sample SawOsc -> LPF -> Gain -> Out
+                      // (4-node sink-terminal)
 };
 
 // Validate an int from the C ABI. Returns nullopt on an unknown
@@ -799,6 +802,7 @@ region_kernel_from_tag(int kind) noexcept {
   case 0: return RegionKernel::NodeLoop;
   case 1: return RegionKernel::SawLpfGain;
   case 2: return RegionKernel::SinGainOut;
+  case 3: return RegionKernel::SawLpfGainOut;
   default: return std::nullopt;
   }
 }
@@ -3171,6 +3175,139 @@ static void process_region_sin_gain_out(
   }
 }
 
+/* Note [Region kernel: SawLpfGainOut]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+4-node sink-terminal kernel. Combines the saw + LPF + gain
+processing of 'process_region_saw_lpf_gain' with the bus
+accumulation + 'inst.block_sink_peak' update of
+'process_region_sin_gain_out'. Member layout:
+  * saw_idx  — KSawOsc producer (frequency RFrom or RConst)
+  * lpf_idx  — KLPF (block-rate latch on freq/q like the
+                non-fused process_lpf)
+  * gain_idx — KGain (scalar control on port 1; audio modulation
+                blocks the kernel at match time)
+  * out_idx  — KOut sink (bus index in controls[0])
+
+The Haskell-side gate ('matchesSawLpfGainOut' /
+'findKernelMatch') ensures the gain has 'rnConsumerCount == 1' so
+its output buffer is unread by anything outside the chain — that
+single-edge invariant is what justifies skipping
+'output_span(gain_node, ...)' here. The 3-node 'RSawLpfGain'
+kernel still fires for shapes where the gain is read by multiple
+consumers (its output buffer must then be materialised for those
+external readers).
+
+Float-rounding identity with the unfused chain: per-sample we do
+exactly what process_sawosc + process_lpf + process_gain +
+process_out would do (q::saw -> filter -> *gain_amount ->
+accumulate into bus[bus] -> peak = max(peak, |s|)). Same
+NaN-sanitisation, same block-rate latch on LPF freq/q, same bus
+index validation in the double domain before casting. A
+kind-sequence mismatch at dispatch time falls back to per-node
+iteration — silent degradation discipline shared with the other
+kernels.
+*/
+static void process_region_saw_lpf_gain_out(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t saw_idx, std::size_t lpf_idx,
+    std::size_t gain_idx, std::size_t out_idx,
+    int nframes
+) noexcept {
+  auto &saw_node  = inst.nodes[saw_idx];
+  auto &lpf_node  = inst.nodes[lpf_idx];
+  auto &gain_node = inst.nodes[gain_idx];
+  auto &out_node  = inst.nodes[out_idx];
+
+  // Saw freq, LPF freq/q — same resolution as the 3-node kernel.
+  const auto saw_freq_in =
+      resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
+  const auto lpf_freq_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in =
+      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+
+  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
+  const double lpf_freq = sanitize_finite_clamp(
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
+                           : lpf_node.controls[0],
+      0.0, max_freq, kFreqFallbackHz);
+  const double lpf_q = sanitize_finite_clamp(
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
+                        : lpf_node.controls[1],
+      kQMin, kQMax, kQFallback);
+
+  auto *osc = std::get_if<OscState>(&saw_node.state);
+  auto *lpf = std::get_if<LPFState>(&lpf_node.state);
+  if (!osc || !lpf) {
+    // No state to drive; silently no-op (block_sink_peak unchanged,
+    // bus untouched). Mirrors the SinGainOut early return.
+    return;
+  }
+
+  if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
+    lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
+    lpf->last_freq = lpf_freq;
+    lpf->last_q    = lpf_q;
+  }
+
+  const float gain_amount = sanitize_finite(
+      static_cast<float>(gain_node.controls[0]), 1.0f);
+
+  // Bus index validation in the double domain — same discipline as
+  // process_out / process_region_sin_gain_out.
+  const double bus_d   = out_node.controls[0];
+  const double bus_lim =
+      static_cast<double>(g.server.output_buses.size());
+  const bool bus_ok =
+      std::isfinite(bus_d) && bus_d >= 0.0 && bus_d < bus_lim;
+  const int  bus     = bus_ok ? static_cast<int>(bus_d) : -1;
+  std::vector<float> *dst =
+      bus_ok ? &g.server.output_buses[static_cast<std::size_t>(bus)]
+             : nullptr;
+
+  // Read-modify-write the per-block sink peak: process_instance
+  // reset it to 0, but a sibling Out / BusOut may run later in the
+  // same block and contribute to the same max.
+  float peak = inst.block_sink_peak;
+
+  if (!saw_freq_in.empty()) {
+    // Audio-rate saw frequency: per-sample increment update.
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const double freq = sanitize_finite(
+          static_cast<double>(saw_freq_in[fi]), 0.0);
+      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
+      const float saw_sample = q::saw(osc->phase_iter++);
+      const float lpf_sample = lpf->filter(saw_sample);
+      const float s          = lpf_sample * gain_amount;
+      if (dst) {
+        (*dst)[fi] += s;
+        const float a = std::fabs(s);
+        if (a > peak) peak = a;
+      }
+    }
+  } else {
+    // Block-rate saw frequency: increment set once per block.
+    const double saw_freq = sanitize_finite(saw_node.controls[0], 0.0);
+    osc->phase_iter.set(q::frequency{saw_freq}, g.sample_rate);
+    for (int i = 0; i < nframes; ++i) {
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float saw_sample = q::saw(osc->phase_iter++);
+      const float lpf_sample = lpf->filter(saw_sample);
+      const float s          = lpf_sample * gain_amount;
+      if (dst) {
+        (*dst)[fi] += s;
+        const float a = std::fabs(s);
+        if (a > peak) peak = a;
+      }
+    }
+  }
+
+  if (dst) {
+    inst.block_sink_peak = peak;
+  }
+}
+
 // ----------------------------------------------------------------
 // Lifecycle helpers (shared between the direct ABI entries and the
 // queued-drain path)
@@ -3566,6 +3703,18 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first + 2].kind == NodeKind::Out) {
       process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
                                   nframes);
+      fused = true;
+    } else if (r.kernel == RegionKernel::SawLpfGainOut
+        && r.node_count == 4
+        && first + 4 <= node_count
+        && def->nodes[first    ].kind == NodeKind::SawOsc
+        && def->nodes[first + 1].kind == NodeKind::LPF
+        && def->nodes[first + 2].kind == NodeKind::Gain
+        && def->nodes[first + 3].kind == NodeKind::Out) {
+      process_region_saw_lpf_gain_out(g, inst,
+                                      first, first + 1,
+                                      first + 2, first + 3,
+                                      nframes);
       fused = true;
     }
 

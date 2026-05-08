@@ -1514,16 +1514,21 @@ unitTests = testGroup "Unit tests"
                   "expected exactly one Gain node, got " <> show (length gns)
       ]
 
-  , -- Phase 4.B: scalar saw → lpf → gain region kernel selection.
-    -- The greedy 'formRegions' lumps the whole chain into one
-    -- region (all SampleRate); 'selectRegionKernels' splits the
-    -- region so the matched [SawOsc, LPF, Gain] becomes its own
-    -- 'RSawLpfGain' region with the Out node living in a
-    -- following 'RNodeLoop' region. This test pins the IR-level
-    -- region overlay; the FFI / C++ side is exercised by the
-    -- bit-equivalence battery below.
+  , -- Phase 4.B region kernel selection. The greedy 'formRegions'
+    -- lumps a whole rate-compatible chain into one region;
+    -- 'selectRegionKernels' splits it so each matched contiguous
+    -- shape becomes its own kernel-tagged region. This test group
+    -- pins the IR-level region overlay; the FFI / C++ side is
+    -- exercised by the bit-equivalence battery below.
     testGroup "Phase 4.B: selectRegionKernels"
-      [ testCase "saw → lpf → gain → out: middle region tagged RSawLpfGain" $ do
+      [ -- 4-node sink-terminal claim. The whole chain
+        -- @[SawOsc, LPF, Gain, Out]@ is contiguous, the 4-node
+        -- match wins by longest-match priority over the 3-node
+        -- 'RSawLpfGain' prefix, and the entire chain becomes one
+        -- 'RSawLpfGainOut' region. Pinning this is the structural
+        -- evidence that 'findKernelMatch' actually preferred the
+        -- longer shape.
+        testCase "saw → lpf → gain → out: full region tagged RSawLpfGainOut" $ do
           let g = runSynth $ do
                 s <- sawOsc 110.0 0.0
                 f <- lpf s (Param 800.0) (Param 4.0)
@@ -1533,9 +1538,41 @@ unitTests = testGroup "Unit tests"
             Left err -> assertFailure $ "compile failed: " <> err
             Right rg -> do
               let kernels = map rrKernel (rgRuntimeRegions rg)
-              -- Exactly one fused region; everything else is RNodeLoop.
-              length [() | RSawLpfGain <- kernels] @?= 1
-              -- The fused region must be 3 nodes: saw, lpf, gain.
+              -- 4-node match wins; the 3-node prefix shape never
+              -- gets to claim anything.
+              length [() | RSawLpfGainOut <- kernels] @?= 1
+              length [() | RSawLpfGain    <- kernels] @?= 0
+              case [r | r <- rgRuntimeRegions rg, rrKernel r == RSawLpfGainOut] of
+                [r] -> do
+                  length (rrNodes r) @?= 4
+                  let kinds = [ rnKind n
+                              | ix <- rrNodes r
+                              , n <- rgNodes rg, rnIndex n == ix ]
+                  kinds @?= [KSawOsc, KLPF, KGain, KOut]
+                rs -> assertFailure $
+                  "expected exactly one fused region, got " <> show (length rs)
+
+      , -- 3-node buffer-terminal claim. With a non-'Out' terminal
+        -- ('busOut' here) the 4-node 'RSawLpfGainOut' shape can't
+        -- match (its terminal kind is fixed to KOut), so the
+        -- selector falls through to 'RSawLpfGain' on the 3-node
+        -- prefix. The BusOut sits in a trailing 'RNodeLoop'
+        -- region. This is the test that pins 'RSawLpfGain' is
+        -- still alive and well after longest-match priority
+        -- redirected the canonical sin → gain → out fixture to
+        -- the 4-node kernel.
+        testCase "saw → lpf → gain → busOut: middle region tagged RSawLpfGain" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                busOut 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RSawLpfGain    <- kernels] @?= 1
+              length [() | RSawLpfGainOut <- kernels] @?= 0
               case [r | r <- rgRuntimeRegions rg, rrKernel r == RSawLpfGain] of
                 [r] -> do
                   length (rrNodes r) @?= 3
@@ -1546,11 +1583,12 @@ unitTests = testGroup "Unit tests"
                 rs -> assertFailure $
                   "expected exactly one fused region, got " <> show (length rs)
 
-      , -- §4.C interaction: when §4.B claims the gain, §4.C must
-        -- skip it. Otherwise scalar Gain fusion would elide the
-        -- gain and the region kernel would have no live gain to
-        -- read controls from.
-        testCase "fuseRuntimeGraph: defers to region kernel on saw → lpf → gain" $ do
+      , -- §4.C interaction (4-node kernel): when §4.B's 4-node
+        -- 'RSawLpfGainOut' claims the chain, §4.C must skip the
+        -- Gain. Otherwise scalar Gain fusion would elide it and
+        -- the region kernel would have no live gain to read
+        -- 'controls[0]' from.
+        testCase "fuseRuntimeGraph: defers to region kernel on saw → lpf → gain → out" $ do
           let g = runSynth $ do
                 s <- sawOsc 110.0 0.0
                 f <- lpf s (Param 800.0) (Param 4.0)
@@ -1629,6 +1667,50 @@ unitTests = testGroup "Unit tests"
             Right rg ->
               null [() | RSawLpfGain <- map rrKernel (rgRuntimeRegions rg)]
                 @?= True
+
+      , -- 4-node-specific gate: 'matchesSawLpfGainOut' adds
+        -- 'rnConsumerCount gain == 1' on top of 'matchesSawLpfGain'.
+        -- A graph where the gain feeds two Outs satisfies the
+        -- 3-node prefix predicate but fails the 4-node gain-
+        -- consumer rule, so longest-match fails over from
+        -- 'RSawLpfGainOut' to 'RSawLpfGain'. Pinned because this is
+        -- the structural property that justifies keeping both
+        -- kernels — the 3-node one materialises the gain's output
+        -- buffer for external readers, the 4-node one absorbs the
+        -- single Out and skips materialisation.
+        testCase "fallback: multi-consumer gain falls through from RSawLpfGainOut to RSawLpfGain" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                out 0 a
+                out 1 a                    -- second consumer of gain
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              length [() | RSawLpfGain    <- kernels] @?= 1
+              length [() | RSawLpfGainOut <- kernels] @?= 0
+
+      , -- 4-node negative: audio-modulated gain blocks both the
+        -- 4-node kernel AND the 3-node fallback (both gates
+        -- require 'isScalarGain'), so the whole chain stays
+        -- 'RNodeLoop'. Distinct from the 3-node-only audio-mod
+        -- near-miss above because it specifically pins the 4-node
+        -- shape's behaviour on the same blocker.
+        testCase "near-miss (4-node): audio-modulated gain stays RNodeLoop" $ do
+          let g = runSynth $ do
+                s   <- sawOsc 110.0 0.0
+                f   <- lpf s (Param 800.0) (Param 4.0)
+                lfo <- sinOsc 6.0 0.0
+                a   <- gain f lfo            -- audio-rate gain modulation
+                out 0 a
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> do
+              let kernels = map rrKernel (rgRuntimeRegions rg)
+              null [() | RSawLpfGainOut <- kernels] @?= True
+              null [() | RSawLpfGain    <- kernels] @?= True
 
       , -- Idempotence: a second pass over an already-tagged region
         -- must be a no-op. Pinned because 'selectRegionKernels'
@@ -1753,6 +1835,13 @@ unitTests = testGroup "Unit tests"
         -- accidentally re-running the pass. Idempotence still
         -- holds: a second 'selectRegionKernels' application is a
         -- no-op on the already-tagged result.
+        --
+        -- Both chains end in 'busOut' (not 'out') so each falls
+        -- through longest-match into 'RSawLpfGain' rather than
+        -- 'RSawLpfGainOut'. The multi-match property is about
+        -- claiming both chains in one pass — orthogonal to which
+        -- terminal kernel claims them — so we pick the kernel
+        -- that keeps the assertion shape simple and pinned.
         testCase "two chains in one region: both tagged in one pass" $ do
           let g = runSynth $ do
                 s1 <- sawOsc 110.0 0.0
@@ -1761,8 +1850,8 @@ unitTests = testGroup "Unit tests"
                 s2 <- sawOsc 220.0 0.0
                 f2 <- lpf s2 (Param 1200.0) (Param 4.0)
                 a2 <- gain f2 (Param 0.3)
-                out 0 a1
-                out 1 a2
+                busOut 0 a1
+                busOut 1 a2
           case lowerGraph g >>= compileRuntimeGraph of
             Left err -> assertFailure $ "compile failed: " <> err
             Right rg -> do
@@ -2970,6 +3059,92 @@ crossCuttingTests = testGroup "End-to-end FFI"
       let peak = maximum (map abs baselineSamples)
       assertBool ("expected peak ≈ 0.3 after set_control, got " <> show peak)
                  (peak > 0.25 && peak < 0.35)
+
+  , -- Phase 4.B 4-node kernel control identity. Mirrors the 3-node
+    -- 'RSinGainOut' control-write test but exercises every control
+    -- the 'RSawLpfGainOut' kernel reads: saw.freq, lpf.freq (slot
+    -- 0), lpf.q (slot 1), gain.amount, and out.bus. The LPF's two
+    -- distinct control slots are the new ground here — a
+    -- regression where the kernel's block-rate latch read the
+    -- wrong slot, or didn't refresh on a Q change, would diverge
+    -- from the per-node baseline that runs the unfused
+    -- 'process_lpf' kernel.
+    --
+    -- The baseline strips region kernels so its render takes
+    -- per-node dispatch on the same compiled graph; bit-identical
+    -- samples on the redirected bus prove every control reaches
+    -- the right slot in the right form.
+    testCase "Phase 4.B: set_control on RSawLpfGainOut covers saw.freq + lpf.freq/q + gain + bus" $ do
+      let nframes = 256
+          chain = runSynth $ do
+            s <- sawOsc 110.0 0.0
+            f <- lpf s (Param 800.0) (Param 4.0)
+            a <- gain f (Param 0.4)
+            out 0 a                       -- initial bus: 0
+          newSawFreq = 220.0  :: Double   -- shift fundamental
+          newLpfFreq = 1500.0 :: Double   -- raise cutoff (more harmonics pass)
+          newLpfQ    = 6.0    :: Double   -- raise Q
+          newGain    = 0.3    :: Double
+          newBus     = 2      :: Int      -- redirect to bus 2
+
+      rtUnRaw <- case lowerGraph chain >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      rtF  <- case lowerGraph chain >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      assertBool "Phase 4.B: fused compile has no RSawLpfGainOut region"
+        (any ((== RSawLpfGainOut) . rrKernel) (rgRuntimeRegions rtF))
+
+      let rtUn = stripRegionKernels rtUnRaw
+
+          ixOf k rg =
+            let NodeIndex i = head [rnIndex n | n <- rgNodes rg, rnKind n == k]
+            in i
+          sawIx  = ixOf KSawOsc rtF
+          lpfIx  = ixOf KLPF    rtF
+          gainIx = ixOf KGain   rtF
+          outIx  = ixOf KOut    rtF
+
+      let sizeOfFloat' = 4 :: Int
+          renderBus loader rt readBus =
+            withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+              loader handle rt
+              c_rt_graph_ensure_bus handle (fromIntegral newBus)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral sawIx)  0 (CDouble newSawFreq)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral lpfIx)  0 (CDouble newLpfFreq)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral lpfIx)  1 (CDouble newLpfQ)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral gainIx) 0 (CDouble newGain)
+              c_rt_graph_instance_set_control handle 0
+                (fromIntegral outIx)  0 (CDouble (fromIntegral newBus))
+              c_rt_graph_process handle (fromIntegral nframes)
+              allocaBytes (nframes * sizeOfFloat') $ \buf -> do
+                _ <- c_rt_graph_read_bus handle (fromIntegral readBus)
+                                         (fromIntegral nframes) (castPtr buf)
+                cs <- peekArray nframes (buf :: PtrCFloat)
+                pure (map (\(CFloat x) -> x) cs)
+
+      baselineSamples <- renderBus loadRuntimeGraph      rtUn newBus
+      fusedSamples    <- renderBus loadRuntimeGraphFused rtF  newBus
+
+      length baselineSamples @?= length fusedSamples
+      assertBool
+        ("Phase 4.B: 4-node kernel set_control divergence on bus " <> show newBus)
+        (baselineSamples == fusedSamples)
+
+      -- Sanity: a 220 Hz saw through an LPF cutoff at 1500 Hz with
+      -- moderate Q, scaled by 0.3, must produce non-silent output.
+      -- Bounds are loose — exact peak depends on filter response —
+      -- the goal is just to flag a stuck-zero render.
+      let peak = maximum (map abs baselineSamples)
+      assertBool ("expected non-silent render on bus " <> show newBus
+                  <> ", got peak " <> show peak)
+                 (peak > 0.05)
 
   , testCase "BusOut → BusIn round-trip preserves the SinOsc signal" $ do
       -- A SinOsc writes to bus 5 via BusOut; a BusIn reads bus 5; that

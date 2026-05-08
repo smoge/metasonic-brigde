@@ -741,8 +741,9 @@ form.
 -- consumer reads of the terminal node's output buffer.
 --
 -- The integer tag is part of the C ABI: 0 = NodeLoop,
--- 1 = SawLpfGain, 2 = SinGainOut. Keep 'kernelTag' in lockstep
--- with the C++ 'RegionKernel' enum in @rt_graph.cpp@.
+-- 1 = SawLpfGain, 2 = SinGainOut, 3 = SawLpfGainOut. Keep
+-- 'kernelTag' in lockstep with the C++ 'RegionKernel' enum in
+-- @rt_graph.cpp@.
 data RegionKernel
   = RNodeLoop
     -- ^ Default: process each member node individually, in stored
@@ -755,9 +756,16 @@ data RegionKernel
     -- (saw → lpf, lpf → gain), no audio modulation on the gain
     -- port, and no external readers of the saw or lpf intermediate
     -- buffers. The gain's output buffer is materialised; sibling
-    -- regions (typically containing an 'Out') read from it. The
+    -- regions (typically containing a 'BusOut') read from it. The
     -- runtime calls one fused per-sample kernel; saw / lpf / gain
     -- per-node kernels are skipped.
+    --
+    -- Note: when the gain's sole consumer is an 'Out' node and that
+    -- 'Out' would form a contiguous suffix, longest-match priority
+    -- in 'findKernelMatch' picks 'RSawLpfGainOut' instead. This
+    -- 3-node kernel still fires for non-'Out' terminals (notably
+    -- 'BusOut') and for shapes where the gain has multiple
+    -- consumers.
   | RSinGainOut
     -- ^ Sink-terminal kernel. The region is exactly
     -- @[KSinOsc, KGain, KOut]@ with single-use internal edges
@@ -768,6 +776,16 @@ data RegionKernel
     -- into 'g.server.output_buses[bus]' and updates
     -- 'inst.block_sink_peak' for §2.E release-then-free silence
     -- detection — no intermediate buffer is materialised.
+  | RSawLpfGainOut
+    -- ^ Sink-terminal kernel for the full 4-node chain
+    -- @[KSawOsc, KLPF, KGain, KOut]@. Combines the saw + LPF +
+    -- gain processing of 'RSawLpfGain' with the bus accumulation
+    -- and 'inst.block_sink_peak' update of 'RSinGainOut'. Single-
+    -- use internal edges and scalar-gain rules apply, plus an
+    -- explicit @rnConsumerCount gain == 1@ requirement (the gain
+    -- output must escape only via the inner 'Out'; otherwise the
+    -- 3-node 'RSawLpfGain' fires and the gain's buffer is
+    -- materialised for the external readers).
   deriving stock    (Eq, Show, Generic, Bounded, Enum)
   deriving anyclass (NFData)
 
@@ -777,9 +795,23 @@ data RegionKernel
 -- @rt_graph_region_kernel_supported@ entry; do not change either
 -- value in isolation.
 kernelTag :: RegionKernel -> CInt
-kernelTag RNodeLoop   = 0
-kernelTag RSawLpfGain = 1
-kernelTag RSinGainOut = 2
+kernelTag RNodeLoop      = 0
+kernelTag RSawLpfGain    = 1
+kernelTag RSinGainOut    = 2
+kernelTag RSawLpfGainOut = 3
+
+-- | Number of contiguous member nodes a fused kernel claims when
+-- it matches. 'RNodeLoop' has no fixed arity — a NodeLoop region
+-- carries however many nodes 'formRegions' grouped — so calling
+-- 'kernelArity' on it returns 0 as a safe placeholder. Real
+-- callers ('findKernelMatch' and the C++ dispatch guards) only
+-- ever ask about successfully-matched fused kernels, so the
+-- 'RNodeLoop' branch is never exercised in production paths.
+kernelArity :: RegionKernel -> Int
+kernelArity RSawLpfGain    = 3
+kernelArity RSinGainOut    = 3
+kernelArity RSawLpfGainOut = 4
+kernelArity RNodeLoop      = 0
 
 -- | One execution region in the runtime graph: a contiguous block
 -- of nodes (in execution order) that 'formRegions' grouped together.
@@ -1090,12 +1122,12 @@ selectRegionKernels rg =
         | rrKernel r /= RNodeLoop = [r]
         | otherwise =
             case findKernelMatch nodeMap (rrNodes r) of
-              Nothing            -> [r]
-              Just (off, kern) ->
-                let members = rrNodes r
+              Nothing -> [r]
+              Just KernelMatch{ kmOffset = off, kmLength = len, kmKernel = kern } ->
+                let members      = rrNodes r
                     (pre, restA) = splitAt off members
-                    (mid, post)  = splitAt 3 restA
-                    rate = rrRate r
+                    (mid, post)  = splitAt len restA
+                    rate         = rrRate r
                     -- The prefix cannot itself contain an earlier
                     -- match (findKernelMatch returns the leftmost
                     -- offset across all shapes), so it stays
@@ -1122,28 +1154,69 @@ selectRegionKernels rg =
         where setIx i r = r { rrIndex = RegionIndex i }
   in rg { rgRuntimeRegions = renumbered }
 
--- | Look for the leftmost contiguous occurrence of any recognised
--- 3-node kernel shape in a region's member list. Returns the offset
--- at which the match starts (length is implicitly 3) and the
--- kernel tag the match should be claimed under. 'Nothing' on no
--- match.
+-- | Result of a successful kernel-shape lookup in
+-- 'findKernelMatch'. Carrying the matched length explicitly makes
+-- the selector independent of any single hardcoded arity (the
+-- 3-node-only era) and lets the descriptor grow with new shapes
+-- ('RSawLpfGainOut' is the first 4-node entry) without further
+-- changes to 'selectRegionKernels'.
+data KernelMatch = KernelMatch
+  { kmOffset :: !Int            -- ^ Member offset of the match.
+  , kmLength :: !Int            -- ^ Number of consumed members; equals 'kernelArity'.
+  , kmKernel :: !RegionKernel   -- ^ Tag the matched region carries.
+  }
+  deriving stock (Eq, Show)
+
+-- | Look for the leftmost match of any recognised kernel shape in
+-- a region's member list.
 --
--- Shapes are tried in declaration order at each position; the
--- preconditions across shapes are mutually exclusive at the
--- leading-kind level (KSawOsc vs KSinOsc), so order doesn't affect
--- correctness — only the order in which a hypothetical future shape
--- with overlapping leading kinds would be tried.
+-- /Longest-match priority/ at each offset: a 4-node match beats a
+-- 3-node match starting at the same position, so a chain
+-- @[KSawOsc, KLPF, KGain, KOut]@ is claimed by 'RSawLpfGainOut' as
+-- a whole rather than getting its prefix cherry-picked by
+-- 'RSawLpfGain'. Without this, the existing 3-node kernel would
+-- always win on a 4-node chain (the prefix matches), the
+-- terminating 'Out' would land in a trailing 'RNodeLoop' region,
+-- and the buffer-vs-sink protocol distinction the kernels are
+-- meant to expose would be invisible.
+--
+-- Shapes are listed longest-first; ties (same length, distinct
+-- predicates) fall through in declaration order, but every
+-- existing shape is mutually exclusive at the leading-kind level
+-- ('KSawOsc' vs 'KSinOsc') so ordering only matters when a future
+-- shape collides on prefix.
 findKernelMatch
   :: M.Map NodeIndex RuntimeNode
   -> [NodeIndex]
-  -> Maybe (Int, RegionKernel)
+  -> Maybe KernelMatch
 findKernelMatch nodes = go 0
   where
-    go !i (a : rest@(b : c : _))
-      | matchesSawLpfGain nodes a b c = Just (i, RSawLpfGain)
-      | matchesSinGainOut nodes a b c = Just (i, RSinGainOut)
-      | otherwise                     = go (i + 1) rest
-    go _ _ = Nothing
+    -- Try each candidate at the current offset, longest first; if
+    -- none match, advance by one and retry.
+    go !i ixs = case (matchHere ixs, ixs) of
+      (Just km, _)  -> Just km { kmOffset = i }
+      (Nothing, _ : rest) -> go (i + 1) rest
+      (Nothing, [])       -> Nothing
+
+    matchHere ixs = case ixs of
+      a : b : c : d : _
+        | matchesSawLpfGainOut nodes a b c d ->
+            Just (mkMatch RSawLpfGainOut)
+      _ -> match3 ixs
+
+    match3 ixs = case ixs of
+      a : b : c : _
+        | matchesSawLpfGain nodes a b c -> Just (mkMatch RSawLpfGain)
+        | matchesSinGainOut nodes a b c -> Just (mkMatch RSinGainOut)
+      _ -> Nothing
+
+    -- 'kmOffset = -1' is a placeholder; 'go' fills in the real
+    -- offset once the match is hoisted to the top level.
+    mkMatch k = KernelMatch
+      { kmOffset = -1
+      , kmLength = kernelArity k
+      , kmKernel = k
+      }
 
 matchesSawLpfGain
   :: M.Map NodeIndex RuntimeNode
@@ -1190,20 +1263,65 @@ matchesSinGainOut nodes sinIx gainIx outIx =
         && isScalarGain gain
     _ -> False
 
--- | Shared between 'matchesSawLpfGain' and 'matchesSinGainOut': the
--- principal audio input of @node@ (port 0) must be wired to @srcIx@.
--- Used to confirm that the chain's internal edge is the only
--- producer-side connection to the next member.
+-- | The 4-node sink-terminal shape: KSawOsc → KLPF → KGain → KOut.
+-- Combines the buffer-terminal saw/lpf/gain processing of
+-- 'matchesSawLpfGain' with the sink-terminal Out absorption of
+-- 'matchesSinGainOut'. Adds an explicit
+-- @rnConsumerCount gain == 1@ requirement on top of the 3-node
+-- kernel: when that holds, the gain's output buffer is unread by
+-- anything outside the chain and the kernel is free to inline the
+-- bus accumulation. When it doesn't, longest-match falls through
+-- to 'matchesSawLpfGain' (which materialises the gain's buffer for
+-- external readers).
+matchesSawLpfGainOut
+  :: M.Map NodeIndex RuntimeNode
+  -> NodeIndex -> NodeIndex -> NodeIndex -> NodeIndex
+  -> Bool
+matchesSawLpfGainOut nodes sawIx lpfIx gainIx outIx =
+  case ( M.lookup sawIx nodes
+       , M.lookup lpfIx nodes
+       , M.lookup gainIx nodes
+       , M.lookup outIx nodes ) of
+    (Just saw, Just lpf, Just gain, Just out_) ->
+      rnKind saw  == KSawOsc
+        && rnKind lpf  == KLPF
+        && rnKind gain == KGain
+        && rnKind out_ == KOut
+        && not (rnElided saw)
+        && not (rnElided lpf)
+        && not (rnElided gain)
+        && not (rnElided out_)
+        && rnConsumerCount saw  == 1
+        && rnConsumerCount lpf  == 1
+        && rnConsumerCount gain == 1
+        && signalSourceIs sawIx  lpf
+        && signalSourceIs lpfIx  gain
+        && signalSourceIs gainIx out_
+        && isScalarGain gain
+    _ -> False
+
+-- | Shared between every 'matches*' kernel predicate: the
+-- principal audio input of @node@ — port 0 — must be wired to
+-- @srcIx@'s principal output port (also port 0). Used to confirm
+-- the chain's internal edge is the only producer-side connection
+-- to the next member.
+--
+-- Both port indices are pinned to 0. Today every UGen has a
+-- single output port, so wiring through any other source port
+-- can't arise from the public DSL; encoding the constraint
+-- explicitly hardens the matcher against a future multi-output
+-- node that could otherwise sneak through with @RFrom s
+-- (PortIndex 1)@ on the same source.
 signalSourceIs :: NodeIndex -> RuntimeNode -> Bool
 signalSourceIs srcIx node = case rnInputs node of
-  RFrom s _ : _ -> s == srcIx
-  _             -> False
+  RFrom s (PortIndex 0) : _ -> s == srcIx
+  _                         -> False
 
--- | Shared between 'matchesSawLpfGain' and 'matchesSinGainOut': the
--- gain has an audio source on port 0 and a constant control on
--- port 1. Audio-modulated gains (RFrom on port 1) block kernel
--- selection so per-sample arithmetic stays bit-equal to the
--- unfused chain.
+-- | Shared between every 'matches*' kernel predicate that names a
+-- gain step: the gain has an audio source on port 0 and a
+-- constant control on port 1. Audio-modulated gains (RFrom on
+-- port 1) block kernel selection so per-sample arithmetic stays
+-- bit-equal to the unfused chain.
 isScalarGain :: RuntimeNode -> Bool
 isScalarGain node = case rnInputs node of
   [RFrom _ _, RConst _] -> True
