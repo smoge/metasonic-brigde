@@ -51,6 +51,7 @@
 -- contract] in 'MetaSonic.Bridge.Compile.Dependencies'.
 module MetaSonic.Bridge.Compile.Schedule
   ( regionSchedule
+  , scheduledRuntimeRegions
   , Segment (..)
   , segmentByBarrier
   ) where
@@ -136,6 +137,28 @@ regionSchedule rg = do
       ixs <- scheduleSegment deps done seg
       let done' = foldr S.insert done ixs
       (ixs ++) <$> go done' rest
+
+-- | Loader-facing helper: turn a 'RuntimeGraph' into the list of
+-- 'RuntimeRegion's in scheduled execution order.
+--
+-- Implemented as 'regionSchedule' followed by an index-to-region
+-- lookup over 'rgRuntimeRegions'. The dense-ascending validation
+-- inside 'regionSchedule' guarantees the lookup is total (every
+-- 'RegionIndex' the planner emits maps to a region in the input
+-- list), so the @Left@ paths surface only planner diagnostics —
+-- there is no separate "index out of range" failure mode.
+--
+-- §4.E.2b loaders use this to register regions on the C++ side in
+-- scheduled order rather than raw 'rgRuntimeRegions' list order.
+-- The two coincide today (the planner's output is the identity
+-- over 'rrIndex' order), so this is a behavior-preserving rewire.
+scheduledRuntimeRegions
+  :: RuntimeGraph -> Either String [RuntimeRegion]
+scheduledRuntimeRegions rg = do
+  ixs <- regionSchedule rg
+  let byIx = M.fromList
+        [ (rrIndex r, r) | r <- rgRuntimeRegions rg ]
+  pure [ byIx M.! ix | ix <- ixs ]
 
 -- | The contract is that 'rgRuntimeRegions' is in dense ascending
 -- 'rrIndex' order from 0. 'segmentByBarrier' relies on /list/

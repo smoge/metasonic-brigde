@@ -82,7 +82,8 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              RuntimeNode (..),
                                              RuntimeRegion (..),
                                              ScaleRef (..),
-                                             kernelTag)
+                                             kernelTag,
+                                             scheduledRuntimeRegions)
 import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
                                              TemplateID (..))
 import           MetaSonic.Types
@@ -699,6 +700,13 @@ wireFusedScale g cTid dstNode dstPort fused = case fused of
 -- See Note [FFI boundary design].
 loadRuntimeGraph :: Ptr RTGraph -> RuntimeGraph -> IO ()
 loadRuntimeGraph g rg = do
+  -- §4.E.2b: route the region overlay through 'regionSchedule'.
+  -- Compute the schedule /before/ touching the C++ handle so a
+  -- broken regionDependencies / region-list invariant cannot
+  -- leave the runtime in a half-cleared state.
+  scheduled <- case scheduledRuntimeRegions rg of
+    Right rs -> pure rs
+    Left err -> fail $ "loadRuntimeGraph: " <> err
   c_rt_graph_clear g
   -- Pass 0: size the shared bus pool to cover every bus this graph
   -- references. Construction-only; must run before audio starts.
@@ -709,11 +717,13 @@ loadRuntimeGraph g rg = do
   mapM_ addNode (rgNodes rg)
   -- Pass 2: wire connections (all nodes now exist).
   mapM_ wireNode (rgNodes rg)
-  -- Pass 3: register the region overlay on template 0. The C++
-  -- side iterates regions in process_instance when present and
-  -- falls back to a flat node loop when absent. See
-  -- Note [Region fallback] in rt_graph.cpp.
-  mapM_ (addRegion 0) (rgRuntimeRegions rg)
+  -- Pass 3: register the region overlay on template 0 in
+  -- /scheduled/ order (today this is identical to rrIndex order;
+  -- the planner is the identity when 'compileRuntimeGraph'
+  -- produces a topologically valid rrIndex sequence). The C++
+  -- side iterates regions in process_instance in registration
+  -- order. See Note [Region fallback] in rt_graph.cpp.
+  mapM_ (addRegion 0) scheduled
   where
     addNode :: RuntimeNode -> IO ()
     addNode node = do
@@ -794,6 +804,11 @@ right slot count.
 -- See Note [loadRuntimeGraphFused protocol].
 loadRuntimeGraphFused :: Ptr RTGraph -> RuntimeGraph -> IO ()
 loadRuntimeGraphFused g rg = do
+  -- §4.E.2b: same scheduled-regions pre-validation as the unfused
+  -- loader. Compute before touching the C++ handle.
+  scheduled <- case scheduledRuntimeRegions rg of
+    Right rs -> pure rs
+    Left err -> fail $ "loadRuntimeGraphFused: " <> err
   c_rt_graph_clear g
   mapM_ ensureBusForNode (rgNodes rg)
   mapM_ addNode (rgNodes rg)
@@ -811,8 +826,9 @@ loadRuntimeGraphFused g rg = do
   -- left elided without a fused override on every consumer would
   -- still be skipped and produce silence).
   mapM_ markElided (rgNodes rg)
-  -- Pass 3: region overlay (same as the unfused loader).
-  mapM_ (addRegionTo g 0) (rgRuntimeRegions rg)
+  -- Pass 3: region overlay in scheduled order (same contract as
+  -- the unfused loader).
+  mapM_ (addRegionTo g 0) scheduled
   where
     addNode :: RuntimeNode -> IO ()
     addNode node = do
@@ -911,24 +927,36 @@ synchronous, non-blocking).
 -- See Note [loadTemplateGraph protocol].
 loadTemplateGraph :: Ptr RTGraph -> TemplateGraph -> IO ()
 loadTemplateGraph g tg = do
+  -- §4.E.2b: compute the scheduled region list for every template
+  -- /before/ touching the C++ handle. If any template's schedule
+  -- is malformed we fail fast and leave the existing graph alone.
+  scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
   c_rt_graph_clear g
   -- The clear left an auto-created instance 0 for legacy callers.
   -- Multi-template loading spawns its own instances per template
   -- below, so remove it first to start with a clean slate.
   c_rt_graph_instance_remove g 0
-  forM_ (zip [0 ..] (tgTemplates tg)) $ \(i, tpl) -> do
+  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled)) -> do
     cTid <- if i == (0 :: Int)
               then pure 0           -- auto-created template 0
               else c_rt_graph_template_add g
-    populateTemplate cTid (tplGraph tpl)
+    populateTemplate cTid (tplGraph tpl) scheduled
     -- Spawn one instance per template so the typical single-voice
     -- ensemble case works without explicit instance spawning. For
     -- polyphony, callers spawn additional instances afterwards via
     -- c_rt_graph_template_instance_add.
     M.void $ c_rt_graph_template_instance_add g cTid
   where
-    populateTemplate :: CInt -> RuntimeGraph -> IO ()
-    populateTemplate cTid rg = do
+    scheduleOrFail :: Template -> IO (Template, [RuntimeRegion])
+    scheduleOrFail tpl =
+      case scheduledRuntimeRegions (tplGraph tpl) of
+        Right rs -> pure (tpl, rs)
+        Left err -> fail $
+          "loadTemplateGraph: template "
+          <> show (tplName tpl) <> ": " <> err
+
+    populateTemplate :: CInt -> RuntimeGraph -> [RuntimeRegion] -> IO ()
+    populateTemplate cTid rg scheduled = do
       -- Pass 0: ensure every referenced bus exists on the shared
       -- pool before any control write. Construction-only; same
       -- contract as in loadRuntimeGraph. See Note [Explicit
@@ -966,9 +994,11 @@ loadTemplateGraph g tg = do
               fail "loadTemplateGraph: RFused input requires the \
                    \fused loader; use loadTemplateGraphFused or \
                    \pass an unfused TemplateGraph."
-      -- Pass 3: register the region overlay for this template.
-      -- See Note [Region fallback] in rt_graph.cpp.
-      mapM_ (addRegionTo g cTid) (rgRuntimeRegions rg)
+      -- Pass 3: register the region overlay in scheduled order
+      -- (today identical to rrIndex order; see the matching note
+      -- in 'loadRuntimeGraph'). See Note [Region fallback] in
+      -- rt_graph.cpp.
+      mapM_ (addRegionTo g cTid) scheduled
 
 -- | Step C (e): fused-aware multi-template loader. Sibling of
 -- 'loadTemplateGraph' that handles 'RFused' inputs and 'rnElided'
@@ -989,17 +1019,28 @@ loadTemplateGraph g tg = do
 -- Note [loadRuntimeGraphFused protocol] for the rationale on order.
 loadTemplateGraphFused :: Ptr RTGraph -> TemplateGraph -> IO ()
 loadTemplateGraphFused g tg = do
+  -- §4.E.2b: pre-validate every template's schedule, same
+  -- contract as 'loadTemplateGraph'.
+  scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
   c_rt_graph_clear g
   c_rt_graph_instance_remove g 0
-  forM_ (zip [0 ..] (tgTemplates tg)) $ \(i, tpl) -> do
+  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled)) -> do
     cTid <- if i == (0 :: Int)
               then pure 0
               else c_rt_graph_template_add g
-    populateTemplate cTid (tplGraph tpl)
+    populateTemplate cTid (tplGraph tpl) scheduled
     M.void $ c_rt_graph_template_instance_add g cTid
   where
-    populateTemplate :: CInt -> RuntimeGraph -> IO ()
-    populateTemplate cTid rg = do
+    scheduleOrFail :: Template -> IO (Template, [RuntimeRegion])
+    scheduleOrFail tpl =
+      case scheduledRuntimeRegions (tplGraph tpl) of
+        Right rs -> pure (tpl, rs)
+        Left err -> fail $
+          "loadTemplateGraphFused: template "
+          <> show (tplName tpl) <> ": " <> err
+
+    populateTemplate :: CInt -> RuntimeGraph -> [RuntimeRegion] -> IO ()
+    populateTemplate cTid rg scheduled = do
       forM_ (rgNodes rg) $ \node ->
         case busIndexOf node of
           Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
@@ -1037,7 +1078,7 @@ loadTemplateGraphFused g tg = do
         when (rnElided node) $
           c_rt_graph_template_set_node_elided g cTid
             (cNodeIndex (rnIndex node))
-      mapM_ (addRegionTo g cTid) (rgRuntimeRegions rg)
+      mapM_ (addRegionTo g cTid) scheduled
 
 {- Note [Realtime audio lifecycle]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

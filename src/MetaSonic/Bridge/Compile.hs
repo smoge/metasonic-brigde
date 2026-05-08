@@ -67,6 +67,7 @@ module MetaSonic.Bridge.Compile
     -- no runtime change. Encodes the contract a future scheduler
     -- consumes.
     regionSchedule
+  , scheduledRuntimeRegions
   , Segment (..)
   , segmentByBarrier
   , -- * Compilation

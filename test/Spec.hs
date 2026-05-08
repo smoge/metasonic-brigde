@@ -2863,6 +2863,113 @@ unitTests = testGroup "Unit tests"
                 <> show (length rs)
       ]
 
+  , -- Phase 4.E.2b: loaders register regions through the schedule.
+    --
+    -- These tests pin the loader-side contract — the four loaders
+    -- ('loadRuntimeGraph', 'loadRuntimeGraphFused', 'loadTemplateGraph',
+    -- 'loadTemplateGraphFused') each register regions on the C++
+    -- side via 'scheduledRuntimeRegions', not the raw 'rgRuntimeRegions'
+    -- list. Today the planner is the identity over 'rrIndex' order on
+    -- well-formed compile output, so the two are equal: equality here
+    -- /is/ the bit-equivalence claim. A future change that breaks
+    -- the planner identity (or the dense-ascending invariant) is
+    -- caught by 'regionSchedule' before any C++ mutation, not by
+    -- silent reorder at the runtime.
+    --
+    -- We don't compare against rendered audio because the existing
+    -- render-equivalence suite (loadTemplateGraph: cross-template
+    -- send/return, BusOut/BusIn round-trip, etc.) already covers
+    -- end-to-end equivalence; these tests pin the precise loader
+    -- contract.
+    testGroup "Phase 4.E.2b: loaders consume scheduledRuntimeRegions"
+      [ -- Single-template, unfused: same input as 'loadRuntimeGraph'
+        -- exercises end-to-end. Confirm scheduled order matches
+        -- rgRuntimeRegions order (planner identity property).
+        testCase "loadRuntimeGraph: scheduled order = rgRuntimeRegions" $ do
+          let g = runSynth $ do
+                s <- sawOsc 110.0 0.0
+                f <- lpf s (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.4)
+                b <- add a (Param 0.0)
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraph of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> case scheduledRuntimeRegions rg of
+              Left err -> assertFailure $
+                "scheduledRuntimeRegions failed: " <> err
+              Right scheduled ->
+                map rrIndex scheduled @?= map rrIndex (rgRuntimeRegions rg)
+
+      , -- Single-template, fused: same input shape as the canonical
+        -- fused-render tests; confirm scheduled order matches.
+        testCase "loadRuntimeGraphFused: scheduled order = rgRuntimeRegions" $ do
+          let g = runSynth $ do
+                s <- sinOsc 440.0 0.0
+                a <- gain s (Param 0.5)
+                b <- add a (Param 0.0)
+                out 0 b
+          case lowerGraph g >>= compileRuntimeGraphFused of
+            Left err -> assertFailure $ "compile failed: " <> err
+            Right rg -> case scheduledRuntimeRegions rg of
+              Left err -> assertFailure $
+                "scheduledRuntimeRegions failed: " <> err
+              Right scheduled ->
+                map rrIndex scheduled @?= map rrIndex (rgRuntimeRegions rg)
+
+      , -- Multi-template, unfused: per-template schedule equals
+        -- per-template rgRuntimeRegions order.
+        testCase "loadTemplateGraph: per-template scheduled order = rgRuntimeRegions" $ do
+          let voice = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                a <- gain s (Param 0.4)
+                busOut 5 a
+              fx = runSynth $ do
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                out 0 a
+          case compileTemplateGraph [("voice", voice), ("fx", fx)] of
+            Left err -> assertFailure err
+            Right tg ->
+              -- For every template, scheduled order matches raw.
+              mapM_ (\tpl ->
+                case scheduledRuntimeRegions (tplGraph tpl) of
+                  Left err -> assertFailure $
+                    "template " <> show (tplName tpl)
+                    <> ": scheduledRuntimeRegions failed: " <> err
+                  Right scheduled ->
+                    map rrIndex scheduled @?=
+                      map rrIndex (rgRuntimeRegions (tplGraph tpl)))
+                (tgTemplates tg)
+
+      , -- Multi-template, fused: same as above but through the
+        -- fused compile path so rg may carry RFused / rnElided.
+        testCase "loadTemplateGraphFused: per-template scheduled order = rgRuntimeRegions" $ do
+          let voice = runSynth $ do
+                s <- sinOsc 220.0 0.0
+                a <- gain s (Param 0.4)
+                busOut 5 a
+              fx = runSynth $ do
+                r <- busIn 5
+                f <- lpf r (Param 800.0) (Param 4.0)
+                a <- gain f (Param 0.6)
+                b <- add a (Param 0.0)
+                out 0 b
+          case compileTemplateGraphFused
+                  [("voice", voice), ("fx", fx)] of
+            Left err -> assertFailure err
+            Right tg ->
+              mapM_ (\tpl ->
+                case scheduledRuntimeRegions (tplGraph tpl) of
+                  Left err -> assertFailure $
+                    "template " <> show (tplName tpl)
+                    <> ": scheduledRuntimeRegions failed: " <> err
+                  Right scheduled ->
+                    map rrIndex scheduled @?=
+                      map rrIndex (rgRuntimeRegions (tplGraph tpl)))
+                (tgTemplates tg)
+      ]
+
   , testCase "kindTag is injective" $
       let ks = [minBound .. maxBound :: NodeKind]
           ts = map kindTag ks
