@@ -942,6 +942,57 @@ surveyShapeProbes =
         summed <- add g2 g3
         out 0 summed )
 
+  , ( "sched/poly-voices-master-fx"
+    , runSynth $ do
+        -- Less synthetic C1d target: three independent synth voices
+        -- do their oscillator/filter/gain work before a shared
+        -- master filter/sink. Each voice is an ordinary
+        -- Saw→LPF→Gain chain; the shared master tail is the
+        -- barrier. This is the single-graph counterpart of
+        -- "polyphonic voices into one master FX" from ROADMAP.md.
+        v1s <- sawOsc 110.0 0.0
+        v1f <- lpf v1s (Param 700.0)  (Param 4.0)
+        v1  <- gain v1f (Param 0.24)
+
+        v2s <- sawOsc 165.0 0.0
+        v2f <- lpf v2s (Param 1100.0) (Param 4.0)
+        v2  <- gain v2f (Param 0.20)
+
+        v3s <- sawOsc 220.0 0.0
+        v3f <- lpf v3s (Param 1600.0) (Param 4.0)
+        v3  <- gain v3f (Param 0.16)
+
+        m12 <- add v1 v2
+        mix <- add m12 v3
+        mf  <- lpf mix (Param 1800.0) (Param 0.8)
+        ma  <- gain mf (Param 0.6)
+        out 0 ma )
+
+  , ( "sched/parallel-fx-rack-master"
+    , runSynth $ do
+        -- Less synthetic C1d target: independent pre-master
+        -- processing lanes that resemble a compact parallel FX
+        -- rack. Each lane has real DSP work before the shared
+        -- master mix; the useful question is whether C1d should
+        -- split one FreeLayer step into region work units, because
+        -- C1c's global-entry dispatch cannot see inside this layer.
+        lowS <- sawOsc 82.5 0.0
+        lowF <- lpf lowS (Param 450.0) (Param 3.0)
+        low  <- gain lowF (Param 0.30)
+
+        midS <- sawOsc 165.0 0.2
+        midF <- lpf midS (Param 1400.0) (Param 2.5)
+        mid  <- gain midF (Param 0.22)
+
+        hiS  <- sawOsc 330.0 0.4
+        hiF  <- lpf hiS (Param 2600.0) (Param 1.5)
+        hi   <- gain hiF (Param 0.14)
+
+        lm   <- add low mid
+        mix  <- add lm hi
+        bus  <- gain mix (Param 0.7)
+        out 0 bus )
+
   -- ── neg/: structural negatives ────────────────────────────────
   , ( "neg/shared-producer-two-gains"
     , runSynth $ do

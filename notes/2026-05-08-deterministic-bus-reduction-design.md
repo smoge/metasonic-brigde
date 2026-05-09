@@ -965,19 +965,21 @@ test/bench gated.
 The representative-data refresh added two Haskell-facing checks:
 
   - `--fusion-survey` now reports corpus worker-band shape. After the
-    first corpus-evolution probes, the fixed corpus has `dirC1c=2`,
-    `redC1c=0`, `maxSfW=2`, and `maxWork=6`.
+    corpus-evolution probes, the fixed corpus has `dirC1c=4`,
+    `redC1c=0`, `maxSfW=3`, and `maxWork=9`.
   - `--worker-bench` loads demos plus corpus through the Haskell FFI path.
     On the measured run it reported `worker_rows_with_parallel=2`,
     `parallel_bands=2`, and `parallel_entries=6`; the only dispatched
     row was the intentionally multi-instance
     `sched/free-only-parallel-compute` probe, and it lost
-    (`best_parallel_worker_speedup=0.68x`).
+    (`best_parallel_worker_speedup=0.62x`).
 
 This strengthens the default-off decision: the synthetic C++ bench has a
 positive sink-free signal only at enough width/work, while the first
 Haskell-loaded worker-shape probes are still narrow and do not yet show
-a win. The `sched/parallel-compute-before-master` probe also exposes a
-future C1d question: region-layer FreeLayer width exists before a later
-sink barrier, but C1c dispatches whole global schedule entries rather
-than individual regions inside one FreeLayer step.
+a win. The `sched/parallel-compute-before-master`,
+`sched/poly-voices-master-fx`, and `sched/parallel-fx-rack-master`
+probes also expose a future C1d question: region-layer FreeLayer width
+exists before a later sink barrier, but C1c dispatches whole global
+schedule entries rather than individual regions inside one FreeLayer
+step.

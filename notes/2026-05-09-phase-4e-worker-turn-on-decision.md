@@ -12,8 +12,11 @@ Inputs:
   equivalence under `pool_size=3`
 - `3c77d0e Survey corpus schedule worker width`
 - `246ac6a Benchmark Haskell-loaded worker schedules`
-- corpus-evolution slice: `sched/free-only-parallel-compute` and
-  `sched/parallel-compute-before-master`
+- corpus-evolution slices:
+  `sched/free-only-parallel-compute`,
+  `sched/parallel-compute-before-master`,
+  `sched/poly-voices-master-fx`, and
+  `sched/parallel-fx-rack-master`
 
 ## Decision
 
@@ -77,12 +80,23 @@ two targeted Haskell-loaded probes:
   corpus can expose the target shape, but the current C1c global-entry
   dispatcher still does not parallelize that single-instance row.
 
+A second corpus-evolution pass added less synthetic output-bearing rows:
+
+- `sched/poly-voices-master-fx`: three independent synth voices feeding
+  a shared master filter/sink;
+- `sched/parallel-fx-rack-master`: three independent pre-master
+  processing lanes feeding a shared master mix.
+
+Those rows raise the region-layer signal and make C1d worth
+investigating, but they still do not enter C1c worker dispatch because
+C1c dispatches one global schedule entry at a time.
+
 `stack exec -- metasonic-bridge --fusion-survey` now includes a fixed
 corpus schedule-width table for C1c worker-gate shape:
 
 ```text
-graphs=60  bands=7  sf=7  sink=0  maxSfW=2  maxSinkW=0
-maxWork=6  dirC1c=2  redC1c=0
+graphs=62  bands=9  sf=9  sink=0  maxSfW=3  maxSinkW=0
+maxWork=9  dirC1c=4  redC1c=0
 ```
 
 Interpretation: the fixed corpus now contains width >= 2 sink-free
@@ -95,15 +109,15 @@ fixed corpus through the Haskell FFI path and compares legacy direct,
 schedule-serial, pool direct, and pool reduction modes:
 
 ```text
-cases=54  rows=216  worker_rows=108  worker_rows_with_parallel=2
+cases=56  rows=224  worker_rows=112  worker_rows_with_parallel=2
 parallel_bands=2  parallel_entries=6  serialized_sink_bands=0
-best_parallel_worker_speedup=0.68x
+best_parallel_worker_speedup=0.62x
 ```
 
 Interpretation: the Haskell-loaded bench now enters the worker dispatch
 path, but only for the intentionally multi-instance
 `sched/free-only-parallel-compute` probe. That probe loses in both pool
-modes in the measured run (`best_parallel_worker_speedup=0.68x`).
+modes in the measured run (`best_parallel_worker_speedup=0.62x`).
 Rows that look faster while `parallel_bands=0` remain schedule-path
 noise or serial-executor variance. Counter data, not speedup alone, is
 the authority here.
