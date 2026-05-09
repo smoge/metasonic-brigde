@@ -2,8 +2,8 @@
 
 Date: 2026-05-09
 Status: Decision recorded after the C1c bench slice; refreshed after
-representative Haskell-loaded survey / bench data and after the first
-corpus-evolution worker-shape probes.
+representative Haskell-loaded survey / bench data, corpus-evolution
+worker-shape probes, and the C1d region-layer survey clarification.
 Inputs:
 
 - `2c737ce Benchmark global schedule worker dispatch`
@@ -92,17 +92,17 @@ investigating, but they still do not enter C1c worker dispatch because
 C1c dispatches one global schedule entry at a time.
 
 `stack exec -- metasonic-bridge --fusion-survey` now includes a fixed
-corpus schedule-width table for C1c worker-gate shape:
+corpus FreeLayer-width table for C1d region-layer candidates:
 
 ```text
 graphs=62  bands=9  sf=9  sink=0  maxSfW=3  maxSinkW=0
-maxWork=9  dirC1c=4  redC1c=0
+maxWork=9  dirC1d=4  redC1d=0
 ```
 
 Interpretation: the fixed corpus now contains width >= 2 sink-free
-FreeLayer shapes. The direct-mode C1c candidate count is no longer zero.
-There are still no reduction-mode sink-band candidates in the fixed
-corpus.
+FreeLayer shapes inside single global schedule entries. This is a C1d
+candidate signal, not proof that C1c can dispatch those rows. There are
+still no reduction-mode sink-band candidates in the fixed corpus.
 
 `stack exec -- metasonic-bridge --worker-bench` loads demos plus the
 fixed corpus through the Haskell FFI path and compares legacy direct,
@@ -126,17 +126,16 @@ the authority here.
 
 The next runtime-parallelism work should be one of:
 
+- C1d design note: decide whether a future executor should dispatch
+  regions inside a single `FreeLayer` step. The survey now labels this
+  as `dirC1d` / `redC1d` so it is not confused with C1c worker-dispatch
+  evidence. The design must pin writer-slot assignment, per-band joins,
+  lifecycle ownership, direct-mode sink fallback, and the equivalence
+  tests before runtime code changes;
 - corpus evolution: add or identify less synthetic Haskell-loaded demos
-  with width >= 2 sink-free Free bands and enough per-entry work to have
-  a plausible crossover point. The first targeted probes prove the
-  instrumentation can see the shape, but they are not a representative
-  default-on basis;
-- region-level dispatch investigation: decide whether a future C1d
-  should dispatch regions inside a single `FreeLayer` step. The
-  `sched/parallel-compute-before-master` probe exposes this width in the
-  survey, but the current C1c runtime dispatch unit is one global
-  schedule entry, so the bench does not parallelize the single-instance
-  row;
+  with enough region-layer work to make C1d worth benchmarking. The
+  first targeted probes prove the instrumentation can see the shape, but
+  they are not a representative default-on basis;
 - dispatch mechanics: prototype a realtime-safer worker wake/join
   strategy only after a later corpus refresh produces worker-dispatchable
   graph shapes that actually win, then rerun both the C++ synthetic grid

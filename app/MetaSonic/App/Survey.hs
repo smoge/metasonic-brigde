@@ -313,13 +313,14 @@ rateDistribution rt =
       BlockRate   -> d { rdBlock   = rdBlock   d + 1 }
       SampleRate  -> d { rdSample  = rdSample  d + 1 }
 
--- §4.E.C1c descriptive worker-band shape. This is intentionally a
+-- §4.E.C1d descriptive region-layer shape. This is intentionally a
 -- corpus survey, not a runtime policy: it asks whether compiled
--- graphs contain free-layer shapes that the current worker gate
--- could use once instantiated widely enough. Direct candidates are
--- sink-free layers with width >= 2; reduction candidates are
--- sink-bearing layers with width >= 2. The latter remain test-only
--- per the turn-on decision.
+-- graphs contain per-template FreeLayer steps with multiple regions.
+-- C1c dispatches whole global schedule entries and cannot split one
+-- entry into these regions. Direct C1d candidates are sink-free
+-- layers with width >= 2; reduction C1d candidates are sink-bearing
+-- layers with width >= 2. The latter remain test-only per the
+-- turn-on decision.
 data WorkerBandStats = WorkerBandStats
   { wbsFreeBands          :: !Int
   , wbsSinkFreeBands      :: !Int
@@ -400,8 +401,8 @@ data SurveyRow = SurveyRow
     -- ^ §4.E.2c parallel-readiness counts. Read-only; surfaces in
     -- the schedule-width section of '--fusion-survey'.
   , srWorkerBands  :: !WorkerBandStats
-    -- ^ §4.E.C1c corpus worker-band shape summary. Read-only;
-    -- surfaces in the corpus schedule-width section of
+    -- ^ §4.E.C1d corpus region-layer shape summary. Read-only;
+    -- surfaces in the corpus FreeLayer-width section of
     -- '--fusion-survey'.
   , srRateDist     :: !RateDistribution
     -- ^ §4.D.1 rate distribution. Counts of each propagated node
@@ -896,7 +897,7 @@ surveyShapeProbes =
         a      <- gain p (Param 0.3)
         out 0 a )
 
-  -- ── sched/: §4.E.C1c worker-band probes ──────────────────────
+  -- ── sched/: §4.E.C1d region-layer probes ─────────────────────
   , ( "sched/free-only-parallel-compute"
     , runSynth $ do
         -- Two independent buffer-terminal compute chains and no
@@ -1656,9 +1657,9 @@ formatScheduleRow cols =
       | length s >= w = s
       | otherwise     = s <> replicate (w - length s) ' '
 
--- Corpus-only worker-band shape report. The existing schedule-width
+-- Corpus-only region-layer shape report. The existing schedule-width
 -- table mixes demos and corpus rows; this section is the decision input
--- for C1c follow-up work and therefore keeps the fixed corpus rows
+-- for C1d follow-up work and therefore keeps the fixed corpus rows
 -- isolated from whatever demo subset the user requested.
 --
 -- Columns:
@@ -1668,19 +1669,22 @@ formatScheduleRow cols =
 --   maxSfW   : widest sink-free band
 --   maxSinkW : widest sink-bearing band
 --   maxWork  : max node-count work estimate inside one band
---   dirC1c   : sink-free bands with width >= 2
---   redC1c   : sink-bearing bands with width >= 2
+--   dirC1d   : sink-free region layers with width >= 2
+--   redC1d   : sink-bearing region layers with width >= 2
 --
--- 'redC1c' is not a recommendation to enable reduction-backed worker
--- dispatch. It marks the shape that would require reduction mode; the
--- turn-on decision keeps that path test-only.
+-- 'dirC1d' / 'redC1d' are not current worker-dispatch counters. They
+-- mark shapes a future C1d executor would need to split inside a
+-- single global schedule entry. Current C1c worker dispatch is measured
+-- by '--worker-bench' counters (`parallel_bands`, `parallel_entries`).
+-- 'redC1d' is also not a recommendation to enable reduction-backed
+-- worker dispatch; the turn-on decision keeps that path test-only.
 printCorpusWorkerBandWidth :: [SurveyRow] -> IO ()
 printCorpusWorkerBandWidth rows = do
   let corpusRows = filter (("corpus:" `isPrefixOf`) . srDemo) rows
-  putStrLn "─── Corpus schedule-width survey (§4.E.C1c worker gate) ───"
+  putStrLn "─── Corpus FreeLayer-width survey (§4.E.C1d region candidates) ───"
   putStrLn $ formatWorkerBandRow
     [ "corpus", "template", "bands", "sf", "sink"
-    , "maxSfW", "maxSinkW", "maxWork", "dirC1c", "redC1c"
+    , "maxSfW", "maxSinkW", "maxWork", "dirC1d", "redC1d"
     ]
   mapM_ (putStrLn . formatWorkerBandRow . renderWorkerBandRow) corpusRows
   putStrLn ""
@@ -1694,8 +1698,8 @@ printCorpusWorkerBandWidth rows = do
           <> "  maxSfW="   <> show (wbsMaxSinkFreeWidth agg)
           <> "  maxSinkW=" <> show (wbsMaxSinkWidth agg)
           <> "  maxWork="  <> show (wbsMaxBandWork agg)
-          <> "  dirC1c="   <> show (wbsDirectCandidates agg)
-          <> "  redC1c="   <> show (wbsReductionCandidates agg)
+          <> "  dirC1d="   <> show (wbsDirectCandidates agg)
+          <> "  redC1d="   <> show (wbsReductionCandidates agg)
 
 renderWorkerBandRow :: SurveyRow -> [String]
 renderWorkerBandRow r =

@@ -964,9 +964,10 @@ test/bench gated.
 
 The representative-data refresh added two Haskell-facing checks:
 
-  - `--fusion-survey` now reports corpus worker-band shape. After the
-    corpus-evolution probes, the fixed corpus has `dirC1c=4`,
-    `redC1c=0`, `maxSfW=3`, and `maxWork=9`.
+  - `--fusion-survey` now reports corpus FreeLayer width as a C1d
+    region-layer candidate signal. After the corpus-evolution probes,
+    the fixed corpus has `dirC1d=4`, `redC1d=0`, `maxSfW=3`, and
+    `maxWork=9`.
   - `--worker-bench` loads demos plus corpus through the Haskell FFI path.
     On the measured run it reported `worker_rows_with_parallel=2`,
     `parallel_bands=2`, and `parallel_entries=6`; the only dispatched
@@ -977,7 +978,9 @@ The representative-data refresh added two Haskell-facing checks:
 This strengthens the default-off decision: the synthetic C++ bench has a
 positive sink-free signal only at enough width/work, while the first
 Haskell-loaded worker-shape probes are still narrow and do not yet show
-a win. The `sched/parallel-compute-before-master`,
+a win. The C1d-labelled survey rows are not current worker-dispatch
+counters; `--worker-bench` remains the authority for actual C1c worker
+dispatch. The `sched/parallel-compute-before-master`,
 `sched/poly-voices-master-fx`, and `sched/parallel-fx-rack-master`
 probes also expose a future C1d question: region-layer FreeLayer width
 exists before a later sink barrier, but C1c dispatches whole global

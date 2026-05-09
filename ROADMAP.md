@@ -674,13 +674,14 @@ Current status:
    equivalence. This path is still marked non-RT-safe because the
    dispatch primitive uses a mutex/condition-variable join on the
    audio thread.
-8. **Bench and turn-on decision — done, default-off.**
+8. **Bench, corpus refresh, and turn-on decision — done, default-off.**
    The C++ synthetic bench and Haskell-loaded worker bench are in
    place. Synthetic sink-free Free-band compute only wins at enough
    width / block work; reduction-backed sink dispatch loses on the
-   measured grid. The fixed Haskell-loaded corpus now contains two
-   width-2 direct C1c candidates (`dirC1c=2`, `redC1c=0`), and the
-   worker bench now records actual worker dispatch
+   measured grid. The fixed Haskell-loaded corpus now contains four
+   region-layer C1d candidates (`dirC1d=4`, `redC1d=0`,
+   `maxSfW=3`, `maxWork=9`). The worker bench records actual C1c
+   worker dispatch
    (`worker_rows_with_parallel=2`, `parallel_bands=2`,
    `parallel_entries=6`), but only through targeted probes and with
    sub-1.0x parallel speedup. The decision note is
@@ -688,30 +689,26 @@ Current status:
 
 Next §4.E slice:
 
-1. **Corpus evolution with less synthetic worker shapes.** Add or
-   identify real Haskell-loaded demos / survey rows with width >= 2
-   sink-free Free bands and enough per-entry DSP work to have a
-   plausible crossover point. Rerun `--fusion-survey` and
-   `--worker-bench`; use counter data (`parallel_bands`,
-   `parallel_entries`) as the authority before timing ratios.
-   Concrete target shapes are end-user synthesis patterns the current
-   corpus lacks, not predicates constructed to satisfy the gate:
+1. **C1d design note before runtime code.** The survey now separates
+   region-layer candidates (`dirC1d` / `redC1d`) from actual C1c
+   worker-dispatch counters. The evolved corpus does contain
+   multi-region sink-free `FreeLayer` steps inside one global schedule
+   entry, so a future C1d is plausible. Do not implement it directly:
+   first write the contract for splitting one `FreeLayer` step into
+   per-region work units, including writer-slot assignment, join
+   points, instance lifecycle, direct-mode sink fallback, and the
+   equivalence tests that must pass.
+2. **More representative workload only if C1d is pursued.** The
+   current C1d candidates are survey rows, not default-on evidence.
+   Before spending runtime complexity, add or identify real
+   Haskell-loaded demos with enough region-layer DSP work to have a
+   plausible crossover point. Useful target shapes remain:
      - polyphonic synth with shared master FX (N voice templates →
        BusOut → master template BusIn → master FX → Out);
      - parallel FX rack (split → N parallel processing chains → join);
      - multi-band processing (input → N band splits → per-band chains
        → join);
      - drum machine (N drum templates writing the same master BusOut).
-2. **C1d investigation: region-level dispatch inside a `FreeLayer`.**
-   Conditional on step 1 surfacing FreeLayer steps with multiple
-   regions per instance. `sched/parallel-compute-before-master`
-   exposes useful region-layer width before a later sink barrier, but
-   C1c dispatches one global schedule entry at a time. If the
-   evolved corpus has multi-region FreeLayer steps, decide whether
-   the runtime should split a single `FreeLayer` step into region
-   work units, and write the equivalence/lifecycle tests before
-   changing dispatch. If the corpus produces only single-region
-   FreeLayer steps, this is a non-issue and can be dropped.
 3. **Realtime-safe dispatch mechanics, only after useful workload
    exists.** The current pool path still uses mutex/cv wake + join on
    the audio thread. Prototype a narrower realtime-safe primitive only
@@ -738,7 +735,7 @@ indefinitely.
 Even if Phase C parallelism never ships, the global schedule, banded
 view, lifecycle hoist, and writer-slot pre-assignment are the
 substrate for deterministic bus reduction (§4.E.2 fold ordering),
-schedule introspection (`--fusion-survey` corpus worker-band table),
+schedule introspection (`--fusion-survey` corpus FreeLayer-width table),
 and future RCU-style topology swap (Phase 5). A "no parallelism"
 outcome would not retire that infrastructure.
 
