@@ -60,11 +60,17 @@ kWorkerBenchWarmupBlocks = 8
 kWorkerBenchBlocks :: Int
 kWorkerBenchBlocks = 32
 
+-- Median-of-three is enough for the current negative decision
+-- because the counter summary says no Haskell-loaded row enters
+-- worker dispatch. Increase this before using the bench to justify
+-- a positive/default-on policy.
 kWorkerBenchRepeats :: Int
 kWorkerBenchRepeats = 3
 
 kWorkerBenchModes :: [BenchMode]
 kWorkerBenchModes =
+  -- legacy-direct must remain first: the speedup column is computed
+  -- against the first mode's ns/block result for each case.
   [ BenchMode "legacy-direct"       False False 0
   , BenchMode "sched-serial-direct" True  False 1
   , BenchMode "sched-pool3-direct"  True  False 3
@@ -79,6 +85,7 @@ runWorkerBench demos = do
           <> ", warmup_blocks=" <> show kWorkerBenchWarmupBlocks
           <> ", blocks=" <> show kWorkerBenchBlocks
           <> ", repeat_runs=" <> show kWorkerBenchRepeats
+  putStrLn "# note: ns_per_block includes equal output-bus readback in every mode; speedup ratios are the intended signal."
   putStrLn "# columns: case,loader,mode,ns_per_block,ns_per_sample,parallel_bands,parallel_entries,serialized_sink_bands,speedup"
   rows <- concat <$> forM cases (\c -> do
     results <- forM kWorkerBenchModes $ \mode -> do
@@ -229,6 +236,11 @@ caseBuses RuntimeCase{bcRuntime = rg} =
 caseBuses TemplateCase{bcTemplate = tg} =
   sort (nub (concatMap (relevantBuses . tplGraph) (tgTemplates tg)))
 
+-- Note [relevantBuses duplication]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- This mirrors the T-9 helper in test/Spec.hs. Keeping the copy local
+-- avoids broadening the library API for a bench-only concern, but if the
+-- runtime bus-kind contract changes, update both places together.
 relevantBuses :: RuntimeGraph -> [Int]
 relevantBuses rt =
   let touchesBus n = case rnKind n of

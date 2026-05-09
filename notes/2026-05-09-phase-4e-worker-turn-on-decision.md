@@ -99,7 +99,11 @@ off. Counter data, not speedup alone, is the authority here.
 The next runtime-parallelism work should be one of:
 
 - corpus evolution: add or identify real Haskell-loaded graphs with
-  width >= 2 sink-free Free bands before doing more worker policy work;
+  width >= 2 sink-free Free bands before doing more worker policy work.
+  Useful targets are independent compute branches before a later
+  barrier, such as parallel modulation/control paths or independent
+  non-sink FX tails before a master sink; parallel `Out` / `BusOut`
+  tails are not the direct-mode target;
 - dispatch mechanics: prototype a realtime-safer worker wake/join
   strategy only if a later corpus refresh produces worker-dispatchable
   graph shapes, then rerun both the C++ synthetic grid and

@@ -353,10 +353,14 @@ workerBandStats :: RuntimeGraph -> Either String WorkerBandStats
 workerBandStats rt = do
   steps <- layeredRegionSchedule rt
   let byIx = M.fromList [(rrIndex r, r) | r <- rgRuntimeRegions rt]
-      layers =
-        [ [ byIx M.! ix | ix <- flRegions fl ]
-        | ScheduleFreeLayer fl <- steps
-        ]
+      layerRegions fl =
+        traverse
+          (\ix -> case M.lookup ix byIx of
+             Just r  -> Right r
+             Nothing -> Left $
+               "workerBandStats: layered schedule referenced unknown "
+               <> "region " <> show ix)
+          (flRegions fl)
       rowFor layer =
         let width   = length layer
             hasSink = any (not . null . bfWrites . rrFootprint) layer
@@ -376,6 +380,8 @@ workerBandStats rt = do
                , wbsMaxBandWork       = work
                , wbsDirectCandidates  = if width >= 2 then 1 else 0
                }
+  layers <- traverse layerRegions
+    [ fl | ScheduleFreeLayer fl <- steps ]
   pure (foldr (addWorkerBandStats . rowFor) emptyWorkerBandStats layers)
 
 -- Per-template summary row.

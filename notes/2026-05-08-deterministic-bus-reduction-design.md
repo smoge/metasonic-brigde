@@ -974,5 +974,4 @@ The representative-data refresh added two Haskell-facing checks:
 
 This strengthens the default-off decision: the synthetic C++ bench has a
 positive sink-free signal only at enough width/work, while the current
-representative Haskell-loaded corpus has no worker-dispatchable width at
-all.
+fixed Haskell-loaded corpus has no worker-dispatchable width at all.
