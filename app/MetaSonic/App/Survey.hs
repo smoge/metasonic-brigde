@@ -1,6 +1,8 @@
 module MetaSonic.App.Survey
   ( printFusionSummary
   , runFusionSurvey
+  , surveyShapeProbes
+  , surveyEnsembleCorpus
   ) where
 
 import           Data.Either               (partitionEithers)

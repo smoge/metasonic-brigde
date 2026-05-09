@@ -16,6 +16,7 @@ import           System.Exit                (die)
 import           MetaSonic.App.Demos
 import           MetaSonic.App.Survey       (printFusionSummary,
                                              runFusionSurvey)
+import           MetaSonic.App.WorkerBench  (runWorkerBench)
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR
@@ -40,6 +41,10 @@ data RunMode
     -- table: per-template fusion stats, a sink-terminal opportunity
     -- scan that flags shapes a future kernel could claim, and
     -- aggregate totals. Exits without opening audio or the TUI.
+  | WorkerBench
+    -- ^ Non-audio reporting mode (--worker-bench). Compiles demos
+    -- plus the fixed corpus, loads them through the Haskell FFI path,
+    -- and times legacy vs schedule-worker modes.
   deriving (Eq, Show)
 
 data Options = Options
@@ -77,6 +82,8 @@ parseArgs = go defaultOptions
       go opts { optFused = True } xs
     go opts ("--fusion-survey" : xs) =
       go opts { optMode = FusionSurvey } xs
+    go opts ("--worker-bench" : xs) =
+      go opts { optMode = WorkerBench } xs
     go opts (x : xs)
       | "--" `prefixOf` x = Left ("Unknown option: " <> x)
       | otherwise         = go opts { optTargets = optTargets opts <> [x] } xs
@@ -106,6 +113,7 @@ usage prog = unlines
   , "  " <> prog <> " --inspect [--fused] [DEMO ...]"
   , "  " <> prog <> " --inspect-only [--fused] [DEMO ...]"
   , "  " <> prog <> " --fusion-survey [DEMO ...]"
+  , "  " <> prog <> " --worker-bench [DEMO ...]"
   , ""
   , "If no demo names are given, all demos are run."
   , ""
@@ -132,6 +140,11 @@ usage prog = unlines
   , "                   included regardless of demo targeting; demos and"
   , "                   corpus get separate subtotals. No audio, no TUI,"
   , "                   just the report."
+  , "  --worker-bench   Compile demos plus the fixed survey corpus, load"
+  , "                   them through the Haskell FFI path, and time the"
+  , "                   legacy direct executor against schedule-serial,"
+  , "                   pool direct, and pool reduction modes. No audio,"
+  , "                   no TUI."
   , ""
   , "Availavle demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
@@ -189,6 +202,9 @@ main = do
     FusionSurvey -> do
       putStrLn "Surveying demos for §4.B / §4.C fusion coverage."
       runFusionSurvey demos
+    WorkerBench -> do
+      putStrLn "Benchmarking Haskell-loaded schedule worker modes."
+      runWorkerBench demos
     AudioOnly      -> runDemos "Running selected demos."
     InspectThenRun -> runDemos "Inspecting selected demos before audio."
     InspectOnly    -> runDemos "Inspecting selected demos without audio."
@@ -197,13 +213,12 @@ main = do
 -- Note [Demo body: single-graph vs multi-template].
 runDemo :: Options -> Demo -> IO ()
 runDemo opts demo
-  -- 'main' routes 'FusionSurvey' to 'runFusionSurvey' before
-  -- 'runDemo' is reached. Guard the dispatch boundary explicitly
-  -- so a future re-routing mistake fails loudly here, rather than
-  -- silently running a demo's audio path under --fusion-survey.
+  -- 'main' routes reporting modes before 'runDemo' is reached.
+  -- Guard the dispatch boundary explicitly so a future re-routing
+  -- mistake fails loudly here, rather than silently running audio.
   -- The single guard covers all three body-specific runners.
-  | optMode opts == FusionSurvey =
-      error "runDemo: FusionSurvey should be handled by main, never reach here"
+  | optMode opts == FusionSurvey || optMode opts == WorkerBench =
+      error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
       MultiTemplate  tpls       -> runTemplateDemo opts demo tpls
@@ -254,6 +269,8 @@ runSingleDemo opts demo g = do
     -- leaning on a wildcard that would also swallow real bugs).
     FusionSurvey ->
       error "runSingleDemo: FusionSurvey should be handled by main, never reach here"
+    WorkerBench ->
+      error "runSingleDemo: WorkerBench should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare
