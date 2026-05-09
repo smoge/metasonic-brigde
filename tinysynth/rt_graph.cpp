@@ -1818,7 +1818,6 @@ struct ScheduleWorkerPool {
     {
       std::lock_guard<std::mutex> lock(mutex);
       configured_size = next_size;
-      stopping = false;
     }
 
     const int background_workers = next_size <= 1 ? 0 : next_size - 1;
