@@ -12,7 +12,7 @@ The architecture has three layers:
 |---------------------------------------|------------------------------------------------|--------------|
 | **metasonic-core + bridge**           | Create and compile graphs                      | sclang       |
 | **Compiled RuntimeGraph/RegionGraph** | Immutable synth template                       | SynthDef     |
-| **tinysynth runtime**                 | Instance host, buses, groups, voices, MIDI, UI | scsynth      |
+| **tinysynth runtime**                 | Instance host, buses, voices, MIDI, UI         | scsynth      |
 
 [Cycfi Q](https://github.com/cycfi/q) serves as the **DSP kernel and I/O
 substrate** — oscillators, filters, envelopes, delays, smoothing, audio streams,
