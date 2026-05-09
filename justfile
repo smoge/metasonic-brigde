@@ -59,3 +59,6 @@ cpp-bench: cpp-bench-build
     ./{{cpp_bench_dir}}/rt_graph_bench
 
 build: stack-build cpp-build
+
+push-bitbucket:
+    git push -u bitbucket main
