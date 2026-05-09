@@ -115,8 +115,9 @@ Known limitations:
   and opt-in Free-band dispatch under the test ABI. The audio-thread
   dispatch primitive is now lock-free/allocation-free (atomic
   generation + completion counters; no mutex/cv on `process_graph`),
-  but the first bench / corpus refresh still showed worker dispatch
-  only through targeted probes and slower than legacy serial. It stays
+  and C1d-a now exposes per-region work-item metadata for future
+  region-layer dispatch. The latest bench / corpus refresh still showed
+  useful worker dispatch only through targeted probes, so the path stays
   test/bench gated.
 - Whole-region kernel /codegen/ (auto-generated DSP bodies) is
   deferred indefinitely. Hand-written kernel bodies plus narrow
@@ -691,20 +692,46 @@ Current status:
    investigation alive but still does not justify default-on worker
    scheduling. The decision note is
    `notes/2026-05-09-phase-4e-worker-turn-on-decision.md`.
+9. **C1d-a region work-item metadata — done, observational.**
+   The runtime now expands each `GlobalScheduleEntry` into
+   `RegionLayerWorkItem`s, one per scheduled region item, with
+   precomputed writer-slot subranges and counters that distinguish
+   sink-free C1d candidates from sink-bearing serialized groups.
+   Capacity is reserved off the audio path using the same
+   `max(polyphony, occupied)` discipline as the global schedule. The
+   executor still ignores this table; C++ tests pin non-contiguous
+   region ordinals, writer-slot subranges, lowered-polyphony capacity,
+   and reset behavior. Review note:
+   `notes/2026-05-09-c1d-a-region-work-item-metadata-review.md`.
 
 Next §4.E slice:
 
-1. **C1d design note — done; implementation still gated.** The
-   survey now separates region-layer candidates (`dirC1d` / `redC1d`)
-   from actual C1c worker-dispatch counters. The evolved corpus does
-   contain multi-region sink-free `FreeLayer` steps inside one global
-   schedule entry, so a future C1d is plausible. The contract is
-   recorded in
-   `notes/2026-05-09-phase-4e-c1d-region-layer-dispatch-design.md`:
-   split one `FreeLayer` step into per-region work units only through
-   phased metadata, serial-equivalence, sink-free parallel dispatch,
-   and benchmark/decision refresh slices.
-2. **More representative workload only if C1d is pursued.** The
+1. **C1d-b serial region-item executor — next implementation slice.**
+   Use the C1d-a work-item table for execution, but only serially and
+   only behind the existing global-schedule test switch. The gate is
+   strict byte-equivalence against the current global-schedule serial
+   executor on hand-built C++ cases and the Haskell T-9 corpus. This
+   slice must not introduce worker dispatch yet.
+2. **C1d-b hardening test before parallel work.** Add a mixed-shape
+   regression:
+   `FreeLayer(region_without_sink, region_with_sink)` should report
+   `candidate_entry_count = 0`, `candidate_item_count = 0`, and
+   `serialized_sink_entry_count = 1`. This pins the `has_sink_writer`
+   OR logic before C1d-c starts relying on the candidate counters.
+3. **C1d-c sink-free parallel region items — only after C1d-b.**
+   Dispatch sink-free multi-region `FreeLayer` items through the
+   existing worker pool. Required gates: counter-confirmed region-item
+   dispatch, bit-identical output, unconditional join before the next
+   schedule band, release/free lifecycle unchanged, and full T-9 under
+   schedule execution + reduction mode + `pool_size=3`.
+4. **C1d-d bench and decision refresh.** Rerun `--fusion-survey`,
+   `--worker-bench`, and the C++ synthetic worker bench after C1d-c.
+   Keep timing claims subordinate to counters: only rows with
+   region-item worker dispatch actually happening can support a
+   turn-on decision. Update
+   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` after the
+   data is collected.
+5. **More representative workload only if C1d is pursued further.** The
    current C1d candidates are survey rows, not default-on evidence.
    Before spending runtime complexity, add or identify real
    Haskell-loaded demos with enough region-layer DSP work to have a
@@ -715,13 +742,7 @@ Next §4.E slice:
      - multi-band processing (input → N band splits → per-band chains
        → join);
      - drum machine (N drum templates writing the same master BusOut).
-3. **Benchmark refresh after the realtime-safe primitive — done.** The
-   previous worker-bench data measured the old mutex/cv dispatch path.
-   The post-atomic refresh shows a stronger sink-free compute envelope
-   and a positive targeted Haskell-loaded row, while sink/reduction and
-   send/return rows remain negative. Repeat this bench step after C1d
-   changes, corpus changes, or pool-policy changes.
-4. **No public switch or default-on path yet.** Do not expose worker
+6. **No public switch or default-on path yet.** Do not expose worker
    scheduling outside the test/bench ABI until a successor decision
    record replaces the current default-off decision with explicit
    corpus and threshold criteria.
