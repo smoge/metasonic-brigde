@@ -7915,23 +7915,24 @@ c0bGlobalScheduleTests =
     ]
 
 ------------------------------------------------------------
--- Phase 4.E.2.C0c: global-schedule serial executor
+-- Phase 4.E.2.C0c/C1a: global-schedule banded serial executor
 ------------------------------------------------------------
 --
 -- C0c promotes the C0b global schedule from observation to an
--- executable serial path, gated by a test-only switch. There is no
--- worker pool yet: the schedule executor must render byte-identical
--- output to the legacy nested loop, preserve §2.E release accounting,
--- and keep the B3 reduction-capture equivalence when both switches are
--- enabled. C++-only graphs with no schedule metadata fall back to the
--- legacy executor; that path is covered in the C++ test suite because
--- Haskell loaders always ship schedule metadata.
+-- executable serial path, gated by a test-only switch. C1a routes that
+-- executor through C0d bands, still serially. There is no worker pool
+-- yet: the schedule executor must render byte-identical output to the
+-- legacy nested loop, preserve §2.E release accounting, and keep the
+-- B3 reduction-capture equivalence when both switches are enabled.
+-- C++-only graphs with no schedule metadata fall back to the legacy
+-- executor; that path is covered in the C++ test suite because Haskell
+-- loaders always ship schedule metadata.
 
 c0cScheduleExecutorTests :: TestTree
 c0cScheduleExecutorTests =
   let nframes = 256
       blocks  = 4
-  in testGroup "Phase 4.E.2.C0c: global-schedule serial executor"
+  in testGroup "Phase 4.E.2.C0c/C1a: global-schedule banded serial executor"
        [ testGroup "legacy executor equals global schedule"
            [ testCase "single template, unfused" $ do
                (rg, _) <- compileBoth "chain" chainGraph
@@ -8030,10 +8031,9 @@ c0cScheduleExecutorTests =
 -- Phase 4.E.2.C0d: global-schedule runnable bands
 ------------------------------------------------------------
 --
--- C0d is still descriptive: the executor remains C0c's serial walk
--- over the flat global schedule. The runtime now also derives a
--- banded view that Phase C can later consume as worker dispatch
--- groups. The conservative v1 rule is intentionally narrow:
+-- C0d derives the banded view that C1a consumes serially and Phase C
+-- can later consume as worker dispatch groups. The conservative v1
+-- rule is intentionally narrow:
 -- barriers are singleton serial bands, and a free band contains only
 -- FreeLayer entries with at most one step per instance slot. That
 -- avoids violating per-instance layer order without shipping the full

@@ -871,10 +871,10 @@ struct RegionSpec {
 
 // Phase §4.E.2.C0a: descriptive layered-schedule shape over the
 // template's registered RegionSpec vector. C0b builds the per-block
-// global schedule from these steps, C0c can consume that schedule as a
-// serial executor under a test switch, and C0d derives descriptive
-// runnable bands. The default production executor remains the legacy
-// deterministic linear path until Phase C worker dispatch lands.
+// global schedule from these steps, C0d derives runnable bands, and
+// C1a can consume those bands serially under a test switch. The
+// default production executor remains the legacy deterministic linear
+// path until Phase C worker dispatch lands.
 //
 // `kind` matches the Haskell ScheduleStep tags:
 //   Barrier   = 0  (a single pinned region between free segments)
@@ -909,9 +909,9 @@ struct ScheduleStepSpec {
 // — a logical work unit pairing a live instance with one of its
 // template's schedule steps. Built once per block from the post-
 // drain instance-state snapshot and stored on RTGraph for the
-// rest of the block. By default it is observational; the C0c
-// test switch lets a serial executor consume it before a later
-// worker-pool slice.
+// rest of the block. By default it is observational; the C0c/C1a
+// test switch lets a serial executor consume the bands derived from it
+// before a later worker-pool slice.
 //
 // Canonical order — pinned by build_global_schedule:
 //   outer:  template_id ascending (registration / topo order)
@@ -934,9 +934,10 @@ struct GlobalScheduleEntry {
   int step_index    = 0;
 };
 
-// Phase §4.E.2.C0d: one contiguous run of entries from
-// RTGraph::global_schedule with the same execution policy. This is
-// still descriptive: process_graph does not dispatch workers yet.
+// Phase §4.E.2.C0d/C1a: one contiguous run of entries from
+// RTGraph::global_schedule with the same execution policy. The C1a
+// opt-in schedule executor consumes these bands serially; Phase C
+// later replaces the Free-band inner loop with worker dispatch.
 //
 //   Barrier = exactly one canonical GlobalScheduleEntry whose
 //             ScheduleStepSpec is a barrier; must run serially.
@@ -1835,8 +1836,8 @@ struct RTGraph {
   // bit-equivalence.
   bool capture_reduction_mode = false;
 
-  // Phase §4.E.2.C0c: when true, process_graph consumes the C0b
-  // global schedule as the serial executor for metadata-bearing
+  // Phase §4.E.2.C0c/C1a: when true, process_graph consumes the C0d
+  // global-schedule bands as the serial executor for metadata-bearing
   // graphs. Default off; tests opt in. If any live instance belongs
   // to a template with no schedule metadata, the executor falls back
   // to the legacy nested loop for the whole block so C++-only /
@@ -1847,9 +1848,9 @@ struct RTGraph {
   // post-drain instance-state snapshot at the top of every
   // process_graph call. The vector is in canonical
   // (template_id, instance_slot, step_index) order; by default it is
-  // observational, and the C0c test switch lets a serial executor
-  // consume it directly before a later worker-pool slice. Cleared in
-  // reset_to_default_state. See GlobalScheduleEntry.
+  // observational, and the C0c/C1a test switch lets a serial executor
+  // consume the banded view derived from it before a later worker-pool
+  // slice. Cleared in reset_to_default_state. See GlobalScheduleEntry.
   //
   // Capacity is reserved off the audio thread by
   // ensure_global_schedule_capacity, called from every construction
@@ -1859,12 +1860,13 @@ struct RTGraph {
   // allocates.
   std::vector<GlobalScheduleEntry> global_schedule;
 
-  // Phase §4.E.2.C0d: descriptive runnable bands over global_schedule.
-  // Each band stores a contiguous [first_entry, first_entry +
-  // entry_count) slice. Barrier bands are singletons; free bands are
-  // conservative dispatch candidates for Phase C. Built once per
-  // block after global_schedule, exposed only through test
-  // introspection, and not consumed by the executor yet.
+  // Phase §4.E.2.C0d/C1a: runnable bands over global_schedule. Each
+  // band stores a contiguous [first_entry, first_entry + entry_count)
+  // slice. Barrier bands are singletons; free bands are conservative
+  // dispatch candidates for Phase C. Built once per block after
+  // global_schedule. The C1a executor consumes the bands serially so
+  // Phase C can substitute worker dispatch at the Free-band boundary
+  // without reshaping instance lifecycle handling.
   std::vector<GlobalScheduleBand> global_schedule_bands;
 };
 
@@ -5036,10 +5038,10 @@ static bool free_entry_conflicts_with_band(
   return false;
 }
 
-// Phase §4.E.2.C0d: build descriptive runnable bands over the C0b
-// global schedule. This is still metadata: C0c execution keeps walking
-// global_schedule serially. Phase C can later consume the Free bands as
-// worker dispatch groups and keep Barrier bands on the audio thread.
+// Phase §4.E.2.C0d/C1a: build runnable bands over the C0b global
+// schedule. C1a execution walks these bands serially. Phase C can
+// later consume the Free bands as worker dispatch groups and keep
+// Barrier bands on the audio thread.
 //
 // The v1 conservative grouping rule is:
 //   * Barrier steps are singleton serial bands.
@@ -5140,7 +5142,7 @@ static void process_schedule_step(
   }
 }
 
-static void process_global_schedule_serial(
+static void process_global_schedule_bands_serial(
     RTGraph &g, int nframes, BlockExecutionContext &ctx
 ) noexcept {
   GraphInstance *current_inst = nullptr;
@@ -5158,27 +5160,21 @@ static void process_global_schedule_serial(
     }
   };
 
-  // build_global_schedule emits every step for one (template, slot)
-  // contiguously because step_index is the innermost loop. We snapshot
-  // SlotState once at group entry and pass that value to
-  // finish_instance_block after the last step. The only same-thread
-  // state transition during the group is Releasing -> Available inside
-  // finish_instance_block, after all steps for that slot have run.
-  for (const GlobalScheduleEntry &entry : g.global_schedule) {
+  auto process_entry = [&](const GlobalScheduleEntry &entry) noexcept {
     if (entry.instance_slot != current_slot) {
       finish_current();
 
-      if (entry.instance_slot < 0) continue;
+      if (entry.instance_slot < 0) return;
       const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
-      if (slot >= g.instances.size()) continue;
+      if (slot >= g.instances.size()) return;
 
       GraphInstance &inst = g.instances[slot];
       const SlotState s = inst.state.load();
-      if (s != SlotState::Active && s != SlotState::Releasing) continue;
-      if (inst.template_id != entry.template_id) continue;
+      if (s != SlotState::Active && s != SlotState::Releasing) return;
+      if (inst.template_id != entry.template_id) return;
 
       const MetaDef *def = template_at(g, entry.template_id);
-      if (!def) continue;
+      if (!def) return;
 
       begin_instance_block(inst);
       current_inst = &inst;
@@ -5190,6 +5186,29 @@ static void process_global_schedule_serial(
     if (current_inst && current_def) {
       process_schedule_step(g, *current_def, *current_inst,
                             entry.step_index, nframes, ctx);
+    }
+  };
+
+  // C1a consumes C0d's bands but still executes every entry serially.
+  // build_global_schedule_bands preserves global_schedule order, so
+  // the instance-lifecycle grouping below remains the same as the flat
+  // C0c loop: build_global_schedule emits every step for one
+  // (template, slot) contiguously because step_index is the innermost
+  // loop. We snapshot SlotState once at group entry and pass that value
+  // to finish_instance_block after the last step. The only same-thread
+  // state transition during the group is Releasing -> Available inside
+  // finish_instance_block, after all steps for that slot have run.
+  for (const GlobalScheduleBand &band : g.global_schedule_bands) {
+    if (band.first_entry < 0 || band.entry_count <= 0) continue;
+    const std::size_t first = static_cast<std::size_t>(band.first_entry);
+    const std::size_t count = static_cast<std::size_t>(band.entry_count);
+    if (first > g.global_schedule.size()
+        || count > g.global_schedule.size() - first) {
+      continue;
+    }
+
+    for (std::size_t i = 0; i < count; ++i) {
+      process_entry(g.global_schedule[first + i]);
     }
   }
 
@@ -5243,11 +5262,11 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   std::swap(g.server.output_buses, g.server.output_buses_prev);
   clear_output_buses(g.server, nframes);
 
-  // Phase §4.E.2.C0b/C0d: rebuild the global schedule from the post-
-  // drain instance-state snapshot, then derive conservative runnable
-  // bands over it. The C0c executor below consumes the flat schedule
-  // only when its test switch is enabled; C0d bands are descriptive
-  // until Phase C worker dispatch lands.
+  // Phase §4.E.2.C0b/C0d/C1a: rebuild the global schedule from the
+  // post-drain instance-state snapshot, then derive conservative
+  // runnable bands over it. When the C0c/C1a test switch is enabled,
+  // the executor consumes the bands serially; Phase C can later replace
+  // Free-band serial iteration with worker dispatch.
   build_global_schedule(g);
   build_global_schedule_bands(g);
 
@@ -5279,7 +5298,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
 
   if (g.execute_global_schedule
       && global_schedule_covers_audio_schedule(g)) {
-    process_global_schedule_serial(g, nframes, ctx);
+    process_global_schedule_bands_serial(g, nframes, ctx);
   } else {
     process_legacy_schedule(g, nframes, ctx);
   }
@@ -5852,7 +5871,7 @@ void rt_graph_test_set_reduction_capture(RTGraph *g, int on) {
   g->capture_reduction_mode = (on != 0);
 }
 
-// Phase §4.E.2.C0c test ABI. See header docblocks.
+// Phase §4.E.2.C0c/C1a test ABI. See header docblocks.
 void rt_graph_test_set_global_schedule_execution(RTGraph *g, int on) {
   if (!g) return;
   g->execute_global_schedule = (on != 0);
@@ -6272,8 +6291,8 @@ int rt_graph_region_kernel_supported(int kernel_kind) {
 // ScheduleStep emitted by Haskell-side layeredRegionSchedule, in
 // flattened order. The runtime stores it on MetaDef::schedule_steps;
 // C0b builds the per-block global schedule from (active instance ×
-// schedule step), and the C0c test executor consumes that schedule
-// when explicitly enabled.
+// schedule step), C0d derives bands over that schedule, and the C1a
+// test executor consumes those bands when explicitly enabled.
 //
 // kind matches the Haskell ScheduleStepKind tags:
 //   0 = Barrier

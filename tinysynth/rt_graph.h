@@ -446,8 +446,9 @@ int rt_graph_region_kernel_supported(int kernel_kind);
 // item_count, or a non-positive item_count. The validation pass
 // runs before any push so a malformed step cannot partially extend
 // schedule_step_regions before being rejected. The default executor
-// does not consume schedule_steps; the C0c test executor consumes
-// them only when rt_graph_test_set_global_schedule_execution is on.
+// does not consume schedule_steps; the C0c/C1a test executor consumes
+// the global-schedule bands derived from them only when
+// rt_graph_test_set_global_schedule_execution is on.
 //
 // The canonical writer-slot key continues to be
 //   (template_id, instance_slot, scheduled_region_ordinal,
@@ -622,9 +623,9 @@ int rt_graph_test_contribution_used_word_count(const RTGraph *g);
 // reduction equivalence. No-op on null g.
 void rt_graph_test_set_reduction_capture(RTGraph *g, int on);
 
-// [T:test-only] Phase §4.E.2.C0c schedule-executor switch. When
+// [T:test-only] Phase §4.E.2.C0c/C1a schedule-executor switch. When
 // non-zero, metadata-bearing graphs execute serially by walking the
-// per-block global schedule instead of the legacy nested
+// per-block global-schedule bands instead of the legacy nested
 // template/instance loop. If any live instance's template has no
 // schedule metadata, the runtime falls back to the legacy loop for
 // the whole block so C++-only construction paths keep rendering.
@@ -697,10 +698,11 @@ int rt_graph_test_template_schedule_step_region(
 // instance_slot, step_index) entries in canonical
 //   template ascending → instance slot ascending → step ascending
 // order, filtered to instances whose state is Active or
-// Releasing. By default this is observational; when the C0c
+// Releasing. By default this is observational; when the C0c/C1a
 // test switch is enabled, metadata-bearing graphs execute serially
-// by walking this schedule. After rt_graph_clear (or before any
-// block has run), the vector is empty. Templates with no schedule_steps emit no
+// by walking the bands derived from this schedule. After rt_graph_clear
+// (or before any block has run), the vector is empty. Templates with
+// no schedule_steps emit no
 // entries even when they have live instances; that's the "no
 // metadata, no schedule" fallback for the legacy single-template
 // build path.
@@ -723,8 +725,8 @@ int rt_graph_test_global_schedule_entry_step(
 //   0 = Barrier  (one serial GlobalScheduleEntry)
 //   1 = Free     (one or more FreeLayer entries that the conservative
 //                 v1 rule would be allowed to dispatch together)
-// The executor still walks global_schedule serially; these bands are
-// descriptive until Phase C worker dispatch consumes them. Return -1 on
+// The C1a executor walks these bands serially; Phase C can replace the
+// Free-band loop with worker dispatch. Return -1 on
 // null g or out-of-range band_index for per-band accessors.
 
 int rt_graph_test_global_schedule_band_count(const RTGraph *g);
