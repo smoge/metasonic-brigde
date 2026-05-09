@@ -4,7 +4,8 @@ module MetaSonic.App.Survey
   ) where
 
 import           Data.Either               (partitionEithers)
-import           Data.List                 (intercalate, nub, sort, sortOn)
+import           Data.List                 (intercalate, isPrefixOf, nub, sort,
+                                             sortOn)
 import qualified Data.Map.Strict           as M
 import           System.Exit               (die)
 
@@ -310,6 +311,71 @@ rateDistribution rt =
       BlockRate   -> d { rdBlock   = rdBlock   d + 1 }
       SampleRate  -> d { rdSample  = rdSample  d + 1 }
 
+-- §4.E.C1c descriptive worker-band shape. This is intentionally a
+-- corpus survey, not a runtime policy: it asks whether compiled
+-- graphs contain free-layer shapes that the current worker gate
+-- could use once instantiated widely enough. Direct candidates are
+-- sink-free layers with width >= 2; reduction candidates are
+-- sink-bearing layers with width >= 2. The latter remain test-only
+-- per the turn-on decision.
+data WorkerBandStats = WorkerBandStats
+  { wbsFreeBands          :: !Int
+  , wbsSinkFreeBands      :: !Int
+  , wbsSinkBands          :: !Int
+  , wbsMaxSinkFreeWidth   :: !Int
+  , wbsMaxSinkWidth       :: !Int
+  , wbsMaxBandWork        :: !Int
+  , wbsDirectCandidates   :: !Int
+  , wbsReductionCandidates:: !Int
+  } deriving (Eq, Show)
+
+emptyWorkerBandStats :: WorkerBandStats
+emptyWorkerBandStats = WorkerBandStats 0 0 0 0 0 0 0 0
+
+addWorkerBandStats :: WorkerBandStats -> WorkerBandStats -> WorkerBandStats
+addWorkerBandStats a b = WorkerBandStats
+  { wbsFreeBands           = wbsFreeBands           a + wbsFreeBands           b
+  , wbsSinkFreeBands       = wbsSinkFreeBands       a + wbsSinkFreeBands       b
+  , wbsSinkBands           = wbsSinkBands           a + wbsSinkBands           b
+  , wbsMaxSinkFreeWidth    = max (wbsMaxSinkFreeWidth a)
+                                  (wbsMaxSinkFreeWidth b)
+  , wbsMaxSinkWidth        = max (wbsMaxSinkWidth a)
+                                  (wbsMaxSinkWidth b)
+  , wbsMaxBandWork         = max (wbsMaxBandWork a)
+                                  (wbsMaxBandWork b)
+  , wbsDirectCandidates    = wbsDirectCandidates    a + wbsDirectCandidates    b
+  , wbsReductionCandidates = wbsReductionCandidates a + wbsReductionCandidates b
+  }
+
+workerBandStats :: RuntimeGraph -> Either String WorkerBandStats
+workerBandStats rt = do
+  steps <- layeredRegionSchedule rt
+  let byIx = M.fromList [(rrIndex r, r) | r <- rgRuntimeRegions rt]
+      layers =
+        [ [ byIx M.! ix | ix <- flRegions fl ]
+        | ScheduleFreeLayer fl <- steps
+        ]
+      rowFor layer =
+        let width   = length layer
+            hasSink = any (not . null . bfWrites . rrFootprint) layer
+            work    = sum (map (length . rrNodes) layer)
+        in if hasSink
+             then emptyWorkerBandStats
+               { wbsFreeBands           = 1
+               , wbsSinkBands           = 1
+               , wbsMaxSinkWidth        = width
+               , wbsMaxBandWork         = work
+               , wbsReductionCandidates = if width >= 2 then 1 else 0
+               }
+             else emptyWorkerBandStats
+               { wbsFreeBands         = 1
+               , wbsSinkFreeBands     = 1
+               , wbsMaxSinkFreeWidth  = width
+               , wbsMaxBandWork       = work
+               , wbsDirectCandidates  = if width >= 2 then 1 else 0
+               }
+  pure (foldr (addWorkerBandStats . rowFor) emptyWorkerBandStats layers)
+
 -- Per-template summary row.
 data SurveyRow = SurveyRow
   { srDemo         :: !String
@@ -325,6 +391,10 @@ data SurveyRow = SurveyRow
   , srSchedStats   :: !RegionScheduleStats
     -- ^ §4.E.2c parallel-readiness counts. Read-only; surfaces in
     -- the schedule-width section of '--fusion-survey'.
+  , srWorkerBands  :: !WorkerBandStats
+    -- ^ §4.E.C1c corpus worker-band shape summary. Read-only;
+    -- surfaces in the corpus schedule-width section of
+    -- '--fusion-survey'.
   , srRateDist     :: !RateDistribution
     -- ^ §4.D.1 rate distribution. Counts of each propagated node
     -- output rate ('rnRate') across this row's runtime nodes.
@@ -374,8 +444,9 @@ surveyRuntimeGraph
   -> RuntimeGraph
   -> RuntimeGraph
   -> RegionScheduleStats
+  -> WorkerBandStats
   -> SurveyRow
-surveyRuntimeGraph d t rt rtF stats =
+surveyRuntimeGraph d t rt rtF stats workerStats =
   let allRegions  = rgRuntimeRegions rt
       fused       = [r | r <- allRegions, rrKernel r /= RNodeLoop]
       -- Enumerate kernel kinds via Bounded/Enum rather than keying
@@ -399,6 +470,7 @@ surveyRuntimeGraph d t rt rtF stats =
        , srRFused       = length [() | n <- rgNodes rtF, RFused _ <- rnInputs n]
        , srShapes       = scanSinkShapes rt
        , srSchedStats   = stats
+       , srWorkerBands  = workerStats
        , srRateDist     = rateDistribution rt
        , srEdgeBuckets  = edgeRateBuckets rt
          -- §4.D.2: read from the unfused graph deliberately. The
@@ -420,7 +492,8 @@ surveySynthGraph d t g = do
   rt    <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraph)
   rtF   <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraphFused)
   stats <- either (Left . stamp) Right (regionScheduleStats rt)
-  Right (surveyRuntimeGraph d t rt rtF stats)
+  workerStats <- either (Left . stamp) Right (workerBandStats rt)
+  Right (surveyRuntimeGraph d t rt rtF stats workerStats)
 
 -- | A short human label used in error messages.
 surveyTag :: String -> Maybe String -> String
@@ -1200,6 +1273,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printScheduleWidth allRows
   putStrLn ""
+  printCorpusWorkerBandWidth allRows
+  putStrLn ""
   printEnsembleScheduleWidth ensembleRows
   putStrLn ""
   printRateDistribution allRows
@@ -1471,6 +1546,73 @@ scheduleColumnWidths = [42, 14, 6, 4, 4, 5, 6, 6, 5, 5, 4]
 formatScheduleRow :: [String] -> String
 formatScheduleRow cols =
   intercalate "  " (zipWith pad scheduleColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+-- Corpus-only worker-band shape report. The existing schedule-width
+-- table mixes demos and corpus rows; this section is the decision input
+-- for C1c follow-up work and therefore keeps the fixed corpus rows
+-- isolated from whatever demo subset the user requested.
+--
+-- Columns:
+--   bands    : free-layer count from 'layeredRegionSchedule'
+--   sf       : sink-free bands (direct mode can dispatch these)
+--   sink     : bands with at least one sink writer
+--   maxSfW   : widest sink-free band
+--   maxSinkW : widest sink-bearing band
+--   maxWork  : max node-count work estimate inside one band
+--   dirC1c   : sink-free bands with width >= 2
+--   redC1c   : sink-bearing bands with width >= 2
+--
+-- 'redC1c' is not a recommendation to enable reduction-backed worker
+-- dispatch. It marks the shape that would require reduction mode; the
+-- turn-on decision keeps that path test-only.
+printCorpusWorkerBandWidth :: [SurveyRow] -> IO ()
+printCorpusWorkerBandWidth rows = do
+  let corpusRows = filter (("corpus:" `isPrefixOf`) . srDemo) rows
+  putStrLn "─── Corpus schedule-width survey (§4.E.C1c worker gate) ───"
+  putStrLn $ formatWorkerBandRow
+    [ "corpus", "template", "bands", "sf", "sink"
+    , "maxSfW", "maxSinkW", "maxWork", "dirC1c", "redC1c"
+    ]
+  mapM_ (putStrLn . formatWorkerBandRow . renderWorkerBandRow) corpusRows
+  putStrLn ""
+  let agg = foldr addWorkerBandStats emptyWorkerBandStats
+              (map srWorkerBands corpusRows)
+  putStrLn $ "  totals: "
+          <> "graphs="  <> show (length corpusRows)
+          <> "  bands=" <> show (wbsFreeBands agg)
+          <> "  sf="    <> show (wbsSinkFreeBands agg)
+          <> "  sink="  <> show (wbsSinkBands agg)
+          <> "  maxSfW="   <> show (wbsMaxSinkFreeWidth agg)
+          <> "  maxSinkW=" <> show (wbsMaxSinkWidth agg)
+          <> "  maxWork="  <> show (wbsMaxBandWork agg)
+          <> "  dirC1c="   <> show (wbsDirectCandidates agg)
+          <> "  redC1c="   <> show (wbsReductionCandidates agg)
+
+renderWorkerBandRow :: SurveyRow -> [String]
+renderWorkerBandRow r =
+  let s = srWorkerBands r
+  in [ srDemo r
+     , maybe "" id (srTemplate r)
+     , show (wbsFreeBands s)
+     , show (wbsSinkFreeBands s)
+     , show (wbsSinkBands s)
+     , show (wbsMaxSinkFreeWidth s)
+     , show (wbsMaxSinkWidth s)
+     , show (wbsMaxBandWork s)
+     , show (wbsDirectCandidates s)
+     , show (wbsReductionCandidates s)
+     ]
+
+workerBandColumnWidths :: [Int]
+workerBandColumnWidths = [42, 14, 6, 4, 5, 6, 8, 8, 7, 7]
+
+formatWorkerBandRow :: [String] -> String
+formatWorkerBandRow cols =
+  intercalate "  " (zipWith pad workerBandColumnWidths cols)
   where
     pad w s
       | length s >= w = s
