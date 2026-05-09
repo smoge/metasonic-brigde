@@ -83,7 +83,7 @@ data SinkShape
 
 -- The full enumeration of shapes the survey reports on. Listed in
 -- a deliberate display order: 3-node oscillator-rooted sinks first
--- (the strongest fusion class per notes/fusion-strategy.md), then
+-- (the strongest fusion class per notes/2026-05-08-fusion-strategy.md), then
 -- 4-node oscillator-rooted sinks, then BusIn-rooted return tails,
 -- then Add-rooted post-mix tails. Producer kinds within the
 -- oscillator groups follow 'sinkProducerKinds'. Iterating this
@@ -1457,7 +1457,7 @@ surveyColumnWidths = [42, 14, 5, 5, 9, 8, 10, 11, 30]
 --             templates contribute the same shape — three misses from
 --             one synthetic graph is weaker signal than three misses
 --             from three independent patch families (per the candidate
---             gate in notes/fusion-strategy.md).
+--             gate in notes/2026-05-08-fusion-strategy.md).
 --   status    'covered' (kernel exists), 'candidate' (no kernel; gate
 --             passed: missed ≥ 3 ∧ sources ≥ 3), or 'no-signal' (no
 --             kernel; gate not yet met).
@@ -1518,7 +1518,7 @@ scanStats rows =
   ]
 
 -- Status: 'covered' is purely a kernel-existence statement; the
--- candidate gate from notes/fusion-strategy.md applies only when
+-- candidate gate from notes/2026-05-08-fusion-strategy.md applies only when
 -- no kernel claims the shape. 'no-signal' covers both "shape never
 -- appeared" (kept in the table only when a kernel exists) and
 -- "shape appeared but the gate didn't pass yet".

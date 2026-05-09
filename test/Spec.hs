@@ -1126,7 +1126,7 @@ unitTests = testGroup "Unit tests"
           -- Uses an 'Env' source rather than any oscillator because
           -- §4.B's growing kernel set claims every contiguous
           -- @{Sin,Saw} → Gain → sink@ shape today, and (per
-          -- 'notes/fusion-strategy.md') is the part of the design
+          -- 'notes/2026-05-08-fusion-strategy.md') is the part of the design
           -- expected to expand. Env is stateful and explicitly
           -- excluded from kernel candidacy in that note, so §4.B
           -- can't claim @Env → Gain → Out@ now or later, and §4.C
@@ -4571,7 +4571,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- adds a fused-aware loader.
     testCase "loadRuntimeGraph rejects RFused inputs with the documented error" $ do
       -- 'Env' source: durable §4.C-only fixture (no §4.B kernel
-      -- candidate, per notes/fusion-strategy.md). We need §4.C to
+      -- candidate, per notes/2026-05-08-fusion-strategy.md). We need §4.C to
       -- actually emit an 'RFused' input for the loader-rejection
       -- check to fire.
       let graph = runSynth $ do

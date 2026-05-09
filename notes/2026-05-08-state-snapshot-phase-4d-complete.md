@@ -142,8 +142,8 @@ Explicitly not next: more kernels, kernel codegen, runtime block-rate work.
 ## Pointers
 
 - `notes/2026-05-08-project-path.md` — 9-stage history of MetaSonic.
-- `notes/blog-post-metasonic-path.md` — architectural thesis essay.
-- `notes/fusion-strategy.md` — sink-terminal fusion notes.
+- `notes/2026-05-08-blog-post-metasonic-path.md` — architectural thesis essay.
+- `notes/2026-05-08-fusion-strategy.md` — sink-terminal fusion notes.
 - `notes/2026-05-08-fusion-kernel-lessons.md` — what the kernel-add loop
   taught us.
 - `notes/2026-05-08-phase-4d2-handoff.md` — §4.D.2 entry point used to

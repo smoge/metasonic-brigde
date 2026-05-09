@@ -589,7 +589,7 @@ data RegionKernel
     --
     -- Added after the post-step-2 ranked missed-shape table
     -- crossed the kernel-add gate from
-    -- @notes/fusion-strategy.md@: @missed=4, sources=4@,
+    -- @notes/2026-05-08-fusion-strategy.md@: @missed=4, sources=4@,
     -- producer in the proven sink-terminal family, kernel body
     -- absorbs the sink and avoids materializing NoiseGen / LPF /
     -- Gain output buffers in sequence. Tri / Pulse / Add filtered
