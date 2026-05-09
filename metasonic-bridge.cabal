@@ -80,6 +80,7 @@ executable metasonic-bridge
   other-modules:
       MetaSonic.App.Demos
       MetaSonic.App.Survey
+      MetaSonic.App.WorkerBench
       Paths_metasonic_bridge
   autogen-modules:
       Paths_metasonic_bridge
