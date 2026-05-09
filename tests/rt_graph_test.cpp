@@ -6269,20 +6269,32 @@ TEST_CASE("writer-slot count: invalid bus still consumes its slot") {
 // shapes the runtime supports today, without yet exercising the
 // reduction-mode opener (still B2's job).
 
+// All three storage vectors must move together. A regression where
+// one resize_for branch grew samples but skipped target or
+// used_words would silently leave the contribution-table writer
+// path indexing dangling memory in B2; this helper makes the
+// lockstep claim from rt_graph.h enforceable.
+static void check_storage_lockstep(const RTGraph *g, int expected_slots) {
+    CHECK(rt_graph_test_contribution_slot_capacity(g) == expected_slots);
+    CHECK(rt_graph_test_contribution_sample_count(g)
+          == expected_slots * kFrames);
+    CHECK(rt_graph_test_contribution_target_count(g) == expected_slots);
+    CHECK(rt_graph_test_contribution_used_word_count(g)
+          == (expected_slots + 63) / 64);
+}
+
 TEST_CASE("contribution capacity: fresh graph with no sinks is zero") {
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);
 
     // Auto-created template 0 has no nodes; instance 0 is Active
     // but contributes nothing because there are no Out / BusOut
-    // NodeSpecs. Capacity must be 0, samples must be empty.
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 0);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 0);
+    // NodeSpecs. All three vectors must be at zero.
+    check_storage_lockstep(g, 0);
 
     // A non-sink node also leaves capacity at 0.
     rt_graph_add_node(g, 0, 1); // SinOsc
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 0);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 0);
+    check_storage_lockstep(g, 0);
 
     rt_graph_destroy(g);
 }
@@ -6297,8 +6309,7 @@ TEST_CASE("contribution capacity: one Out, default polyphony 8 gives 8 slots") {
     rt_graph_add_node(g, 1, 2);  // Out
     rt_graph_set_control(g, 1, 0, 0.0f);
 
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 8);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 8 * kFrames);
+    check_storage_lockstep(g, 8);
 
     rt_graph_destroy(g);
 }
@@ -6319,8 +6330,7 @@ TEST_CASE("contribution capacity: mixed Out and BusOut with cap 4 gives sink_cou
     rt_graph_add_node(g, 3, 10);  // BusOut (bus 3)
     rt_graph_set_control(g, 3, 0, 3.0f);
 
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 12);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 12 * kFrames);
+    check_storage_lockstep(g, 12);
 
     rt_graph_destroy(g);
 }
@@ -6349,8 +6359,7 @@ TEST_CASE("contribution capacity: cross-template sums per-template independently
     rt_graph_template_set_default(g, t1, 2, 0, 1.0);
 
     // Total = template 0 (4) + template 1 (6) = 10.
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 10);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 10 * kFrames);
+    check_storage_lockstep(g, 10);
 
     rt_graph_destroy(g);
 }
@@ -6396,9 +6405,8 @@ TEST_CASE("contribution capacity: rt_graph_clear resets to zero") {
 
     rt_graph_clear(g);
     // After clear, the auto-recreated template 0 has no nodes →
-    // capacity drops to 0. samples must follow.
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 0);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 0);
+    // every parallel storage vector drops to its empty size.
+    check_storage_lockstep(g, 0);
 
     rt_graph_destroy(g);
 }
@@ -6433,8 +6441,7 @@ TEST_CASE("contribution capacity: lowering polyphony does not shrink storage") {
 
     // max(2, 6 occupied) × 1 sink = 6, but capacity was already 8.
     // Grow-only resize_for keeps it at 8, the high-water mark.
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 8);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 8 * kFrames);
+    check_storage_lockstep(g, 8);
 
     rt_graph_destroy(g);
 }
@@ -6465,8 +6472,40 @@ TEST_CASE("contribution capacity: occupied count keeps storage above lowered cap
     rt_graph_set_control(g, 1, 0, 0.0f);
 
     // max(polyphony=2, occupied=5) × 1 sink = 5.
-    CHECK(rt_graph_test_contribution_slot_capacity(g) == 5);
-    CHECK(rt_graph_test_contribution_sample_count(g) == 5 * kFrames);
+    check_storage_lockstep(g, 5);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("contribution capacity: parallel vector sizing across many capacities") {
+    // Direct lockstep regression. Walk a handful of distinct
+    // capacities (including ones that cross the 64-slot boundary
+    // where used_words gains a second word) and assert that
+    // resize_for keeps samples, target, and used_words in step.
+    // If a future refactor of resize_for forgets to grow one of
+    // them, this test fails with a specific size mismatch rather
+    // than crashing in B2's reduction phase.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Cap 1, single sink: 1 slot → fits in 1 used_words bucket.
+    rt_graph_template_set_polyphony(g, 0, 1);
+    rt_graph_add_node(g, 0, 1);  // SinOsc
+    rt_graph_add_node(g, 1, 2);  // Out
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    check_storage_lockstep(g, 1);
+
+    // Bump cap to 64: still one used_words bucket (ceil(64/64) = 1).
+    rt_graph_template_set_polyphony(g, 0, 64);
+    check_storage_lockstep(g, 64);
+
+    // Bump cap to 65: spills into a second used_words bucket.
+    rt_graph_template_set_polyphony(g, 0, 65);
+    check_storage_lockstep(g, 65);
+
+    // Bump cap to 200: ceil(200/64) = 4 used_words.
+    rt_graph_template_set_polyphony(g, 0, 200);
+    check_storage_lockstep(g, 200);
 
     rt_graph_destroy(g);
 }

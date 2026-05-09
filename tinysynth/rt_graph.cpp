@@ -5144,6 +5144,16 @@ int rt_graph_test_contribution_sample_count(const RTGraph *g) {
   return static_cast<int>(g->contribution_storage.samples.size());
 }
 
+int rt_graph_test_contribution_target_count(const RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->contribution_storage.target.size());
+}
+
+int rt_graph_test_contribution_used_word_count(const RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->contribution_storage.used_words.size());
+}
+
 // Add or reconfigure one node at its dense runtime index in the named
 // template.
 //

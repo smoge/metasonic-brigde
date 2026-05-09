@@ -548,11 +548,25 @@ int rt_graph_test_contribution_slot_capacity(const RTGraph *g);
 // [T:read-only] Phase §4.E.2.B1 test surface: total sample count
 // in the contribution storage's per-slot frame buffers. Equals
 // rt_graph_test_contribution_slot_capacity * max_frames at every
-// point construction is observable from outside. Used by tests as
-// a cross-check that the parallel storage vectors stay in
-// lockstep — a future refactor that resized one without the
-// other would diverge here. Returns 0 on null g.
+// point construction is observable from outside. Used by tests
+// as a cross-check that samples sizing tracks slot capacity.
+// Returns 0 on null g.
 int rt_graph_test_contribution_sample_count(const RTGraph *g);
+
+// [T:read-only] Phase §4.E.2.B1 test surface: contribution
+// target-vector size. Equals rt_graph_test_contribution_slot_capacity
+// for any well-formed storage state, since target is one int per
+// writer slot. Returns 0 on null g.
+int rt_graph_test_contribution_target_count(const RTGraph *g);
+
+// [T:read-only] Phase §4.E.2.B1 test surface: contribution
+// used-bitset word count. Equals
+// (rt_graph_test_contribution_slot_capacity + 63) / 64 for any
+// well-formed storage state — one 64-bit word covers up to 64
+// slots. Together with the sample and target accessors, this is
+// the third leg that makes "all parallel storage vectors stay in
+// lockstep" testable. Returns 0 on null g.
+int rt_graph_test_contribution_used_word_count(const RTGraph *g);
 
 // ----------------------------------------------------------------
 // Multi-instance support
