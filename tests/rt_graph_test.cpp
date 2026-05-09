@@ -6543,6 +6543,35 @@ static void build_free_then_out_schedule_graph(RTGraph *g) {
                                         /*item_count=*/1, barrier_region);
 }
 
+static void build_split_free_lifecycle_graph(RTGraph *g) {
+    // Env -> Out in one Free step, plus an unrelated Free step in
+    // the same instance. C0d splits those into two Free bands because
+    // a single band may not contain two steps from one instance slot.
+    rt_graph_add_node(g, 0, 9);          // Env
+    rt_graph_set_control(g, 0, 0, 1.0);  // gate high
+    rt_graph_set_control(g, 0, 1, 0.0005);
+    rt_graph_set_control(g, 0, 2, 0.002);
+    rt_graph_set_control(g, 0, 3, 1.0);
+    rt_graph_set_control(g, 0, 4, 0.5);  // long release
+
+    rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    add_const_node(g, 2, 0.125f, 0.25f);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/2);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/2, /*node_count=*/1);
+    const int env_out_region[] = {0};
+    const int side_region[] = {1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, env_out_region);
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, side_region);
+}
+
 TEST_CASE("reduction capture: flat fallback puts distinct sinks in distinct slots") {
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
@@ -7247,6 +7276,44 @@ TEST_CASE("global schedule executor: worker pool scaffold preserves reduction eq
 
     rt_graph_destroy(direct);
     rt_graph_destroy(reduced);
+}
+
+// ----------------------------------------------------------------
+// Phase §4.E.2.C1c-a: scheduled lifecycle is outside worker contexts
+// ----------------------------------------------------------------
+
+TEST_CASE("global schedule executor: split free bands do not restart lifecycle") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_split_free_lifecycle_graph(g);
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+
+    // Open the envelope before releasing. The two Free steps should
+    // land in two bands for the same slot; lifecycle must still begin
+    // once before all bands and finish once after all bands.
+    rt_graph_process(g, kFrames);
+    REQUIRE(rt_graph_test_global_schedule_band_count(g) == 2);
+    CHECK(rt_graph_test_global_schedule_band_kind(g, 0) == 1);
+    CHECK(rt_graph_test_global_schedule_band_kind(g, 1) == 1);
+    CHECK(rt_graph_test_global_schedule_band_entry_count(g, 0) == 1);
+    CHECK(rt_graph_test_global_schedule_band_entry_count(g, 1) == 1);
+    REQUIRE(rt_graph_instance_status(g, 0) == 0);
+    rt_graph_instance_release(g, 0);
+    REQUIRE(rt_graph_instance_status(g, 0) == 1);
+
+    // With a long release, the Env->Out band remains audible for far
+    // more than the 8 silent blocks needed to auto-free. A per-band
+    // lifecycle reset would zero block_sink_peak in the second Free
+    // band and incorrectly free this slot inside this loop.
+    for (int i = 0; i < 12; ++i) {
+        rt_graph_process(g, kFrames);
+        CHECK(rt_graph_instance_alive(g, 0) == 1);
+        CHECK(rt_graph_instance_status(g, 0) == 1);
+    }
+
+    rt_graph_destroy(g);
 }
 
 // ----------------------------------------------------------------

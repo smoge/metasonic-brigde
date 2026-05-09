@@ -1035,6 +1035,15 @@ struct GraphInstance {
   // activity that may be silenced downstream.
   float block_sink_peak = 0.0f;
 
+  // Phase §4.E.2.C1c-a: the global-schedule executor begins and
+  // finishes each live instance block from the audio thread, outside
+  // per-entry worker contexts. These two fields snapshot that
+  // top-of-block lifecycle state so finish_instance_block can run once
+  // after all bands complete, even when future worker dispatch gives
+  // different bands to different contexts.
+  bool block_lifecycle_active = false;
+  SlotState block_state_at_start = SlotState::Available;
+
   // Step C: one float[max_frames] buffer per registered fused input
   // (any kind — single scale, scale chain, or affine chain).
   // resolve_input materializes into the slot assigned in the matching
@@ -4840,6 +4849,34 @@ static inline void finish_instance_block(
   }
 }
 
+static inline bool is_audio_scheduled_state(SlotState s) noexcept {
+  return s == SlotState::Active || s == SlotState::Releasing;
+}
+
+static void begin_global_schedule_instance_blocks(RTGraph &g) noexcept {
+  for (GraphInstance &inst : g.instances) {
+    inst.block_lifecycle_active = false;
+    inst.block_state_at_start = SlotState::Available;
+
+    const SlotState s = inst.state.load();
+    if (!is_audio_scheduled_state(s)) continue;
+
+    inst.block_lifecycle_active = true;
+    inst.block_state_at_start = s;
+    begin_instance_block(inst);
+  }
+}
+
+static void finish_global_schedule_instance_blocks(RTGraph &g) noexcept {
+  for (GraphInstance &inst : g.instances) {
+    if (!inst.block_lifecycle_active) continue;
+
+    finish_instance_block(inst, inst.block_state_at_start);
+    inst.block_lifecycle_active = false;
+    inst.block_state_at_start = SlotState::Available;
+  }
+}
+
 static void process_region(
     RTGraph &g, const MetaDef &def, GraphInstance &inst,
     const RegionSpec &r, int nframes, BlockExecutionContext &ctx
@@ -5242,52 +5279,28 @@ struct ScheduleEntryExecutionContext {
   RTGraph &g;
   int nframes;
   BlockExecutionContext &block_ctx;
-  GraphInstance *current_inst = nullptr;
-  const MetaDef *current_def = nullptr;
-  SlotState current_state = SlotState::Available;
-  int current_slot = -1;
-
-  void finish_current() noexcept {
-    if (current_inst) {
-      finish_instance_block(*current_inst, current_state);
-      current_inst = nullptr;
-      current_def = nullptr;
-      current_slot = -1;
-      current_state = SlotState::Available;
-    }
-  }
 
   void process_entry(const GlobalScheduleEntry &entry) noexcept {
     // Early return here is the entry-local equivalent of the old flat
     // loop's continue: skip this malformed/stale entry and keep walking
-    // the remaining band entries. Future worker dispatch gets one
-    // context per worker, so these lifecycle fields are not shared.
-    if (entry.instance_slot != current_slot) {
-      finish_current();
+    // the remaining band entries. Instance lifecycle is owned by
+    // begin_global_schedule_instance_blocks /
+    // finish_global_schedule_instance_blocks, so this context is safe
+    // to duplicate per worker in C1c.
+    if (entry.instance_slot < 0) return;
+    const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
+    if (slot >= g.instances.size()) return;
 
-      if (entry.instance_slot < 0) return;
-      const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
-      if (slot >= g.instances.size()) return;
+    GraphInstance &inst = g.instances[slot];
+    const SlotState s = inst.state.load();
+    if (!is_audio_scheduled_state(s)) return;
+    if (inst.template_id != entry.template_id) return;
 
-      GraphInstance &inst = g.instances[slot];
-      const SlotState s = inst.state.load();
-      if (s != SlotState::Active && s != SlotState::Releasing) return;
-      if (inst.template_id != entry.template_id) return;
+    const MetaDef *def = template_at(g, entry.template_id);
+    if (!def) return;
 
-      const MetaDef *def = template_at(g, entry.template_id);
-      if (!def) return;
-
-      begin_instance_block(inst);
-      current_inst = &inst;
-      current_def = def;
-      current_state = s;
-      current_slot = entry.instance_slot;
-    }
-
-    if (current_inst && current_def) {
-      process_schedule_step(g, *current_def, *current_inst,
-                            entry.step_index, nframes, block_ctx);
-    }
+    process_schedule_step(g, *def, inst, entry.step_index,
+                          nframes, block_ctx);
   }
 };
 
@@ -5320,19 +5333,16 @@ static void process_global_schedule_bands_serial(
 ) noexcept {
   ScheduleEntryExecutionContext worker_ctx{g, nframes, ctx};
   // C1a consumes C0d's bands but still executes every entry serially.
-  // build_global_schedule_bands preserves global_schedule order, so
-  // the instance-lifecycle grouping below remains the same as the flat
-  // C0c loop: build_global_schedule emits every step for one
-  // (template, slot) contiguously because step_index is the innermost
-  // loop. We snapshot SlotState once at group entry and pass that value
-  // to finish_instance_block after the last step. The only same-thread
-  // state transition during the group is Releasing -> Available inside
-  // finish_instance_block, after all steps for that slot have run.
+  // C1c-a hoists instance lifecycle out of the per-entry context:
+  // begin every live instance block once before the band loop, and
+  // finish it once after all bands complete. This keeps §2.E release
+  // accounting correct when future C1c worker dispatch processes
+  // different bands with different per-worker contexts.
+  begin_global_schedule_instance_blocks(g);
   for (const GlobalScheduleBand &band : g.global_schedule_bands) {
     process_schedule_band_serial(g, band, worker_ctx);
   }
-
-  worker_ctx.finish_current();
+  finish_global_schedule_instance_blocks(g);
 }
 
 static void process_legacy_schedule(
@@ -5355,7 +5365,7 @@ static void process_legacy_schedule(
       // already been published into the schedule. Snapshot once; the
       // §2.E silence-window branch reuses the snapshot.
       const SlotState s = inst.state.load();
-      if (s != SlotState::Active && s != SlotState::Releasing) continue;
+      if (!is_audio_scheduled_state(s)) continue;
       if (inst.template_id != tid_i) continue;
       process_instance(g, inst, nframes, ctx);
       finish_instance_block(inst, s);
@@ -6829,6 +6839,8 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
     slot.template_id = template_id;
     slot.silent_blocks = 0;
     slot.block_sink_peak = 0.0f;
+    slot.block_lifecycle_active = false;
+    slot.block_state_at_start = SlotState::Available;
     slot.nodes.resize(def->nodes.size());
     for (std::size_t i = 0; i < def->nodes.size(); ++i) {
       init_node_state(slot.nodes[i], def->nodes[i], g->max_frames);
