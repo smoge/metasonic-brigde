@@ -1,4 +1,5 @@
-// rt_graph_bench: microbench for §4.B region kernels.
+// rt_graph_bench: microbench for §4.B region kernels and §4.E
+// schedule-worker dispatch.
 //
 // Compares two compiled forms of the same graph back-to-back:
 //   * node-loop : every region tagged RegionKernel::NodeLoop, so
@@ -34,9 +35,15 @@
 // the bus contents after each render so the optimizer cannot dead-
 // code-eliminate process_graph.
 //
-// Build with -O3 (Release / RelWithDebInfo) — debug timings are
-// dominated by libstdc++ checks and the kernel-vs-loop ratio is
-// noise. The CMake target is wired via `just cpp-bench`.
+// The second section is the §4.E bench slice: it compares the
+// legacy executor, global-schedule serial executor, and worker-pool
+// Free-band dispatch at pool sizes 2/3/4. Those rows also report the
+// C1c debug counters (parallel bands, parallel entries, serialized
+// sink bands) so timing data can be read against the schedule shape.
+//
+// Build with -O3 / RelWithDebInfo — debug timings are dominated by
+// libstdc++ checks and the kernel-vs-loop ratio is noise. The CMake
+// target is wired via `just cpp-bench`.
 
 #include "rt_graph.h"
 
@@ -60,6 +67,7 @@ constexpr int kNkGain     = 3;
 constexpr int kNkSawOsc   = 5;
 constexpr int kNkNoiseGen = 6;
 constexpr int kNkLPF      = 7;
+constexpr int kNkBusOut   = 10;
 constexpr int kNkBusIn    = 11;
 
 // Rate ints — value 3 corresponds to SampleRate.
@@ -80,6 +88,11 @@ constexpr int kMaxFrames     = 1024;
 constexpr int kBenchBus      = 0;
 constexpr int kWarmupBlocks  = 64;
 constexpr int kRepeatRuns    = 5;
+constexpr int kScheduleRepeatRuns = 3;
+constexpr int kScheduleWarmupBlocks = 32;
+
+constexpr int kScheduleBarrier  = 0;
+constexpr int kScheduleFreeLayer = 1;
 
 // Volatile sink to defeat dead-code elimination of the rendered
 // audio. Every measurement reads the output bus and accumulates
@@ -350,6 +363,239 @@ double run_cell(const ShapeSpec &shape, bool fused,
   return ns_per_sample[ns_per_sample.size() / 2];
 }
 
+// ----------------------------------------------------------------
+// §4.E schedule-worker bench
+// ----------------------------------------------------------------
+
+struct ScheduleModeSpec {
+  const char *name;
+  bool global_schedule = false;
+  bool reduction = false;
+  int worker_pool_size = 0;
+};
+
+struct ScheduleBenchSpec {
+  const char *name;
+  void (*build)(RTGraph *, int voices);
+};
+
+struct ScheduleBenchResult {
+  double ns_per_block = 0.0;
+  double ns_per_sample = 0.0;
+  int parallel_bands = 0;
+  int parallel_entries = 0;
+  int serialized_sink_bands = 0;
+};
+
+const ScheduleModeSpec kScheduleModes[] = {
+  { "legacy-direct",       false, false, 0 },
+  { "sched-serial-direct", true,  false, 1 },
+  { "sched-pool2-direct",  true,  false, 2 },
+  { "sched-pool3-direct",  true,  false, 3 },
+  { "sched-pool4-direct",  true,  false, 4 },
+  { "sched-pool2-reduce",  true,  true,  2 },
+  { "sched-pool3-reduce",  true,  true,  3 },
+  { "sched-pool4-reduce",  true,  true,  4 },
+};
+
+constexpr int kScheduleBlockSizes[]  = { 128, 512 };
+constexpr int kScheduleVoiceCounts[] = { 2, 8, 32 };
+
+void configure_schedule_mode(RTGraph *g, const ScheduleModeSpec &mode) {
+  if (mode.worker_pool_size > 0) {
+    rt_graph_test_set_worker_pool_size(g, mode.worker_pool_size);
+  }
+  if (mode.reduction) {
+    rt_graph_test_set_reduction_capture(g, 1);
+  }
+  if (mode.global_schedule) {
+    rt_graph_test_set_global_schedule_execution(g, 1);
+  }
+}
+
+void add_schedule_step(RTGraph *g, int tid, int kind, int region_ordinal) {
+  const int regions[] = { region_ordinal };
+  rt_graph_template_add_schedule_step(g, tid, kind, 1, regions);
+}
+
+void spawn_exact_voices(RTGraph *g, int template_id, int voices) {
+  rt_graph_template_set_polyphony(g, template_id, voices);
+  for (int i = 0; i < voices; ++i) {
+    rt_graph_template_instance_add(g, template_id);
+  }
+}
+
+// One sink-free, DSP-heavy FreeLayer per instance. With global
+// schedule execution on, all live instances form one Free band and
+// are eligible for worker dispatch in both direct and reduction mode.
+void build_schedule_free_compute_graph(RTGraph *g, int voices) {
+  rt_graph_instance_remove(g, 0);
+  rt_graph_template_set_polyphony(g, 0, voices);
+
+  rt_graph_template_add_node(g, 0, 0, kNkSawOsc);
+  rt_graph_template_add_node(g, 0, 1, kNkLPF);
+  rt_graph_template_add_node(g, 0, 2, kNkGain);
+  rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+  rt_graph_template_connect(g, 0, 1, 0, 2, 0);
+  rt_graph_template_set_default(g, 0, 0, 0, 220.0);
+  rt_graph_template_set_default(g, 0, 1, 0, 800.0);
+  rt_graph_template_set_default(g, 0, 1, 1, 4.0);
+  rt_graph_template_set_default(g, 0, 2, 0, 0.4);
+  rt_graph_template_add_region_kernel(g, 0, kKernelSawLpfGain,
+                                      kRateSampleRate, 0, 3);
+  add_schedule_step(g, 0, kScheduleFreeLayer, 0);
+
+  spawn_exact_voices(g, 0, voices);
+}
+
+// Deliberately marks a sink-terminal region as FreeLayer. The
+// Haskell scheduler keeps sink regions on the barrier path today;
+// this C++-only bench exercises the C1c gate directly:
+//   * direct mode serializes the sink Free band;
+//   * reduction mode may dispatch it and fold after the join.
+void build_schedule_free_sink_graph(RTGraph *g, int voices) {
+  rt_graph_instance_remove(g, 0);
+  rt_graph_template_set_polyphony(g, 0, voices);
+
+  build_sin_gain_out_chain(g);
+  rt_graph_template_add_region_kernel(g, 0, kKernelSinGainOut,
+                                      kRateSampleRate, 0, 3);
+  add_schedule_step(g, 0, kScheduleFreeLayer, 0);
+
+  spawn_exact_voices(g, 0, voices);
+}
+
+// Send/return shape: N sender voices write bus 1 in one Free band;
+// a single reader template consumes bus 1 live and writes bus 0 in a
+// later Barrier step. Reduction-mode worker dispatch must join and
+// fold before the reader barrier runs.
+void build_schedule_send_return_graph(RTGraph *g, int voices) {
+  rt_graph_instance_remove(g, 0);
+  rt_graph_ensure_bus(g, 1);
+
+  rt_graph_template_set_polyphony(g, 0, voices);
+  rt_graph_template_add_node(g, 0, 0, kNkSinOsc);
+  rt_graph_template_add_node(g, 0, 1, kNkGain);
+  rt_graph_template_add_node(g, 0, 2, kNkBusOut);
+  rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+  rt_graph_template_connect(g, 0, 1, 0, 2, 0);
+  rt_graph_template_set_default(g, 0, 0, 0, 220.0);
+  rt_graph_template_set_default(g, 0, 1, 0, 0.25);
+  rt_graph_template_set_default(g, 0, 2, 0, 1.0);
+  rt_graph_template_add_region_kernel(g, 0, kKernelSinGainOut,
+                                      kRateSampleRate, 0, 3);
+  add_schedule_step(g, 0, kScheduleFreeLayer, 0);
+  spawn_exact_voices(g, 0, voices);
+
+  const int reader = rt_graph_template_add(g);
+  rt_graph_template_set_polyphony(g, reader, 1);
+  rt_graph_template_add_node(g, reader, 0, kNkBusIn);
+  rt_graph_template_add_node(g, reader, 1, kNkLPF);
+  rt_graph_template_add_node(g, reader, 2, kNkGain);
+  rt_graph_template_add_node(g, reader, 3, kNkOut);
+  rt_graph_template_connect(g, reader, 0, 0, 1, 0);
+  rt_graph_template_connect(g, reader, 1, 0, 2, 0);
+  rt_graph_template_connect(g, reader, 2, 0, 3, 0);
+  rt_graph_template_set_default(g, reader, 0, 0, 1.0);
+  rt_graph_template_set_default(g, reader, 1, 0, 1200.0);
+  rt_graph_template_set_default(g, reader, 1, 1, 4.0);
+  rt_graph_template_set_default(g, reader, 2, 0, 0.5);
+  rt_graph_template_set_default(g, reader, 3, 0, kBenchBus);
+  rt_graph_template_add_region_kernel(g, reader, kKernelBusInLpfGainOut,
+                                      kRateSampleRate, 0, 4);
+  add_schedule_step(g, reader, kScheduleBarrier, 0);
+  spawn_exact_voices(g, reader, 1);
+}
+
+const ScheduleBenchSpec kScheduleShapes[] = {
+  { "FreeCompute", &build_schedule_free_compute_graph },
+  { "FreeSink",    &build_schedule_free_sink_graph    },
+  { "SendReturn",  &build_schedule_send_return_graph  },
+};
+
+RTGraph *build_schedule_graph(
+    const ScheduleBenchSpec &shape,
+    const ScheduleModeSpec &mode,
+    int voices
+) {
+  RTGraph *g = rt_graph_create(kCapacity, kMaxFrames);
+  shape.build(g, voices);
+  rt_graph_ensure_bus(g, kBenchBus);
+  configure_schedule_mode(g, mode);
+  return g;
+}
+
+int choose_schedule_iters(int nframes) {
+  const int min_blocks = 64;
+  const int target_samples = kSampleRate / 10;  // ~100 ms of audio.
+  const int iters = target_samples / nframes;
+  return iters < min_blocks ? min_blocks : iters;
+}
+
+std::int64_t time_schedule_render(
+    RTGraph *g, int nframes, int iters, std::vector<float> &scratch
+) {
+  for (int i = 0; i < kScheduleWarmupBlocks; ++i) {
+    rt_graph_process(g, nframes);
+  }
+  drain_into_sink(g, nframes, scratch);
+
+  using clock = std::chrono::steady_clock;
+  const auto t0 = clock::now();
+  for (int i = 0; i < iters; ++i) {
+    rt_graph_process(g, nframes);
+  }
+  const auto t1 = clock::now();
+
+  drain_into_sink(g, nframes, scratch);
+
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      t1 - t0).count();
+}
+
+ScheduleBenchResult run_schedule_cell(
+    const ScheduleBenchSpec &shape,
+    const ScheduleModeSpec &mode,
+    int nframes,
+    int voices
+) {
+  std::vector<float> scratch;
+  std::vector<double> ns_per_block;
+  ns_per_block.reserve(static_cast<std::size_t>(kScheduleRepeatRuns));
+
+  const int iters = choose_schedule_iters(nframes);
+  ScheduleBenchResult observed;
+
+  for (int run = 0; run < kScheduleRepeatRuns; ++run) {
+    RTGraph *g = build_schedule_graph(shape, mode, voices);
+    const std::int64_t ns = time_schedule_render(g, nframes, iters, scratch);
+    ns_per_block.push_back(static_cast<double>(ns) /
+                           static_cast<double>(iters));
+
+    if (run == kScheduleRepeatRuns - 1) {
+      // One untimed block records representative C1c counters for
+      // this shape/mode. Reading the counters inside the timed loop
+      // would benchmark introspection overhead instead of rendering.
+      rt_graph_process(g, nframes);
+      observed.parallel_bands =
+          rt_graph_test_last_parallel_band_count(g);
+      observed.parallel_entries =
+          rt_graph_test_last_parallel_entry_count(g);
+      observed.serialized_sink_bands =
+          rt_graph_test_last_serialized_free_band_count(g);
+      drain_into_sink(g, nframes, scratch);
+    }
+
+    rt_graph_destroy(g);
+  }
+
+  std::sort(ns_per_block.begin(), ns_per_block.end());
+  observed.ns_per_block = ns_per_block[ns_per_block.size() / 2];
+  observed.ns_per_sample =
+      observed.ns_per_block / static_cast<double>(nframes);
+  return observed;
+}
+
 }  // namespace
 
 int main() {
@@ -368,6 +614,37 @@ int main() {
                     shape.name, nframes, voices, base, "-");
         std::printf("%-14s,fused    ,%4d,%3d,%9.2f,%5.2fx\n",
                     shape.name, nframes, voices, fused, speedup);
+      }
+    }
+  }
+
+  std::printf("\n# rt_graph_bench: §4.E schedule-worker microbench\n");
+  std::printf("# schedule_warmup_blocks=%d, schedule_repeat_runs=%d\n",
+              kScheduleWarmupBlocks, kScheduleRepeatRuns);
+  std::printf(
+      "# columns: shape,mode,block,voices,ns_per_block,ns_per_sample,"
+      "parallel_bands,parallel_entries,serialized_sink_bands,speedup\n");
+
+  for (const auto &shape : kScheduleShapes) {
+    for (const int voices : kScheduleVoiceCounts) {
+      for (const int nframes : kScheduleBlockSizes) {
+        double legacy_ns_per_block = 0.0;
+        for (const auto &mode : kScheduleModes) {
+          const ScheduleBenchResult result =
+              run_schedule_cell(shape, mode, nframes, voices);
+          if (!mode.global_schedule && !mode.reduction) {
+            legacy_ns_per_block = result.ns_per_block;
+          }
+          const double speedup = result.ns_per_block > 0.0
+              ? legacy_ns_per_block / result.ns_per_block
+              : 0.0;
+          std::printf(
+              "%-12s,%-20s,%4d,%3d,%12.2f,%9.2f,%3d,%4d,%3d,%5.2fx\n",
+              shape.name, mode.name, nframes, voices,
+              result.ns_per_block, result.ns_per_sample,
+              result.parallel_bands, result.parallel_entries,
+              result.serialized_sink_bands, speedup);
+        }
       }
     }
   }
