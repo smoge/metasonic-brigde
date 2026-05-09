@@ -25,7 +25,7 @@ only for compiling structure.
 
 # Next Steps
 
-## 0 — Current State (2026-05-08)
+## 0 — Current State (2026-05-09)
 
 What already works:
 
@@ -112,9 +112,11 @@ Known limitations:
   the signal grows.
 - Region-level parallelism is test-gated (§4.E): the runtime now has
   global schedule metadata, band construction, a worker-pool scaffold,
-  and opt-in Free-band dispatch under the test ABI. It is not a
-  realtime-safe default yet; bench data decides whether and where it
-  turns on outside tests.
+  and opt-in Free-band dispatch under the test ABI. The first bench /
+  corpus refresh is complete: worker dispatch is observable from the
+  Haskell-loaded corpus, but only through targeted probes, and the
+  measured dispatched rows are still slower than legacy serial. It is
+  not a realtime-safe default and stays test/bench gated.
 - Whole-region kernel /codegen/ (auto-generated DSP bodies) is
   deferred indefinitely. Hand-written kernel bodies plus narrow
   helpers (`SinkAccumulator`, `drive_oscillator`) cover the proven
@@ -415,13 +417,17 @@ parked until that signal grows.
 What's in progress: §4.E (region-level parallelism —
 independent regions / templates on separate threads). The
 schedule metadata, global schedule, deterministic reduction
-substrate, and test-gated worker Free-band dispatch are now in
-place. The next decision is not more structure; it is bench data:
-measure whether the worker path beats global-serial execution
-for real Free-band widths and DSP loads before exposing or
-defaulting it. §4.D's descriptive metadata remains in place and
-feeds future scheduling decisions; the block-rate execution path
-stays parked until the per-port survey signal grows.
+substrate, test-gated worker Free-band dispatch, synthetic bench,
+Haskell-loaded worker bench, and first corpus-evolution probes are
+now in place. The current turn-on decision is negative:
+worker dispatch remains test/bench gated because the only
+Haskell-loaded rows that actually enter worker dispatch are
+targeted probes and still lose. The next decision is narrower:
+either add less synthetic corpus shapes with enough work to make
+worker dispatch plausible, or investigate region-level dispatch
+inside one `FreeLayer` step. §4.D's descriptive metadata remains
+in place and feeds future scheduling decisions; the block-rate
+execution path stays parked until the per-port survey signal grows.
 
 What's deferred indefinitely: whole-region kernel /codegen/.
 Hand-written DSP bodies plus narrow helpers (`SinkAccumulator`,
@@ -613,7 +619,7 @@ does not strictly require §4.D and can ship with conservative
 scheduling. The §4.D descriptive metadata stays in place to feed
 whatever decisions §4.E eventually makes.
 
-### 4.E Region-level parallelism — runtime substrate test-gated, bench next
+### 4.E Region-level parallelism — runtime substrate test-gated, default off
 
 Independent regions (no shared bus hazards) can run on separate
 threads. Another design difference from sc3/supernova: this is
@@ -668,24 +674,73 @@ Current status:
    equivalence. This path is still marked non-RT-safe because the
    dispatch primitive uses a mutex/condition-variable join on the
    audio thread.
+8. **Bench and turn-on decision — done, default-off.**
+   The C++ synthetic bench and Haskell-loaded worker bench are in
+   place. Synthetic sink-free Free-band compute only wins at enough
+   width / block work; reduction-backed sink dispatch loses on the
+   measured grid. The fixed Haskell-loaded corpus now contains two
+   width-2 direct C1c candidates (`dirC1c=2`, `redC1c=0`), and the
+   worker bench now records actual worker dispatch
+   (`worker_rows_with_parallel=2`, `parallel_bands=2`,
+   `parallel_entries=6`), but only through targeted probes and with
+   sub-1.0x parallel speedup. The decision note is
+   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md`.
 
 Next §4.E slice:
 
-1. **Bench worker scheduling before promotion.** Extend
-   `tools/rt_graph_bench.cpp` (or add a companion bench mode) to
-   compare legacy serial, global-schedule serial, and global
-   schedule + worker pool sizes 2/3/4. Report per-block timing
-   plus the schedule counters already exposed by the test ABI:
-   parallel bands, parallel entries, and serialized sink bands.
-2. **Decide turn-on policy from data.** Use the bench to find the
-   Free-band width / DSP-weight crossover point and to quantify
-   mutex/cv wakeup overhead. Until that evidence exists, worker
-   dispatch stays test/bench gated and is not a default runtime
-   path.
-3. **Only then relax gates, if justified.** Candidate follow-ups
-   are a public runtime opt-in, narrower worker wakeup mechanics,
-   or Phase-D live-bus writer relaxation. Each one needs fresh
-   equivalence coverage and benchmarks.
+1. **Corpus evolution with less synthetic worker shapes.** Add or
+   identify real Haskell-loaded demos / survey rows with width >= 2
+   sink-free Free bands and enough per-entry DSP work to have a
+   plausible crossover point. Rerun `--fusion-survey` and
+   `--worker-bench`; use counter data (`parallel_bands`,
+   `parallel_entries`) as the authority before timing ratios.
+   Concrete target shapes are end-user synthesis patterns the current
+   corpus lacks, not predicates constructed to satisfy the gate:
+     - polyphonic synth with shared master FX (N voice templates →
+       BusOut → master template BusIn → master FX → Out);
+     - parallel FX rack (split → N parallel processing chains → join);
+     - multi-band processing (input → N band splits → per-band chains
+       → join);
+     - drum machine (N drum templates writing the same master BusOut).
+2. **C1d investigation: region-level dispatch inside a `FreeLayer`.**
+   Conditional on step 1 surfacing FreeLayer steps with multiple
+   regions per instance. `sched/parallel-compute-before-master`
+   exposes useful region-layer width before a later sink barrier, but
+   C1c dispatches one global schedule entry at a time. If the
+   evolved corpus has multi-region FreeLayer steps, decide whether
+   the runtime should split a single `FreeLayer` step into region
+   work units, and write the equivalence/lifecycle tests before
+   changing dispatch. If the corpus produces only single-region
+   FreeLayer steps, this is a non-issue and can be dropped.
+3. **Realtime-safe dispatch mechanics, only after useful workload
+   exists.** The current pool path still uses mutex/cv wake + join on
+   the audio thread. Prototype a narrower realtime-safe primitive only
+   if the corpus/bench refresh finds worker-dispatchable rows that
+   actually win. Note the bench-pessimism risk: if post-corpus rows
+   land in the borderline-negative range (≈ 0.7–0.95x), prototype a
+   thinner primitive before concluding parallelism doesn't pay. Sub-
+   1.0x with the current primitive is not equivalent to "parallelism
+   is futile" — it can also mean "wake/join overhead is masking
+   speedup that a leaner primitive would expose."
+4. **No public switch or default-on path yet.** Do not expose worker
+   scheduling outside the test/bench ABI until a successor decision
+   record replaces the current default-off decision with explicit
+   corpus and threshold criteria.
+
+**Stop condition.** After two corpus + bench iterations with no row
+showing > 1.0x parallel speedup (counter-confirmed `parallel_bands
+> 0`), freeze Phase C as test/bench gated and revisit only when a
+specific use case demands runtime parallelism. This bounds the work;
+the absence of such a bound is how parallelism projects accrete
+indefinitely.
+
+**The C0–C1 substrate has value independent of parallel dispatch.**
+Even if Phase C parallelism never ships, the global schedule, banded
+view, lifecycle hoist, and writer-slot pre-assignment are the
+substrate for deterministic bus reduction (§4.E.2 fold ordering),
+schedule introspection (`--fusion-survey` corpus worker-band table),
+and future RCU-style topology swap (Phase 5). A "no parallelism"
+outcome would not retire that infrastructure.
 
 ---
 
