@@ -896,6 +896,52 @@ surveyShapeProbes =
         a      <- gain p (Param 0.3)
         out 0 a )
 
+  -- ── sched/: §4.E.C1c worker-band probes ──────────────────────
+  , ( "sched/free-only-parallel-compute"
+    , runSynth $ do
+        -- Two independent buffer-terminal compute chains and no
+        -- sink. Region-kernel selection keeps each Saw→LPF→Gain
+        -- chain as a separate sink-free region; the layered
+        -- schedule can put them in the same FreeLayer. This is a
+        -- Haskell-loaded counterpart to the C1c free-compute bench:
+        -- direct mode can dispatch it without deterministic bus
+        -- reduction, provided there are multiple live instances to
+        -- make the runtime global band multi-entry.
+        s1 <- sawOsc 110.0 0.0
+        f1 <- lpf s1 (Param 800.0)  (Param 4.0)
+        _  <- gain f1 (Param 0.4)
+
+        s2 <- sawOsc 220.0 0.0
+        f2 <- lpf s2 (Param 1200.0) (Param 4.0)
+        _  <- gain f2 (Param 0.3)
+        pure () )
+
+  , ( "sched/parallel-compute-before-master"
+    , runSynth $ do
+        -- Real output-bearing target shape for corpus evolution:
+        -- two independent sink-free compute regions are ready
+        -- before a later master sink barrier. One branch feeds a
+        -- dependent follow-up filter, the other is independent, so
+        -- the layered schedule has a width-2 FreeLayer before the
+        -- final Add→Out path. This proves the corpus can now expose
+        -- the shape "independent compute before a later barrier",
+        -- even though C1c's current runtime dispatch unit is still
+        -- a global schedule entry rather than each region inside one
+        -- FreeLayer step.
+        s1 <- sawOsc 110.0 0.0
+        f1 <- lpf s1 (Param 800.0)  (Param 4.0)
+        g1 <- gain f1 (Param 0.4)
+
+        f2 <- lpf g1 (Param 1500.0) (Param 4.0)
+        g2 <- gain f2 (Param 0.4)
+
+        s3 <- sawOsc 220.0 0.0
+        f3 <- lpf s3 (Param 1000.0) (Param 4.0)
+        g3 <- gain f3 (Param 0.4)
+
+        summed <- add g2 g3
+        out 0 summed )
+
   -- ── neg/: structural negatives ────────────────────────────────
   , ( "neg/shared-producer-two-gains"
     , runSynth $ do

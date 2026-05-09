@@ -5,7 +5,8 @@ module MetaSonic.App.WorkerBench
   ) where
 
 import           Control.Exception          (evaluate)
-import           Control.Monad              (forM, forM_, replicateM, when)
+import           Control.Monad              (forM, forM_, replicateM,
+                                             replicateM_, when)
 import           Data.List                  (nub, sort, sortOn)
 import           Data.Maybe                 (mapMaybe)
 import           Foreign                    (allocaArray, castPtr, peekArray)
@@ -26,14 +27,16 @@ import           MetaSonic.Types            (NodeKind (..))
 
 data BenchCase
   = RuntimeCase
-      { bcName     :: !String
-      , bcLoader   :: !String
-      , bcRuntime  :: !RuntimeGraph
+      { bcName           :: !String
+      , bcLoader         :: !String
+      , bcRuntime        :: !RuntimeGraph
+      , bcExtraInstances :: !Int
       }
   | TemplateCase
-      { bcName     :: !String
-      , bcLoader   :: !String
-      , bcTemplate :: !TemplateGraph
+      { bcName           :: !String
+      , bcLoader         :: !String
+      , bcTemplate       :: !TemplateGraph
+      , bcExtraInstances :: !Int
       }
 
 data BenchMode = BenchMode
@@ -60,10 +63,9 @@ kWorkerBenchWarmupBlocks = 8
 kWorkerBenchBlocks :: Int
 kWorkerBenchBlocks = 32
 
--- Median-of-three is enough for the current negative decision
--- because the counter summary says no Haskell-loaded row enters
--- worker dispatch. Increase this before using the bench to justify
--- a positive/default-on policy.
+-- Median-of-three is enough for the current negative/default-off
+-- decision because the counter summary is the primary signal. Increase
+-- this before using the bench to justify a positive/default-on policy.
 kWorkerBenchRepeats :: Int
 kWorkerBenchRepeats = 3
 
@@ -85,7 +87,9 @@ runWorkerBench demos = do
           <> ", warmup_blocks=" <> show kWorkerBenchWarmupBlocks
           <> ", blocks=" <> show kWorkerBenchBlocks
           <> ", repeat_runs=" <> show kWorkerBenchRepeats
-  putStrLn "# note: ns_per_block includes equal output-bus readback in every mode; speedup ratios are the intended signal."
+  putStrLn $ "# note: ns_per_block includes equal output-bus readback "
+          <> "in every mode for graphs that touch buses; bus-less "
+          <> "compute probes read no buses."
   putStrLn "# columns: case,loader,mode,ns_per_block,ns_per_sample,parallel_bands,parallel_entries,serialized_sink_bands,speedup"
   rows <- concat <$> forM cases (\c -> do
     results <- forM kWorkerBenchModes $ \mode -> do
@@ -141,7 +145,11 @@ workerBenchCases demos = do
   demoCases <- concat <$> traverse demoCasesFor demos
   shapeCases <-
     traverse
-      (\(name, graph) -> runtimeCase ("corpus:" <> name) graph)
+      (\(name, graph) ->
+          runtimeCaseWithInstances
+            ("corpus:" <> name)
+            (workerBenchExtraInstances name)
+            graph)
       surveyShapeProbes
   ensembleCases <-
     traverse
@@ -149,6 +157,10 @@ workerBenchCases demos = do
           templateCase ("corpus:" <> name) templates)
       surveyEnsembleCorpus
   pure (demoCases <> shapeCases <> ensembleCases)
+
+workerBenchExtraInstances :: String -> Int
+workerBenchExtraInstances "sched/free-only-parallel-compute" = 2
+workerBenchExtraInstances _                                  = 0
 
 demoCasesFor :: Demo -> Either String [BenchCase]
 demoCasesFor demo = case demoBody demo of
@@ -161,21 +173,27 @@ demoCasesFor demo = case demoBody demo of
     in (: []) <$> runtimeCase ("demo:" <> demoKey demo) graph
 
 runtimeCase :: String -> SynthGraph -> Either String BenchCase
-runtimeCase name graph = do
+runtimeCase name =
+  runtimeCaseWithInstances name 0
+
+runtimeCaseWithInstances :: String -> Int -> SynthGraph -> Either String BenchCase
+runtimeCaseWithInstances name extra graph = do
   rg <- lowerGraph graph >>= compileRuntimeGraph
   pure RuntimeCase
-    { bcName    = name
-    , bcLoader  = "loadRuntimeGraph"
-    , bcRuntime = rg
+    { bcName           = name
+    , bcLoader         = "loadRuntimeGraph"
+    , bcRuntime        = rg
+    , bcExtraInstances = max 0 extra
     }
 
 templateCase :: String -> [(String, SynthGraph)] -> Either String BenchCase
 templateCase name templates = do
   tg <- compileTemplateGraph templates
   pure TemplateCase
-    { bcName     = name
-    , bcLoader   = "loadTemplateGraph"
-    , bcTemplate = tg
+    { bcName           = name
+    , bcLoader         = "loadTemplateGraph"
+    , bcTemplate       = tg
+    , bcExtraInstances = 0
     }
 
 runBenchMode :: BenchCase -> BenchMode -> IO BenchResult
@@ -219,8 +237,15 @@ runBenchOnce c mode =
       }
 
 loadCase :: Ptr RTGraph -> BenchCase -> IO ()
-loadCase handle RuntimeCase{bcRuntime = rg} =
+loadCase handle RuntimeCase{ bcName = name
+                           , bcRuntime = rg
+                           , bcExtraInstances = extra
+                           } = do
   loadRuntimeGraph handle rg
+  replicateM_ extra $ do
+    slot <- c_rt_graph_template_instance_add handle 0
+    when (slot < 0) $
+      fail $ "worker bench: failed to add extra instance for " <> name
 loadCase handle TemplateCase{bcTemplate = tg} =
   loadTemplateGraph handle tg
 
@@ -254,7 +279,8 @@ relevantBuses rt =
           let i = truncate b :: Int
           in if i >= 0 then Just i else Nothing
         [] -> Nothing
-  in sort (nub (0 : mapMaybe idxOf (filter touchesBus (rgNodes rt))))
+      buses = mapMaybe idxOf (filter touchesBus (rgNodes rt))
+  in if null buses then [] else sort (nub (0 : buses))
 
 runBlocks :: Ptr RTGraph -> Int -> [Int] -> IO Double
 runBlocks handle blocks buses =

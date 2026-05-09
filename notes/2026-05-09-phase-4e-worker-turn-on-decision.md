@@ -2,7 +2,8 @@
 
 Date: 2026-05-09
 Status: Decision recorded after the C1c bench slice; refreshed after
-representative Haskell-loaded survey / bench data.
+representative Haskell-loaded survey / bench data and after the first
+corpus-evolution worker-shape probes.
 Inputs:
 
 - `2c737ce Benchmark global schedule worker dispatch`
@@ -11,6 +12,8 @@ Inputs:
   equivalence under `pool_size=3`
 - `3c77d0e Survey corpus schedule worker width`
 - `246ac6a Benchmark Haskell-loaded worker schedules`
+- corpus-evolution slice: `sched/free-only-parallel-compute` and
+  `sched/parallel-compute-before-master`
 
 ## Decision
 
@@ -62,52 +65,68 @@ current test/bench substrate and not acceptable as a default audio path.
 
 ## Representative-data refresh
 
-The follow-up survey / bench work closes the earlier
-"representative graph data" open item.
+The follow-up survey / bench work first showed that the fixed corpus
+had no worker-dispatchable width. The corpus-evolution slice then added
+two targeted Haskell-loaded probes:
+
+- `sched/free-only-parallel-compute`: two independent sink-free compute
+  chains, no bus sink, and extra live instances in `--worker-bench` so
+  the C1c global-entry worker path is actually exercised;
+- `sched/parallel-compute-before-master`: independent sink-free compute
+  before a later master sink barrier. This proves the region-layer
+  corpus can expose the target shape, but the current C1c global-entry
+  dispatcher still does not parallelize that single-instance row.
 
 `stack exec -- metasonic-bridge --fusion-survey` now includes a fixed
 corpus schedule-width table for C1c worker-gate shape:
 
 ```text
-graphs=58  bands=4  sf=4  sink=0  maxSfW=1  maxSinkW=0
-maxWork=1  dirC1c=0  redC1c=0
+graphs=60  bands=7  sf=7  sink=0  maxSfW=2  maxSinkW=0
+maxWork=6  dirC1c=2  redC1c=0
 ```
 
-Interpretation: the current fixed corpus has no width >= 2 free-band
-shape that passes either direct-mode or reduction-mode C1c candidate
-criteria. The only free bands are sink-free, width 1, and single-node
-work.
+Interpretation: the fixed corpus now contains width >= 2 sink-free
+FreeLayer shapes. The direct-mode C1c candidate count is no longer zero.
+There are still no reduction-mode sink-band candidates in the fixed
+corpus.
 
 `stack exec -- metasonic-bridge --worker-bench` loads demos plus the
 fixed corpus through the Haskell FFI path and compares legacy direct,
 schedule-serial, pool direct, and pool reduction modes:
 
 ```text
-cases=52  rows=208  worker_rows=104  worker_rows_with_parallel=0
-parallel_bands=0  parallel_entries=0  serialized_sink_bands=0
-best_parallel_worker_speedup=0.00x
+cases=54  rows=216  worker_rows=108  worker_rows_with_parallel=2
+parallel_bands=2  parallel_entries=6  serialized_sink_bands=0
+best_parallel_worker_speedup=0.68x
 ```
 
-Interpretation: the Haskell-loaded bench never enters the worker
-dispatch path on the current demo + corpus set. Any row where
-`sched-pool3-*` appears faster than legacy is therefore schedule-path
-noise or serial-executor variance, not evidence that workers are paying
-off. Counter data, not speedup alone, is the authority here.
+Interpretation: the Haskell-loaded bench now enters the worker dispatch
+path, but only for the intentionally multi-instance
+`sched/free-only-parallel-compute` probe. That probe loses in both pool
+modes in the measured run (`best_parallel_worker_speedup=0.68x`).
+Rows that look faster while `parallel_bands=0` remain schedule-path
+noise or serial-executor variance. Counter data, not speedup alone, is
+the authority here.
 
 ## Next allowed work
 
 The next runtime-parallelism work should be one of:
 
-- corpus evolution: add or identify real Haskell-loaded graphs with
-  width >= 2 sink-free Free bands before doing more worker policy work.
-  Useful targets are independent compute branches before a later
-  barrier, such as parallel modulation/control paths or independent
-  non-sink FX tails before a master sink; parallel `Out` / `BusOut`
-  tails are not the direct-mode target;
+- corpus evolution: add or identify less synthetic Haskell-loaded demos
+  with width >= 2 sink-free Free bands and enough per-entry work to have
+  a plausible crossover point. The first targeted probes prove the
+  instrumentation can see the shape, but they are not a representative
+  default-on basis;
+- region-level dispatch investigation: decide whether a future C1d
+  should dispatch regions inside a single `FreeLayer` step. The
+  `sched/parallel-compute-before-master` probe exposes this width in the
+  survey, but the current C1c runtime dispatch unit is one global
+  schedule entry, so the bench does not parallelize the single-instance
+  row;
 - dispatch mechanics: prototype a realtime-safer worker wake/join
-  strategy only if a later corpus refresh produces worker-dispatchable
-  graph shapes, then rerun both the C++ synthetic grid and
-  `--worker-bench`;
+  strategy only after a later corpus refresh produces worker-dispatchable
+  graph shapes that actually win, then rerun both the C++ synthetic grid
+  and `--worker-bench`;
 - policy prototype under the test ABI only, and only after representative
   rows actually enter worker dispatch: sink-free bands, no reduction,
   minimum width/work threshold, and full T-9 equivalence.
@@ -115,6 +134,6 @@ The next runtime-parallelism work should be one of:
 Do not make a public switch or default-on change until a later decision
 record replaces this one. That successor record must define the
 representative corpus and threshold explicitly; this note only records the
-current negative decision. As of this refresh, the threshold is not merely
-unmet; the representative Haskell-loaded path has zero worker-dispatched
-bands.
+current negative decision. As of this refresh, worker dispatch is
+observable from the Haskell-loaded corpus, but the only dispatched rows
+are targeted probes and the measured parallel speedup is below 1.0x.
