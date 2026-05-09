@@ -62,6 +62,10 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_test_global_schedule_entry_instance,
                                             c_rt_graph_test_global_schedule_entry_step,
                                             c_rt_graph_test_global_schedule_entry_template,
+                                            c_rt_graph_test_global_schedule_band_count,
+                                            c_rt_graph_test_global_schedule_band_entry_count,
+                                            c_rt_graph_test_global_schedule_band_first_entry,
+                                            c_rt_graph_test_global_schedule_band_kind,
                                             c_rt_graph_test_set_global_schedule_execution,
                                             c_rt_graph_test_set_reduction_capture,
                                             c_rt_graph_test_template_schedule_step_count,
@@ -90,6 +94,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , c0aLoaderMetadataTests
   , c0bGlobalScheduleTests
   , c0cScheduleExecutorTests
+  , c0dGlobalScheduleBandTests
   ]
 
 ------------------------------------------------------------
@@ -7617,6 +7622,65 @@ readGlobalSchedule h = do
     p <- c_rt_graph_test_global_schedule_entry_step      h i
     pure (fromIntegral t, fromIntegral s, fromIntegral p)
 
+-- | Read every C0d global-schedule band as
+-- (kind, first_entry, entry_count), where kind is 0 = Barrier and
+-- 1 = Free.
+readGlobalScheduleBands :: Ptr RTGraph -> IO [(Int, Int, Int)]
+readGlobalScheduleBands h = do
+  cnt <- c_rt_graph_test_global_schedule_band_count h
+  forM [0 .. fromIntegral cnt - 1] $ \i -> do
+    k <- c_rt_graph_test_global_schedule_band_kind h i
+    f <- c_rt_graph_test_global_schedule_band_first_entry h i
+    n <- c_rt_graph_test_global_schedule_band_entry_count h i
+    pure (fromIntegral k, fromIntegral f, fromIntegral n)
+
+-- | Assert the C0d band vector is a conservative, contiguous
+-- partition of the C0b entry vector. Barrier bands must be singleton
+-- barrier steps. Free bands must contain only FreeLayer steps and
+-- cannot contain two entries for the same instance slot.
+assertGlobalScheduleBandsWellFormed :: String -> Ptr RTGraph -> Assertion
+assertGlobalScheduleBandsWellFormed label h = do
+  entries <- readGlobalSchedule h
+  bands   <- readGlobalScheduleBands h
+
+  let ranges =
+        concat
+          [ [first .. first + count - 1]
+          | (_kind, first, count) <- bands
+          ]
+      expectedRange = [0 .. length entries - 1]
+  ranges @?= expectedRange
+
+  forM_ (zip [0 :: Int ..] bands) $ \(bandIndex, (kind, first, count)) -> do
+    assertBool
+      (label <> ": band " <> show bandIndex <> " has non-positive count")
+      (count > 0)
+    assertBool
+      (label <> ": band " <> show bandIndex <> " starts out of range")
+      (first >= 0 && first + count <= length entries)
+    let slice = take count (drop first entries)
+    stepKinds <- forM slice $ \(tid, _slot, step) ->
+      c_rt_graph_test_template_schedule_step_kind h
+        (fromIntegral tid) (fromIntegral step)
+    case kind of
+      0 -> do
+        count @?= 1
+        stepKinds @?= [0]
+      1 -> do
+        stepKinds @?= replicate count 1
+        let slots = [slot | (_tid, slot, _step) <- slice]
+        slots @?= nub slots
+      _ -> assertFailure
+             (label <> ": unexpected band kind " <> show kind)
+
+  let over = fromIntegral (length bands) :: CInt
+  badKind <- c_rt_graph_test_global_schedule_band_kind h over
+  badFirst <- c_rt_graph_test_global_schedule_band_first_entry h over
+  badCount <- c_rt_graph_test_global_schedule_band_entry_count h over
+  badKind @?= -1
+  badFirst @?= -1
+  badCount @?= -1
+
 -- | Pure expectation for a single-template graph: emit
 -- (0, slot, step) triples for every (slot in @slots@, step in
 -- the layered schedule), in slot-then-step order. Steps come from
@@ -7961,3 +8025,98 @@ c0cScheduleExecutorTests =
              s2 <- c_rt_graph_instance_status handle 0
              s2 @?= (-1)
        ]
+
+------------------------------------------------------------
+-- Phase 4.E.2.C0d: global-schedule runnable bands
+------------------------------------------------------------
+--
+-- C0d is still descriptive: the executor remains C0c's serial walk
+-- over the flat global schedule. The runtime now also derives a
+-- banded view that Phase C can later consume as worker dispatch
+-- groups. The conservative v1 rule is intentionally narrow:
+-- barriers are singleton serial bands, and a free band contains only
+-- FreeLayer entries with at most one step per instance slot. That
+-- avoids violating per-instance layer order without shipping the full
+-- region dependency graph to the runtime.
+
+c0dGlobalScheduleBandTests :: TestTree
+c0dGlobalScheduleBandTests =
+  testGroup "Phase 4.E.2.C0d: global-schedule runnable bands"
+    [ testCase "fresh handle: empty bands" $
+        withRTGraph 4 256 $ \handle -> do
+          c_rt_graph_process handle 256
+          entries <- readGlobalSchedule handle
+          bands   <- readGlobalScheduleBands handle
+          entries @?= []
+          bands   @?= []
+
+    , testCase "bands form a conservative partition" $ do
+        (rg, _) <- compileBoth "chain" chainGraph
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          c_rt_graph_process handle 256
+          assertGlobalScheduleBandsWellFormed "chain" handle
+
+    , testCase "free-only instances share one band" $ do
+        let computeOnly = runSynth $ do
+              o <- sinOsc 110.0 0.0
+              _ <- gain o 0.25
+              pure ()
+        rg <- case lowerGraph computeOnly >>= compileRuntimeGraph of
+          Right r  -> pure r
+          Left err -> assertFailure ("compute-only compile: " <> err)
+                      >> error "unreachable"
+        steps <- case layeredRegionSchedule rg of
+          Right ss -> pure ss
+          Left err -> assertFailure
+                        ("compute-only layered schedule: " <> err)
+                      >> error "unreachable"
+        let expectedFreeOnly =
+              case steps of
+                [ScheduleFreeLayer _] -> True
+                _                     -> False
+        assertBool
+          ("expected compute-only graph to be one free layer, got "
+           <> show steps)
+          expectedFreeOnly
+
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          _ <- c_rt_graph_template_instance_add handle 0
+          _ <- c_rt_graph_template_instance_add handle 0
+          c_rt_graph_process handle 256
+          entries <- readGlobalSchedule handle
+          entries @?= expectedGlobalRG rg [0, 1, 2]
+          bands <- readGlobalScheduleBands handle
+          bands @?= [(1, 0, 3)]
+          assertGlobalScheduleBandsWellFormed "compute-only" handle
+
+    , testCase "same-instance free layers split before barrier" $ do
+        rg <- case lowerGraph divergentLayerGraph >>= compileRuntimeGraph of
+          Right r  -> pure r
+          Left err -> assertFailure ("c0d divergent compile: " <> err)
+                      >> error "unreachable"
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          c_rt_graph_process handle 256
+          entries <- readGlobalSchedule handle
+          entries @?= expectedGlobalRG rg [0]
+          bands <- readGlobalScheduleBands handle
+          bands @?= [(1, 0, 1), (1, 1, 1), (0, 2, 1)]
+          assertGlobalScheduleBandsWellFormed "divergent" handle
+
+    , testCase "reload clears prior band snapshot" $ do
+        (rgChain,  _) <- compileBoth "chain"  chainGraph
+        (rgSimple, _) <- compileBoth "simple" simpleGraph
+        let totalNodes = max (length (rgNodes rgChain))
+                             (length (rgNodes rgSimple))
+        withRTGraph totalNodes 256 $ \handle -> do
+          loadRuntimeGraph handle rgChain
+          c_rt_graph_process handle 256
+          firstCount <- c_rt_graph_test_global_schedule_band_count handle
+          assertBool "expected non-empty bands after first load"
+                     (firstCount > 0)
+          loadRuntimeGraph handle rgSimple
+          c_rt_graph_process handle 256
+          assertGlobalScheduleBandsWellFormed "simple after reload" handle
+    ]

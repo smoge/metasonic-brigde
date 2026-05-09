@@ -870,10 +870,11 @@ struct RegionSpec {
 };
 
 // Phase §4.E.2.C0a: descriptive layered-schedule shape over the
-// template's registered RegionSpec vector. The runtime stores this
-// as metadata only — process_instance still iterates def->regions
-// in registration (= scheduled) order. C0b will build the per-block
-// global schedule from these steps; until then this is observational.
+// template's registered RegionSpec vector. C0b builds the per-block
+// global schedule from these steps, C0c can consume that schedule as a
+// serial executor under a test switch, and C0d derives descriptive
+// runnable bands. The default production executor remains the legacy
+// deterministic linear path until Phase C worker dispatch lands.
 //
 // `kind` matches the Haskell ScheduleStep tags:
 //   Barrier   = 0  (a single pinned region between free segments)
@@ -933,6 +934,27 @@ struct GlobalScheduleEntry {
   int step_index    = 0;
 };
 
+// Phase §4.E.2.C0d: one contiguous run of entries from
+// RTGraph::global_schedule with the same execution policy. This is
+// still descriptive: process_graph does not dispatch workers yet.
+//
+//   Barrier = exactly one canonical GlobalScheduleEntry whose
+//             ScheduleStepSpec is a barrier; must run serially.
+//   Free    = one or more canonical GlobalScheduleEntry values whose
+//             ScheduleStepSpec is FreeLayer and that the conservative
+//             v1 rule would be allowed to hand to a worker dispatch
+//             group. The C0d rule avoids putting two steps from the
+//             same instance in one band; that preserves per-instance
+//             layer order without needing a runtime copy of
+//             regionDependencies.
+enum class GlobalScheduleBandKind : int { Barrier = 0, Free = 1 };
+
+struct GlobalScheduleBand {
+  GlobalScheduleBandKind kind = GlobalScheduleBandKind::Barrier;
+  int first_entry = 0;
+  int entry_count = 0;
+};
+
 struct MetaDef {
   int max_frames = 0;
   std::vector<NodeSpec> nodes;
@@ -959,9 +981,8 @@ struct MetaDef {
   // `regions`, populated by rt_graph_template_add_schedule_step
   // during construction. Empty for templates the loader did not
   // ship a schedule for (e.g. C++ doctests built directly via
-  // rt_graph_add_region). Process_instance ignores this in C0a;
-  // C0b will consume it to build a per-block global schedule from
-  // (active instance × schedule step). Each step's
+  // rt_graph_add_region). C0b consumes it to build a per-block
+  // global schedule from (active instance × schedule step). Each step's
   // [first_item, first_item + item_count) range slices
   // `schedule_step_regions`, whose entries are ordinals into
   // `regions`. The indirection is load-bearing: a free layer's
@@ -1833,9 +1854,18 @@ struct RTGraph {
   // Capacity is reserved off the audio thread by
   // ensure_global_schedule_capacity, called from every construction
   // mutation that can affect the high-water bound. The audio path
-  // (build_global_schedule) only does clear() + push_back into
-  // already-reserved space, so it never allocates.
+  // (build_global_schedule / build_global_schedule_bands) only does
+  // clear() + push_back into already-reserved space, so it never
+  // allocates.
   std::vector<GlobalScheduleEntry> global_schedule;
+
+  // Phase §4.E.2.C0d: descriptive runnable bands over global_schedule.
+  // Each band stores a contiguous [first_entry, first_entry +
+  // entry_count) slice. Barrier bands are singletons; free bands are
+  // conservative dispatch candidates for Phase C. Built once per
+  // block after global_schedule, exposed only through test
+  // introspection, and not consumed by the executor yet.
+  std::vector<GlobalScheduleBand> global_schedule_bands;
 };
 
 namespace {
@@ -2222,9 +2252,9 @@ required_global_schedule_entries(const RTGraph &g) noexcept {
 }
 
 // Grow-only reserve on the global_schedule vector so build_global_schedule
-// (which runs on the audio thread) can clear() + push_back() without
-// allocating. Called from every construction mutation that can affect
-// the bound:
+// and build_global_schedule_bands (which run on the audio thread) can
+// clear() + push_back() without allocating. Called from every
+// construction mutation that can affect the bound:
 //   * rt_graph_template_add                (no-op: new template has 0 steps)
 //   * rt_graph_template_set_polyphony
 //   * rt_graph_template_add_schedule_step  (steps grows on each push)
@@ -2232,12 +2262,16 @@ required_global_schedule_entries(const RTGraph &g) noexcept {
 // larger one is a no-op — so set_polyphony lowering the cap leaves the
 // already-allocated capacity intact, matching the contribution-storage
 // invariant. Also indirectly from rt_graph_clear via
-// reset_to_default_state's global_schedule.clear() (which keeps
-// capacity); the next mutation re-tightens the bound.
+// reset_to_default_state's global_schedule / global_schedule_bands
+// clear() calls (which keep capacity); the next mutation re-tightens
+// the bound. Band count is bounded by entry count because each band
+// contains at least one entry.
 static void ensure_global_schedule_capacity(RTGraph &g) {
   const int required = required_global_schedule_entries(g);
   if (required > 0) {
-    g.global_schedule.reserve(static_cast<std::size_t>(required));
+    const auto n = static_cast<std::size_t>(required);
+    g.global_schedule.reserve(n);
+    g.global_schedule_bands.reserve(n);
   }
 }
 
@@ -4946,6 +4980,107 @@ static void build_global_schedule(RTGraph &g) noexcept {
   }
 }
 
+static const ScheduleStepSpec *
+schedule_step_for_entry(
+    const RTGraph &g, const GlobalScheduleEntry &entry
+) noexcept {
+  if (entry.template_id < 0 || entry.step_index < 0) return nullptr;
+  const std::size_t tid = static_cast<std::size_t>(entry.template_id);
+  if (tid >= g.defs.size()) return nullptr;
+  const auto &steps = g.defs[tid].schedule_steps;
+  const std::size_t step = static_cast<std::size_t>(entry.step_index);
+  if (step >= steps.size()) return nullptr;
+  return &steps[step];
+}
+
+static bool global_schedule_entry_is_free(
+    const RTGraph &g, const GlobalScheduleEntry &entry
+) noexcept {
+  const ScheduleStepSpec *step = schedule_step_for_entry(g, entry);
+  return step && step->kind == ScheduleStepKind::FreeLayer;
+}
+
+static bool free_entry_conflicts_with_band(
+    const RTGraph &g, const GlobalScheduleEntry &entry,
+    int first_entry, int entry_count
+) noexcept {
+  if (entry_count <= 0) return false;
+  const std::size_t first = static_cast<std::size_t>(first_entry);
+  const std::size_t count = static_cast<std::size_t>(entry_count);
+  if (first > g.global_schedule.size()
+      || count > g.global_schedule.size() - first) {
+    return true;
+  }
+
+  for (std::size_t i = 0; i < count; ++i) {
+    const GlobalScheduleEntry &member = g.global_schedule[first + i];
+    // Conservative C0d rule: do not put two schedule steps from the
+    // same instance in one dispatch band. Consecutive FreeLayer steps
+    // in one instance are layer-ordered; grouping them would require
+    // the dependency graph at runtime, which C0d deliberately does not
+    // ship yet.
+    if (member.instance_slot == entry.instance_slot) return true;
+  }
+  return false;
+}
+
+// Phase §4.E.2.C0d: build descriptive runnable bands over the C0b
+// global schedule. This is still metadata: C0c execution keeps walking
+// global_schedule serially. Phase C can later consume the Free bands as
+// worker dispatch groups and keep Barrier bands on the audio thread.
+//
+// The v1 conservative grouping rule is:
+//   * Barrier steps are singleton serial bands.
+//   * FreeLayer steps may join the current free band only if that band
+//     does not already contain another step for the same instance.
+//
+// Haskell's per-template layeredRegionSchedule has already enforced
+// intra-step independence; live-bus steps are barriers; and structural
+// dependencies across instances/templates do not exist. Avoiding
+// duplicate instance slots is the remaining runtime-side condition
+// needed to preserve per-instance layer order without re-running
+// regionDependencies on the audio thread.
+static void build_global_schedule_bands(RTGraph &g) noexcept {
+  g.global_schedule_bands.clear();
+
+  int free_start = -1;
+  int free_count = 0;
+
+  auto flush_free = [&]() noexcept {
+    if (free_count <= 0) return;
+    g.global_schedule_bands.push_back(
+        GlobalScheduleBand{GlobalScheduleBandKind::Free,
+                           free_start, free_count});
+    free_start = -1;
+    free_count = 0;
+  };
+
+  const int entry_count = static_cast<int>(g.global_schedule.size());
+  for (int i = 0; i < entry_count; ++i) {
+    const GlobalScheduleEntry &entry =
+        g.global_schedule[static_cast<std::size_t>(i)];
+    if (!global_schedule_entry_is_free(g, entry)) {
+      flush_free();
+      g.global_schedule_bands.push_back(
+          GlobalScheduleBand{GlobalScheduleBandKind::Barrier, i, 1});
+      continue;
+    }
+
+    if (free_count > 0
+        && free_entry_conflicts_with_band(g, entry,
+                                          free_start, free_count)) {
+      flush_free();
+    }
+
+    if (free_count == 0) {
+      free_start = i;
+    }
+    ++free_count;
+  }
+
+  flush_free();
+}
+
 static bool global_schedule_covers_audio_schedule(const RTGraph &g) noexcept {
   for (const GraphInstance &inst : g.instances) {
     const SlotState s = inst.state.load();
@@ -5081,11 +5216,13 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   std::swap(g.server.output_buses, g.server.output_buses_prev);
   clear_output_buses(g.server, nframes);
 
-  // Phase §4.E.2.C0b: rebuild the global schedule from the post-
-  // drain instance-state snapshot. Observational only in C0b; the
-  // executor below still drives execution. See
-  // build_global_schedule.
+  // Phase §4.E.2.C0b/C0d: rebuild the global schedule from the post-
+  // drain instance-state snapshot, then derive conservative runnable
+  // bands over it. The C0c executor below consumes the flat schedule
+  // only when its test switch is enabled; C0d bands are descriptive
+  // until Phase C worker dispatch lands.
   build_global_schedule(g);
+  build_global_schedule_bands(g);
 
   // Per-block execution context. The writer-slot counter every
   // dispatch boundary advances on each sink write resets here so
@@ -5385,13 +5522,14 @@ static void reset_to_default_state(RTGraph &g) {
   g.capture_reduction_mode = false;
   g.execute_global_schedule = false;
 
-  // Phase §4.E.2.C0b: drop the previous block's global schedule
-  // snapshot. The next process_graph rebuilds it from the
+  // Phase §4.E.2.C0b/C0d: drop the previous block's global schedule
+  // and band snapshots. The next process_graph rebuilds them from the
   // freshly-cleared instance pool (which after reset has only the
   // auto-created instance 0 belonging to template 0, and template
   // 0 has no schedule_steps yet — so the first build produces an
   // empty schedule until a loader ships C0a metadata).
   g.global_schedule.clear();
+  g.global_schedule_bands.clear();
 
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
@@ -5827,6 +5965,48 @@ int rt_graph_test_global_schedule_entry_step(
 ) {
   const auto *e = global_schedule_entry_at(g, entry_index);
   return e ? e->step_index : -1;
+}
+
+// Phase §4.E.2.C0d test surfaces. The band vector is rebuilt in the
+// same process_graph prelude as global_schedule and stores contiguous
+// entry ranges, so tests can recover the entries through the C0b
+// accessors and the per-template step metadata through the C0a
+// accessors.
+int rt_graph_test_global_schedule_band_count(const RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->global_schedule_bands.size());
+}
+
+namespace {
+const GlobalScheduleBand *
+global_schedule_band_at(const RTGraph *g, int band_index) {
+  if (!g) return nullptr;
+  if (band_index < 0) return nullptr;
+  const std::size_t i = static_cast<std::size_t>(band_index);
+  if (i >= g->global_schedule_bands.size()) return nullptr;
+  return &g->global_schedule_bands[i];
+}
+}  // namespace
+
+int rt_graph_test_global_schedule_band_kind(
+    const RTGraph *g, int band_index
+) {
+  const auto *b = global_schedule_band_at(g, band_index);
+  return b ? static_cast<int>(b->kind) : -1;
+}
+
+int rt_graph_test_global_schedule_band_first_entry(
+    const RTGraph *g, int band_index
+) {
+  const auto *b = global_schedule_band_at(g, band_index);
+  return b ? b->first_entry : -1;
+}
+
+int rt_graph_test_global_schedule_band_entry_count(
+    const RTGraph *g, int band_index
+) {
+  const auto *b = global_schedule_band_at(g, band_index);
+  return b ? b->entry_count : -1;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named

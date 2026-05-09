@@ -44,6 +44,11 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_test_global_schedule_entry_template
   , c_rt_graph_test_global_schedule_entry_instance
   , c_rt_graph_test_global_schedule_entry_step
+  , -- * §4.E.2.C0d global schedule bands (test-only introspection)
+    c_rt_graph_test_global_schedule_band_count
+  , c_rt_graph_test_global_schedule_band_kind
+  , c_rt_graph_test_global_schedule_band_first_entry
+  , c_rt_graph_test_global_schedule_band_entry_count
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
   , c_rt_graph_read_bus
@@ -408,6 +413,34 @@ foreign import ccall unsafe "rt_graph_test_global_schedule_entry_instance"
 -- Returns -1 on null g or out-of-range entry_index.
 foreign import ccall unsafe "rt_graph_test_global_schedule_entry_step"
   c_rt_graph_test_global_schedule_entry_step
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | §4.E.2.C0d test surface: number of runnable bands derived from
+-- the most recent C0b global schedule. Bands are contiguous slices of
+-- global-schedule entries: 0 = Barrier singleton, 1 = conservative
+-- Free dispatch candidate. Returns 0 before any process call or on
+-- null g.
+foreign import ccall unsafe "rt_graph_test_global_schedule_band_count"
+  c_rt_graph_test_global_schedule_band_count
+    :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C0d test surface: band kind tag (0 = Barrier, 1 = Free).
+-- Returns -1 on null g or out-of-range band index.
+foreign import ccall unsafe "rt_graph_test_global_schedule_band_kind"
+  c_rt_graph_test_global_schedule_band_kind
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | §4.E.2.C0d test surface: first global-schedule entry covered by
+-- the band. Returns -1 on null g or out-of-range band index.
+foreign import ccall unsafe "rt_graph_test_global_schedule_band_first_entry"
+  c_rt_graph_test_global_schedule_band_first_entry
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | §4.E.2.C0d test surface: number of global-schedule entries
+-- covered by the band. Returns -1 on null g or out-of-range band
+-- index.
+foreign import ccall unsafe "rt_graph_test_global_schedule_band_entry_count"
+  c_rt_graph_test_global_schedule_band_entry_count
     :: Ptr RTGraph -> CInt -> IO CInt
 
 -- | Copy nframes samples from one output bus into the caller's buffer.

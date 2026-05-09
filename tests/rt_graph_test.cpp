@@ -7122,6 +7122,80 @@ TEST_CASE("global schedule executor: no-metadata graph falls back to legacy") {
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase §4.E.2.C0d: descriptive global-schedule runnable bands
+// ----------------------------------------------------------------
+
+TEST_CASE("global schedule bands: free entries from different instances group") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_set_polyphony(g, 0, 3);
+    add_const_node(g, 0, 0.125f, 0.5f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    const int region0[] = {0};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, region0);
+
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 1);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 2);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_global_schedule_entry_count(g) == 3);
+    REQUIRE(rt_graph_test_global_schedule_band_count(g) == 1);
+    CHECK(rt_graph_test_global_schedule_band_kind(g, 0) == 1);
+    CHECK(rt_graph_test_global_schedule_band_first_entry(g, 0) == 0);
+    CHECK(rt_graph_test_global_schedule_band_entry_count(g, 0) == 3);
+
+    CHECK(rt_graph_test_global_schedule_band_kind(g, 1) == -1);
+    CHECK(rt_graph_test_global_schedule_band_first_entry(g, 1) == -1);
+    CHECK(rt_graph_test_global_schedule_band_entry_count(g, 1) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("global schedule bands: same-instance free layers split before barrier") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.1f, 0.0f);
+    add_const_node(g, 1, 0.2f, 0.0f);
+    add_const_node(g, 2, 0.3f, 0.0f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/2, /*node_count=*/1);
+
+    const int region0[] = {0};
+    const int region1[] = {1};
+    const int region2[] = {2};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, region0);
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, region1);
+    rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                        /*item_count=*/1, region2);
+
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_global_schedule_entry_count(g) == 3);
+    REQUIRE(rt_graph_test_global_schedule_band_count(g) == 3);
+    CHECK(rt_graph_test_global_schedule_band_kind(g, 0) == 1);
+    CHECK(rt_graph_test_global_schedule_band_first_entry(g, 0) == 0);
+    CHECK(rt_graph_test_global_schedule_band_entry_count(g, 0) == 1);
+    CHECK(rt_graph_test_global_schedule_band_kind(g, 1) == 1);
+    CHECK(rt_graph_test_global_schedule_band_first_entry(g, 1) == 1);
+    CHECK(rt_graph_test_global_schedule_band_entry_count(g, 1) == 1);
+    CHECK(rt_graph_test_global_schedule_band_kind(g, 2) == 0);
+    CHECK(rt_graph_test_global_schedule_band_first_entry(g, 2) == 2);
+    CHECK(rt_graph_test_global_schedule_band_entry_count(g, 2) == 1);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("contribution capacity: parallel vector sizing across many capacities") {
     // Direct lockstep regression. Walk a handful of distinct
     // capacities (including ones that cross the 64-slot boundary

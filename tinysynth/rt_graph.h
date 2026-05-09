@@ -717,6 +717,24 @@ int rt_graph_test_global_schedule_entry_instance(
 int rt_graph_test_global_schedule_entry_step(
     const RTGraph *g, int entry_index);
 
+// [T:read-only] Phase §4.E.2.C0d test surfaces. The runtime derives a
+// second per-block vector of contiguous "bands" over the C0b global
+// schedule:
+//   0 = Barrier  (one serial GlobalScheduleEntry)
+//   1 = Free     (one or more FreeLayer entries that the conservative
+//                 v1 rule would be allowed to dispatch together)
+// The executor still walks global_schedule serially; these bands are
+// descriptive until Phase C worker dispatch consumes them. Return -1 on
+// null g or out-of-range band_index for per-band accessors.
+
+int rt_graph_test_global_schedule_band_count(const RTGraph *g);
+int rt_graph_test_global_schedule_band_kind(
+    const RTGraph *g, int band_index);
+int rt_graph_test_global_schedule_band_first_entry(
+    const RTGraph *g, int band_index);
+int rt_graph_test_global_schedule_band_entry_count(
+    const RTGraph *g, int band_index);
+
 // ----------------------------------------------------------------
 // Multi-instance support
 // ----------------------------------------------------------------
