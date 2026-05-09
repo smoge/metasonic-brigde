@@ -515,6 +515,25 @@ void rt_graph_stop_audio(RTGraph *g);
 // verify Haskell's NodeKind tags agree with this file's enum.
 int rt_graph_kind_supported(int node_kind);
 
+// [T:read-only] Phase §4.E.2.B0 test surface: the count of canonical
+// writer slots reserved during the most recent rt_graph_process call.
+// Equals the total of:
+//
+//   - For each Active or Releasing instance of every template:
+//       - One slot per Out / BusOut NodeSpec dispatched through
+//         dispatch_node (flat-fallback path or NodeLoop region).
+//       - One slot per sink-terminal fused region (SinGainOut,
+//         SawGainOut, NoiseGainOut, SawLpfGainOut, BusInLpfGainOut,
+//         NoiseLpfGainOut).
+//
+// Buffer-terminal regions and non-sink nodes contribute zero. Returns
+// 0 if no block has run yet, or if g is null. Used by offline tests
+// to assert canonical-order reservation across flat-fallback,
+// NodeLoop, fused-sink, and cross-instance / cross-template
+// scenarios — the count is what Phase B2 will use to size the
+// active portion of the contribution table.
+int rt_graph_test_last_writer_slot_count(const RTGraph *g);
+
 // ----------------------------------------------------------------
 // Multi-instance support
 // ----------------------------------------------------------------

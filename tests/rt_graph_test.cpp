@@ -6008,3 +6008,223 @@ TEST_CASE("Step C (d): out-of-range fused refs are silent no-ops, render is unaf
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// Phase §4.E.2.B0: writer-slot reservation contract
+// ----------------------------------------------------------------
+//
+// process_graph reserves one canonical writer slot per sink writer at
+// the dispatch boundary (dispatch_node Out/BusOut branches and
+// process_instance fused-sink branches). The total per block is
+// exposed via rt_graph_test_last_writer_slot_count for tests that
+// assert canonical-order slot reservation across the dispatch shapes
+// the runtime supports today.
+//
+// Key invariant: the count must equal the number of sink-terminal
+// NodeSpecs across all Active/Releasing instances of all templates,
+// regardless of whether each was dispatched via flat fallback,
+// NodeLoop region, or a fused sink kernel. Phase B2 will use the same
+// canonical numbering as the contribution-table key.
+
+TEST_CASE("writer-slot count: flat fallback, single Out") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // SinOsc → Out, no regions registered → flat-fallback dispatch.
+    rt_graph_add_node(g, 0, 1); // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 2); // Out
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writer-slot count: flat fallback, mixed Out and BusOut") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 3);
+
+    // SinOsc fanned into Out(bus 0), Out(bus 1), and BusOut(bus 3).
+    // Three sinks total → three writer slots in flat-fallback order.
+    rt_graph_add_node(g, 0, 1); // SinOsc
+    rt_graph_set_control(g, 0, 0, 220.0f);
+    rt_graph_add_node(g, 1, 2);  // Out → bus 0
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_add_node(g, 2, 2);  // Out → bus 1
+    rt_graph_set_control(g, 2, 0, 1.0f);
+    rt_graph_add_node(g, 3, 10); // BusOut → bus 3
+    rt_graph_set_control(g, 3, 0, 3.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    rt_graph_connect(g, 0, 0, 2, 0);
+    rt_graph_connect(g, 0, 0, 3, 0);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 3);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writer-slot count: NodeLoop region with two Out nodes") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);
+
+    rt_graph_template_add_node(g, 0, 0, 1);              // SinOsc
+    rt_graph_template_set_default(g, 0, 0, 0, 440.0);
+    rt_graph_template_add_node(g, 0, 1, 2);              // Out (bus 0)
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_template_add_node(g, 0, 2, 2);              // Out (bus 1)
+    rt_graph_template_set_default(g, 0, 2, 0, 1.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+    rt_graph_template_connect(g, 0, 0, 0, 2, 0);
+
+    // One NodeLoop region covering all three nodes. The two Out
+    // members each consume one slot; the SinOsc consumes none.
+    rt_graph_template_add_region(g, /*template_id=*/0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/3);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writer-slot count: sink-terminal fused region (SinGainOut)") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_add_node(g, 0, 0, 1);              // SinOsc
+    rt_graph_template_set_default(g, 0, 0, 0, 220.0);
+    rt_graph_template_add_node(g, 0, 1, 3);              // Gain
+    rt_graph_template_set_default(g, 0, 1, 0, 0.5);
+    rt_graph_template_add_node(g, 0, 2, 2);              // Out (bus 0)
+    rt_graph_template_set_default(g, 0, 2, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+    rt_graph_template_connect(g, 0, 1, 0, 2, 0);
+
+    // SinGainOut fused region (kernel_kind = 2). One sink-terminal
+    // fused kernel reserves exactly one slot, regardless of node
+    // count inside.
+    rt_graph_template_add_region_kernel(
+        g, /*template_id=*/0, /*kernel_kind=*/2, /*rate=*/0,
+        /*first_node=*/0, /*node_count=*/3);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writer-slot count: cross-instance same template") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Single template with one Out; spawn 3 instances → 3 slots in
+    // canonical (slot-order) sequence within the same template.
+    rt_graph_template_add_node(g, 0, 0, 1);               // SinOsc
+    rt_graph_template_set_default(g, 0, 0, 0, 440.0);
+    rt_graph_template_add_node(g, 0, 1, 2);               // Out (bus 0)
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+    rt_graph_template_set_polyphony(g, 0, 4);
+
+    // Drop auto-created instance 0 to keep the count exact.
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_template_instance_add(g, 0) >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, 0) >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, 0) >= 0);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 3);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writer-slot count: cross-template, one instance each") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 3);
+
+    // Template 0: SinOsc → BusOut(bus 3). Auto-created.
+    rt_graph_template_add_node(g, 0, 0, 1);               // SinOsc
+    rt_graph_template_set_default(g, 0, 0, 0, 220.0);
+    rt_graph_template_add_node(g, 0, 1, 10);              // BusOut
+    rt_graph_template_set_default(g, 0, 1, 0, 3.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+    // Template 1: BusIn(bus 3) → Out(bus 0). Adds explicitly.
+    int t1 = rt_graph_template_add(g);
+    REQUIRE(t1 == 1);
+    rt_graph_template_add_node(g, t1, 0, 11);             // BusIn
+    rt_graph_template_set_default(g, t1, 0, 0, 3.0);
+    rt_graph_template_add_node(g, t1, 1, 2);              // Out
+    rt_graph_template_set_default(g, t1, 1, 0, 0.0);
+    rt_graph_template_connect(g, t1, 0, 0, 1, 0);
+
+    // Drop auto-created instance 0 (template 0) and spawn one of
+    // each template; total = 1 BusOut + 1 Out = 2 sink writers.
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_template_instance_add(g, 0)  >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writer-slot count: counter resets between blocks") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 2);                // Out
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 1);
+
+    // Counter must reset every block; not cumulative across blocks.
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 1);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("writer-slot count: invalid bus still consumes its slot") {
+    // The canonical writer-slot contract: a sink writer must consume
+    // exactly one slot even when its bus index is invalid (NaN /
+    // negative / out-of-range). Otherwise later writers' slot
+    // indices would shift block-to-block depending on transient
+    // control state, breaking the canonical reduction order Phase B2
+    // depends on.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 2);                // Out → invalid bus -1
+    rt_graph_set_control(g, 1, 0, -1.0f);
+    rt_graph_add_node(g, 2, 2);                // Out → bus 0 (valid)
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    rt_graph_connect(g, 0, 0, 2, 0);
+
+    rt_graph_process(g, kFrames);
+    // Two Out NodeSpecs → two slots, regardless of one bus being
+    // out-of-range. process_out reserves the slot before its bus
+    // validation, so the silent-degradation path still consumes its
+    // canonical position.
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    rt_graph_destroy(g);
+}

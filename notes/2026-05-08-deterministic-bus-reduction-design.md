@@ -299,12 +299,25 @@ max_writer_slots = sum over templates t of
 carried by `MetaDef` ([rt_graph.cpp:883](../tinysynth/rt_graph.cpp#L883))
 and set via `rt_graph_template_set_polyphony`
 ([rt_graph.h:117](../tinysynth/rt_graph.h#L117));
-`sink_writer_count[t]` is the count of sink-terminal writers in
-`t`'s scheduled region sequence, constant per template once
-compiled. Allocation happens at template registration /
-polyphony change time, not on the audio thread. Resizing
-follows the same quiescent-graph protocol as
-`ensure_output_bus_count` ([rt_graph.cpp:1916](../tinysynth/rt_graph.cpp#L1916)).
+`sink_writer_count[t]` is the count of sink-terminal `NodeSpec`s
+in template `t`'s nodes — those with
+`kind ∈ {Out, BusOut}` — independent of how regions are formed.
+This is the canonical definition because the runtime supports
+both region-driven dispatch and a regionless flat fallback (when
+`def->regions.empty()`, see [process_instance](../tinysynth/rt_graph.cpp#L4179));
+the latter reserves one writer slot per `Out` / `BusOut`
+`NodeSpec` directly through `dispatch_node`. Sizing from the
+scheduled region sequence alone would under-size for graphs
+built directly via `rt_graph_add_node` without going through the
+loaders. Region / kernel metadata still maps slot ranges
+(buffer-terminal regions reserve zero, sink-terminal fused
+regions reserve one, NodeLoop regions reserve one per
+sink-terminal member), but the *total* count is per-`NodeSpec`.
+`sink_writer_count[t]` is constant per template once compiled.
+Allocation happens at template registration / polyphony change
+time, not on the audio thread. Resizing follows the same
+quiescent-graph protocol as `ensure_output_bus_count`
+([rt_graph.cpp:1916](../tinysynth/rt_graph.cpp#L1916)).
 
 **Memory cost.** With `max_writer_slots = S` and `max_frames = F`,
 storage is `S × F × 4` bytes plus `O(S)` metadata. For ensembles
@@ -391,16 +404,24 @@ regardless of completion order.
 
 Cost: O(active_slots × regions_per_instance), once per block.
 
-**Slot count per region** is a property of the region's kernel
-shape, not of runtime state, so it is a constant computed at graph
-load:
+**Slot count per region** maps the per-`NodeSpec` total
+(§5 `sink_writer_count[t]`) onto the dispatch shape. It is a
+property of the region's kernel choice, not of runtime state, so
+it is a constant computed at graph load:
 
-  - Unfused region: count of `Out` / `BusOut` nodes in `rrNodes`.
+  - NodeLoop region (unfused): count of `Out` / `BusOut`
+    `NodeSpec`s in `rrNodes`.
   - Fused sink-terminal kernel: 1.
   - Buffer-terminal kernel (no sink): 0.
 
-Recording this on each `RuntimeRegion` (or its C++ counterpart) is
-a small Phase-A-companion change.
+For the regionless flat-fallback path (templates built via
+`rt_graph_add_node` without registered regions), each `Out` /
+`BusOut` `NodeSpec` reserves one slot directly through
+`dispatch_node`; there is no enclosing region. The §5 capacity
+formula already covers this case because it counts `NodeSpec`s,
+not regions. Recording per-region slot counts on each
+`RuntimeRegion` (or its C++ counterpart) is a small
+Phase-A-companion change for the region-driven path.
 
 **Instance lifetime.** The instance vector is sparse (slots go
 `Active → Releasing → Available`). Re-deriving the work-unit and

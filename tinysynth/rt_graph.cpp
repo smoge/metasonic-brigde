@@ -1636,6 +1636,16 @@ struct RTGraph {
   // audio thread at the very top of process_graph (before bus swap
   // or any kernel runs). See Note [A.2: realtime control queue].
   ControlQueue control_queue;
+
+  // Phase §4.E.2.B0 test surface: writer-slot count from the most
+  // recent process_graph block. Written once per block at the end
+  // of process_graph from ctx.bus_writes.next_writer_slot. Exposed
+  // via rt_graph_test_last_writer_slot_count for offline tests
+  // that exercise canonical-order slot reservation across flat-
+  // fallback, NodeLoop, fused-sink, and cross-instance / cross-
+  // template scenarios. Has no runtime use: B0 only asserts the
+  // counter on the kernel side and uses this snapshot for tests.
+  int last_block_writer_slot_count = 0;
 };
 
 namespace {
@@ -3341,6 +3351,13 @@ static void process_region_sin_gain_out(
     std::size_t sin_idx, std::size_t gain_idx, std::size_t out_idx,
     int nframes, int writer_slot
 ) noexcept {
+  // Writer slot is reserved at the dispatch boundary unconditionally
+  // (process_instance, before this call). Asserting here so an
+  // early-exit path below cannot bypass the contract — Phase B2 will
+  // index contributions[writer_slot] from inside this kernel.
+  assert(writer_slot >= 0);
+  (void)writer_slot;
+
   auto &sin_node  = inst.nodes[sin_idx];
   auto &gain_node = inst.nodes[gain_idx];
   auto &out_node  = inst.nodes[out_idx];
@@ -3404,6 +3421,9 @@ static void process_region_saw_gain_out(
     std::size_t saw_idx, std::size_t gain_idx, std::size_t out_idx,
     int nframes, int writer_slot
 ) noexcept {
+  assert(writer_slot >= 0);
+  (void)writer_slot;
+
   auto &saw_node  = inst.nodes[saw_idx];
   auto &gain_node = inst.nodes[gain_idx];
   auto &out_node  = inst.nodes[out_idx];
@@ -3469,6 +3489,9 @@ static void process_region_noise_gain_out(
     std::size_t noise_idx, std::size_t gain_idx, std::size_t out_idx,
     int nframes, int writer_slot
 ) noexcept {
+  assert(writer_slot >= 0);
+  (void)writer_slot;
+
   auto &noise_node = inst.nodes[noise_idx];
   auto &gain_node  = inst.nodes[gain_idx];
   auto &out_node   = inst.nodes[out_idx];
@@ -3539,6 +3562,9 @@ static void process_region_saw_lpf_gain_out(
     std::size_t gain_idx, std::size_t out_idx,
     int nframes, int writer_slot
 ) noexcept {
+  assert(writer_slot >= 0);
+  (void)writer_slot;
+
   auto &saw_node  = inst.nodes[saw_idx];
   auto &lpf_node  = inst.nodes[lpf_idx];
   auto &gain_node = inst.nodes[gain_idx];
@@ -3644,6 +3670,9 @@ static void process_region_busin_lpf_gain_out(
     std::size_t gain_idx, std::size_t out_idx,
     int nframes, int writer_slot
 ) noexcept {
+  assert(writer_slot >= 0);
+  (void)writer_slot;
+
   auto &busin_node = inst.nodes[busin_idx];
   auto &lpf_node   = inst.nodes[lpf_idx];
   auto &gain_node  = inst.nodes[gain_idx];
@@ -3789,6 +3818,9 @@ static void process_region_noise_lpf_gain_out(
     std::size_t gain_idx, std::size_t out_idx,
     int nframes, int writer_slot
 ) noexcept {
+  assert(writer_slot >= 0);
+  (void)writer_slot;
+
   auto &noise_node = inst.nodes[noise_idx];
   auto &lpf_node   = inst.nodes[lpf_idx];
   auto &gain_node  = inst.nodes[gain_idx];
@@ -4428,6 +4460,13 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       }
     }
   }
+
+  // Phase B0 test surface: snapshot the canonical writer-slot count
+  // from this block. Read by rt_graph_test_last_writer_slot_count
+  // so offline tests can assert canonical-order reservation across
+  // flat-fallback, NodeLoop, fused-sink, and cross-instance /
+  // cross-template scenarios.
+  g.last_block_writer_slot_count = ctx.bus_writes.next_writer_slot;
 }
 
 GraphAudioStream::GraphAudioStream(
@@ -4902,6 +4941,12 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
 int rt_graph_template_count(RTGraph *g) {
   if (!g) return 0;
   return static_cast<int>(g->defs.size());
+}
+
+// Phase §4.E.2.B0 test surface. See header docblock.
+int rt_graph_test_last_writer_slot_count(const RTGraph *g) {
+  if (!g) return 0;
+  return g->last_block_writer_slot_count;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named
