@@ -321,37 +321,37 @@ rateDistribution rt =
 -- layers with width >= 2; reduction C1d candidates are sink-bearing
 -- layers with width >= 2. The latter remain test-only per the
 -- turn-on decision.
-data WorkerBandStats = WorkerBandStats
-  { wbsFreeBands          :: !Int
-  , wbsSinkFreeBands      :: !Int
-  , wbsSinkBands          :: !Int
-  , wbsMaxSinkFreeWidth   :: !Int
-  , wbsMaxSinkWidth       :: !Int
-  , wbsMaxBandWork        :: !Int
-  , wbsDirectCandidates   :: !Int
-  , wbsReductionCandidates:: !Int
+data RegionLayerStats = RegionLayerStats
+  { rlsFreeBands          :: !Int
+  , rlsSinkFreeBands      :: !Int
+  , rlsSinkBands          :: !Int
+  , rlsMaxSinkFreeWidth   :: !Int
+  , rlsMaxSinkWidth       :: !Int
+  , rlsMaxBandWork        :: !Int
+  , rlsDirectCandidates   :: !Int
+  , rlsReductionCandidates:: !Int
   } deriving (Eq, Show)
 
-emptyWorkerBandStats :: WorkerBandStats
-emptyWorkerBandStats = WorkerBandStats 0 0 0 0 0 0 0 0
+emptyRegionLayerStats :: RegionLayerStats
+emptyRegionLayerStats = RegionLayerStats 0 0 0 0 0 0 0 0
 
-addWorkerBandStats :: WorkerBandStats -> WorkerBandStats -> WorkerBandStats
-addWorkerBandStats a b = WorkerBandStats
-  { wbsFreeBands           = wbsFreeBands           a + wbsFreeBands           b
-  , wbsSinkFreeBands       = wbsSinkFreeBands       a + wbsSinkFreeBands       b
-  , wbsSinkBands           = wbsSinkBands           a + wbsSinkBands           b
-  , wbsMaxSinkFreeWidth    = max (wbsMaxSinkFreeWidth a)
-                                  (wbsMaxSinkFreeWidth b)
-  , wbsMaxSinkWidth        = max (wbsMaxSinkWidth a)
-                                  (wbsMaxSinkWidth b)
-  , wbsMaxBandWork         = max (wbsMaxBandWork a)
-                                  (wbsMaxBandWork b)
-  , wbsDirectCandidates    = wbsDirectCandidates    a + wbsDirectCandidates    b
-  , wbsReductionCandidates = wbsReductionCandidates a + wbsReductionCandidates b
+addRegionLayerStats :: RegionLayerStats -> RegionLayerStats -> RegionLayerStats
+addRegionLayerStats a b = RegionLayerStats
+  { rlsFreeBands           = rlsFreeBands           a + rlsFreeBands           b
+  , rlsSinkFreeBands       = rlsSinkFreeBands       a + rlsSinkFreeBands       b
+  , rlsSinkBands           = rlsSinkBands           a + rlsSinkBands           b
+  , rlsMaxSinkFreeWidth    = max (rlsMaxSinkFreeWidth a)
+                                  (rlsMaxSinkFreeWidth b)
+  , rlsMaxSinkWidth        = max (rlsMaxSinkWidth a)
+                                  (rlsMaxSinkWidth b)
+  , rlsMaxBandWork         = max (rlsMaxBandWork a)
+                                  (rlsMaxBandWork b)
+  , rlsDirectCandidates    = rlsDirectCandidates    a + rlsDirectCandidates    b
+  , rlsReductionCandidates = rlsReductionCandidates a + rlsReductionCandidates b
   }
 
-workerBandStats :: RuntimeGraph -> Either String WorkerBandStats
-workerBandStats rt = do
+regionLayerStats :: RuntimeGraph -> Either String RegionLayerStats
+regionLayerStats rt = do
   steps <- layeredRegionSchedule rt
   let byIx = M.fromList [(rrIndex r, r) | r <- rgRuntimeRegions rt]
       layerRegions fl =
@@ -359,7 +359,7 @@ workerBandStats rt = do
           (\ix -> case M.lookup ix byIx of
              Just r  -> Right r
              Nothing -> Left $
-               "workerBandStats: layered schedule referenced unknown "
+               "regionLayerStats: layered schedule referenced unknown "
                <> "region " <> show ix)
           (flRegions fl)
       rowFor layer =
@@ -367,23 +367,23 @@ workerBandStats rt = do
             hasSink = any (not . null . bfWrites . rrFootprint) layer
             work    = sum (map (length . rrNodes) layer)
         in if hasSink
-             then emptyWorkerBandStats
-               { wbsFreeBands           = 1
-               , wbsSinkBands           = 1
-               , wbsMaxSinkWidth        = width
-               , wbsMaxBandWork         = work
-               , wbsReductionCandidates = if width >= 2 then 1 else 0
+             then emptyRegionLayerStats
+               { rlsFreeBands           = 1
+               , rlsSinkBands           = 1
+               , rlsMaxSinkWidth        = width
+               , rlsMaxBandWork         = work
+               , rlsReductionCandidates = if width >= 2 then 1 else 0
                }
-             else emptyWorkerBandStats
-               { wbsFreeBands         = 1
-               , wbsSinkFreeBands     = 1
-               , wbsMaxSinkFreeWidth  = width
-               , wbsMaxBandWork       = work
-               , wbsDirectCandidates  = if width >= 2 then 1 else 0
+             else emptyRegionLayerStats
+               { rlsFreeBands         = 1
+               , rlsSinkFreeBands     = 1
+               , rlsMaxSinkFreeWidth  = width
+               , rlsMaxBandWork       = work
+               , rlsDirectCandidates  = if width >= 2 then 1 else 0
                }
   layers <- traverse layerRegions
     [ fl | ScheduleFreeLayer fl <- steps ]
-  pure (foldr (addWorkerBandStats . rowFor) emptyWorkerBandStats layers)
+  pure (foldr (addRegionLayerStats . rowFor) emptyRegionLayerStats layers)
 
 -- Per-template summary row.
 data SurveyRow = SurveyRow
@@ -400,7 +400,7 @@ data SurveyRow = SurveyRow
   , srSchedStats   :: !RegionScheduleStats
     -- ^ §4.E.2c parallel-readiness counts. Read-only; surfaces in
     -- the schedule-width section of '--fusion-survey'.
-  , srWorkerBands  :: !WorkerBandStats
+  , srRegionLayer  :: !RegionLayerStats
     -- ^ §4.E.C1d corpus region-layer shape summary. Read-only;
     -- surfaces in the corpus FreeLayer-width section of
     -- '--fusion-survey'.
@@ -453,7 +453,7 @@ surveyRuntimeGraph
   -> RuntimeGraph
   -> RuntimeGraph
   -> RegionScheduleStats
-  -> WorkerBandStats
+  -> RegionLayerStats
   -> SurveyRow
 surveyRuntimeGraph d t rt rtF stats workerStats =
   let allRegions  = rgRuntimeRegions rt
@@ -479,7 +479,7 @@ surveyRuntimeGraph d t rt rtF stats workerStats =
        , srRFused       = length [() | n <- rgNodes rtF, RFused _ <- rnInputs n]
        , srShapes       = scanSinkShapes rt
        , srSchedStats   = stats
-       , srWorkerBands  = workerStats
+       , srRegionLayer  = workerStats
        , srRateDist     = rateDistribution rt
        , srEdgeBuckets  = edgeRateBuckets rt
          -- §4.D.2: read from the unfused graph deliberately. The
@@ -501,7 +501,7 @@ surveySynthGraph d t g = do
   rt    <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraph)
   rtF   <- either (Left . stamp) Right (lowerGraph g >>= compileRuntimeGraphFused)
   stats <- either (Left . stamp) Right (regionScheduleStats rt)
-  workerStats <- either (Left . stamp) Right (workerBandStats rt)
+  workerStats <- either (Left . stamp) Right (regionLayerStats rt)
   Right (surveyRuntimeGraph d t rt rtF stats workerStats)
 
 -- | A short human label used in error messages.
@@ -1379,7 +1379,7 @@ runFusionSurvey demos = do
   putStrLn ""
   printScheduleWidth allRows
   putStrLn ""
-  printCorpusWorkerBandWidth allRows
+  printCorpusRegionLayerWidth allRows
   putStrLn ""
   printEnsembleScheduleWidth ensembleRows
   putStrLn ""
@@ -1678,50 +1678,50 @@ formatScheduleRow cols =
 -- by '--worker-bench' counters (`parallel_bands`, `parallel_entries`).
 -- 'redC1d' is also not a recommendation to enable reduction-backed
 -- worker dispatch; the turn-on decision keeps that path test-only.
-printCorpusWorkerBandWidth :: [SurveyRow] -> IO ()
-printCorpusWorkerBandWidth rows = do
+printCorpusRegionLayerWidth :: [SurveyRow] -> IO ()
+printCorpusRegionLayerWidth rows = do
   let corpusRows = filter (("corpus:" `isPrefixOf`) . srDemo) rows
   putStrLn "─── Corpus FreeLayer-width survey (§4.E.C1d region candidates) ───"
-  putStrLn $ formatWorkerBandRow
+  putStrLn $ formatRegionLayerRow
     [ "corpus", "template", "bands", "sf", "sink"
     , "maxSfW", "maxSinkW", "maxWork", "dirC1d", "redC1d"
     ]
-  mapM_ (putStrLn . formatWorkerBandRow . renderWorkerBandRow) corpusRows
+  mapM_ (putStrLn . formatRegionLayerRow . renderRegionLayerRow) corpusRows
   putStrLn ""
-  let agg = foldr addWorkerBandStats emptyWorkerBandStats
-              (map srWorkerBands corpusRows)
+  let agg = foldr addRegionLayerStats emptyRegionLayerStats
+              (map srRegionLayer corpusRows)
   putStrLn $ "  totals: "
           <> "graphs="  <> show (length corpusRows)
-          <> "  bands=" <> show (wbsFreeBands agg)
-          <> "  sf="    <> show (wbsSinkFreeBands agg)
-          <> "  sink="  <> show (wbsSinkBands agg)
-          <> "  maxSfW="   <> show (wbsMaxSinkFreeWidth agg)
-          <> "  maxSinkW=" <> show (wbsMaxSinkWidth agg)
-          <> "  maxWork="  <> show (wbsMaxBandWork agg)
-          <> "  dirC1d="   <> show (wbsDirectCandidates agg)
-          <> "  redC1d="   <> show (wbsReductionCandidates agg)
+          <> "  bands=" <> show (rlsFreeBands agg)
+          <> "  sf="    <> show (rlsSinkFreeBands agg)
+          <> "  sink="  <> show (rlsSinkBands agg)
+          <> "  maxSfW="   <> show (rlsMaxSinkFreeWidth agg)
+          <> "  maxSinkW=" <> show (rlsMaxSinkWidth agg)
+          <> "  maxWork="  <> show (rlsMaxBandWork agg)
+          <> "  dirC1d="   <> show (rlsDirectCandidates agg)
+          <> "  redC1d="   <> show (rlsReductionCandidates agg)
 
-renderWorkerBandRow :: SurveyRow -> [String]
-renderWorkerBandRow r =
-  let s = srWorkerBands r
+renderRegionLayerRow :: SurveyRow -> [String]
+renderRegionLayerRow r =
+  let s = srRegionLayer r
   in [ srDemo r
      , maybe "" id (srTemplate r)
-     , show (wbsFreeBands s)
-     , show (wbsSinkFreeBands s)
-     , show (wbsSinkBands s)
-     , show (wbsMaxSinkFreeWidth s)
-     , show (wbsMaxSinkWidth s)
-     , show (wbsMaxBandWork s)
-     , show (wbsDirectCandidates s)
-     , show (wbsReductionCandidates s)
+     , show (rlsFreeBands s)
+     , show (rlsSinkFreeBands s)
+     , show (rlsSinkBands s)
+     , show (rlsMaxSinkFreeWidth s)
+     , show (rlsMaxSinkWidth s)
+     , show (rlsMaxBandWork s)
+     , show (rlsDirectCandidates s)
+     , show (rlsReductionCandidates s)
      ]
 
-workerBandColumnWidths :: [Int]
-workerBandColumnWidths = [42, 14, 6, 4, 5, 6, 8, 8, 7, 7]
+regionLayerColumnWidths :: [Int]
+regionLayerColumnWidths = [42, 14, 6, 4, 5, 6, 8, 8, 7, 7]
 
-formatWorkerBandRow :: [String] -> String
-formatWorkerBandRow cols =
-  intercalate "  " (zipWith pad workerBandColumnWidths cols)
+formatRegionLayerRow :: [String] -> String
+formatRegionLayerRow cols =
+  intercalate "  " (zipWith pad regionLayerColumnWidths cols)
   where
     pad w s
       | length s >= w = s
