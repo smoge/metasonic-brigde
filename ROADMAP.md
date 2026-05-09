@@ -27,116 +27,72 @@ only for compiling structure.
 
 ## 0 — Current State (2026-05-09)
 
-What already works:
+A compiled MetaSonic graph builds a subtractive voice
+(oscillator → filter → envelope → delay → output), plays it polyphonically
+from a MIDI controller, and routes the mix through a shared FX template via
+the bus pool. End-to-end demos cover chain, fan-out, saw, noise, filtered
+noise, resonant bass, detuned-saw beating, envelope-shaped pluck, vibrato
+FM, multi-template send-return, and live-MIDI poly.
 
-- Haskell DSL constructs synth graphs with typed nodes and connections.
-- Bridge lowers graphs to dense execution order with no symbolic IDs.
-- FFI loads nodes/controls in one pass, connections in another.
-- C++ runtime walks a dense node array in storage order — no symbolic lookups on the audio thread.
-- Sixteen node kinds implemented: oscillators `SinOsc`, `SawOsc` (PolyBLEP),
-  `PulseOsc`, `TriOsc`; `NoiseGen`; biquads `LPF`, `HPF`, `BPF`, `Notch`
-  (Bristow-Johnson via Q); arithmetic `Gain`, `Add`; sinks `Out`; envelopes
-  `Env` (`q::adsr_envelope_gen`); delays `Delay` (`q::fractional_ring_buffer`);
-  control smoothing `Smooth` (`q::dynamic_smoother`); and the bus-routing
-  kinds `BusOut` / `BusIn` / `BusInDelayed`.
-- Per-node state unified under `std::variant` (`OscState`, `NoiseGenState`,
-  `LPFState`, `EnvState`, `DelayState`, `monostate`) with `std::get_if` dispatch.
-- Initial phase control on oscillators.
-- Runtime subclasses `q::audio_stream` for audio callback.
-- Brick-based TUI inspector (`--inspect` / `--inspect-only`) walks every
-  pipeline stage per demo and shows partial traces on failure (single-graph
-  demos only; multi-template demos fall back to a textual footprint summary).
-- Demo graphs covering chain, fan-out, saw, noise, filtered noise, resonant
-  bass, detuned-saw beating, envelope-shaped pluck, vibrato FM, a
-  multi-template send-return through a shared bus, and a live-MIDI poly
-  demo driven from an external controller.
-- **Instance model (§2.A–§2.B):** templates split into immutable `MetaDef`
-  (spec) and per-instance `NodeInstanceState`; one template can host many live
-  instances, each with its own kernel state but shared spec.
-- **Server-global bus pool (§2.C):** single-buffered for live reads, double-
-  buffered (ping-pong + clear) for `BusInDelayed` so feedback loops are
-  block-bounded but well-defined.
-- **Multi-template runtime (§2.D):** `RTGraph` hosts a vector of `MetaDef`s in
-  registration order. The Haskell-side `compileTemplateGraph` derives that
-  order from inter-template precedence (write-set ∩ live-read-set) and
-  topo-sorts; cycles are rejected at compile time. The C++ runtime is a dumb
-  executor — it never inspects precedence or reorders.
-- **Release-then-free instance lifecycle (§2.E):** `rt_graph_instance_release`
-  flips a slot to `Releasing`, lets envelopes finish their tail, and reclaims
-  the slot once the instance produces silence across a configured threshold +
-  window. Hard-free remains available for stealing under pressure.
-- **Voice allocation + MIDI (Phase 3.1–3.3):** a C++ `VoiceAllocator` maps
-  note-on/off to `instance_add` / `instance_release`; the `MidiVoiceProcessor`
-  is a MIDI-1.0 → allocator translator over Q's typed MIDI stack; per-voice
-  CC and pitch-bend dispatch is wired via the realtime control queue, with
-  `Smooth` auto-inserted at control ingress to de-zipper writes.
-- **Single-input rewrite fusion (Phase 4.C.1 + 4.C.2):** scalar Gain
-  fusion (single-edge + chain extension) /and/ scalar Add / bias
-  fusion compose into one `FAffineFrom` chain-walk in
-  `compileRuntimeGraphFused`. Affected nodes are elided but stay
-  control-addressable through the FFI; one scratch slot per fused
-  input regardless of chain length. Live in normal demo use behind
-  the `--fused` flag.
-- **§4.B region kernels (concrete, in the runtime):** hand-written
-  fused kernels run through `process_instance`'s region dispatch.
-  Buffer-terminal: `RSawLpfGain`. Sink-terminal 3-node:
-  `RSinGainOut`, `RSawGainOut`, `RNoiseGainOut`. Sink-terminal
-  4-node: `RSawLpfGainOut`, `RBusInLpfGainOut`. `KBusOut` is a
-  first-class sink terminal alongside `KOut`. Selection runs
-  unconditionally inside `compileRuntimeGraph`; descriptors and
-  longest-match priority handle 3- vs 4-node overlap.
-- **Evidence-driven kernel selection:** `--fusion-survey` reports
-  found / claimed / missed shapes per surveyed graph, with
-  separate subtotals for the playable demo set and a fixed
-  survey-only corpus (single-graph + multi-template ensembles).
-  `tools/rt_graph_bench.cpp` compares fused kernels against
-  stripped node-loop baselines on the same compiled graph; new
-  filtered/stateful kernels gate on both the survey signal and
-  the benchmark before landing.
-- `Eff` annotations are real for the bus kinds: `Out`/`BusOut` carry
-  `BusWrite`, `BusIn` carries `BusRead`, `BusInDelayed` carries
-  `BusReadDelayed`; non-bus kinds remain `Pure`. These drive both intra-graph
-  E_r ordering and inter-template precedence.
+What's landed:
 
-Known limitations:
+- **Phase 1 — node registry.** Eighteen `NodeKind`s implemented:
+  oscillators `SinOsc` / `SawOsc` (PolyBLEP) / `PulseOsc` / `TriOsc`,
+  `NoiseGen`, biquads `LPF` / `HPF` / `BPF` / `Notch` (Bristow-Johnson via
+  Q), arithmetic `Gain` / `Add`, sinks `Out` / `BusOut`, `Env`
+  (`q::adsr_envelope_gen`), `Delay` (`q::fractional_ring_buffer`), `Smooth`
+  (`q::dynamic_smoother`), `BusIn` / `BusInDelayed`. Per-node state unified
+  under `std::variant` with `std::get_if` dispatch. See §1 for per-kind
+  status.
+- **Phase 2 — instance / multi-template model.** §2.A–§2.E done: spec/state
+  split (`MetaDef` + `GraphInstance`), multi-instance support with slot
+  reuse, server-global bus pool (single-buffered live, double-buffered
+  delayed), multi-template runtime with compile-time inter-template
+  precedence derived from `BusFootprint`, release-then-free instance
+  lifecycle. §2.F (groups) closed as declined.
+- **Phase 3 — polyphony and MIDI.** C++ `VoiceAllocator` over the realtime
+  ABI, `MidiVoiceProcessor` translating MIDI 1.0 over Q's typed MIDI stack,
+  per-voice CC + pitch-bend through the realtime control queue, `Smooth`
+  auto-inserted at control ingress. The `midi-poly` demo plays end-to-end
+  from an external controller.
+- **Phase 4.A/B/C/D — regions, fused kernels, single-input fusion, rate
+  metadata.** Region overlay shipped across the FFI; seven hand-written
+  region kernels (six sink-terminal, one buffer-terminal) selected
+  unconditionally with longest-match priority; scalar Gain/Add chain fusion
+  via the `FAffineFrom` algebra (one scratch slot per fused input);
+  IR-propagated `rnRate` plus per-kind/per-port `PortConsumptionRate`
+  metadata in place. `Eff` annotations are real for the bus kinds and drive
+  both intra-graph E_r ordering and inter-template precedence.
+- **Tooling.** Brick TUI inspector (`--inspect` / `--inspect-only`),
+  `--fusion-survey` for kernel coverage and rate distribution,
+  `tools/rt_graph_bench.cpp` synthetic bench, and `--worker-bench`
+  Haskell-loaded worker bench.
 
-- Connected control inputs are block-latched from sample 0, not sample-accurate yet.
-- Block-rate execution is not implemented; everything runs at sample
-  rate today. The §4.D descriptive work (see §4.D below) confirmed
-  that per-node /output/ rate is too coarse to drive the decision
-  (100 % `SampleRate` on the surveyed corpus) and that the per-port
-  /consumption/ view shows a small but non-zero signal — currently
-  4 sample-rate producer nodes across 4 distinct kinds wired only
-  into block-latched ports. That signal is preserved as descriptive
-  metadata; a runtime block-rate execution path is parked until
-  the signal grows.
-- Region-level parallelism is test-gated (§4.E): the runtime now has
-  global schedule metadata, band construction, a worker-pool scaffold,
-  and opt-in Free-band dispatch under the test ABI. The audio-thread
-  dispatch primitive is now lock-free/allocation-free (atomic
-  generation + completion counters; no mutex/cv on `process_graph`),
-  and C1d-a now exposes per-region work-item metadata for future
-  region-layer dispatch. The latest bench / corpus refresh still showed
-  useful worker dispatch only through targeted probes, so the path stays
-  test/bench gated.
-- Whole-region kernel /codegen/ (auto-generated DSP bodies) is
-  deferred indefinitely. Hand-written kernel bodies plus narrow
-  helpers (`SinkAccumulator`, `drive_oscillator`) cover the proven
-  cases; codegen waits until that becomes a real maintenance
-  problem, not before.
-- Filtered/stateful kernel expansion is gated behind survey
-  recurrence + benchmark evidence (see §4.B). `RNoiseLpfGainOut`
-  was unparked after the post-corpus-expansion ranked missed-shape
-  table reached `missed=4, sources=4` and the benchmark cleared
-  the sink-kernel win range (median ~1.25x). Tri/Pulse/Add
-  filtered tails remain parked as singleton-source `no-signal`
-  rows until corpus growth puts them past the gate.
+Parked / deferred:
+
+- **Sample-accurate connected control inputs.** Currently block-latched from
+  sample 0.
+- **Block-rate execution path (§4.D).** Per-node output rate is too coarse
+  (100 % `SampleRate` on the surveyed corpus); the per-port consumption
+  view shows a small but non-zero signal (4 sample-rate producer nodes
+  across 4 distinct kinds wired only into block-latched ports). Metadata
+  is preserved; the runtime path waits for the signal to grow.
+- **Region-level parallelism (§4.E).** Worker-pool Free-band dispatch is
+  test-gated and default-off; only targeted probes win. C1d-a region
+  work-item metadata is in place but the executor ignores it. C1d-b
+  (serial region-item executor) is the next slice.
+- **Whole-region kernel codegen.** Deferred indefinitely. Hand-written DSP
+  bodies plus narrow helpers (`SinkAccumulator`, `drive_oscillator`) are
+  the working approach.
+- **Filtered/stateful kernel expansion.** Gated behind survey recurrence +
+  benchmark evidence (§4.B.x). Tri/Pulse/Add filtered tails parked as
+  singleton-source rows until corpus growth puts them past the gate.
 
 ---
 
 ## 0.5 — Contract & Foundations
 
-The post-2026-03-22 review (see [Design notes after Miller Puckette][puckette])
+The post-2026-03-25 review (see [Design notes after Miller Puckette][puckette])
 flagged that contract drift between the Haskell and C++ sides is already
 happening, and that adding more nodes onto an unverified contract compounds
 the problem. Phase 0.5 inserts the smallest amount of work that makes
@@ -334,16 +290,16 @@ silence across a configured threshold + window. Hard-free
 (panic stops, voice stealing in extremis). A polyphonic stress test
 exercises many voices with staggered release and slot reuse.
 
-### 2.F Groups  — likely fold into TemplateGraph
+### 2.F Groups  — declined
 
 The original §2.4 envisioned SuperCollider-style groups: ordered
-containers of instances with intra-group bus-derived ordering. With
-`TemplateGraph` deriving inter-template ordering from bus footprints at
-compile time, the runtime case for groups is much weaker — the schedule
-is already static, and SC's group reparenting is exactly the runtime
-ordering knob this design rejects (see Design Principle 5 and the
-"Compile-time vs runtime ordering" note in `CLAUDE.md`). If a use case
-that genuinely needs groups appears, design it then; do not pre-build.
+containers of instances with intra-group bus-derived ordering.
+`TemplateGraph` already derives inter-template ordering from bus
+footprints at compile time, and SC's group reparenting is exactly the
+runtime ordering knob this design rejects (see Design Principle 5 and
+the "Compile-time vs runtime ordering" note in `CLAUDE.md`). Closed
+as decided-against. If a concrete use case appears that the static
+schedule cannot serve, reopen then.
 
 ---
 
@@ -679,18 +635,10 @@ Current status:
 8. **Bench, corpus refresh, and turn-on decision — done, default-off.**
    The C++ synthetic bench and Haskell-loaded worker bench are in
    place. Synthetic sink-free Free-band compute only wins at enough
-   width / block work; the post-atomic dispatch refresh moves the
-   synthetic sink-free crossover lower, but reduction-backed sink
-   dispatch still loses on the measured grid. The fixed Haskell-loaded
-   corpus now contains four region-layer C1d candidates (`dirC1d=4`,
-   `redC1d=0`, `maxSfW=3`, `maxWork=9`). The worker bench records
-   actual C1c worker dispatch
-   (`worker_rows_with_parallel=2`, `parallel_bands=2`,
-   `parallel_entries=6`), but only through targeted probes. After the
-   atomic dispatch pass, the targeted free-only probe is positive
-   (`best_parallel_worker_speedup=1.42x`), which keeps C1d
-   investigation alive but still does not justify default-on worker
-   scheduling. The decision note is
+   width / block work; reduction-backed sink dispatch still loses on
+   the measured grid. Targeted free-only probes are positive and keep
+   C1d investigation alive, but no row supports default-on worker
+   scheduling. Current numbers and the standing decision live in
    `notes/2026-05-09-phase-4e-worker-turn-on-decision.md`.
 9. **C1d-a region work-item metadata — done, observational.**
    The runtime now expands each `GlobalScheduleEntry` into
