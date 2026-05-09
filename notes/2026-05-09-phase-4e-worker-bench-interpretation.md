@@ -78,9 +78,10 @@ Interpretation:
 - Width 8 only wins at the larger 512-frame block.
 - Width 32 wins at both block sizes, with the strongest result at
   512 frames.
-- Reduction mode is roughly comparable for sink-free compute because
-  there are no sink slots to fold; the differences are measurement noise
-  plus mode plumbing.
+- Reduction mode is roughly comparable for sink-free compute because this
+  row measures reduction-mode plumbing only: `FreeCompute` has no sink
+  slots to fold, so there is no contribution reduction work in the timed
+  path.
 
 Working crossover from this run:
 

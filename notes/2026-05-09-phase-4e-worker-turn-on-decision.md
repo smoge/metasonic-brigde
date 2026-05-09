@@ -70,4 +70,6 @@ The next runtime-parallelism work should be one of:
   reduction, minimum width/work threshold, and full T-9 equivalence.
 
 Do not make a public switch or default-on change until a later decision
-record replaces this one.
+record replaces this one. That successor record must define the
+representative corpus and threshold explicitly; this note only records the
+current negative decision.

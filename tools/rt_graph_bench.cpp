@@ -52,6 +52,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <sched.h>
+#include <string>
+#include <sys/utsname.h>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -88,6 +93,9 @@ constexpr int kMaxFrames     = 1024;
 constexpr int kBenchBus      = 0;
 constexpr int kWarmupBlocks  = 64;
 constexpr int kRepeatRuns    = 5;
+// Three schedule repeats are enough for the current "do not turn on
+// by default" decision. Before using this bench to justify default-on
+// behavior, increase this count and report spread (stddev or IQR).
 constexpr int kScheduleRepeatRuns = 3;
 constexpr int kScheduleWarmupBlocks = 32;
 
@@ -98,6 +106,66 @@ constexpr int kScheduleFreeLayer = 1;
 // audio. Every measurement reads the output bus and accumulates
 // into this sink so the compiler cannot collapse the timed region.
 volatile float g_sink = 0.0f;
+
+std::string trim_ascii(std::string s) {
+  const std::size_t first = s.find_first_not_of(" \t");
+  if (first == std::string::npos) {
+    return {};
+  }
+  const std::size_t last = s.find_last_not_of(" \t");
+  return s.substr(first, last - first + 1);
+}
+
+std::string host_cpu_model() {
+  std::ifstream cpuinfo("/proc/cpuinfo");
+  std::string line;
+  while (std::getline(cpuinfo, line)) {
+    const std::size_t colon = line.find(':');
+    if (colon == std::string::npos) {
+      continue;
+    }
+    if (trim_ascii(line.substr(0, colon)) == "model name") {
+      return trim_ascii(line.substr(colon + 1));
+    }
+  }
+  return "unknown";
+}
+
+const char *scheduler_policy_name(int policy) {
+  switch (policy) {
+    case SCHED_OTHER:
+      return "SCHED_OTHER";
+    case SCHED_FIFO:
+      return "SCHED_FIFO";
+    case SCHED_RR:
+      return "SCHED_RR";
+#ifdef SCHED_BATCH
+    case SCHED_BATCH:
+      return "SCHED_BATCH";
+#endif
+#ifdef SCHED_IDLE
+    case SCHED_IDLE:
+      return "SCHED_IDLE";
+#endif
+    default:
+      return "unknown";
+  }
+}
+
+void print_bench_reproducibility() {
+  struct utsname uts {};
+  const bool have_uname = uname(&uts) == 0;
+  const int scheduler = sched_getscheduler(0);
+  std::printf(
+      "# bench_repro: cpu_model=\"%s\", hardware_threads=%u, "
+      "os=\"%s %s %s\", scheduler_policy=%s\n",
+      host_cpu_model().c_str(),
+      std::thread::hardware_concurrency(),
+      have_uname ? uts.sysname : "unknown",
+      have_uname ? uts.release : "unknown",
+      have_uname ? uts.machine : "unknown",
+      scheduler_policy_name(scheduler));
+}
 
 // ----------------------------------------------------------------
 // Graph builders
@@ -388,6 +456,9 @@ struct ScheduleBenchResult {
 };
 
 const ScheduleModeSpec kScheduleModes[] = {
+  // Canonical speedup baseline. Keep this row first and unique among
+  // modes with !global_schedule && !reduction; the schedule rows divide
+  // by its ns/block value.
   { "legacy-direct",       false, false, 0 },
   { "sched-serial-direct", true,  false, 1 },
   { "sched-pool2-direct",  true,  false, 2 },
@@ -599,6 +670,8 @@ ScheduleBenchResult run_schedule_cell(
 }  // namespace
 
 int main() {
+  print_bench_reproducibility();
+
   std::printf("# rt_graph_bench: §4.B region kernel microbench\n");
   std::printf("# sample_rate=%d, warmup_blocks=%d, repeat_runs=%d\n",
               kSampleRate, kWarmupBlocks, kRepeatRuns);
@@ -632,6 +705,10 @@ int main() {
         for (const auto &mode : kScheduleModes) {
           const ScheduleBenchResult result =
               run_schedule_cell(shape, mode, nframes, voices);
+          // See kScheduleModes: this captures the canonical legacy
+          // baseline once per cell so later rows cannot silently pick
+          // a different denominator without changing the mode table
+          // contract.
           if (!mode.global_schedule && !mode.reduction) {
             legacy_ns_per_block = result.ns_per_block;
           }
