@@ -6482,9 +6482,11 @@ TEST_CASE("contribution capacity: occupied count keeps storage above lowered cap
 // ----------------------------------------------------------------
 //
 // When rt_graph_test_set_reduction_capture is on, sink writes are
-// routed into the per-writer-slot contribution buffer instead of
-// server.output_buses. These tests inspect the per-slot capture
-// (samples + target + used) directly, asserting:
+// routed into the per-writer-slot contribution buffer first, then
+// folded back into server.output_buses at deterministic serial join
+// points. These tests inspect the per-slot capture (samples + target
+// + used) directly and assert output-bus equivalence where the fold
+// matters:
 //
 //   * Distinct sinks land in distinct slots in canonical order.
 //   * Same-bus writers stay in separate slots — no pre-summing.
@@ -6497,8 +6499,8 @@ TEST_CASE("contribution capacity: occupied count keeps storage above lowered cap
 //   * Fused sink kernels write through SinkAccumulator into the
 //     correct slot.
 //
-// The actual reduction (folding contributions[*] into output_buses)
-// is the next slice; B2 only proves the capture path.
+// The worker-parallel schedule is still a later slice; this mode
+// remains a serial executor with an observable private-write step.
 
 // Helper: sum-of-products-of-control-Add. Sets node `idx` to an Add
 // whose two controls multiplied... no, just two controls summed.
@@ -6507,6 +6509,20 @@ static void add_const_node(RTGraph *g, int idx, float a, float b) {
     rt_graph_add_node(g, idx, 8); // Add
     rt_graph_set_control(g, idx, 0, a);
     rt_graph_set_control(g, idx, 1, b);
+}
+
+static std::vector<float> read_bus_vec(RTGraph *g, int bus, int nframes) {
+    std::vector<float> out(static_cast<std::size_t>(nframes), 0.0f);
+    rt_graph_read_bus(g, bus, nframes, out.data());
+    return out;
+}
+
+static void check_exact_same(const std::vector<float> &a,
+                             const std::vector<float> &b) {
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        CHECK(a[i] == b[i]);
+    }
 }
 
 TEST_CASE("reduction capture: flat fallback puts distinct sinks in distinct slots") {
@@ -6581,6 +6597,254 @@ TEST_CASE("reduction capture: same-bus writers stay in separate slots (no pre-su
     for (auto v : s1) CHECK(v == doctest::Approx(0.50f).epsilon(1e-5));
 
     rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction fold: same-bus writers match direct output exactly") {
+    auto build = [](RTGraph *g) {
+        add_const_node(g, 0, 0.25f, 0.0f);
+        rt_graph_add_node(g, 1, 2);
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+
+        add_const_node(g, 2, 0.5f, 0.0f);
+        rt_graph_add_node(g, 3, 2);
+        rt_graph_set_control(g, 3, 0, 0.0f);
+        rt_graph_connect(g, 2, 0, 3, 0);
+    };
+
+    auto *direct = rt_graph_create(8, kFrames);
+    auto *reduced = rt_graph_create(8, kFrames);
+    REQUIRE(direct != nullptr);
+    REQUIRE(reduced != nullptr);
+    build(direct);
+    build(reduced);
+
+    rt_graph_test_set_reduction_capture(reduced, 1);
+    rt_graph_process(direct, kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    const auto direct_bus0 = read_bus_vec(direct, 0, kFrames);
+    const auto reduced_bus0 = read_bus_vec(reduced, 0, kFrames);
+    check_exact_same(direct_bus0, reduced_bus0);
+    for (auto v : reduced_bus0) CHECK(v == doctest::Approx(0.75f).epsilon(1e-6));
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
+}
+
+TEST_CASE("reduction fold: same-instance live BusIn sees earlier BusOut") {
+    auto build = [](RTGraph *g) {
+        rt_graph_ensure_bus(g, 1);
+        add_const_node(g, 0, 0.5f, 0.0f);
+        rt_graph_add_node(g, 1, 10); // BusOut bus 1
+        rt_graph_set_control(g, 1, 0, 1.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+
+        rt_graph_add_node(g, 2, 11); // BusIn bus 1
+        rt_graph_set_control(g, 2, 0, 1.0f);
+        rt_graph_add_node(g, 3, 2);  // Out bus 0
+        rt_graph_set_control(g, 3, 0, 0.0f);
+        rt_graph_connect(g, 2, 0, 3, 0);
+    };
+
+    auto *direct = rt_graph_create(8, kFrames);
+    auto *reduced = rt_graph_create(8, kFrames);
+    REQUIRE(direct != nullptr);
+    REQUIRE(reduced != nullptr);
+    build(direct);
+    build(reduced);
+
+    rt_graph_test_set_reduction_capture(reduced, 1);
+    rt_graph_process(direct, kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    const auto direct_bus0 = read_bus_vec(direct, 0, kFrames);
+    const auto reduced_bus0 = read_bus_vec(reduced, 0, kFrames);
+    check_exact_same(direct_bus0, reduced_bus0);
+    for (auto v : reduced_bus0) CHECK(v == doctest::Approx(0.5f).epsilon(1e-6));
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
+}
+
+TEST_CASE("reduction fold: BusInDelayed reads previous block's folded output_buses") {
+    // Writer (Add → BusOut bus 1) in template 0; delayed reader
+    // (BusInDelayed bus 1 → Out bus 0) in template 1. The fold must
+    // make this block's writes land in output_buses[1], so the
+    // block-end swap puts them into output_buses_prev for the next
+    // block, where BusInDelayed picks them up. We render two
+    // contiguous blocks: block 1 sees zero (prev pool is initial
+    // zero), block 2 sees the previous block's writer constant.
+    auto build = [](RTGraph *g) {
+        rt_graph_ensure_bus(g, 1);
+
+        rt_graph_template_add_node(g, 0, 0, 8);  // Add const 0.5
+        rt_graph_template_set_default(g, 0, 0, 0, 0.5);
+        rt_graph_template_set_default(g, 0, 0, 1, 0.0);
+        rt_graph_template_add_node(g, 0, 1, 10); // BusOut bus 1
+        rt_graph_template_set_default(g, 0, 1, 0, 1.0);
+        rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+        int t1 = rt_graph_template_add(g);
+        REQUIRE(t1 == 1);
+        rt_graph_template_add_node(g, t1, 0, 12); // BusInDelayed bus 1
+        rt_graph_template_set_default(g, t1, 0, 0, 1.0);
+        rt_graph_template_add_node(g, t1, 1, 2);  // Out bus 0
+        rt_graph_template_set_default(g, t1, 1, 0, 0.0);
+        rt_graph_template_connect(g, t1, 0, 0, 1, 0);
+
+        rt_graph_instance_remove(g, 0);
+        REQUIRE(rt_graph_template_instance_add(g, 0)  >= 0);
+        REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+    };
+
+    auto *direct  = rt_graph_create(8, kFrames);
+    auto *reduced = rt_graph_create(8, kFrames);
+    REQUIRE(direct  != nullptr);
+    REQUIRE(reduced != nullptr);
+    build(direct);
+    build(reduced);
+
+    rt_graph_test_set_reduction_capture(reduced, 1);
+
+    // Block 1: BusInDelayed reads the initial-zero prev pool, so
+    // bus 0 should be silent in both modes. Equivalent or not, it
+    // tests the swap path.
+    rt_graph_process(direct,  kFrames);
+    rt_graph_process(reduced, kFrames);
+    {
+        const auto d = read_bus_vec(direct,  0, kFrames);
+        const auto r = read_bus_vec(reduced, 0, kFrames);
+        check_exact_same(d, r);
+        for (auto v : d) CHECK(v == doctest::Approx(0.0f).epsilon(1e-6));
+    }
+
+    // Block 2: BusInDelayed picks up block 1's folded writes from
+    // output_buses_prev. Reduction mode must produce the same value
+    // as direct mode — proves the block-end swap sees a fully-
+    // folded output_buses, not a still-empty one.
+    rt_graph_process(direct,  kFrames);
+    rt_graph_process(reduced, kFrames);
+    {
+        const auto d = read_bus_vec(direct,  0, kFrames);
+        const auto r = read_bus_vec(reduced, 0, kFrames);
+        check_exact_same(d, r);
+        for (auto v : d) CHECK(v == doctest::Approx(0.5f).epsilon(1e-6));
+    }
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
+}
+
+TEST_CASE("reduction fold: same-template cross-instance live BusIn") {
+    // Two instances of one template: instance slot 0 writes Add(0.7)
+    // into bus 1 via BusOut, instance slot 1 reads bus 1 live via
+    // BusIn and routes it to Out(bus 0). The serial executor walks
+    // instances in slot order, so instance 0's fold completes before
+    // instance 1's BusIn runs. Reduction mode must preserve this —
+    // it's the per-instance equivalent of the cross-template T-10
+    // hazard the design note calls out.
+    auto build = [](RTGraph *g) {
+        rt_graph_ensure_bus(g, 1);
+        rt_graph_template_set_polyphony(g, 0, 4);
+
+        // Two-role template: BusOut(bus 1) wired from Add, BusIn(bus 1)
+        // wired into Out(bus 0). Each instance carries both roles, but
+        // we silence one role per instance via the bus-control override.
+        rt_graph_template_add_node(g, 0, 0, 8);  // Add (constant)
+        rt_graph_template_set_default(g, 0, 0, 0, 0.0);
+        rt_graph_template_set_default(g, 0, 0, 1, 0.0);
+        rt_graph_template_add_node(g, 0, 1, 10); // BusOut
+        rt_graph_template_set_default(g, 0, 1, 0, 1.0);
+        rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+        rt_graph_template_add_node(g, 0, 2, 11); // BusIn
+        rt_graph_template_set_default(g, 0, 2, 0, 1.0);
+        rt_graph_template_add_node(g, 0, 3, 2);  // Out
+        rt_graph_template_set_default(g, 0, 3, 0, 0.0);
+        rt_graph_template_connect(g, 0, 2, 0, 3, 0);
+
+        rt_graph_instance_remove(g, 0);
+        const int writer = rt_graph_template_instance_add(g, 0);
+        const int reader = rt_graph_template_instance_add(g, 0);
+        REQUIRE(writer == 0);
+        REQUIRE(reader == 1);
+
+        // Writer instance: Add control 0 = 0.7 → BusOut(bus 1).
+        // Disable its Out (bus -1) and BusIn (bus -1) to keep it
+        // contributing only the BusOut.
+        rt_graph_instance_set_control(g, writer, 0, 0, 0.7f);
+        rt_graph_instance_set_control(g, writer, 2, 0, -1.0f);
+        rt_graph_instance_set_control(g, writer, 3, 0, -1.0f);
+
+        // Reader instance: silence its Add and BusOut so it adds
+        // nothing of its own to bus 1; its BusIn(bus 1) → Out(bus 0)
+        // sees only the writer's contribution.
+        rt_graph_instance_set_control(g, reader, 0, 0, 0.0f);
+        rt_graph_instance_set_control(g, reader, 1, 0, -1.0f);
+    };
+
+    auto *direct  = rt_graph_create(8, kFrames);
+    auto *reduced = rt_graph_create(8, kFrames);
+    REQUIRE(direct  != nullptr);
+    REQUIRE(reduced != nullptr);
+    build(direct);
+    build(reduced);
+
+    rt_graph_test_set_reduction_capture(reduced, 1);
+    rt_graph_process(direct,  kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    const auto direct_bus0  = read_bus_vec(direct,  0, kFrames);
+    const auto reduced_bus0 = read_bus_vec(reduced, 0, kFrames);
+    check_exact_same(direct_bus0, reduced_bus0);
+    for (auto v : reduced_bus0) CHECK(v == doctest::Approx(0.7f).epsilon(1e-6));
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
+}
+
+TEST_CASE("reduction fold: cross-template live BusIn sees earlier template BusOut") {
+    auto build = [](RTGraph *g) {
+        rt_graph_ensure_bus(g, 1);
+
+        rt_graph_template_add_node(g, 0, 0, 8);  // Add const 0.4
+        rt_graph_template_set_default(g, 0, 0, 0, 0.4);
+        rt_graph_template_set_default(g, 0, 0, 1, 0.0);
+        rt_graph_template_add_node(g, 0, 1, 10); // BusOut bus 1
+        rt_graph_template_set_default(g, 0, 1, 0, 1.0);
+        rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+        int t1 = rt_graph_template_add(g);
+        REQUIRE(t1 == 1);
+        rt_graph_template_add_node(g, t1, 0, 11); // BusIn bus 1
+        rt_graph_template_set_default(g, t1, 0, 0, 1.0);
+        rt_graph_template_add_node(g, t1, 1, 2);  // Out bus 0
+        rt_graph_template_set_default(g, t1, 1, 0, 0.0);
+        rt_graph_template_connect(g, t1, 0, 0, 1, 0);
+
+        rt_graph_instance_remove(g, 0);
+        REQUIRE(rt_graph_template_instance_add(g, 0) >= 0);
+        REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+    };
+
+    auto *direct = rt_graph_create(8, kFrames);
+    auto *reduced = rt_graph_create(8, kFrames);
+    REQUIRE(direct != nullptr);
+    REQUIRE(reduced != nullptr);
+    build(direct);
+    build(reduced);
+
+    rt_graph_test_set_reduction_capture(reduced, 1);
+    rt_graph_process(direct, kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    const auto direct_bus0 = read_bus_vec(direct, 0, kFrames);
+    const auto reduced_bus0 = read_bus_vec(reduced, 0, kFrames);
+    check_exact_same(direct_bus0, reduced_bus0);
+    for (auto v : reduced_bus0) CHECK(v == doctest::Approx(0.4f).epsilon(1e-6));
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
 }
 
 TEST_CASE("reduction capture: cross-instance slot order matches instance slot order") {

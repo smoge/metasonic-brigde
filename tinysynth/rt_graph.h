@@ -572,11 +572,11 @@ int rt_graph_test_contribution_used_word_count(const RTGraph *g);
 // non-zero, the next rt_graph_process call routes every sink
 // write into the per-writer-slot contribution buffer instead of
 // server.output_buses, and records target / used metadata for
-// each slot. Default off; tests opt in to inspect the capture
-// before the post-block reduction-fold pass exists. While
-// reduction-capture is on, output_buses receives no sink writes
-// for the affected blocks, so do not enable this in normal
-// rendering or live audio paths. No-op on null g.
+// each slot. The serial reduction fold then accumulates used slots
+// back into server.output_buses at deterministic join points so
+// later live BusIn reads see canonically earlier writes. Default
+// off; tests opt in to inspect the capture and assert direct-vs-
+// reduction equivalence. No-op on null g.
 void rt_graph_test_set_reduction_capture(RTGraph *g, int on);
 
 // [T:read-only] Phase §4.E.2.B2 test surface: per-slot resolved

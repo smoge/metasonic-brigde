@@ -1723,16 +1723,15 @@ struct RTGraph {
   // Note [Contribution storage — Phase §4.E.2.B1].
   ContributionStorage contribution_storage;
 
-  // Phase §4.E.2.B2: when true, process_graph runs the audio loop
-  // in reduction-capture mode — sink writes land in
-  // contribution_storage.samples instead of server.output_buses,
-  // and per-slot target / used metadata records where each
-  // canonical writer landed. Default off; opt-in via
+  // Phase §4.E.2.B2/B3: when true, process_graph runs the audio
+  // loop in reduction mode — sink writes land in
+  // contribution_storage.samples first, per-slot target / used
+  // metadata records where each canonical writer landed, and B3's
+  // serial fold reduces the private slots back into output_buses at
+  // deterministic join points. Default off; opt-in via
   // rt_graph_test_set_reduction_capture for tests that need to
-  // inspect the per-slot capture before the post-block reduction
-  // pass exists. The serial fold from contributions back into
-  // output_buses is the next slice; until that lands, enabling
-  // this flag silences output_buses for the affected block.
+  // inspect the per-slot capture while still verifying output-bus
+  // bit-equivalence.
   bool capture_reduction_mode = false;
 };
 
@@ -2808,15 +2807,29 @@ index it logically belongs to. Two modes share the same shape:
     rt_graph_test_set_reduction_capture):
     'samples' points at the first frame of the writer slot's
     private buffer in g.contribution_storage.samples. Per-sample
-    'add' accumulates into that private buffer; nothing yet lands
-    in server.output_buses. The post-block reduction pass that
-    folds private buffers back is the next slice (B3 / Phase C
-    boundary); B2 only verifies the capture path is correct.
+    'add' accumulates into that private buffer. B3 folds used slots
+    back into server.output_buses at serial join points, preserving
+    same-block live BusIn semantics while making the private capture
+    observable to tests.
 
 Phase §4.E.2.A introduced the abstraction; B2 generalises the
 'samples' field from std::vector<float>* to a flat float* so
 both modes share one add() implementation. The kernel does
 'samples[fi] += s' regardless of which mode opened the target.
+
+Kernel contract: at most one target.add(fi, ...) per writer slot
+per frame index per block. If a future kernel needs two or more
+independently-ordered bus additions for the same (slot, fi), it
+must use a separate writer slot for each contribution. Reasoning:
+direct mode produces 'output_buses[fi] += a; output_buses[fi] += b'
+— two distinct IEEE-754 += operations. Reduction mode would
+collapse them into 'slot[fi] = a + b' inside the slot, then fold
+'output_buses[fi] += (a + b)', which is mathematically equal but
+not bit-equal under IEEE-754. Today every sink kernel issues
+exactly one add per (slot, fi), so this is a contract for future
+kernels rather than a current bug. See §3 of
+notes/2026-05-08-deterministic-bus-reduction-design.md for the
+canonical-writer-slot model that motivates this rule.
 */
 struct BusWriteTarget {
   float *samples = nullptr;
@@ -2922,6 +2935,56 @@ open_bus_write_target(RTGraph &g, BusWriteMode mode,
                                             writer_slot, nframes);
   }
   return open_direct_bus_write_target(g.server, bus_control);
+}
+
+[[nodiscard]] static bool
+contribution_slot_used(
+    const ContributionStorage &storage, int writer_slot
+) noexcept {
+  if (writer_slot < 0 || writer_slot >= storage.max_writer_slots) return false;
+  const std::size_t ws = static_cast<std::size_t>(writer_slot);
+  const std::size_t word = ws / 64;
+  const std::uint64_t bit = std::uint64_t{1} << (ws % 64);
+  return (storage.used_words[word] & bit) != 0;
+}
+
+// Fold a half-open canonical slot range into the live output buses.
+// Callers pass ranges that have just finished executing, so the
+// fold happens before any later live BusIn can observe the bus. The
+// inner order is writer-slot ascending, which is the canonical serial
+// executor order captured by B0's slot assignment.
+static void fold_contribution_slots(
+    RTGraph &g, int first_slot, int end_slot, int nframes
+) noexcept {
+  auto &storage = g.contribution_storage;
+  assert(first_slot >= 0);
+  assert(end_slot >= first_slot);
+  assert(end_slot <= storage.max_writer_slots);
+
+  const std::size_t mf = static_cast<std::size_t>(g.max_frames);
+  const std::size_t nf = static_cast<std::size_t>(nframes);
+  for (int ws_i = first_slot; ws_i < end_slot; ++ws_i) {
+    if (!contribution_slot_used(storage, ws_i)) continue;
+
+    const std::size_t ws = static_cast<std::size_t>(ws_i);
+    const int bus = storage.target[ws];
+    if (bus < 0) continue;
+    const std::size_t bus_idx = static_cast<std::size_t>(bus);
+    if (bus_idx >= g.server.output_buses.size()) continue;
+
+    float *dst = g.server.output_buses[bus_idx].data();
+    const float *src = &storage.samples[ws * mf];
+    for (std::size_t fi = 0; fi < nf; ++fi) {
+      dst[fi] += src[fi];
+    }
+  }
+}
+
+static inline void fold_recent_writer_slot_if_needed(
+    RTGraph &g, const BlockExecutionContext &ctx, int writer_slot, int nframes
+) noexcept {
+  if (ctx.bus_writes.mode != BusWriteMode::Reduction) return;
+  fold_contribution_slots(g, writer_slot, writer_slot + 1, nframes);
 }
 
 /* Note [Bus-write kernel: Out and BusOut share this]
@@ -4408,6 +4471,7 @@ static inline void dispatch_node(
     // invalid-bus checks. See Note [Writer-slot plumbing].
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
     process_out(g, inst, i, nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     break;
   }
   case NodeKind::Gain:
@@ -4433,6 +4497,7 @@ static inline void dispatch_node(
     // Note [Bus-write kernel: Out and BusOut share this].
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
     process_out(g, inst, i, nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     break;
   }
   case NodeKind::BusIn:
@@ -4533,6 +4598,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
       const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
                                   nframes, writer_slot, ctx.bus_writes.mode);
+      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
       fused = true;
     } else if (r.kernel == RegionKernel::SawLpfGainOut
         && r.node_count == 4
@@ -4546,6 +4612,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
                                       first, first + 1,
                                       first + 2, first + 3,
                                       nframes, writer_slot, ctx.bus_writes.mode);
+      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
       fused = true;
     } else if (r.kernel == RegionKernel::SawGainOut
         && r.node_count == 3
@@ -4556,6 +4623,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
       const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_saw_gain_out(g, inst, first, first + 1, first + 2,
                                   nframes, writer_slot, ctx.bus_writes.mode);
+      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
       fused = true;
     } else if (r.kernel == RegionKernel::NoiseGainOut
         && r.node_count == 3
@@ -4566,6 +4634,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
       const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_noise_gain_out(g, inst, first, first + 1, first + 2,
                                     nframes, writer_slot, ctx.bus_writes.mode);
+      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
       fused = true;
     } else if (r.kernel == RegionKernel::BusInLpfGainOut
         && r.node_count == 4
@@ -4579,6 +4648,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
                                         first, first + 1,
                                         first + 2, first + 3,
                                         nframes, writer_slot, ctx.bus_writes.mode);
+      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
       fused = true;
     } else if (r.kernel == RegionKernel::NoiseLpfGainOut
         && r.node_count == 4
@@ -4592,6 +4662,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
                                         first, first + 1,
                                         first + 2, first + 3,
                                         nframes, writer_slot, ctx.bus_writes.mode);
+      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
       fused = true;
     }
 
@@ -4664,7 +4735,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // See Note [Writer-slot plumbing].
   BlockExecutionContext ctx;
 
-  // Phase B2: when capture_reduction_mode is on, switch the
+  // Phase B2/B3: when capture_reduction_mode is on, switch the
   // per-block bus-write mode to Reduction and clear the
   // contribution table's per-block metadata (target / used bits).
   // Direct mode (the default) leaves contribution_storage
@@ -4672,7 +4743,10 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // themselves are zeroed lazily by open_reduction_bus_write_target
   // for each slot the kernels actually open — an unopened slot
   // keeps its used bit clear, so a stale samples value cannot be
-  // misread as a real contribution.
+  // misread as a real contribution. B3 folds each used slot into
+  // output_buses at the serial join point immediately after its
+  // producing sink step finishes, preserving live BusIn
+  // read-after-write semantics.
   if (g.capture_reduction_mode) {
     ctx.bus_writes.mode = BusWriteMode::Reduction;
     auto &storage = g.contribution_storage;
