@@ -534,6 +534,26 @@ int rt_graph_kind_supported(int node_kind);
 // active portion of the contribution table.
 int rt_graph_test_last_writer_slot_count(const RTGraph *g);
 
+// [T:read-only] Phase §4.E.2.B1 test surface: writer-slot capacity
+// the contribution storage is currently sized for. Equals
+// Σ_t max(def[t].polyphony, occupied_t) × sink_writer_count[t]
+// at the high-water mark, where occupied_t counts {Active,
+// Releasing, Reserved} instances. Updated by every construction
+// mutation that can affect the bound (rt_graph_template_add,
+// rt_graph_template_set_polyphony, rt_graph_template_add_node,
+// rt_graph_clear). Grow-only — see Note [Contribution storage —
+// Phase §4.E.2.B1]. Returns 0 on null g.
+int rt_graph_test_contribution_slot_capacity(const RTGraph *g);
+
+// [T:read-only] Phase §4.E.2.B1 test surface: total sample count
+// in the contribution storage's per-slot frame buffers. Equals
+// rt_graph_test_contribution_slot_capacity * max_frames at every
+// point construction is observable from outside. Used by tests as
+// a cross-check that the parallel storage vectors stay in
+// lockstep — a future refactor that resized one without the
+// other would diverge here. Returns 0 on null g.
+int rt_graph_test_contribution_sample_count(const RTGraph *g);
+
 // ----------------------------------------------------------------
 // Multi-instance support
 // ----------------------------------------------------------------

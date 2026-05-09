@@ -1606,6 +1606,73 @@ In SuperCollider terms, output_buses corresponds to In.ar's source
 and output_buses_prev corresponds to InFeedback.ar's source.
 */
 
+/* Note [Contribution storage — Phase §4.E.2.B1]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Storage for the writer-slot-keyed contribution table the design note
+in notes/2026-05-08-deterministic-bus-reduction-design.md (§5)
+specifies. B1 only allocates and sizes the storage; B2 will route
+sink writes into it and add the canonical-order reduction pass.
+
+Three parallel vectors, all indexed by writer slot ws ∈ [0, max_writer_slots):
+
+  * samples[ws * max_frames .. ws * max_frames + max_frames)
+      — per-slot frame buffer. Phase B2 fills this from sink kernels.
+  * target[ws]
+      — resolved bus index for slot ws; -1 means invalid / unused.
+  * used_words[ws / 64] bit (1 << (ws % 64))
+      — set by the producing work unit when it actually writes a
+        contribution this block; the reduction skips clear bits.
+
+Capacity is grow-only. resize_for refuses to shrink, mirroring
+ensure_output_bus_count's discipline: even if a future polyphony
+lowering would suggest a smaller bound, the high-water mark holds
+so a previously-live writer slot can never end up out-of-range.
+clear (called from reset_to_default_state) drops back to the
+empty/default state, matching the snapshot-reset discipline.
+
+Sizing follows §5 with one tightening for runtime safety:
+
+  required = Σ_t max(def[t].polyphony, occupied_t) × sink_writer_count[t]
+
+where occupied_t counts {Active, Releasing, Reserved} instances of
+template t. The plain Σ polyphony × sink_writer_count formula is
+unsafe because rt_graph_template_set_polyphony allows lowering the
+cap below already-live instances; the max(...) form keeps the
+table sized for the larger of the two until the live count drains
+naturally.
+*/
+struct ContributionStorage {
+  int max_writer_slots = 0;
+  std::vector<float>    samples;     // size = max_writer_slots * max_frames
+  std::vector<int>      target;      // size = max_writer_slots, default -1
+  std::vector<std::uint64_t> used_words; // size = ceil_div(max_writer_slots, 64)
+
+  // Grow-only. Sizes the three parallel vectors for at least
+  // slot_count writer slots × max_frames samples per slot. A
+  // request for fewer slots than already allocated is a no-op —
+  // the high-water mark holds so a slot reserved earlier in the
+  // block (under a higher cap) cannot land out-of-range later.
+  void resize_for(int slot_count, int max_frames) {
+    if (slot_count <= max_writer_slots) return;
+    const std::size_t s = static_cast<std::size_t>(slot_count);
+    const std::size_t f = static_cast<std::size_t>(max_frames);
+    samples.resize(s * f, 0.0f);
+    target.resize(s, -1);
+    used_words.resize((s + 63) / 64, 0);
+    max_writer_slots = slot_count;
+  }
+
+  // Drop back to the empty/default state. Called from
+  // reset_to_default_state so rt_graph_clear puts the table in the
+  // same shape rt_graph_create starts with.
+  void clear() {
+    max_writer_slots = 0;
+    samples.clear();
+    target.clear();
+    used_words.clear();
+  }
+};
+
 struct RTGraph {
   int capacity = 0;
   int max_frames = 0;
@@ -1646,6 +1713,15 @@ struct RTGraph {
   // template scenarios. Has no runtime use: B0 only asserts the
   // counter on the kernel side and uses this snapshot for tests.
   int last_block_writer_slot_count = 0;
+
+  // Phase §4.E.2.B1: writer-slot-keyed contribution table. Sized
+  // by ensure_contribution_capacity from
+  // Σ_t max(def[t].polyphony, occupied_t) × sink_writer_count[t]
+  // at every construction mutation that can affect the bound. B1
+  // only allocates and sizes; B2 will route sink writes here and
+  // add the canonical-order reduction pass. See
+  // Note [Contribution storage — Phase §4.E.2.B1].
+  ContributionStorage contribution_storage;
 };
 
 namespace {
@@ -1926,6 +2002,86 @@ static void ensure_output_bus_count(Server &server, std::size_t count, int max_f
     server.output_buses[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
     server.output_buses_prev[i].resize(static_cast<std::size_t>(max_frames), 0.0f);
   }
+}
+
+// ----------------------------------------------------------------
+// Phase §4.E.2.B1: contribution storage capacity
+// ----------------------------------------------------------------
+//
+// Three helpers, one resize point. ensure_contribution_capacity is
+// the only place that mutates RTGraph::contribution_storage's size,
+// and it is grow-only. See Note [Contribution storage — Phase
+// §4.E.2.B1] above the ContributionStorage struct for the model.
+
+// Count of sink-terminal NodeSpecs in template t — the writers that
+// will reserve a slot each at every dispatch boundary, regardless
+// of whether a region (NodeLoop / fused) wraps them. Drives the
+// per-template multiplier in required_contribution_slots.
+[[nodiscard]] static int sink_writer_count(const MetaDef &def) noexcept {
+  int n = 0;
+  for (const auto &node : def.nodes) {
+    if (node.kind == NodeKind::Out || node.kind == NodeKind::BusOut) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+// Count of instances currently occupying a slot for template tid.
+// {Active, Releasing, Reserved} all count: an Active or Releasing
+// slot is part of the current block's audio schedule, and a
+// Reserved slot is mid-spawn — its producer may publish it Active
+// (and start consuming writer slots) before the next process_graph
+// call. Available slots do not occupy.
+[[nodiscard]] static int
+occupied_instances_for_template(const RTGraph &g, int tid) noexcept {
+  int n = 0;
+  for (const auto &inst : g.instances) {
+    if (inst.template_id != tid) continue;
+    const SlotState s = inst.state.load();
+    if (s == SlotState::Active || s == SlotState::Releasing
+        || s == SlotState::Reserved) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+// Compute the required writer-slot capacity. The plain
+// Σ polyphony × sink_writer_count formula from §5 is unsafe
+// against rt_graph_template_set_polyphony lowering the cap below
+// already-live instances (see its docblock); the max(...) form
+// keeps the table sized for the larger of the two until the live
+// count drains naturally. Combined with grow-only resize_for, this
+// makes a once-allocated slot index safe for the lifetime of any
+// in-flight block.
+[[nodiscard]] static int
+required_contribution_slots(const RTGraph &g) noexcept {
+  int total = 0;
+  for (std::size_t tid = 0; tid < g.defs.size(); ++tid) {
+    const int sinks = sink_writer_count(g.defs[tid]);
+    if (sinks == 0) continue;
+    const int poly = g.defs[tid].polyphony;
+    const int occ  = occupied_instances_for_template(g, static_cast<int>(tid));
+    const int per  = poly > occ ? poly : occ;
+    total += per * sinks;
+  }
+  return total;
+}
+
+// Grow-only resize the contribution storage to satisfy the current
+// required bound. Called from every construction mutation that can
+// affect the bound:
+//   * rt_graph_template_add        (no-op: new template has 0 sinks)
+//   * rt_graph_template_set_polyphony
+//   * rt_graph_template_add_node   (sink_writer_count grows on
+//                                   Out / BusOut nodes)
+// Also indirectly from rt_graph_clear via reset_to_default_state's
+// contribution_storage.clear(), which puts the table at 0 capacity
+// and lets the next mutation re-grow it.
+static void ensure_contribution_capacity(RTGraph &g) {
+  const int required = required_contribution_slots(g);
+  g.contribution_storage.resize_for(required, g.max_frames);
 }
 
 // Zero the first nframes of each *live* output bus before one block
@@ -4713,6 +4869,12 @@ static void reset_to_default_state(RTGraph &g) {
   // has run yet" promise.
   g.last_block_writer_slot_count = 0;
 
+  // Phase B1: drop contribution storage back to empty. The next
+  // construction mutation (rt_graph_template_add_node,
+  // rt_graph_template_set_polyphony, etc.) will re-call
+  // ensure_contribution_capacity with the post-clear shape.
+  g.contribution_storage.clear();
+
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
   // commands against the freshly-rebuilt template / instance pool
@@ -4921,6 +5083,15 @@ int rt_graph_template_add(RTGraph *g) {
     def.nodes.reserve(static_cast<std::size_t>(g->capacity));
   }
   g->defs.push_back(std::move(def));
+
+  // A fresh template has zero sink writers, so the bound is
+  // unchanged today. The call is here for symmetry — every
+  // construction mutation that can affect required_contribution_slots
+  // routes through ensure_contribution_capacity, so a future change
+  // (e.g. cloning a template's nodes on add) cannot silently
+  // under-size the table.
+  ensure_contribution_capacity(*g);
+
   return static_cast<int>(g->defs.size() - 1);
 }
 
@@ -4942,6 +5113,12 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
   MetaDef *def = template_at(*g, template_id);
   if (!def) return;
   def->polyphony = polyphony < 1 ? 1 : polyphony;
+
+  // ensure_contribution_capacity is grow-only and uses
+  // max(polyphony, occupied) per template, so lowering the cap
+  // below already-live instances does not shrink the table — a
+  // writer slot reserved under the old cap stays in range.
+  ensure_contribution_capacity(*g);
 }
 
 // Number of registered templates. Iterate 0..count-1 to enumerate.
@@ -4954,6 +5131,17 @@ int rt_graph_template_count(RTGraph *g) {
 int rt_graph_test_last_writer_slot_count(const RTGraph *g) {
   if (!g) return 0;
   return g->last_block_writer_slot_count;
+}
+
+// Phase §4.E.2.B1 test surfaces. See header docblocks.
+int rt_graph_test_contribution_slot_capacity(const RTGraph *g) {
+  if (!g) return 0;
+  return g->contribution_storage.max_writer_slots;
+}
+
+int rt_graph_test_contribution_sample_count(const RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->contribution_storage.samples.size());
 }
 
 // Add or reconfigure one node at its dense runtime index in the named
@@ -5010,6 +5198,12 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
   if (kind == NodeKind::Out) {
     ensure_output_bus_count(g->server, 1, g->max_frames);
   }
+
+  // Phase B1: Out / BusOut nodes are sink writers; each one bumps
+  // sink_writer_count[template_id] by 1, so the contribution table
+  // may need more rows. Other kinds don't change the bound but the
+  // call is cheap (resize_for is a no-op when nothing grew).
+  ensure_contribution_capacity(*g);
 }
 
 // Set one entry of a template's spec.default_controls. New instances
