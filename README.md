@@ -35,8 +35,11 @@ runtime problem. Two worlds:
 You don't evaluate structure at runtime. You build, validate, order, compile —
 then execute. When audio starts, decisions are already made.
 
-Note: planned changes include adding and modifying graphs without interrupting
-audio. This will require some changes in the C ABI.
+Note: graphs and instances can be added, modified, or removed at runtime
+without restarting audio. Voice templates declare polyphony at load time and
+the C runtime pre-warms an instance pool; new voices are reserved off-thread
+and activated on the audio thread without allocation. See the
+`rt_graph_realtime_*` surface in [tinysynth/rt_graph.h](tinysynth/rt_graph.h).
 
 ---
 
@@ -215,7 +218,26 @@ detunedSawGraph = runSynth $ do
   out 0 g1
   out 0 g2
 
+-- Voice template: write to a bus instead of straight to output.
+voiceGraph :: SynthGraph
+voiceGraph = runSynth $ do
+  osc <- sawOsc 110.0 0.0
+  g   <- gain osc 0.4
+  busOut 7 g
+
+-- Master template: read the same bus, apply shared FX, write to output.
+masterGraph :: SynthGraph
+masterGraph = runSynth $ do
+  r <- busIn 7
+  f <- lpf r 1200.0 1.5
+  g <- gain f 0.8
+  out 0 g
+
 ```
+
+Inter-template precedence (voice runs before master) is derived automatically
+from the `busOut 7` / `busIn 7` connectivity at compile time — there is no
+runtime ordering knob.
 
 This syntax belongs to `metasonic-bridge` — the compilation layer that
 constructs IR nodes and lowers them to C++. The authoring DSL in
