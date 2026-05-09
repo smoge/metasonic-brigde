@@ -2575,6 +2575,55 @@ static void process_env(const RTGraph &g, GraphInstance &inst,
   }
 }
 
+/* Note [BusWriteTarget: direct bus writes today]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Phase §4.E.2.A introduces a named bus-write target without changing
+runtime behavior. Today the target always points directly at
+server.output_buses[bus], preserving the serial executor byte-for-byte.
+Phase B can add a contribution-buffer-backed target behind the same
+open/add interface while keeping sink kernels oblivious to where the
+samples land.
+*/
+struct BusWriteTarget {
+  std::vector<float> *samples = nullptr;
+  int resolved_bus = -1;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return samples != nullptr;
+  }
+
+  inline void add(std::size_t fi, float s) noexcept {
+    (*samples)[fi] += s;
+  }
+};
+
+// Validate the bus index in the double domain BEFORE casting to int.
+// double -> int is unspecified for NaN / Inf / out-of-int-range finite
+// values; the range check below would run on garbage. See
+// Note [Pathological-input sanitation].
+[[nodiscard]] static std::optional<int>
+resolve_output_bus_index(const Server &server, double bus_control) noexcept {
+  const double bus_lim = static_cast<double>(server.output_buses.size());
+  if (!std::isfinite(bus_control) || bus_control < 0.0
+      || bus_control >= bus_lim) {
+    return std::nullopt;
+  }
+  return static_cast<int>(bus_control);
+}
+
+[[nodiscard]] static BusWriteTarget
+open_direct_bus_write_target(Server &server, double bus_control) noexcept {
+  const auto bus = resolve_output_bus_index(server, bus_control);
+  if (!bus.has_value()) {
+    return {};
+  }
+
+  return BusWriteTarget{
+    &server.output_buses[static_cast<std::size_t>(*bus)],
+    *bus,
+  };
+}
+
 /* Note [Bus-write kernel: Out and BusOut share this]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out and BusOut are operationally identical: both accumulate their input
@@ -2611,15 +2660,9 @@ static void process_out(RTGraph &g, GraphInstance &inst,
   if (in.empty())
     return;
 
-  // Validate the bus index in the double domain BEFORE casting to int.
-  // double -> int is unspecified for NaN / Inf / out-of-int-range
-  // finite values; the range check below would run on garbage. See
-  // Note [Pathological-input sanitation].
-  const double bus_d = node.controls[0];
-  const double bus_lim = static_cast<double>(g.server.output_buses.size());
-  if (!std::isfinite(bus_d) || bus_d < 0.0 || bus_d >= bus_lim)
+  auto target = open_direct_bus_write_target(g.server, node.controls[0]);
+  if (!target.valid())
     return;
-  const int bus = static_cast<int>(bus_d);
 
   // Accumulate into the bus and, in the same pass, track the block's
   // peak |input| for §2.E release-then-free silence detection. The
@@ -2627,11 +2670,11 @@ static void process_out(RTGraph &g, GraphInstance &inst,
   // the same instance contribute to the same max. process_instance
   // resets inst.block_sink_peak to 0 before any node runs this block;
   // process_graph reads it after the instance finishes.
-  auto &dst = g.server.output_buses[static_cast<std::size_t>(bus)];
   float peak = inst.block_sink_peak;
   for (int i = 0; i < nframes; ++i) {
-    const float s = in[static_cast<std::size_t>(i)];
-    dst[static_cast<std::size_t>(i)] += s;
+    const std::size_t fi = static_cast<std::size_t>(i);
+    const float s = in[fi];
+    target.add(fi, s);
     const float a = std::fabs(s);
     if (a > peak) peak = a;
   }
@@ -3012,8 +3055,8 @@ attempt to be a unified region kernel runner.
 // read-modify-write of inst.block_sink_peak, with the same
 // silent-no-op behavior on an invalid bus.
 struct SinkAccumulator {
-  std::vector<float> *dst;   // null when the bus index was invalid
-  float peak;                // running max(|sample|) for this block
+  BusWriteTarget target;  // invalid when the bus index was invalid
+  float peak;             // running max(|sample|) for this block
 
   // Validate the bus index and snapshot the per-instance running
   // peak. process_instance reset block_sink_peak to 0 before this
@@ -3021,23 +3064,18 @@ struct SinkAccumulator {
   // that already ran in this block.
   static SinkAccumulator open(RTGraph &g, GraphInstance &inst,
                               double bus_control) noexcept {
-    const double bus_lim =
-        static_cast<double>(g.server.output_buses.size());
-    if (!std::isfinite(bus_control) || bus_control < 0.0
-        || bus_control >= bus_lim) {
-      return SinkAccumulator{nullptr, 0.0f};
+    auto target = open_direct_bus_write_target(g.server, bus_control);
+    if (!target.valid()) {
+      return SinkAccumulator{target, 0.0f};
     }
-    return SinkAccumulator{
-      &g.server.output_buses[static_cast<std::size_t>(bus_control)],
-      inst.block_sink_peak,
-    };
+    return SinkAccumulator{target, inst.block_sink_peak};
   }
 
   // Add a sample to the live bus and update the block peak. No-op
   // on an invalid bus.
   inline void push(std::size_t fi, float s) noexcept {
-    if (dst) {
-      (*dst)[fi] += s;
+    if (target.valid()) {
+      target.add(fi, s);
       const float a = std::fabs(s);
       if (a > peak) peak = a;
     }
@@ -3047,7 +3085,7 @@ struct SinkAccumulator {
   // invalid bus so the rejected-bus path cannot stomp a peak that
   // a sibling kernel had already recorded.
   inline void flush_to(GraphInstance &inst) const noexcept {
-    if (dst) inst.block_sink_peak = peak;
+    if (target.valid()) inst.block_sink_peak = peak;
   }
 };
 

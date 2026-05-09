@@ -738,12 +738,12 @@ Required before any phase ships:
 
   - `just stack-test` passes.
   - `just cpp-build` passes.
-  - `just cpp-test` passes — the full C++ CTest suite in
-    `build-cpp/` (recipe runs `ctest --test-dir build-cpp
-    --output-on-failure`). The closing paragraph of this
-    section discusses live-audio tests as a follow-up sanity
-    check rather than a per-phase gate; the existing CTest
-    suite is offline by construction.
+  - The deterministic C++ CTest subset passes:
+    `ctest --test-dir build-cpp --output-on-failure -E
+    "start_audio|audio start|clear during a running audio stream|rebuild after clear with active stream|destroy after start_audio"`.
+    `just cpp-test` runs the full CTest suite and may reach
+    host-audio lifecycle tests, so it is useful as an end-to-end
+    probe but not the required per-phase gate on no-audio hosts.
   - The kindTag-agreement and `ugenView` arity properties in
     `test/Spec.hs` pass (already required, listed for
     completeness).
