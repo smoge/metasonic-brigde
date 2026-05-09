@@ -955,8 +955,10 @@ expose a public runtime switch yet, and do not start Phase-D
 live-bus writer relaxation yet. The only positive bench signal is
 sink-free Free-band compute at enough width and block work. Reduction-
 backed sink dispatch and send/return dispatch both lose on the
-current bench grid, and the worker wake/join primitive still uses a
-mutex / condition-variable wait on the audio thread.
+current bench grid. A follow-up pass replaced the worker wake/join
+primitive's audio-thread mutex / condition-variable path with atomic
+generation + completion counters, but the default-off policy remains
+until post-atomic-dispatch benchmarks show a representative win.
 
 This updates §13's "bench work gates whether Phase C ships
 defaulted-on or defaulted-off" question: for now, Phase C remains

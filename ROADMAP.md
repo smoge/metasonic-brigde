@@ -112,11 +112,12 @@ Known limitations:
   the signal grows.
 - Region-level parallelism is test-gated (§4.E): the runtime now has
   global schedule metadata, band construction, a worker-pool scaffold,
-  and opt-in Free-band dispatch under the test ABI. The first bench /
-  corpus refresh is complete: worker dispatch is observable from the
-  Haskell-loaded corpus, but only through targeted probes, and the
-  measured dispatched rows are still slower than legacy serial. It is
-  not a realtime-safe default and stays test/bench gated.
+  and opt-in Free-band dispatch under the test ABI. The audio-thread
+  dispatch primitive is now lock-free/allocation-free (atomic
+  generation + completion counters; no mutex/cv on `process_graph`),
+  but the first bench / corpus refresh still showed worker dispatch
+  only through targeted probes and slower than legacy serial. It stays
+  test/bench gated.
 - Whole-region kernel /codegen/ (auto-generated DSP bodies) is
   deferred indefinitely. Hand-written kernel bodies plus narrow
   helpers (`SinkAccumulator`, `drive_oscillator`) cover the proven
@@ -671,9 +672,9 @@ Current status:
    serialize explicitly, while reduction-mode sink bands can use
    deferred per-slot folding after the worker join. C1c tests run
    the full T-9 corpus under `pool_size=3` and preserve byte
-   equivalence. This path is still marked non-RT-safe because the
-   dispatch primitive uses a mutex/condition-variable join on the
-   audio thread.
+   equivalence. The dispatch primitive now publishes work and joins
+   with atomics only on the audio thread; thread start/stop remains a
+   construction-time operation.
 8. **Bench, corpus refresh, and turn-on decision — done, default-off.**
    The C++ synthetic bench and Haskell-loaded worker bench are in
    place. Synthetic sink-free Free-band compute only wins at enough
@@ -709,16 +710,12 @@ Next §4.E slice:
      - multi-band processing (input → N band splits → per-band chains
        → join);
      - drum machine (N drum templates writing the same master BusOut).
-3. **Realtime-safe dispatch mechanics, only after useful workload
-   exists.** The current pool path still uses mutex/cv wake + join on
-   the audio thread. Prototype a narrower realtime-safe primitive only
-   if the corpus/bench refresh finds worker-dispatchable rows that
-   actually win. Note the bench-pessimism risk: if post-corpus rows
-   land in the borderline-negative range (≈ 0.7–0.95x), prototype a
-   thinner primitive before concluding parallelism doesn't pay. Sub-
-   1.0x with the current primitive is not equivalent to "parallelism
-   is futile" — it can also mean "wake/join overhead is masking
-   speedup that a leaner primitive would expose."
+3. **Benchmark refresh after the realtime-safe primitive.** The
+   previous worker-bench data measured the old mutex/cv dispatch path.
+   Rerun both the C++ synthetic grid and `--worker-bench` before making
+   any policy change. Counter-confirmed sub-1.0x rows after the atomic
+   dispatch pass are stronger evidence against default-on scheduling
+   than the earlier mutex/cv measurements.
 4. **No public switch or default-on path yet.** Do not expose worker
    scheduling outside the test/bench ABI until a successor decision
    record replaces the current default-off decision with explicit

@@ -27,10 +27,10 @@ Do **not** expose a public runtime switch yet.
 Keep the worker schedule path under the test / bench ABI until both of
 these are true:
 
-- the dispatch primitive has a realtime-safe policy, not the current
-  mutex / condition-variable join on the audio thread;
-- representative graph benchmarks show speedup on real Haskell-loaded
-  schedules, not only on synthetic C++ fixtures.
+- the post-realtime-safe-dispatch benchmarks show useful speedup on
+  representative Haskell-loaded schedules;
+- a successor decision record defines the representative corpus,
+  minimum speedup threshold, and public/runtime switch policy.
 
 ## Policy by path
 
@@ -60,11 +60,15 @@ The same run shows no useful signal for reduction-backed sink work:
   not worker-dispatch wins, as the counters show `parallel_bands=0` and
   `serialized_sink_bands=1`.
 
-The current worker pool also still has a realtime-policy gap:
-`ScheduleWorkerPool::run_parallel` is allocation-free during
-`process_graph`, but it takes a mutex, wakes worker threads, and waits on
-a condition variable from the audio thread. That is acceptable for the
-current test/bench substrate and not acceptable as a default audio path.
+The original C1c worker pool had a realtime-policy gap:
+`ScheduleWorkerPool::run_parallel` was allocation-free during
+`process_graph`, but it took a mutex, woke worker threads, and waited on
+a condition variable from the audio thread. The follow-up dispatch pass
+removed that audio-thread mutex/cv path and replaced it with atomic
+generation + completion counters. That makes the dispatch substrate
+safe with respect to audio-thread locks/allocation, but it does not
+change the default-off policy: the measured corpus still lacks a
+representative winning workload until the benches are refreshed.
 
 ## Representative-data refresh
 
@@ -136,10 +140,11 @@ The next runtime-parallelism work should be one of:
   with enough region-layer work to make C1d worth benchmarking. The
   first targeted probes prove the instrumentation can see the shape, but
   they are not a representative default-on basis;
-- dispatch mechanics: prototype a realtime-safer worker wake/join
-  strategy only after a later corpus refresh produces worker-dispatchable
-  graph shapes that actually win, then rerun both the C++ synthetic grid
-  and `--worker-bench`;
+- benchmark refresh: rerun both the C++ synthetic grid and
+  `--worker-bench` after the atomic dispatch pass. Treat the previous
+  mutex/cv worker-bench numbers as superseded for performance policy,
+  but keep their counter data as evidence of which rows actually
+  reached worker dispatch;
 - policy prototype under the test ABI only, and only after representative
   rows actually enter worker dispatch: sink-free bands, no reduction,
   minimum width/work threshold, and full T-9 equivalence.

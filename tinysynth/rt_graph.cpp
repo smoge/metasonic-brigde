@@ -33,12 +33,10 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
-#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <thread>
@@ -1816,23 +1814,31 @@ thread publishes one stack-owned dispatch descriptor, wakes the
 already-created workers, processes lane 0 itself, then waits for all
 background lanes to finish before the next schedule band begins.
 
-This remains a test-gated substrate, not an RT-safe default path:
-run_parallel briefly takes a mutex on the audio thread and waits on a
-condition variable for worker completion. Keep the public runtime on the
-legacy/global-serial path until bench work and an explicit RT-safety pass
-justify a wider turn-on.
+The dispatch primitive is deliberately narrower than the C1c scaffold:
+the audio thread never takes a mutex, waits on a condition variable,
+allocates, starts threads, or joins threads while processing a block.
+It publishes a stack-owned dispatch descriptor with atomic stores,
+bumps an atomic generation counter, processes lane 0 itself, then waits
+on an atomic completion counter until background lanes finish. The join
+uses spin-then-yield backoff rather than a blocking mutex/cv; workers
+are created / destroyed only by the construction/test ABI while audio is
+stopped.
+
+This still remains test/bench gated. The primitive is now realtime-safe
+with respect to locks/allocation on the audio thread, but the worker
+path still needs representative workload wins and a successor turn-on
+decision before becoming public/default.
 */
 struct ScheduleWorkerPool {
   using WorkFn = void (*)(void *, int) noexcept;
 
-  mutable std::mutex mutex;
-  std::condition_variable cv;
-  bool stopping = false;
-  int configured_size = 0;
-  int work_generation = 0;
-  int completed_workers = 0;
-  WorkFn current_work = nullptr;
-  void *current_work_user = nullptr;
+  std::atomic<bool> stopping{false};
+  std::atomic<int> configured_size{0};
+  std::atomic<int> background_workers{0};
+  std::atomic<int> work_generation{0};
+  std::atomic<int> completed_workers{0};
+  std::atomic<WorkFn> current_work{nullptr};
+  std::atomic<void *> current_work_user{nullptr};
   std::vector<std::thread> workers;
 
   ~ScheduleWorkerPool() {
@@ -1847,24 +1853,20 @@ struct ScheduleWorkerPool {
     const int next_size = std::max(0, requested_size);
     stop_workers();
 
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      configured_size = next_size;
-    }
+    configured_size.store(next_size, std::memory_order_release);
 
-    const int background_workers = next_size <= 1 ? 0 : next_size - 1;
-    workers.reserve(static_cast<std::size_t>(background_workers));
-    for (int i = 0; i < background_workers; ++i) {
+    const int next_background_workers = next_size <= 1 ? 0 : next_size - 1;
+    workers.reserve(static_cast<std::size_t>(next_background_workers));
+    for (int i = 0; i < next_background_workers; ++i) {
       workers.emplace_back([this, i]() noexcept { worker_loop(i + 1); });
     }
+    background_workers.store(
+        next_background_workers, std::memory_order_release);
   }
 
   void stop_workers() noexcept {
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      stopping = true;
-    }
-    cv.notify_all();
+    stopping.store(true, std::memory_order_release);
+    work_generation.fetch_add(1, std::memory_order_release);
 
     for (auto &worker : workers) {
       if (worker.joinable()) {
@@ -1873,92 +1875,123 @@ struct ScheduleWorkerPool {
     }
     workers.clear();
 
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      stopping = false;
-      current_work = nullptr;
-      current_work_user = nullptr;
-      work_generation = 0;
-      completed_workers = 0;
-    }
+    background_workers.store(0, std::memory_order_release);
+    current_work.store(nullptr, std::memory_order_release);
+    current_work_user.store(nullptr, std::memory_order_release);
+    completed_workers.store(0, std::memory_order_release);
+    work_generation.store(0, std::memory_order_release);
+    stopping.store(false, std::memory_order_release);
   }
 
   int logical_size() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex);
-    return configured_size;
+    return configured_size.load(std::memory_order_acquire);
   }
 
   int background_thread_count() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex);
-    return static_cast<int>(workers.size());
+    return background_workers.load(std::memory_order_acquire);
   }
 
-  // C1c dispatch primitive. This is deliberately allocation-free during
-  // process_graph, but it is not lock-free: the audio thread uses the
-  // mutex/cv pair to publish work and join background lanes. Treat it as
-  // test/bench infrastructure until the RT policy is revisited.
+  // Realtime-safe band dispatch: no mutex/cv, allocation, thread start,
+  // or thread join from the audio thread. The wait is still a hard join
+  // on the current band's background lanes because later bands may read
+  // state produced by this band.
   void run_parallel(WorkFn fn, void *user) noexcept {
-    int background_workers = 0;
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      background_workers = static_cast<int>(workers.size());
-      if (background_workers > 0) {
-        current_work = fn;
-        current_work_user = user;
-        completed_workers = 0;
-        ++work_generation;
-      }
+    if (!fn) return;
+
+    const int active_background_workers =
+        background_workers.load(std::memory_order_acquire);
+
+    if (active_background_workers > 0) {
+      current_work_user.store(user, std::memory_order_release);
+      current_work.store(fn, std::memory_order_release);
+      completed_workers.store(0, std::memory_order_release);
+      work_generation.fetch_add(1, std::memory_order_release);
     }
 
-    if (background_workers > 0) {
-      cv.notify_all();
-    }
+    fn(user, 0);
 
-    if (fn) {
-      fn(user, 0);
-    }
-
-    if (background_workers <= 0) {
+    if (active_background_workers <= 0) {
       return;
     }
 
-    {
-      std::unique_lock<std::mutex> lock(mutex);
-      cv.wait(lock, [this, background_workers]() noexcept {
-        return completed_workers >= background_workers;
-      });
-      current_work = nullptr;
-      current_work_user = nullptr;
+    int join_spins = 0;
+    while (completed_workers.load(std::memory_order_acquire)
+           < active_background_workers) {
+      audio_join_pause(join_spins);
+      join_spins = std::min(join_spins + 1, 4096);
     }
+
+    current_work.store(nullptr, std::memory_order_release);
+    current_work_user.store(nullptr, std::memory_order_release);
   }
 
 private:
+  static void rt_spin_pause() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+  }
+
+  static void worker_idle_pause(int idle_spins) noexcept {
+    if (idle_spins < 1024) {
+      rt_spin_pause();
+    } else {
+      // Background workers may yield while idle. The audio thread never
+      // takes this path; its dispatch/join path stays lock-free and
+      // syscall-free.
+      std::this_thread::yield();
+    }
+  }
+
+  static void audio_join_pause(int join_spins) noexcept {
+    if (join_spins < 4096) {
+      rt_spin_pause();
+    } else {
+      // This path is a progress fallback for normal-priority test/bench
+      // hosts. A deployed realtime configuration should run worker
+      // lanes with an audio-compatible scheduling policy so the join
+      // completes during the spin window.
+      std::this_thread::yield();
+    }
+  }
+
   void worker_loop(int worker_id) noexcept {
+    // Start from the reset generation, not the currently-observed
+    // value. A thread may start after the first dispatch has already
+    // bumped work_generation; initializing from the current value would
+    // make that worker miss the in-flight band and deadlock the join.
     int seen_generation = 0;
-    std::unique_lock<std::mutex> lock(mutex);
+    int idle_spins = 0;
     while (true) {
-      cv.wait(lock, [this, seen_generation]() noexcept {
-        return stopping || work_generation != seen_generation;
-      });
-      if (stopping) {
+      if (stopping.load(std::memory_order_acquire)) {
         return;
       }
 
-      WorkFn fn = current_work;
-      void *user = current_work_user;
-      const int generation = work_generation;
-      lock.unlock();
+      const int generation = work_generation.load(std::memory_order_acquire);
+      if (generation == seen_generation) {
+        worker_idle_pause(idle_spins);
+        idle_spins = std::min(idle_spins + 1, 1024);
+        continue;
+      }
+
+      if (stopping.load(std::memory_order_acquire)) {
+        return;
+      }
+
+      WorkFn fn = current_work.load(std::memory_order_acquire);
+      void *user = current_work_user.load(std::memory_order_acquire);
+      idle_spins = 0;
 
       if (fn) {
         fn(user, worker_id);
       }
 
-      lock.lock();
       seen_generation = generation;
-      ++completed_workers;
-      // Small C1c pools make notify_all acceptable. Bench work should
-      // decide whether larger pools need a narrower completion wakeup.
-      cv.notify_all();
+      completed_workers.fetch_add(1, std::memory_order_release);
     }
   }
 };

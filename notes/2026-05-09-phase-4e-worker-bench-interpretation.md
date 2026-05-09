@@ -133,9 +133,11 @@ The current worker path has a useful but narrow performance envelope:
   enough per-entry sample work.
 - Negative signal: narrow bands, sink/reduction bands, and send/return
   bands.
-- The mutex / condition-variable wakeup cost is visible. Pool size 4 is
-  best on the widest/heaviest `FreeCompute` rows, but it is often worse
-  on smaller rows.
+- This run measured the original mutex / condition-variable wakeup
+  path. A later realtime-dispatch pass replaced that audio-thread path
+  with atomic generation + completion counters, so this note remains
+  useful for the workload-shape conclusion but should not be used as
+  the final performance policy after that change.
 
 The current implementation should stay gated. A future turn-on policy
 would need at least:
