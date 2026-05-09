@@ -78,6 +78,8 @@ library
 executable metasonic-bridge
   main-is: Main.hs
   other-modules:
+      MetaSonic.App.Demos
+      MetaSonic.App.Survey
       Paths_metasonic_bridge
   autogen-modules:
       Paths_metasonic_bridge
