@@ -6525,6 +6525,24 @@ static void check_exact_same(const std::vector<float> &a,
     }
 }
 
+static void build_free_then_out_schedule_graph(RTGraph *g) {
+    add_const_node(g, 0, 0.25f, 0.5f); // const 0.75
+    rt_graph_add_node(g, 1, 2);        // Out(bus 0)
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    const int free_region[] = {0};
+    const int barrier_region[] = {1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, free_region);
+    rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                        /*item_count=*/1, barrier_region);
+}
+
 TEST_CASE("reduction capture: flat fallback puts distinct sinks in distinct slots") {
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
@@ -7120,6 +7138,115 @@ TEST_CASE("global schedule executor: no-metadata graph falls back to legacy") {
     CHECK(rt_graph_test_global_schedule_entry_count(g) == 0);
 
     rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Phase §4.E.2.C1b: worker-pool scaffold, no parallel DSP yet
+// ----------------------------------------------------------------
+
+TEST_CASE("schedule worker pool scaffold: zero and one stay serial") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    CHECK(rt_graph_test_worker_pool_size(g) == 0);
+    CHECK(rt_graph_test_worker_thread_count(g) == 0);
+
+    rt_graph_test_set_worker_pool_size(g, -4);
+    CHECK(rt_graph_test_worker_pool_size(g) == 0);
+    CHECK(rt_graph_test_worker_thread_count(g) == 0);
+
+    rt_graph_test_set_worker_pool_size(g, 1);
+    CHECK(rt_graph_test_worker_pool_size(g) == 1);
+    CHECK(rt_graph_test_worker_thread_count(g) == 0);
+
+    rt_graph_test_set_worker_pool_size(g, 0);
+    CHECK(rt_graph_test_worker_pool_size(g) == 0);
+    CHECK(rt_graph_test_worker_thread_count(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("schedule worker pool scaffold: resize starts and joins idle workers") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_test_set_worker_pool_size(g, 4);
+    CHECK(rt_graph_test_worker_pool_size(g) == 4);
+    CHECK(rt_graph_test_worker_thread_count(g) == 3);
+
+    rt_graph_test_set_worker_pool_size(g, 2);
+    CHECK(rt_graph_test_worker_pool_size(g) == 2);
+    CHECK(rt_graph_test_worker_thread_count(g) == 1);
+
+    rt_graph_test_set_worker_pool_size(g, 1);
+    CHECK(rt_graph_test_worker_pool_size(g) == 1);
+    CHECK(rt_graph_test_worker_thread_count(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("schedule worker pool scaffold: clear preserves pool lifetime") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_test_set_worker_pool_size(g, 3);
+    CHECK(rt_graph_test_worker_pool_size(g) == 3);
+    CHECK(rt_graph_test_worker_thread_count(g) == 2);
+
+    rt_graph_clear(g);
+    CHECK(rt_graph_test_worker_pool_size(g) == 3);
+    CHECK(rt_graph_test_worker_thread_count(g) == 2);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("global schedule executor: worker pool scaffold still matches legacy") {
+    auto *legacy = rt_graph_create(4, kFrames);
+    auto *sched  = rt_graph_create(4, kFrames);
+    REQUIRE(legacy != nullptr);
+    REQUIRE(sched  != nullptr);
+
+    build_free_then_out_schedule_graph(legacy);
+    build_free_then_out_schedule_graph(sched);
+
+    rt_graph_test_set_worker_pool_size(sched, 3);
+    rt_graph_test_set_global_schedule_execution(sched, 1);
+
+    rt_graph_process(legacy, kFrames);
+    rt_graph_process(sched,  kFrames);
+
+    CHECK(rt_graph_test_worker_pool_size(sched) == 3);
+    CHECK(rt_graph_test_worker_thread_count(sched) == 2);
+    check_exact_same(read_bus_vec(legacy, 0, kFrames),
+                     read_bus_vec(sched,  0, kFrames));
+
+    rt_graph_destroy(legacy);
+    rt_graph_destroy(sched);
+}
+
+TEST_CASE("global schedule executor: worker pool scaffold preserves reduction equivalence") {
+    auto *direct  = rt_graph_create(4, kFrames);
+    auto *reduced = rt_graph_create(4, kFrames);
+    REQUIRE(direct  != nullptr);
+    REQUIRE(reduced != nullptr);
+
+    build_free_then_out_schedule_graph(direct);
+    build_free_then_out_schedule_graph(reduced);
+
+    rt_graph_test_set_worker_pool_size(direct, 3);
+    rt_graph_test_set_worker_pool_size(reduced, 3);
+    rt_graph_test_set_global_schedule_execution(direct, 1);
+    rt_graph_test_set_global_schedule_execution(reduced, 1);
+    rt_graph_test_set_reduction_capture(reduced, 1);
+
+    rt_graph_process(direct,  kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    check_exact_same(read_bus_vec(direct,  0, kFrames),
+                     read_bus_vec(reduced, 0, kFrames));
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
 }
 
 // ----------------------------------------------------------------

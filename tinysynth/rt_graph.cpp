@@ -33,10 +33,12 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <thread>
@@ -1775,6 +1777,94 @@ struct ContributionStorage {
   }
 };
 
+/* Note [Schedule worker pool scaffold — Phase §4.E.2.C1b]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C1b adds the lifetime/configuration substrate for Phase C without
+dispatching any DSP work to worker threads yet.
+
+The configured pool size is a logical lane count:
+
+  * 0 or 1 means pure serial execution and creates no background
+    worker threads.
+  * N > 1 means the audio thread is lane 0 and the pool owns
+    N - 1 idle background workers.
+
+The pool belongs to RTGraph, so its lifetime is independent of the
+global-schedule execution switch. Tests may resize it through the
+test-only C ABI before rendering; process_graph never starts, stops,
+allocates, or joins worker threads. The current worker loop only waits
+for shutdown. C1c will add a preallocated work queue and teach Free
+bands to dispatch through these workers.
+*/
+struct ScheduleWorkerPool {
+  mutable std::mutex mutex;
+  std::condition_variable cv;
+  bool stopping = false;
+  int configured_size = 0;
+  std::vector<std::thread> workers;
+
+  ~ScheduleWorkerPool() {
+    stop_workers();
+  }
+
+  ScheduleWorkerPool() = default;
+  ScheduleWorkerPool(const ScheduleWorkerPool &) = delete;
+  ScheduleWorkerPool &operator=(const ScheduleWorkerPool &) = delete;
+
+  void set_size(int requested_size) {
+    const int next_size = std::max(0, requested_size);
+    stop_workers();
+
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      configured_size = next_size;
+      stopping = false;
+    }
+
+    const int background_workers = next_size <= 1 ? 0 : next_size - 1;
+    workers.reserve(static_cast<std::size_t>(background_workers));
+    for (int i = 0; i < background_workers; ++i) {
+      workers.emplace_back([this]() noexcept { worker_loop(); });
+    }
+  }
+
+  void stop_workers() noexcept {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stopping = true;
+    }
+    cv.notify_all();
+
+    for (auto &worker : workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers.clear();
+
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stopping = false;
+    }
+  }
+
+  int logical_size() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    return configured_size;
+  }
+
+  int background_thread_count() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex);
+    return static_cast<int>(workers.size());
+  }
+
+private:
+  void worker_loop() noexcept {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [this]() noexcept { return stopping; });
+  }
+};
+
 struct RTGraph {
   int capacity = 0;
   int max_frames = 0;
@@ -1868,6 +1958,13 @@ struct RTGraph {
   // Phase C can substitute worker dispatch at the Free-band boundary
   // without reshaping instance lifecycle handling.
   std::vector<GlobalScheduleBand> global_schedule_bands;
+
+  // Phase §4.E.2.C1b: worker-pool lifetime/configuration scaffold.
+  // The schedule executor does not dispatch work to it yet; it is
+  // owned by RTGraph so future Phase C dispatch can use already-created
+  // workers without tying thread allocation to the C0c/C1a execution
+  // switch.
+  ScheduleWorkerPool worker_pool;
 };
 
 namespace {
@@ -5142,15 +5239,16 @@ static void process_schedule_step(
   }
 }
 
-static void process_global_schedule_bands_serial(
-    RTGraph &g, int nframes, BlockExecutionContext &ctx
-) noexcept {
+struct ScheduleEntryExecutionContext {
+  RTGraph &g;
+  int nframes;
+  BlockExecutionContext &block_ctx;
   GraphInstance *current_inst = nullptr;
   const MetaDef *current_def = nullptr;
   SlotState current_state = SlotState::Available;
   int current_slot = -1;
 
-  auto finish_current = [&]() noexcept {
+  void finish_current() noexcept {
     if (current_inst) {
       finish_instance_block(*current_inst, current_state);
       current_inst = nullptr;
@@ -5158,12 +5256,13 @@ static void process_global_schedule_bands_serial(
       current_slot = -1;
       current_state = SlotState::Available;
     }
-  };
+  }
 
-  auto process_entry = [&](const GlobalScheduleEntry &entry) noexcept {
-    // Early return here is the lambda-local equivalent of the old flat
+  void process_entry(const GlobalScheduleEntry &entry) noexcept {
+    // Early return here is the entry-local equivalent of the old flat
     // loop's continue: skip this malformed/stale entry and keep walking
-    // the remaining band entries.
+    // the remaining band entries. Future worker dispatch gets one
+    // context per worker, so these lifecycle fields are not shared.
     if (entry.instance_slot != current_slot) {
       finish_current();
 
@@ -5188,10 +5287,39 @@ static void process_global_schedule_bands_serial(
 
     if (current_inst && current_def) {
       process_schedule_step(g, *current_def, *current_inst,
-                            entry.step_index, nframes, ctx);
+                            entry.step_index, nframes, block_ctx);
     }
-  };
+  }
+};
 
+static void process_schedule_band_serial(
+    RTGraph &g,
+    const GlobalScheduleBand &band,
+    ScheduleEntryExecutionContext &worker_ctx
+) noexcept {
+  // C1b seam: Free bands still execute serially even when the worker
+  // pool is configured. C1c replaces this helper's Free-band path with
+  // dispatch while keeping Barrier bands on the audio thread.
+  // Defensive only: build_global_schedule_bands emits valid,
+  // contiguous slices over g.global_schedule. Keep the executor
+  // silent if a future ABI/debug path corrupts the band metadata.
+  if (band.first_entry < 0 || band.entry_count <= 0) return;
+  const std::size_t first = static_cast<std::size_t>(band.first_entry);
+  const std::size_t count = static_cast<std::size_t>(band.entry_count);
+  if (first > g.global_schedule.size()
+      || count > g.global_schedule.size() - first) {
+    return;
+  }
+
+  for (std::size_t i = 0; i < count; ++i) {
+    worker_ctx.process_entry(g.global_schedule[first + i]);
+  }
+}
+
+static void process_global_schedule_bands_serial(
+    RTGraph &g, int nframes, BlockExecutionContext &ctx
+) noexcept {
+  ScheduleEntryExecutionContext worker_ctx{g, nframes, ctx};
   // C1a consumes C0d's bands but still executes every entry serially.
   // build_global_schedule_bands preserves global_schedule order, so
   // the instance-lifecycle grouping below remains the same as the flat
@@ -5202,23 +5330,10 @@ static void process_global_schedule_bands_serial(
   // state transition during the group is Releasing -> Available inside
   // finish_instance_block, after all steps for that slot have run.
   for (const GlobalScheduleBand &band : g.global_schedule_bands) {
-    // Defensive only: build_global_schedule_bands emits valid,
-    // contiguous slices over g.global_schedule. Keep the executor
-    // silent if a future ABI/debug path corrupts the band metadata.
-    if (band.first_entry < 0 || band.entry_count <= 0) continue;
-    const std::size_t first = static_cast<std::size_t>(band.first_entry);
-    const std::size_t count = static_cast<std::size_t>(band.entry_count);
-    if (first > g.global_schedule.size()
-        || count > g.global_schedule.size() - first) {
-      continue;
-    }
-
-    for (std::size_t i = 0; i < count; ++i) {
-      process_entry(g.global_schedule[first + i]);
-    }
+    process_schedule_band_serial(g, band, worker_ctx);
   }
 
-  finish_current();
+  worker_ctx.finish_current();
 }
 
 static void process_legacy_schedule(
@@ -5742,6 +5857,7 @@ void rt_graph_destroy(RTGraph *g) {
     return;
   }
   stop_audio_stream(*g);
+  g->worker_pool.stop_workers();
   delete g;
 }
 
@@ -5881,6 +5997,22 @@ void rt_graph_test_set_reduction_capture(RTGraph *g, int on) {
 void rt_graph_test_set_global_schedule_execution(RTGraph *g, int on) {
   if (!g) return;
   g->execute_global_schedule = (on != 0);
+}
+
+// Phase §4.E.2.C1b test ABI. See header docblocks.
+void rt_graph_test_set_worker_pool_size(RTGraph *g, int worker_count) {
+  if (!g) return;
+  g->worker_pool.set_size(worker_count);
+}
+
+int rt_graph_test_worker_pool_size(const RTGraph *g) {
+  if (!g) return 0;
+  return g->worker_pool.logical_size();
+}
+
+int rt_graph_test_worker_thread_count(const RTGraph *g) {
+  if (!g) return 0;
+  return g->worker_pool.background_thread_count();
 }
 
 int rt_graph_test_contribution_slot_target(const RTGraph *g, int ws) {
