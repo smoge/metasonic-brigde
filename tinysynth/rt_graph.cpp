@@ -4706,6 +4706,13 @@ static void reset_to_default_state(RTGraph &g) {
   g.server.output_buses.clear();
   g.server.output_buses_prev.clear();
 
+  // Reset the Phase B0 test snapshot. Without this, after a
+  // process → clear cycle the helper would report the previous
+  // block's slot count against a freshly reset graph, contradicting
+  // rt_graph_test_last_writer_slot_count's "returns 0 if no block
+  // has run yet" promise.
+  g.last_block_writer_slot_count = 0;
+
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
   // commands against the freshly-rebuilt template / instance pool

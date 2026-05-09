@@ -6200,6 +6200,30 @@ TEST_CASE("writer-slot count: counter resets between blocks") {
     rt_graph_destroy(g);
 }
 
+TEST_CASE("writer-slot count: rt_graph_clear resets the snapshot to 0") {
+    // The header promises the helper returns 0 if no block has run
+    // yet. rt_graph_clear puts the graph back into "freshly created"
+    // state — the snapshot must follow, otherwise a process → clear
+    // cycle leaves the previous block's count visible to tests
+    // building a brand new graph against the cleared handle.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_add_node(g, 0, 1);                // SinOsc
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_add_node(g, 1, 2);                // Out
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 1);
+
+    rt_graph_clear(g);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("writer-slot count: invalid bus still consumes its slot") {
     // The canonical writer-slot contract: a sink writer must consume
     // exactly one slot even when its bus index is invalid (NaN /
