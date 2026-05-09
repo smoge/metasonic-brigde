@@ -931,3 +931,33 @@ No code change in this slice depends on §4.D's rate-region work
 landing first. The reduction model does not assume rate
 distinction; it operates on `RuntimeRegion`s as the §4.E substrate
 already produces them.
+
+
+## 14. Post-C1c bench decision (2026-05-09)
+
+Phase C has now landed as a test-gated substrate:
+
+  - C0 ships schedule metadata and builds the global schedule.
+  - C0c / C1a consume global-schedule bands serially.
+  - C1b adds the RTGraph-owned worker-pool scaffold.
+  - C1c dispatches eligible Free bands through pre-created workers
+    under the test ABI and preserves direct-vs-reduction equivalence
+    on the Haskell T-9 corpus.
+
+The bench slice (`2c737ce`) added a schedule-worker section to
+`tools/rt_graph_bench.cpp`. The interpretation is recorded in
+`notes/2026-05-09-phase-4e-worker-bench-interpretation.md`; the
+turn-on decision is recorded in
+`notes/2026-05-09-phase-4e-worker-turn-on-decision.md`.
+
+Decision summary: do not turn worker dispatch on by default, do not
+expose a public runtime switch yet, and do not start Phase-D
+live-bus writer relaxation yet. The only positive bench signal is
+sink-free Free-band compute at enough width and block work. Reduction-
+backed sink dispatch and send/return dispatch both lose on the
+current bench grid, and the worker wake/join primitive still uses a
+mutex / condition-variable wait on the audio thread.
+
+This updates §13's "bench work gates whether Phase C ships
+defaulted-on or defaulted-off" question: for now, Phase C remains
+test/bench gated.
