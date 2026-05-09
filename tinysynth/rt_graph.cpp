@@ -1815,6 +1815,12 @@ allocates, or joins worker threads. During process_graph, the audio
 thread publishes one stack-owned dispatch descriptor, wakes the
 already-created workers, processes lane 0 itself, then waits for all
 background lanes to finish before the next schedule band begins.
+
+This remains a test-gated substrate, not an RT-safe default path:
+run_parallel briefly takes a mutex on the audio thread and waits on a
+condition variable for worker completion. Keep the public runtime on the
+legacy/global-serial path until bench work and an explicit RT-safety pass
+justify a wider turn-on.
 */
 struct ScheduleWorkerPool {
   using WorkFn = void (*)(void *, int) noexcept;
@@ -1887,6 +1893,10 @@ struct ScheduleWorkerPool {
     return static_cast<int>(workers.size());
   }
 
+  // C1c dispatch primitive. This is deliberately allocation-free during
+  // process_graph, but it is not lock-free: the audio thread uses the
+  // mutex/cv pair to publish work and join background lanes. Treat it as
+  // test/bench infrastructure until the RT policy is revisited.
   void run_parallel(WorkFn fn, void *user) noexcept {
     int background_workers = 0;
     {
@@ -1946,6 +1956,8 @@ private:
       lock.lock();
       seen_generation = generation;
       ++completed_workers;
+      // Small C1c pools make notify_all acceptable. Bench work should
+      // decide whether larger pools need a narrower completion wakeup.
       cv.notify_all();
     }
   }
@@ -3332,6 +3344,10 @@ contribution_slot_used(
 ) noexcept {
   if (writer_slot < 0 || writer_slot >= storage.max_writer_slots) return false;
   const std::size_t ws = static_cast<std::size_t>(writer_slot);
+  // Serial Reduction sets both target[ws] and used_words. Parallel
+  // ReductionDeferred intentionally skips used_words to avoid races when
+  // two workers own slots in the same 64-bit word, so target[ws] >= 0 is
+  // the authoritative validity predicate for deferred folds.
   if (storage.target[ws] >= 0) return true;
   const std::size_t word = ws / 64;
   const std::uint64_t bit = std::uint64_t{1} << (ws % 64);
@@ -5209,6 +5225,11 @@ BusInDelayed to break the cross-instance dependency.
 static int region_sink_writer_count(
     const MetaDef &def, const RegionSpec &r
 ) noexcept {
+  // Writer-slot sizing is node-spec based. Today's fused sink kernels are
+  // one-sink-terminal regions and reserve exactly one slot; if a future
+  // fused kernel contains multiple sink terminals, its reservation code
+  // must grow to match this count rather than relying on the old 1-slot
+  // fused-kernel assumption.
   if (r.first_node < 0 || r.node_count <= 0) return 0;
   const std::size_t node_count = def.nodes.size();
   const std::size_t first = static_cast<std::size_t>(r.first_node);
