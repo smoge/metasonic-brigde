@@ -2624,6 +2624,47 @@ open_direct_bus_write_target(Server &server, double bus_control) noexcept {
   };
 }
 
+/* Note [Writer-slot plumbing — Phase §4.E.2.B0]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The reduction model in notes/2026-05-08-deterministic-bus-reduction-design.md
+keys contribution buffers by *writer slot*: a canonical-order index over
+sink writers across the whole block, ordered by
+(template_id, instance_slot, scheduled_region_ordinal, sink_ordinal_within_region).
+Phase B0 introduces the slot identity without enabling reduction
+mode. Direct bus writes still go straight into server.output_buses;
+the slot is reserved at every dispatch boundary that produces a sink
+write and is threaded into the kernels for Phase B2 to consume.
+
+Reservation is unconditional: a sink writer must consume exactly one
+slot even when it degrades silently — invalid bus index, disconnected
+input, or fused-kernel early-exit before SinkAccumulator::open. If the
+counter only advanced on successful opens, later writers' slot indices
+would shift block-to-block depending on transient state, and the
+canonical reduction order would stop matching the serial executor.
+That contract is why the reservation lives at the dispatch site in
+process_instance / dispatch_node, not inside SinkAccumulator::open.
+*/
+enum class BusWriteMode {
+  Direct,    // current behavior: kernels write into server.output_buses
+  Reduction, // Phase B2: kernels write into contributions[writer_slot]; not yet enabled
+};
+
+struct BusWriteContext {
+  BusWriteMode mode = BusWriteMode::Direct;
+  int next_writer_slot = 0;
+
+  // Reserve one canonical writer slot at a dispatch boundary. The
+  // returned index is monotonically increasing across the block and
+  // becomes the writer-slot identity in the canonical ordering of §3.
+  [[nodiscard]] int reserve_writer_slot() noexcept {
+    return next_writer_slot++;
+  }
+};
+
+struct BlockExecutionContext {
+  BusWriteContext bus_writes;
+};
+
 /* Note [Bus-write kernel: Out and BusOut share this]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out and BusOut are operationally identical: both accumulate their input
@@ -2654,7 +2695,16 @@ If the input is unconnected or the bus index is invalid, the node
 contributes nothing. Multiple writers to the same bus sum.
 */
 static void process_out(RTGraph &g, GraphInstance &inst,
-                        std::size_t node_idx, int nframes) noexcept {
+                        std::size_t node_idx, int nframes,
+                        int writer_slot) noexcept {
+  // Phase B0: writer_slot is reserved at the dispatch site
+  // (dispatch_node's Out/BusOut branches) and threaded in here. Direct
+  // mode does not consult it; Phase B2 will use it to select the
+  // contribution buffer. Asserted >= 0 so a Phase B2 indexing bug
+  // surfaces here rather than via OOB reads later.
+  assert(writer_slot >= 0);
+  (void)writer_slot;
+
   auto &node = inst.nodes[node_idx];
   const auto in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
   if (in.empty())
@@ -3062,8 +3112,16 @@ struct SinkAccumulator {
   // peak. process_instance reset block_sink_peak to 0 before this
   // kernel runs, so the snapshot reflects any sibling Out / BusOut
   // that already ran in this block.
+  //
+  // writer_slot is the canonical writer-slot index reserved at the
+  // dispatch boundary. Phase B0 only stores it for symmetry with
+  // process_out and to keep the dispatch contract explicit; Phase B2
+  // will use it to choose between direct and reduction-mode targets.
   static SinkAccumulator open(RTGraph &g, GraphInstance &inst,
-                              double bus_control) noexcept {
+                              double bus_control,
+                              int writer_slot) noexcept {
+    assert(writer_slot >= 0);
+    (void)writer_slot;
     auto target = open_direct_bus_write_target(g.server, bus_control);
     if (!target.valid()) {
       return SinkAccumulator{target, 0.0f};
@@ -3281,7 +3339,7 @@ SawLpfGain.
 static void process_region_sin_gain_out(
     RTGraph &g, GraphInstance &inst,
     std::size_t sin_idx, std::size_t gain_idx, std::size_t out_idx,
-    int nframes
+    int nframes, int writer_slot
 ) noexcept {
   auto &sin_node  = inst.nodes[sin_idx];
   auto &gain_node = inst.nodes[gain_idx];
@@ -3311,7 +3369,8 @@ static void process_region_sin_gain_out(
   // node's bus index in the double domain, snapshots the
   // running peak), drive the sin osc, push each per-sample
   // product, then flush the running peak back to the instance.
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
+                                    writer_slot);
   drive_oscillator(g, *osc, sin_freq_in, sin_node.controls[0],
                    nframes, q::sin,
     [&](std::size_t fi, float sin_sample) noexcept {
@@ -3343,7 +3402,7 @@ other §4.B kernels.
 static void process_region_saw_gain_out(
     RTGraph &g, GraphInstance &inst,
     std::size_t saw_idx, std::size_t gain_idx, std::size_t out_idx,
-    int nframes
+    int nframes, int writer_slot
 ) noexcept {
   auto &saw_node  = inst.nodes[saw_idx];
   auto &gain_node = inst.nodes[gain_idx];
@@ -3363,7 +3422,8 @@ static void process_region_saw_gain_out(
   const float gain_amount = sanitize_finite(
       static_cast<float>(gain_node.controls[0]), 1.0f);
 
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
+                                    writer_slot);
   drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
                    nframes, q::saw,
     [&](std::size_t fi, float saw_sample) noexcept {
@@ -3407,7 +3467,7 @@ other §4.B kernels.
 static void process_region_noise_gain_out(
     RTGraph &g, GraphInstance &inst,
     std::size_t noise_idx, std::size_t gain_idx, std::size_t out_idx,
-    int nframes
+    int nframes, int writer_slot
 ) noexcept {
   auto &noise_node = inst.nodes[noise_idx];
   auto &gain_node  = inst.nodes[gain_idx];
@@ -3423,7 +3483,8 @@ static void process_region_noise_gain_out(
   const float gain_amount = sanitize_finite(
       static_cast<float>(gain_node.controls[0]), 1.0f);
 
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
+                                    writer_slot);
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
     // Mirror process_noisegen exactly: pull one PRNG sample,
@@ -3476,7 +3537,7 @@ static void process_region_saw_lpf_gain_out(
     RTGraph &g, GraphInstance &inst,
     std::size_t saw_idx, std::size_t lpf_idx,
     std::size_t gain_idx, std::size_t out_idx,
-    int nframes
+    int nframes, int writer_slot
 ) noexcept {
   auto &saw_node  = inst.nodes[saw_idx];
   auto &lpf_node  = inst.nodes[lpf_idx];
@@ -3523,7 +3584,8 @@ static void process_region_saw_lpf_gain_out(
   // hand-written; the freq/q latch above is filter-specific
   // setup that intentionally doesn't live in the helpers), and
   // flush the running peak back to the instance.
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
+                                    writer_slot);
   drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
                    nframes, q::saw,
     [&](std::size_t fi, float saw_sample) noexcept {
@@ -3580,7 +3642,7 @@ static void process_region_busin_lpf_gain_out(
     RTGraph &g, GraphInstance &inst,
     std::size_t busin_idx, std::size_t lpf_idx,
     std::size_t gain_idx, std::size_t out_idx,
-    int nframes
+    int nframes, int writer_slot
 ) noexcept {
   auto &busin_node = inst.nodes[busin_idx];
   auto &lpf_node   = inst.nodes[lpf_idx];
@@ -3658,7 +3720,8 @@ static void process_region_busin_lpf_gain_out(
   // sample into the SinkAccumulator (so 'block_sink_peak' tracks
   // the LPF's transient response on a fresh-state filter just as
   // process_lpf + process_out would have).
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
+                                    writer_slot);
   if (src_data != nullptr) {
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
@@ -3724,7 +3787,7 @@ static void process_region_noise_lpf_gain_out(
     RTGraph &g, GraphInstance &inst,
     std::size_t noise_idx, std::size_t lpf_idx,
     std::size_t gain_idx, std::size_t out_idx,
-    int nframes
+    int nframes, int writer_slot
 ) noexcept {
   auto &noise_node = inst.nodes[noise_idx];
   auto &lpf_node   = inst.nodes[lpf_idx];
@@ -3777,7 +3840,8 @@ static void process_region_noise_lpf_gain_out(
   // Sink-terminal accumulate. PRNG pull + recenter per sample,
   // identical to process_noisegen, then through the LPF + scalar
   // gain before SinkAccumulator handles bus + block_sink_peak.
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0]);
+  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
+                                    writer_slot);
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
     const float noise_sample = noisegen->noise() - 1.0f;
@@ -4054,15 +4118,20 @@ static void drain_control_queue(RTGraph &g) noexcept {
 // paths share one switch statement. See Note [Region fallback].
 static inline void dispatch_node(
     RTGraph &g, GraphInstance &inst, std::size_t i, int nframes,
-    const NodeSpec &spec
+    const NodeSpec &spec, BlockExecutionContext &ctx
 ) noexcept {
   switch (spec.kind) {
   case NodeKind::SinOsc:
     process_sinosc(g, inst, i, nframes);
     break;
-  case NodeKind::Out:
-    process_out(g, inst, i, nframes);
+  case NodeKind::Out: {
+    // Reserve a canonical writer slot at the dispatch boundary —
+    // unconditionally, before process_out's empty-input or
+    // invalid-bus checks. See Note [Writer-slot plumbing].
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_out(g, inst, i, nframes, writer_slot);
     break;
+  }
   case NodeKind::Gain:
     process_gain(g, inst, i, nframes);
     break;
@@ -4081,11 +4150,13 @@ static inline void dispatch_node(
   case NodeKind::Env:
     process_env(g, inst, i, nframes);
     break;
-  case NodeKind::BusOut:
+  case NodeKind::BusOut: {
     // Out and BusOut share the same bus-write kernel; see
     // Note [Bus-write kernel: Out and BusOut share this].
-    process_out(g, inst, i, nframes);
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_out(g, inst, i, nframes, writer_slot);
     break;
+  }
   case NodeKind::BusIn:
     process_busin(g, inst, i, nframes);
     break;
@@ -4119,7 +4190,8 @@ static inline void dispatch_node(
   }
 }
 
-static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexcept {
+static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
+                              BlockExecutionContext &ctx) noexcept {
   // Look up the spec via inst.template_id. If the template is gone
   // (shouldn't happen — we never shrink g.defs while instances are
   // live — but be defensive), skip the instance.
@@ -4144,7 +4216,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
   if (def->regions.empty()) {
     for (std::size_t i = 0; i < node_count; ++i) {
       if (def->nodes[i].elided) continue;
-      dispatch_node(g, inst, i, nframes, def->nodes[i]);
+      dispatch_node(g, inst, i, nframes, def->nodes[i], ctx);
     }
     return;
   }
@@ -4180,8 +4252,9 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first    ].kind == NodeKind::SinOsc
         && def->nodes[first + 1].kind == NodeKind::Gain
         && is_sink_terminal(def->nodes[first + 2].kind)) {
+      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
-                                  nframes);
+                                  nframes, writer_slot);
       fused = true;
     } else if (r.kernel == RegionKernel::SawLpfGainOut
         && r.node_count == 4
@@ -4190,10 +4263,11 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first + 1].kind == NodeKind::LPF
         && def->nodes[first + 2].kind == NodeKind::Gain
         && is_sink_terminal(def->nodes[first + 3].kind)) {
+      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_saw_lpf_gain_out(g, inst,
                                       first, first + 1,
                                       first + 2, first + 3,
-                                      nframes);
+                                      nframes, writer_slot);
       fused = true;
     } else if (r.kernel == RegionKernel::SawGainOut
         && r.node_count == 3
@@ -4201,8 +4275,9 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first    ].kind == NodeKind::SawOsc
         && def->nodes[first + 1].kind == NodeKind::Gain
         && is_sink_terminal(def->nodes[first + 2].kind)) {
+      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_saw_gain_out(g, inst, first, first + 1, first + 2,
-                                  nframes);
+                                  nframes, writer_slot);
       fused = true;
     } else if (r.kernel == RegionKernel::NoiseGainOut
         && r.node_count == 3
@@ -4210,8 +4285,9 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first    ].kind == NodeKind::NoiseGen
         && def->nodes[first + 1].kind == NodeKind::Gain
         && is_sink_terminal(def->nodes[first + 2].kind)) {
+      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_noise_gain_out(g, inst, first, first + 1, first + 2,
-                                    nframes);
+                                    nframes, writer_slot);
       fused = true;
     } else if (r.kernel == RegionKernel::BusInLpfGainOut
         && r.node_count == 4
@@ -4220,10 +4296,11 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first + 1].kind == NodeKind::LPF
         && def->nodes[first + 2].kind == NodeKind::Gain
         && is_sink_terminal(def->nodes[first + 3].kind)) {
+      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_busin_lpf_gain_out(g, inst,
                                         first, first + 1,
                                         first + 2, first + 3,
-                                        nframes);
+                                        nframes, writer_slot);
       fused = true;
     } else if (r.kernel == RegionKernel::NoiseLpfGainOut
         && r.node_count == 4
@@ -4232,17 +4309,18 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes) noexc
         && def->nodes[first + 1].kind == NodeKind::LPF
         && def->nodes[first + 2].kind == NodeKind::Gain
         && is_sink_terminal(def->nodes[first + 3].kind)) {
+      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
       process_region_noise_lpf_gain_out(g, inst,
                                         first, first + 1,
                                         first + 2, first + 3,
-                                        nframes);
+                                        nframes, writer_slot);
       fused = true;
     }
 
     if (!fused) {
       for (std::size_t i = first; i < end_excl; ++i) {
         if (def->nodes[i].elided) continue;
-        dispatch_node(g, inst, i, nframes, def->nodes[i]);
+        dispatch_node(g, inst, i, nframes, def->nodes[i], ctx);
       }
     }
   }
@@ -4302,6 +4380,13 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   std::swap(g.server.output_buses, g.server.output_buses_prev);
   clear_output_buses(g.server, nframes);
 
+  // Per-block execution context. Phase B0 carries the writer-slot
+  // counter that every dispatch boundary advances on each sink
+  // write; Phase B2 will add contribution storage and a Reduction
+  // mode here. Reset every block so writer-slot indices start at 0
+  // in canonical order. See Note [Writer-slot plumbing].
+  BlockExecutionContext ctx;
+
   // Iterate templates in registration order. The Haskell side picks
   // registration order to match the topological sort over template
   // precedence, so this loop respects all bus-induced ordering
@@ -4321,7 +4406,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
       const SlotState s = inst.state.load();
       if (s != SlotState::Active && s != SlotState::Releasing) continue;
       if (inst.template_id != tid_i) continue;
-      process_instance(g, inst, nframes);
+      process_instance(g, inst, nframes, ctx);
 
       // §2.E: if the slot is Releasing, drive the silence counter from
       // the peak that process_out just recorded into block_sink_peak.

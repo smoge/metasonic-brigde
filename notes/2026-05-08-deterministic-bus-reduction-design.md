@@ -292,17 +292,18 @@ pools:
 
 ```
 max_writer_slots = sum over templates t of
-                     (max_active_instances[t]
-                       × sink_writer_count[t])
+                     (def[t].polyphony × sink_writer_count[t])
 ```
 
-`max_active_instances[t]` is the per-template polyphony cap (the
-voice-allocator's pool size for that template — see Q-1 for the
-current API state); `sink_writer_count[t]` is the count of
-sink-terminal writers in `t`'s scheduled region sequence,
-constant per template once compiled. Allocation happens at
-template registration / pool expansion time, not on the audio
-thread. Resizing follows the same quiescent-graph protocol as
+`def[t].polyphony` is the per-template polyphony cap already
+carried by `MetaDef` ([rt_graph.cpp:883](../tinysynth/rt_graph.cpp#L883))
+and set via `rt_graph_template_set_polyphony`
+([rt_graph.h:117](../tinysynth/rt_graph.h#L117));
+`sink_writer_count[t]` is the count of sink-terminal writers in
+`t`'s scheduled region sequence, constant per template once
+compiled. Allocation happens at template registration /
+polyphony change time, not on the audio thread. Resizing
+follows the same quiescent-graph protocol as
 `ensure_output_bus_count` ([rt_graph.cpp:1916](../tinysynth/rt_graph.cpp#L1916)).
 
 **Memory cost.** With `max_writer_slots = S` and `max_frames = F`,
@@ -872,17 +873,17 @@ diagnose than the same regression caught by T-9.
 These do not block starting Phase A but should be answered before
 Phase B lands:
 
-  - **Q-1.** Polyphony cap surface. §5's slot-table sizing
-    depends on `max_active_instances[t]` per template — the
-    polyphony cap of each template's instance pool. Today the
-    runtime grows the instance vector dynamically; pinning a
-    per-template cap may require a new ABI knob (e.g.
-    `rt_graph_template_set_polyphony`) or wiring the existing
-    voice-allocator pool size through. Decide as part of
-    Phase C0. Until then, a conservative fallback is to size from
-    the current instance-vector capacity at audio-start time and
-    refuse pool growth past that without a quiescent-graph
-    rebuild.
+  - **Q-1.** ~~Polyphony cap surface.~~ **Resolved.** The
+    runtime already exposes `rt_graph_template_set_polyphony`
+    ([rt_graph.h:117](../tinysynth/rt_graph.h#L117)) and
+    `MetaDef::polyphony`
+    ([rt_graph.cpp:883](../tinysynth/rt_graph.cpp#L883));
+    Phase B sizes the contribution table from
+    `Σ_t (def[t].polyphony × sink_writer_count[t])` directly.
+    The default polyphony of `kDefaultPolyphony = 8` applies to
+    templates that don't call the setter, matching how the
+    voice allocator already enforces the cap. No new ABI knob
+    is needed.
   - **Q-2.** Should the worker pool size be a property of the
     graph (compile-time) or of the runtime (env var, set at audio
     start)? Audio-start is more flexible; compile-time is more
