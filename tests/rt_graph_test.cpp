@@ -6477,6 +6477,326 @@ TEST_CASE("contribution capacity: occupied count keeps storage above lowered cap
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase §4.E.2.B2: reduction-capture mode
+// ----------------------------------------------------------------
+//
+// When rt_graph_test_set_reduction_capture is on, sink writes are
+// routed into the per-writer-slot contribution buffer instead of
+// server.output_buses. These tests inspect the per-slot capture
+// (samples + target + used) directly, asserting:
+//
+//   * Distinct sinks land in distinct slots in canonical order.
+//   * Same-bus writers stay in separate slots — no pre-summing.
+//   * Slot order follows (template_id, instance_slot, region,
+//     sink_within_region) lexicographically.
+//   * Invalid bus / disconnected input degrade silently (slot
+//     reserved, target = -1, used = 0).
+//   * Dynamic bus redirect changes target without leaking stale
+//     metadata across blocks.
+//   * Fused sink kernels write through SinkAccumulator into the
+//     correct slot.
+//
+// The actual reduction (folding contributions[*] into output_buses)
+// is the next slice; B2 only proves the capture path.
+
+// Helper: sum-of-products-of-control-Add. Sets node `idx` to an Add
+// whose two controls multiplied... no, just two controls summed.
+// Used to feed Out with a known constant signal in capture-mode tests.
+static void add_const_node(RTGraph *g, int idx, float a, float b) {
+    rt_graph_add_node(g, idx, 8); // Add
+    rt_graph_set_control(g, idx, 0, a);
+    rt_graph_set_control(g, idx, 1, b);
+}
+
+TEST_CASE("reduction capture: flat fallback puts distinct sinks in distinct slots") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);
+
+    // Two Add-fed Outs targeting different buses with different constants.
+    add_const_node(g, 0, 0.3f, 0.4f); // const 0.7 → Out(bus 0)
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    add_const_node(g, 2, 0.1f, 0.2f); // const 0.3 → Out(bus 1)
+    rt_graph_add_node(g, 3, 2);
+    rt_graph_set_control(g, 3, 0, 1.0f);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == 0);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0) == 1);
+    CHECK(rt_graph_test_contribution_slot_target(g, 1) == 1);
+    CHECK(rt_graph_test_contribution_slot_used(g, 1) == 1);
+
+    std::vector<float> s0(kFrames, 0.0f);
+    std::vector<float> s1(kFrames, 0.0f);
+    REQUIRE(rt_graph_test_read_contribution_slot(g, 0, kFrames, s0.data()) == 0);
+    REQUIRE(rt_graph_test_read_contribution_slot(g, 1, kFrames, s1.data()) == 0);
+
+    for (auto v : s0) CHECK(v == doctest::Approx(0.7f).epsilon(1e-5));
+    for (auto v : s1) CHECK(v == doctest::Approx(0.3f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction capture: same-bus writers stay in separate slots (no pre-sum)") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Both Outs target bus 0 with different constants. Reduction-mode
+    // capture must keep them separate so the eventual fold can apply
+    // canonical-order +=. Pre-summing inside the kernel would change
+    // float rounding versus the direct-write executor.
+    add_const_node(g, 0, 0.25f, 0.0f); // const 0.25 → Out(bus 0)
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    add_const_node(g, 2, 0.5f, 0.0f);  // const 0.5 → Out(bus 0)
+    rt_graph_add_node(g, 3, 2);
+    rt_graph_set_control(g, 3, 0, 0.0f);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_last_writer_slot_count(g) == 2);
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == 0);
+    CHECK(rt_graph_test_contribution_slot_target(g, 1) == 0);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0) == 1);
+    CHECK(rt_graph_test_contribution_slot_used(g, 1) == 1);
+
+    std::vector<float> s0(kFrames, 0.0f);
+    std::vector<float> s1(kFrames, 0.0f);
+    rt_graph_test_read_contribution_slot(g, 0, kFrames, s0.data());
+    rt_graph_test_read_contribution_slot(g, 1, kFrames, s1.data());
+    for (auto v : s0) CHECK(v == doctest::Approx(0.25f).epsilon(1e-5));
+    for (auto v : s1) CHECK(v == doctest::Approx(0.50f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction capture: cross-instance slot order matches instance slot order") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // One template: Add(c, 0) → Out(bus 0). Spawn two instances and
+    // override control 'c' per instance. Slot 0 belongs to instance
+    // slot 0, slot 1 to instance slot 1 — canonical (§3.2) order.
+    rt_graph_template_set_polyphony(g, 0, 4);
+    rt_graph_template_add_node(g, 0, 0, 8); // Add
+    rt_graph_template_set_default(g, 0, 0, 0, 0.0);
+    rt_graph_template_set_default(g, 0, 0, 1, 0.0);
+    rt_graph_template_add_node(g, 0, 1, 2); // Out
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+    // Drop auto-instance 0; spawn a fresh pair with distinct
+    // per-instance controls.
+    rt_graph_instance_remove(g, 0);
+    int inst0 = rt_graph_template_instance_add(g, 0);
+    int inst1 = rt_graph_template_instance_add(g, 0);
+    REQUIRE(inst0 >= 0);
+    REQUIRE(inst1 >= 0);
+    rt_graph_instance_set_control(g, inst0, 0, 0, 0.111f);
+    rt_graph_instance_set_control(g, inst1, 0, 0, 0.222f);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    std::vector<float> s0(kFrames, 0.0f);
+    std::vector<float> s1(kFrames, 0.0f);
+    rt_graph_test_read_contribution_slot(g, 0, kFrames, s0.data());
+    rt_graph_test_read_contribution_slot(g, 1, kFrames, s1.data());
+
+    // Slot index = instance slot order, not which instance got
+    // spawned with which constant. The lower instance slot owns
+    // slot 0 regardless of spawn timing — process_graph iterates
+    // g.instances by index.
+    for (auto v : s0) CHECK(v == doctest::Approx(0.111f).epsilon(1e-5));
+    for (auto v : s1) CHECK(v == doctest::Approx(0.222f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction capture: cross-template slot order matches registration order") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);
+
+    // Template 0: Add(0.4) → Out(bus 0).
+    rt_graph_template_add_node(g, 0, 0, 8);
+    rt_graph_template_set_default(g, 0, 0, 0, 0.4);
+    rt_graph_template_set_default(g, 0, 0, 1, 0.0);
+    rt_graph_template_add_node(g, 0, 1, 2);
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+    // Template 1: Add(0.6) → Out(bus 1). Registered after template 0.
+    int t1 = rt_graph_template_add(g);
+    REQUIRE(t1 == 1);
+    rt_graph_template_add_node(g, t1, 0, 8);
+    rt_graph_template_set_default(g, t1, 0, 0, 0.6);
+    rt_graph_template_set_default(g, t1, 0, 1, 0.0);
+    rt_graph_template_add_node(g, t1, 1, 2);
+    rt_graph_template_set_default(g, t1, 1, 0, 1.0);
+    rt_graph_template_connect(g, t1, 0, 0, 1, 0);
+
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_template_instance_add(g, 0)  >= 0);
+    REQUIRE(rt_graph_template_instance_add(g, t1) >= 0);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    // §3.1: template registration order means slot 0 belongs to
+    // template 0's writer, slot 1 to template 1's.
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == 0);
+    CHECK(rt_graph_test_contribution_slot_target(g, 1) == 1);
+
+    std::vector<float> s0(kFrames, 0.0f);
+    std::vector<float> s1(kFrames, 0.0f);
+    rt_graph_test_read_contribution_slot(g, 0, kFrames, s0.data());
+    rt_graph_test_read_contribution_slot(g, 1, kFrames, s1.data());
+    for (auto v : s0) CHECK(v == doctest::Approx(0.4f).epsilon(1e-5));
+    for (auto v : s1) CHECK(v == doctest::Approx(0.6f).epsilon(1e-5));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction capture: invalid bus reserves slot but leaves target = -1, used = 0") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Out node with bus_control = -1 (invalid). Slot is reserved
+    // unconditionally at the dispatch site; reduction-mode opener
+    // sees the bad bus and bails before recording target / used.
+    add_const_node(g, 0, 0.5f, 0.0f);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, -1.0f);  // invalid bus
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_last_writer_slot_count(g) == 1);
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == -1);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0)   == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction capture: disconnected input reserves slot, leaves metadata clear") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Out(bus 0) with no input wired. process_out's empty-input
+    // branch returns before opening the target — slot is still
+    // reserved at the dispatch site, but reduction-mode metadata
+    // never gets written for it.
+    rt_graph_add_node(g, 0, 2);
+    rt_graph_set_control(g, 0, 0, 0.0f);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_last_writer_slot_count(g) == 1);
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == -1);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0)   == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction capture: dynamic bus redirect updates target without stale metadata") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 3);
+
+    add_const_node(g, 0, 0.5f, 0.0f);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);  // initial bus = 0
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == 0);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0)   == 1);
+
+    // Redirect to bus 3 (instance 0 is the auto-created one).
+    rt_graph_instance_set_control(g, 0, 1, 0, 3.0f);
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == 3);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0)   == 1);
+
+    // Redirect to invalid bus. target reset to -1 by per-block clear,
+    // and the opener doesn't overwrite for invalid bus → stays -1.
+    // used must clear too (no leak from the previous block's set bit).
+    rt_graph_instance_set_control(g, 0, 1, 0, -2.0f);
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == -1);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0)   == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("reduction capture: fused sink kernel (SinGainOut) writes through SinkAccumulator") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_add_node(g, 0, 0, 1);   // SinOsc
+    rt_graph_template_set_default(g, 0, 0, 0, 220.0);
+    rt_graph_template_add_node(g, 0, 1, 3);   // Gain
+    rt_graph_template_set_default(g, 0, 1, 0, 0.5);
+    rt_graph_template_add_node(g, 0, 2, 2);   // Out
+    rt_graph_template_set_default(g, 0, 2, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+    rt_graph_template_connect(g, 0, 1, 0, 2, 0);
+
+    rt_graph_template_add_region_kernel(
+        g, /*template_id=*/0, /*kernel_kind=*/2, /*rate=*/0,
+        /*first_node=*/0, /*node_count=*/3);
+
+    // Drop the auto-instance and respawn so per-instance controls
+    // pick up the spec defaults set above (the auto-instance is
+    // initialized at template-0 creation, before the defaults
+    // were written, so its Gain.controls[0] would still be the
+    // initial value).
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_template_instance_add(g, 0) >= 0);
+
+    rt_graph_test_set_reduction_capture(g, 1);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_last_writer_slot_count(g) == 1);
+    CHECK(rt_graph_test_contribution_slot_target(g, 0) == 0);
+    CHECK(rt_graph_test_contribution_slot_used(g, 0)   == 1);
+
+    // The SinGainOut kernel writes 0.5 * sin(2π·220·t/sr) per frame
+    // into the slot. Peak should be near gain=0.5 once the sin
+    // sweeps a full cycle (220 Hz × 1024/48000 ≈ 4.7 cycles in
+    // kFrames, so peak is reached).
+    std::vector<float> s0(kFrames, 0.0f);
+    rt_graph_test_read_contribution_slot(g, 0, kFrames, s0.data());
+    CHECK(peak_abs(s0) == doctest::Approx(0.5f).epsilon(0.02));
+    // It's an actual oscillation — not a constant — so plenty of zero
+    // crossings.
+    CHECK(zero_crossings(s0) >= 7);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("contribution capacity: parallel vector sizing across many capacities") {
     // Direct lockstep regression. Walk a handful of distinct
     // capacities (including ones that cross the 64-slot boundary

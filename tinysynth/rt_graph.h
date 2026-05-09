@@ -568,6 +568,41 @@ int rt_graph_test_contribution_target_count(const RTGraph *g);
 // lockstep" testable. Returns 0 on null g.
 int rt_graph_test_contribution_used_word_count(const RTGraph *g);
 
+// [T:test-only] Phase §4.E.2.B2 reduction-capture switch. When
+// non-zero, the next rt_graph_process call routes every sink
+// write into the per-writer-slot contribution buffer instead of
+// server.output_buses, and records target / used metadata for
+// each slot. Default off; tests opt in to inspect the capture
+// before the post-block reduction-fold pass exists. While
+// reduction-capture is on, output_buses receives no sink writes
+// for the affected blocks, so do not enable this in normal
+// rendering or live audio paths. No-op on null g.
+void rt_graph_test_set_reduction_capture(RTGraph *g, int on);
+
+// [T:read-only] Phase §4.E.2.B2 test surface: per-slot resolved
+// bus index for the most recent reduction-capture block.
+// Returns target[ws] for ws in [0, slot_capacity); -1 means
+// either the slot wasn't opened this block, or it was opened
+// with an invalid bus control. Returns -1 on null g or
+// out-of-range ws.
+int rt_graph_test_contribution_slot_target(const RTGraph *g, int ws);
+
+// [T:read-only] Phase §4.E.2.B2 test surface: per-slot used bit
+// for the most recent reduction-capture block. Returns 1 if the
+// slot was opened with a valid bus this block, 0 otherwise
+// (early exit, invalid bus, or slot not reserved). Returns 0 on
+// null g or out-of-range ws.
+int rt_graph_test_contribution_slot_used(const RTGraph *g, int ws);
+
+// [T:read-only] Phase §4.E.2.B2 test surface: copy a slot's
+// per-frame buffer into 'out' for inspection. Writes the first
+// 'nframes' frames of contribution_storage's slot ws into
+// out[0..nframes). Returns 0 on success, -1 on null g, null out,
+// out-of-range ws, or nframes exceeding the slot capacity. The
+// destination is left untouched on error.
+int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
+                                         int nframes, float *out);
+
 // ----------------------------------------------------------------
 // Multi-instance support
 // ----------------------------------------------------------------
