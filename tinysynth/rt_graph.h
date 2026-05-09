@@ -439,21 +439,21 @@ int rt_graph_region_kernel_supported(int kernel_kind);
 // 0), rrIndex 2 (independent) yields regionSchedule = [0, 1, 2] but
 // layeredRegionSchedule = [FreeLayer {0, 2}, FreeLayer {1}]. A
 // contiguous-range encoding would silently rewrite layer {0, 2} to
-// {0, 1}, miscategorising rrIndex 1 once C0b consumes the metadata.
+// {0, 1}, miscategorising rrIndex 1 once C0c consumes the metadata.
 //
 // Silent no-op on invalid template_id, unknown kind tag, an ordinal
 // outside [0, region_count), null region_ordinals on a positive
 // item_count, or a non-positive item_count. The validation pass
 // runs before any push so a malformed step cannot partially extend
-// schedule_step_regions before being rejected. C0a is metadata-
-// only — process_instance does not consume schedule_steps yet, so
-// a stale or short metadata vector cannot affect rendered audio.
+// schedule_step_regions before being rejected. The default executor
+// does not consume schedule_steps; the C0c test executor consumes
+// them only when rt_graph_test_set_global_schedule_execution is on.
 //
 // The canonical writer-slot key continues to be
 //   (template_id, instance_slot, scheduled_region_ordinal,
 //    sink_ordinal_within_region)
-// so step ordinals are observational only — they do not enter any
-// existing key.
+// so step ordinals are execution metadata rather than part of the
+// per-writer-slot identity.
 void rt_graph_template_add_schedule_step(
     RTGraph *g, int template_id,
     int kind,
@@ -622,6 +622,15 @@ int rt_graph_test_contribution_used_word_count(const RTGraph *g);
 // reduction equivalence. No-op on null g.
 void rt_graph_test_set_reduction_capture(RTGraph *g, int on);
 
+// [T:test-only] Phase §4.E.2.C0c schedule-executor switch. When
+// non-zero, metadata-bearing graphs execute serially by walking the
+// per-block global schedule instead of the legacy nested
+// template/instance loop. If any live instance's template has no
+// schedule metadata, the runtime falls back to the legacy loop for
+// the whole block so C++-only construction paths keep rendering.
+// Default off; no-op on null g.
+void rt_graph_test_set_global_schedule_execution(RTGraph *g, int on);
+
 // [T:read-only] Phase §4.E.2.B2 test surface: per-slot resolved
 // bus index for the most recent reduction-capture block.
 // Returns target[ws] for ws in [0, slot_capacity); -1 means
@@ -681,6 +690,32 @@ int rt_graph_test_template_schedule_step_item_count(
 // shapes up-front).
 int rt_graph_test_template_schedule_step_region(
     const RTGraph *g, int template_id, int step_index, int item_index);
+
+// [T:read-only] Phase §4.E.2.C0b test surfaces. The runtime
+// rebuilds a per-block "global schedule" at the top of every
+// rt_graph_process call: a flat list of (template_id,
+// instance_slot, step_index) entries in canonical
+//   template ascending → instance slot ascending → step ascending
+// order, filtered to instances whose state is Active or
+// Releasing. By default this is observational; when the C0c
+// test switch is enabled, metadata-bearing graphs execute serially
+// by walking this schedule. After rt_graph_clear (or before any
+// block has run), the vector is empty. Templates with no schedule_steps emit no
+// entries even when they have live instances; that's the "no
+// metadata, no schedule" fallback for the legacy single-template
+// build path.
+
+// Number of entries built for the most recent block.
+int rt_graph_test_global_schedule_entry_count(const RTGraph *g);
+
+// Per-entry accessors. Return -1 on null g or out-of-range
+// entry_index (i.e. >= rt_graph_test_global_schedule_entry_count).
+int rt_graph_test_global_schedule_entry_template(
+    const RTGraph *g, int entry_index);
+int rt_graph_test_global_schedule_entry_instance(
+    const RTGraph *g, int entry_index);
+int rt_graph_test_global_schedule_entry_step(
+    const RTGraph *g, int entry_index);
 
 // ----------------------------------------------------------------
 // Multi-instance support

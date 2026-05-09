@@ -49,6 +49,7 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_instance_alive,
                                             c_rt_graph_instance_count,
                                             c_rt_graph_instance_release,
+                                            c_rt_graph_instance_remove,
                                             c_rt_graph_instance_set_control,
                                             c_rt_graph_instance_status,
                                             c_rt_graph_kind_supported,
@@ -57,6 +58,11 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_read_bus,
                                             c_rt_graph_template_count,
                                             c_rt_graph_template_instance_add,
+                                            c_rt_graph_test_global_schedule_entry_count,
+                                            c_rt_graph_test_global_schedule_entry_instance,
+                                            c_rt_graph_test_global_schedule_entry_step,
+                                            c_rt_graph_test_global_schedule_entry_template,
+                                            c_rt_graph_test_set_global_schedule_execution,
                                             c_rt_graph_test_set_reduction_capture,
                                             c_rt_graph_test_template_schedule_step_count,
                                             c_rt_graph_test_template_schedule_step_item_count,
@@ -82,6 +88,8 @@ main = defaultMain $ testGroup "MetaSonic"
   , crossCuttingTests
   , t9DirectEqualsReductionTests
   , c0aLoaderMetadataTests
+  , c0bGlobalScheduleTests
+  , c0cScheduleExecutorTests
   ]
 
 ------------------------------------------------------------
@@ -7024,10 +7032,23 @@ renderBlocksRG :: (Ptr RTGraph -> RuntimeGraph -> IO ())
                -> [Int]  -- buses to read each block
                -> IO [[(Int, [Float])]]
 renderBlocksRG loader rt reduction nframes blocks buses =
+  renderBlocksRGWithFlags loader rt reduction False nframes blocks buses
+
+renderBlocksRGWithFlags :: (Ptr RTGraph -> RuntimeGraph -> IO ())
+                        -> RuntimeGraph
+                        -> Bool   -- reduction-capture on?
+                        -> Bool   -- schedule executor on?
+                        -> Int
+                        -> Int
+                        -> [Int]
+                        -> IO [[(Int, [Float])]]
+renderBlocksRGWithFlags loader rt reduction scheduleExec nframes blocks buses =
   withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
     loader handle rt
     when reduction $
       c_rt_graph_test_set_reduction_capture handle 1
+    when scheduleExec $
+      c_rt_graph_test_set_global_schedule_execution handle 1
     forM [1 .. blocks] $ \_ -> processAndReadBuses handle nframes buses
 
 renderBlocksTG :: (Ptr RTGraph -> TemplateGraph -> IO ())
@@ -7038,12 +7059,25 @@ renderBlocksTG :: (Ptr RTGraph -> TemplateGraph -> IO ())
                -> [Int]
                -> IO [[(Int, [Float])]]
 renderBlocksTG loader tg reduction nframes blocks buses =
+  renderBlocksTGWithFlags loader tg reduction False nframes blocks buses
+
+renderBlocksTGWithFlags :: (Ptr RTGraph -> TemplateGraph -> IO ())
+                        -> TemplateGraph
+                        -> Bool
+                        -> Bool
+                        -> Int
+                        -> Int
+                        -> [Int]
+                        -> IO [[(Int, [Float])]]
+renderBlocksTGWithFlags loader tg reduction scheduleExec nframes blocks buses =
   let totalNodes = sum (map (length . rgNodes . tplGraph)
                             (tgTemplates tg))
   in withRTGraph totalNodes nframes $ \handle -> do
        loader handle tg
        when reduction $
          c_rt_graph_test_set_reduction_capture handle 1
+       when scheduleExec $
+         c_rt_graph_test_set_global_schedule_execution handle 1
        forM [1 .. blocks] $ \_ -> processAndReadBuses handle nframes buses
 
 -- Process one block, then read every bus in the supplied list.
@@ -7127,6 +7161,58 @@ assertDirectEqualsReductionTG label loader tg nframes blocks = do
   d <- renderBlocksTG loader tg False nframes blocks buses
   r <- renderBlocksTG loader tg True  nframes blocks buses
   assertBlocksEqual label d r
+
+assertDirectEqualsScheduleRG
+  :: String
+  -> (Ptr RTGraph -> RuntimeGraph -> IO ())
+  -> RuntimeGraph
+  -> Int
+  -> Int
+  -> Assertion
+assertDirectEqualsScheduleRG label loader rt nframes blocks = do
+  let buses = relevantBuses rt
+  legacy <- renderBlocksRGWithFlags loader rt False False nframes blocks buses
+  sched  <- renderBlocksRGWithFlags loader rt False True  nframes blocks buses
+  assertBlocksEqual (label <> ": legacy/schedule") legacy sched
+
+assertDirectEqualsScheduleTG
+  :: String
+  -> (Ptr RTGraph -> TemplateGraph -> IO ())
+  -> TemplateGraph
+  -> Int
+  -> Int
+  -> Assertion
+assertDirectEqualsScheduleTG label loader tg nframes blocks = do
+  let buses = relevantBusesTG tg
+  legacy <- renderBlocksTGWithFlags loader tg False False nframes blocks buses
+  sched  <- renderBlocksTGWithFlags loader tg False True  nframes blocks buses
+  assertBlocksEqual (label <> ": legacy/schedule") legacy sched
+
+assertScheduleDirectEqualsReductionRG
+  :: String
+  -> (Ptr RTGraph -> RuntimeGraph -> IO ())
+  -> RuntimeGraph
+  -> Int
+  -> Int
+  -> Assertion
+assertScheduleDirectEqualsReductionRG label loader rt nframes blocks = do
+  let buses = relevantBuses rt
+  d <- renderBlocksRGWithFlags loader rt False True nframes blocks buses
+  r <- renderBlocksRGWithFlags loader rt True  True nframes blocks buses
+  assertBlocksEqual (label <> ": schedule direct/reduction") d r
+
+assertScheduleDirectEqualsReductionTG
+  :: String
+  -> (Ptr RTGraph -> TemplateGraph -> IO ())
+  -> TemplateGraph
+  -> Int
+  -> Int
+  -> Assertion
+assertScheduleDirectEqualsReductionTG label loader tg nframes blocks = do
+  let buses = relevantBusesTG tg
+  d <- renderBlocksTGWithFlags loader tg False True nframes blocks buses
+  r <- renderBlocksTGWithFlags loader tg True  True nframes blocks buses
+  assertBlocksEqual (label <> ": schedule direct/reduction") d r
 
 -- Per-block, per-bus exact-equality check. Reports the first
 -- divergent (block, bus, frame) so a failure points straight at the
@@ -7504,3 +7590,374 @@ c0aLoaderMetadataTests =
   where
     stepRegions (ScheduleBarrier ix)   = [ix]
     stepRegions (ScheduleFreeLayer fl) = flRegions fl
+
+------------------------------------------------------------
+-- Phase 4.E.2.C0b: per-block global schedule
+------------------------------------------------------------
+--
+-- The runtime rebuilds a global schedule at the top of every
+-- 'rt_graph_process' call: a flat list of
+-- (template_id, instance_slot, step_index) entries in canonical
+--   template ascending → instance slot ascending → step ascending
+-- order, filtered to instances whose state is Active or
+-- Releasing. These tests pin the shape the C0c serial executor
+-- consumes when its test switch is enabled. Cross-resolution to
+-- per-step kind / ordinal data goes through the C0a accessors;
+-- the divergent-layer case proves a non-contiguous free layer
+-- survives all the way out to a global-schedule consumer.
+
+-- | Read every entry of the global schedule as a list of
+-- (template_id, instance_slot, step_index) triples.
+readGlobalSchedule :: Ptr RTGraph -> IO [(Int, Int, Int)]
+readGlobalSchedule h = do
+  cnt <- c_rt_graph_test_global_schedule_entry_count h
+  forM [0 .. fromIntegral cnt - 1] $ \i -> do
+    t <- c_rt_graph_test_global_schedule_entry_template h i
+    s <- c_rt_graph_test_global_schedule_entry_instance h i
+    p <- c_rt_graph_test_global_schedule_entry_step      h i
+    pure (fromIntegral t, fromIntegral s, fromIntegral p)
+
+-- | Pure expectation for a single-template graph: emit
+-- (0, slot, step) triples for every (slot in @slots@, step in
+-- the layered schedule), in slot-then-step order. Steps come from
+-- 'layeredRegionSchedule' to make the test contract obvious;
+-- assertion failure here would indicate either a planner or
+-- loader regression.
+expectedGlobalRG :: RuntimeGraph -> [Int] -> [(Int, Int, Int)]
+expectedGlobalRG rg slots =
+  let stepCount = case layeredRegionSchedule rg of
+        Right ss -> length ss
+        Left _   -> 0
+  in [ (0, slot, step)
+     | slot <- slots
+     , step <- [0 .. stepCount - 1]
+     ]
+
+-- | Multi-template counterpart: emit per-template entries in
+-- registration order, then per-instance-slot, then per-step. The
+-- caller supplies the live slot list per template_id so this
+-- helper does not need to know about the runtime instance pool.
+expectedGlobalTG
+  :: TemplateGraph -> [(Int, [Int])] -> [(Int, Int, Int)]
+expectedGlobalTG tg perTpl =
+  let tplCount = zip [0 :: Int ..] (tgTemplates tg)
+      stepCountFor i = case lookup i tplCount of
+        Just t -> case layeredRegionSchedule (tplGraph t) of
+          Right ss -> length ss
+          Left _   -> 0
+        Nothing -> 0
+  in [ (tid, slot, step)
+     | (tid, slots) <- perTpl
+     , slot <- slots
+     , step <- [0 .. stepCountFor tid - 1]
+     ]
+
+c0bGlobalScheduleTests :: TestTree
+c0bGlobalScheduleTests =
+  testGroup "Phase 4.E.2.C0b: per-block global schedule"
+    [ -- Default state has no schedule_steps anywhere, so the
+      -- global schedule must be empty even after a process tick.
+      -- This pins the "no metadata, no schedule" fallback for the
+      -- legacy single-template build path.
+      testCase "fresh handle: empty global schedule" $
+        withRTGraph 4 256 $ \handle -> do
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          actual @?= []
+
+    , -- The single auto-spawned instance produces one entry per
+      -- step in canonical (0, 0, step) order.
+      testCase "single instance, single template" $ do
+        (rg, _) <- compileBoth "chain" chainGraph
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          actual @?= expectedGlobalRG rg [0]
+
+    , -- Spawning more instances of the same template appends slots
+      -- to the canonical order: slot 0 → slot 1 → slot 2, with the
+      -- full step list interleaved per slot.
+      testCase "multiple instances preserve slot order" $ do
+        (rg, _) <- compileBoth "chain" chainGraph
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          _ <- c_rt_graph_template_instance_add handle 0
+          _ <- c_rt_graph_template_instance_add handle 0
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          actual @?= expectedGlobalRG rg [0, 1, 2]
+
+    , -- 'instance_remove' transitions the slot to Available, which
+      -- the build skips. Verify the middle slot disappears while
+      -- slots 0 and 2 remain in canonical order.
+      testCase "Available slot is skipped" $ do
+        (rg, _) <- compileBoth "chain" chainGraph
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          extra1 <- c_rt_graph_template_instance_add handle 0
+          _      <- c_rt_graph_template_instance_add handle 0
+          c_rt_graph_instance_remove handle extra1
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          actual @?= expectedGlobalRG rg [0, 2]
+
+    , -- A graph with an Env node: 'instance_release' transitions
+      -- to Releasing rather than Available, so the slot must
+      -- still appear in the global schedule until §2.E's silence
+      -- detector promotes it to Available many blocks later.
+      -- envPluckGraph's release time (0.1s ≈ 19 blocks at
+      -- 256/48000s) is comfortably longer than the one block this
+      -- test runs, and the gain is non-trivial so block_sink_peak
+      -- starts well above the silence threshold.
+      testCase "Releasing slot stays in schedule" $ do
+        (rg, _) <- compileBoth "envPluck" envPluckGraph
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          c_rt_graph_process handle 256   -- warm up
+          c_rt_graph_instance_release handle 0
+          status <- c_rt_graph_instance_status handle 0
+          status @?= instanceStatusReleasing
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          actual @?= expectedGlobalRG rg [0]
+
+    , -- For a multi-template graph the outer ordering is
+      -- template_id ascending; only after every entry of template
+      -- 0 has been emitted does any entry of template 1 appear.
+      -- 'sendReturnLiveTG' has two templates with one instance
+      -- each (auto-spawned by 'loadTemplateGraph').
+      testCase "multi-template: template before instance order" $ do
+        let tg = sendReturnLiveTG
+            totalNodes = sum (map (length . rgNodes . tplGraph)
+                                  (tgTemplates tg))
+        withRTGraph totalNodes 256 $ \handle -> do
+          loadTemplateGraph handle tg
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          let perTpl = [ (i, [i])
+                       | i <- [0 .. length (tgTemplates tg) - 1]
+                       ]
+          actual @?= expectedGlobalTG tg perTpl
+          -- Stronger ordering check: every template-0 entry must
+          -- precede every template-1 entry in the flat list.
+          let tids   = map (\(t, _, _) -> t) actual
+              afterT = dropWhile (== 0) tids
+          all (== 1) afterT @?= True
+
+    , -- Stronger regression for the canonical-order contract: the
+      -- previous case's slot indices coincide with template_id
+      -- (template 0 → slot 0, template 1 → slot 1), so it doesn't
+      -- prove that template order /dominates/ slot order. Spawn an
+      -- extra template-0 instance after the auto-spawned pair,
+      -- which the pool places at slot 2 (first growth past the
+      -- occupied 0,1). Slot order is now interleaved across
+      -- templates (template 0 owns slots 0, 2; template 1 owns
+      -- slot 1) but the global schedule must still group all
+      -- template-0 entries before any template-1 entry.
+      testCase "multi-template: template order dominates slot order" $ do
+        let tg = sendReturnLiveTG
+            totalNodes = sum (map (length . rgNodes . tplGraph)
+                                  (tgTemplates tg))
+        withRTGraph (totalNodes + 16) 256 $ \handle -> do
+          loadTemplateGraph handle tg
+          extraSlot <- c_rt_graph_template_instance_add handle 0
+          extraSlot @?= 2  -- pool grew past the auto-spawned 0,1
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          actual @?= expectedGlobalTG tg
+            [ (0, [0, 2])  -- template 0 owns slot 0 (auto) and slot 2 (extra)
+            , (1, [1])     -- template 1 owns slot 1 (auto)
+            ]
+          -- Pin the dominance directly: the flat tid sequence must
+          -- be a non-decreasing run, so a slot-1 entry can never
+          -- appear between two slot-0 entries.
+          let tids = map (\(t, _, _) -> t) actual
+          tids @?= sort tids
+          -- And the slot interleaving must actually be present in
+          -- this test's data (otherwise we're not exercising the
+          -- "template order dominates" path).
+          let tidSlots = nub [(t, s) | (t, s, _) <- actual]
+          tidSlots @?= [(0, 0), (0, 2), (1, 1)]
+
+    , -- Non-contiguous free-layer ordinals must survive into the
+      -- global schedule. This test resolves each entry's
+      -- (template, step) through the C0a accessors and pins the
+      -- divergent layer's ordinals at [0, 2] (not [0, 1]).
+      testCase "non-contiguous layer ordinals survive" $ do
+        rg <- case lowerGraph divergentLayerGraph
+                >>= compileRuntimeGraph of
+          Right rg' -> pure rg'
+          Left err  -> assertFailure
+                         ("c0b divergent compile: " <> err)
+                       >> error "unreachable"
+        withRTGraph (length (rgNodes rg)) 256 $ \handle -> do
+          loadRuntimeGraph handle rg
+          c_rt_graph_process handle 256
+          entries <- readGlobalSchedule handle
+          -- Resolve every entry's step back to its ordinal list.
+          ordinalsPerEntry <-
+            forM entries $ \(tid, _slot, step) -> do
+              n <- c_rt_graph_test_template_schedule_step_item_count
+                     handle (fromIntegral tid)
+                     (fromIntegral step)
+              forM [0 .. fromIntegral n - 1] $ \j ->
+                c_rt_graph_test_template_schedule_step_region
+                  handle (fromIntegral tid)
+                  (fromIntegral step) j
+          let toInts = map fromIntegral
+              -- Split entries by step_index; instance 0 only.
+              steps  = nub (map (\(_, _, p) -> p) entries)
+              perStep =
+                [ ( s
+                  , [ ords
+                    | ((_, _, p), ords) <- zip entries
+                                              (map toInts
+                                                   ordinalsPerEntry)
+                    , p == s
+                    ]
+                  )
+                | s <- steps
+                ]
+          -- Pin the divergent shape: step 0 = [0, 2], step 1 = [1],
+          -- step 2 = [3] (the barrier sink). The entries for the
+          -- single instance present each step exactly once.
+          map snd perStep @?=
+            [ [[0, 2]]
+            , [[1]]
+            , [[3]]
+            ]
+
+    , -- Reload through a Haskell loader calls c_rt_graph_clear
+      -- internally, which drops the prior block's global schedule
+      -- snapshot. After the second load the global schedule must
+      -- reflect only the new graph's shape.
+      testCase "reload clears prior global schedule" $ do
+        (rgChain,  _) <- compileBoth "chain"  chainGraph
+        (rgSimple, _) <- compileBoth "simple" simpleGraph
+        let totalNodes = max (length (rgNodes rgChain))
+                             (length (rgNodes rgSimple))
+        withRTGraph totalNodes 256 $ \handle -> do
+          loadRuntimeGraph handle rgChain
+          c_rt_graph_process handle 256
+          firstCount <- c_rt_graph_test_global_schedule_entry_count
+                          handle
+          assertBool "expected non-empty schedule after first load"
+                     (firstCount > 0)
+          loadRuntimeGraph handle rgSimple
+          c_rt_graph_process handle 256
+          actual <- readGlobalSchedule handle
+          actual @?= expectedGlobalRG rgSimple [0]
+    ]
+
+------------------------------------------------------------
+-- Phase 4.E.2.C0c: global-schedule serial executor
+------------------------------------------------------------
+--
+-- C0c promotes the C0b global schedule from observation to an
+-- executable serial path, gated by a test-only switch. There is no
+-- worker pool yet: the schedule executor must render byte-identical
+-- output to the legacy nested loop, preserve §2.E release accounting,
+-- and keep the B3 reduction-capture equivalence when both switches are
+-- enabled. C++-only graphs with no schedule metadata fall back to the
+-- legacy executor; that path is covered in the C++ test suite because
+-- Haskell loaders always ship schedule metadata.
+
+c0cScheduleExecutorTests :: TestTree
+c0cScheduleExecutorTests =
+  let nframes = 256
+      blocks  = 4
+  in testGroup "Phase 4.E.2.C0c: global-schedule serial executor"
+       [ testGroup "legacy executor equals global schedule"
+           [ testCase "single template, unfused" $ do
+               (rg, _) <- compileBoth "chain" chainGraph
+               assertDirectEqualsScheduleRG
+                 "chain" loadRuntimeGraph rg nframes blocks
+
+           , testCase "single template, fused" $ do
+               (_, rg) <- compileBoth "filtered-saw" filteredSawGraph
+               assertDirectEqualsScheduleRG
+                 "filtered-saw" loadRuntimeGraphFused rg nframes blocks
+
+           , testCase "multi-template live send/return" $
+               assertDirectEqualsScheduleTG
+                 "send-return-live" loadTemplateGraph
+                 sendReturnLiveTG nframes blocks
+
+           , testCase "non-contiguous free layer" $ do
+               rg <- case lowerGraph divergentLayerGraph
+                       >>= compileRuntimeGraph of
+                 Right rg' -> pure rg'
+                 Left err  -> assertFailure
+                                ("c0c divergent compile: " <> err)
+                              >> error "unreachable"
+               assertDirectEqualsScheduleRG
+                 "divergent-layer" loadRuntimeGraph rg nframes blocks
+           ]
+
+       , testGroup "T-9 under global schedule"
+           [ testGroup "single template, unfused loader"
+               [ testCase name $ do
+                   (rtUn, _) <- compileBoth name g
+                   assertScheduleDirectEqualsReductionRG
+                     name loadRuntimeGraph rtUn nframes blocks
+               | (name, g) <- t9CorpusGraphs
+               ]
+
+           , testGroup "single template, fused loader"
+               [ testCase name $ do
+                   (_, rtF) <- compileBoth name g
+                   assertScheduleDirectEqualsReductionRG
+                     name loadRuntimeGraphFused rtF nframes blocks
+               | (name, g) <- t9CorpusGraphs
+               ]
+
+           , testGroup "multi-template, unfused loader"
+               [ testCase name $
+                   assertScheduleDirectEqualsReductionTG
+                     name loadTemplateGraph tg nframes blocks
+               | (name, tg) <- t9CorpusTemplates
+               ]
+
+           , testGroup "multi-template, fused loader"
+               [ testCase name $
+                   assertScheduleDirectEqualsReductionTG
+                     name loadTemplateGraphFused tg nframes blocks
+               | (name, tg) <- t9CorpusTemplates
+               ]
+           ]
+
+       , testCase "release-then-free still runs once per instance block" $ do
+           let voice = runSynth $ do
+                 e <- env 1.0 0.0005 0.002 0.5 0.002
+                 out 0 e
+               rg = case lowerGraph voice >>= compileRuntimeGraph of
+                 Right r  -> r
+                 Left err -> error err
+
+           withRTGraph (length (rgNodes rg)) nframes $ \handle -> do
+             loadRuntimeGraph handle rg
+             c_rt_graph_test_set_global_schedule_execution handle 1
+
+             s0 <- c_rt_graph_instance_status handle 0
+             s0 @?= instanceStatusLive
+
+             c_rt_graph_process handle (fromIntegral nframes)
+             c_rt_graph_instance_release handle 0
+             s1 <- c_rt_graph_instance_status handle 0
+             s1 @?= instanceStatusReleasing
+
+             let drain n
+                   | n <= 0    = pure False
+                   | otherwise = do
+                       c_rt_graph_process handle (fromIntegral nframes)
+                       alive <- c_rt_graph_instance_alive handle 0
+                       if alive == 0 then pure True else drain (n - 1)
+             freed <- drain (64 :: Int)
+             assertBool
+               "scheduled executor should auto-free within 64 blocks"
+               freed
+
+             s2 <- c_rt_graph_instance_status handle 0
+             s2 @?= (-1)
+       ]

@@ -7061,6 +7061,67 @@ TEST_CASE("reduction capture: fused sink kernel (SinGainOut) writes through Sink
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase §4.E.2.C0c: global-schedule serial executor
+// ----------------------------------------------------------------
+
+TEST_CASE("global schedule executor: metadata-bearing graph matches legacy") {
+    auto build = [](RTGraph *g) {
+        add_const_node(g, 0, 0.25f, 0.5f); // const 0.75 → Out(bus 0)
+        rt_graph_add_node(g, 1, 2);
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+
+        rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                     /*first_node=*/0, /*node_count=*/2);
+        const int region0[] = {0};
+        rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                            /*item_count=*/1, region0);
+    };
+
+    auto *legacy = rt_graph_create(4, kFrames);
+    auto *sched  = rt_graph_create(4, kFrames);
+    REQUIRE(legacy != nullptr);
+    REQUIRE(sched  != nullptr);
+    build(legacy);
+    build(sched);
+
+    rt_graph_test_set_global_schedule_execution(sched, 1);
+    rt_graph_process(legacy, kFrames);
+    rt_graph_process(sched,  kFrames);
+
+    const auto legacy_bus0 = read_bus_vec(legacy, 0, kFrames);
+    const auto sched_bus0  = read_bus_vec(sched,  0, kFrames);
+    check_exact_same(legacy_bus0, sched_bus0);
+    for (auto v : sched_bus0) CHECK(v == doctest::Approx(0.75f).epsilon(1e-6));
+
+    rt_graph_destroy(legacy);
+    rt_graph_destroy(sched);
+}
+
+TEST_CASE("global schedule executor: no-metadata graph falls back to legacy") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.125f, 0.5f); // const 0.625 → Out(bus 0)
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    // No RegionSpec / ScheduleStepSpec metadata is registered here.
+    // With the C0c flag on, process_graph must still use the legacy
+    // flat-node executor rather than treating the empty global schedule
+    // as "nothing to run".
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_process(g, kFrames);
+
+    const auto bus0 = read_bus_vec(g, 0, kFrames);
+    for (auto v : bus0) CHECK(v == doctest::Approx(0.625f).epsilon(1e-6));
+    CHECK(rt_graph_test_global_schedule_entry_count(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("contribution capacity: parallel vector sizing across many capacities") {
     // Direct lockstep regression. Walk a handful of distinct
     // capacities (including ones that cross the 64-slot boundary

@@ -904,6 +904,35 @@ struct ScheduleStepSpec {
   int item_count = 0;
 };
 
+// Phase §4.E.2.C0b: one entry in the per-block global schedule
+// — a logical work unit pairing a live instance with one of its
+// template's schedule steps. Built once per block from the post-
+// drain instance-state snapshot and stored on RTGraph for the
+// rest of the block. By default it is observational; the C0c
+// test switch lets a serial executor consume it before a later
+// worker-pool slice.
+//
+// Canonical order — pinned by build_global_schedule:
+//   outer:  template_id ascending (registration / topo order)
+//   middle: instance_slot ascending (filtered to this template,
+//           Active or Releasing)
+//   inner:  step_index ascending (the template's
+//           schedule_steps order, which is the flattened
+//           layeredRegionSchedule order Haskell shipped in C0a)
+//
+// The (template_id, instance_slot, step_index) triple is enough
+// to recover the kind and the scheduled-region ordinal list via
+// MetaDef::schedule_steps + MetaDef::schedule_step_regions.
+// Storing only the IDs avoids stale-copy hazards: if a future
+// schedule mutation lands inside a block (it cannot today —
+// schedule registration is construction-only), the build
+// reflects current metadata rather than a snapshot.
+struct GlobalScheduleEntry {
+  int template_id   = 0;
+  int instance_slot = 0;
+  int step_index    = 0;
+};
+
 struct MetaDef {
   int max_frames = 0;
   std::vector<NodeSpec> nodes;
@@ -1784,6 +1813,29 @@ struct RTGraph {
   // inspect the per-slot capture while still verifying output-bus
   // bit-equivalence.
   bool capture_reduction_mode = false;
+
+  // Phase §4.E.2.C0c: when true, process_graph consumes the C0b
+  // global schedule as the serial executor for metadata-bearing
+  // graphs. Default off; tests opt in. If any live instance belongs
+  // to a template with no schedule metadata, the executor falls back
+  // to the legacy nested loop for the whole block so C++-only /
+  // legacy construction paths keep working.
+  bool execute_global_schedule = false;
+
+  // Phase §4.E.2.C0b: per-block global schedule, rebuilt from the
+  // post-drain instance-state snapshot at the top of every
+  // process_graph call. The vector is in canonical
+  // (template_id, instance_slot, step_index) order; by default it is
+  // observational, and the C0c test switch lets a serial executor
+  // consume it directly before a later worker-pool slice. Cleared in
+  // reset_to_default_state. See GlobalScheduleEntry.
+  //
+  // Capacity is reserved off the audio thread by
+  // ensure_global_schedule_capacity, called from every construction
+  // mutation that can affect the high-water bound. The audio path
+  // (build_global_schedule) only does clear() + push_back into
+  // already-reserved space, so it never allocates.
+  std::vector<GlobalScheduleEntry> global_schedule;
 };
 
 namespace {
@@ -2144,6 +2196,49 @@ required_contribution_slots(const RTGraph &g) noexcept {
 static void ensure_contribution_capacity(RTGraph &g) {
   const int required = required_contribution_slots(g);
   g.contribution_storage.resize_for(required, g.max_frames);
+}
+
+// Phase §4.E.2.C0b: number of GlobalScheduleEntry's the per-block
+// build can produce at high water. Mirrors required_contribution_slots
+// for the same reason: rt_graph_template_set_polyphony can lower
+// the cap below already-live instances, so the bound is
+// max(polyphony, occupied) rather than plain polyphony. Templates
+// with no schedule_steps contribute nothing — that's the
+// observational "no metadata, no schedule" fallback.
+[[nodiscard]] static int
+required_global_schedule_entries(const RTGraph &g) noexcept {
+  int total = 0;
+  for (std::size_t tid = 0; tid < g.defs.size(); ++tid) {
+    const auto &def = g.defs[tid];
+    const int steps = static_cast<int>(def.schedule_steps.size());
+    if (steps == 0) continue;
+    const int poly = def.polyphony;
+    const int occ  = occupied_instances_for_template(
+                        g, static_cast<int>(tid));
+    const int per  = poly > occ ? poly : occ;
+    total += per * steps;
+  }
+  return total;
+}
+
+// Grow-only reserve on the global_schedule vector so build_global_schedule
+// (which runs on the audio thread) can clear() + push_back() without
+// allocating. Called from every construction mutation that can affect
+// the bound:
+//   * rt_graph_template_add                (no-op: new template has 0 steps)
+//   * rt_graph_template_set_polyphony
+//   * rt_graph_template_add_schedule_step  (steps grows on each push)
+// std::vector::reserve is itself grow-only — a smaller request after a
+// larger one is a no-op — so set_polyphony lowering the cap leaves the
+// already-allocated capacity intact, matching the contribution-storage
+// invariant. Also indirectly from rt_graph_clear via
+// reset_to_default_state's global_schedule.clear() (which keeps
+// capacity); the next mutation re-tightens the bound.
+static void ensure_global_schedule_capacity(RTGraph &g) {
+  const int required = required_global_schedule_entries(g);
+  if (required > 0) {
+    g.global_schedule.reserve(static_cast<std::size_t>(required));
+  }
 }
 
 // Zero the first nframes of each *live* output bus before one block
@@ -4587,6 +4682,139 @@ static inline void dispatch_node(
   }
 }
 
+static inline void begin_instance_block(GraphInstance &inst) noexcept {
+  // §2.E: zero the per-block sink peak before any kernel runs. Out /
+  // BusOut kernels accumulate the block's max |input| into this field;
+  // process_graph reads it after the instance's block work completes
+  // to decide whether a Releasing instance has gone silent.
+  inst.block_sink_peak = 0.0f;
+}
+
+static inline void finish_instance_block(
+    GraphInstance &inst, SlotState state_at_block_start
+) noexcept {
+  // §2.E: if the slot is Releasing, drive the silence counter from
+  // the peak that sink kernels recorded into block_sink_peak. Once
+  // the counter crosses kReleaseSilenceBlocks, transition the slot
+  // back to Available. Active slots bypass this entirely.
+  if (state_at_block_start == SlotState::Releasing) {
+    if (inst.block_sink_peak < kReleaseSilenceThreshold) {
+      if (++inst.silent_blocks >= kReleaseSilenceBlocks) {
+        inst.state.store(SlotState::Available);
+      }
+    } else {
+      inst.silent_blocks = 0;
+    }
+  }
+}
+
+static void process_region(
+    RTGraph &g, const MetaDef &def, GraphInstance &inst,
+    const RegionSpec &r, int nframes, BlockExecutionContext &ctx
+) noexcept {
+  const std::size_t node_count = std::min(def.nodes.size(), inst.nodes.size());
+  const std::size_t first = static_cast<std::size_t>(r.first_node);
+  const std::size_t end_excl =
+      std::min(node_count, first + static_cast<std::size_t>(r.node_count));
+
+  // Fused-kernel dispatch. A kind-sequence mismatch falls back
+  // to per-node iteration so a stale or misshapen tag silently
+  // degrades rather than silencing the region.
+  bool fused = false;
+  if (r.kernel == RegionKernel::SawLpfGain
+      && r.node_count == 3
+      && first + 3 <= node_count
+      && def.nodes[first    ].kind == NodeKind::SawOsc
+      && def.nodes[first + 1].kind == NodeKind::LPF
+      && def.nodes[first + 2].kind == NodeKind::Gain) {
+    process_region_saw_lpf_gain(g, inst, first, first + 1, first + 2,
+                                nframes);
+    fused = true;
+  } else if (r.kernel == RegionKernel::SinGainOut
+      && r.node_count == 3
+      && first + 3 <= node_count
+      && def.nodes[first    ].kind == NodeKind::SinOsc
+      && def.nodes[first + 1].kind == NodeKind::Gain
+      && is_sink_terminal(def.nodes[first + 2].kind)) {
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
+                                nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
+    fused = true;
+  } else if (r.kernel == RegionKernel::SawLpfGainOut
+      && r.node_count == 4
+      && first + 4 <= node_count
+      && def.nodes[first    ].kind == NodeKind::SawOsc
+      && def.nodes[first + 1].kind == NodeKind::LPF
+      && def.nodes[first + 2].kind == NodeKind::Gain
+      && is_sink_terminal(def.nodes[first + 3].kind)) {
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_region_saw_lpf_gain_out(g, inst,
+                                    first, first + 1,
+                                    first + 2, first + 3,
+                                    nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
+    fused = true;
+  } else if (r.kernel == RegionKernel::SawGainOut
+      && r.node_count == 3
+      && first + 3 <= node_count
+      && def.nodes[first    ].kind == NodeKind::SawOsc
+      && def.nodes[first + 1].kind == NodeKind::Gain
+      && is_sink_terminal(def.nodes[first + 2].kind)) {
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_region_saw_gain_out(g, inst, first, first + 1, first + 2,
+                                nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
+    fused = true;
+  } else if (r.kernel == RegionKernel::NoiseGainOut
+      && r.node_count == 3
+      && first + 3 <= node_count
+      && def.nodes[first    ].kind == NodeKind::NoiseGen
+      && def.nodes[first + 1].kind == NodeKind::Gain
+      && is_sink_terminal(def.nodes[first + 2].kind)) {
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_region_noise_gain_out(g, inst, first, first + 1, first + 2,
+                                  nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
+    fused = true;
+  } else if (r.kernel == RegionKernel::BusInLpfGainOut
+      && r.node_count == 4
+      && first + 4 <= node_count
+      && def.nodes[first    ].kind == NodeKind::BusIn
+      && def.nodes[first + 1].kind == NodeKind::LPF
+      && def.nodes[first + 2].kind == NodeKind::Gain
+      && is_sink_terminal(def.nodes[first + 3].kind)) {
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_region_busin_lpf_gain_out(g, inst,
+                                      first, first + 1,
+                                      first + 2, first + 3,
+                                      nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
+    fused = true;
+  } else if (r.kernel == RegionKernel::NoiseLpfGainOut
+      && r.node_count == 4
+      && first + 4 <= node_count
+      && def.nodes[first    ].kind == NodeKind::NoiseGen
+      && def.nodes[first + 1].kind == NodeKind::LPF
+      && def.nodes[first + 2].kind == NodeKind::Gain
+      && is_sink_terminal(def.nodes[first + 3].kind)) {
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_region_noise_lpf_gain_out(g, inst,
+                                      first, first + 1,
+                                      first + 2, first + 3,
+                                      nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
+    fused = true;
+  }
+
+  if (!fused) {
+    for (std::size_t i = first; i < end_excl; ++i) {
+      if (def.nodes[i].elided) continue;
+      dispatch_node(g, inst, i, nframes, def.nodes[i], ctx);
+    }
+  }
+}
+
 static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
                               BlockExecutionContext &ctx) noexcept {
   // Look up the spec via inst.template_id. If the template is gone
@@ -4597,11 +4825,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
     return;
   }
 
-  // §2.E: zero the per-block sink peak before any kernel runs. Out /
-  // BusOut kernels accumulate the block's max |input| into this field;
-  // process_graph reads it after this function returns to decide
-  // whether a Releasing instance has gone silent.
-  inst.block_sink_peak = 0.0f;
+  begin_instance_block(inst);
 
   const std::size_t node_count = std::min(def->nodes.size(), inst.nodes.size());
 
@@ -4626,106 +4850,7 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
   // exactly once with no overlap; we clamp each region's range
   // against node_count defensively in case construction was partial.
   for (const RegionSpec &r : def->regions) {
-    const std::size_t first = static_cast<std::size_t>(r.first_node);
-    const std::size_t end_excl =
-        std::min(node_count, first + static_cast<std::size_t>(r.node_count));
-
-    // Fused-kernel dispatch. A kind-sequence mismatch falls back
-    // to per-node iteration so a stale or misshapen tag silently
-    // degrades rather than silencing the region.
-    bool fused = false;
-    if (r.kernel == RegionKernel::SawLpfGain
-        && r.node_count == 3
-        && first + 3 <= node_count
-        && def->nodes[first    ].kind == NodeKind::SawOsc
-        && def->nodes[first + 1].kind == NodeKind::LPF
-        && def->nodes[first + 2].kind == NodeKind::Gain) {
-      process_region_saw_lpf_gain(g, inst, first, first + 1, first + 2,
-                                  nframes);
-      fused = true;
-    } else if (r.kernel == RegionKernel::SinGainOut
-        && r.node_count == 3
-        && first + 3 <= node_count
-        && def->nodes[first    ].kind == NodeKind::SinOsc
-        && def->nodes[first + 1].kind == NodeKind::Gain
-        && is_sink_terminal(def->nodes[first + 2].kind)) {
-      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-      process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
-                                  nframes, writer_slot, ctx.bus_writes.mode);
-      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
-      fused = true;
-    } else if (r.kernel == RegionKernel::SawLpfGainOut
-        && r.node_count == 4
-        && first + 4 <= node_count
-        && def->nodes[first    ].kind == NodeKind::SawOsc
-        && def->nodes[first + 1].kind == NodeKind::LPF
-        && def->nodes[first + 2].kind == NodeKind::Gain
-        && is_sink_terminal(def->nodes[first + 3].kind)) {
-      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-      process_region_saw_lpf_gain_out(g, inst,
-                                      first, first + 1,
-                                      first + 2, first + 3,
-                                      nframes, writer_slot, ctx.bus_writes.mode);
-      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
-      fused = true;
-    } else if (r.kernel == RegionKernel::SawGainOut
-        && r.node_count == 3
-        && first + 3 <= node_count
-        && def->nodes[first    ].kind == NodeKind::SawOsc
-        && def->nodes[first + 1].kind == NodeKind::Gain
-        && is_sink_terminal(def->nodes[first + 2].kind)) {
-      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-      process_region_saw_gain_out(g, inst, first, first + 1, first + 2,
-                                  nframes, writer_slot, ctx.bus_writes.mode);
-      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
-      fused = true;
-    } else if (r.kernel == RegionKernel::NoiseGainOut
-        && r.node_count == 3
-        && first + 3 <= node_count
-        && def->nodes[first    ].kind == NodeKind::NoiseGen
-        && def->nodes[first + 1].kind == NodeKind::Gain
-        && is_sink_terminal(def->nodes[first + 2].kind)) {
-      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-      process_region_noise_gain_out(g, inst, first, first + 1, first + 2,
-                                    nframes, writer_slot, ctx.bus_writes.mode);
-      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
-      fused = true;
-    } else if (r.kernel == RegionKernel::BusInLpfGainOut
-        && r.node_count == 4
-        && first + 4 <= node_count
-        && def->nodes[first    ].kind == NodeKind::BusIn
-        && def->nodes[first + 1].kind == NodeKind::LPF
-        && def->nodes[first + 2].kind == NodeKind::Gain
-        && is_sink_terminal(def->nodes[first + 3].kind)) {
-      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-      process_region_busin_lpf_gain_out(g, inst,
-                                        first, first + 1,
-                                        first + 2, first + 3,
-                                        nframes, writer_slot, ctx.bus_writes.mode);
-      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
-      fused = true;
-    } else if (r.kernel == RegionKernel::NoiseLpfGainOut
-        && r.node_count == 4
-        && first + 4 <= node_count
-        && def->nodes[first    ].kind == NodeKind::NoiseGen
-        && def->nodes[first + 1].kind == NodeKind::LPF
-        && def->nodes[first + 2].kind == NodeKind::Gain
-        && is_sink_terminal(def->nodes[first + 3].kind)) {
-      const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-      process_region_noise_lpf_gain_out(g, inst,
-                                        first, first + 1,
-                                        first + 2, first + 3,
-                                        nframes, writer_slot, ctx.bus_writes.mode);
-      fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
-      fused = true;
-    }
-
-    if (!fused) {
-      for (std::size_t i = first; i < end_excl; ++i) {
-        if (def->nodes[i].elided) continue;
-        dispatch_node(g, inst, i, nframes, def->nodes[i], ctx);
-      }
-    }
+    process_region(g, *def, inst, r, nframes, ctx);
   }
 }
 
@@ -4764,6 +4889,179 @@ template-level precedence (split into multiple templates) or use
 BusInDelayed to break the cross-instance dependency.
 */
 
+// Phase §4.E.2.C0b: build the per-block global schedule from the
+// post-drain instance-state snapshot. Mirrors the canonical order
+// process_graph's nested loop iterates in:
+//
+//   for tid in [0, defs.size()):
+//     for slot in [0, instances.size()):
+//       skip if instances[slot].state not in {Active, Releasing}
+//       skip if instances[slot].template_id != tid
+//       for step in [0, defs[tid].schedule_steps.size()):
+//         emit (tid, slot, step)
+//
+// The same SlotState load both this builder and the executor loop
+// perform is safe to do twice without producing different values:
+// drain_control_queue has already applied this block's incoming
+// commands, and the only same-thread state mutation that happens
+// later (the §2.E Releasing → Available transition inside the
+// executor) is sequenced after the build. Every Reserved /
+// Available slot is skipped by both — Reserved because the
+// producer may still be initialising the slot's node-state
+// vectors (an audio-thread race would be UB), Available because
+// the slot has no live instance.
+//
+// Templates with empty schedule_steps emit no entries even when
+// they have live instances. That's the "no metadata, no schedule"
+// fallback for templates loaded via the legacy single-template
+// rt_graph_add_node / rt_graph_add_region path. The C0c executor
+// detects that fallback case and uses the legacy nested loop for the
+// whole block instead of treating an empty global schedule as
+// "nothing to run".
+//
+// This function runs on the audio thread and must not allocate.
+// ensure_global_schedule_capacity (called from every construction
+// mutation that can grow the bound) keeps g.global_schedule's
+// capacity at or above max-block size; clear() preserves that
+// capacity, and every push_back below lands inside it.
+static void build_global_schedule(RTGraph &g) noexcept {
+  g.global_schedule.clear();
+  const std::size_t template_count = g.defs.size();
+  for (std::size_t tid = 0; tid < template_count; ++tid) {
+    const MetaDef &def = g.defs[tid];
+    if (def.schedule_steps.empty()) continue;
+    const int tid_i  = static_cast<int>(tid);
+    const std::size_t step_count = def.schedule_steps.size();
+    for (std::size_t slot = 0; slot < g.instances.size(); ++slot) {
+      const GraphInstance &inst = g.instances[slot];
+      const SlotState s = inst.state.load();
+      if (s != SlotState::Active && s != SlotState::Releasing) continue;
+      if (inst.template_id != tid_i) continue;
+      const int slot_i = static_cast<int>(slot);
+      for (std::size_t step = 0; step < step_count; ++step) {
+        g.global_schedule.push_back(
+            GlobalScheduleEntry{tid_i, slot_i, static_cast<int>(step)});
+      }
+    }
+  }
+}
+
+static bool global_schedule_covers_audio_schedule(const RTGraph &g) noexcept {
+  for (const GraphInstance &inst : g.instances) {
+    const SlotState s = inst.state.load();
+    if (s != SlotState::Active && s != SlotState::Releasing) continue;
+    const MetaDef *def = template_at(g, inst.template_id);
+    if (!def || def->schedule_steps.empty()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void process_schedule_step(
+    RTGraph &g, const MetaDef &def, GraphInstance &inst,
+    int step_index, int nframes, BlockExecutionContext &ctx
+) noexcept {
+  if (step_index < 0) return;
+  const std::size_t step_pos = static_cast<std::size_t>(step_index);
+  if (step_pos >= def.schedule_steps.size()) return;
+
+  const ScheduleStepSpec &step = def.schedule_steps[step_pos];
+  if (step.first_item < 0 || step.item_count <= 0) return;
+  const std::size_t first_item = static_cast<std::size_t>(step.first_item);
+  const std::size_t item_count = static_cast<std::size_t>(step.item_count);
+  if (first_item > def.schedule_step_regions.size()
+      || item_count > def.schedule_step_regions.size() - first_item) {
+    return;
+  }
+
+  for (std::size_t i = 0; i < item_count; ++i) {
+    const int region_ordinal = def.schedule_step_regions[first_item + i];
+    if (region_ordinal < 0) continue;
+    const std::size_t region_pos = static_cast<std::size_t>(region_ordinal);
+    if (region_pos >= def.regions.size()) continue;
+    process_region(g, def, inst, def.regions[region_pos], nframes, ctx);
+  }
+}
+
+static void process_global_schedule_serial(
+    RTGraph &g, int nframes, BlockExecutionContext &ctx
+) noexcept {
+  GraphInstance *current_inst = nullptr;
+  const MetaDef *current_def = nullptr;
+  SlotState current_state = SlotState::Available;
+  int current_slot = -1;
+
+  auto finish_current = [&]() noexcept {
+    if (current_inst) {
+      finish_instance_block(*current_inst, current_state);
+      current_inst = nullptr;
+      current_def = nullptr;
+      current_slot = -1;
+      current_state = SlotState::Available;
+    }
+  };
+
+  for (const GlobalScheduleEntry &entry : g.global_schedule) {
+    if (entry.instance_slot != current_slot) {
+      finish_current();
+
+      if (entry.instance_slot < 0) continue;
+      const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
+      if (slot >= g.instances.size()) continue;
+
+      GraphInstance &inst = g.instances[slot];
+      const SlotState s = inst.state.load();
+      if (s != SlotState::Active && s != SlotState::Releasing) continue;
+      if (inst.template_id != entry.template_id) continue;
+
+      const MetaDef *def = template_at(g, entry.template_id);
+      if (!def) continue;
+
+      begin_instance_block(inst);
+      current_inst = &inst;
+      current_def = def;
+      current_state = s;
+      current_slot = entry.instance_slot;
+    }
+
+    if (current_inst && current_def) {
+      process_schedule_step(g, *current_def, *current_inst,
+                            entry.step_index, nframes, ctx);
+    }
+  }
+
+  finish_current();
+}
+
+static void process_legacy_schedule(
+    RTGraph &g, int nframes, BlockExecutionContext &ctx
+) noexcept {
+  // Iterate templates in registration order. The Haskell side picks
+  // registration order to match the topological sort over template
+  // precedence, so this loop respects all bus-induced ordering
+  // constraints between templates. See Note [Multi-template
+  // execution loop].
+  const std::size_t template_count = g.defs.size();
+  for (std::size_t tid = 0; tid < template_count; ++tid) {
+    const int tid_i = static_cast<int>(tid);
+    for (auto &inst : g.instances) {
+      // Skip every state that is not part of the audio schedule.
+      // Available is "free", Reserved is the producer's private claim
+      // (preparation in progress — the producer may be resizing /
+      // initializing inst.nodes right now, so the audio thread MUST
+      // NOT race those writes). Only Active and Releasing slots have
+      // already been published into the schedule. Snapshot once; the
+      // §2.E silence-window branch reuses the snapshot.
+      const SlotState s = inst.state.load();
+      if (s != SlotState::Active && s != SlotState::Releasing) continue;
+      if (inst.template_id != tid_i) continue;
+      process_instance(g, inst, nframes, ctx);
+      finish_instance_block(inst, s);
+    }
+  }
+}
+
 static void process_graph(RTGraph &g, int nframes) noexcept {
   // Drain the realtime control queue *before* anything else runs.
   // This snapshots the producer's published-up-to point once and
@@ -4782,6 +5080,12 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // into the same live buffer. See Note [Bus pool double-buffering].
   std::swap(g.server.output_buses, g.server.output_buses_prev);
   clear_output_buses(g.server, nframes);
+
+  // Phase §4.E.2.C0b: rebuild the global schedule from the post-
+  // drain instance-state snapshot. Observational only in C0b; the
+  // executor below still drives execution. See
+  // build_global_schedule.
+  build_global_schedule(g);
 
   // Per-block execution context. The writer-slot counter every
   // dispatch boundary advances on each sink write resets here so
@@ -4809,46 +5113,11 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
               std::uint64_t{0});
   }
 
-  // Iterate templates in registration order. The Haskell side picks
-  // registration order to match the topological sort over template
-  // precedence, so this loop respects all bus-induced ordering
-  // constraints between templates. See Note [Multi-template
-  // execution loop].
-  const std::size_t template_count = g.defs.size();
-  for (std::size_t tid = 0; tid < template_count; ++tid) {
-    const int tid_i = static_cast<int>(tid);
-    for (auto &inst : g.instances) {
-      // Skip every state that is not part of the audio schedule.
-      // Available is "free", Reserved is the producer's private claim
-      // (preparation in progress — the producer may be resizing /
-      // initializing inst.nodes right now, so the audio thread MUST
-      // NOT race those writes). Only Active and Releasing slots have
-      // already been published into the schedule. Snapshot once; the
-      // §2.E silence-window branch reuses the snapshot.
-      const SlotState s = inst.state.load();
-      if (s != SlotState::Active && s != SlotState::Releasing) continue;
-      if (inst.template_id != tid_i) continue;
-      process_instance(g, inst, nframes, ctx);
-
-      // §2.E: if the slot is Releasing, drive the silence counter from
-      // the peak that process_out just recorded into block_sink_peak.
-      // Once the counter crosses kReleaseSilenceBlocks, transition the
-      // slot back to Available — the GraphInstance object stays in
-      // place (its node-state vectors are kept for the next reuse), so
-      // there is no allocation/deallocation on the audio thread. Active
-      // slots bypass this entirely; the field is consulted only when
-      // state == Releasing. See Note [§2.E: release-then-free instance
-      // lifecycle].
-      if (s == SlotState::Releasing) {
-        if (inst.block_sink_peak < kReleaseSilenceThreshold) {
-          if (++inst.silent_blocks >= kReleaseSilenceBlocks) {
-            inst.state.store(SlotState::Available);
-          }
-        } else {
-          inst.silent_blocks = 0;
-        }
-      }
-    }
+  if (g.execute_global_schedule
+      && global_schedule_covers_audio_schedule(g)) {
+    process_global_schedule_serial(g, nframes, ctx);
+  } else {
+    process_legacy_schedule(g, nframes, ctx);
   }
 
   // Phase B0 test surface: snapshot the canonical writer-slot count
@@ -5114,6 +5383,15 @@ static void reset_to_default_state(RTGraph &g) {
   // contribution table without an explicit
   // rt_graph_test_set_reduction_capture call.
   g.capture_reduction_mode = false;
+  g.execute_global_schedule = false;
+
+  // Phase §4.E.2.C0b: drop the previous block's global schedule
+  // snapshot. The next process_graph rebuilds it from the
+  // freshly-cleared instance pool (which after reset has only the
+  // auto-created instance 0 belonging to template 0, and template
+  // 0 has no schedule_steps yet — so the first build produces an
+  // empty schedule until a loader ships C0a metadata).
+  g.global_schedule.clear();
 
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
@@ -5331,6 +5609,13 @@ int rt_graph_template_add(RTGraph *g) {
   // (e.g. cloning a template's nodes on add) cannot silently
   // under-size the table.
   ensure_contribution_capacity(*g);
+  // C0b counterpart: a fresh template has zero schedule_steps, so
+  // the bound is unchanged today. Same symmetry rationale as the
+  // contribution call above — keep every construction mutation
+  // routed through ensure_global_schedule_capacity so a future
+  // change cannot silently let the audio path fall off the
+  // reserved capacity.
+  ensure_global_schedule_capacity(*g);
 
   return static_cast<int>(g->defs.size() - 1);
 }
@@ -5359,6 +5644,8 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
   // below already-live instances does not shrink the table — a
   // writer slot reserved under the old cap stays in range.
   ensure_contribution_capacity(*g);
+  // Same grow-only invariant for the C0b global-schedule reserve.
+  ensure_global_schedule_capacity(*g);
 }
 
 // Number of registered templates. Iterate 0..count-1 to enumerate.
@@ -5398,6 +5685,12 @@ int rt_graph_test_contribution_used_word_count(const RTGraph *g) {
 void rt_graph_test_set_reduction_capture(RTGraph *g, int on) {
   if (!g) return;
   g->capture_reduction_mode = (on != 0);
+}
+
+// Phase §4.E.2.C0c test ABI. See header docblocks.
+void rt_graph_test_set_global_schedule_execution(RTGraph *g, int on) {
+  if (!g) return;
+  g->execute_global_schedule = (on != 0);
 }
 
 int rt_graph_test_contribution_slot_target(const RTGraph *g, int ws) {
@@ -5492,6 +5785,48 @@ int rt_graph_test_template_schedule_step_region(
                           + static_cast<std::size_t>(item_index);
   if (pos >= items.size()) return -1;
   return items[pos];
+}
+
+// Phase §4.E.2.C0b test surfaces. The global_schedule vector is
+// rebuilt at the top of every process_graph call from the post-
+// drain instance-state snapshot, so these accessors return the
+// schedule for the most recent block. After rt_graph_clear (or
+// before any block has run), the vector is empty.
+int rt_graph_test_global_schedule_entry_count(const RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->global_schedule.size());
+}
+
+namespace {
+const GlobalScheduleEntry *
+global_schedule_entry_at(const RTGraph *g, int entry_index) {
+  if (!g) return nullptr;
+  if (entry_index < 0) return nullptr;
+  const std::size_t i = static_cast<std::size_t>(entry_index);
+  if (i >= g->global_schedule.size()) return nullptr;
+  return &g->global_schedule[i];
+}
+}  // namespace
+
+int rt_graph_test_global_schedule_entry_template(
+    const RTGraph *g, int entry_index
+) {
+  const auto *e = global_schedule_entry_at(g, entry_index);
+  return e ? e->template_id : -1;
+}
+
+int rt_graph_test_global_schedule_entry_instance(
+    const RTGraph *g, int entry_index
+) {
+  const auto *e = global_schedule_entry_at(g, entry_index);
+  return e ? e->instance_slot : -1;
+}
+
+int rt_graph_test_global_schedule_entry_step(
+    const RTGraph *g, int entry_index
+) {
+  const auto *e = global_schedule_entry_at(g, entry_index);
+  return e ? e->step_index : -1;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named
@@ -5728,9 +6063,10 @@ int rt_graph_region_kernel_supported(int kernel_kind) {
 // Phase §4.E.2.C0a: append one descriptive schedule step to the
 // named template's metadata. Loaders call this once per
 // ScheduleStep emitted by Haskell-side layeredRegionSchedule, in
-// flattened order. The runtime stores it on MetaDef::schedule_steps
-// and does not yet consume it — C0b will build the per-block global
-// schedule from (active instance × schedule step).
+// flattened order. The runtime stores it on MetaDef::schedule_steps;
+// C0b builds the per-block global schedule from (active instance ×
+// schedule step), and the C0c test executor consumes that schedule
+// when explicitly enabled.
 //
 // kind matches the Haskell ScheduleStepKind tags:
 //   0 = Barrier
@@ -5794,6 +6130,12 @@ void rt_graph_template_add_schedule_step(
   }
   def->schedule_steps.push_back(
       ScheduleStepSpec{step_kind, first_item, item_count});
+
+  // C0b: schedule_steps just grew by one, so the per-block global
+  // schedule's high-water bound grows by max(polyphony, occupied)
+  // for this template. Reserve here so build_global_schedule on
+  // the audio path is alloc-free. Grow-only.
+  ensure_global_schedule_capacity(*g);
 }
 
 // Step C (d): mark a node as elided. Idempotent on existing state;

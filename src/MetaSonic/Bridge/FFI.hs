@@ -32,11 +32,18 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_region_kernel_supported
   , -- * §4.E.2.B test surface (off by default; tests opt in)
     c_rt_graph_test_set_reduction_capture
+  , -- * §4.E.2.C0c schedule-executor test switch
+    c_rt_graph_test_set_global_schedule_execution
   , -- * §4.E.2.C0a layered-schedule metadata (test-only introspection)
     c_rt_graph_test_template_schedule_step_count
   , c_rt_graph_test_template_schedule_step_kind
   , c_rt_graph_test_template_schedule_step_item_count
   , c_rt_graph_test_template_schedule_step_region
+  , -- * §4.E.2.C0b global block schedule (test-only introspection)
+    c_rt_graph_test_global_schedule_entry_count
+  , c_rt_graph_test_global_schedule_entry_template
+  , c_rt_graph_test_global_schedule_entry_instance
+  , c_rt_graph_test_global_schedule_entry_step
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
   , c_rt_graph_read_bus
@@ -328,6 +335,16 @@ foreign import ccall unsafe "rt_graph_kind_supported"
 foreign import ccall unsafe "rt_graph_test_set_reduction_capture"
   c_rt_graph_test_set_reduction_capture :: Ptr RTGraph -> CInt -> IO ()
 
+-- | §4.E.2.C0c test surface: toggle the serial executor that consumes
+-- the per-block global schedule. When non-zero, metadata-bearing
+-- graphs execute by walking the C0b schedule; graphs with any live
+-- template lacking schedule metadata fall back to the legacy executor
+-- for the whole block. Test-only — not for normal rendering or live
+-- audio paths.
+foreign import ccall unsafe "rt_graph_test_set_global_schedule_execution"
+  c_rt_graph_test_set_global_schedule_execution
+    :: Ptr RTGraph -> CInt -> IO ()
+
 -- | §4.E.2.C0a test surface: number of schedule steps registered
 -- for the named template. Returns 0 on null g or unknown
 -- template_id. Loaders are expected to ship one step per Haskell
@@ -361,6 +378,37 @@ foreign import ccall unsafe "rt_graph_test_template_schedule_step_item_count"
 foreign import ccall unsafe "rt_graph_test_template_schedule_step_region"
   c_rt_graph_test_template_schedule_step_region
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> IO CInt
+
+-- | §4.E.2.C0b test surface: number of entries in the per-block
+-- global schedule built by the most recent 'c_rt_graph_process'
+-- call. Returns 0 if no block has run yet or g is null. The
+-- vector is rebuilt every block from the post-drain instance-
+-- state snapshot in canonical
+-- (template, instance_slot, step) ascending order.
+foreign import ccall unsafe "rt_graph_test_global_schedule_entry_count"
+  c_rt_graph_test_global_schedule_entry_count
+    :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C0b test surface: template_id of the @entry_index@-th
+-- global-schedule entry. Returns -1 on null g or out-of-range
+-- entry_index.
+foreign import ccall unsafe "rt_graph_test_global_schedule_entry_template"
+  c_rt_graph_test_global_schedule_entry_template
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | §4.E.2.C0b test surface: instance_slot of the @entry_index@-th
+-- global-schedule entry (an index into the flat instance pool).
+-- Returns -1 on null g or out-of-range entry_index.
+foreign import ccall unsafe "rt_graph_test_global_schedule_entry_instance"
+  c_rt_graph_test_global_schedule_entry_instance
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | §4.E.2.C0b test surface: step_index of the @entry_index@-th
+-- global-schedule entry (into the template's schedule_steps).
+-- Returns -1 on null g or out-of-range entry_index.
+foreign import ccall unsafe "rt_graph_test_global_schedule_entry_step"
+  c_rt_graph_test_global_schedule_entry_step
+    :: Ptr RTGraph -> CInt -> IO CInt
 
 -- | Copy nframes samples from one output bus into the caller's buffer.
 -- Returns the number of samples written; 0 on bad arguments. Used by
@@ -861,10 +909,10 @@ loadRuntimeGraph g rg = do
   -- order. See Note [Region fallback] in rt_graph.cpp.
   mapM_ (addRegion 0) scheduled
   -- Pass 4 (§4.E.2.C0a): ship the layered-schedule view as
-  -- per-step ordinal lists over the same scheduled order. C0a is
-  -- metadata-only — process_instance does not yet consume
-  -- def->schedule_steps, so this is observational. Must run after
-  -- the region pass so the runtime can range-check each ordinal.
+  -- per-step ordinal lists over the same scheduled order. Default
+  -- execution ignores it; the C0c test executor consumes it when
+  -- explicitly enabled. Must run after the region pass so the
+  -- runtime can range-check each ordinal.
   addScheduleStepsTo g 0 scheduled steps
   where
     addNode :: RuntimeNode -> IO ()
@@ -1162,8 +1210,9 @@ loadTemplateGraph g tg = do
       -- in 'loadRuntimeGraph'). See Note [Region fallback] in
       -- rt_graph.cpp.
       mapM_ (addRegionTo g cTid) scheduled
-      -- Pass 4 (§4.E.2.C0a): layered-schedule metadata. C0a is
-      -- metadata-only; process_instance does not yet consume it.
+      -- Pass 4 (§4.E.2.C0a): layered-schedule metadata. Default
+      -- execution ignores it; the C0c test executor consumes it
+      -- when explicitly enabled.
       addScheduleStepsTo g cTid scheduled steps
 
 -- | Step C (e): fused-aware multi-template loader. Sibling of
