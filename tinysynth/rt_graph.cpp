@@ -4953,6 +4953,18 @@ BusInDelayed to break the cross-instance dependency.
 // whole block instead of treating an empty global schedule as
 // "nothing to run".
 //
+// Note [Mixed-mode global schedule fallback]
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// The fallback is intentionally all-or-nothing per block. If any live
+// Active/Releasing instance belongs to a template with no schedule
+// metadata, global_schedule_covers_audio_schedule returns false and
+// process_graph ignores the whole global_schedule vector for that
+// block, even if build_global_schedule emitted entries for other
+// metadata-bearing templates. That avoids a mixed executor where some
+// templates run through the schedule path while metadata-free templates
+// run through the legacy path. Haskell loaders always ship metadata;
+// this path exists for C++/legacy construction.
+//
 // This function runs on the audio thread and must not allocate.
 // ensure_global_schedule_capacity (called from every construction
 // mutation that can grow the bound) keeps g.global_schedule's
@@ -5081,6 +5093,11 @@ static void build_global_schedule_bands(RTGraph &g) noexcept {
   flush_free();
 }
 
+// C0c fallback gate. Called once per block only when
+// execute_global_schedule is on. The O(instance_count) scan is fine for
+// the current opt-in path; a future always-on scheduler can cache this
+// if high-polyphony graphs make it measurable.
+// See Note [Mixed-mode global schedule fallback].
 static bool global_schedule_covers_audio_schedule(const RTGraph &g) noexcept {
   for (const GraphInstance &inst : g.instances) {
     const SlotState s = inst.state.load();
@@ -5097,6 +5114,10 @@ static void process_schedule_step(
     RTGraph &g, const MetaDef &def, GraphInstance &inst,
     int step_index, int nframes, BlockExecutionContext &ctx
 ) noexcept {
+  // Defensive only: rt_graph_template_add_schedule_step validates the
+  // step bounds, item slice, and region ordinals before committing
+  // metadata. Keep the executor silent if a future ABI path corrupts or
+  // stales the schedule metadata.
   if (step_index < 0) return;
   const std::size_t step_pos = static_cast<std::size_t>(step_index);
   if (step_pos >= def.schedule_steps.size()) return;
@@ -5137,6 +5158,12 @@ static void process_global_schedule_serial(
     }
   };
 
+  // build_global_schedule emits every step for one (template, slot)
+  // contiguously because step_index is the innermost loop. We snapshot
+  // SlotState once at group entry and pass that value to
+  // finish_instance_block after the last step. The only same-thread
+  // state transition during the group is Releasing -> Available inside
+  // finish_instance_block, after all steps for that slot have run.
   for (const GlobalScheduleEntry &entry : g.global_schedule) {
     if (entry.instance_slot != current_slot) {
       finish_current();
