@@ -30,6 +30,7 @@ import qualified Data.Set                  as S
 import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
                                             sortBy)
 import           Control.Exception         (try)
+import           Control.Monad             (forM, when)
 import           Data.Maybe                (mapMaybe)
 import           Data.Ord                  (comparing)
 import           Data.Word                 (Word8)
@@ -43,7 +44,8 @@ import           Test.Tasty.HUnit
 import           Test.Tasty.QuickCheck     as QC
 
 import           MetaSonic.Bridge.Compile
-import           MetaSonic.Bridge.FFI      (c_rt_graph_ensure_bus,
+import           MetaSonic.Bridge.FFI      (RTGraph,
+                                            c_rt_graph_ensure_bus,
                                             c_rt_graph_instance_alive,
                                             c_rt_graph_instance_count,
                                             c_rt_graph_instance_release,
@@ -55,6 +57,7 @@ import           MetaSonic.Bridge.FFI      (c_rt_graph_ensure_bus,
                                             c_rt_graph_read_bus,
                                             c_rt_graph_template_count,
                                             c_rt_graph_template_instance_add,
+                                            c_rt_graph_test_set_reduction_capture,
                                             instanceStatusLive,
                                             instanceStatusReleasing,
                                             loadRuntimeGraph,
@@ -73,6 +76,7 @@ main = defaultMain $ testGroup "MetaSonic"
   [ unitTests
   , properties
   , crossCuttingTests
+  , t9DirectEqualsReductionTests
   ]
 
 ------------------------------------------------------------
@@ -6838,3 +6842,286 @@ interpretConnections = go [] S.empty
           let src = xs !! (i `mod` length xs)
           out ch src
           go xs r rest
+
+------------------------------------------------------------
+-- T-9: direct ≡ reduction equivalence (Phase §4.E.2.B3)
+------------------------------------------------------------
+--
+-- The headline gate from notes/2026-05-08-deterministic-bus-reduction-design.md.
+-- For every shape in t9CorpusGraphs / t9CorpusTemplates, render N
+-- blocks in direct mode and N blocks in reduction-capture mode
+-- (which folds slots back into output_buses on every sink-producing
+-- step) and assert byte-identical bus 0 samples per block. Coverage:
+--
+--   * Single-template, unfused loader  (loadRuntimeGraph)
+--   * Single-template, fused   loader  (loadRuntimeGraphFused)
+--   * Multi-template send/return live  (loadTemplateGraph / Fused)
+--   * Multi-template send/return delayed (BusInDelayed via the
+--     block-end swap)
+--   * Multi-template 3-stage chain (transitive cross-template flow)
+--
+-- Per-block exact equality (==) is the gate; any IEEE drift fails.
+-- The corpus mirrors the pure-render shapes from app/Main.hs's
+-- demoTable and adds the cross-template cases compileTemplateGraph
+-- exercises; together they cover every kernel that holds a
+-- SinkAccumulator or routes through process_out today.
+
+-- Demos that exist in app/Main.hs but not in 'demoGraphs' above.
+-- Mirrored here so the T-9 corpus matches the runtime audio path.
+noiseGraph :: SynthGraph
+noiseGraph = runSynth $ do
+  n <- noiseGen
+  g <- gain n 0.15
+  out 0 g
+
+filteredSawGraph :: SynthGraph
+filteredSawGraph = runSynth $ do
+  osc <- sawOsc 110.0 0.0
+  f   <- lpf osc 1200.0 1.5
+  g   <- gain f 0.6
+  out 0 g
+
+detunedSawGraph :: SynthGraph
+detunedSawGraph = runSynth $ do
+  osc1 <- sawOsc 220.0 0.0
+  osc2 <- sawOsc 220.5 0.5     -- phase offset avoids cancellation
+  g1   <- gain osc1 0.3
+  g2   <- gain osc2 0.3
+  out 0 g1
+  out 0 g2                     -- two writers on bus 0; reduction mode
+                               -- must keep them in distinct slots and
+                               -- fold in canonical order.
+
+envPluckGraph :: SynthGraph
+envPluckGraph = runSynth $ do
+  e     <- env 1.0 0.005 0.2 0.0 0.1
+  tone  <- sinOsc 220.0 0.0
+  amped <- gain tone e
+  scale <- gain amped 0.5
+  out 0 scale
+
+intermodGraph :: SynthGraph
+intermodGraph = runSynth $ do
+  lfo1   <- triOsc 0.7 0.0
+  lfo1s  <- gain lfo1 0.35
+  width  <- add  lfo1s 0.5
+  lfo2   <- sinOsc 0.3 0.0
+  lfo2s  <- gain lfo2 800.0
+  cutoff <- add  lfo2s 1200.0
+  voice  <- pulseOsc 220.0 0.0 width
+  filt   <- bpf voice cutoff 4.0
+  master <- gain filt 0.4
+  out 0 master
+
+t9CorpusGraphs :: [(String, SynthGraph)]
+t9CorpusGraphs = demoGraphs ++
+  [ ("noise",        noiseGraph)
+  , ("filtered-saw", filteredSawGraph)
+  , ("detuned-saw",  detunedSawGraph)
+  , ("env-pluck",    envPluckGraph)
+  , ("intermod",     intermodGraph)
+  ]
+
+-- Multi-template corpus: the canonical send/return shapes the
+-- compileTemplateGraph tests already exercise in their precedence
+-- form. T-9 runs them through loadTemplateGraph / loadTemplateGraphFused
+-- under both modes and asserts bit-identical output.
+sendReturnLiveTG :: TemplateGraph
+sendReturnLiveTG =
+  let producer = runSynth $ do
+        o <- sinOsc 440.0 0.0
+        busOut 5 o
+      consumer = runSynth $ do
+        t <- busIn 5
+        out 0 t
+  in case compileTemplateGraph
+            [("producer", producer), ("consumer", consumer)] of
+       Right tg  -> tg
+       Left  err -> error ("sendReturnLiveTG: " <> err)
+
+sendReturnDelayedTG :: TemplateGraph
+sendReturnDelayedTG =
+  let producer = runSynth $ do
+        o <- sawOsc 220.0 0.0
+        g <- gain o 0.5
+        busOut 6 g
+      consumer = runSynth $ do
+        t <- busInDelayed 6
+        out 0 t
+  in case compileTemplateGraph
+            [("producer", producer), ("consumer", consumer)] of
+       Right tg  -> tg
+       Left  err -> error ("sendReturnDelayedTG: " <> err)
+
+threeTemplateChainTG :: TemplateGraph
+threeTemplateChainTG =
+  let a = runSynth $ do
+        o <- sinOsc 330.0 0.0
+        busOut 5 o
+      b = runSynth $ do
+        s <- busIn 5
+        g <- gain s 0.5
+        busOut 7 g
+      c = runSynth $ do
+        t <- busIn 7
+        out 0 t
+  in case compileTemplateGraph [("a", a), ("b", b), ("c", c)] of
+       Right tg  -> tg
+       Left  err -> error ("threeTemplateChainTG: " <> err)
+
+t9CorpusTemplates :: [(String, TemplateGraph)]
+t9CorpusTemplates =
+  [ ("send-return-live",    sendReturnLiveTG)
+  , ("send-return-delayed", sendReturnDelayedTG)
+  , ("three-template-chain", threeTemplateChainTG)
+  ]
+
+-- Render @blocks@ blocks of @nframes@ frames each, returning bus 0
+-- samples per block as a list. Optionally enables reduction-capture
+-- mode for the whole render. The capture switch flips the runtime
+-- to fold slot contributions back into output_buses on every sink
+-- step, but the externally visible bus values must remain
+-- byte-identical to the direct path — that's what T-9 verifies.
+renderBlocksRG :: (Ptr RTGraph -> RuntimeGraph -> IO ())
+               -> RuntimeGraph
+               -> Bool   -- reduction-capture on?
+               -> Int    -- nframes per block
+               -> Int    -- block count
+               -> IO [[Float]]
+renderBlocksRG loader rt reduction nframes blocks =
+  withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+    loader handle rt
+    when reduction $
+      c_rt_graph_test_set_reduction_capture handle 1
+    forM [1 .. blocks] $ \_ -> readBus0 handle nframes
+
+renderBlocksTG :: (Ptr RTGraph -> TemplateGraph -> IO ())
+               -> TemplateGraph
+               -> Bool
+               -> Int
+               -> Int
+               -> IO [[Float]]
+renderBlocksTG loader tg reduction nframes blocks =
+  let totalNodes = sum (map (length . rgNodes . tplGraph)
+                            (tgTemplates tg))
+  in withRTGraph totalNodes nframes $ \handle -> do
+       loader handle tg
+       when reduction $
+         c_rt_graph_test_set_reduction_capture handle 1
+       forM [1 .. blocks] $ \_ -> readBus0 handle nframes
+
+readBus0 :: Ptr RTGraph -> Int -> IO [Float]
+readBus0 handle nframes = do
+  c_rt_graph_process handle (fromIntegral nframes)
+  allocaBytes (nframes * sizeOfFloatT9) $ \buf -> do
+    _ <- c_rt_graph_read_bus handle 0 (fromIntegral nframes)
+                             (castPtr buf)
+    cs <- peekArray nframes (buf :: PtrCFloat)
+    pure (map (\(CFloat x) -> x) cs)
+  where
+    sizeOfFloatT9 = 4
+
+-- Direct-vs-reduction equivalence assertion. Renders the same graph
+-- through the same loader twice — once direct, once with reduction
+-- capture — and requires every block to be byte-identical.
+assertDirectEqualsReductionRG
+  :: String
+  -> (Ptr RTGraph -> RuntimeGraph -> IO ())
+  -> RuntimeGraph
+  -> Int   -- nframes per block
+  -> Int   -- block count
+  -> Assertion
+assertDirectEqualsReductionRG label loader rt nframes blocks = do
+  d <- renderBlocksRG loader rt False nframes blocks
+  r <- renderBlocksRG loader rt True  nframes blocks
+  assertBlocksEqual label d r
+
+assertDirectEqualsReductionTG
+  :: String
+  -> (Ptr RTGraph -> TemplateGraph -> IO ())
+  -> TemplateGraph
+  -> Int
+  -> Int
+  -> Assertion
+assertDirectEqualsReductionTG label loader tg nframes blocks = do
+  d <- renderBlocksTG loader tg False nframes blocks
+  r <- renderBlocksTG loader tg True  nframes blocks
+  assertBlocksEqual label d r
+
+-- Per-block exact-equality check. Reports the first divergent block
+-- and frame so a failure points straight at the kernel that broke
+-- the contract.
+assertBlocksEqual :: String -> [[Float]] -> [[Float]] -> Assertion
+assertBlocksEqual label direct reduced = do
+  length direct @?= length reduced
+  let diffs =
+        [ (b, fi, dv, rv)
+        | (b, (db, rb)) <- zip [0 :: Int ..] (zip direct reduced)
+        , (fi, (dv, rv)) <- zip [0 :: Int ..] (zip db rb)
+        , dv /= rv
+        ]
+  case diffs of
+    [] -> pure ()
+    ((b, fi, dv, rv) : _) ->
+      assertFailure $
+        label <> ": direct/reduction diverge at block " <> show b
+        <> ", frame " <> show fi
+        <> ": direct=" <> show dv <> " reduced=" <> show rv
+
+-- Compile a SynthGraph through both lowering paths so a single test
+-- can route the same source through unfused and fused loaders. The
+-- error path on either compile is a hard test failure — these are
+-- demo shapes that all compile cleanly.
+compileBoth
+  :: String -> SynthGraph -> IO (RuntimeGraph, RuntimeGraph)
+compileBoth name g = do
+  rtUn <- case lowerGraph g >>= compileRuntimeGraph of
+    Right r  -> pure r
+    Left err -> assertFailure
+                  (name <> ": compileRuntimeGraph failed: " <> err)
+                >> error "unreachable"
+  rtF  <- case lowerGraph g >>= compileRuntimeGraphFused of
+    Right r  -> pure r
+    Left err -> assertFailure
+                  (name <> ": compileRuntimeGraphFused failed: " <> err)
+                >> error "unreachable"
+  pure (rtUn, rtF)
+
+t9DirectEqualsReductionTests :: TestTree
+t9DirectEqualsReductionTests =
+  let nframes = 256
+      blocks  = 4   -- enough to cover BusInDelayed's prev-pool path
+                    -- (block 2 picks up block 1's folded writes via
+                    -- the swap; later blocks expose any state-
+                    -- continuity drift in oscillators / filters).
+  in testGroup "T-9: direct ≡ reduction"
+       [ testGroup "single template, unfused loader"
+           [ testCase name $ do
+               (rtUn, _) <- compileBoth name g
+               assertDirectEqualsReductionRG
+                 name loadRuntimeGraph rtUn nframes blocks
+           | (name, g) <- t9CorpusGraphs
+           ]
+
+       , testGroup "single template, fused loader"
+           [ testCase name $ do
+               (_, rtF) <- compileBoth name g
+               assertDirectEqualsReductionRG
+                 name loadRuntimeGraphFused rtF nframes blocks
+           | (name, g) <- t9CorpusGraphs
+           ]
+
+       , testGroup "multi-template, unfused loader"
+           [ testCase name $
+               assertDirectEqualsReductionTG
+                 name loadTemplateGraph tg nframes blocks
+           | (name, tg) <- t9CorpusTemplates
+           ]
+
+       , testGroup "multi-template, fused loader"
+           [ testCase name $
+               assertDirectEqualsReductionTG
+                 name loadTemplateGraphFused tg nframes blocks
+           | (name, tg) <- t9CorpusTemplates
+           ]
+       ]

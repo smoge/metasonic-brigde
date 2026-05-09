@@ -2775,7 +2775,10 @@ process_instance / dispatch_node, not inside SinkAccumulator::open.
 */
 enum class BusWriteMode {
   Direct,    // default: kernels write into server.output_buses
-  Reduction, // B2 capture-only: kernels write into contributions[writer_slot]
+  Reduction, // kernels write into contributions[writer_slot]; the
+             // per-step fold copies used slots back into
+             // server.output_buses at deterministic joins so live
+             // BusIn semantics match Direct mode block-for-block.
 };
 
 struct BusWriteContext {

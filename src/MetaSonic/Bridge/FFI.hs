@@ -30,6 +30,8 @@ module MetaSonic.Bridge.FFI
   , -- * Introspection
     c_rt_graph_kind_supported
   , c_rt_graph_region_kernel_supported
+  , -- * §4.E.2.B test surface (off by default; tests opt in)
+    c_rt_graph_test_set_reduction_capture
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
   , c_rt_graph_read_bus
@@ -306,6 +308,16 @@ foreign import ccall safe "rt_graph_stop_audio"
 -- no graph state needed. 'unsafe' is correct.
 foreign import ccall unsafe "rt_graph_kind_supported"
   c_rt_graph_kind_supported :: CInt -> IO CInt
+
+-- | §4.E.2.B test surface: toggle reduction-capture mode for the next
+-- 'c_rt_graph_process' call. When non-zero, sink writes route into
+-- per-writer-slot contribution buffers and the per-step fold copies
+-- them back into the live output buses at deterministic joins;
+-- output is bit-identical to the default direct path. When zero
+-- (default), behaviour is unchanged. Test-only — not for use in
+-- normal rendering or live audio paths.
+foreign import ccall unsafe "rt_graph_test_set_reduction_capture"
+  c_rt_graph_test_set_reduction_capture :: Ptr RTGraph -> CInt -> IO ()
 
 -- | Copy nframes samples from one output bus into the caller's buffer.
 -- Returns the number of samples written; 0 on bad arguments. Used by
