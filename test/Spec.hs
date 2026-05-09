@@ -66,6 +66,9 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_test_global_schedule_band_entry_count,
                                             c_rt_graph_test_global_schedule_band_first_entry,
                                             c_rt_graph_test_global_schedule_band_kind,
+                                            c_rt_graph_test_last_parallel_band_count,
+                                            c_rt_graph_test_last_parallel_entry_count,
+                                            c_rt_graph_test_set_worker_pool_size,
                                             c_rt_graph_test_set_global_schedule_execution,
                                             c_rt_graph_test_set_reduction_capture,
                                             c_rt_graph_test_template_schedule_step_count,
@@ -95,6 +98,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , c0bGlobalScheduleTests
   , c0cScheduleExecutorTests
   , c0dGlobalScheduleBandTests
+  , c1cWorkerScheduleTests
   ]
 
 ------------------------------------------------------------
@@ -7048,8 +7052,24 @@ renderBlocksRGWithFlags :: (Ptr RTGraph -> RuntimeGraph -> IO ())
                         -> [Int]
                         -> IO [[(Int, [Float])]]
 renderBlocksRGWithFlags loader rt reduction scheduleExec nframes blocks buses =
+  renderBlocksRGWithWorkerPool
+    loader rt reduction scheduleExec 0 nframes blocks buses
+
+renderBlocksRGWithWorkerPool :: (Ptr RTGraph -> RuntimeGraph -> IO ())
+                             -> RuntimeGraph
+                             -> Bool   -- reduction-capture on?
+                             -> Bool   -- schedule executor on?
+                             -> Int    -- logical worker-pool size
+                             -> Int
+                             -> Int
+                             -> [Int]
+                             -> IO [[(Int, [Float])]]
+renderBlocksRGWithWorkerPool
+    loader rt reduction scheduleExec workerPool nframes blocks buses =
   withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
     loader handle rt
+    when (workerPool > 0) $
+      c_rt_graph_test_set_worker_pool_size handle (fromIntegral workerPool)
     when reduction $
       c_rt_graph_test_set_reduction_capture handle 1
     when scheduleExec $
@@ -7075,10 +7095,26 @@ renderBlocksTGWithFlags :: (Ptr RTGraph -> TemplateGraph -> IO ())
                         -> [Int]
                         -> IO [[(Int, [Float])]]
 renderBlocksTGWithFlags loader tg reduction scheduleExec nframes blocks buses =
+  renderBlocksTGWithWorkerPool
+    loader tg reduction scheduleExec 0 nframes blocks buses
+
+renderBlocksTGWithWorkerPool :: (Ptr RTGraph -> TemplateGraph -> IO ())
+                             -> TemplateGraph
+                             -> Bool   -- reduction-capture on?
+                             -> Bool   -- schedule executor on?
+                             -> Int    -- logical worker-pool size
+                             -> Int
+                             -> Int
+                             -> [Int]
+                             -> IO [[(Int, [Float])]]
+renderBlocksTGWithWorkerPool
+    loader tg reduction scheduleExec workerPool nframes blocks buses =
   let totalNodes = sum (map (length . rgNodes . tplGraph)
                             (tgTemplates tg))
   in withRTGraph totalNodes nframes $ \handle -> do
        loader handle tg
+       when (workerPool > 0) $
+         c_rt_graph_test_set_worker_pool_size handle (fromIntegral workerPool)
        when reduction $
          c_rt_graph_test_set_reduction_capture handle 1
        when scheduleExec $
@@ -7218,6 +7254,58 @@ assertScheduleDirectEqualsReductionTG label loader tg nframes blocks = do
   d <- renderBlocksTGWithFlags loader tg False True nframes blocks buses
   r <- renderBlocksTGWithFlags loader tg True  True nframes blocks buses
   assertBlocksEqual (label <> ": schedule direct/reduction") d r
+
+assertSchedulePoolDirectEqualsReductionRG
+  :: String
+  -> (Ptr RTGraph -> RuntimeGraph -> IO ())
+  -> RuntimeGraph
+  -> Int
+  -> Int
+  -> Int
+  -> Assertion
+assertSchedulePoolDirectEqualsReductionRG
+    label loader rt workerPool nframes blocks = do
+  let buses = relevantBuses rt
+  d <- renderBlocksRGWithWorkerPool
+         loader rt False True workerPool nframes blocks buses
+  r <- renderBlocksRGWithWorkerPool
+         loader rt True  True workerPool nframes blocks buses
+  assertBlocksEqual
+    (label <> ": schedule pool direct/reduction") d r
+
+assertSchedulePoolDirectEqualsReductionTG
+  :: String
+  -> (Ptr RTGraph -> TemplateGraph -> IO ())
+  -> TemplateGraph
+  -> Int
+  -> Int
+  -> Int
+  -> Assertion
+assertSchedulePoolDirectEqualsReductionTG
+    label loader tg workerPool nframes blocks = do
+  let buses = relevantBusesTG tg
+  d <- renderBlocksTGWithWorkerPool
+         loader tg False True workerPool nframes blocks buses
+  r <- renderBlocksTGWithWorkerPool
+         loader tg True  True workerPool nframes blocks buses
+  assertBlocksEqual
+    (label <> ": schedule pool direct/reduction") d r
+
+assertDirectEqualsSchedulePoolRG
+  :: String
+  -> (Ptr RTGraph -> RuntimeGraph -> IO ())
+  -> RuntimeGraph
+  -> Int
+  -> Int
+  -> Int
+  -> Assertion
+assertDirectEqualsSchedulePoolRG label loader rt workerPool nframes blocks = do
+  let buses = relevantBuses rt
+  legacy <- renderBlocksRGWithWorkerPool
+              loader rt False False 0 nframes blocks buses
+  sched  <- renderBlocksRGWithWorkerPool
+              loader rt False True workerPool nframes blocks buses
+  assertBlocksEqual (label <> ": legacy/schedule-pool") legacy sched
 
 -- Per-block, per-bus exact-equality check. Reports the first
 -- divergent (block, bus, frame) so a failure points straight at the
@@ -7920,10 +8008,11 @@ c0bGlobalScheduleTests =
 --
 -- C0c promotes the C0b global schedule from observation to an
 -- executable serial path, gated by a test-only switch. C1a routes that
--- executor through C0d bands, still serially. There is no worker pool
--- yet: the schedule executor must render byte-identical output to the
--- legacy nested loop, preserve §2.E release accounting, and keep the
--- B3 reduction-capture equivalence when both switches are enabled.
+-- executor through C0d bands, still serially. This group keeps the
+-- worker pool disabled: the schedule executor must render
+-- byte-identical output to the legacy nested loop, preserve §2.E
+-- release accounting, and keep the B3 reduction-capture equivalence
+-- when both switches are enabled.
 -- C++-only graphs with no schedule metadata fall back to the legacy
 -- executor; that path is covered in the C++ test suite because Haskell
 -- loaders always ship schedule metadata.
@@ -8031,8 +8120,8 @@ c0cScheduleExecutorTests =
 -- Phase 4.E.2.C0d: global-schedule runnable bands
 ------------------------------------------------------------
 --
--- C0d derives the banded view that C1a consumes serially and Phase C
--- can later consume as worker dispatch groups. The conservative v1
+-- C0d derives the banded view that C1a consumes serially and C1c can
+-- consume as worker dispatch groups. The conservative v1
 -- rule is intentionally narrow:
 -- barriers are singleton serial bands, and a free band contains only
 -- FreeLayer entries with at most one step per instance slot. That
@@ -8120,3 +8209,82 @@ c0dGlobalScheduleBandTests =
           c_rt_graph_process handle 256
           assertGlobalScheduleBandsWellFormed "simple after reload" handle
     ]
+
+------------------------------------------------------------
+-- Phase 4.E.2.C1c-c: worker-schedule integration gates
+------------------------------------------------------------
+--
+-- C1c-b added the conservative worker-dispatch path for eligible Free
+-- bands. C1c-c keeps the same bit-equivalence discipline as T-9 and
+-- C0c, but enables the graph-owned worker pool while the schedule
+-- executor is active. The corpus test catches loader/runtime boundary
+-- drift; the final small test proves that Haskell-loaded metadata can
+-- enter the worker path, not merely run with idle background threads.
+
+c1cWorkerScheduleTests :: TestTree
+c1cWorkerScheduleTests =
+  let nframes = 256
+      blocks  = 4
+      pool    = 3
+  in testGroup "Phase 4.E.2.C1c-c: worker-schedule equivalence"
+       [ testGroup "T-9 under global schedule + pool_size=3"
+           [ testGroup "single template, unfused loader"
+               [ testCase name $ do
+                   (rtUn, _) <- compileBoth name g
+                   assertSchedulePoolDirectEqualsReductionRG
+                     name loadRuntimeGraph rtUn pool nframes blocks
+               | (name, g) <- t9CorpusGraphs
+               ]
+
+           , testGroup "single template, fused loader"
+               [ testCase name $ do
+                   (_, rtF) <- compileBoth name g
+                   assertSchedulePoolDirectEqualsReductionRG
+                     name loadRuntimeGraphFused rtF pool nframes blocks
+               | (name, g) <- t9CorpusGraphs
+               ]
+
+           , testGroup "multi-template, unfused loader"
+               [ testCase name $
+                   assertSchedulePoolDirectEqualsReductionTG
+                     name loadTemplateGraph tg pool nframes blocks
+               | (name, tg) <- t9CorpusTemplates
+               ]
+
+           , testGroup "multi-template, fused loader"
+               [ testCase name $
+                   assertSchedulePoolDirectEqualsReductionTG
+                     name loadTemplateGraphFused tg pool nframes blocks
+               | (name, tg) <- t9CorpusTemplates
+               ]
+           ]
+
+       , testCase "schedule pool matches legacy on a representative graph" $ do
+           (rg, _) <- compileBoth "chain" chainGraph
+           assertDirectEqualsSchedulePoolRG
+             "chain" loadRuntimeGraph rg pool nframes blocks
+
+       , testCase "Haskell-loaded free-only graph enters worker dispatch" $ do
+           let computeOnly = runSynth $ do
+                 o <- sinOsc 110.0 0.0
+                 _ <- gain o 0.25
+                 pure ()
+           rg <- case lowerGraph computeOnly >>= compileRuntimeGraph of
+             Right r  -> pure r
+             Left err -> assertFailure ("c1c compute-only compile: " <> err)
+                         >> error "unreachable"
+
+           withRTGraph (length (rgNodes rg)) nframes $ \handle -> do
+             loadRuntimeGraph handle rg
+             _ <- c_rt_graph_template_instance_add handle 0
+             _ <- c_rt_graph_template_instance_add handle 0
+             c_rt_graph_test_set_worker_pool_size handle (fromIntegral pool)
+             c_rt_graph_test_set_global_schedule_execution handle 1
+             c_rt_graph_process handle (fromIntegral nframes)
+
+             bands <- c_rt_graph_test_last_parallel_band_count handle
+             entries <- c_rt_graph_test_last_parallel_entry_count handle
+             assertBool "expected at least one worker-dispatched band"
+                        (bands > 0)
+             entries @?= 3
+       ]

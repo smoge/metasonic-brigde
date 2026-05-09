@@ -34,6 +34,13 @@ module MetaSonic.Bridge.FFI
     c_rt_graph_test_set_reduction_capture
   , -- * §4.E.2.C0c schedule-executor test switch
     c_rt_graph_test_set_global_schedule_execution
+  , -- * §4.E.2.C1 worker-pool test surface
+    c_rt_graph_test_set_worker_pool_size
+  , c_rt_graph_test_worker_pool_size
+  , c_rt_graph_test_worker_thread_count
+  , c_rt_graph_test_last_parallel_band_count
+  , c_rt_graph_test_last_parallel_entry_count
+  , c_rt_graph_test_last_serialized_free_band_count
   , -- * §4.E.2.C0a layered-schedule metadata (test-only introspection)
     c_rt_graph_test_template_schedule_step_count
   , c_rt_graph_test_template_schedule_step_kind
@@ -349,6 +356,39 @@ foreign import ccall unsafe "rt_graph_test_set_reduction_capture"
 foreign import ccall unsafe "rt_graph_test_set_global_schedule_execution"
   c_rt_graph_test_set_global_schedule_execution
     :: Ptr RTGraph -> CInt -> IO ()
+
+-- | §4.E.2.C1 test surface: configure the RTGraph-owned worker pool.
+-- Values <= 1 keep the schedule executor purely serial; values > 1
+-- create @worker_count - 1@ background workers. Construction/test-only:
+-- call while audio is stopped.
+foreign import ccall unsafe "rt_graph_test_set_worker_pool_size"
+  c_rt_graph_test_set_worker_pool_size :: Ptr RTGraph -> CInt -> IO ()
+
+-- | §4.E.2.C1 test surface: logical worker lane count currently
+-- configured on the graph-owned worker pool.
+foreign import ccall unsafe "rt_graph_test_worker_pool_size"
+  c_rt_graph_test_worker_pool_size :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C1 test surface: number of background threads currently
+-- owned by the graph's worker pool.
+foreign import ccall unsafe "rt_graph_test_worker_thread_count"
+  c_rt_graph_test_worker_thread_count :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C1c-b test counters from the most recent process block:
+-- number of Free bands dispatched through workers.
+foreign import ccall unsafe "rt_graph_test_last_parallel_band_count"
+  c_rt_graph_test_last_parallel_band_count :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C1c-b test counters from the most recent process block:
+-- total global-schedule entries claimed by the worker-dispatch path.
+foreign import ccall unsafe "rt_graph_test_last_parallel_entry_count"
+  c_rt_graph_test_last_parallel_entry_count :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C1c-b test counters from the most recent process block:
+-- multi-entry Free bands deliberately kept serial because they contain
+-- sink writers while reduction mode is off.
+foreign import ccall unsafe "rt_graph_test_last_serialized_free_band_count"
+  c_rt_graph_test_last_serialized_free_band_count :: Ptr RTGraph -> IO CInt
 
 -- | §4.E.2.C0a test surface: number of schedule steps registered
 -- for the named template. Returns 0 on null g or unknown
