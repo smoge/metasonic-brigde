@@ -6501,13 +6501,15 @@ int rt_graph_template_count(RTGraph *g) {
   return static_cast<int>(g->defs.size());
 }
 
-// Phase §4.E.2.B0 test surface. See header docblock.
+// ----------------------------------------------------------------
+// Phase §4.E.2 test surface (see rt_graph.h)
+// ----------------------------------------------------------------
+
 int rt_graph_test_last_writer_slot_count(const RTGraph *g) {
   if (!g) return 0;
   return g->last_block_writer_slot_count;
 }
 
-// Phase §4.E.2.B1 test surfaces. See header docblocks.
 int rt_graph_test_contribution_slot_capacity(const RTGraph *g) {
   if (!g) return 0;
   return g->contribution_storage.max_writer_slots;
@@ -6528,19 +6530,16 @@ int rt_graph_test_contribution_used_word_count(const RTGraph *g) {
   return static_cast<int>(g->contribution_storage.used_words.size());
 }
 
-// Phase §4.E.2.B2 test ABI. See header docblocks.
 void rt_graph_test_set_reduction_capture(RTGraph *g, int on) {
   if (!g) return;
   g->capture_reduction_mode = (on != 0);
 }
 
-// Phase §4.E.2.C0c/C1a test ABI. See header docblocks.
 void rt_graph_test_set_global_schedule_execution(RTGraph *g, int on) {
   if (!g) return;
   g->execute_global_schedule = (on != 0);
 }
 
-// Phase §4.E.2.C1b test ABI. See header docblocks.
 void rt_graph_test_set_worker_pool_size(RTGraph *g, int worker_count) {
   if (!g) return;
   g->worker_pool.set_size(worker_count);
@@ -6598,10 +6597,10 @@ int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
   return 0;
 }
 
-// Phase §4.E.2.C0a test surfaces. See header docblocks. All four
-// share a "validate template_id and step_index, then read the
-// vector entry" shape; mismatches return safe sentinels (0 for
-// counts, -1 for per-step accessors) without raising or aborting.
+// Schedule-step accessors share a "validate template_id and
+// step_index, then read the vector entry" shape; mismatches return
+// safe sentinels (0 for counts, -1 for per-step accessors) without
+// raising or aborting.
 int rt_graph_test_template_schedule_step_count(
     const RTGraph *g, int template_id
 ) {
@@ -6746,7 +6745,6 @@ int rt_graph_test_global_schedule_band_entry_count(
   return b ? b->entry_count : -1;
 }
 
-// Phase §4.E.2.C1d-a test surfaces. See header docblock.
 int rt_graph_test_region_layer_work_item_count(const RTGraph *g) {
   if (!g) return 0;
   return static_cast<int>(g->region_layer_work_items.size());
@@ -7148,12 +7146,11 @@ void rt_graph_template_add_schedule_step(
   ensure_region_layer_work_item_capacity(*g);
 }
 
-// Step C (d): mark a node as elided. Idempotent on existing state;
-// silent no-op on bad indices. The node remains in def->nodes and
-// every live instance keeps its NodeInstanceState slot, so control
-// writes targeting node_index continue to land on the same controls
-// vector that resolve_input reads at fused-input materialization
-// time.
+// Mark a node as elided. Idempotent on existing state; silent no-op
+// on bad indices. The node remains in def->nodes and every live
+// instance keeps its NodeInstanceState slot, so control writes
+// targeting node_index continue to land on the same controls vector
+// that resolve_input reads at fused-input materialization time.
 void rt_graph_template_set_node_elided(
     RTGraph *g, int template_id, int node_index
 ) {
@@ -7166,8 +7163,8 @@ void rt_graph_template_set_node_elided(
   def->nodes[idx].elided = true;
 }
 
-// Step C (d): wire one input port through a fused scaled-source
-// form. Validates each index, claims a fresh scratch slot on the
+// Wire one input port through a fused scaled-source form. Validates
+// each index, claims a fresh scratch slot on the
 // MetaDef, writes the FusedAffineRef into dst_spec.fused_inputs[port],
 // and walks every live instance of the template to grow its
 // fused_scratch in lockstep — the same parallel-growth contract as
@@ -7255,8 +7252,8 @@ void rt_graph_template_connect_fused_scale_input(
   }
 }
 
-// Step C chain extension: wire one input port through a chain of
-// scalar Gains. Validates every (src, dst, scale[k]) ref before
+// Wire one input port through a chain of scalar Gains. Validates
+// every (src, dst, scale[k]) ref before
 // claiming a scratch slot — a partial allocation on a bad chain
 // would leak the slot and wedge fused_input_count above what the
 // resolver can actually use. One slot per fused input regardless of
@@ -7336,8 +7333,8 @@ void rt_graph_template_connect_fused_scale_chain_input(
   }
 }
 
-// Phase 4.C.2: wire one input port through an affine chain — a
-// run of scalar Gain (multiply by control) and scalar Add (bias by
+// Wire one input port through an affine chain — a run of scalar Gain
+// (multiply by control) and scalar Add (bias by
 // control) operations, in source-to-sink order. Mirrors the chain-
 // scale entry but takes a per-step kind tag so heterogeneous Gain
 // + Add chains compose into one fused input.
@@ -7502,8 +7499,6 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
 // Legacy single-template ABI (template 0 shim)
 // ----------------------------------------------------------------
 
-// Legacy: add a node to template 0. See Note [Legacy single-template
-// ABI as template-0 shim].
 void rt_graph_add_node(RTGraph *g, int node_index, int node_kind) {
   rt_graph_template_add_node(g, 0, node_index, node_kind);
 }
@@ -7522,36 +7517,30 @@ int rt_graph_kind_supported(int node_kind) {
   return kind_from_tag(node_kind).has_value() ? 1 : 0;
 }
 
-// Legacy: set one control slot on instance 0. Mutates the *instance*,
-// not the spec — preserves the pre-§2.D.3 semantics exactly. New
+// Set one control slot on instance 0. Mutates the *instance*, not
+// the spec — preserves the pre-§2.D.3 semantics exactly. New
 // instances spawned later get spec defaults, not instance 0's values.
 // To set spec defaults, use rt_graph_template_set_default.
 void rt_graph_set_control(RTGraph *g, int node_index, int control_index, double value) {
   rt_graph_instance_set_control(g, 0, node_index, control_index, value);
 }
 
-// Legacy: connect ports in template 0.
 void rt_graph_connect(
     RTGraph *g, int src_index, int src_port, int dst_index, int dst_port
 ) {
   rt_graph_template_connect(g, 0, src_index, src_port, dst_index, dst_port);
 }
 
-// Legacy: add one region to template 0. See Note [Region fallback]
-// — calling this is optional; without any regions, process_instance
-// uses the flat per-node loop.
 void rt_graph_add_region(
     RTGraph *g, int rate, int first_node, int node_count
 ) {
   rt_graph_template_add_region(g, 0, rate, first_node, node_count);
 }
 
-// Legacy: mark a node in template 0 as elided. Step C (d).
 void rt_graph_set_node_elided(RTGraph *g, int node_index) {
   rt_graph_template_set_node_elided(g, 0, node_index);
 }
 
-// Legacy: wire a fused-scale input on template 0. Step C (d).
 void rt_graph_connect_fused_scale_input(
     RTGraph *g,
     int dst_node, int dst_port,
@@ -7726,7 +7715,6 @@ void rt_graph_stop_audio(RTGraph *g) {
 // 0" shorthand kept for back-compat with §2.B-era callers)
 // ----------------------------------------------------------------
 
-// Legacy: spawn an instance of template 0.
 int rt_graph_instance_add(RTGraph *g) {
   return rt_graph_template_instance_add(g, 0);
 }

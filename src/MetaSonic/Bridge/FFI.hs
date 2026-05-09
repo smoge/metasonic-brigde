@@ -593,16 +593,16 @@ foreign import ccall unsafe "rt_graph_template_add_schedule_step"
     -> Ptr CInt    -- ^ region_ordinals
     -> IO ()
 
--- | Step C (e): mark a node in the named template as elided. The
--- node's kernel is skipped during dispatch but its 'NodeIndex' and
--- controls remain addressable. See 'rt_graph_template_set_node_elided'
--- in @rt_graph.h@.
+-- | Mark a node in the named template as elided. The node's kernel
+-- is skipped during dispatch but its 'NodeIndex' and controls remain
+-- addressable. See 'rt_graph_template_set_node_elided' in
+-- @rt_graph.h@.
 foreign import ccall unsafe "rt_graph_template_set_node_elided"
   c_rt_graph_template_set_node_elided
     :: Ptr RTGraph -> CInt -> CInt -> IO ()
 
--- | Step C (e): wire one input port through a fused scaled-source
--- form. The runtime materializes the value as
+-- | Wire one input port through a fused scaled-source form. The
+-- runtime materializes the value as
 -- @src[i] * float(scale_node.controls[scale_control_index])@ into a
 -- per-instance scratch slot at resolve time. See
 -- 'rt_graph_template_connect_fused_scale_input' in @rt_graph.h@.
@@ -614,14 +614,12 @@ foreign import ccall unsafe "rt_graph_template_connect_fused_scale_input"
     -> CInt -> CInt
     -> IO ()
 
--- | Step C chain extension: wire one input port through a
--- chained fused scaled-source form. The runtime materializes
--- @scratch[i] = src[i]@, then folds in each
+-- | Wire one input port through a chained fused scaled-source form.
+-- The runtime materializes @scratch[i] = src[i]@, then folds in each
 -- @float(scale_nodes[k].controls[scale_controls[k]])@ in
--- source-to-sink order. One scratch slot per fused input
--- regardless of chain length. See
--- 'rt_graph_template_connect_fused_scale_chain_input' in
--- @rt_graph.h@.
+-- source-to-sink order. One scratch slot per fused input regardless
+-- of chain length. See
+-- 'rt_graph_template_connect_fused_scale_chain_input' in @rt_graph.h@.
 foreign import ccall unsafe "rt_graph_template_connect_fused_scale_chain_input"
   c_rt_graph_template_connect_fused_scale_chain_input
     :: Ptr RTGraph -> CInt
@@ -632,11 +630,11 @@ foreign import ccall unsafe "rt_graph_template_connect_fused_scale_chain_input"
     -> Ptr CInt
     -> IO ()
 
--- | Phase 4.C.2: wire one input port through an affine chain
--- (mixed Gain × scale and Add + bias steps). The runtime applies
--- each step in source-to-sink order, casting controls to 'float'
--- once per step. See
--- 'rt_graph_template_connect_fused_affine_input' in @rt_graph.h@.
+-- | Wire one input port through an affine chain (mixed Gain × scale
+-- and Add + bias steps). The runtime applies each step in
+-- source-to-sink order, casting controls to 'float' once per step.
+-- See 'rt_graph_template_connect_fused_affine_input' in
+-- @rt_graph.h@.
 foreign import ccall unsafe "rt_graph_template_connect_fused_affine_input"
   c_rt_graph_template_connect_fused_affine_input
     :: Ptr RTGraph -> CInt
@@ -1033,8 +1031,8 @@ loadRuntimeGraph g rg = do
 
 {- Note [loadRuntimeGraphFused protocol]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Step C (e) sibling of 'loadRuntimeGraph'. Accepts both fused and
-unfused 'RuntimeGraph' values; on a graph that contains no 'RFused'
+Fused sibling of 'loadRuntimeGraph'. Accepts both fused and unfused
+'RuntimeGraph' values; on a graph that contains no 'RFused'
 inputs and no 'rnElided' nodes, the wire-level effect is identical
 to 'loadRuntimeGraph'. On a fused graph it additionally:
 
@@ -1057,7 +1055,7 @@ time the audio callback can fire, every live instance has the
 right slot count.
 -}
 
--- | Step C (e): fused-aware single-template loader. Equivalent to
+-- | Fused-aware single-template loader. Equivalent to
 -- 'loadRuntimeGraph' on graphs from 'compileRuntimeGraph' (no
 -- 'RFused' / no 'rnElided'); on graphs from
 -- 'compileRuntimeGraphFused' it additionally wires fused inputs
@@ -1288,9 +1286,9 @@ loadTemplateGraph g tg = do
       -- when explicitly enabled.
       addScheduleStepsTo g cTid scheduled steps
 
--- | Step C (e): fused-aware multi-template loader. Sibling of
--- 'loadTemplateGraph' that handles 'RFused' inputs and 'rnElided'
--- nodes via the fused-* connect ABI entries. Each template's
+-- | Fused-aware multi-template loader. Sibling of 'loadTemplateGraph'
+-- that handles 'RFused' inputs and 'rnElided' nodes via the fused-*
+-- connect ABI entries. Each template's
 -- per-spec passes run in the same order as 'loadRuntimeGraphFused':
 --
 --   1. ensure-bus
