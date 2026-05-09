@@ -100,7 +100,7 @@ stack exec metasonic-bridge
 
 ## Usage
 
-The executable supports three run modes and an optional set of demo targets.
+The executable supports five run modes and an optional set of demo targets.
 
 ```
 stack exec -- metasonic-bridge [MODE] [DEMO ...]
@@ -113,6 +113,10 @@ stack exec -- metasonic-bridge [MODE] [DEMO ...]
 | *(default)*        | Compile and play audio directly                        |
 | `--inspect`        | Open the TUI pipeline inspector, then play audio       |
 | `--inspect-only`   | Open the TUI pipeline inspector, skip audio            |
+| `--fusion-survey`  | Compile demos through both runtime paths and report    |
+|                    | fusion coverage and corpus FreeLayer-width             |
+| `--worker-bench`   | Compile demos plus the fixed corpus and benchmark      |
+|                    | the schedule worker dispatch path                      |
 
 ### Demo targets
 
@@ -226,4 +230,5 @@ constructs IR nodes and lowers them to C++. The authoring DSL in
 - DSP layer grounded on q_lib
 - Minimal node set (tinysynth includes q_lib "plugins" and will extend it)
 - TUI inspector for stepping through compilation stages (use command-line options)
+- Survey/benchmark reporting modes for fusion coverage and schedule worker dispatch
 
