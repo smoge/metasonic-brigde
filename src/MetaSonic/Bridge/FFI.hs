@@ -32,6 +32,11 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_region_kernel_supported
   , -- * §4.E.2.B test surface (off by default; tests opt in)
     c_rt_graph_test_set_reduction_capture
+  , -- * §4.E.2.C0a layered-schedule metadata (test-only introspection)
+    c_rt_graph_test_template_schedule_step_count
+  , c_rt_graph_test_template_schedule_step_kind
+  , c_rt_graph_test_template_schedule_step_item_count
+  , c_rt_graph_test_template_schedule_step_region
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
   , c_rt_graph_read_bus
@@ -47,6 +52,7 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_template_set_default
   , c_rt_graph_template_connect
   , c_rt_graph_template_add_region
+  , c_rt_graph_template_add_schedule_step
   , c_rt_graph_template_set_node_elided
   , c_rt_graph_template_connect_fused_scale_input
   , c_rt_graph_template_connect_fused_scale_chain_input
@@ -77,6 +83,7 @@ import           Foreign
 import           Foreign.C.Types
 
 import           MetaSonic.Bridge.Compile   (AffineStep (..),
+                                             FreeLayer (..),
                                              FusedInput (..),
                                              RegionKernel (..),
                                              RuntimeGraph (..),
@@ -84,7 +91,9 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              RuntimeNode (..),
                                              RuntimeRegion (..),
                                              ScaleRef (..),
+                                             ScheduleStep (..),
                                              kernelTag,
+                                             layeredRegionSchedule,
                                              scheduledRuntimeRegions)
 import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
                                              TemplateID (..))
@@ -319,6 +328,40 @@ foreign import ccall unsafe "rt_graph_kind_supported"
 foreign import ccall unsafe "rt_graph_test_set_reduction_capture"
   c_rt_graph_test_set_reduction_capture :: Ptr RTGraph -> CInt -> IO ()
 
+-- | §4.E.2.C0a test surface: number of schedule steps registered
+-- for the named template. Returns 0 on null g or unknown
+-- template_id. Loaders are expected to ship one step per Haskell
+-- ScheduleStep, so this should equal
+-- @length (layeredRegionSchedule rg)@ for any well-formed
+-- template.
+foreign import ccall unsafe "rt_graph_test_template_schedule_step_count"
+  c_rt_graph_test_template_schedule_step_count
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | §4.E.2.C0a test surface: ScheduleStepKind tag of a registered
+-- step. Returns 0 = Barrier, 1 = FreeLayer, or -1 on null g or
+-- out-of-range indices. Pinned by Haskell-side metadata-equivalence
+-- tests against 'layeredRegionSchedule'.
+foreign import ccall unsafe "rt_graph_test_template_schedule_step_kind"
+  c_rt_graph_test_template_schedule_step_kind
+    :: Ptr RTGraph -> CInt -> CInt -> IO CInt
+
+-- | §4.E.2.C0a test surface: number of regions covered by a
+-- registered step. Returns -1 on null g or out-of-range indices.
+foreign import ccall unsafe "rt_graph_test_template_schedule_step_item_count"
+  c_rt_graph_test_template_schedule_step_item_count
+    :: Ptr RTGraph -> CInt -> CInt -> IO CInt
+
+-- | §4.E.2.C0a test surface: scheduled-region ordinal at
+-- @item_index@ within a registered step. Resolved through
+-- MetaDef::schedule_step_regions. Returns -1 on null g, out-of-
+-- range template_id / step_index / item_index, or a backing-vector
+-- underrun (only possible if a future change corrupts the
+-- storage; the C ABI's add entry validates step shapes up-front).
+foreign import ccall unsafe "rt_graph_test_template_schedule_step_region"
+  c_rt_graph_test_template_schedule_step_region
+    :: Ptr RTGraph -> CInt -> CInt -> CInt -> IO CInt
+
 -- | Copy nframes samples from one output bus into the caller's buffer.
 -- Returns the number of samples written; 0 on bad arguments. Used by
 -- the offline test path; production code reads buses via the realtime
@@ -410,6 +453,24 @@ foreign import ccall unsafe "rt_graph_template_add_region_kernel"
 -- machine-check the 'kernelTag' agreement between Haskell and C++.
 foreign import ccall unsafe "rt_graph_region_kernel_supported"
   c_rt_graph_region_kernel_supported :: CInt -> IO CInt
+
+-- | §4.E.2.C0a: append one descriptive layered-schedule step to the
+-- named template, layering an interpretation on top of the regions
+-- registered via 'c_rt_graph_template_add_region'. The integer
+-- @kind@ matches the Haskell 'ScheduleStepKind' tags (0 = Barrier,
+-- 1 = FreeLayer). The third / fourth arguments form an array slice:
+-- @item_count@ ints starting at @region_ordinals@, each one a
+-- scheduled-region ordinal in @[0, region_count)@. The indirect
+-- shape is required because a 'FreeLayer' can carry non-contiguous
+-- ordinals — see 'rt_graph_template_add_schedule_step' in
+-- @rt_graph.h@.
+foreign import ccall unsafe "rt_graph_template_add_schedule_step"
+  c_rt_graph_template_add_schedule_step
+    :: Ptr RTGraph -> CInt
+    -> CInt        -- ^ ScheduleStepKind tag
+    -> CInt        -- ^ item_count
+    -> Ptr CInt    -- ^ region_ordinals
+    -> IO ()
 
 -- | Step C (e): mark a node in the named template as elided. The
 -- node's kernel is skipped during dispatch but its 'NodeIndex' and
@@ -610,6 +671,57 @@ cPortIndex (PortIndex x) = fromIntegral x
 cControlIndex :: ControlIndex -> CInt
 cControlIndex (ControlIndex x) = fromIntegral x
 
+-- | §4.E.2.C0a: project a 'layeredRegionSchedule' result onto a
+-- list of @(kind, [ordinals])@ pairs, where the ordinals are
+-- positions in the supplied @scheduled@ list (=
+-- 'scheduledRuntimeRegions'), which is the order the loader
+-- registers regions in. Each step's ordinal list can be
+-- non-contiguous in linear schedule order: 'goLayers' partitions
+-- all currently-ready regions into one layer, so a free segment
+-- with rrIndex 0, rrIndex 1 (depends on 0), rrIndex 2 (independent)
+-- yields layers @[{0, 2}, {1}]@. Encoding such a layer as a
+-- contiguous range @[first, first+2)@ would silently rewrite it to
+-- @{0, 1}@, miscategorising rrIndex 1 once C0b consumes the
+-- metadata.
+--
+-- 'rrIndex' values that are not in @scheduled@ trigger 'error': by
+-- construction every 'flRegions' / 'ScheduleBarrier' index is a
+-- member of 'rgRuntimeRegions' (the planner validates the same
+-- input), so this is a structural-invariant violation, not a user
+-- error.
+--
+-- The kind encoding mirrors the C-side 'ScheduleStepKind' tags:
+--   0 = Barrier, 1 = FreeLayer.
+scheduleStepItems
+  :: [RuntimeRegion] -> [ScheduleStep] -> [(CInt, [CInt])]
+scheduleStepItems scheduled = map step
+  where
+    pairs = zip [0 :: Int ..] scheduled
+    ordinal ix =
+      case [i | (i, r) <- pairs, rrIndex r == ix] of
+        (n : _) -> fromIntegral n
+        []      -> error $
+          "scheduleStepItems: rrIndex " <> show ix
+          <> " not in scheduledRuntimeRegions"
+    step (ScheduleBarrier ix)    = (0, [ordinal ix])
+    step (ScheduleFreeLayer fl)  = (1, map ordinal (flRegions fl))
+
+-- | §4.E.2.C0a: ship a 'layeredRegionSchedule' across the FFI as
+-- one 'c_rt_graph_template_add_schedule_step' call per step. Must
+-- run after the per-region registration pass for the same template
+-- so the runtime can range-check each ordinal against the
+-- registered region vector. The @scheduled@ argument must be the
+-- same list the region pass used (= 'scheduledRuntimeRegions') so
+-- ordinals here match the runtime's region vector positions.
+addScheduleStepsTo
+  :: Ptr RTGraph -> CInt
+  -> [RuntimeRegion] -> [ScheduleStep] -> IO ()
+addScheduleStepsTo g cTid scheduled steps =
+  forM_ (scheduleStepItems scheduled steps) $ \(cKind, ords) ->
+    withArray ords $ \pOrds ->
+      c_rt_graph_template_add_schedule_step g cTid cKind
+        (fromIntegral (length ords)) pOrds
+
 -- | Send one 'RuntimeRegion' across the FFI as a contiguous range.
 -- Currently the greedy 'formRegions' pass produces only contiguous
 -- regions; this helper flattens 'rrNodes' to (first_node, node_count)
@@ -723,6 +835,14 @@ loadRuntimeGraph g rg = do
   scheduled <- case scheduledRuntimeRegions rg of
     Right rs -> pure rs
     Left err -> fail $ "loadRuntimeGraph: " <> err
+  -- §4.E.2.C0a: also derive the layered schedule up-front so the
+  -- pre-clear validation gate covers the metadata path. Both calls
+  -- run 'regionSchedule' internally, so a Left here is impossible
+  -- after the previous bind succeeded; the case is left in for
+  -- coverage rather than for live failure.
+  steps <- case layeredRegionSchedule rg of
+    Right ss -> pure ss
+    Left err -> fail $ "loadRuntimeGraph: " <> err
   c_rt_graph_clear g
   -- Pass 0: size the shared bus pool to cover every bus this graph
   -- references. Construction-only; must run before audio starts.
@@ -740,6 +860,12 @@ loadRuntimeGraph g rg = do
   -- side iterates regions in process_instance in registration
   -- order. See Note [Region fallback] in rt_graph.cpp.
   mapM_ (addRegion 0) scheduled
+  -- Pass 4 (§4.E.2.C0a): ship the layered-schedule view as
+  -- per-step ordinal lists over the same scheduled order. C0a is
+  -- metadata-only — process_instance does not yet consume
+  -- def->schedule_steps, so this is observational. Must run after
+  -- the region pass so the runtime can range-check each ordinal.
+  addScheduleStepsTo g 0 scheduled steps
   where
     addNode :: RuntimeNode -> IO ()
     addNode node = do
@@ -825,6 +951,9 @@ loadRuntimeGraphFused g rg = do
   scheduled <- case scheduledRuntimeRegions rg of
     Right rs -> pure rs
     Left err -> fail $ "loadRuntimeGraphFused: " <> err
+  steps <- case layeredRegionSchedule rg of
+    Right ss -> pure ss
+    Left err -> fail $ "loadRuntimeGraphFused: " <> err
   c_rt_graph_clear g
   mapM_ ensureBusForNode (rgNodes rg)
   mapM_ addNode (rgNodes rg)
@@ -845,6 +974,8 @@ loadRuntimeGraphFused g rg = do
   -- Pass 3: region overlay in scheduled order (same contract as
   -- the unfused loader).
   mapM_ (addRegionTo g 0) scheduled
+  -- Pass 4 (§4.E.2.C0a): same metadata pass as the unfused loader.
+  addScheduleStepsTo g 0 scheduled steps
   where
     addNode :: RuntimeNode -> IO ()
     addNode node = do
@@ -946,36 +1077,49 @@ synchronous, non-blocking).
 -- See Note [loadTemplateGraph protocol].
 loadTemplateGraph :: Ptr RTGraph -> TemplateGraph -> IO ()
 loadTemplateGraph g tg = do
-  -- §4.E.2b: compute the scheduled region list for every template
-  -- /before/ touching the C++ handle. If any template's schedule
-  -- is malformed we fail fast and leave the existing graph alone.
+  -- §4.E.2b / §4.E.2.C0a: compute the scheduled region list and
+  -- the layered schedule for every template /before/ touching the
+  -- C++ handle. If any template's schedule is malformed we fail
+  -- fast and leave the existing graph alone.
   scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
   c_rt_graph_clear g
   -- The clear left an auto-created instance 0 for legacy callers.
   -- Multi-template loading spawns its own instances per template
   -- below, so remove it first to start with a clean slate.
   c_rt_graph_instance_remove g 0
-  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled)) -> do
+  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled, steps)) -> do
     cTid <- if i == (0 :: Int)
               then pure 0           -- auto-created template 0
               else c_rt_graph_template_add g
-    populateTemplate cTid (tplGraph tpl) scheduled
+    populateTemplate cTid (tplGraph tpl) scheduled steps
     -- Spawn one instance per template so the typical single-voice
     -- ensemble case works without explicit instance spawning. For
     -- polyphony, callers spawn additional instances afterwards via
     -- c_rt_graph_template_instance_add.
     M.void $ c_rt_graph_template_instance_add g cTid
   where
-    scheduleOrFail :: Template -> IO (Template, [RuntimeRegion])
-    scheduleOrFail tpl =
-      case scheduledRuntimeRegions (tplGraph tpl) of
-        Right rs -> pure (tpl, rs)
-        Left err -> fail $
+    scheduleOrFail
+      :: Template
+      -> IO (Template, [RuntimeRegion], [ScheduleStep])
+    scheduleOrFail tpl = do
+      let rg = tplGraph tpl
+      rs <- case scheduledRuntimeRegions rg of
+        Right rs  -> pure rs
+        Left err  -> fail $
           "loadTemplateGraph: template "
           <> show (tplName tpl) <> ": " <> err
+      ss <- case layeredRegionSchedule rg of
+        Right ss  -> pure ss
+        Left err  -> fail $
+          "loadTemplateGraph: template "
+          <> show (tplName tpl) <> ": " <> err
+      pure (tpl, rs, ss)
 
-    populateTemplate :: CInt -> RuntimeGraph -> [RuntimeRegion] -> IO ()
-    populateTemplate cTid rg scheduled = do
+    populateTemplate
+      :: CInt -> RuntimeGraph
+      -> [RuntimeRegion] -> [ScheduleStep]
+      -> IO ()
+    populateTemplate cTid rg scheduled steps = do
       -- Pass 0: ensure every referenced bus exists on the shared
       -- pool before any control write. Construction-only; same
       -- contract as in loadRuntimeGraph. See Note [Explicit
@@ -1018,6 +1162,9 @@ loadTemplateGraph g tg = do
       -- in 'loadRuntimeGraph'). See Note [Region fallback] in
       -- rt_graph.cpp.
       mapM_ (addRegionTo g cTid) scheduled
+      -- Pass 4 (§4.E.2.C0a): layered-schedule metadata. C0a is
+      -- metadata-only; process_instance does not yet consume it.
+      addScheduleStepsTo g cTid scheduled steps
 
 -- | Step C (e): fused-aware multi-template loader. Sibling of
 -- 'loadTemplateGraph' that handles 'RFused' inputs and 'rnElided'
@@ -1038,28 +1185,41 @@ loadTemplateGraph g tg = do
 -- Note [loadRuntimeGraphFused protocol] for the rationale on order.
 loadTemplateGraphFused :: Ptr RTGraph -> TemplateGraph -> IO ()
 loadTemplateGraphFused g tg = do
-  -- §4.E.2b: pre-validate every template's schedule, same
-  -- contract as 'loadTemplateGraph'.
+  -- §4.E.2b / §4.E.2.C0a: pre-validate every template's schedule
+  -- and derive its layered view, same fail-fast contract as
+  -- 'loadTemplateGraph'.
   scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
   c_rt_graph_clear g
   c_rt_graph_instance_remove g 0
-  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled)) -> do
+  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled, steps)) -> do
     cTid <- if i == (0 :: Int)
               then pure 0
               else c_rt_graph_template_add g
-    populateTemplate cTid (tplGraph tpl) scheduled
+    populateTemplate cTid (tplGraph tpl) scheduled steps
     M.void $ c_rt_graph_template_instance_add g cTid
   where
-    scheduleOrFail :: Template -> IO (Template, [RuntimeRegion])
-    scheduleOrFail tpl =
-      case scheduledRuntimeRegions (tplGraph tpl) of
-        Right rs -> pure (tpl, rs)
-        Left err -> fail $
+    scheduleOrFail
+      :: Template
+      -> IO (Template, [RuntimeRegion], [ScheduleStep])
+    scheduleOrFail tpl = do
+      let rg = tplGraph tpl
+      rs <- case scheduledRuntimeRegions rg of
+        Right rs  -> pure rs
+        Left err  -> fail $
           "loadTemplateGraphFused: template "
           <> show (tplName tpl) <> ": " <> err
+      ss <- case layeredRegionSchedule rg of
+        Right ss  -> pure ss
+        Left err  -> fail $
+          "loadTemplateGraphFused: template "
+          <> show (tplName tpl) <> ": " <> err
+      pure (tpl, rs, ss)
 
-    populateTemplate :: CInt -> RuntimeGraph -> [RuntimeRegion] -> IO ()
-    populateTemplate cTid rg scheduled = do
+    populateTemplate
+      :: CInt -> RuntimeGraph
+      -> [RuntimeRegion] -> [ScheduleStep]
+      -> IO ()
+    populateTemplate cTid rg scheduled steps = do
       forM_ (rgNodes rg) $ \node ->
         case busIndexOf node of
           Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
@@ -1098,6 +1258,8 @@ loadTemplateGraphFused g tg = do
           c_rt_graph_template_set_node_elided g cTid
             (cNodeIndex (rnIndex node))
       mapM_ (addRegionTo g cTid) scheduled
+      -- Pass 4 (§4.E.2.C0a): layered-schedule metadata.
+      addScheduleStepsTo g cTid scheduled steps
 
 {- Note [Realtime audio lifecycle]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

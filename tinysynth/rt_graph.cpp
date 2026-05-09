@@ -869,6 +869,41 @@ struct RegionSpec {
   RegionKernel kernel = RegionKernel::NodeLoop;
 };
 
+// Phase §4.E.2.C0a: descriptive layered-schedule shape over the
+// template's registered RegionSpec vector. The runtime stores this
+// as metadata only — process_instance still iterates def->regions
+// in registration (= scheduled) order. C0b will build the per-block
+// global schedule from these steps; until then this is observational.
+//
+// `kind` matches the Haskell ScheduleStep tags:
+//   Barrier   = 0  (a single pinned region between free segments)
+//   FreeLayer = 1  (one topological layer of independent regions)
+//
+// `first_item` and `item_count` slice MetaDef::schedule_step_regions,
+// whose entries are ordinals into MetaDef::regions (the same vector
+// rt_graph_template_add_region appends to, in registered = scheduled
+// order). The indirection matters because Haskell's
+// 'segmentLayers' / 'goLayers' can produce a free layer whose
+// members are non-contiguous in the linear regionSchedule order —
+// e.g. layer {rrIndex 0, rrIndex 2} when rrIndex 1 depends on
+// rrIndex 0. A contiguous-range encoding would silently rewrite
+// such a layer to {rrIndex 0, rrIndex 1}, putting a dependent
+// region into the wrong free layer once C0b consumes the metadata.
+//
+// The canonical writer-slot key continues to be
+// (template, instance, scheduled_region_ordinal,
+// sink_ordinal_within_region) — step ordinals are observational
+// only, not a key dimension. Unknown kind tags or out-of-range
+// ordinals are rejected by the C ABI entry, so a stale Haskell
+// sender cannot silently corrupt the metadata.
+enum class ScheduleStepKind : int { Barrier = 0, FreeLayer = 1 };
+
+struct ScheduleStepSpec {
+  ScheduleStepKind kind = ScheduleStepKind::Barrier;
+  int first_item = 0;
+  int item_count = 0;
+};
+
 struct MetaDef {
   int max_frames = 0;
   std::vector<NodeSpec> nodes;
@@ -890,6 +925,22 @@ struct MetaDef {
   // dispatch; behavior is identical either way for Step A. See
   // Note [Region fallback].
   std::vector<RegionSpec> regions;
+
+  // Phase §4.E.2.C0a: descriptive layered-schedule view over
+  // `regions`, populated by rt_graph_template_add_schedule_step
+  // during construction. Empty for templates the loader did not
+  // ship a schedule for (e.g. C++ doctests built directly via
+  // rt_graph_add_region). Process_instance ignores this in C0a;
+  // C0b will consume it to build a per-block global schedule from
+  // (active instance × schedule step). Each step's
+  // [first_item, first_item + item_count) range slices
+  // `schedule_step_regions`, whose entries are ordinals into
+  // `regions`. The indirection is load-bearing: a free layer's
+  // members are not necessarily contiguous in registered order
+  // (see ScheduleStepSpec's docblock for the rrIndex {0, 2}
+  // example).
+  std::vector<ScheduleStepSpec> schedule_steps;
+  std::vector<int> schedule_step_regions;
 
   // Step C: running tally of how many fused inputs have been
   // registered across this template, across every fused-* ABI entry
@@ -5379,6 +5430,70 @@ int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
   return 0;
 }
 
+// Phase §4.E.2.C0a test surfaces. See header docblocks. All four
+// share a "validate template_id and step_index, then read the
+// vector entry" shape; mismatches return safe sentinels (0 for
+// counts, -1 for per-step accessors) without raising or aborting.
+int rt_graph_test_template_schedule_step_count(
+    const RTGraph *g, int template_id
+) {
+  if (!g) return 0;
+  if (template_id < 0) return 0;
+  const std::size_t tid = static_cast<std::size_t>(template_id);
+  if (tid >= g->defs.size()) return 0;
+  return static_cast<int>(g->defs[tid].schedule_steps.size());
+}
+
+namespace {
+const ScheduleStepSpec *
+schedule_step_at(const RTGraph *g, int template_id, int step_index) {
+  if (!g) return nullptr;
+  if (template_id < 0 || step_index < 0) return nullptr;
+  const std::size_t tid = static_cast<std::size_t>(template_id);
+  if (tid >= g->defs.size()) return nullptr;
+  const auto &steps = g->defs[tid].schedule_steps;
+  const std::size_t sidx = static_cast<std::size_t>(step_index);
+  if (sidx >= steps.size()) return nullptr;
+  return &steps[sidx];
+}
+}  // namespace
+
+int rt_graph_test_template_schedule_step_kind(
+    const RTGraph *g, int template_id, int step_index
+) {
+  const auto *spec = schedule_step_at(g, template_id, step_index);
+  if (!spec) return -1;
+  return static_cast<int>(spec->kind);
+}
+
+int rt_graph_test_template_schedule_step_item_count(
+    const RTGraph *g, int template_id, int step_index
+) {
+  const auto *spec = schedule_step_at(g, template_id, step_index);
+  if (!spec) return -1;
+  return spec->item_count;
+}
+
+// Read one entry of the indirect schedule_step_regions vector,
+// resolved through the step's (first_item, item_count) slice.
+// Returns the scheduled-region ordinal at item_index within
+// step_index, or -1 on null g, out-of-range template_id /
+// step_index / item_index, or a corrupted slice that points past
+// the backing vector.
+int rt_graph_test_template_schedule_step_region(
+    const RTGraph *g, int template_id, int step_index, int item_index
+) {
+  const auto *spec = schedule_step_at(g, template_id, step_index);
+  if (!spec) return -1;
+  if (item_index < 0 || item_index >= spec->item_count) return -1;
+  const std::size_t tid = static_cast<std::size_t>(template_id);
+  const auto &items = g->defs[tid].schedule_step_regions;
+  const std::size_t pos = static_cast<std::size_t>(spec->first_item)
+                          + static_cast<std::size_t>(item_index);
+  if (pos >= items.size()) return -1;
+  return items[pos];
+}
+
 // Add or reconfigure one node at its dense runtime index in the named
 // template.
 //
@@ -5608,6 +5723,77 @@ void rt_graph_template_add_region_kernel(
 // agreement test, mirrors rt_graph_kind_supported for node kinds.
 int rt_graph_region_kernel_supported(int kernel_kind) {
   return region_kernel_from_tag(kernel_kind).has_value() ? 1 : 0;
+}
+
+// Phase §4.E.2.C0a: append one descriptive schedule step to the
+// named template's metadata. Loaders call this once per
+// ScheduleStep emitted by Haskell-side layeredRegionSchedule, in
+// flattened order. The runtime stores it on MetaDef::schedule_steps
+// and does not yet consume it — C0b will build the per-block global
+// schedule from (active instance × schedule step).
+//
+// kind matches the Haskell ScheduleStepKind tags:
+//   0 = Barrier
+//   1 = FreeLayer
+// Unknown tags are a silent no-op; same policy as the kernel-aware
+// region entry.
+//
+// region_ordinals points at item_count ints, each one a scheduled-
+// region ordinal in [0, def->regions.size()). The indirect shape
+// (vs a contiguous [first, first+count) range) is required because
+// 'segmentLayers' / 'goLayers' on the Haskell side can produce a
+// free layer whose members are not contiguous in regionSchedule
+// order — see ScheduleStepSpec's docblock. Any ordinal that's
+// negative or out of range, a non-positive item_count, or a null
+// region_ordinals on a non-zero count is a silent no-op for the
+// whole step, mirroring the per-region entry's policy. Partial
+// pushes never happen: the function checks every ordinal before
+// committing anything to schedule_step_regions.
+void rt_graph_template_add_schedule_step(
+    RTGraph *g, int template_id,
+    int kind,
+    int item_count,
+    const int *region_ordinals
+) {
+  if (!g) return;
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return;
+
+  if (item_count <= 0) return;
+  if (!region_ordinals) return;
+
+  ScheduleStepKind step_kind;
+  switch (kind) {
+    case 0: step_kind = ScheduleStepKind::Barrier;   break;
+    case 1: step_kind = ScheduleStepKind::FreeLayer; break;
+    default: return;
+  }
+
+  // Barriers are single pinned regions by definition (Haskell's
+  // 'ScheduleBarrier' carries one RegionIndex). Reject any other
+  // shape so a stale or malformed sender cannot smuggle a multi-
+  // region "barrier" past C0b's consumer.
+  if (step_kind == ScheduleStepKind::Barrier && item_count != 1) {
+    return;
+  }
+
+  // Validate every ordinal up-front so a malformed step cannot
+  // partially extend schedule_step_regions before being rejected.
+  const std::size_t region_count = def->regions.size();
+  for (int i = 0; i < item_count; ++i) {
+    const int ord = region_ordinals[i];
+    if (ord < 0 || static_cast<std::size_t>(ord) >= region_count) {
+      return;
+    }
+  }
+
+  const int first_item =
+      static_cast<int>(def->schedule_step_regions.size());
+  for (int i = 0; i < item_count; ++i) {
+    def->schedule_step_regions.push_back(region_ordinals[i]);
+  }
+  def->schedule_steps.push_back(
+      ScheduleStepSpec{step_kind, first_item, item_count});
 }
 
 // Step C (d): mark a node as elided. Idempotent on existing state;

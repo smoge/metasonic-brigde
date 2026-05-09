@@ -417,6 +417,49 @@ void rt_graph_template_add_region_kernel(
 // node kinds.
 int rt_graph_region_kernel_supported(int kernel_kind);
 
+// [T:construction] Phase §4.E.2.C0a: append one descriptive
+// schedule step to the named template, layering an interpretation
+// on top of the regions appended via rt_graph_template_add_region.
+//
+//   kind             : ScheduleStepKind tag matching the Haskell
+//                      ScheduleStep encoding:
+//                        0 = Barrier
+//                        1 = FreeLayer
+//   item_count       : number of regions covered by this step.
+//   region_ordinals  : pointer to item_count ints, each one an
+//                      ordinal into the template's region vector
+//                      (the same vector rt_graph_template_add_region
+//                      appends to, in registered = scheduled order).
+//
+// The indirect (per-item) shape — rather than a contiguous
+// [first_region, first_region + region_count) range — is required
+// because Haskell's 'segmentLayers' / 'goLayers' can produce a free
+// layer whose members are non-contiguous in regionSchedule order.
+// Concretely: a free segment with rrIndex 0, rrIndex 1 (depends on
+// 0), rrIndex 2 (independent) yields regionSchedule = [0, 1, 2] but
+// layeredRegionSchedule = [FreeLayer {0, 2}, FreeLayer {1}]. A
+// contiguous-range encoding would silently rewrite layer {0, 2} to
+// {0, 1}, miscategorising rrIndex 1 once C0b consumes the metadata.
+//
+// Silent no-op on invalid template_id, unknown kind tag, an ordinal
+// outside [0, region_count), null region_ordinals on a positive
+// item_count, or a non-positive item_count. The validation pass
+// runs before any push so a malformed step cannot partially extend
+// schedule_step_regions before being rejected. C0a is metadata-
+// only — process_instance does not consume schedule_steps yet, so
+// a stale or short metadata vector cannot affect rendered audio.
+//
+// The canonical writer-slot key continues to be
+//   (template_id, instance_slot, scheduled_region_ordinal,
+//    sink_ordinal_within_region)
+// so step ordinals are observational only — they do not enter any
+// existing key.
+void rt_graph_template_add_schedule_step(
+    RTGraph *g, int template_id,
+    int kind,
+    int item_count,
+    const int *region_ordinals);
+
 // [T:control] Spawn an instance of the named template. Returns
 // globally-unique instance_id (>= 0) or -1 on failure. Slot reuse: a
 // dead slot is reused before appending. The instance carries its
@@ -602,6 +645,42 @@ int rt_graph_test_contribution_slot_used(const RTGraph *g, int ws);
 // destination is left untouched on error.
 int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
                                          int nframes, float *out);
+
+// [T:read-only] Phase §4.E.2.C0a test surface: number of schedule
+// steps registered for the named template via
+// rt_graph_template_add_schedule_step. Returns 0 if g is null or
+// template_id is out of range. Loaders are expected to ship one
+// step per Haskell ScheduleStep, so this should equal
+// length (layeredRegionSchedule rg) for any well-formed template.
+int rt_graph_test_template_schedule_step_count(
+    const RTGraph *g, int template_id);
+
+// [T:read-only] Phase §4.E.2.C0a test surface: ScheduleStepKind
+// tag of the @step_index@-th step on the named template. Returns
+//   0 = Barrier
+//   1 = FreeLayer
+// or -1 if g is null, template_id is out of range, or step_index
+// is out of range. Pinned by Haskell-side metadata-equivalence
+// tests against layeredRegionSchedule.
+int rt_graph_test_template_schedule_step_kind(
+    const RTGraph *g, int template_id, int step_index);
+
+// [T:read-only] Phase §4.E.2.C0a test surface: number of regions
+// covered by the @step_index@-th step. Returns -1 on null g or
+// out-of-range indices.
+int rt_graph_test_template_schedule_step_item_count(
+    const RTGraph *g, int template_id, int step_index);
+
+// [T:read-only] Phase §4.E.2.C0a test surface: the scheduled-
+// region ordinal at @item_index@ within the @step_index@-th step,
+// resolved through MetaDef::schedule_step_regions. Returns -1 on
+// null g, out-of-range template_id / step_index / item_index, or
+// a backing-vector underrun (the slice points past the end of
+// schedule_step_regions — only possible if a future change
+// corrupts the storage; the C ABI's add entry validates step
+// shapes up-front).
+int rt_graph_test_template_schedule_step_region(
+    const RTGraph *g, int template_id, int step_index, int item_index);
 
 // ----------------------------------------------------------------
 // Multi-instance support
