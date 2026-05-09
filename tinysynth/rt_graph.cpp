@@ -5161,6 +5161,9 @@ static void process_global_schedule_bands_serial(
   };
 
   auto process_entry = [&](const GlobalScheduleEntry &entry) noexcept {
+    // Early return here is the lambda-local equivalent of the old flat
+    // loop's continue: skip this malformed/stale entry and keep walking
+    // the remaining band entries.
     if (entry.instance_slot != current_slot) {
       finish_current();
 
@@ -5199,6 +5202,9 @@ static void process_global_schedule_bands_serial(
   // state transition during the group is Releasing -> Available inside
   // finish_instance_block, after all steps for that slot have run.
   for (const GlobalScheduleBand &band : g.global_schedule_bands) {
+    // Defensive only: build_global_schedule_bands emits valid,
+    // contiguous slices over g.global_schedule. Keep the executor
+    // silent if a future ABI/debug path corrupts the band metadata.
     if (band.first_entry < 0 || band.entry_count <= 0) continue;
     const std::size_t first = static_cast<std::size_t>(band.first_entry);
     const std::size_t count = static_cast<std::size_t>(band.entry_count);
