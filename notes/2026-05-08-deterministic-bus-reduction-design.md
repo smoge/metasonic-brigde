@@ -961,3 +961,18 @@ mutex / condition-variable wait on the audio thread.
 This updates §13's "bench work gates whether Phase C ships
 defaulted-on or defaulted-off" question: for now, Phase C remains
 test/bench gated.
+
+The representative-data refresh added two Haskell-facing checks:
+
+  - `--fusion-survey` now reports corpus worker-band shape. The fixed
+    corpus currently has `dirC1c=0` and `redC1c=0`; its free bands are
+    width 1 only.
+  - `--worker-bench` loads demos plus corpus through the Haskell FFI path.
+    On the measured run it reported `worker_rows_with_parallel=0` and
+    `parallel_bands=0`, so no Haskell-loaded row exercised actual worker
+    dispatch.
+
+This strengthens the default-off decision: the synthetic C++ bench has a
+positive sink-free signal only at enough width/work, while the current
+representative Haskell-loaded corpus has no worker-dispatchable width at
+all.
