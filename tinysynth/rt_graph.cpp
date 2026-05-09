@@ -926,6 +926,11 @@ struct ScheduleStepSpec {
 // The (template_id, instance_slot, step_index) triple is enough
 // to recover the kind and the scheduled-region ordinal list via
 // MetaDef::schedule_steps + MetaDef::schedule_step_regions.
+// `first_writer_slot` and `writer_slot_count` preassign the
+// canonical writer-slot range this entry owns for the current block.
+// C1c worker dispatch uses that range instead of racing on a shared
+// counter; serial execution still observes the same order because
+// build_global_schedule fills these fields in canonical entry order.
 // Storing only the IDs avoids stale-copy hazards: if a future
 // schedule mutation lands inside a block (it cannot today —
 // schedule registration is construction-only), the build
@@ -934,12 +939,14 @@ struct GlobalScheduleEntry {
   int template_id   = 0;
   int instance_slot = 0;
   int step_index    = 0;
+  int first_writer_slot = 0;
+  int writer_slot_count = 0;
 };
 
-// Phase §4.E.2.C0d/C1a: one contiguous run of entries from
-// RTGraph::global_schedule with the same execution policy. The C1a
-// opt-in schedule executor consumes these bands serially; Phase C
-// later replaces the Free-band inner loop with worker dispatch.
+// Phase §4.E.2.C0d/C1: one contiguous run of entries from
+// RTGraph::global_schedule with the same execution policy. Barrier
+// bands always run on the audio thread; C1c may dispatch eligible Free
+// bands to the worker pool.
 //
 //   Barrier = exactly one canonical GlobalScheduleEntry whose
 //             ScheduleStepSpec is a barrier; must run serially.
@@ -1734,7 +1741,9 @@ Three parallel vectors, all indexed by writer slot ws ∈ [0, max_writer_slots):
       — resolved bus index for slot ws; -1 means invalid / unused.
   * used_words[ws / 64] bit (1 << (ws % 64))
       — set by the producing work unit when it actually writes a
-        contribution this block; the reduction skips clear bits.
+        contribution this block in serial reduction mode. C1c's
+        deferred parallel reduction path avoids worker races on this
+        shared bitset and uses target[ws] >= 0 as the fold predicate.
 
 Capacity is grow-only. resize_for refuses to shrink, mirroring
 ensure_output_bus_count's discipline: even if a future polyphony
@@ -1786,10 +1795,11 @@ struct ContributionStorage {
   }
 };
 
-/* Note [Schedule worker pool scaffold — Phase §4.E.2.C1b]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-C1b adds the lifetime/configuration substrate for Phase C without
-dispatching any DSP work to worker threads yet.
+/* Note [Schedule worker pool — Phase §4.E.2.C1b/C1c]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C1b added the lifetime/configuration substrate for Phase C; C1c uses
+the same pool to dispatch conservative Free bands while keeping
+Barrier bands on the audio thread.
 
 The configured pool size is a logical lane count:
 
@@ -1801,15 +1811,22 @@ The configured pool size is a logical lane count:
 The pool belongs to RTGraph, so its lifetime is independent of the
 global-schedule execution switch. Tests may resize it through the
 test-only C ABI before rendering; process_graph never starts, stops,
-allocates, or joins worker threads. The current worker loop only waits
-for shutdown. C1c will add a preallocated work queue and teach Free
-bands to dispatch through these workers.
+allocates, or joins worker threads. During process_graph, the audio
+thread publishes one stack-owned dispatch descriptor, wakes the
+already-created workers, processes lane 0 itself, then waits for all
+background lanes to finish before the next schedule band begins.
 */
 struct ScheduleWorkerPool {
+  using WorkFn = void (*)(void *, int) noexcept;
+
   mutable std::mutex mutex;
   std::condition_variable cv;
   bool stopping = false;
   int configured_size = 0;
+  int work_generation = 0;
+  int completed_workers = 0;
+  WorkFn current_work = nullptr;
+  void *current_work_user = nullptr;
   std::vector<std::thread> workers;
 
   ~ScheduleWorkerPool() {
@@ -1832,7 +1849,7 @@ struct ScheduleWorkerPool {
     const int background_workers = next_size <= 1 ? 0 : next_size - 1;
     workers.reserve(static_cast<std::size_t>(background_workers));
     for (int i = 0; i < background_workers; ++i) {
-      workers.emplace_back([this]() noexcept { worker_loop(); });
+      workers.emplace_back([this, i]() noexcept { worker_loop(i + 1); });
     }
   }
 
@@ -1853,6 +1870,10 @@ struct ScheduleWorkerPool {
     {
       std::lock_guard<std::mutex> lock(mutex);
       stopping = false;
+      current_work = nullptr;
+      current_work_user = nullptr;
+      work_generation = 0;
+      completed_workers = 0;
     }
   }
 
@@ -1866,10 +1887,67 @@ struct ScheduleWorkerPool {
     return static_cast<int>(workers.size());
   }
 
+  void run_parallel(WorkFn fn, void *user) noexcept {
+    int background_workers = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      background_workers = static_cast<int>(workers.size());
+      if (background_workers > 0) {
+        current_work = fn;
+        current_work_user = user;
+        completed_workers = 0;
+        ++work_generation;
+      }
+    }
+
+    if (background_workers > 0) {
+      cv.notify_all();
+    }
+
+    if (fn) {
+      fn(user, 0);
+    }
+
+    if (background_workers <= 0) {
+      return;
+    }
+
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      cv.wait(lock, [this, background_workers]() noexcept {
+        return completed_workers >= background_workers;
+      });
+      current_work = nullptr;
+      current_work_user = nullptr;
+    }
+  }
+
 private:
-  void worker_loop() noexcept {
+  void worker_loop(int worker_id) noexcept {
+    int seen_generation = 0;
     std::unique_lock<std::mutex> lock(mutex);
-    cv.wait(lock, [this]() noexcept { return stopping; });
+    while (true) {
+      cv.wait(lock, [this, seen_generation]() noexcept {
+        return stopping || work_generation != seen_generation;
+      });
+      if (stopping) {
+        return;
+      }
+
+      WorkFn fn = current_work;
+      void *user = current_work_user;
+      const int generation = work_generation;
+      lock.unlock();
+
+      if (fn) {
+        fn(user, worker_id);
+      }
+
+      lock.lock();
+      seen_generation = generation;
+      ++completed_workers;
+      cv.notify_all();
+    }
   }
 };
 
@@ -1957,6 +2035,7 @@ struct RTGraph {
   // clear() + push_back into already-reserved space, so it never
   // allocates.
   std::vector<GlobalScheduleEntry> global_schedule;
+  int global_schedule_writer_slot_count = 0;
 
   // Phase §4.E.2.C0d/C1a: runnable bands over global_schedule. Each
   // band stores a contiguous [first_entry, first_entry + entry_count)
@@ -1973,6 +2052,14 @@ struct RTGraph {
   // workers without tying thread allocation to the C0c/C1a execution
   // switch.
   ScheduleWorkerPool worker_pool;
+
+  // Phase §4.E.2.C1c-b test/debug counters for the most recent block.
+  // They are not used by rendering. Tests use them to prove unsafe
+  // direct-mode sink bands fall back to serial execution while
+  // reduction-mode sink bands actually enter the worker dispatch path.
+  int last_parallel_band_count = 0;
+  int last_parallel_entry_count = 0;
+  int last_serialized_free_band_count = 0;
 };
 
 namespace {
@@ -3066,11 +3153,18 @@ enum class BusWriteMode {
              // per-step fold copies used slots back into
              // server.output_buses at deterministic joins so live
              // BusIn semantics match Direct mode block-for-block.
+  ReductionDeferred, // same private slot target as Reduction, but
+                     // used by C1c Free-band worker dispatch: workers
+                     // do not fold immediately and do not update the
+                     // shared used_words bitset. The audio thread folds
+                     // the band range after the worker join using
+                     // contribution_target[slot] as the validity flag.
 };
 
 struct BusWriteContext {
   BusWriteMode mode = BusWriteMode::Direct;
   int next_writer_slot = 0;
+  bool fold_after_each_sink = true;
 
   // Reserve one canonical writer slot at a dispatch boundary. The
   // returned index is monotonically increasing across the block and
@@ -3180,7 +3274,8 @@ open_direct_bus_write_target(Server &server, double bus_control) noexcept {
 // retain whatever was there but are never read this block.
 [[nodiscard]] static BusWriteTarget
 open_reduction_bus_write_target(RTGraph &g, double bus_control,
-                                 int writer_slot, int nframes) noexcept {
+                                 int writer_slot, int nframes,
+                                 bool record_used_bit) noexcept {
   assert(writer_slot >= 0);
   auto &storage = g.contribution_storage;
   assert(writer_slot < storage.max_writer_slots);
@@ -3203,7 +3298,9 @@ open_reduction_bus_write_target(RTGraph &g, double bus_control,
   std::fill_n(&storage.samples[ws * mf], nf, 0.0f);
 
   storage.target[ws] = *bus;
-  storage.used_words[ws / 64] |= (std::uint64_t{1} << (ws % 64));
+  if (record_used_bit) {
+    storage.used_words[ws / 64] |= (std::uint64_t{1} << (ws % 64));
+  }
 
   return BusWriteTarget{
     &storage.samples[ws * mf],
@@ -3220,9 +3317,11 @@ open_reduction_bus_write_target(RTGraph &g, double bus_control,
 open_bus_write_target(RTGraph &g, BusWriteMode mode,
                       double bus_control, int writer_slot,
                       int nframes) noexcept {
-  if (mode == BusWriteMode::Reduction) {
+  if (mode == BusWriteMode::Reduction
+      || mode == BusWriteMode::ReductionDeferred) {
     return open_reduction_bus_write_target(g, bus_control,
-                                            writer_slot, nframes);
+                                            writer_slot, nframes,
+                                            mode == BusWriteMode::Reduction);
   }
   return open_direct_bus_write_target(g.server, bus_control);
 }
@@ -3233,6 +3332,7 @@ contribution_slot_used(
 ) noexcept {
   if (writer_slot < 0 || writer_slot >= storage.max_writer_slots) return false;
   const std::size_t ws = static_cast<std::size_t>(writer_slot);
+  if (storage.target[ws] >= 0) return true;
   const std::size_t word = ws / 64;
   const std::uint64_t bit = std::uint64_t{1} << (ws % 64);
   return (storage.used_words[word] & bit) != 0;
@@ -3274,6 +3374,7 @@ static inline void fold_recent_writer_slot_if_needed(
     RTGraph &g, const BlockExecutionContext &ctx, int writer_slot, int nframes
 ) noexcept {
   if (ctx.bus_writes.mode != BusWriteMode::Reduction) return;
+  if (!ctx.bus_writes.fold_after_each_sink) return;
   fold_contribution_slots(g, writer_slot, writer_slot + 1, nframes);
 }
 
@@ -5105,8 +5206,52 @@ BusInDelayed to break the cross-instance dependency.
 // mutation that can grow the bound) keeps g.global_schedule's
 // capacity at or above max-block size; clear() preserves that
 // capacity, and every push_back below lands inside it.
+static int region_sink_writer_count(
+    const MetaDef &def, const RegionSpec &r
+) noexcept {
+  if (r.first_node < 0 || r.node_count <= 0) return 0;
+  const std::size_t node_count = def.nodes.size();
+  const std::size_t first = static_cast<std::size_t>(r.first_node);
+  if (first >= node_count) return 0;
+  const std::size_t end_excl =
+      std::min(node_count, first + static_cast<std::size_t>(r.node_count));
+
+  int count = 0;
+  for (std::size_t i = first; i < end_excl; ++i) {
+    if (is_sink_terminal(def.nodes[i].kind)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+static int schedule_step_sink_writer_count(
+    const MetaDef &def, std::size_t step_index
+) noexcept {
+  if (step_index >= def.schedule_steps.size()) return 0;
+  const ScheduleStepSpec &step = def.schedule_steps[step_index];
+  if (step.first_item < 0 || step.item_count <= 0) return 0;
+  const std::size_t first_item = static_cast<std::size_t>(step.first_item);
+  const std::size_t item_count = static_cast<std::size_t>(step.item_count);
+  if (first_item > def.schedule_step_regions.size()
+      || item_count > def.schedule_step_regions.size() - first_item) {
+    return 0;
+  }
+
+  int count = 0;
+  for (std::size_t i = 0; i < item_count; ++i) {
+    const int region_ordinal = def.schedule_step_regions[first_item + i];
+    if (region_ordinal < 0) continue;
+    const std::size_t region_pos = static_cast<std::size_t>(region_ordinal);
+    if (region_pos >= def.regions.size()) continue;
+    count += region_sink_writer_count(def, def.regions[region_pos]);
+  }
+  return count;
+}
+
 static void build_global_schedule(RTGraph &g) noexcept {
   g.global_schedule.clear();
+  int next_writer_slot = 0;
   const std::size_t template_count = g.defs.size();
   for (std::size_t tid = 0; tid < template_count; ++tid) {
     const MetaDef &def = g.defs[tid];
@@ -5120,11 +5265,20 @@ static void build_global_schedule(RTGraph &g) noexcept {
       if (inst.template_id != tid_i) continue;
       const int slot_i = static_cast<int>(slot);
       for (std::size_t step = 0; step < step_count; ++step) {
+        const int writer_count = schedule_step_sink_writer_count(def, step);
         g.global_schedule.push_back(
-            GlobalScheduleEntry{tid_i, slot_i, static_cast<int>(step)});
+            GlobalScheduleEntry{
+              tid_i,
+              slot_i,
+              static_cast<int>(step),
+              next_writer_slot,
+              writer_count
+            });
+        next_writer_slot += writer_count;
       }
     }
   }
+  g.global_schedule_writer_slot_count = next_writer_slot;
 }
 
 static const ScheduleStepSpec *
@@ -5304,45 +5458,202 @@ struct ScheduleEntryExecutionContext {
   }
 };
 
+static bool band_range_valid(
+    const RTGraph &g, const GlobalScheduleBand &band
+) noexcept {
+  if (band.first_entry < 0 || band.entry_count <= 0) return false;
+  const std::size_t first = static_cast<std::size_t>(band.first_entry);
+  const std::size_t count = static_cast<std::size_t>(band.entry_count);
+  return first <= g.global_schedule.size()
+      && count <= g.global_schedule.size() - first;
+}
+
+static int band_first_writer_slot(
+    const RTGraph &g, const GlobalScheduleBand &band
+) noexcept {
+  if (!band_range_valid(g, band)) return 0;
+  const std::size_t first = static_cast<std::size_t>(band.first_entry);
+  return g.global_schedule[first].first_writer_slot;
+}
+
+static int band_end_writer_slot(
+    const RTGraph &g, const GlobalScheduleBand &band
+) noexcept {
+  if (!band_range_valid(g, band)) return 0;
+  const std::size_t first = static_cast<std::size_t>(band.first_entry);
+  const std::size_t count = static_cast<std::size_t>(band.entry_count);
+
+  int end_slot = g.global_schedule[first].first_writer_slot;
+  for (std::size_t i = 0; i < count; ++i) {
+    const GlobalScheduleEntry &entry = g.global_schedule[first + i];
+    end_slot = std::max(
+        end_slot, entry.first_writer_slot + entry.writer_slot_count);
+  }
+  return end_slot;
+}
+
+static bool schedule_band_has_sink_writers(
+    const RTGraph &g, const GlobalScheduleBand &band
+) noexcept {
+  return band_end_writer_slot(g, band) > band_first_writer_slot(g, band);
+}
+
+static bool schedule_band_has_duplicate_instances(
+    const RTGraph &g, const GlobalScheduleBand &band
+) noexcept {
+  if (!band_range_valid(g, band)) return true;
+  const std::size_t first = static_cast<std::size_t>(band.first_entry);
+  const std::size_t count = static_cast<std::size_t>(band.entry_count);
+  for (std::size_t i = 0; i < count; ++i) {
+    const int slot = g.global_schedule[first + i].instance_slot;
+    for (std::size_t j = i + 1; j < count; ++j) {
+      if (g.global_schedule[first + j].instance_slot == slot) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 static void process_schedule_band_serial(
     RTGraph &g,
     const GlobalScheduleBand &band,
     ScheduleEntryExecutionContext &worker_ctx
 ) noexcept {
-  // C1b seam: Free bands still execute serially even when the worker
-  // pool is configured. C1c replaces this helper's Free-band path with
-  // dispatch while keeping Barrier bands on the audio thread.
   // Defensive only: build_global_schedule_bands emits valid,
   // contiguous slices over g.global_schedule. Keep the executor
   // silent if a future ABI/debug path corrupts the band metadata.
-  if (band.first_entry < 0 || band.entry_count <= 0) return;
+  if (!band_range_valid(g, band)) return;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
-  if (first > g.global_schedule.size()
-      || count > g.global_schedule.size() - first) {
-    return;
-  }
 
   for (std::size_t i = 0; i < count; ++i) {
     worker_ctx.process_entry(g.global_schedule[first + i]);
   }
 }
 
-static void process_global_schedule_bands_serial(
+struct ParallelBandDispatch {
+  RTGraph &g;
+  const GlobalScheduleBand &band;
+  int nframes = 0;
+  BusWriteMode mode = BusWriteMode::Direct;
+  bool defer_reduction_folds = false;
+  std::atomic<int> next_entry_offset{0};
+};
+
+static void process_parallel_band_worker(void *user, int /*worker_id*/) noexcept {
+  auto &dispatch = *static_cast<ParallelBandDispatch *>(user);
+  while (true) {
+    const int offset = dispatch.next_entry_offset.fetch_add(
+        1, std::memory_order_relaxed);
+    if (offset >= dispatch.band.entry_count) {
+      return;
+    }
+
+    const int entry_index = dispatch.band.first_entry + offset;
+    if (entry_index < 0) continue;
+    const std::size_t i = static_cast<std::size_t>(entry_index);
+    if (i >= dispatch.g.global_schedule.size()) continue;
+
+    const GlobalScheduleEntry &entry = dispatch.g.global_schedule[i];
+    BlockExecutionContext local_ctx;
+    local_ctx.bus_writes.mode = dispatch.defer_reduction_folds
+        ? BusWriteMode::ReductionDeferred
+        : dispatch.mode;
+    local_ctx.bus_writes.next_writer_slot = entry.first_writer_slot;
+    local_ctx.bus_writes.fold_after_each_sink =
+        !dispatch.defer_reduction_folds;
+
+    ScheduleEntryExecutionContext local_entry_ctx{
+      dispatch.g,
+      dispatch.nframes,
+      local_ctx
+    };
+    local_entry_ctx.process_entry(entry);
+  }
+}
+
+static bool should_parallelize_schedule_band(
+    const RTGraph &g,
+    const GlobalScheduleBand &band,
+    const BlockExecutionContext &ctx
+) noexcept {
+  if (band.kind != GlobalScheduleBandKind::Free) return false;
+  if (!band_range_valid(g, band)) return false;
+  if (band.entry_count <= 1) return false;
+  if (g.worker_pool.logical_size() <= 1) return false;
+  if (schedule_band_has_duplicate_instances(g, band)) return false;
+
+  const bool has_sinks = schedule_band_has_sink_writers(g, band);
+  if (has_sinks && ctx.bus_writes.mode != BusWriteMode::Reduction) {
+    return false;
+  }
+
+  return true;
+}
+
+static void process_schedule_band(
+    RTGraph &g,
+    const GlobalScheduleBand &band,
+    ScheduleEntryExecutionContext &serial_ctx,
+    BlockExecutionContext &block_ctx
+) noexcept {
+  if (!band_range_valid(g, band)) return;
+
+  const bool has_sinks = schedule_band_has_sink_writers(g, band);
+  if (!should_parallelize_schedule_band(g, band, block_ctx)) {
+    if (band.kind == GlobalScheduleBandKind::Free
+        && band.entry_count > 1
+        && has_sinks
+        && block_ctx.bus_writes.mode == BusWriteMode::Direct) {
+      ++g.last_serialized_free_band_count;
+    }
+    process_schedule_band_serial(g, band, serial_ctx);
+    return;
+  }
+
+  const int first_slot = band_first_writer_slot(g, band);
+  const int end_slot = band_end_writer_slot(g, band);
+  block_ctx.bus_writes.next_writer_slot =
+      std::max(block_ctx.bus_writes.next_writer_slot, end_slot);
+
+  ParallelBandDispatch dispatch{
+    g,
+    band,
+    serial_ctx.nframes,
+    block_ctx.bus_writes.mode,
+    has_sinks && block_ctx.bus_writes.mode == BusWriteMode::Reduction,
+  };
+
+  ++g.last_parallel_band_count;
+  g.last_parallel_entry_count += band.entry_count;
+  g.worker_pool.run_parallel(process_parallel_band_worker, &dispatch);
+
+  // Join is complete when run_parallel returns. If the band wrote
+  // private reduction slots, fold the whole canonical range once on
+  // the audio thread before any later band can observe output_buses.
+  if (dispatch.defer_reduction_folds) {
+    fold_contribution_slots(g, first_slot, end_slot, serial_ctx.nframes);
+  }
+}
+
+static void process_global_schedule_bands(
     RTGraph &g, int nframes, BlockExecutionContext &ctx
 ) noexcept {
   ScheduleEntryExecutionContext worker_ctx{g, nframes, ctx};
-  // C1a consumes C0d's bands but still executes every entry serially.
   // C1c-a hoists instance lifecycle out of the per-entry context:
   // begin every live instance block once before the band loop, and
   // finish it once after all bands complete. This keeps §2.E release
-  // accounting correct when future C1c worker dispatch processes
-  // different bands with different per-worker contexts.
+  // accounting correct when C1c worker dispatch processes different
+  // bands with different per-worker contexts.
   begin_global_schedule_instance_blocks(g);
   for (const GlobalScheduleBand &band : g.global_schedule_bands) {
-    process_schedule_band_serial(g, band, worker_ctx);
+    process_schedule_band(g, band, worker_ctx, ctx);
   }
   finish_global_schedule_instance_blocks(g);
+  ctx.bus_writes.next_writer_slot =
+      std::max(ctx.bus_writes.next_writer_slot,
+               g.global_schedule_writer_slot_count);
 }
 
 static void process_legacy_schedule(
@@ -5392,13 +5703,16 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   std::swap(g.server.output_buses, g.server.output_buses_prev);
   clear_output_buses(g.server, nframes);
 
-  // Phase §4.E.2.C0b/C0d/C1a: rebuild the global schedule from the
+  // Phase §4.E.2.C0b/C0d/C1: rebuild the global schedule from the
   // post-drain instance-state snapshot, then derive conservative
   // runnable bands over it. When the C0c/C1a test switch is enabled,
-  // the executor consumes the bands serially; Phase C can later replace
-  // Free-band serial iteration with worker dispatch.
+  // Barrier bands run on the audio thread and C1c may dispatch eligible
+  // Free bands to the pre-created worker pool.
   build_global_schedule(g);
   build_global_schedule_bands(g);
+  g.last_parallel_band_count = 0;
+  g.last_parallel_entry_count = 0;
+  g.last_serialized_free_band_count = 0;
 
   // Per-block execution context. The writer-slot counter every
   // dispatch boundary advances on each sink write resets here so
@@ -5428,7 +5742,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
 
   if (g.execute_global_schedule
       && global_schedule_covers_audio_schedule(g)) {
-    process_global_schedule_bands_serial(g, nframes, ctx);
+    process_global_schedule_bands(g, nframes, ctx);
   } else {
     process_legacy_schedule(g, nframes, ctx);
   }
@@ -5706,6 +6020,10 @@ static void reset_to_default_state(RTGraph &g) {
   // empty schedule until a loader ships C0a metadata).
   g.global_schedule.clear();
   g.global_schedule_bands.clear();
+  g.global_schedule_writer_slot_count = 0;
+  g.last_parallel_band_count = 0;
+  g.last_parallel_entry_count = 0;
+  g.last_serialized_free_band_count = 0;
 
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
@@ -6024,6 +6342,21 @@ int rt_graph_test_worker_thread_count(const RTGraph *g) {
   return g->worker_pool.background_thread_count();
 }
 
+int rt_graph_test_last_parallel_band_count(const RTGraph *g) {
+  if (!g) return 0;
+  return g->last_parallel_band_count;
+}
+
+int rt_graph_test_last_parallel_entry_count(const RTGraph *g) {
+  if (!g) return 0;
+  return g->last_parallel_entry_count;
+}
+
+int rt_graph_test_last_serialized_free_band_count(const RTGraph *g) {
+  if (!g) return 0;
+  return g->last_serialized_free_band_count;
+}
+
 int rt_graph_test_contribution_slot_target(const RTGraph *g, int ws) {
   if (!g) return -1;
   const auto &storage = g->contribution_storage;
@@ -6035,10 +6368,7 @@ int rt_graph_test_contribution_slot_used(const RTGraph *g, int ws) {
   if (!g) return 0;
   const auto &storage = g->contribution_storage;
   if (ws < 0 || ws >= storage.max_writer_slots) return 0;
-  const std::size_t word = static_cast<std::size_t>(ws) / 64;
-  const std::uint64_t bit = std::uint64_t{1}
-                            << (static_cast<std::size_t>(ws) % 64);
-  return (storage.used_words[word] & bit) ? 1 : 0;
+  return contribution_slot_used(storage, ws) ? 1 : 0;
 }
 
 int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,

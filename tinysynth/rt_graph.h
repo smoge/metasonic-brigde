@@ -636,8 +636,9 @@ void rt_graph_test_set_global_schedule_execution(RTGraph *g, int on);
 // logical worker lane count on the RTGraph-owned pool. Values <= 1
 // create no background worker threads and keep execution purely
 // serial. Values > 1 create (worker_count - 1) idle background
-// workers, ready for a future Phase C dispatch path. This is
-// construction/test-only: call while audio is stopped. No-op on null g.
+// workers. With global-schedule execution enabled, C1c can use those
+// workers for conservative Free-band dispatch. This is construction /
+// test-only: call while audio is stopped. No-op on null g.
 void rt_graph_test_set_worker_pool_size(RTGraph *g, int worker_count);
 
 // [T:read-only] Current logical worker lane count configured via
@@ -648,6 +649,17 @@ int rt_graph_test_worker_pool_size(const RTGraph *g);
 // the graph. Returns 0 on null g. For logical sizes 0 and 1 this is 0;
 // for logical size N > 1 this is N - 1.
 int rt_graph_test_worker_thread_count(const RTGraph *g);
+
+// [T:read-only] Phase §4.E.2.C1c-b test counters from the most recent
+// process block. `parallel_band_count` is the number of Free bands
+// dispatched through the worker pool; `parallel_entry_count` is the
+// total entries claimed by that path; `serialized_free_band_count` is
+// the number of multi-entry Free bands explicitly kept on the audio
+// thread because they contained sink writers while reduction mode was
+// off. All return 0 on null g.
+int rt_graph_test_last_parallel_band_count(const RTGraph *g);
+int rt_graph_test_last_parallel_entry_count(const RTGraph *g);
+int rt_graph_test_last_serialized_free_band_count(const RTGraph *g);
 
 // [T:read-only] Phase §4.E.2.B2 test surface: per-slot resolved
 // bus index for the most recent reduction-capture block.

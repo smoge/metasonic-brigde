@@ -6572,6 +6572,95 @@ static void build_split_free_lifecycle_graph(RTGraph *g) {
                                         /*item_count=*/1, side_region);
 }
 
+static void add_template_const_node(
+    RTGraph *g, int template_id, int idx, float a, float b
+) {
+    rt_graph_template_add_node(g, template_id, idx, 8); // Add
+    rt_graph_template_set_default(g, template_id, idx, 0, a);
+    rt_graph_template_set_default(g, template_id, idx, 1, b);
+}
+
+static void build_free_sink_writer_band_graph(RTGraph *g) {
+    rt_graph_template_set_polyphony(g, 0, 2);
+    add_template_const_node(g, 0, 0, 0.25f, 0.0f);
+    rt_graph_instance_set_control(g, 0, 0, 0, 0.25);
+    rt_graph_instance_set_control(g, 0, 0, 1, 0.0);
+
+    rt_graph_template_add_node(g, 0, 1, 2); // Out(bus 0)
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_instance_set_control(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/2);
+    const int sink_region[] = {0};
+    // Deliberately mark the sink step as FreeLayer. Haskell normally
+    // keeps sink regions as barriers today; this C++ fixture exercises
+    // C1c-b's runtime safety gate directly.
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, sink_region);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 1);
+}
+
+static void build_parallel_send_return_graph(RTGraph *g) {
+    rt_graph_ensure_bus(g, 1);
+
+    rt_graph_template_set_polyphony(g, 0, 2);
+    add_template_const_node(g, 0, 0, 0.25f, 0.0f);
+    rt_graph_instance_set_control(g, 0, 0, 0, 0.25);
+    rt_graph_instance_set_control(g, 0, 0, 1, 0.0);
+    rt_graph_template_add_node(g, 0, 1, 10); // BusOut(bus 1)
+    rt_graph_template_set_default(g, 0, 1, 0, 1.0);
+    rt_graph_instance_set_control(g, 0, 1, 0, 1.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/2);
+    const int send_region[] = {0};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, send_region);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 1);
+
+    const int reader = rt_graph_template_add(g);
+    REQUIRE(reader == 1);
+    rt_graph_template_add_node(g, reader, 0, 11); // BusIn(bus 1)
+    rt_graph_template_set_default(g, reader, 0, 0, 1.0);
+    rt_graph_template_add_node(g, reader, 1, 2);  // Out(bus 0)
+    rt_graph_template_set_default(g, reader, 1, 0, 0.0);
+    rt_graph_template_connect(g, reader, 0, 0, 1, 0);
+    rt_graph_template_add_region(g, reader, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/2);
+    const int read_region[] = {0};
+    rt_graph_template_add_schedule_step(g, reader, /*Barrier=*/0,
+                                        /*item_count=*/1, read_region);
+    REQUIRE(rt_graph_template_instance_add(g, reader) >= 0);
+}
+
+static void build_parallel_release_graph(RTGraph *g) {
+    rt_graph_template_set_polyphony(g, 0, 2);
+    rt_graph_template_add_node(g, 0, 0, 9); // Env
+    rt_graph_template_set_default(g, 0, 0, 0, 1.0);
+    rt_graph_template_set_default(g, 0, 0, 1, 0.0005);
+    rt_graph_template_set_default(g, 0, 0, 2, 0.002);
+    rt_graph_template_set_default(g, 0, 0, 3, 0.5);
+    rt_graph_template_set_default(g, 0, 0, 4, 0.002);
+    rt_graph_instance_set_control(g, 0, 0, 0, 1.0);
+    rt_graph_instance_set_control(g, 0, 0, 1, 0.0005);
+    rt_graph_instance_set_control(g, 0, 0, 2, 0.002);
+    rt_graph_instance_set_control(g, 0, 0, 3, 0.5);
+    rt_graph_instance_set_control(g, 0, 0, 4, 0.002);
+
+    rt_graph_template_add_node(g, 0, 1, 2); // Out(bus 0)
+    rt_graph_template_set_default(g, 0, 1, 0, 0.0);
+    rt_graph_instance_set_control(g, 0, 1, 0, 0.0);
+    rt_graph_template_connect(g, 0, 0, 0, 1, 0);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/2);
+    const int env_out_region[] = {0};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, env_out_region);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 1);
+}
+
 TEST_CASE("reduction capture: flat fallback puts distinct sinks in distinct slots") {
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
@@ -7312,6 +7401,159 @@ TEST_CASE("global schedule executor: split free bands do not restart lifecycle")
         CHECK(rt_graph_instance_alive(g, 0) == 1);
         CHECK(rt_graph_instance_status(g, 0) == 1);
     }
+
+    rt_graph_destroy(g);
+}
+
+// ----------------------------------------------------------------
+// Phase §4.E.2.C1c-b: parallel Free-band dispatch gates
+// ----------------------------------------------------------------
+
+TEST_CASE("global schedule executor: free no-sink band dispatches in parallel") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_set_polyphony(g, 0, 3);
+    add_const_node(g, 0, 0.125f, 0.5f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    const int region0[] = {0};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, region0);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 1);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 2);
+
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_global_schedule_band_count(g) == 1);
+    CHECK(rt_graph_test_last_parallel_band_count(g) == 1);
+    CHECK(rt_graph_test_last_parallel_entry_count(g) == 3);
+    CHECK(rt_graph_test_last_serialized_free_band_count(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("global schedule executor: direct-mode sink free band serializes") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_free_sink_writer_band_graph(g);
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_global_schedule_band_count(g) == 1);
+    CHECK(rt_graph_test_last_parallel_band_count(g) == 0);
+    CHECK(rt_graph_test_last_parallel_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_serialized_free_band_count(g) == 1);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    const auto bus0 = read_bus_vec(g, 0, kFrames);
+    for (float v : bus0) {
+        CHECK(v == 0.5f);
+    }
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("global schedule executor: reduction-mode sink free band dispatches in parallel") {
+    auto *direct = rt_graph_create(4, kFrames);
+    auto *reduced = rt_graph_create(4, kFrames);
+    REQUIRE(direct != nullptr);
+    REQUIRE(reduced != nullptr);
+
+    build_free_sink_writer_band_graph(direct);
+    build_free_sink_writer_band_graph(reduced);
+
+    rt_graph_test_set_worker_pool_size(direct, 3);
+    rt_graph_test_set_worker_pool_size(reduced, 3);
+    rt_graph_test_set_global_schedule_execution(direct, 1);
+    rt_graph_test_set_global_schedule_execution(reduced, 1);
+    rt_graph_test_set_reduction_capture(reduced, 1);
+
+    rt_graph_process(direct, kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    CHECK(rt_graph_test_last_serialized_free_band_count(direct) == 1);
+    CHECK(rt_graph_test_last_parallel_band_count(reduced) == 1);
+    CHECK(rt_graph_test_last_parallel_entry_count(reduced) == 2);
+    CHECK(rt_graph_test_last_serialized_free_band_count(reduced) == 0);
+    CHECK(rt_graph_test_last_writer_slot_count(reduced) == 2);
+    CHECK(rt_graph_test_contribution_slot_target(reduced, 0) == 0);
+    CHECK(rt_graph_test_contribution_slot_target(reduced, 1) == 0);
+
+    check_exact_same(read_bus_vec(direct, 0, kFrames),
+                     read_bus_vec(reduced, 0, kFrames));
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
+}
+
+TEST_CASE("global schedule executor: parallel reduction joins before reader band") {
+    auto *direct = rt_graph_create(8, kFrames);
+    auto *reduced = rt_graph_create(8, kFrames);
+    REQUIRE(direct != nullptr);
+    REQUIRE(reduced != nullptr);
+
+    build_parallel_send_return_graph(direct);
+    build_parallel_send_return_graph(reduced);
+
+    rt_graph_test_set_worker_pool_size(direct, 3);
+    rt_graph_test_set_worker_pool_size(reduced, 3);
+    rt_graph_test_set_global_schedule_execution(direct, 1);
+    rt_graph_test_set_global_schedule_execution(reduced, 1);
+    rt_graph_test_set_reduction_capture(reduced, 1);
+
+    rt_graph_process(direct, kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    CHECK(rt_graph_test_last_serialized_free_band_count(direct) == 1);
+    CHECK(rt_graph_test_last_parallel_band_count(reduced) == 1);
+    CHECK(rt_graph_test_last_parallel_entry_count(reduced) == 2);
+
+    const auto direct_bus0 = read_bus_vec(direct, 0, kFrames);
+    const auto reduced_bus0 = read_bus_vec(reduced, 0, kFrames);
+    check_exact_same(direct_bus0, reduced_bus0);
+    for (float v : reduced_bus0) {
+        CHECK(v == 0.5f);
+    }
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
+}
+
+TEST_CASE("global schedule executor: release accounting survives parallel sink dispatch") {
+    auto *g = rt_graph_create(4, 256);
+    REQUIRE(g != nullptr);
+
+    build_parallel_release_graph(g);
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_test_set_reduction_capture(g, 1);
+
+    rt_graph_process(g, 256);
+    REQUIRE(rt_graph_test_last_parallel_band_count(g) == 1);
+    REQUIRE(rt_graph_instance_status(g, 0) == 0);
+    rt_graph_instance_release(g, 0);
+    REQUIRE(rt_graph_instance_status(g, 0) == 1);
+
+    bool saw_parallel = false;
+    bool freed = false;
+    for (int i = 0; i < 64; ++i) {
+        rt_graph_process(g, 256);
+        saw_parallel = saw_parallel
+            || rt_graph_test_last_parallel_band_count(g) > 0;
+        if (rt_graph_instance_alive(g, 0) == 0) {
+            freed = true;
+            break;
+        }
+    }
+
+    CHECK(saw_parallel);
+    CHECK(freed);
+    CHECK(rt_graph_instance_status(g, 0) == -1);
 
     rt_graph_destroy(g);
 }
