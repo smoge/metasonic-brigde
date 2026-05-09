@@ -7632,6 +7632,179 @@ TEST_CASE("global schedule bands: same-instance free layers split before barrier
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase §4.E.2.C1d-a: descriptive per-region work items
+// ----------------------------------------------------------------
+
+TEST_CASE("region-layer work items: non-contiguous free step preserves item order") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.1f, 0.0f);
+    add_const_node(g, 1, 0.2f, 0.0f);
+    add_const_node(g, 2, 0.3f, 0.0f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/2, /*node_count=*/1);
+
+    const int free_items[] = {0, 2};
+    const int barrier_item[] = {1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, free_items);
+    rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                        /*item_count=*/1, barrier_item);
+
+    // Default polyphony is 8; each instance can emit 3 region work
+    // items. The capacity accessor pins the construction-time reserve
+    // that makes the per-block builder allocation-free.
+    CHECK(rt_graph_test_region_layer_work_item_capacity(g) >= 24);
+
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_global_schedule_entry_count(g) == 2);
+    REQUIRE(rt_graph_test_region_layer_work_item_count(g) == 3);
+
+    CHECK(rt_graph_test_region_layer_work_item_entry(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_step(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_item(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 0) == 0);
+
+    CHECK(rt_graph_test_region_layer_work_item_entry(g, 1) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_step(g, 1) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_item(g, 1) == 1);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 1) == 2);
+
+    CHECK(rt_graph_test_region_layer_work_item_entry(g, 2) == 1);
+    CHECK(rt_graph_test_region_layer_work_item_step(g, 2) == 1);
+    CHECK(rt_graph_test_region_layer_work_item_item(g, 2) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 2) == 1);
+
+    for (int i = 0; i < 3; ++i) {
+        CHECK(rt_graph_test_region_layer_work_item_template(g, i) == 0);
+        CHECK(rt_graph_test_region_layer_work_item_instance(g, i) == 0);
+        CHECK(rt_graph_test_region_layer_work_item_first_writer_slot(g, i) == 0);
+        CHECK(rt_graph_test_region_layer_work_item_writer_slot_count(g, i) == 0);
+    }
+
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 1);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 2);
+    CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(g) == 0);
+
+    CHECK(rt_graph_test_region_layer_work_item_entry(g, 3) == -1);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 3) == -1);
+    CHECK(rt_graph_test_region_layer_work_item_first_writer_slot(g, 3) == -1);
+    CHECK(rt_graph_test_region_layer_work_item_writer_slot_count(g, 3) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("region-layer work items: writer slot subranges follow region order") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    rt_graph_ensure_bus(g, 1);
+
+    add_const_node(g, 0, 0.25f, 0.0f);
+    rt_graph_add_node(g, 1, 2); // Out(bus 0)
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    add_const_node(g, 2, 0.5f, 0.0f);
+    rt_graph_add_node(g, 3, 10); // BusOut(bus 1)
+    rt_graph_set_control(g, 3, 0, 1.0f);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/2);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/2, /*node_count=*/2);
+
+    const int sink_items[] = {0, 1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, sink_items);
+
+    CHECK(rt_graph_test_region_layer_work_item_capacity(g) >= 16);
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_region_layer_work_item_count(g) == 2);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_first_writer_slot(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_writer_slot_count(g, 0) == 1);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 1) == 1);
+    CHECK(rt_graph_test_region_layer_work_item_first_writer_slot(g, 1) == 1);
+    CHECK(rt_graph_test_region_layer_work_item_writer_slot_count(g, 1) == 1);
+
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(g) == 1);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 2);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("region-layer work items: capacity uses occupied count above lowered cap") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    rt_graph_template_set_polyphony(g, 0, 8);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 1);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 2);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 3);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 4);
+    rt_graph_template_set_polyphony(g, 0, 2);
+
+    add_const_node(g, 0, 0.1f, 0.0f);
+    add_const_node(g, 1, 0.2f, 0.0f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    const int items[] = {0, 1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, items);
+
+    // Live count is five (auto instance + four spawns). The lowered
+    // cap is two, but the reserve bound must use max(polyphony,
+    // occupied) so every live slot's two region work items fit.
+    CHECK(rt_graph_test_region_layer_work_item_capacity(g) >= 10);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_region_layer_work_item_count(g) == 10);
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 5);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 10);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("region-layer work items: clear resets snapshot and counters") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.1f, 0.0f);
+    add_const_node(g, 1, 0.2f, 0.0f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    const int items[] = {0, 1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, items);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_region_layer_work_item_count(g) == 2);
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 1);
+
+    rt_graph_clear(g);
+    CHECK(rt_graph_test_region_layer_work_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("contribution capacity: parallel vector sizing across many capacities") {
     // Direct lockstep regression. Walk a handful of distinct
     // capacities (including ones that cross the 64-slot boundary

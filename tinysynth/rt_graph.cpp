@@ -941,6 +941,26 @@ struct GlobalScheduleEntry {
   int writer_slot_count = 0;
 };
 
+// Phase §4.E.2.C1d-a: descriptive work item for a single scheduled
+// region inside one GlobalScheduleEntry. C1c dispatches whole entries
+// (one ScheduleStepSpec) to workers; C1d will be able to dispatch
+// individual sink-free regions from a multi-region FreeLayer entry.
+//
+// Built once per block from global_schedule and MetaDef::schedule_steps.
+// The executor does not consume this vector in C1d-a; tests inspect it
+// to pin the canonical mapping and writer-slot subranges before C1d-b
+// introduces any region-level worker dispatch.
+struct RegionLayerWorkItem {
+  int global_entry_index = 0;
+  int template_id = 0;
+  int instance_slot = 0;
+  int step_index = 0;
+  int item_index = 0;
+  int region_ordinal = 0;
+  int first_writer_slot = 0;
+  int writer_slot_count = 0;
+};
+
 // Phase §4.E.2.C0d/C1: one contiguous run of entries from
 // RTGraph::global_schedule with the same execution policy. Barrier
 // bands always run on the audio thread; C1c may dispatch eligible Free
@@ -2082,6 +2102,14 @@ struct RTGraph {
   std::vector<GlobalScheduleEntry> global_schedule;
   int global_schedule_writer_slot_count = 0;
 
+  // Phase §4.E.2.C1d-a: per-region expansion of global_schedule.
+  // Every RegionLayerWorkItem points back to one GlobalScheduleEntry
+  // and one item inside that entry's ScheduleStepSpec. Capacity is
+  // reserved off the audio thread by ensure_region_layer_work_item_capacity;
+  // build_region_layer_work_items only clear() + push_back()s into the
+  // existing allocation. Observational in C1d-a.
+  std::vector<RegionLayerWorkItem> region_layer_work_items;
+
   // Phase §4.E.2.C0d/C1a: runnable bands over global_schedule. Each
   // band stores a contiguous [first_entry, first_entry + entry_count)
   // slice. Barrier bands are singletons; free bands are conservative
@@ -2105,6 +2133,16 @@ struct RTGraph {
   int last_parallel_band_count = 0;
   int last_parallel_entry_count = 0;
   int last_serialized_free_band_count = 0;
+
+  // Phase §4.E.2.C1d-a test/debug counters for the most recent block.
+  // `candidate_*` count multi-region FreeLayer entries whose regions
+  // are sink-free and therefore eligible for future C1d region-level
+  // dispatch. `serialized_sink_entry_count` counts multi-region
+  // FreeLayer entries that currently must remain entry-serial because
+  // at least one region owns a sink writer.
+  int last_c1d_candidate_entry_count = 0;
+  int last_c1d_candidate_item_count = 0;
+  int last_c1d_serialized_sink_entry_count = 0;
 };
 
 namespace {
@@ -2511,6 +2549,49 @@ static void ensure_global_schedule_capacity(RTGraph &g) {
     const auto n = static_cast<std::size_t>(required);
     g.global_schedule.reserve(n);
     g.global_schedule_bands.reserve(n);
+  }
+}
+
+// Phase §4.E.2.C1d-a: number of per-region work items the block
+// builder can produce at high water. This is the same
+// max(polyphony, occupied) multiplier as global_schedule, but each
+// schedule step contributes its item_count rather than one entry.
+// Construction validates ScheduleStepSpec slices; this helper is
+// still defensive so a malformed debug path cannot ask reserve() for
+// a negative / nonsensical size.
+[[nodiscard]] static int
+required_region_layer_work_items(const RTGraph &g) noexcept {
+  int total = 0;
+  for (std::size_t tid = 0; tid < g.defs.size(); ++tid) {
+    const MetaDef &def = g.defs[tid];
+    if (def.schedule_steps.empty()) continue;
+
+    int items_per_instance = 0;
+    for (const ScheduleStepSpec &step : def.schedule_steps) {
+      if (step.item_count > 0) {
+        items_per_instance += step.item_count;
+      }
+    }
+    if (items_per_instance == 0) continue;
+
+    const int poly = def.polyphony;
+    const int occ = occupied_instances_for_template(
+        g, static_cast<int>(tid));
+    const int per = poly > occ ? poly : occ;
+    total += per * items_per_instance;
+  }
+  return total;
+}
+
+// Grow-only reserve for RegionLayerWorkItem storage so
+// build_region_layer_work_items can run on the audio path with no
+// allocation. Called from the same construction mutations as the C0b
+// global-schedule reserve because the same template polyphony and
+// schedule-step metadata determine the bound.
+static void ensure_region_layer_work_item_capacity(RTGraph &g) {
+  const int required = required_region_layer_work_items(g);
+  if (required > 0) {
+    g.region_layer_work_items.reserve(static_cast<std::size_t>(required));
   }
 }
 
@@ -5335,6 +5416,70 @@ static void build_global_schedule(RTGraph &g) noexcept {
   g.global_schedule_writer_slot_count = next_writer_slot;
 }
 
+static void build_region_layer_work_items(RTGraph &g) noexcept {
+  g.region_layer_work_items.clear();
+  g.last_c1d_candidate_entry_count = 0;
+  g.last_c1d_candidate_item_count = 0;
+  g.last_c1d_serialized_sink_entry_count = 0;
+
+  const int entry_count = static_cast<int>(g.global_schedule.size());
+  for (int entry_index = 0; entry_index < entry_count; ++entry_index) {
+    const auto &entry =
+        g.global_schedule[static_cast<std::size_t>(entry_index)];
+    if (entry.template_id < 0 || entry.step_index < 0) continue;
+    const std::size_t tid = static_cast<std::size_t>(entry.template_id);
+    if (tid >= g.defs.size()) continue;
+    const MetaDef &def = g.defs[tid];
+
+    const std::size_t step_pos = static_cast<std::size_t>(entry.step_index);
+    if (step_pos >= def.schedule_steps.size()) continue;
+    const ScheduleStepSpec &step = def.schedule_steps[step_pos];
+    if (step.first_item < 0 || step.item_count <= 0) continue;
+    const std::size_t first_item = static_cast<std::size_t>(step.first_item);
+    const std::size_t item_count = static_cast<std::size_t>(step.item_count);
+    if (first_item > def.schedule_step_regions.size()
+        || item_count > def.schedule_step_regions.size() - first_item) {
+      continue;
+    }
+
+    int next_writer_slot = entry.first_writer_slot;
+    bool has_sink_writer = false;
+    int emitted_items = 0;
+    for (std::size_t item = 0; item < item_count; ++item) {
+      const int region_ordinal = def.schedule_step_regions[first_item + item];
+      if (region_ordinal < 0) continue;
+      const std::size_t region_pos = static_cast<std::size_t>(region_ordinal);
+      if (region_pos >= def.regions.size()) continue;
+
+      const int writer_count =
+          region_sink_writer_count(def, def.regions[region_pos]);
+      has_sink_writer = has_sink_writer || writer_count > 0;
+      g.region_layer_work_items.push_back(
+          RegionLayerWorkItem{
+            entry_index,
+            entry.template_id,
+            entry.instance_slot,
+            entry.step_index,
+            static_cast<int>(item),
+            region_ordinal,
+            next_writer_slot,
+            writer_count
+          });
+      next_writer_slot += writer_count;
+      ++emitted_items;
+    }
+
+    if (step.kind == ScheduleStepKind::FreeLayer && emitted_items > 1) {
+      if (has_sink_writer) {
+        ++g.last_c1d_serialized_sink_entry_count;
+      } else {
+        ++g.last_c1d_candidate_entry_count;
+        g.last_c1d_candidate_item_count += emitted_items;
+      }
+    }
+  }
+}
+
 static const ScheduleStepSpec *
 schedule_step_for_entry(
     const RTGraph &g, const GlobalScheduleEntry &entry
@@ -5758,11 +5903,13 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   clear_output_buses(g.server, nframes);
 
   // Phase §4.E.2.C0b/C0d/C1: rebuild the global schedule from the
-  // post-drain instance-state snapshot, then derive conservative
+  // post-drain instance-state snapshot, expand it into C1d-a
+  // per-region work items for observation, then derive conservative
   // runnable bands over it. When the C0c/C1a test switch is enabled,
   // Barrier bands run on the audio thread and C1c may dispatch eligible
   // Free bands to the pre-created worker pool.
   build_global_schedule(g);
+  build_region_layer_work_items(g);
   build_global_schedule_bands(g);
   g.last_parallel_band_count = 0;
   g.last_parallel_entry_count = 0;
@@ -6073,11 +6220,15 @@ static void reset_to_default_state(RTGraph &g) {
   // 0 has no schedule_steps yet — so the first build produces an
   // empty schedule until a loader ships C0a metadata).
   g.global_schedule.clear();
+  g.region_layer_work_items.clear();
   g.global_schedule_bands.clear();
   g.global_schedule_writer_slot_count = 0;
   g.last_parallel_band_count = 0;
   g.last_parallel_entry_count = 0;
   g.last_serialized_free_band_count = 0;
+  g.last_c1d_candidate_entry_count = 0;
+  g.last_c1d_candidate_item_count = 0;
+  g.last_c1d_serialized_sink_entry_count = 0;
 
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
@@ -6303,6 +6454,9 @@ int rt_graph_template_add(RTGraph *g) {
   // change cannot silently let the audio path fall off the
   // reserved capacity.
   ensure_global_schedule_capacity(*g);
+  // C1d-a counterpart: a fresh template has zero scheduled-region
+  // items, so this is also a symmetry/no-op call today.
+  ensure_region_layer_work_item_capacity(*g);
 
   return static_cast<int>(g->defs.size() - 1);
 }
@@ -6333,6 +6487,8 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
   ensure_contribution_capacity(*g);
   // Same grow-only invariant for the C0b global-schedule reserve.
   ensure_global_schedule_capacity(*g);
+  // Same grow-only invariant for the C1d-a region work-item reserve.
+  ensure_region_layer_work_item_capacity(*g);
 }
 
 // Number of registered templates. Iterate 0..count-1 to enumerate.
@@ -6584,6 +6740,96 @@ int rt_graph_test_global_schedule_band_entry_count(
 ) {
   const auto *b = global_schedule_band_at(g, band_index);
   return b ? b->entry_count : -1;
+}
+
+// Phase §4.E.2.C1d-a test surfaces. See header docblock.
+int rt_graph_test_region_layer_work_item_count(const RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->region_layer_work_items.size());
+}
+
+int rt_graph_test_region_layer_work_item_capacity(const RTGraph *g) {
+  if (!g) return 0;
+  return static_cast<int>(g->region_layer_work_items.capacity());
+}
+
+namespace {
+const RegionLayerWorkItem *
+region_layer_work_item_at(const RTGraph *g, int item_index) {
+  if (!g) return nullptr;
+  if (item_index < 0) return nullptr;
+  const std::size_t i = static_cast<std::size_t>(item_index);
+  if (i >= g->region_layer_work_items.size()) return nullptr;
+  return &g->region_layer_work_items[i];
+}
+}  // namespace
+
+int rt_graph_test_region_layer_work_item_entry(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->global_entry_index : -1;
+}
+
+int rt_graph_test_region_layer_work_item_template(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->template_id : -1;
+}
+
+int rt_graph_test_region_layer_work_item_instance(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->instance_slot : -1;
+}
+
+int rt_graph_test_region_layer_work_item_step(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->step_index : -1;
+}
+
+int rt_graph_test_region_layer_work_item_item(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->item_index : -1;
+}
+
+int rt_graph_test_region_layer_work_item_region(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->region_ordinal : -1;
+}
+
+int rt_graph_test_region_layer_work_item_first_writer_slot(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->first_writer_slot : -1;
+}
+
+int rt_graph_test_region_layer_work_item_writer_slot_count(
+    const RTGraph *g, int item_index
+) {
+  const auto *item = region_layer_work_item_at(g, item_index);
+  return item ? item->writer_slot_count : -1;
+}
+
+int rt_graph_test_last_c1d_candidate_entry_count(const RTGraph *g) {
+  return g ? g->last_c1d_candidate_entry_count : 0;
+}
+
+int rt_graph_test_last_c1d_candidate_item_count(const RTGraph *g) {
+  return g ? g->last_c1d_candidate_item_count : 0;
+}
+
+int rt_graph_test_last_c1d_serialized_sink_entry_count(const RTGraph *g) {
+  return g ? g->last_c1d_serialized_sink_entry_count : 0;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named
@@ -6893,6 +7139,9 @@ void rt_graph_template_add_schedule_step(
   // for this template. Reserve here so build_global_schedule on
   // the audio path is alloc-free. Grow-only.
   ensure_global_schedule_capacity(*g);
+  // C1d-a: the per-region expansion grows by
+  // max(polyphony, occupied) × item_count for this step.
+  ensure_region_layer_work_item_capacity(*g);
 }
 
 // Step C (d): mark a node as elided. Idempotent on existing state;
