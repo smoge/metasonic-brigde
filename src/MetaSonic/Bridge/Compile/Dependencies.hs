@@ -15,8 +15,8 @@
 --     shapes.
 --   * 'regionBusPrecedence' — bus-only edge subgraph.
 --   * 'regionStructuralPrecedence' — cross-region port-edge subgraph.
---   * 'regionDependencies' — the union view consumed by future
---     scheduling work.
+  --   * 'regionDependencies' — the union view consumed by scheduler
+  --     planning and metadata generation.
 --   * 'isLiveBusKind' / 'regionHasLiveBus' — barrier predicate
 --     under the §4.E.1c policy.
 --
@@ -105,7 +105,7 @@ attachRegionFootprints rg =
 
 {- Note [Region dependency contract]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A future scheduler (§4.E.2 onwards) needs the /full/ region
+The scheduler planner (§4.E.2 onwards) needs the /full/ region
 dependency graph: which regions must execute before which others.
 That graph has two independent edge sources:
 
@@ -247,7 +247,7 @@ regionStructuralPrecedence rg =
   in M.fromList [(rrIndex r, depsFor r) | r <- regions]
 
 -- | Full region dependency graph: the union of bus-dataflow and
--- structural-port edges. This is the view a future scheduler
+-- structural-port edges. This is the view the scheduler planner
 -- (§4.E.2) consumes for any "must precede" decision. See
 -- Note [Region dependency contract] for why both edge classes
 -- matter, and Note [Region barrier policy] for how a scheduler

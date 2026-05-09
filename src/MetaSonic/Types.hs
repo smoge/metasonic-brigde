@@ -314,11 +314,14 @@ kindSpec = \case
   -- carry sample-rate information that cannot be coarsened without
   -- losing audio.
   --
-  --   * Oscillators (SinOsc, SawOsc) run a phase accumulator per sample
-  --     so the per-sample lookup yields the right waveform.
+  --   * Oscillators (SinOsc, SawOsc, PulseOsc, TriOsc) run a phase
+  --     accumulator per sample so the per-sample lookup yields the
+  --     right waveform.
   --   * NoiseGen uses a PRNG that produces one value per sample.
-  --   * LPF and Env are stateful: a block-rate biquad would alias and
-  --     a block-rate envelope would miss gate transitions.
+  --   * Delay and Smooth carry sample history across blocks.
+  --   * The biquad family (LPF, HPF, BPF, Notch) and Env are stateful:
+  --     a block-rate biquad would alias and a block-rate envelope
+  --     would miss gate transitions.
   --   * BusIn / BusInDelayed read sample-rate bus storage; coarsening
   --     them would silently drop samples.
   KSinOsc       -> KindSpec 1  SampleRate  2 2 "sinOsc"

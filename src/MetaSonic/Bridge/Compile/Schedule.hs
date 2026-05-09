@@ -1,15 +1,16 @@
 {-# LANGUAGE DerivingStrategies #-}
 -- |
 -- Module      : MetaSonic.Bridge.Compile.Schedule
--- Description : §4.E.2a — pure single-thread region scheduler
---               planner. Produces the deterministic execution
---               order a future scheduler should consume.
+-- Description : §4.E.2 — pure region scheduler planner. Produces
+--               the deterministic schedule metadata consumed by the
+--               runtime's opt-in schedule executor.
 --
--- This is the planner only; no runtime changes. The C++ executor
--- still walks 'rgRuntimeRegions' in 'rrIndex' order. The function
--- exists as the explicit contract between 'compileRuntimeGraph'
--- and the eventual scheduler ('regionSchedule' encodes the
--- correctness rules a future parallel scheduler must respect):
+-- This module stays pure: it validates and describes the schedule,
+-- while the loader passes the layered metadata to C++. The default
+-- production runtime path can still take the legacy deterministic
+-- executor, but the opt-in global-schedule executor consumes this
+-- metadata. 'regionSchedule' encodes the correctness rules any
+-- serial or parallel executor must respect:
 --
 --   1. Live-bus regions are barriers ('regionHasLiveBus' = True).
 --      They occupy their compile-decreed 'rrIndex' positions and
@@ -28,9 +29,9 @@
 -- barrier-and-topo-sort logic so a future change that breaks
 -- that invariant is caught here, not in the scheduler.
 --
--- Bit-equivalence with the current executor follows from the
--- identity property; the scheduler-side bit-equivalence test
--- (when §4.E.2b lands) will catch any future divergence.
+-- Bit-equivalence with the legacy executor follows from the identity
+-- property; scheduler-side tests catch divergence between the
+-- metadata-driven executor and the legacy path.
 --
 -- The planner is /checked/: it rejects ('Left') any of —
 --
@@ -43,9 +44,9 @@
 --   * cross-segment edges that point to a not-yet-scheduled
 --     region.
 --
--- This is the whole point of having a planner before §4.E.2b —
--- silent fallback would let the runtime start trusting a broken
--- contract.
+-- This is the whole point of having a checked planner before the
+-- runtime consumes schedule metadata: silent fallback would let the
+-- runtime start trusting a broken contract.
 --
 -- See Note [Region barrier policy] and Note [Region dependency
 -- contract] in 'MetaSonic.Bridge.Compile.Dependencies'.
@@ -84,8 +85,8 @@ import           MetaSonic.Bridge.Compile.Types
 -- position) or a 'FreeSegment' — a maximal run of non-barrier
 -- regions that the scheduler may topologically sort.
 --
--- Exported for diagnostic / testability purposes; the scheduler
--- consumes 'regionSchedule' directly.
+-- Exported for diagnostic / testability purposes and for building
+-- checked schedule metadata.
 data Segment
   = Barrier     !RuntimeRegion
   | FreeSegment ![RuntimeRegion]
@@ -112,9 +113,9 @@ data FreeLayer = FreeLayer
 
 -- | Descriptive layered schedule representation for §4.E.
 -- Barriers remain single pinned steps; non-barrier segments are
--- expanded into free topological layers. No runtime consumes this
--- yet — 'regionSchedule' remains the deterministic linear
--- fallback.
+-- expanded into free topological layers. The runtime loader sends
+-- this shape to C++; the opt-in global-schedule executor can consume
+-- it, while 'regionSchedule' remains the deterministic linear view.
 data ScheduleStep
   = ScheduleBarrier   !RegionIndex
   | ScheduleFreeLayer !FreeLayer

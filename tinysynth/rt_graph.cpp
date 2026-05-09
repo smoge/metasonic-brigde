@@ -57,9 +57,10 @@ The Haskell compiler performs the decisive symbolic -> dense lowering:
   NodeID    -> NodeIndex
   Port name -> PortIndex
 
-By the time control reaches this file, there is no symbolic lookup,
-no map from user-facing names to nodes, and no scheduling work left to
-perform.
+By the time control reaches this file, there is no symbolic lookup
+and no map from user-facing names to nodes. Later code may materialize
+Haskell-provided schedule metadata into per-block bands, but it does
+not recover symbolic topology or invent new graph dependencies.
 
 This matters for both simplicity and safety.
 
@@ -176,7 +177,7 @@ constexpr int   kReleaseSilenceBlocks    = 8;
 // rt_graph_instance_status.
 //
 // See Note [§2.E: release-then-free instance lifecycle], Note [Pool
-// model], and (when it lands) Note [A.2: realtime control queue].
+// model], and Note [A.2: realtime control queue].
 enum class SlotState : int {
   Available = -1,  // free; reusable by any spawn path
   Active    = 0,   // running, gate-on / sustaining (was Live)
@@ -440,9 +441,11 @@ This preserves the protocol used by the Haskell side:
   * RFrom edges become rt_graph_connect calls
   * RConst values do not produce connections
 
-At the moment the runtime uses block-latched semantics for connected
-control-like inputs. That's temporary, just for demonstration and simplicity,
-while leaving open the future step to sample-accurate modulation.
+InputRef only records connectivity. Each kernel decides how often to
+sample the referenced buffer: oscillators and Delay can read selected
+ports sample-by-sample, filters latch cutoff/Q once per block, and
+oscillator phase ports currently use construction defaults. Keep this
+comment in sync with 'PortConsumptionRate' in MetaSonic.Types.
 */
 
 struct InputRef {
@@ -845,9 +848,10 @@ region_kernel_from_tag(int kind) noexcept {
 // process_instance iterates as the unit of dispatch when present.
 //
 // `rate` is the int form of the Haskell Rate lattice
-// (0=CompileRate ... 3=SampleRate). The runtime stores it but does
-// not currently make decisions on it; it becomes load-bearing in
-// Step B (region-local scratch buffers) and Step C (per-op fusion).
+// (0=CompileRate ... 3=SampleRate). The runtime stores it for
+// diagnostics and future rate-aware executor decisions; current
+// region execution, fusion dispatch, and worker scheduling do not
+// branch on it.
 //
 // `first_node + node_count` flatten Haskell's [NodeIndex] membership
 // list back into a contiguous range. The contiguity invariant holds
@@ -872,9 +876,9 @@ struct RegionSpec {
 // Phase §4.E.2.C0a: descriptive layered-schedule shape over the
 // template's registered RegionSpec vector. C0b builds the per-block
 // global schedule from these steps, C0d derives runnable bands, and
-// C1a can consume those bands serially under a test switch. The
-// default production executor remains the legacy deterministic linear
-// path until Phase C worker dispatch lands.
+// C1a/C1c can consume those bands under a test switch. The default
+// production executor remains the legacy deterministic linear path
+// unless global-schedule execution is explicitly enabled.
 //
 // `kind` matches the Haskell ScheduleStep tags:
 //   Barrier   = 0  (a single pinned region between free segments)
@@ -991,8 +995,8 @@ struct MetaDef {
   // live (Active or Releasing) instances of this template. Set via
   // rt_graph_template_set_polyphony during construction; defaults to
   // kDefaultPolyphony. rt_graph_template_instance_add returns -1 once
-  // the cap is reached (the runtime is dumb about voice stealing —
-  // that policy lives in the future Phase-3 voice allocator).
+  // the cap is reached; caller-side policy such as VoiceAllocator owns
+  // voice stealing and retry decisions.
   // See Note [Pool model].
   int polyphony = kDefaultPolyphony;
 
@@ -1064,8 +1068,8 @@ struct GraphInstance {
   // finishes each live instance block from the audio thread, outside
   // per-entry worker contexts. These two fields snapshot that
   // top-of-block lifecycle state so finish_instance_block can run once
-  // after all bands complete, even when future worker dispatch gives
-  // different bands to different contexts.
+  // after all bands complete, even when worker dispatch gives different
+  // bands to different contexts.
   bool block_lifecycle_active = false;
   SlotState block_state_at_start = SlotState::Available;
 
@@ -1366,8 +1370,8 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 A.1 made the slot pool fixed-shape and the slot state atomic.
 A.2 layers a single-producer / single-consumer (SPSC) lock-free
-command ring on top so a non-audio "producer" thread (the future
-voice allocator, MIDI handler, or any control-plane caller) can
+command ring on top so a non-audio "producer" thread (VoiceAllocator,
+MIDI handler, or any control-plane caller) can
 spawn / release / remove / set-control on instances *while the
 audio callback is running*, without taking locks and without
 allocating on the audio thread.
@@ -2119,11 +2123,11 @@ struct RTGraph {
   // without reshaping instance lifecycle handling.
   std::vector<GlobalScheduleBand> global_schedule_bands;
 
-  // Phase §4.E.2.C1b: worker-pool lifetime/configuration scaffold.
-  // The schedule executor does not dispatch work to it yet; it is
-  // owned by RTGraph so future Phase C dispatch can use already-created
-  // workers without tying thread allocation to the C0c/C1a execution
-  // switch.
+  // Phase §4.E.2.C1b/C1c: worker-pool lifetime/configuration and
+  // conservative Free-band dispatch. It is owned by RTGraph so tests
+  // can pre-create workers while audio is stopped; process_graph only
+  // wakes already-created workers when the schedule executor decides a
+  // band is eligible.
   ScheduleWorkerPool worker_pool;
 
   // Phase §4.E.2.C1c-b test/debug counters for the most recent block.

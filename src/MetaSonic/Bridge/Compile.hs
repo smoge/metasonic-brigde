@@ -61,11 +61,10 @@ module MetaSonic.Bridge.Compile
     -- Note [Region barrier policy] in that module.
     isLiveBusKind
   , regionHasLiveBus
-  , -- * Region schedule planner (§4.E.2a)
+  , -- * Region schedule planner (§4.E.2)
     --
-    -- From "MetaSonic.Bridge.Compile.Schedule". Pure planner —
-    -- no runtime change. Encodes the contract a future scheduler
-    -- consumes.
+    -- From "MetaSonic.Bridge.Compile.Schedule". Pure planner and
+    -- metadata producer for the runtime's opt-in schedule executor.
     regionSchedule
   , scheduledRuntimeRegions
   , layeredRegionSchedule

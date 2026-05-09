@@ -135,9 +135,12 @@ Each node receives a starting rate equal to 'ksRate' for its kind.
 split is:
 
   Producers / stateful kinds (floor SampleRate):
-    SinOsc, SawOsc, NoiseGen — generate sample-rate streams.
-    LPF, Env                 — carry per-sample state.
-    BusIn, BusInDelayed      — read sample-rate bus storage.
+    SinOsc, SawOsc, PulseOsc, TriOsc, NoiseGen
+      — generate sample-rate streams.
+    LPF, HPF, BPF, Notch, Env, Delay, Smooth
+      — carry per-sample or cross-block state.
+    BusIn, BusInDelayed
+      — read sample-rate bus storage.
 
   Consumers / stateless transforms (floor CompileRate):
     Gain, Add                — stateless arithmetic, no rate of own.

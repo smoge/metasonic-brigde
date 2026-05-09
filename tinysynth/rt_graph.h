@@ -104,8 +104,9 @@ int rt_graph_template_count(RTGraph *g);
 // [T:construction] Set the polyphony cap for a template — the maximum
 // number of simultaneously-live (Active or Releasing) instances of
 // that template. rt_graph_template_instance_add returns -1 once the
-// cap is reached; the runtime does not steal voices automatically
-// (the future Phase-3 voice allocator owns that policy).
+// cap is reached; the runtime does not steal voices automatically.
+// Caller-side policy such as VoiceAllocator owns stealing/retry
+// decisions.
 //
 // Default: 8 per template (covers existing tests). Callers that need
 // more declare it explicitly during construction. Values <= 0 are
@@ -287,9 +288,9 @@ void rt_graph_template_connect_fused_affine_input(
 //
 //   rate         : raw int matching the Haskell 'Rate' lattice ordering
 //                  (0=CompileRate, 1=InitRate, 2=BlockRate, 3=SampleRate).
-//                  Stored verbatim; future Step-B / Step-C work consumes
-//                  it. The runtime does not currently make decisions
-//                  based on rate.
+//                  Stored verbatim for diagnostics and future
+//                  rate-aware executor decisions. The runtime does not
+//                  currently make decisions based on rate.
 //   first_node   : dense index of the region's first node within the
 //                  template's node array.
 //   node_count   : number of contiguous nodes in this region.
