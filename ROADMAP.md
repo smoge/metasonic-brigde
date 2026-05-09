@@ -678,27 +678,32 @@ Current status:
 8. **Bench, corpus refresh, and turn-on decision — done, default-off.**
    The C++ synthetic bench and Haskell-loaded worker bench are in
    place. Synthetic sink-free Free-band compute only wins at enough
-   width / block work; reduction-backed sink dispatch loses on the
-   measured grid. The fixed Haskell-loaded corpus now contains four
-   region-layer C1d candidates (`dirC1d=4`, `redC1d=0`,
-   `maxSfW=3`, `maxWork=9`). The worker bench records actual C1c
-   worker dispatch
+   width / block work; the post-atomic dispatch refresh moves the
+   synthetic sink-free crossover lower, but reduction-backed sink
+   dispatch still loses on the measured grid. The fixed Haskell-loaded
+   corpus now contains four region-layer C1d candidates (`dirC1d=4`,
+   `redC1d=0`, `maxSfW=3`, `maxWork=9`). The worker bench records
+   actual C1c worker dispatch
    (`worker_rows_with_parallel=2`, `parallel_bands=2`,
-   `parallel_entries=6`), but only through targeted probes and with
-   sub-1.0x parallel speedup. The decision note is
+   `parallel_entries=6`), but only through targeted probes. After the
+   atomic dispatch pass, the targeted free-only probe is positive
+   (`best_parallel_worker_speedup=1.42x`), which keeps C1d
+   investigation alive but still does not justify default-on worker
+   scheduling. The decision note is
    `notes/2026-05-09-phase-4e-worker-turn-on-decision.md`.
 
 Next §4.E slice:
 
-1. **C1d design note before runtime code.** The survey now separates
-   region-layer candidates (`dirC1d` / `redC1d`) from actual C1c
-   worker-dispatch counters. The evolved corpus does contain
-   multi-region sink-free `FreeLayer` steps inside one global schedule
-   entry, so a future C1d is plausible. Do not implement it directly:
-   first write the contract for splitting one `FreeLayer` step into
-   per-region work units, including writer-slot assignment, join
-   points, instance lifecycle, direct-mode sink fallback, and the
-   equivalence tests that must pass.
+1. **C1d design note — done; implementation still gated.** The
+   survey now separates region-layer candidates (`dirC1d` / `redC1d`)
+   from actual C1c worker-dispatch counters. The evolved corpus does
+   contain multi-region sink-free `FreeLayer` steps inside one global
+   schedule entry, so a future C1d is plausible. The contract is
+   recorded in
+   `notes/2026-05-09-phase-4e-c1d-region-layer-dispatch-design.md`:
+   split one `FreeLayer` step into per-region work units only through
+   phased metadata, serial-equivalence, sink-free parallel dispatch,
+   and benchmark/decision refresh slices.
 2. **More representative workload only if C1d is pursued.** The
    current C1d candidates are survey rows, not default-on evidence.
    Before spending runtime complexity, add or identify real
@@ -710,12 +715,12 @@ Next §4.E slice:
      - multi-band processing (input → N band splits → per-band chains
        → join);
      - drum machine (N drum templates writing the same master BusOut).
-3. **Benchmark refresh after the realtime-safe primitive.** The
+3. **Benchmark refresh after the realtime-safe primitive — done.** The
    previous worker-bench data measured the old mutex/cv dispatch path.
-   Rerun both the C++ synthetic grid and `--worker-bench` before making
-   any policy change. Counter-confirmed sub-1.0x rows after the atomic
-   dispatch pass are stronger evidence against default-on scheduling
-   than the earlier mutex/cv measurements.
+   The post-atomic refresh shows a stronger sink-free compute envelope
+   and a positive targeted Haskell-loaded row, while sink/reduction and
+   send/return rows remain negative. Repeat this bench step after C1d
+   changes, corpus changes, or pool-policy changes.
 4. **No public switch or default-on path yet.** Do not expose worker
    scheduling outside the test/bench ABI until a successor decision
    record replaces the current default-off decision with explicit

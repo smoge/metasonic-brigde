@@ -3,7 +3,8 @@
 Date: 2026-05-09
 Status: Decision recorded after the C1c bench slice; refreshed after
 representative Haskell-loaded survey / bench data, corpus-evolution
-worker-shape probes, and the C1d region-layer survey clarification.
+worker-shape probes, the C1d region-layer survey clarification, and
+the post-atomic worker benchmark refresh.
 Inputs:
 
 - `2c737ce Benchmark global schedule worker dispatch`
@@ -17,6 +18,8 @@ Inputs:
   `sched/parallel-compute-before-master`,
   `sched/poly-voices-master-fx`, and
   `sched/parallel-fx-rack-master`
+- `notes/2026-05-09-phase-4e-c1d-region-layer-dispatch-design.md`
+- `e77868f Make worker dispatch lock-free on audio thread`
 
 ## Decision
 
@@ -48,9 +51,10 @@ these are true:
 The bench shows a narrow positive envelope:
 
 - `FreeCompute` width 2 loses at both block sizes.
-- `FreeCompute` width 8 only wins at 512 frames.
+- `FreeCompute` width 8 wins at both measured block sizes after the
+  atomic dispatch pass, but remains workload-sensitive.
 - `FreeCompute` width 32 wins at 128 and 512 frames, topping out around
-  2.12x in the measured run.
+  2.17x in the measured run.
 
 The same run shows no useful signal for reduction-backed sink work:
 
@@ -66,9 +70,11 @@ The original C1c worker pool had a realtime-policy gap:
 a condition variable from the audio thread. The follow-up dispatch pass
 removed that audio-thread mutex/cv path and replaced it with atomic
 generation + completion counters. That makes the dispatch substrate
-safe with respect to audio-thread locks/allocation, but it does not
-change the default-off policy: the measured corpus still lacks a
-representative winning workload until the benches are refreshed.
+safe with respect to audio-thread locks/allocation. The post-atomic
+bench refresh improves the sink-free compute envelope, but it does not
+change the default-off policy: the only Haskell-loaded dispatched row
+that wins is still a targeted probe, not representative default-on
+evidence.
 
 ## Representative-data refresh
 
@@ -115,36 +121,31 @@ schedule-serial, pool direct, and pool reduction modes:
 ```text
 cases=56  rows=224  worker_rows=112  worker_rows_with_parallel=2
 parallel_bands=2  parallel_entries=6  serialized_sink_bands=0
-best_parallel_worker_speedup=0.62x
+best_worker_speedup=2.06x  best_parallel_worker_speedup=1.42x
 ```
 
 Interpretation: the Haskell-loaded bench now enters the worker dispatch
 path, but only for the intentionally multi-instance
-`sched/free-only-parallel-compute` probe. That probe loses in both pool
-modes in the measured run (`best_parallel_worker_speedup=0.62x`).
-Rows that look faster while `parallel_bands=0` remain schedule-path
-noise or serial-executor variance. Counter data, not speedup alone, is
-the authority here.
+`sched/free-only-parallel-compute` probe. After the atomic dispatch
+pass, that targeted row is positive (`sched-pool3-direct` 1.42x,
+`sched-pool3-reduce` 1.32x). Rows that look faster while
+`parallel_bands=0` remain schedule-path noise or serial-executor
+variance. Counter data, not speedup alone, is the authority here.
 
 ## Next allowed work
 
 The next runtime-parallelism work should be one of:
 
-- C1d design note: decide whether a future executor should dispatch
-  regions inside a single `FreeLayer` step. The survey now labels this
-  as `dirC1d` / `redC1d` so it is not confused with C1c worker-dispatch
-  evidence. The design must pin writer-slot assignment, per-band joins,
-  lifecycle ownership, direct-mode sink fallback, and the equivalence
-  tests before runtime code changes;
+- C1d substrate implementation, only in the phases described by the C1d
+  design note: allocation-free metadata/introspection, serial
+  region-item equivalence, sink-free parallel region items, then bench
+  and decision refresh. Do not start with worker dispatch directly;
 - corpus evolution: add or identify less synthetic Haskell-loaded demos
   with enough region-layer work to make C1d worth benchmarking. The
   first targeted probes prove the instrumentation can see the shape, but
   they are not a representative default-on basis;
-- benchmark refresh: rerun both the C++ synthetic grid and
-  `--worker-bench` after the atomic dispatch pass. Treat the previous
-  mutex/cv worker-bench numbers as superseded for performance policy,
-  but keep their counter data as evidence of which rows actually
-  reached worker dispatch;
+- benchmark refresh: done for the atomic dispatch pass. Repeat only
+  after C1d changes, corpus changes, or pool-policy changes;
 - policy prototype under the test ABI only, and only after representative
   rows actually enter worker dispatch: sink-free bands, no reduction,
   minimum width/work threshold, and full T-9 equivalence.
@@ -154,4 +155,6 @@ record replaces this one. That successor record must define the
 representative corpus and threshold explicitly; this note only records the
 current negative decision. As of this refresh, worker dispatch is
 observable from the Haskell-loaded corpus, but the only dispatched rows
-are targeted probes and the measured parallel speedup is below 1.0x.
+are targeted probes. One targeted row now measures above 1.0x, which is
+good evidence for continuing C1d investigation, but not enough evidence
+for a public switch or default-on policy.

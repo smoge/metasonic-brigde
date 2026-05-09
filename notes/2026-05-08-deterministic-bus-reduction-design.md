@@ -957,8 +957,10 @@ sink-free Free-band compute at enough width and block work. Reduction-
 backed sink dispatch and send/return dispatch both lose on the
 current bench grid. A follow-up pass replaced the worker wake/join
 primitive's audio-thread mutex / condition-variable path with atomic
-generation + completion counters, but the default-off policy remains
-until post-atomic-dispatch benchmarks show a representative win.
+generation + completion counters. The post-atomic benchmark refresh
+improved the sink-free compute envelope, but the default-off policy
+remains until a representative Haskell-loaded workload wins and a
+successor decision record defines the public policy.
 
 This updates §13's "bench work gates whether Phase C ships
 defaulted-on or defaulted-off" question: for now, Phase C remains
@@ -974,17 +976,27 @@ The representative-data refresh added two Haskell-facing checks:
     On the measured run it reported `worker_rows_with_parallel=2`,
     `parallel_bands=2`, and `parallel_entries=6`; the only dispatched
     row was the intentionally multi-instance
-    `sched/free-only-parallel-compute` probe, and it lost
-    (`best_parallel_worker_speedup=0.62x`).
+    `sched/free-only-parallel-compute` probe. After the atomic dispatch
+    pass, that targeted row is positive
+    (`best_parallel_worker_speedup=1.42x`).
 
-This strengthens the default-off decision: the synthetic C++ bench has a
-positive sink-free signal only at enough width/work, while the first
-Haskell-loaded worker-shape probes are still narrow and do not yet show
-a win. The C1d-labelled survey rows are not current worker-dispatch
-counters; `--worker-bench` remains the authority for actual C1c worker
-dispatch. The `sched/parallel-compute-before-master`,
+This refines but does not reverse the default-off decision: the
+synthetic C++ bench has a positive sink-free signal only at enough
+width/work, and the first Haskell-loaded winning row is still a targeted
+probe rather than representative default-on evidence. The C1d-labelled
+survey rows are not current worker-dispatch counters; `--worker-bench`
+remains the authority for actual C1c worker dispatch. The
+`sched/parallel-compute-before-master`,
 `sched/poly-voices-master-fx`, and `sched/parallel-fx-rack-master`
 probes also expose a future C1d question: region-layer FreeLayer width
 exists before a later sink barrier, but C1c dispatches whole global
 schedule entries rather than individual regions inside one FreeLayer
 step.
+
+The C1d region-layer dispatch contract is now recorded in
+`notes/2026-05-09-phase-4e-c1d-region-layer-dispatch-design.md`.
+It keeps the first implementation sink-free, requires a serial
+region-item equivalence slice before parallel dispatch, and treats
+sink-bearing same-instance region dispatch as a later problem because
+it needs per-work-item peak accumulation in addition to writer-slot
+reduction.
