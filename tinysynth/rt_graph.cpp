@@ -46,14 +46,8 @@
 namespace q = cycfi::q;
 
 struct RTGraph;
-
-// Phase 5.1.A: RCU hot-swap protocol substrate. The empty payload is
-// deliberate — this slice exists to pin the publish/install/retire
-// dance before later slices add real world content. Defined at file
-// scope (outside the anonymous namespace) so the C ABI's
-// extern "C" entries can name it. See
-// notes/2026-05-10-phase-5-rcu-hot-swap-design.md.
-struct RTGraphSwap {};
+struct RTGraphState;
+struct RTGraphSwap;
 
 /* Note [Dense runtime model]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -354,14 +348,14 @@ NodeKind must align with the integer tags emitted by the compiler.
   Cross-instance routing (§2.C): because the bus pool is shared,
   voice A writing bus 5 is visible to voice B's BusIn(5) within the
   same block (assuming A's Out runs before B's BusIn — which holds
-  if A's template precedes B's in g.defs ordering and the per-instance
+  if A's template precedes B's in world(g).defs ordering and the per-instance
   topological order respects bus E_r edges).
 
   Cross-template ordering (§2.D.3): the template execution order in
-  g.defs is the order produced by Haskell's compileTemplateGraph,
+  world(g).defs is the order produced by Haskell's compileTemplateGraph,
   which topologically sorts templates by inter-template bus precedence
   (T_a precedes T_b iff bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅). The runtime
-  has no scheduling logic of its own — it just iterates g.defs in
+  has no scheduling logic of its own — it just iterates world(g).defs in
   registration order, and registration order equals execution order
   by Haskell-side construction. See Note [Multi-template execution
   loop] below.
@@ -694,7 +688,7 @@ destructures the per-instance node state at the top. The NodeSpec is
 read indirectly via resolve_input(g, inst, node_idx, …) which looks
 up the right MetaDef from inst.template_id; node.controls /
 node.outputs / node.state are read and written directly.
-g.server.output_buses / g.server.output_buses_prev are accessed by the
+world(g).server.output_buses / world(g).server.output_buses_prev are accessed by the
 bus-write/bus-read kernels.
 */
 
@@ -795,7 +789,7 @@ server-global buses].
 §2.D.3: the (template_id, GraphInstance) pair lets the runtime's
 process_graph iterate templates in execution order outer × instances
 inner. A GraphInstance never references the MetaDef directly; it goes
-through g.defs[template_id] every time, so reallocating g.defs
+through world(g).defs[template_id] every time, so reallocating world(g).defs
 (growing the vector when more templates are registered) doesn't
 invalidate any instance — pointers into MetaDef would, instance_id +
 template_id is stable.
@@ -1580,6 +1574,7 @@ one of these categories:
       rt_graph_set_control       (template-0 shim — see note below)
       rt_graph_connect           (template-0 shim)
       rt_graph_prepare_swap
+      rt_graph_prepare_swap_from_graph
       rt_graph_cancel_swap       (for unpublished swaps)
 
   Control-thread (audio-stopped only) — mutates per-instance
@@ -1745,7 +1740,7 @@ Within a block, reads and writes have well-defined origins:
     BusOut/Out to execute before BusIn, so by the time an
     intra-instance BusIn runs the live buffer holds this block's
     accumulated value. Cross-instance, ordering depends on the
-    enclosing template's position in g.defs (templates execute in
+    enclosing template's position in world(g).defs (templates execute in
     registration order, and Haskell's compileTemplateGraph put
     writers before readers).
   - BusInDelayed reads from server.output_buses_prev[bus]. No E_r
@@ -2043,29 +2038,52 @@ private:
   }
 };
 
-struct RTGraph {
-  int capacity = 0;
-  int max_frames = 0;
-  float sample_rate = kDefaultSampleRate;
+// Phase 5.1.B: swappable graph world. Fields in this struct are the
+// topology/state payload that can be prepared off-audio and installed
+// at a block boundary. RTGraph keeps handle-owned resources (audio
+// stream, realtime queue, worker pool, sample rate, max_frames,
+// switches, and counters) outside this object.
+struct RTGraphState {
   // §2.D.3: vector of MetaDefs (templates). Index i is template_id i,
   // and the iteration order in process_graph is i ascending — i.e.
   // registration order is execution order. The Haskell side
   // (compileTemplateGraph) picks registration order to match the
   // topo-sort over template precedence.
   std::vector<MetaDef> defs;
+
   // GraphInstances live in a flat vector regardless of template.
   // Each GraphInstance carries its template_id; process_graph filters
   // by it to group instances per template. Slot index is the
-  // instance_id exposed at the C ABI; std::optional models live/dead.
-  // Pool of GraphInstance slots. Replaces the pre-A.1
-  // std::vector<std::optional<GraphInstance>>: each slot is now a
-  // GraphInstance carrying a SlotState; "dead" is state == Available
-  // (the slot exists in the vector but has no live instance), so
-  // freeing an instance no longer destructs anything — vector
-  // capacity for the per-node state is preserved across reuse.
-  // See Note [Pool model].
+  // instance_id exposed at the C ABI; state == Available represents
+  // a reusable dead slot.
   std::vector<GraphInstance> instances;
+
   Server server;
+  ContributionStorage contribution_storage;
+
+  // Phase §4.E.2.C0b/C1d: per-block schedule scratch. Capacity is
+  // reserved off-audio by construction helpers, while the audio path
+  // only clear() + push_back()s into this world-local storage.
+  std::vector<GlobalScheduleEntry> global_schedule;
+  int global_schedule_writer_slot_count = 0;
+  std::vector<RegionLayerWorkItem> region_layer_work_items;
+  std::vector<GlobalScheduleBand> global_schedule_bands;
+};
+
+// Phase 5.1.B: prepared next-world payload. `state` is installed on
+// the audio thread; the previous active state is moved into
+// `retired_state` and freed when the producer disposes the collected
+// RTGraphSwap off-audio.
+struct RTGraphSwap {
+  std::unique_ptr<RTGraphState> state;
+  std::unique_ptr<RTGraphState> retired_state;
+};
+
+struct RTGraph {
+  int capacity = 0;
+  int max_frames = 0;
+  float sample_rate = kDefaultSampleRate;
+  std::unique_ptr<RTGraphState> active = std::make_unique<RTGraphState>();
   std::unique_ptr<GraphAudioStream> audio;
 
   // A.2: lock-free SPSC command queue for realtime mutation. Filled
@@ -2084,18 +2102,9 @@ struct RTGraph {
   // counter on the kernel side and uses this snapshot for tests.
   int last_block_writer_slot_count = 0;
 
-  // Phase §4.E.2.B1: writer-slot-keyed contribution table. Sized
-  // by ensure_contribution_capacity from
-  // Σ_t max(def[t].polyphony, occupied_t) × sink_writer_count[t]
-  // at every construction mutation that can affect the bound. B1
-  // only allocates and sizes; B2 routes sink writes here when
-  // capture_reduction_mode is on. See
-  // Note [Contribution storage — Phase §4.E.2.B1].
-  ContributionStorage contribution_storage;
-
   // Phase §4.E.2.B2/B3: when true, process_graph runs the audio
   // loop in reduction mode — sink writes land in
-  // contribution_storage.samples first, per-slot target / used
+  // active->contribution_storage.samples first, per-slot target / used
   // metadata records where each canonical writer landed, and B3's
   // serial fold reduces the private slots back into output_buses at
   // deterministic join points. Default off; opt-in via
@@ -2111,40 +2120,6 @@ struct RTGraph {
   // to the legacy nested loop for the whole block so C++-only /
   // legacy construction paths keep working.
   bool execute_global_schedule = false;
-
-  // Phase §4.E.2.C0b: per-block global schedule, rebuilt from the
-  // post-drain instance-state snapshot at the top of every
-  // process_graph call. The vector is in canonical
-  // (template_id, instance_slot, step_index) order; by default it is
-  // observational, and the C0c/C1a test switch lets a serial executor
-  // consume the banded view derived from it before a later worker-pool
-  // slice. Cleared in reset_to_default_state. See GlobalScheduleEntry.
-  //
-  // Capacity is reserved off the audio thread by
-  // ensure_global_schedule_capacity, called from every construction
-  // mutation that can affect the high-water bound. The audio path
-  // (build_global_schedule / build_global_schedule_bands) only does
-  // clear() + push_back into already-reserved space, so it never
-  // allocates.
-  std::vector<GlobalScheduleEntry> global_schedule;
-  int global_schedule_writer_slot_count = 0;
-
-  // Phase §4.E.2.C1d-a: per-region expansion of global_schedule.
-  // Every RegionLayerWorkItem points back to one GlobalScheduleEntry
-  // and one item inside that entry's ScheduleStepSpec. Capacity is
-  // reserved off the audio thread by ensure_region_layer_work_item_capacity;
-  // build_region_layer_work_items only clear() + push_back()s into the
-  // existing allocation. Observational in C1d-a.
-  std::vector<RegionLayerWorkItem> region_layer_work_items;
-
-  // Phase §4.E.2.C0d/C1a: runnable bands over global_schedule. Each
-  // band stores a contiguous [first_entry, first_entry + entry_count)
-  // slice. Barrier bands are singletons; free bands are conservative
-  // dispatch candidates for Phase C. Built once per block after
-  // global_schedule. The C1a executor consumes the bands serially so
-  // Phase C can substitute worker dispatch at the Free-band boundary
-  // without reshaping instance lifecycle handling.
-  std::vector<GlobalScheduleBand> global_schedule_bands;
 
   // Phase §4.E.2.C1b/C1c: worker-pool lifetime/configuration and
   // conservative Free-band dispatch. It is owned by RTGraph so tests
@@ -2191,15 +2166,15 @@ struct RTGraph {
   int last_c1d_parallel_entry_count = 0;
   int last_c1d_parallel_region_item_count = 0;
 
-  // Phase 5.1.A: RCU hot-swap protocol substrate. The pending slot
-  // holds a producer-published RTGraphSwap until the audio thread
-  // acquires it at the top of the next process_graph block. The
-  // retired slot holds an installed swap until the producer reaps it.
-  // Both are one-deep: a publish-while-pending is rejected by
-  // rt_graph_publish_swap; an install-while-retired-pending overwrites
-  // the retire slot (the substrate's swap payload is empty so the
-  // overwrite is detectable but not load-bearing — the producer is
-  // contractually required to reap after each publish).
+  // Phase 5.1.B: RCU hot-swap protocol substrate + world payload. The
+  // pending slot holds a producer-published RTGraphSwap until the
+  // audio thread acquires it at the top of the next process_graph
+  // block. The retired slot holds an installed swap until the
+  // producer reaps it.
+  // Both are one-deep and guarded by swap_in_flight: a publish is
+  // rejected while any previous swap is pending, installing, or
+  // retired-but-not-collected, so a retired RTGraphState cannot be
+  // overwritten on the audio thread.
   //
   // swap_generation_observed is the count of installs the audio thread
   // has performed since construction or rt_graph_clear. It is atomic
@@ -2207,15 +2182,26 @@ struct RTGraph {
   // wait until commands can target the new world.
   //
   // No allocation runs on the audio thread: the install path is one
-  // atomic exchange (pending -> null), one retired-slot exchange, and
-  // one generation increment. See
+  // atomic exchange (pending -> null), two unique_ptr moves, one
+  // retired-slot store, and one generation increment. See
   // notes/2026-05-10-phase-5-rcu-hot-swap-design.md.
   std::atomic<RTGraphSwap *> pending_swap{nullptr};
   std::atomic<RTGraphSwap *> retired_swap{nullptr};
+  std::atomic<bool> swap_in_flight{false};
   std::atomic<int> swap_generation_observed{0};
 };
 
 namespace {
+
+[[nodiscard]] static RTGraphState &world(RTGraph &g) noexcept {
+  assert(g.active != nullptr);
+  return *g.active;
+}
+
+[[nodiscard]] static const RTGraphState &world(const RTGraph &g) noexcept {
+  assert(g.active != nullptr);
+  return *g.active;
+}
 
 // Lookup a template's MetaDef by id. Returns nullptr for negative /
 // out-of-range ids.
@@ -2223,16 +2209,16 @@ namespace {
 template_at(RTGraph &g, int template_id) noexcept {
   if (template_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(template_id);
-  if (idx >= g.defs.size()) return nullptr;
-  return &g.defs[idx];
+  if (idx >= world(g).defs.size()) return nullptr;
+  return &world(g).defs[idx];
 }
 
 [[nodiscard]] static const MetaDef *
 template_at(const RTGraph &g, int template_id) noexcept {
   if (template_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(template_id);
-  if (idx >= g.defs.size()) return nullptr;
-  return &g.defs[idx];
+  if (idx >= world(g).defs.size()) return nullptr;
+  return &world(g).defs[idx];
 }
 
 // Lookup an instance by id. Returns nullptr for negative / out-of-range
@@ -2244,18 +2230,18 @@ template_at(const RTGraph &g, int template_id) noexcept {
 instance_at(RTGraph &g, int instance_id) noexcept {
   if (instance_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= g.instances.size()) return nullptr;
-  if (g.instances[idx].state.load() == SlotState::Available) return nullptr;
-  return &g.instances[idx];
+  if (idx >= world(g).instances.size()) return nullptr;
+  if (world(g).instances[idx].state.load() == SlotState::Available) return nullptr;
+  return &world(g).instances[idx];
 }
 
 [[nodiscard]] static const GraphInstance *
 instance_at(const RTGraph &g, int instance_id) noexcept {
   if (instance_id < 0) return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= g.instances.size()) return nullptr;
-  if (g.instances[idx].state.load() == SlotState::Available) return nullptr;
-  return &g.instances[idx];
+  if (idx >= world(g).instances.size()) return nullptr;
+  if (world(g).instances[idx].state.load() == SlotState::Available) return nullptr;
+  return &world(g).instances[idx];
 }
 
 // Resolve one connected input to the source node's output span.
@@ -2439,7 +2425,7 @@ static void ensure_node_slot(RTGraph &g, int template_id, NodeIndex node_index) 
   if (def->nodes.size() <= idx) {
     def->nodes.resize(idx + 1);
   }
-  for (auto &inst : g.instances) {
+  for (auto &inst : world(g).instances) {
     // ensure_node_slot is [T:construction] and shouldn't see any
     // Reserved slots in practice (no producer is running during
     // construction), but skip them defensively if encountered: a
@@ -2527,7 +2513,7 @@ static void ensure_output_bus_count(Server &server, std::size_t count, int max_f
 [[nodiscard]] static int
 occupied_instances_for_template(const RTGraph &g, int tid) noexcept {
   int n = 0;
-  for (const auto &inst : g.instances) {
+  for (const auto &inst : world(g).instances) {
     if (inst.template_id != tid) continue;
     const SlotState s = inst.state.load();
     if (s == SlotState::Active || s == SlotState::Releasing
@@ -2549,10 +2535,10 @@ occupied_instances_for_template(const RTGraph &g, int tid) noexcept {
 [[nodiscard]] static int
 required_contribution_slots(const RTGraph &g) noexcept {
   int total = 0;
-  for (std::size_t tid = 0; tid < g.defs.size(); ++tid) {
-    const int sinks = sink_writer_count(g.defs[tid]);
+  for (std::size_t tid = 0; tid < world(g).defs.size(); ++tid) {
+    const int sinks = sink_writer_count(world(g).defs[tid]);
     if (sinks == 0) continue;
-    const int poly = g.defs[tid].polyphony;
+    const int poly = world(g).defs[tid].polyphony;
     const int occ  = occupied_instances_for_template(g, static_cast<int>(tid));
     const int per  = poly > occ ? poly : occ;
     total += per * sinks;
@@ -2572,7 +2558,7 @@ required_contribution_slots(const RTGraph &g) noexcept {
 // and lets the next mutation re-grow it.
 static void ensure_contribution_capacity(RTGraph &g) {
   const int required = required_contribution_slots(g);
-  g.contribution_storage.resize_for(required, g.max_frames);
+  world(g).contribution_storage.resize_for(required, g.max_frames);
 }
 
 // Phase §4.E.2.C0b: number of GlobalScheduleEntry's the per-block
@@ -2585,8 +2571,8 @@ static void ensure_contribution_capacity(RTGraph &g) {
 [[nodiscard]] static int
 required_global_schedule_entries(const RTGraph &g) noexcept {
   int total = 0;
-  for (std::size_t tid = 0; tid < g.defs.size(); ++tid) {
-    const auto &def = g.defs[tid];
+  for (std::size_t tid = 0; tid < world(g).defs.size(); ++tid) {
+    const auto &def = world(g).defs[tid];
     const int steps = static_cast<int>(def.schedule_steps.size());
     if (steps == 0) continue;
     const int poly = def.polyphony;
@@ -2617,8 +2603,8 @@ static void ensure_global_schedule_capacity(RTGraph &g) {
   const int required = required_global_schedule_entries(g);
   if (required > 0) {
     const auto n = static_cast<std::size_t>(required);
-    g.global_schedule.reserve(n);
-    g.global_schedule_bands.reserve(n);
+    world(g).global_schedule.reserve(n);
+    world(g).global_schedule_bands.reserve(n);
   }
 }
 
@@ -2632,8 +2618,8 @@ static void ensure_global_schedule_capacity(RTGraph &g) {
 [[nodiscard]] static int
 required_region_layer_work_items(const RTGraph &g) noexcept {
   int total = 0;
-  for (std::size_t tid = 0; tid < g.defs.size(); ++tid) {
-    const MetaDef &def = g.defs[tid];
+  for (std::size_t tid = 0; tid < world(g).defs.size(); ++tid) {
+    const MetaDef &def = world(g).defs[tid];
     if (def.schedule_steps.empty()) continue;
 
     int items_per_instance = 0;
@@ -2661,7 +2647,7 @@ required_region_layer_work_items(const RTGraph &g) noexcept {
 static void ensure_region_layer_work_item_capacity(RTGraph &g) {
   const int required = required_region_layer_work_items(g);
   if (required > 0) {
-    g.region_layer_work_items.reserve(static_cast<std::size_t>(required));
+    world(g).region_layer_work_items.reserve(static_cast<std::size_t>(required));
   }
 }
 
@@ -3386,7 +3372,7 @@ index it logically belongs to. Two modes share the same shape:
   * Reduction-capture (B2, opt-in via
     rt_graph_test_set_reduction_capture):
     'samples' points at the first frame of the writer slot's
-    private buffer in g.contribution_storage.samples. Per-sample
+    private buffer in world(g).contribution_storage.samples. Per-sample
     'add' accumulates into that private buffer. B3 folds used slots
     back into server.output_buses at serial join points, preserving
     same-block live BusIn semantics while making the private capture
@@ -3473,10 +3459,10 @@ open_reduction_bus_write_target(RTGraph &g, double bus_control,
                                  int writer_slot, int nframes,
                                  bool record_used_bit) noexcept {
   assert(writer_slot >= 0);
-  auto &storage = g.contribution_storage;
+  auto &storage = world(g).contribution_storage;
   assert(writer_slot < storage.max_writer_slots);
 
-  const auto bus = resolve_output_bus_index(g.server, bus_control);
+  const auto bus = resolve_output_bus_index(world(g).server, bus_control);
   const std::size_t ws = static_cast<std::size_t>(writer_slot);
   const std::size_t mf = static_cast<std::size_t>(g.max_frames);
   const std::size_t nf = static_cast<std::size_t>(nframes);
@@ -3519,7 +3505,7 @@ open_bus_write_target(RTGraph &g, BusWriteMode mode,
                                             writer_slot, nframes,
                                             mode == BusWriteMode::Reduction);
   }
-  return open_direct_bus_write_target(g.server, bus_control);
+  return open_direct_bus_write_target(world(g).server, bus_control);
 }
 
 [[nodiscard]] static bool
@@ -3546,7 +3532,7 @@ contribution_slot_used(
 static void fold_contribution_slots(
     RTGraph &g, int first_slot, int end_slot, int nframes
 ) noexcept {
-  auto &storage = g.contribution_storage;
+  auto &storage = world(g).contribution_storage;
   assert(first_slot >= 0);
   assert(end_slot >= first_slot);
   assert(end_slot <= storage.max_writer_slots);
@@ -3560,9 +3546,9 @@ static void fold_contribution_slots(
     const int bus = storage.target[ws];
     if (bus < 0) continue;
     const std::size_t bus_idx = static_cast<std::size_t>(bus);
-    if (bus_idx >= g.server.output_buses.size()) continue;
+    if (bus_idx >= world(g).server.output_buses.size()) continue;
 
-    float *dst = g.server.output_buses[bus_idx].data();
+    float *dst = world(g).server.output_buses[bus_idx].data();
     const float *src = &storage.samples[ws * mf];
     for (std::size_t fi = 0; fi < nf; ++fi) {
       dst[fi] += src[fi];
@@ -3581,7 +3567,7 @@ static inline void fold_recent_writer_slot_if_needed(
 /* Note [Bus-write kernel: Out and BusOut share this]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Out and BusOut are operationally identical: both accumulate their input
-signal additively into 'g.server.output_buses[bus]', where 'bus' is
+signal additively into 'world(g).server.output_buses[bus]', where 'bus' is
 read from control slot 0. The only difference is at the *source* level
 — Out reads as "final hardware output", BusOut reads as "intermediate
 audio bus". The audio callback routes buses [0..output_channels-1] to
@@ -3647,7 +3633,7 @@ static void process_out(RTGraph &g, GraphInstance &inst,
 /* Note [BusIn kernel: read live bus contents]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 BusIn is a source: it copies the current contents of
-'g.server.output_buses[bus]' into the node's output port 0, so
+'world(g).server.output_buses[bus]' into the node's output port 0, so
 downstream consumers can read it like any other audio source.
 
 Same-cycle semantics within an instance: by the time a BusIn runs,
@@ -3655,8 +3641,8 @@ every BusOut/Out on the same bus *within the same instance* has
 already accumulated this block's contributions, because the topological
 sort on the Haskell side put writers before readers via the E_r edges
 derived from BusWrite/BusRead effects. Across instances of the same
-template, ordering depends on the iteration order of g.instances.
-Across templates, ordering follows g.defs registration order — which
+template, ordering depends on the iteration order of world(g).instances.
+Across templates, ordering follows world(g).defs registration order — which
 the Haskell side picks to match the topo sort over template
 precedence (writers' templates precede readers' templates whenever
 a live read intersects a write). For deterministic feedback that
@@ -3674,14 +3660,14 @@ static void process_busin(const RTGraph &g, GraphInstance &inst,
 
   // Validate before casting; see process_out comment.
   const double bus_d = node.controls[0];
-  const double bus_lim = static_cast<double>(g.server.output_buses.size());
+  const double bus_lim = static_cast<double>(world(g).server.output_buses.size());
   if (!std::isfinite(bus_d) || bus_d < 0.0 || bus_d >= bus_lim) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
   const int bus = static_cast<int>(bus_d);
 
-  const auto &src = g.server.output_buses[static_cast<std::size_t>(bus)];
+  const auto &src = world(g).server.output_buses[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
   std::copy_n(src.begin(), frames, out.begin());
 }
@@ -3689,9 +3675,9 @@ static void process_busin(const RTGraph &g, GraphInstance &inst,
 /* Note [BusInDelayed kernel: read previous block's snapshot]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 BusInDelayed is the feedback primitive. It reads from
-'g.server.output_buses_prev[bus]' — the frozen snapshot of what the
+'world(g).server.output_buses_prev[bus]' — the frozen snapshot of what the
 previous block wrote — rather than from the live
-'g.server.output_buses[bus]'. The swap-and-clear in process_graph
+'world(g).server.output_buses[bus]'. The swap-and-clear in process_graph
 guarantees that:
 
   * output_buses_prev[bus] holds exactly what the previous block's
@@ -3731,14 +3717,14 @@ static void process_busin_delayed(
 
   // Validate before casting; see process_out comment.
   const double bus_d = node.controls[0];
-  const double bus_lim = static_cast<double>(g.server.output_buses_prev.size());
+  const double bus_lim = static_cast<double>(world(g).server.output_buses_prev.size());
   if (!std::isfinite(bus_d) || bus_d < 0.0 || bus_d >= bus_lim) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
   const int bus = static_cast<int>(bus_d);
 
-  const auto &src = g.server.output_buses_prev[static_cast<std::size_t>(bus)];
+  const auto &src = world(g).server.output_buses_prev[static_cast<std::size_t>(bus)];
   const std::size_t frames = static_cast<std::size_t>(nframes);
   std::copy_n(src.begin(), frames, out.begin());
 }
@@ -3951,19 +3937,19 @@ scheduler in this file. The dense node vector is already the
 "intra-instance schedule".
 
 Across instances of the same template, the order is the order of
-g.instances (vector slot index). Server-global buses (§2.C) make
+world(g).instances (vector slot index). Server-global buses (§2.C) make
 cross-instance ordering visible: instance A writing bus N before
 instance B reading bus N is observable. For deterministic feedback
 that doesn't depend on this ordering, use BusInDelayed which reads
 from the previous-block snapshot.
 
-Across templates (§2.D.3), the order is g.defs registration order.
+Across templates (§2.D.3), the order is world(g).defs registration order.
 The Haskell side (compileTemplateGraph) assigns registration order
 to match the topological sort over the inter-template precedence DAG
 (T_a precedes T_b iff bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅; BusInDelayed
 reads do not contribute, exactly as within a single graph). Cycles
 in the precedence DAG are rejected at compile time. The runtime is a
-dumb executor — it iterates g.defs in order and never inspects the
+dumb executor — it iterates world(g).defs in order and never inspects the
 precedence relation; the schedule is the compiler's responsibility.
 
 There is no runtime-side knob for reordering. Users who need a
@@ -4220,7 +4206,7 @@ reads it; here, the chain ends in a sink that writes nothing to
 its own output port. Instead, the kernel does exactly what
 process_out would have done after process_sinosc and process_gain:
 per sample, compute @sin * gain_amount@, accumulate into
-'g.server.output_buses[bus]', and update 'inst.block_sink_peak'.
+'world(g).server.output_buses[bus]', and update 'inst.block_sink_peak'.
 
 That last step is load-bearing for §2.E release-then-free. The
 parent voice's silence detection reads block_sink_peak after the
@@ -4527,7 +4513,7 @@ static void process_region_saw_lpf_gain_out(
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 4-node sink-terminal kernel. The chain's source is a BusIn node, so
 unlike RSawLpfGainOut there's no phase iterator to step — the kernel
-reads samples directly from 'g.server.output_buses[busin_bus]', the
+reads samples directly from 'world(g).server.output_buses[busin_bus]', the
 same place 'process_busin' would have copied from. Member layout:
   * busin_idx — KBusIn (controls[0] = source bus index)
   * lpf_idx   — KLPF   (block-rate latch on freq/q like
@@ -4597,14 +4583,14 @@ static void process_region_busin_lpf_gain_out(
   // way; written as two loops here for reading-order obviousness.
   const double busin_bus_d = busin_node.controls[0];
   const double busin_bus_lim =
-      static_cast<double>(g.server.output_buses.size());
+      static_cast<double>(world(g).server.output_buses.size());
   const float *src_data = nullptr;
   if (std::isfinite(busin_bus_d)
       && busin_bus_d >= 0.0
       && busin_bus_d < busin_bus_lim) {
     const int busin_bus = static_cast<int>(busin_bus_d);
     src_data =
-        g.server.output_buses[static_cast<std::size_t>(busin_bus)].data();
+        world(g).server.output_buses[static_cast<std::size_t>(busin_bus)].data();
   }
 
   // LPF freq/q resolution + block-rate latch. Identical to
@@ -4963,8 +4949,8 @@ static bool enqueue_command(ControlQueue &q, const ControlCommand &cmd) noexcept
 static void apply_control_command(RTGraph &g, const ControlCommand &cmd) noexcept {
   if (cmd.slot_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(cmd.slot_id);
-  if (idx >= g.instances.size()) return;
-  GraphInstance &inst = g.instances[idx];
+  if (idx >= world(g).instances.size()) return;
+  GraphInstance &inst = world(g).instances[idx];
 
   switch (cmd.kind) {
     case ControlCommand::Kind::Activate: {
@@ -5155,7 +5141,7 @@ static inline bool is_audio_scheduled_state(SlotState s) noexcept {
 }
 
 static void begin_global_schedule_instance_blocks(RTGraph &g) noexcept {
-  for (GraphInstance &inst : g.instances) {
+  for (GraphInstance &inst : world(g).instances) {
     inst.block_lifecycle_active = false;
     inst.block_state_at_start = SlotState::Available;
 
@@ -5169,7 +5155,7 @@ static void begin_global_schedule_instance_blocks(RTGraph &g) noexcept {
 }
 
 static void finish_global_schedule_instance_blocks(RTGraph &g) noexcept {
-  for (GraphInstance &inst : g.instances) {
+  for (GraphInstance &inst : world(g).instances) {
     if (!inst.block_lifecycle_active) continue;
 
     finish_instance_block(inst, inst.block_state_at_start);
@@ -5288,7 +5274,7 @@ static void process_region(
 static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
                               BlockExecutionContext &ctx) noexcept {
   // Look up the spec via inst.template_id. If the template is gone
-  // (shouldn't happen — we never shrink g.defs while instances are
+  // (shouldn't happen — we never shrink world(g).defs while instances are
   // live — but be defensive), skip the instance.
   const MetaDef *def = template_at(g, inst.template_id);
   if (!def) {
@@ -5334,7 +5320,7 @@ process_graph runs one block of audio. Its job after §2.D.3:
      sees the same prev snapshot and writes into the same live pool.
 
   2. Iterate templates in registration order (== execution order):
-     for each template_id in [0, g.defs.size()), find every live
+     for each template_id in [0, world(g).defs.size()), find every live
      instance with that template_id and process it.
 
 The outer-by-template, inner-by-instance ordering matters for
@@ -5352,7 +5338,7 @@ to make the inner loop O(I_t) instead of O(I), but the speedup is
 not measurable today.
 
 Within a template, instances run in slot order (the index in
-g.instances). Slot order is implicit in rt_graph_template_instance_add
+world(g).instances). Slot order is implicit in rt_graph_template_instance_add
 calls; the runtime does not expose any way to reorder. If a user
 needs a specific cross-instance order they can either rely on
 template-level precedence (split into multiple templates) or use
@@ -5403,7 +5389,7 @@ BusInDelayed to break the cross-instance dependency.
 //
 // This function runs on the audio thread and must not allocate.
 // ensure_global_schedule_capacity (called from every construction
-// mutation that can grow the bound) keeps g.global_schedule's
+// mutation that can grow the bound) keeps world(g).global_schedule's
 // capacity at or above max-block size; clear() preserves that
 // capacity, and every push_back below lands inside it.
 static int region_sink_writer_count(
@@ -5455,23 +5441,23 @@ static int schedule_step_sink_writer_count(
 }
 
 static void build_global_schedule(RTGraph &g) noexcept {
-  g.global_schedule.clear();
+  world(g).global_schedule.clear();
   int next_writer_slot = 0;
-  const std::size_t template_count = g.defs.size();
+  const std::size_t template_count = world(g).defs.size();
   for (std::size_t tid = 0; tid < template_count; ++tid) {
-    const MetaDef &def = g.defs[tid];
+    const MetaDef &def = world(g).defs[tid];
     if (def.schedule_steps.empty()) continue;
     const int tid_i  = static_cast<int>(tid);
     const std::size_t step_count = def.schedule_steps.size();
-    for (std::size_t slot = 0; slot < g.instances.size(); ++slot) {
-      const GraphInstance &inst = g.instances[slot];
+    for (std::size_t slot = 0; slot < world(g).instances.size(); ++slot) {
+      const GraphInstance &inst = world(g).instances[slot];
       const SlotState s = inst.state.load();
       if (s != SlotState::Active && s != SlotState::Releasing) continue;
       if (inst.template_id != tid_i) continue;
       const int slot_i = static_cast<int>(slot);
       for (std::size_t step = 0; step < step_count; ++step) {
         const int writer_count = schedule_step_sink_writer_count(def, step);
-        g.global_schedule.push_back(
+        world(g).global_schedule.push_back(
             GlobalScheduleEntry{
               tid_i,
               slot_i,
@@ -5483,11 +5469,11 @@ static void build_global_schedule(RTGraph &g) noexcept {
       }
     }
   }
-  g.global_schedule_writer_slot_count = next_writer_slot;
+  world(g).global_schedule_writer_slot_count = next_writer_slot;
 }
 
 static void build_region_layer_work_items(RTGraph &g) noexcept {
-  g.region_layer_work_items.clear();
+  world(g).region_layer_work_items.clear();
   g.last_c1d_candidate_entry_count = 0;
   g.last_c1d_candidate_item_count = 0;
   g.last_c1d_serialized_sink_entry_count = 0;
@@ -5495,16 +5481,16 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
   g.last_c1d_parallel_entry_count = 0;
   g.last_c1d_parallel_region_item_count = 0;
 
-  const int entry_count = static_cast<int>(g.global_schedule.size());
+  const int entry_count = static_cast<int>(world(g).global_schedule.size());
   for (int entry_index = 0; entry_index < entry_count; ++entry_index) {
     auto &entry =
-        g.global_schedule[static_cast<std::size_t>(entry_index)];
+        world(g).global_schedule[static_cast<std::size_t>(entry_index)];
     entry.first_work_item = -1;
     entry.work_item_count = 0;
     if (entry.template_id < 0 || entry.step_index < 0) continue;
     const std::size_t tid = static_cast<std::size_t>(entry.template_id);
-    if (tid >= g.defs.size()) continue;
-    const MetaDef &def = g.defs[tid];
+    if (tid >= world(g).defs.size()) continue;
+    const MetaDef &def = world(g).defs[tid];
 
     const std::size_t step_pos = static_cast<std::size_t>(entry.step_index);
     if (step_pos >= def.schedule_steps.size()) continue;
@@ -5518,7 +5504,7 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
     }
 
     const int items_begin =
-        static_cast<int>(g.region_layer_work_items.size());
+        static_cast<int>(world(g).region_layer_work_items.size());
 
     int next_writer_slot = entry.first_writer_slot;
     bool has_sink_writer = false;
@@ -5532,7 +5518,7 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
       const int writer_count =
           region_sink_writer_count(def, def.regions[region_pos]);
       has_sink_writer = has_sink_writer || writer_count > 0;
-      g.region_layer_work_items.push_back(
+      world(g).region_layer_work_items.push_back(
           RegionLayerWorkItem{
             entry_index,
             entry.template_id,
@@ -5569,8 +5555,8 @@ schedule_step_for_entry(
 ) noexcept {
   if (entry.template_id < 0 || entry.step_index < 0) return nullptr;
   const std::size_t tid = static_cast<std::size_t>(entry.template_id);
-  if (tid >= g.defs.size()) return nullptr;
-  const auto &steps = g.defs[tid].schedule_steps;
+  if (tid >= world(g).defs.size()) return nullptr;
+  const auto &steps = world(g).defs[tid].schedule_steps;
   const std::size_t step = static_cast<std::size_t>(entry.step_index);
   if (step >= steps.size()) return nullptr;
   return &steps[step];
@@ -5590,13 +5576,13 @@ static bool free_entry_conflicts_with_band(
   if (entry_count <= 0) return false;
   const std::size_t first = static_cast<std::size_t>(first_entry);
   const std::size_t count = static_cast<std::size_t>(entry_count);
-  if (first > g.global_schedule.size()
-      || count > g.global_schedule.size() - first) {
+  if (first > world(g).global_schedule.size()
+      || count > world(g).global_schedule.size() - first) {
     return true;
   }
 
   for (std::size_t i = 0; i < count; ++i) {
-    const GlobalScheduleEntry &member = g.global_schedule[first + i];
+    const GlobalScheduleEntry &member = world(g).global_schedule[first + i];
     // Conservative C0d rule: do not put two schedule steps from the
     // same instance in one dispatch band. Consecutive FreeLayer steps
     // in one instance are layer-ordered; grouping them would require
@@ -5624,27 +5610,27 @@ static bool free_entry_conflicts_with_band(
 // needed to preserve per-instance layer order without re-running
 // regionDependencies on the audio thread.
 static void build_global_schedule_bands(RTGraph &g) noexcept {
-  g.global_schedule_bands.clear();
+  world(g).global_schedule_bands.clear();
 
   int free_start = -1;
   int free_count = 0;
 
   auto flush_free = [&]() noexcept {
     if (free_count <= 0) return;
-    g.global_schedule_bands.push_back(
+    world(g).global_schedule_bands.push_back(
         GlobalScheduleBand{GlobalScheduleBandKind::Free,
                            free_start, free_count});
     free_start = -1;
     free_count = 0;
   };
 
-  const int entry_count = static_cast<int>(g.global_schedule.size());
+  const int entry_count = static_cast<int>(world(g).global_schedule.size());
   for (int i = 0; i < entry_count; ++i) {
     const GlobalScheduleEntry &entry =
-        g.global_schedule[static_cast<std::size_t>(i)];
+        world(g).global_schedule[static_cast<std::size_t>(i)];
     if (!global_schedule_entry_is_free(g, entry)) {
       flush_free();
-      g.global_schedule_bands.push_back(
+      world(g).global_schedule_bands.push_back(
           GlobalScheduleBand{GlobalScheduleBandKind::Barrier, i, 1});
       continue;
     }
@@ -5670,7 +5656,7 @@ static void build_global_schedule_bands(RTGraph &g) noexcept {
 // if high-polyphony graphs make it measurable.
 // See Note [Mixed-mode global schedule fallback].
 static bool global_schedule_covers_audio_schedule(const RTGraph &g) noexcept {
-  for (const GraphInstance &inst : g.instances) {
+  for (const GraphInstance &inst : world(g).instances) {
     const SlotState s = inst.state.load();
     if (s != SlotState::Active && s != SlotState::Releasing) continue;
     const MetaDef *def = template_at(g, inst.template_id);
@@ -5725,9 +5711,9 @@ struct ScheduleEntryExecutionContext {
     // to duplicate per worker in C1c.
     if (entry.instance_slot < 0) return;
     const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
-    if (slot >= g.instances.size()) return;
+    if (slot >= world(g).instances.size()) return;
 
-    GraphInstance &inst = g.instances[slot];
+    GraphInstance &inst = world(g).instances[slot];
     const SlotState s = inst.state.load();
     if (!is_audio_scheduled_state(s)) return;
     if (inst.template_id != entry.template_id) return;
@@ -5746,8 +5732,8 @@ static bool band_range_valid(
   if (band.first_entry < 0 || band.entry_count <= 0) return false;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
-  return first <= g.global_schedule.size()
-      && count <= g.global_schedule.size() - first;
+  return first <= world(g).global_schedule.size()
+      && count <= world(g).global_schedule.size() - first;
 }
 
 static int band_first_writer_slot(
@@ -5755,7 +5741,7 @@ static int band_first_writer_slot(
 ) noexcept {
   if (!band_range_valid(g, band)) return 0;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
-  return g.global_schedule[first].first_writer_slot;
+  return world(g).global_schedule[first].first_writer_slot;
 }
 
 static int band_end_writer_slot(
@@ -5765,9 +5751,9 @@ static int band_end_writer_slot(
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
 
-  int end_slot = g.global_schedule[first].first_writer_slot;
+  int end_slot = world(g).global_schedule[first].first_writer_slot;
   for (std::size_t i = 0; i < count; ++i) {
-    const GlobalScheduleEntry &entry = g.global_schedule[first + i];
+    const GlobalScheduleEntry &entry = world(g).global_schedule[first + i];
     end_slot = std::max(
         end_slot, entry.first_writer_slot + entry.writer_slot_count);
   }
@@ -5787,9 +5773,9 @@ static bool schedule_band_has_duplicate_instances(
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
   for (std::size_t i = 0; i < count; ++i) {
-    const int slot = g.global_schedule[first + i].instance_slot;
+    const int slot = world(g).global_schedule[first + i].instance_slot;
     for (std::size_t j = i + 1; j < count; ++j) {
-      if (g.global_schedule[first + j].instance_slot == slot) {
+      if (world(g).global_schedule[first + j].instance_slot == slot) {
         return true;
       }
     }
@@ -5817,9 +5803,9 @@ static void process_entry_via_work_items(
 ) noexcept {
   if (entry.instance_slot < 0) return;
   const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
-  if (slot >= g.instances.size()) return;
+  if (slot >= world(g).instances.size()) return;
 
-  GraphInstance &inst = g.instances[slot];
+  GraphInstance &inst = world(g).instances[slot];
   const SlotState s = inst.state.load();
   if (!is_audio_scheduled_state(s)) return;
   if (inst.template_id != entry.template_id) return;
@@ -5832,14 +5818,14 @@ static void process_entry_via_work_items(
       static_cast<std::size_t>(entry.first_work_item);
   const std::size_t count =
       static_cast<std::size_t>(entry.work_item_count);
-  if (first > g.region_layer_work_items.size()
-      || count > g.region_layer_work_items.size() - first) {
+  if (first > world(g).region_layer_work_items.size()
+      || count > world(g).region_layer_work_items.size() - first) {
     return;
   }
 
   for (std::size_t i = 0; i < count; ++i) {
     const RegionLayerWorkItem &item =
-        g.region_layer_work_items[first + i];
+        world(g).region_layer_work_items[first + i];
     if (item.region_ordinal < 0) continue;
     const std::size_t region_pos =
         static_cast<std::size_t>(item.region_ordinal);
@@ -5874,16 +5860,16 @@ static void process_parallel_entry_region_item_worker(
     const int item_index = dispatch.first_work_item + offset;
     if (item_index < 0) continue;
     const std::size_t i = static_cast<std::size_t>(item_index);
-    if (i >= dispatch.g.region_layer_work_items.size()) continue;
+    if (i >= world(dispatch.g).region_layer_work_items.size()) continue;
 
     const RegionLayerWorkItem &item =
-        dispatch.g.region_layer_work_items[i];
+        world(dispatch.g).region_layer_work_items[i];
     if (item.instance_slot < 0) continue;
     const std::size_t slot =
         static_cast<std::size_t>(item.instance_slot);
-    if (slot >= dispatch.g.instances.size()) continue;
+    if (slot >= world(dispatch.g).instances.size()) continue;
 
-    GraphInstance &inst = dispatch.g.instances[slot];
+    GraphInstance &inst = world(dispatch.g).instances[slot];
     const SlotState s = inst.state.load();
     if (!is_audio_scheduled_state(s)) continue;
     if (inst.template_id != item.template_id) continue;
@@ -5918,8 +5904,8 @@ static bool entry_is_c1d_parallel_candidate(
       static_cast<std::size_t>(entry.first_work_item);
   const std::size_t count =
       static_cast<std::size_t>(entry.work_item_count);
-  if (first > g.region_layer_work_items.size()
-      || count > g.region_layer_work_items.size() - first) {
+  if (first > world(g).region_layer_work_items.size()
+      || count > world(g).region_layer_work_items.size() - first) {
     return false;
   }
 
@@ -5930,7 +5916,7 @@ static bool entry_is_c1d_parallel_candidate(
   // slots. C1d-c never carries a sink writer through worker dispatch
   // — sink ordering and bus-reduction folding stay on the audio thread.
   for (std::size_t i = 0; i < count; ++i) {
-    if (g.region_layer_work_items[first + i].writer_slot_count > 0) {
+    if (world(g).region_layer_work_items[first + i].writer_slot_count > 0) {
       return false;
     }
   }
@@ -5965,7 +5951,7 @@ static void process_schedule_band_serial(
     ScheduleEntryExecutionContext &worker_ctx
 ) noexcept {
   // Defensive only: build_global_schedule_bands emits valid,
-  // contiguous slices over g.global_schedule. Keep the executor
+  // contiguous slices over world(g).global_schedule. Keep the executor
   // silent if a future ABI/debug path corrupts the band metadata.
   if (!band_range_valid(g, band)) return;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
@@ -5988,7 +5974,7 @@ static void process_schedule_band_serial(
   // band-level worker thread.
   if (band.kind == GlobalScheduleBandKind::Free) {
     for (std::size_t i = 0; i < count; ++i) {
-      const GlobalScheduleEntry &entry = g.global_schedule[first + i];
+      const GlobalScheduleEntry &entry = world(g).global_schedule[first + i];
       if (entry_is_c1d_parallel_candidate(g, entry)) {
         dispatch_c1d_parallel_entry(g, entry, worker_ctx.nframes);
       } else {
@@ -6000,7 +5986,7 @@ static void process_schedule_band_serial(
   }
 
   for (std::size_t i = 0; i < count; ++i) {
-    worker_ctx.process_entry(g.global_schedule[first + i]);
+    worker_ctx.process_entry(world(g).global_schedule[first + i]);
   }
 }
 
@@ -6025,9 +6011,9 @@ static void process_parallel_band_worker(void *user, int /*worker_id*/) noexcept
     const int entry_index = dispatch.band.first_entry + offset;
     if (entry_index < 0) continue;
     const std::size_t i = static_cast<std::size_t>(entry_index);
-    if (i >= dispatch.g.global_schedule.size()) continue;
+    if (i >= world(dispatch.g).global_schedule.size()) continue;
 
-    const GlobalScheduleEntry &entry = dispatch.g.global_schedule[i];
+    const GlobalScheduleEntry &entry = world(dispatch.g).global_schedule[i];
     BlockExecutionContext local_ctx;
     local_ctx.bus_writes.mode = dispatch.defer_reduction_folds
         ? BusWriteMode::ReductionDeferred
@@ -6119,13 +6105,13 @@ static void process_global_schedule_bands(
   // accounting correct when C1c worker dispatch processes different
   // bands with different per-worker contexts.
   begin_global_schedule_instance_blocks(g);
-  for (const GlobalScheduleBand &band : g.global_schedule_bands) {
+  for (const GlobalScheduleBand &band : world(g).global_schedule_bands) {
     process_schedule_band(g, band, worker_ctx, ctx);
   }
   finish_global_schedule_instance_blocks(g);
   ctx.bus_writes.next_writer_slot =
       std::max(ctx.bus_writes.next_writer_slot,
-               g.global_schedule_writer_slot_count);
+               world(g).global_schedule_writer_slot_count);
 }
 
 static void process_legacy_schedule(
@@ -6136,10 +6122,10 @@ static void process_legacy_schedule(
   // precedence, so this loop respects all bus-induced ordering
   // constraints between templates. See Note [Multi-template
   // execution loop].
-  const std::size_t template_count = g.defs.size();
+  const std::size_t template_count = world(g).defs.size();
   for (std::size_t tid = 0; tid < template_count; ++tid) {
     const int tid_i = static_cast<int>(tid);
-    for (auto &inst : g.instances) {
+    for (auto &inst : world(g).instances) {
       // Skip every state that is not part of the audio schedule.
       // Available is "free", Reserved is the producer's private claim
       // (preparation in progress — the producer may be resizing /
@@ -6157,7 +6143,7 @@ static void process_legacy_schedule(
 }
 
 static void process_graph(RTGraph &g, int nframes) noexcept {
-  // Phase 5.1.A: first acquire any pending hot-swap, but do not install
+  // Phase 5.1.B: first acquire any pending hot-swap, but do not install
   // it until after the realtime control queue is drained below. The
   // acquire on pending_swap synchronizes-with the producer's
   // release-store in rt_graph_publish_swap. Because producers must
@@ -6166,10 +6152,11 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // write_idx snapshot; such commands are therefore applied to the old
   // world before it retires.
   //
-  // The substrate's payload is empty, so install is a no-op for
-  // rendering; only swap_generation_observed advances. Future slices
-  // attach the new world's defs/instances/server payload to this same
-  // acquired pointer.
+  // The acquired swap carries a fully-prepared RTGraphState. Install
+  // is a pointer move: the old active world moves into the swap's
+  // retired_state, and the prepared state becomes active. The old
+  // world's destructor runs later, off-audio, when the producer
+  // disposes the collected RTGraphSwap.
   RTGraphSwap *pending_install =
       g.pending_swap.exchange(nullptr, std::memory_order_acquire);
 
@@ -6187,17 +6174,14 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // Install the acquired swap before bus ping-pong and any kernel runs.
   //
   // Allocation-free: the install is one earlier atomic exchange
-  // (pending -> null), one atomic store/exchange into the retired slot,
-  // and one atomic generation increment. The retire slot is one-deep;
-  // overwriting an unreaped retired swap is permitted by the substrate
-  // (the payload is trivially destructible) but flagged as a test
-  // failure — the producer is contractually required to reap after each
-  // publish. Future slices with non-trivial payloads will likely tighten
-  // this to reject publish-while-retired-pending.
+  // (pending -> null), two unique_ptr moves, one atomic store into the
+  // retired slot, and one atomic generation increment. publish_swap
+  // holds swap_in_flight true until collection, so an unreaped retired
+  // payload cannot be overwritten by a second install.
   if (pending_install) {
-    RTGraphSwap *prev =
-        g.retired_swap.exchange(pending_install, std::memory_order_release);
-    (void)prev;
+    pending_install->retired_state = std::move(g.active);
+    g.active = std::move(pending_install->state);
+    g.retired_swap.store(pending_install, std::memory_order_release);
     g.swap_generation_observed.fetch_add(1, std::memory_order_release);
   }
 
@@ -6205,8 +6189,8 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // This runs ONCE per block, before any instance executes — every
   // instance in this block sees the same prev snapshot and writes
   // into the same live buffer. See Note [Bus pool double-buffering].
-  std::swap(g.server.output_buses, g.server.output_buses_prev);
-  clear_output_buses(g.server, nframes);
+  std::swap(world(g).server.output_buses, world(g).server.output_buses_prev);
+  clear_output_buses(world(g).server, nframes);
 
   // Phase §4.E.2.C0b/C0d/C1: rebuild the global schedule from the
   // post-drain instance-state snapshot, expand it into C1d-a
@@ -6241,7 +6225,7 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // read-after-write semantics.
   if (g.capture_reduction_mode) {
     ctx.bus_writes.mode = BusWriteMode::Reduction;
-    auto &storage = g.contribution_storage;
+    auto &storage = world(g).contribution_storage;
     std::fill(storage.target.begin(), storage.target.end(), -1);
     std::fill(storage.used_words.begin(), storage.used_words.end(),
               std::uint64_t{0});
@@ -6300,16 +6284,16 @@ void GraphAudioStream::process(out_channels const &out) {
     auto dst = out[ch];
     std::fill(dst.begin(), dst.end(), 0.0f);
 
-    if (graph.server.output_buses.empty()) {
+    if (world(graph).server.output_buses.empty()) {
       continue;
     }
 
     const std::size_t bus =
-        (graph.server.output_buses.size() == 1 && out.size() > 1) ? 0 : ch;
+        (world(graph).server.output_buses.size() == 1 && out.size() > 1) ? 0 : ch;
 
-    if (bus < graph.server.output_buses.size()) {
+    if (bus < world(graph).server.output_buses.size()) {
       std::copy_n(
-          graph.server.output_buses[bus].begin(),
+          world(graph).server.output_buses[bus].begin(),
           static_cast<std::size_t>(nframes),
           dst.begin()
       );
@@ -6477,6 +6461,28 @@ static GraphInstance make_instance(const MetaDef &def, int template_id, int max_
   return inst;
 }
 
+static std::unique_ptr<RTGraphState>
+make_default_state(int capacity, int max_frames) {
+  auto next = std::make_unique<RTGraphState>();
+
+  MetaDef def;
+  def.max_frames = max_frames;
+  if (capacity > 0) {
+    def.nodes.reserve(static_cast<std::size_t>(capacity));
+  }
+  next->defs.push_back(std::move(def));
+
+  GraphInstance inst;
+  inst.template_id = 0;
+  inst.state.store(SlotState::Active);
+  if (capacity > 0) {
+    inst.nodes.reserve(static_cast<std::size_t>(capacity));
+  }
+  next->instances.push_back(std::move(inst));
+
+  return next;
+}
+
 // Reset the graph to the initial single-template state: one empty
 // MetaDef at index 0, one empty GraphInstance at slot 0 belonging to
 // template 0, and an empty Server bus pool. Used by both
@@ -6494,10 +6500,7 @@ static GraphInstance make_instance(const MetaDef &def, int template_id, int max_
 // See Note [Legacy single-template ABI as template-0 shim].
 static void reset_to_default_state(RTGraph &g) {
   g.sample_rate = kDefaultSampleRate;
-  g.defs.clear();
-  g.instances.clear();
-  g.server.output_buses.clear();
-  g.server.output_buses_prev.clear();
+  g.active = make_default_state(g.capacity, g.max_frames);
 
   // Reset the Phase B0 test snapshot. Without this, after a
   // process → clear cycle the helper would report the previous
@@ -6506,12 +6509,6 @@ static void reset_to_default_state(RTGraph &g) {
   // has run yet" promise.
   g.last_block_writer_slot_count = 0;
 
-  // Phase B1: drop contribution storage back to empty. The next
-  // construction mutation (rt_graph_template_add_node,
-  // rt_graph_template_set_polyphony, etc.) will re-call
-  // ensure_contribution_capacity with the post-clear shape.
-  g.contribution_storage.clear();
-
   // Phase B2: reduction-capture is a test-only opt-in; clear
   // resets it so a fresh graph never silently captures into the
   // contribution table without an explicit
@@ -6519,16 +6516,6 @@ static void reset_to_default_state(RTGraph &g) {
   g.capture_reduction_mode = false;
   g.execute_global_schedule = false;
 
-  // Phase §4.E.2.C0b/C0d: drop the previous block's global schedule
-  // and band snapshots. The next process_graph rebuilds them from the
-  // freshly-cleared instance pool (which after reset has only the
-  // auto-created instance 0 belonging to template 0, and template
-  // 0 has no schedule_steps yet — so the first build produces an
-  // empty schedule until a loader ships C0a metadata).
-  g.global_schedule.clear();
-  g.region_layer_work_items.clear();
-  g.global_schedule_bands.clear();
-  g.global_schedule_writer_slot_count = 0;
   g.last_parallel_band_count = 0;
   g.last_parallel_entry_count = 0;
   g.last_serialized_free_band_count = 0;
@@ -6539,7 +6526,7 @@ static void reset_to_default_state(RTGraph &g) {
   g.last_c1d_parallel_entry_count = 0;
   g.last_c1d_parallel_region_item_count = 0;
 
-  // Phase 5.1.A: reset the hot-swap protocol slots. rt_graph_clear
+  // Phase 5.1.B: reset the hot-swap protocol slots. rt_graph_clear
   // already called stop_audio_stream, so there is no concurrent
   // audio thread and no concurrent producer (publish is
   // [T:realtime-producer] which by §1's contract is only safe to
@@ -6553,6 +6540,7 @@ static void reset_to_default_state(RTGraph &g) {
           nullptr, std::memory_order_relaxed)) {
     delete retired;
   }
+  g.swap_in_flight.store(false, std::memory_order_relaxed);
   g.swap_generation_observed.store(0, std::memory_order_relaxed);
 
   // Discard any control commands that were enqueued before the
@@ -6565,25 +6553,9 @@ static void reset_to_default_state(RTGraph &g) {
   g.control_queue.write_idx.store(0, std::memory_order_relaxed);
   g.control_queue.read_idx.store(0, std::memory_order_relaxed);
 
-  // Push template 0 (empty MetaDef).
-  MetaDef def;
-  def.max_frames = g.max_frames;
-  if (g.capacity > 0) {
-    def.nodes.reserve(static_cast<std::size_t>(g.capacity));
-  }
-  g.defs.push_back(std::move(def));
-
-  // Push instance 0 (empty GraphInstance, template_id = 0). Active
-  // by default so the legacy single-template ABI (rt_graph_set_control
-  // and friends, which target instance 0) sees a live slot from the
-  // moment the handle is constructed.
-  GraphInstance inst;
-  inst.template_id = 0;
-  inst.state.store(SlotState::Active);
-  if (g.capacity > 0) {
-    inst.nodes.reserve(static_cast<std::size_t>(g.capacity));
-  }
-  g.instances.push_back(std::move(inst));
+  // g.active now owns a fresh default world: template 0 plus active
+  // instance 0, empty server bus pool, empty contribution storage, and
+  // empty schedule scratch.
 }
 
 /* Note [Pool model]
@@ -6619,7 +6591,7 @@ Why the change:
     Active+Releasing slots assigned to that template reaches the cap.
     The runtime does not steal — that's the voice allocator's job.
 
-Pool layout: g.instances is a flat vector across all templates, each
+Pool layout: world(g).instances is a flat vector across all templates, each
 slot tagged with template_id (preserved from §2.D.3). A template's
 polyphony cap is enforced by counting at spawn time, not by reserving
 a contiguous range. Spawn prefers reuse (first Available slot) over
@@ -6637,7 +6609,7 @@ way, allocation happens in _instance_add (control thread today,
 control queue tomorrow), never in the audio callback.
 
 Slot identity: the C ABI's instance_id is the slot index in
-g.instances. instance_count returns g.instances.size() — under the
+world(g).instances. instance_count returns world(g).instances.size() — under the
 pool model that's the slot-pool size, not a high-water-mark of
 ever-used indices. instance_alive returns 1 iff state is Active or
 Releasing (Reserved slots are not yet schedulable, so they read as
@@ -6715,7 +6687,7 @@ void rt_graph_destroy(RTGraph *g) {
   }
   stop_audio_stream(*g);
   g->worker_pool.stop_workers();
-  // Phase 5.1.A: stop_audio_stream has joined the audio thread, so the
+  // Phase 5.1.B: stop_audio_stream has joined the audio thread, so the
   // pending / retired swap slots can no longer be touched concurrently.
   // Free any unreaped swap so destroying a graph mid-protocol does not
   // leak. Mirrors the reset_to_default_state path; matters here for
@@ -6776,7 +6748,7 @@ int rt_graph_template_add(RTGraph *g) {
   if (g->capacity > 0) {
     def.nodes.reserve(static_cast<std::size_t>(g->capacity));
   }
-  g->defs.push_back(std::move(def));
+  world(*g).defs.push_back(std::move(def));
 
   // A fresh template has zero sink writers, so the bound is
   // unchanged today. The call is here for symmetry — every
@@ -6796,7 +6768,7 @@ int rt_graph_template_add(RTGraph *g) {
   // items, so this is also a symmetry/no-op call today.
   ensure_region_layer_work_item_capacity(*g);
 
-  return static_cast<int>(g->defs.size() - 1);
+  return static_cast<int>(world(*g).defs.size() - 1);
 }
 
 // Set the per-template polyphony cap (max simultaneously-live
@@ -6832,7 +6804,7 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
 // Number of registered templates. Iterate 0..count-1 to enumerate.
 int rt_graph_template_count(RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->defs.size());
+  return static_cast<int>(world(*g).defs.size());
 }
 
 // ----------------------------------------------------------------
@@ -6846,22 +6818,22 @@ int rt_graph_test_last_writer_slot_count(const RTGraph *g) {
 
 int rt_graph_test_contribution_slot_capacity(const RTGraph *g) {
   if (!g) return 0;
-  return g->contribution_storage.max_writer_slots;
+  return world(*g).contribution_storage.max_writer_slots;
 }
 
 int rt_graph_test_contribution_sample_count(const RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->contribution_storage.samples.size());
+  return static_cast<int>(world(*g).contribution_storage.samples.size());
 }
 
 int rt_graph_test_contribution_target_count(const RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->contribution_storage.target.size());
+  return static_cast<int>(world(*g).contribution_storage.target.size());
 }
 
 int rt_graph_test_contribution_used_word_count(const RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->contribution_storage.used_words.size());
+  return static_cast<int>(world(*g).contribution_storage.used_words.size());
 }
 
 void rt_graph_test_set_reduction_capture(RTGraph *g, int on) {
@@ -6906,14 +6878,14 @@ int rt_graph_test_last_serialized_free_band_count(const RTGraph *g) {
 
 int rt_graph_test_contribution_slot_target(const RTGraph *g, int ws) {
   if (!g) return -1;
-  const auto &storage = g->contribution_storage;
+  const auto &storage = world(*g).contribution_storage;
   if (ws < 0 || ws >= storage.max_writer_slots) return -1;
   return storage.target[static_cast<std::size_t>(ws)];
 }
 
 int rt_graph_test_contribution_slot_used(const RTGraph *g, int ws) {
   if (!g) return 0;
-  const auto &storage = g->contribution_storage;
+  const auto &storage = world(*g).contribution_storage;
   if (ws < 0 || ws >= storage.max_writer_slots) return 0;
   return contribution_slot_used(storage, ws) ? 1 : 0;
 }
@@ -6921,7 +6893,7 @@ int rt_graph_test_contribution_slot_used(const RTGraph *g, int ws) {
 int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
                                          int nframes, float *out) {
   if (!g || !out) return -1;
-  const auto &storage = g->contribution_storage;
+  const auto &storage = world(*g).contribution_storage;
   if (ws < 0 || ws >= storage.max_writer_slots) return -1;
   if (nframes < 0 || nframes > g->max_frames) return -1;
   const std::size_t base = static_cast<std::size_t>(ws)
@@ -6941,8 +6913,8 @@ int rt_graph_test_template_schedule_step_count(
   if (!g) return 0;
   if (template_id < 0) return 0;
   const std::size_t tid = static_cast<std::size_t>(template_id);
-  if (tid >= g->defs.size()) return 0;
-  return static_cast<int>(g->defs[tid].schedule_steps.size());
+  if (tid >= world(*g).defs.size()) return 0;
+  return static_cast<int>(world(*g).defs[tid].schedule_steps.size());
 }
 
 namespace {
@@ -6951,8 +6923,8 @@ schedule_step_at(const RTGraph *g, int template_id, int step_index) {
   if (!g) return nullptr;
   if (template_id < 0 || step_index < 0) return nullptr;
   const std::size_t tid = static_cast<std::size_t>(template_id);
-  if (tid >= g->defs.size()) return nullptr;
-  const auto &steps = g->defs[tid].schedule_steps;
+  if (tid >= world(*g).defs.size()) return nullptr;
+  const auto &steps = world(*g).defs[tid].schedule_steps;
   const std::size_t sidx = static_cast<std::size_t>(step_index);
   if (sidx >= steps.size()) return nullptr;
   return &steps[sidx];
@@ -6988,7 +6960,7 @@ int rt_graph_test_template_schedule_step_region(
   if (!spec) return -1;
   if (item_index < 0 || item_index >= spec->item_count) return -1;
   const std::size_t tid = static_cast<std::size_t>(template_id);
-  const auto &items = g->defs[tid].schedule_step_regions;
+  const auto &items = world(*g).defs[tid].schedule_step_regions;
   const std::size_t pos = static_cast<std::size_t>(spec->first_item)
                           + static_cast<std::size_t>(item_index);
   if (pos >= items.size()) return -1;
@@ -7002,7 +6974,7 @@ int rt_graph_test_template_schedule_step_region(
 // before any block has run), the vector is empty.
 int rt_graph_test_global_schedule_entry_count(const RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->global_schedule.size());
+  return static_cast<int>(world(*g).global_schedule.size());
 }
 
 namespace {
@@ -7011,8 +6983,8 @@ global_schedule_entry_at(const RTGraph *g, int entry_index) {
   if (!g) return nullptr;
   if (entry_index < 0) return nullptr;
   const std::size_t i = static_cast<std::size_t>(entry_index);
-  if (i >= g->global_schedule.size()) return nullptr;
-  return &g->global_schedule[i];
+  if (i >= world(*g).global_schedule.size()) return nullptr;
+  return &world(*g).global_schedule[i];
 }
 }  // namespace
 
@@ -7044,7 +7016,7 @@ int rt_graph_test_global_schedule_entry_step(
 // accessors.
 int rt_graph_test_global_schedule_band_count(const RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->global_schedule_bands.size());
+  return static_cast<int>(world(*g).global_schedule_bands.size());
 }
 
 namespace {
@@ -7053,8 +7025,8 @@ global_schedule_band_at(const RTGraph *g, int band_index) {
   if (!g) return nullptr;
   if (band_index < 0) return nullptr;
   const std::size_t i = static_cast<std::size_t>(band_index);
-  if (i >= g->global_schedule_bands.size()) return nullptr;
-  return &g->global_schedule_bands[i];
+  if (i >= world(*g).global_schedule_bands.size()) return nullptr;
+  return &world(*g).global_schedule_bands[i];
 }
 }  // namespace
 
@@ -7081,12 +7053,12 @@ int rt_graph_test_global_schedule_band_entry_count(
 
 int rt_graph_test_region_layer_work_item_count(const RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->region_layer_work_items.size());
+  return static_cast<int>(world(*g).region_layer_work_items.size());
 }
 
 int rt_graph_test_region_layer_work_item_capacity(const RTGraph *g) {
   if (!g) return 0;
-  return static_cast<int>(g->region_layer_work_items.capacity());
+  return static_cast<int>(world(*g).region_layer_work_items.capacity());
 }
 
 namespace {
@@ -7095,8 +7067,8 @@ region_layer_work_item_at(const RTGraph *g, int item_index) {
   if (!g) return nullptr;
   if (item_index < 0) return nullptr;
   const std::size_t i = static_cast<std::size_t>(item_index);
-  if (i >= g->region_layer_work_items.size()) return nullptr;
-  return &g->region_layer_work_items[i];
+  if (i >= world(*g).region_layer_work_items.size()) return nullptr;
+  return &world(*g).region_layer_work_items[i];
 }
 }  // namespace
 
@@ -7182,12 +7154,34 @@ int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g) {
 }
 
 // ----------------------------------------------------------------
-// Phase 5.1.A: RCU hot-swap protocol substrate
+// Phase 5.1.B: RCU hot-swap protocol substrate + world payload
 // ----------------------------------------------------------------
 
 RTGraphSwap *rt_graph_prepare_swap(RTGraph *g) {
   if (!g) return nullptr;
-  return new RTGraphSwap{};
+  auto *swap = new RTGraphSwap{};
+  swap->state = make_default_state(g->capacity, g->max_frames);
+  return swap;
+}
+
+RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
+                                              RTGraph *source) {
+  if (!target || !source || target == source) return nullptr;
+  if (target->max_frames != source->max_frames) return nullptr;
+  if (source->pending_swap.load(std::memory_order_acquire) != nullptr) {
+    return nullptr;
+  }
+  if (source->retired_swap.load(std::memory_order_acquire) != nullptr) {
+    return nullptr;
+  }
+  if (source->swap_in_flight.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
+
+  auto *swap = new RTGraphSwap{};
+  swap->state = std::move(source->active);
+  reset_to_default_state(*source);
+  return swap;
 }
 
 void rt_graph_cancel_swap(RTGraph * /*g*/, RTGraphSwap *swap) {
@@ -7195,7 +7189,14 @@ void rt_graph_cancel_swap(RTGraph * /*g*/, RTGraphSwap *swap) {
 }
 
 int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap) {
-  if (!g || !swap) return 0;
+  if (!g || !swap || !swap->state) return 0;
+  bool idle = false;
+  if (!g->swap_in_flight.compare_exchange_strong(
+          idle, true,
+          std::memory_order_acq_rel,
+          std::memory_order_relaxed)) {
+    return 0;
+  }
   // CAS the pending slot from null → swap. A failure means a
   // previous publish has not yet been installed; the producer must
   // wait (poll rt_graph_test_swap_pending) and retry. Release on
@@ -7206,6 +7207,7 @@ int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap) {
           expected, swap,
           std::memory_order_release,
           std::memory_order_relaxed)) {
+    g->swap_in_flight.store(false, std::memory_order_release);
     return 0;
   }
   return 1;
@@ -7213,9 +7215,14 @@ int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap) {
 
 RTGraphSwap *rt_graph_collect_retired_swap(RTGraph *g) {
   if (!g) return nullptr;
-  // Acquire so any payload future slices stash on the retired swap
-  // before the audio thread releases it is visible here.
-  return g->retired_swap.exchange(nullptr, std::memory_order_acquire);
+  // Acquire so the retired state moved into the swap by the audio
+  // thread is visible before the producer disposes it.
+  RTGraphSwap *retired =
+      g->retired_swap.exchange(nullptr, std::memory_order_acquire);
+  if (retired) {
+    g->swap_in_flight.store(false, std::memory_order_release);
+  }
+  return retired;
 }
 
 int rt_graph_test_swap_generation(const RTGraph *g) {
@@ -7230,6 +7237,35 @@ int rt_graph_test_swap_pending(const RTGraph *g) {
 int rt_graph_test_swap_retired_pending(const RTGraph *g) {
   if (!g) return 0;
   return g->retired_swap.load(std::memory_order_acquire) != nullptr ? 1 : 0;
+}
+
+int rt_graph_test_retired_swap_control_value(
+    const RTGraphSwap *swap,
+    int instance_id,
+    int node_index,
+    int control_index,
+    double *out_value
+) {
+  if (!swap || !swap->retired_state || !out_value) return 0;
+  if (instance_id < 0 || node_index < 0 || control_index < 0) return 0;
+
+  const auto &instances = swap->retired_state->instances;
+  const std::size_t inst_idx = static_cast<std::size_t>(instance_id);
+  if (inst_idx >= instances.size()) return 0;
+
+  const GraphInstance &inst = instances[inst_idx];
+  const SlotState s = inst.state.load();
+  if (s == SlotState::Available) return 0;
+
+  const std::size_t node_idx = static_cast<std::size_t>(node_index);
+  if (node_idx >= inst.nodes.size()) return 0;
+
+  const auto &controls = inst.nodes[node_idx].controls;
+  const std::size_t control_idx = static_cast<std::size_t>(control_index);
+  if (control_idx >= controls.size()) return 0;
+
+  *out_value = controls[control_idx];
+  return 1;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named
@@ -7264,7 +7300,7 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
 
   ensure_node_slot(*g, template_id, idx);
   configure_spec(def->nodes[to_size(idx)], kind);
-  for (auto &inst : g->instances) {
+  for (auto &inst : world(*g).instances) {
     // [T:construction]: walk only the slots that already participate
     // in the audio schedule, skipping Reserved alongside Available.
     // A Reserved slot is owned by a producer that may be writing
@@ -7284,7 +7320,7 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
   // shared server pool. Growing here is fine — every other template
   // can read or write the same bus once it's allocated.
   if (kind == NodeKind::Out) {
-    ensure_output_bus_count(g->server, 1, g->max_frames);
+    ensure_output_bus_count(world(*g).server, 1, g->max_frames);
   }
 
   // Phase B1: Out / BusOut nodes are sink writers; each one bumps
@@ -7643,7 +7679,7 @@ void rt_graph_template_connect_fused_scale_input(
   // process_instance call. Mirrors rt_graph_template_add_node's
   // parallel-growth contract; uses the shared ensure_fused_scratch
   // helper so reuse paths and growth paths agree exactly.
-  for (auto &inst : g->instances) {
+  for (auto &inst : world(*g).instances) {
     if (inst.template_id != template_id) continue;
     if (inst.state.load() == SlotState::Available) continue;
     ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
@@ -7724,7 +7760,7 @@ void rt_graph_template_connect_fused_scale_chain_input(
   ref.scratch_slot = slot;
   dst_spec.fused_inputs[dport] = std::move(ref);
 
-  for (auto &inst : g->instances) {
+  for (auto &inst : world(*g).instances) {
     if (inst.template_id != template_id) continue;
     if (inst.state.load() == SlotState::Available) continue;
     ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
@@ -7813,7 +7849,7 @@ void rt_graph_template_connect_fused_affine_input(
   ref.scratch_slot = slot;
   dst_spec.fused_inputs[dport] = std::move(ref);
 
-  for (auto &inst : g->instances) {
+  for (auto &inst : world(*g).instances) {
     if (inst.template_id != template_id) continue;
     if (inst.state.load() == SlotState::Available) continue;
     ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
@@ -7829,7 +7865,7 @@ void rt_graph_template_connect_fused_affine_input(
 //      reached (count of Active + Releasing slots assigned to this
 //      template_id == def->polyphony), return -1. The voice allocator
 //      will eventually own the stealing policy; the runtime is dumb.
-//   2. Scan g.instances for an Available slot, preferring reuse over
+//   2. Scan world(g).instances for an Available slot, preferring reuse over
 //      growth. A reused slot keeps its node-state vector capacity
 //      from the previous occupant, which is the whole point of A.1's
 //      pool model.
@@ -7850,24 +7886,24 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
 
   // Count live slots (Active + Releasing) assigned to this template
   // and remember the first Available slot we see, so the cap check
-  // and the slot scan share one pass over g.instances.
+  // and the slot scan share one pass over world(g).instances.
   int live_count = 0;
-  std::size_t free_slot = g->instances.size();  // sentinel: no slot found
-  for (std::size_t i = 0; i < g->instances.size(); ++i) {
-    auto &s = g->instances[i];
+  std::size_t free_slot = world(*g).instances.size();  // sentinel: no slot found
+  for (std::size_t i = 0; i < world(*g).instances.size(); ++i) {
+    auto &s = world(*g).instances[i];
     if (s.state.load() == SlotState::Available) {
-      if (free_slot == g->instances.size()) free_slot = i;
+      if (free_slot == world(*g).instances.size()) free_slot = i;
     } else if (s.template_id == template_id) {
       ++live_count;
     }
   }
   if (live_count >= def->polyphony) return -1;
 
-  if (free_slot < g->instances.size()) {
+  if (free_slot < world(*g).instances.size()) {
     // Reuse: preserve the GraphInstance's vector capacity, just
     // re-initialize its node state from the (possibly mutated) spec
     // and flip the slot to Active.
-    GraphInstance &slot = g->instances[free_slot];
+    GraphInstance &slot = world(*g).instances[free_slot];
     slot.template_id = template_id;
     slot.silent_blocks = 0;
     slot.block_sink_peak = 0.0f;
@@ -7889,8 +7925,8 @@ int rt_graph_template_instance_add(RTGraph *g, int template_id) {
   // No free slot — grow the pool by one. Construction-only path.
   GraphInstance inst = make_instance(*def, template_id, g->max_frames);
   inst.state.store(SlotState::Active);
-  g->instances.push_back(std::move(inst));
-  return static_cast<int>(g->instances.size() - 1);
+  world(*g).instances.push_back(std::move(inst));
+  return static_cast<int>(world(*g).instances.size() - 1);
 }
 
 // ----------------------------------------------------------------
@@ -7964,8 +8000,8 @@ void rt_graph_process(RTGraph *g, int nframes) {
 
   // Ensure at least one server bus exists so single-instance default
   // graphs can read bus 0 without explicit setup.
-  if (g->server.output_buses.empty()) {
-    ensure_output_bus_count(g->server, 1, g->max_frames);
+  if (world(*g).server.output_buses.empty()) {
+    ensure_output_bus_count(world(*g).server, 1, g->max_frames);
   }
 
   process_graph(*g, nframes);
@@ -7977,7 +8013,7 @@ Until §2.E the bus pool grew implicitly as a side effect of
 rt_graph_template_set_default and rt_graph_instance_set_control:
 when control 0 of an Out / BusOut / BusIn / BusInDelayed node was
 written with a non-negative value, the runtime quietly resized
-g.server.output_buses to cover that bus index.
+world(g).server.output_buses to cover that bus index.
 
 This was convenient for callers (no extra API to learn) but
 architecturally messy: a function whose nominal job is "write a
@@ -8016,7 +8052,7 @@ to this pattern when the implicit growth was removed.
 void rt_graph_ensure_bus(RTGraph *g, int bus_index) {
   if (!g || bus_index < 0) return;
   const auto bus = static_cast<std::size_t>(bus_index);
-  ensure_output_bus_count(g->server, bus + 1, g->max_frames);
+  ensure_output_bus_count(world(*g).server, bus + 1, g->max_frames);
 }
 
 // Read one bus from the shared server pool. Under §2.C+§2.D.3 the
@@ -8029,11 +8065,11 @@ int rt_graph_read_bus(RTGraph *g, int bus_index, int nframes, float *out) {
   }
 
   const std::size_t bus = static_cast<std::size_t>(bus_index);
-  if (bus >= g->server.output_buses.size()) {
+  if (bus >= world(*g).server.output_buses.size()) {
     return 0;
   }
 
-  const auto &src = g->server.output_buses[bus];
+  const auto &src = world(*g).server.output_buses[bus];
   const std::size_t to_copy =
       std::min(static_cast<std::size_t>(nframes), src.size());
   std::copy_n(src.begin(), to_copy, out);
@@ -8064,11 +8100,11 @@ int rt_graph_start_audio(RTGraph *g, int output_channels, int device_id) {
   }
 
   if (output_channels <= 0) {
-    output_channels = std::max(1, static_cast<int>(g->server.output_buses.size()));
+    output_channels = std::max(1, static_cast<int>(world(*g).server.output_buses.size()));
   }
 
-  if (g->server.output_buses.empty()) {
-    ensure_output_bus_count(g->server, 1, g->max_frames);
+  if (world(*g).server.output_buses.empty()) {
+    ensure_output_bus_count(world(*g).server, 1, g->max_frames);
   }
 
   auto stream = open_audio_stream(*g, output_channels, device_id);
@@ -8121,19 +8157,19 @@ void rt_graph_instance_remove(RTGraph *g, int instance_id) {
   if (!g) return;
   if (instance_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= g->instances.size()) return;
+  if (idx >= world(*g).instances.size()) return;
   // Gate to Active / Releasing only. Hard-freeing an Available slot
   // is a silent no-op (the slot is already free); hard-freeing a
   // Reserved slot would yank a producer's claim out from under it,
   // dropping in-progress preparation work — the producer is the
   // only legitimate owner of a Reserved slot's lifecycle. See
   // Note [Pool model] and the SlotState comment.
-  const SlotState s = g->instances[idx].state.load();
+  const SlotState s = world(*g).instances[idx].state.load();
   if (s != SlotState::Active && s != SlotState::Releasing) return;
   // Flip to Available; preserve the GraphInstance object and its
   // node-state vector capacity for the next reuse. No allocation,
   // no destruction.
-  g->instances[idx].state.store(SlotState::Available);
+  world(*g).instances[idx].state.store(SlotState::Available);
 }
 
 /* Note [§2.E: release-then-free instance lifecycle]
@@ -8206,7 +8242,7 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
   if (!g) return;
   if (instance_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= g->instances.size()) return;
+  if (idx >= world(*g).instances.size()) return;
   // Gate to Active / Releasing only. Releasing an Available slot is
   // a no-op (nothing to release). Releasing a Reserved slot would
   // flip it to Releasing and publish it into the audio schedule
@@ -8215,26 +8251,26 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
   // in flight. The producer is the only legitimate owner of a
   // Reserved slot's lifecycle; external callers must wait until the
   // queued Activate publishes it before they can ask for release.
-  const SlotState pre_state = g->instances[idx].state.load();
+  const SlotState pre_state = world(*g).instances[idx].state.load();
   if (pre_state != SlotState::Active && pre_state != SlotState::Releasing) return;
 
   // The body lives in apply_instance_release so the queued-drain
   // path (apply_control_command::Release) shares the gate-off and
   // state-flip logic without duplication.
-  apply_instance_release(*g, g->instances[idx]);
+  apply_instance_release(*g, world(*g).instances[idx]);
 }
 
 int rt_graph_instance_status(RTGraph *g, int instance_id) {
   if (!g) return -1;
   if (instance_id < 0) return -1;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= g->instances.size()) return -1;
+  if (idx >= world(*g).instances.size()) return -1;
   // Active and Releasing have ABI-stable integer values (0 and 1);
   // Available and Reserved both surface as -1 to external callers.
   // Reserved is the producer's claim and is not visible through this
   // entry — a caller that did not perform the reservation has no
   // business observing it as "live". See SlotState comment.
-  const SlotState s = g->instances[idx].state.load();
+  const SlotState s = world(*g).instances[idx].state.load();
   if (s == SlotState::Active)    return 0;
   if (s == SlotState::Releasing) return 1;
   return -1;
@@ -8246,19 +8282,19 @@ int rt_graph_instance_count(RTGraph *g) {
   // ever-used indices. The pool grows during construction up to the
   // sum of per-template polyphony caps; once stable, instance_count
   // is constant for the life of the graph.
-  return static_cast<int>(g->instances.size());
+  return static_cast<int>(world(*g).instances.size());
 }
 
 int rt_graph_instance_alive(RTGraph *g, int instance_id) {
   if (!g) return 0;
   if (instance_id < 0) return 0;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= g->instances.size()) return 0;
+  if (idx >= world(*g).instances.size()) return 0;
   // Alive iff the slot is part of the audio schedule. Reserved slots
   // (claimed by a producer but not yet activated) are not yet
   // schedulable, so they read as not alive — same as Available. See
   // SlotState comment for the full state machine.
-  const SlotState s = g->instances[idx].state.load();
+  const SlotState s = world(*g).instances[idx].state.load();
   return (s == SlotState::Active || s == SlotState::Releasing) ? 1 : 0;
 }
 
@@ -8334,17 +8370,17 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
   // Active→Available — both increase the Available count, never
   // decrease it). We can therefore CAS without retries.
   int live_count = 0;
-  std::size_t free_slot = g->instances.size();  // sentinel
-  for (std::size_t i = 0; i < g->instances.size(); ++i) {
-    const SlotState s = g->instances[i].state.load();
+  std::size_t free_slot = world(*g).instances.size();  // sentinel
+  for (std::size_t i = 0; i < world(*g).instances.size(); ++i) {
+    const SlotState s = world(*g).instances[i].state.load();
     if (s == SlotState::Available) {
-      if (free_slot == g->instances.size()) free_slot = i;
-    } else if (g->instances[i].template_id == template_id) {
+      if (free_slot == world(*g).instances.size()) free_slot = i;
+    } else if (world(*g).instances[i].template_id == template_id) {
       ++live_count;  // Active, Releasing, or Reserved for this template
     }
   }
   if (live_count >= def->polyphony) return -1;
-  if (free_slot >= g->instances.size()) return -1;  // pool not pre-warmed
+  if (free_slot >= world(*g).instances.size()) return -1;  // pool not pre-warmed
 
   // CAS Available → Reserved. Acquire on success synchronizes-with
   // the audio thread's release-store that flipped this slot to
@@ -8353,7 +8389,7 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
   // CAS can't legitimately fail. If it does, treat it as the
   // contract being violated and silently return -1.
   SlotState expected = SlotState::Available;
-  if (!g->instances[free_slot].state.compare_exchange_strong(
+  if (!world(*g).instances[free_slot].state.compare_exchange_strong(
           expected, SlotState::Reserved,
           std::memory_order_acquire,
           std::memory_order_relaxed)) {
@@ -8369,9 +8405,9 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
   // catch never fires; this is defense in depth so an exception
   // never escapes the extern "C" boundary into producer code.
   try {
-    prepare_reserved_slot(*g, g->instances[free_slot], *def, template_id);
+    prepare_reserved_slot(*g, world(*g).instances[free_slot], *def, template_id);
   } catch (...) {
-    g->instances[free_slot].state.store(SlotState::Available, std::memory_order_release);
+    world(*g).instances[free_slot].state.store(SlotState::Available, std::memory_order_release);
     return -1;
   }
   return static_cast<int>(free_slot);
@@ -8387,13 +8423,13 @@ void rt_graph_realtime_cancel(RTGraph *g, int slot_id) {
   if (!g) return;
   if (slot_id < 0) return;
   const std::size_t idx = static_cast<std::size_t>(slot_id);
-  if (idx >= g->instances.size()) return;
+  if (idx >= world(*g).instances.size()) return;
   SlotState expected = SlotState::Reserved;
   // Failure is silent — Available means already canceled, Active
   // means the queue already activated us, Releasing means the
   // queue activated then released. None of these are recoverable
   // by cancel; the producer must handle that path differently.
-  (void) g->instances[idx].state.compare_exchange_strong(
+  (void) world(*g).instances[idx].state.compare_exchange_strong(
       expected, SlotState::Available,
       std::memory_order_release,
       std::memory_order_relaxed);

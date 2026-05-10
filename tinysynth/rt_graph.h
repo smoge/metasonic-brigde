@@ -6,9 +6,10 @@ extern "C" {
 
 typedef struct RTGraph RTGraph;
 
-// Phase 5.1.A: opaque handle to a "next world" prepared off-audio.
-// Today the payload is empty; the substrate exists to pin the
-// publish/install/retire dance before later slices add real content.
+// Phase 5.1.B: opaque handle to a "next world" prepared off-audio.
+// A prepared swap owns the RTGraphState that the audio thread will
+// install at the next block boundary, then owns the retired previous
+// state until the producer disposes the collected swap.
 // See notes/2026-05-10-phase-5-rcu-hot-swap-design.md.
 typedef struct RTGraphSwap RTGraphSwap;
 
@@ -831,32 +832,33 @@ int rt_graph_test_last_c1d_parallel_entry_count(const RTGraph *g);
 int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g);
 
 // ----------------------------------------------------------------
-// Phase 5.1.A: RCU hot-swap protocol substrate
+// Phase 5.1.B: RCU hot-swap protocol substrate + world payload
 // ----------------------------------------------------------------
 //
-// The substrate stands up the publish/install/retire dance with an
-// empty payload so the dance itself can be tested before it carries
-// DSP state. Today an installed swap is a no-op for rendering — it
-// only advances the audio thread's `swap_generation` counter so tests
-// can pin "the install actually happened at a block boundary."
+// The swap protocol installs a prepared RTGraphState at a block
+// boundary. The previous active world is moved into the same
+// RTGraphSwap as retired payload; deleting the collected swap frees
+// that old world off-audio.
 //
 // Lifecycle:
 //
-//   1. Off-audio thread calls rt_graph_prepare_swap(g) -> swap.
-//   2. (Future slices: populate `swap` with the next world's defs,
-//      instances, server, schedule metadata.)
-//   3. Off-audio calls rt_graph_publish_swap(g, swap). Returns 1 on
-//      success, 0 if a swap is already pending or args are null. On
-//      success, the runtime owns `swap` from this point.
-//   4. The next rt_graph_process call's audio thread acquires the
+//   1. Off-audio thread calls rt_graph_prepare_swap(g) -> swap for a
+//      default empty world, or builds a separate offline RTGraph and
+//      calls rt_graph_prepare_swap_from_graph(target, builder) to move
+//      that builder's world into the swap.
+//   2. Off-audio calls rt_graph_publish_swap(g, swap). Returns 1 on
+//      success, 0 if args are invalid or any previous swap is still
+//      pending, installing, or retired-but-not-collected. On success,
+//      the runtime owns `swap` from this point.
+//   3. The next rt_graph_process call's audio thread acquires the
 //      pending swap at the top of the block, advances
-//      swap_generation, and moves the consumed swap to a one-deep
-//      retire slot.
-//   5. Off-audio polls rt_graph_collect_retired_swap(g) and frees
+//      swap_generation, replaces the active world, and moves the
+//      consumed swap to a one-deep retire slot.
+//   4. Off-audio polls rt_graph_collect_retired_swap(g) and frees
 //      the returned swap. Producer is contractually required to reap
-//      until the call returns null after each publish; otherwise the
-//      next install overwrites the retire slot and the previous swap
-//      leaks.
+//      until the call returns the retired swap after each publish.
+//      A new publish is rejected while any previous swap is pending,
+//      installing, or retired-but-not-collected.
 //
 // rt_graph_cancel_swap is the rollback path for a prepared but not
 // yet published swap; once publish has succeeded the runtime owns the
@@ -865,11 +867,25 @@ int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g);
 // See notes/2026-05-10-phase-5-rcu-hot-swap-design.md for the full
 // protocol, world boundary, and migration deferral rationale.
 
-// [T:construction] Allocate an empty next-world handle off-audio. The
+// [T:construction] Allocate a default next-world handle off-audio. The
+// next world is equivalent to a freshly-cleared graph: template 0 plus
+// active instance 0, no nodes, no buses, no schedule metadata. The
 // returned pointer is owned by the caller until either
 // rt_graph_cancel_swap or a successful rt_graph_publish_swap. Returns
 // null if g is null.
 RTGraphSwap *rt_graph_prepare_swap(RTGraph *g);
+
+// [T:construction] Move the swappable world from an offline builder
+// graph into a next-world handle for `target`. target and source must
+// be non-null, distinct handles with the same max_frames. On success,
+// source is reset to the same default state as rt_graph_clear and the
+// caller owns the returned swap until cancel or successful publish.
+// This lets producers reuse the existing RTGraph construction ABI to
+// build a future world without duplicating every construction call for
+// RTGraphSwap. Returns null on invalid args or if source itself has a
+// swap in flight.
+RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
+                                              RTGraph *source);
 
 // [T:construction] Free an unpublished swap. Silent no-op on null. Do
 // not call after rt_graph_publish_swap has succeeded for this swap;
@@ -877,11 +893,12 @@ RTGraphSwap *rt_graph_prepare_swap(RTGraph *g);
 // reap path may move it.
 void rt_graph_cancel_swap(RTGraph *g, RTGraphSwap *swap);
 
-// [T:realtime-producer] Atomically install `swap` as the pending next
+// [T:realtime-producer] Atomically publish `swap` as the pending next
 // world. Returns 1 on success, 0 if a swap is already pending or args
-// are null. On success, the audio thread acquires `swap` at the top of
-// the next process_graph block and the runtime owns it from publish
-// time forward.
+// are null. Returns 0 as well while a previous swap has installed but
+// not yet been collected. On success, the audio thread acquires `swap`
+// at the top of the next process_graph block and the runtime owns it
+// from publish time forward.
 //
 // Single-producer contract. Only one off-audio thread may publish.
 // Concurrent publish from multiple threads is undefined behavior.
@@ -893,9 +910,9 @@ int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap);
 // destructor — cancel and reap-then-free share the off-audio dispose
 // path).
 //
-// Producer responsibility: poll until null after each publish. The
-// retire slot is one-deep; failing to drain it means the next install
-// overwrites the previous retired swap and that swap leaks.
+// Producer responsibility: collect and dispose the retired swap after
+// each successful publish. Until collection happens, the next publish
+// fails so the one-deep retire slot cannot be overwritten.
 RTGraphSwap *rt_graph_collect_retired_swap(RTGraph *g);
 
 // [T:read-only] Phase 5.1.A test surface: atomic count of swaps the
@@ -916,6 +933,18 @@ int rt_graph_test_swap_pending(const RTGraph *g);
 // currently in the retire slot (installed by the audio thread but not
 // yet collected by the producer), 0 otherwise. Returns 0 on null g.
 int rt_graph_test_swap_retired_pending(const RTGraph *g);
+
+// [T:read-only] Phase 5.1.B test surface: inspect one control value
+// from the retired world stored inside a collected swap. Returns 1 and
+// writes *out_value on success, 0 on null args or out-of-range ids.
+// This is only meaningful after rt_graph_collect_retired_swap returns
+// a non-null swap and before rt_graph_cancel_swap disposes it.
+int rt_graph_test_retired_swap_control_value(
+    const RTGraphSwap *swap,
+    int instance_id,
+    int node_index,
+    int control_index,
+    double *out_value);
 
 // ----------------------------------------------------------------
 // Multi-instance support

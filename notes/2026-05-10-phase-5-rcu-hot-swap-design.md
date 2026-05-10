@@ -1,16 +1,16 @@
 # Phase 5 — RCU Hot-Swap Protocol
 
 Date: 2026-05-10
-Status: Phase 5.1 design + minimal substrate. State migration explicitly deferred.
+Status: Phase 5.1.A/B implemented. State migration explicitly deferred.
 
 This note pins the protocol for swapping a running MetaSonic graph
 without a stop/start cycle. It records what the runtime does today,
 what the target swap shape is, what crosses the audio-thread boundary
 and what does not, and what state migration would have to commit to —
-*after* the substrate is pinned. The substrate landing alongside this
-note is intentionally narrower than the full protocol: it stands up the
-publish / install / retire dance with an empty payload so the dance
-itself can be tested before it carries DSP state.
+*after* the substrate is pinned. Phase 5.1.A first stood up the
+publish / install / retire dance with an empty payload; Phase 5.1.B
+moves the swappable runtime world into `RTGraphState` and makes
+`RTGraphSwap` carry a real next-world payload.
 
 ## 1. Today: stop / rebuild semantics
 
@@ -96,43 +96,45 @@ Inside-the-world fields are what the off-audio prepare path populates;
 outside-the-world fields belong to the RTGraph handle and outlive any
 single graph.
 
-## 4. Substrate landing in this slice
+## 4. Phase 5.1.A/B landing
 
-The slice landing alongside this note implements the publish / install
-/ retire protocol with an **empty** world payload. The `RTGraphSwap`
-struct exists, the four ABI entries
-(`rt_graph_prepare_swap`, `rt_graph_cancel_swap`,
-`rt_graph_publish_swap`, `rt_graph_collect_retired_swap`) work, the
-audio thread observes the install at a block boundary and hands the
-consumed swap back to a retire slot, and tests pin the dance — but the
-swap object carries no `defs` / `instances` / `server` content yet, and
-the active world is unchanged after install.
+The landed implementation has two layers:
 
-This is deliberate. The protocol shape is the load-bearing decision:
-where the install happens, what atomic ordering publishes the world,
-who frees the retired payload, what happens if a publish lands while
-one is pending. Once those answers are pinned by tests and counters,
-later slices can add real content to `RTGraphSwap` without re-litigating
-the protocol.
+- **5.1.A:** `RTGraphSwap` plus the publish / install / retire protocol
+  with generation and pending/retired test counters.
+- **5.1.B:** the swappable subset of `RTGraph` lives in
+  `RTGraphState`, `RTGraph` holds `std::unique_ptr<RTGraphState>
+  active`, and `RTGraphSwap` carries a prepared `RTGraphState`.
+  Install moves the old active state into the collected swap's
+  `retired_state` and moves the prepared state into `active`.
+
+The producer can build a future world by constructing a separate
+offline `RTGraph` with the existing construction ABI, then calling
+`rt_graph_prepare_swap_from_graph(target, builder)` to move that
+builder's world into the swap. This avoids cloning DSP state and avoids
+duplicating every construction call for `RTGraphSwap`. The builder is
+reset to the default empty world after the move.
 
 What the substrate provides:
 
-- `rt_graph_prepare_swap(g) -> RTGraphSwap *`: allocates an empty
-  swap off-audio. Returns null if `g` is null.
+- `rt_graph_prepare_swap(g) -> RTGraphSwap *`: allocates a default
+  empty next-world swap off-audio. Returns null if `g` is null.
+- `rt_graph_prepare_swap_from_graph(target, builder) -> RTGraphSwap *`:
+  moves `builder`'s swappable world into a swap for `target`. Requires
+  distinct non-null handles with the same `max_frames` and no swap in
+  flight on the builder.
 - `rt_graph_cancel_swap(g, swap)`: frees an unpublished swap off-audio.
 - `rt_graph_publish_swap(g, swap) -> int`: atomic CAS into a single
   pending slot. Returns 1 on success, 0 if a swap is already pending or
-  args are null. The audio thread acquires the pending swap at the top
-  of the next `process_graph` block.
+  retired-but-not-collected, or args are null. The audio thread acquires
+  the pending swap at the top of the next `process_graph` block.
 - `rt_graph_collect_retired_swap(g) -> RTGraphSwap *`: off-audio reap
   point. Returns a swap the audio thread has consumed, or null. The
-  producer is contractually required to call this until it returns
-  null after each publish; failing to do so leaks at most one swap per
-  unreaped publish (substrate-level: the slot is one-deep, so a stale
-  retired swap is overwritten by the next install).
+  producer is contractually required to collect and dispose the retired
+  swap after each publish; a new publish is rejected until collection.
 - `rt_graph_test_swap_generation(g) -> int`: atomic number of installs
   the audio thread has performed. Pinned by tests and usable by the
-  producer as a pollable "installed" signal in this substrate slice.
+  producer as a pollable "installed" signal.
 
 ## 5. Realtime control queue across a swap
 
@@ -149,9 +151,6 @@ old world before it retires. Commands the producer enqueues *after*
 publish should not target the old world's slots — those slots may not
 exist (or may be at different indices) in the new world.
 
-Under the substrate's empty payload, this is moot. Under future slices
-with real world content, the protocol becomes:
-
 > Publish a swap → wait until `swap_generation` advances → resume
 > enqueuing realtime commands against the new world.
 
@@ -163,15 +162,16 @@ populated by the audio thread. v1 leaves this to the caller.
 
 The substrate preserves every existing allocation-free property:
 
-- **`process_graph` allocates nothing.** The substrate path is one
-  atomic exchange to acquire `pending_swap`, one atomic store/exchange
-  to publish `retired_swap`, and one atomic generation increment. No
-  vector growth, no `new`, no thread join, no destructor.
+- **`process_graph` allocates nothing.** The install path is one
+  atomic exchange to acquire `pending_swap`, two `unique_ptr` moves,
+  one atomic store to publish `retired_swap`, and one atomic generation
+  increment. No vector growth, no `new`, no thread join, no destructor.
 - **The retired-swap slot is one-deep.** Audio thread atomically
-  exchanges into it; if the producer hasn't reaped, the previous value
-  is overwritten — but the substrate's empty-payload swaps are
-  trivially destructible, and the substrate test suite asserts the
-  producer reaps every publish.
+  stores into it after install. `rt_graph_publish_swap` holds a
+  `swap_in_flight` guard from publish until collection, so a second
+  publish is rejected while any previous swap is pending, installing,
+  or retired-but-not-collected. A retired world is therefore never
+  overwritten on the audio thread.
 - **Pending-swap acquire orders the world payload.** The producer's
   release-store on `rt_graph_publish_swap` synchronizes-with the
   audio-thread's acquire-load before the queue drain, so any prep work
@@ -250,7 +250,7 @@ loops don't shift content.
 
 ## 8. Phased plan
 
-- **5.1.A (this slice) — Swap protocol substrate.** `RTGraphSwap` with
+- **5.1.A — Swap protocol substrate.** `RTGraphSwap` with
   empty payload, four ABI entries, `swap_generation` test counter,
   block-boundary install, off-audio retire/reap. Tests pin the dance.
   No DSP behavior change.
@@ -260,10 +260,9 @@ loops don't shift content.
   (`global_schedule`, `region_layer_work_items`, `global_schedule_bands`)
   as pre-reserved world-local capacity, even though their contents are
   rebuilt each block and never migrated. Rewrite the audio path to read
-  through `g.active->...`.
-  `RTGraphSwap` carries an `RTGraphState`. After 5.1.B, a publish
-  actually replaces the world; tests prove byte-equivalence with
-  `rt_graph_clear + rebuild`.
+  through `g.active->...`. `RTGraphSwap` carries an `RTGraphState`.
+  A publish actually replaces the world; tests prove byte-equivalence
+  with a separately rebuilt graph.
 - **5.2 — State migration policy.** Pick one of §7.1 (a)/(b)/(c), wire
   it into the install path, define live-instance survival, lift bus-pool
   stability into a publish precondition.

@@ -729,9 +729,21 @@ Replace a running MetaDef with a recompiled version **without audible glitches**
 
 ### 5.1 RCU-based topology swap
 
-The runtime already targets RCU-style reconfiguration. Formalize the protocol:
-new `MetaDef` is compiled and lowered while the old one plays; swap happens at a
-block boundary; old instance state is migrated where node identity is preserved.
+**5.1.A/B done.** The runtime now has the RCU protocol substrate plus
+real world-payload replacement:
+
+- `RTGraphSwap` publish / block-boundary install / retire / collect is
+  pinned by C++ tests.
+- The swappable world lives in `RTGraphState` behind `RTGraph::active`.
+- A producer can build a separate offline `RTGraph`, move its world into
+  a swap with `rt_graph_prepare_swap_from_graph`, and install it without
+  stopping the target audio handle.
+
+State is not migrated yet: the installed world starts with whatever
+fresh instances the builder graph prepared. The old world is moved into
+the collected swap and destroyed off-audio.
+
+Next slice: §5.2 state migration policy.
 
 ### 5.2 State migration policy
 
