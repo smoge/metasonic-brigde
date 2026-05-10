@@ -753,6 +753,22 @@ parallelism" outcome would not retire that infrastructure.
 
 Replace a running MetaDef with a recompiled version **without audible glitches**.
 
+**Status: hot-swap substrate v1 complete.** RCU protocol (§5.1),
+copy-safe state migration via caller-tagged keys + slot-index
+identity (§5.2), Haskell producer ergonomics (§5.3), swap-bench
+instrumentation (§5.3.C), and template identity precondition
+(§5.4.B) all shipped. State preservation is partial today — Env,
+Delay, and Smooth state default-init across a swap (§5.2); an
+allocation-free prewarm / custom-copy slice for those kinds is the
+remaining work toward the "without audible glitches" goal for graphs
+that depend on those state types. The two open API items — §5.3.D
+blocking wait and §5.4.C producer-side mapping helpers — stay
+deferred. Both are explicitly gated on real-producer evidence;
+pulling them ahead of that signal would be the same circular-evidence
+trap the §4.E freeze warns against. Phase 6.A is the first such
+producer candidate; revisit these only if 6.A's corpus or 6.B's OSC
+surface demonstrates concrete friction.
+
 ### [x] 5.1 RCU-based topology swap
 
 The runtime now has the RCU protocol substrate plus
@@ -912,21 +928,103 @@ Haskell-side `RuntimeGraph` knowledge is sufficient for v1 producers.
 
 ## Phase 6 — Extended DSP and Ecosystem
 
-Lower priority, hold implementation until core is more stable.
+Phase 6 collects five formerly-bundled workstreams as named
+sub-phases. Only 6.A is active; the rest are described but not
+started. Ordering reflects two project rules: cheapest unblocker for
+the parked §4 corpus signals first, and items whose design needs its
+own pass before code go after items whose surface is already
+analogous to something shipped.
 
-- **Spectral processing:** Streaming DFT nodes for vocoder, spectral
-  freeze, convolution.
+### Phase 6.A — Sequencing / Pattern Layer (active)
 
-- **Buffer I/O:** Sample playback, granular synthesis, recording into buffers.
+A Haskell-side producer of compiled graphs and timed control / hot-swap
+events. No new C++ runtime substrate, no new DSP nodes, no audio-thread
+symbolic lookup. Starting here is twofold: it lands without straining
+the C++ surface, and it generates the corpus that several Phase 4
+freezes are waiting on (§4.B.x kernel-add gate, §4.D block-rate
+signal, §4.E worker turn-on). A pattern-system prototype exists
+outside the current tracked bridge tree; 6.A formalizes the
+producer-vs-runtime boundary before any prototype is promoted into
+this repo.
 
-- **OSC control interface:** Receive and send OSC for integration with
-  other tools.
+#### 6.A.1 Design note (current task)
 
-- **Sequencing / pattern layer:** Haskell-side pattern system (already
-  prototyped) driving the server via timed control messages.
+Settles four bounds before any code lands:
 
-- **Plugin hosting:** Load external audio plugins (VST3/CLAP) as
-  opaque nodes.
+- **Corpus naturalness.** Patterns produce shapes natural for music-
+  making. The corpus must not be engineered to feed fusion /
+  parallelism / hot-swap gates — that's the same circular-evidence
+  trap §4.E names.
+- **Verification meaning.** "Compatibility with existing
+  `--fusion-survey`, `--worker-bench`, `--swap-bench`" means the
+  corpus produces shapes those surveys already recognize, not just
+  that the surveys run without crashing on the new artifacts.
+- **In-scope vs out-of-scope.** Pattern is a *producer* of compiled
+  graphs and timed events. It is not a runtime scheduler in Haskell;
+  it does not own audio-thread state; it does not introduce a new DSL
+  layer between user and `SynthGraph`.
+- **Swap-bench role.** Once patterns drive real hot-swaps,
+  `--swap-bench` becomes production-load measurement instead of
+  synthetic. That may surface 5.3.D or 5.4.C friction sooner than the
+  §5 freeze anticipated; treat that as a positive signal, not a
+  regression.
+
+Note: [Phase 6.A pattern design](notes/2026-05-10-phase-6a-pattern-design.md).
+
+#### 6.A.2 Minimal pattern corpus
+
+A small, fixed, deterministic battery — analogous to the §4 demo
+battery — covering recurring control changes, bus send/return
+patterns, polyphonic template ensembles, hot-swap edits across
+generations, and natural-music graph families that incidentally cover
+fusion / parallelism / hot-swap shapes. Corpus design is not on the
+audio thread.
+
+#### 6.A.3 Verification before "musical" surface
+
+First tests assert deterministic event expansion (same pattern → same
+events), generated graph shape (corpus-shape regression pin), and
+recognition by existing surveys / benches in the (b) sense above (do
+parked rows in the §4 ranked tables move, does the §4.D opportunity
+count grow, do `--worker-bench` rows cross the synthetic envelope, do
+pattern-driven `--swap-bench` runs surface friction the fixed corpus
+cannot). Live scheduling polish, ergonomic API, and concert-grade
+event timing all stay out of 6.A.
+
+### Phase 6.B — OSC Control Surface
+
+OSC is the first real external producer. Mirrors the §3 MIDI
+integration — receive, route to known compiled targets, expose any
+producer-retargeting friction — without owning any DSP. Independent of
+6.A; can run in parallel once 6.A.1 settles the producer / runtime
+boundary.
+
+### Phase 6.C — Buffer I/O Design Pass
+
+Buffer I/O is where resource identity becomes real: large sample data,
+shared references, mutation / recording, ownership across hot-swap,
+allocation rules. Deserves its own design note before any
+implementation. Couples to Phase 6.E (most plugin formats want
+sample-buffer access), so 6.E may force a 6.C revision rather than
+only consume it as-is.
+
+### Phase 6.D — Spectral Processing
+
+New `NodeKind` family for streaming DFT (vocoder, spectral freeze,
+convolution). FFT windows are inherently block-structured, so 6.D may
+*inform* §4.D's block-rate executor rather than only wait on it — the
+6.D corpus would be the first non-trivial block-rate consumer the
+project sees. Bidirectional coupling: §4.D's executor waits on signal,
+and 6.D produces signal.
+
+### Phase 6.E — Plugin Hosting
+
+Last because it imports external lifecycles, error vocabularies,
+resource ownership rules, and realtime guarantees all at once.
+Prerequisites — stable resource model, error vocabulary, audio-thread
+guarantees — only become concrete once 6.A–6.D have stressed them.
+Coupling to 6.C is real (sample-buffer access) and may force 6.C and
+6.E to be co-designed even if 6.E lands later.
 
 ---
 
