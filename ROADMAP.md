@@ -801,6 +801,28 @@ synchronization surface:
   wait primitive is deferred until swap-bench data or a real producer
   shows polling is the wrong abstraction.
 
+**Recommended next slice: 5.3.C1 Haskell swap-bench scaffold.**
+
+- Add a non-audio `--swap-bench` reporting mode beside
+  `--fusion-survey` and `--worker-bench`, with a small
+  `MetaSonic.App.SwapBench` module. Reuse the existing Haskell hot-swap
+  helpers and `c_rt_graph_process`; do not add runtime ABI or C++
+  synchronization primitives.
+- Start with a fixed deterministic corpus: unchanged graph, tagged
+  oscillator, tagged biquad, lifecycle-only graph, fused graph, and
+  template graph. Each row should prove the intended path with migration
+  counters rather than timing alone.
+- Print a grep-friendly table with at least: row name, loader shape,
+  builder capacity, publish result, blocks-to-install,
+  prepare/publish time, collect time, and the Phase 5.2 migration
+  counters.
+- Gate C1 on `just stack-test` plus a manual `--swap-bench` run. C++
+  tests are required only if the slice touches the runtime.
+
+**5.3.C2 after C1:** add repetition/statistics around the same corpus
+and refresh the RCU design note with the observed envelope. Only then
+decide whether 5.3.D (`rt_graph_wait_swap_installed`) is still needed.
+
 ---
 
 ## Phase 6 — Extended DSP and Ecosystem
