@@ -98,9 +98,15 @@ import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Bridge.Validate
+import qualified MetaSonic.OSC.Dispatch    as OSC
+import qualified MetaSonic.OSC.Wire        as OSC
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
 import           MetaSonic.Types
+
+import qualified Data.ByteString           as OBS
+import qualified Data.ByteString.Char8     as OBSC
+import           Data.Word                 (Word8)
 
 main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
@@ -114,6 +120,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , c0dGlobalScheduleBandTests
   , c1cWorkerScheduleTests
   , patternCorpusTests
+  , oscWireAndDispatchTests
   ]
 
 ------------------------------------------------------------
@@ -9138,4 +9145,234 @@ patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
               , UnknownVoiceForWrite (VoiceKey "v0")
               ]
       ]
+  ]
+
+------------------------------------------------------------
+-- Phase 6.B.2a: OSC wire + dispatch
+--
+-- Three test groups:
+--   1. Pure wire parser: hand-crafted byte sequences round-trip
+--      to expected OscMessage values; bundles and unsupported
+--      type tags are rejected explicitly.
+--   2. Dispatch against the arpeggio-send-return fx template
+--      (which carries 'tagged "lpf" / "outgain"') registered as
+--      one voice key. Positive case writes a control; negative
+--      cases mirror the §6.A DriverIssue shape.
+--   3. OSC-safe identifier profile boundary cases.
+------------------------------------------------------------
+
+oscWireAndDispatchTests :: TestTree
+oscWireAndDispatchTests = testGroup "Phase 6.B.2a: OSC wire + dispatch"
+  [ wireTests
+  , dispatchTests
+  , identifierProfileTests
+  ]
+
+-- ----- Hand-built wire fixtures ------------------------------
+
+-- An OSC-string is null-terminated, padded with zeros to a
+-- 4-byte boundary. The padding count is the smallest p ≥ 0 such
+-- that (length s + 1 + p) ≡ 0 mod 4.
+oscString :: OBSC.ByteString -> OBSC.ByteString
+oscString s =
+  let n    = OBS.length s
+      pad  = (4 - ((n + 1) `mod` 4)) `mod` 4
+      zeros = OBS.replicate (1 + pad) 0
+  in s `OBS.append` zeros
+
+-- Big-endian 4-byte encoding of a Word32.
+be4 :: [Word8] -> OBSC.ByteString
+be4 = OBS.pack
+
+-- The bit pattern of 1500.0 :: Float in IEEE 754 big-endian is
+-- 0x44BB8000.
+floatBytes1500 :: OBSC.ByteString
+floatBytes1500 = be4 [0x44, 0xBB, 0x80, 0x00]
+
+-- 42 as a big-endian 32-bit signed integer: 0x0000002A.
+intBytes42 :: OBSC.ByteString
+intBytes42 = be4 [0x00, 0x00, 0x00, 0x2A]
+
+-- A complete OSC message: /fx0/lpf/0 ,f 1500.0
+messageBytesFx0LpfFloat :: OBSC.ByteString
+messageBytesFx0LpfFloat = OBS.concat
+  [ oscString (OBSC.pack "/fx0/lpf/0")
+  , oscString (OBSC.pack ",f")
+  , floatBytes1500
+  ]
+
+-- /fx0/outgain/0 ,i 42
+messageBytesFx0OutgainInt :: OBSC.ByteString
+messageBytesFx0OutgainInt = OBS.concat
+  [ oscString (OBSC.pack "/fx0/outgain/0")
+  , oscString (OBSC.pack ",i")
+  , intBytes42
+  ]
+
+wireTests :: TestTree
+wireTests = testGroup "wire parser"
+  [ testCase "parses /fx0/lpf/0 ,f 1500.0" $
+      OSC.parseMessage messageBytesFx0LpfFloat
+        @?= Right (OSC.OscMessage (OBSC.pack "/fx0/lpf/0")
+                                   [OSC.OscArgFloat 1500.0])
+
+  , testCase "parses /fx0/outgain/0 ,i 42" $
+      OSC.parseMessage messageBytesFx0OutgainInt
+        @?= Right (OSC.OscMessage (OBSC.pack "/fx0/outgain/0")
+                                   [OSC.OscArgInt 42])
+
+  , testCase "rejects an OSC bundle prefix" $
+      case OSC.parseMessage (oscString (OBSC.pack "#bundle")) of
+        Left  err -> assertBool ("expected bundle rejection, got: " <> err)
+                                ("bundle" `isInfixOf` err)
+        Right msg -> assertFailure ("expected Left, got: " <> show msg)
+
+  , testCase "rejects an unsupported type tag" $ do
+      let bytes = OBS.concat
+            [ oscString (OBSC.pack "/foo")
+            , oscString (OBSC.pack ",s")
+            , oscString (OBSC.pack "hello")
+            ]
+      case OSC.parseMessage bytes of
+        Left  _   -> pure ()
+        Right msg -> assertFailure ("expected Left, got: " <> show msg)
+
+  , testCase "rejects a truncated argument" $ do
+      -- ,f promises 4 argument bytes; supply only 2.
+      let bytes = OBS.concat
+            [ oscString (OBSC.pack "/foo")
+            , oscString (OBSC.pack ",f")
+            , OBS.pack [0x44, 0xBB]
+            ]
+      case OSC.parseMessage bytes of
+        Left  _   -> pure ()
+        Right msg -> assertFailure ("expected Left, got: " <> show msg)
+  ]
+
+-- ----- Dispatch against a 6.A corpus template ----------------
+
+-- Build a ResolveState that registers voice key "fx0" against
+-- the arpeggio-send-return fx template. The voice's runtime
+-- slot id is fixed at 1 (the IO layer would have this from a
+-- prior rt_graph_realtime_reserve call).
+arpeggioFxResolveState :: OSC.ResolveState
+arpeggioFxResolveState =
+  OSC.registerVoice (OBSC.pack "fx0") 1 (OBSC.pack "fx")
+    (OSC.emptyResolveState (patternTemplates arpeggioSendReturn))
+
+dispatchTests :: TestTree
+dispatchTests = testGroup "dispatch against arpeggio-send-return/fx"
+  [ testCase "control write resolves to the fx template's lpf slot 0" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/0")
+                                [OSC.OscArgFloat 1500.0]
+      case OSC.dispatch arpeggioFxResolveState msg of
+        Right (OSC.DAControlWrite
+                  { OSC.daSlotId     = 1
+                  , OSC.daControlIdx = 0
+                  , OSC.daValue      = v
+                  }) -> v @?= 1500.0
+        other -> assertFailure ("unexpected dispatch result: " <> show other)
+
+  , testCase "int argument coerces to Double" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/outgain/0")
+                                [OSC.OscArgInt 1]
+      case OSC.dispatch arpeggioFxResolveState msg of
+        Right da -> OSC.daValue da @?= 1.0
+        Left  i  -> assertFailure ("expected success, got: " <> show i)
+
+  , testCase "unknown voice key surfaces as DiUnknownVoice" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/no-such/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiUnknownVoice (OBSC.pack "no-such"))
+
+  , testCase "unknown node tag surfaces as DiUnknownNodeTag" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/no-such/0")
+                                [OSC.OscArgFloat 1.0]
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiUnknownNodeTag (OBSC.pack "fx0")
+                                        (OBSC.pack "no-such"))
+
+  , testCase "out-of-range slot surfaces as DiInvalidControlSlot" $ do
+      -- The fx template's lpf node has 2 controls (freq, q);
+      -- slot 99 is out of range.
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/99")
+                                [OSC.OscArgFloat 1.0]
+      case OSC.dispatch arpeggioFxResolveState msg of
+        Left (OSC.DiInvalidControlSlot
+                  v t 99 _) -> do
+          v @?= OBSC.pack "fx0"
+          t @?= OBSC.pack "lpf"
+        other -> assertFailure ("unexpected dispatch result: " <> show other)
+
+  , testCase "reserved path segment 'swap' surfaces as DiReservedPathSegment" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/swap/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiReservedPathSegment (OBSC.pack "swap"))
+
+  , testCase "malformed address surfaces as DiInvalidAddressFormat" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf") [OSC.OscArgFloat 1.0]
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiInvalidAddressFormat (OBSC.pack "/fx0/lpf"))
+
+  , testCase "non-integer slot surfaces as DiSlotNotInteger" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/cutoff")
+                                [OSC.OscArgFloat 1.0]
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiSlotNotInteger (OBSC.pack "cutoff"))
+
+  , testCase "zero arguments surface as DiUnsupportedArgShape" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/0") []
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiUnsupportedArgShape 0)
+
+  , testCase "two arguments surface as DiUnsupportedArgShape" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/0")
+                                [OSC.OscArgFloat 1.0, OSC.OscArgInt 2]
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiUnsupportedArgShape 2)
+  ]
+
+-- ----- OSC-safe identifier profile ---------------------------
+
+identifierProfileTests :: TestTree
+identifierProfileTests = testGroup "OSC-safe identifier profile"
+  [ testCase "accepts plain ASCII alphanumeric" $
+      OSC.isOscSafeIdentifier (OBSC.pack "fx0") @?= True
+
+  , testCase "accepts underscore and hyphen" $ do
+      OSC.isOscSafeIdentifier (OBSC.pack "snare_hi") @?= True
+      OSC.isOscSafeIdentifier (OBSC.pack "kick-1")   @?= True
+
+  , testCase "rejects empty string" $
+      OSC.isOscSafeIdentifier OBS.empty @?= False
+
+  , testCase "rejects strings longer than 16 bytes" $
+      OSC.isOscSafeIdentifier (OBSC.pack "abcdefghijklmnopq")  -- 17
+        @?= False
+
+  , testCase "rejects strings containing '/'" $
+      OSC.isOscSafeIdentifier (OBSC.pack "foo/bar") @?= False
+
+  , testCase "rejects strings containing spaces" $
+      OSC.isOscSafeIdentifier (OBSC.pack "foo bar") @?= False
+
+  , testCase "registers but cannot resolve through dispatch" $ do
+      -- A voice key registered outside the OSC-safe profile is
+      -- reachable in the ResolveState table but unreachable from
+      -- a dispatched message because dispatch validates the
+      -- profile on the path segment first.
+      let rs = OSC.registerVoice (OBSC.pack "bad name") 1 (OBSC.pack "fx")
+                 (OSC.emptyResolveState (patternTemplates arpeggioSendReturn))
+          msg = OSC.OscMessage (OBSC.pack "/bad/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+          -- The path segment 'bad' is OSC-safe (the dispatch
+          -- never sees 'bad name'), so this surfaces as a
+          -- DiUnknownVoice rather than an identifier-profile
+          -- error. The registered-but-unreachable voice is
+          -- documentation of the design property, not a
+          -- separate gate.
+      OSC.dispatch rs msg
+        @?= Left (OSC.DiUnknownVoice (OBSC.pack "bad"))
   ]

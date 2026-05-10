@@ -9,6 +9,7 @@ category: Audio
 
 dependencies:
   - base >= 4.14 && < 5
+  - bytestring
   - containers
   - mtl
   - deepseq
@@ -45,6 +46,8 @@ library:
     - MetaSonic.Bridge.Templates
     - MetaSonic.Bridge.FFI
     - MetaSonic.Bridge.MidiDemo
+    - MetaSonic.OSC.Wire
+    - MetaSonic.OSC.Dispatch
     - MetaSonic.Pattern
     - MetaSonic.Pattern.Corpus
     - MetaSonic.Visualize.Trace

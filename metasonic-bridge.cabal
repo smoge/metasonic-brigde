@@ -32,6 +32,8 @@ library
       MetaSonic.Bridge.Templates
       MetaSonic.Bridge.FFI
       MetaSonic.Bridge.MidiDemo
+      MetaSonic.OSC.Wire
+      MetaSonic.OSC.Dispatch
       MetaSonic.Pattern
       MetaSonic.Pattern.Corpus
       MetaSonic.Visualize.Trace
@@ -67,6 +69,7 @@ library
   build-depends:
       base >=4.14 && <5
     , brick
+    , bytestring
     , containers
     , deepseq
     , microlens
@@ -91,6 +94,7 @@ executable metasonic-bridge
   build-depends:
       base >=4.14 && <5
     , brick
+    , bytestring
     , containers
     , deepseq
     , metasonic-bridge
@@ -116,6 +120,7 @@ test-suite metasonic-bridge-test
       QuickCheck
     , base >=4.14 && <5
     , brick
+    , bytestring
     , containers
     , deepseq
     , metasonic-bridge
