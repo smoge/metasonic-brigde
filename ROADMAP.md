@@ -1005,13 +1005,49 @@ timing all stay out of 6.A. Piping the corpus through
 6.A.3 extension if the §4.E / §5 signals warrant it; the current
 `--corpus-survey` does not perform those measurements.
 
-### Phase 6.B — OSC Control Surface
+### Phase 6.B — OSC Control Surface (active)
 
-OSC is the first real external producer. Mirrors the §3 MIDI
-integration — receive, route to known compiled targets, expose any
-producer-retargeting friction — without owning any DSP. Independent of
-6.A; can run in parallel once 6.A.1 settles the producer / runtime
-boundary.
+OSC is the first real external producer. Receive surface only —
+binds a configured UDP port, parses single messages, and writes
+through the existing realtime control queue. Address space mirrors
+6.A's symbolic identifiers (`/<voice-key>/<node-tag>/<slot>`), and
+the address-to-target resolution table is the §5.4.C producer-side
+mapping work made concrete: if 6.B implementation surfaces
+hot-swap re-resolution or multi-producer friction, §5.4.C lands
+here.
+
+Departs from §3 MIDI in one deliberate way: OSC parsing and
+dispatch live on the Haskell side, not C++. Reasoning is in the
+design note. OSC is a control plane, not a data plane; the
+realtime control queue absorbs Haskell-side jitter without harm.
+
+#### 6.B.1 Design note (current task)
+
+Bounds the architecture, scope, and address resolution model
+before code lands. Settles the Haskell-vs-C++ ownership decision,
+names the §5.4.C connection, and previews the
+`MetaSonic.OSC.{Wire,Dispatch}` module shape that 6.B.2 will
+implement.
+
+Note: [Phase 6.B OSC design](notes/2026-05-10-phase-6b-osc-design.md).
+
+#### 6.B.2 Minimal handler module
+
+Pure `OscMessage` ADT + parser (`MetaSonic.OSC.Wire`), pure
+dispatch resolver (`MetaSonic.OSC.Dispatch`), and an IO entry
+point (`MetaSonic.App.Osc.runOscListen`) that holds a resolution
+table behind an `IORef` and calls the realtime queue helpers.
+Tests parse round-trip + dispatch resolution against the 6.A
+corpus, plus negative cases mirroring 6.A's `DriverIssue` shape
+(unknown voice / node tag / slot).
+
+#### 6.B.3 Verification before live use
+
+End-to-end test using either an in-process loopback or a Haskell
+OSC client driving `runOscListen` against a loaded
+`TemplateGraph`. Asserts the realtime queue writes match what the
+OSC stream specified. No `--osc-listen` subcommand until this
+gate holds.
 
 ### Phase 6.C — Buffer I/O Design Pass
 
