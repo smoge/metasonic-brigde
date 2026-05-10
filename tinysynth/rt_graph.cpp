@@ -1031,6 +1031,16 @@ struct MetaDef {
   int max_frames = 0;
   std::vector<NodeSpec> nodes;
 
+  // Phase 5.4.B template identity. Set off-audio via
+  // rt_graph_template_set_identity, used only by
+  // rt_graph_prepare_swap_from_graph as a precondition: if a slot at
+  // this template_id is live (Active or Releasing) in the old world
+  // and both old and new defs[template_id] carry an identity, the
+  // tokens must match or prepare returns nullptr. Empty identities
+  // (length 0) opt out — single-template legacy callers and any
+  // template that was never set via the ABI behave as before.
+  MigrationKey identity{};
+
   // Per-template polyphony cap: the maximum number of simultaneously
   // live (Active or Releasing) instances of this template. Set via
   // rt_graph_template_set_polyphony during construction; defaults to
@@ -7529,6 +7539,35 @@ RTGraphSwap *rt_graph_prepare_swap(RTGraph *g) {
   return swap;
 }
 
+// Phase 5.4.B precondition: reject prepare when a live old slot's
+// template_id has differing identity tokens between old and new
+// worlds. Empty tokens opt out (single-template legacy or any template
+// not set via the identity ABI), so the check is graceful: it fires
+// only when the producer has explicitly opted into identity for both
+// sides and the tokens disagree. Templates without any live slot are
+// not checked because a renumber that happens before any voice is
+// active is not observable through migration anyway.
+[[nodiscard]] static bool template_identity_precondition_ok(
+    const RTGraphState &old_state,
+    const RTGraphState &new_state
+) noexcept {
+  for (const GraphInstance &inst : old_state.instances) {
+    const SlotState slot = inst.state.load(std::memory_order_acquire);
+    if (slot != SlotState::Active && slot != SlotState::Releasing) continue;
+    const int tid = inst.template_id;
+    if (tid < 0) continue;
+    const std::size_t utid = static_cast<std::size_t>(tid);
+    if (utid >= old_state.defs.size() || utid >= new_state.defs.size()) {
+      continue;
+    }
+    const MigrationKey &old_id = old_state.defs[utid].identity;
+    const MigrationKey &new_id = new_state.defs[utid].identity;
+    if (!old_id.present() || !new_id.present()) continue;
+    if (!migration_key_equals(old_id, new_id)) return false;
+  }
+  return true;
+}
+
 RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
                                               RTGraph *source) {
   if (!target || !source || target == source) return nullptr;
@@ -7549,6 +7588,9 @@ RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
     return nullptr;
   }
   if (source->swap_in_flight.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
+  if (!template_identity_precondition_ok(world(*target), world(*source))) {
     return nullptr;
   }
 
@@ -7772,6 +7814,28 @@ int rt_graph_template_set_node_migration_key(
   next.length = key_len;
   std::memcpy(next.bytes.data(), key, static_cast<std::size_t>(key_len));
   def->nodes[node_idx].migration_key = next;
+  return 1;
+}
+
+int rt_graph_template_set_identity(
+    RTGraph *g,
+    int template_id,
+    const char *key,
+    int key_len
+) {
+  if (!g || !key) return 0;
+  if (key_len <= 0 || key_len > kMigrationKeyMaxBytes) return 0;
+  for (int i = 0; i < key_len; ++i) {
+    if (key[i] == '\0') return 0;
+  }
+
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return 0;
+
+  MigrationKey next{};
+  next.length = key_len;
+  std::memcpy(next.bytes.data(), key, static_cast<std::size_t>(key_len));
+  def->identity = next;
   return 1;
 }
 

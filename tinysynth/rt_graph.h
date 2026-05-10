@@ -144,6 +144,17 @@ int rt_graph_template_set_node_migration_key(
     RTGraph *g, int template_id, int node_index,
     const char *key, int key_len);
 
+// [T:construction] Attach a Phase 5.4.B template identity token. Used
+// only by rt_graph_prepare_swap_from_graph as a precondition: if any
+// live (Active or Releasing) old slot's template_id has identities set
+// on both old and new defs[template_id] and the tokens differ, prepare
+// returns nullptr. Identities are optional; templates without one opt
+// out of the precondition. key_len must be in 1..16; bytes are opaque
+// but may not include NUL. Returns 1 on success, 0 on invalid args.
+int rt_graph_template_set_identity(
+    RTGraph *g, int template_id,
+    const char *key, int key_len);
+
 // [T:construction] Set one entry of a template's spec.default_controls.
 // New instances created later via rt_graph_template_instance_add inherit
 // the value; existing instances are *not* mutated. Use

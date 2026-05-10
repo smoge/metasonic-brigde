@@ -4762,6 +4762,136 @@ crossCuttingTests = testGroup "End-to-end FFI"
              Just s  -> smsLifecycleCopyCount s == 2
              Nothing -> False)
 
+  , testCase "hotSwapTemplateGraph: same-name same-order swap publishes" $ do
+      -- Phase 5.4.B: identical template name list across old and new
+      -- worlds must round-trip publish + install. Counter-confirms
+      -- that the identity precondition does not block legitimate
+      -- swaps; the lifecycle copy count proves the slots actually
+      -- migrated rather than getting silently rejected upstream.
+      let nframes = 256
+          voiceA = runSynth $ do
+            o <- sinOsc 220.0 0.0
+            out 0 o
+          voiceB = runSynth $ do
+            o <- sinOsc 660.0 0.0
+            out 1 o
+
+      oldTg <- case compileTemplateGraph [("a", voiceA), ("b", voiceB)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      newTg <- case compileTemplateGraph [("a", voiceA), ("b", voiceB)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let capacity = templateGraphBuilderCapacity oldTg + 4
+      withRTGraph capacity nframes $ \handle -> do
+        loadTemplateGraph handle oldTg
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        published <- hotSwapTemplateGraph handle capacity nframes newTg
+        published @?= True
+        c_rt_graph_process handle (fromIntegral nframes)
+        stats <- collectRetiredSwapStats handle
+        assertBool "expected retired swap with two lifecycle copies"
+          (case stats of
+             Just s  -> smsLifecycleCopyCount s == 2
+             Nothing -> False)
+
+  , testCase "hotSwapTemplateGraph: reordered names reject before install" $ do
+      -- Phase 5.4.B: swapping in a TemplateGraph whose names land at
+      -- different template_ids than the live old world must fail
+      -- before any block install. The helper returns False because
+      -- prepare_swap_from_graph rejects the precondition; no swap
+      -- ownership leaks through, so a follow-up same-shape publish
+      -- still works.
+      let nframes = 256
+          voiceA = runSynth $ do
+            o <- sinOsc 220.0 0.0
+            out 0 o
+          voiceB = runSynth $ do
+            o <- sinOsc 660.0 0.0
+            out 1 o
+
+      oldTg <- case compileTemplateGraph [("a", voiceA), ("b", voiceB)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      reorderedTg <- case compileTemplateGraph [("b", voiceB), ("a", voiceA)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      sameTg <- case compileTemplateGraph [("a", voiceA), ("b", voiceB)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let capacity = templateGraphBuilderCapacity oldTg + 4
+      withRTGraph capacity nframes $ \handle -> do
+        loadTemplateGraph handle oldTg
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        beforeGen <- c_rt_graph_test_swap_generation handle
+
+        rejected <- hotSwapTemplateGraph handle capacity nframes reorderedTg
+        rejected @?= False
+
+        -- A rejected publish must not advance the install counter.
+        afterReject <- c_rt_graph_test_swap_generation handle
+        afterReject @?= beforeGen
+
+        -- Nothing should be sitting in the retired slot.
+        leftover <- collectRetiredSwapStats handle
+        leftover @?= Nothing
+
+        -- Same-shape replacement still works after a reject.
+        ok <- hotSwapTemplateGraph handle capacity nframes sameTg
+        ok @?= True
+        c_rt_graph_process handle (fromIntegral nframes)
+        stats <- collectRetiredSwapStats handle
+        assertBool "expected stats from the recovery publish"
+          (case stats of
+             Just _  -> True
+             Nothing -> False)
+
+  , testCase "loadTemplateGraph: invalid template identity fails before clear" $ do
+      -- Phase 5.4.B: template-name identity validation is part of the
+      -- pre-clear loader gate. An invalid next TemplateGraph must not
+      -- erase the currently loaded graph.
+      let nframes = 256
+          stableVoice = runSynth $ do
+            o <- sinOsc 220.0 0.0
+            out 0 o
+          tooLongName = "abcdefghijklmnopq" -- 17 ASCII bytes
+
+      stableTg <- case compileTemplateGraph [("stable", stableVoice)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      invalidTg <- case compileTemplateGraph [(tooLongName, stableVoice)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let capacity = templateGraphBuilderCapacity stableTg + 4
+      withRTGraph capacity nframes $ \handle -> do
+        loadTemplateGraph handle stableTg
+        before <- processAndReadBuses handle nframes [0]
+
+        let attempt :: IO (Either IOError ())
+            attempt = try $ loadTemplateGraph handle invalidTg
+        result <- attempt
+        case result of
+          Right () ->
+            assertFailure "expected loadTemplateGraph to reject overlong identity"
+          Left e ->
+            assertBool
+              ("expected overlong identity diagnostic in: " <> show e)
+              ("rt_graph_template_set_identity rejects > 16" `isInfixOf` show e)
+
+        after <- processAndReadBuses handle nframes [0]
+        let peak xs = maximum (map abs xs)
+            beforePeak = peak (snd (head before))
+            afterPeak  = peak (snd (head after))
+        assertBool ("expected pre-failure graph to render, peak=" <> show beforePeak)
+          (beforePeak > 0.05)
+        assertBool ("expected graph to survive failed load, peak=" <> show afterPeak)
+          (afterPeak > 0.05)
+
   , testCase "hotSwapTemplateGraphFused publishes a fused template world" $ do
       let nframes = 256
           graph = runSynth $ do
@@ -4794,6 +4924,48 @@ crossCuttingTests = testGroup "End-to-end FFI"
           (case stats of
              Just s  -> smsLifecycleCopyCount s == 1
              Nothing -> False)
+
+  , testCase "hotSwapTemplateGraphFused: reordered names reject before install" $ do
+      -- Same precondition as the unfused template hot-swap helper, but
+      -- pinned on the fused loader path so identity wiring cannot drift
+      -- independently.
+      let nframes = 256
+          voiceA = runSynth $ do
+            e <- env (Param 1.0) 0.0005 0.002 1.0 0.002
+            a <- gain e (Param 0.5)
+            out 0 a
+          voiceB = runSynth $ do
+            e <- env (Param 1.0) 0.0005 0.002 1.0 0.002
+            a <- gain e (Param 0.25)
+            out 1 a
+
+      oldTg <- case compileTemplateGraphFused [("a", voiceA), ("b", voiceB)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      reorderedTg <- case compileTemplateGraphFused [("b", voiceB), ("a", voiceA)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let hasRFused tg =
+            not (null [ () | tpl <- tgTemplates tg
+                           , node <- rgNodes (tplGraph tpl)
+                           , RFused _ <- rnInputs node ])
+      assertBool "old fused fixture carried no RFused inputs" (hasRFused oldTg)
+      assertBool "reordered fused fixture carried no RFused inputs" (hasRFused reorderedTg)
+
+      let capacity = templateGraphBuilderCapacity oldTg + 4
+      withRTGraph capacity nframes $ \handle -> do
+        loadTemplateGraphFused handle oldTg
+        c_rt_graph_process handle (fromIntegral nframes)
+        beforeGen <- c_rt_graph_test_swap_generation handle
+
+        rejected <- hotSwapTemplateGraphFused handle capacity nframes reorderedTg
+        rejected @?= False
+
+        afterReject <- c_rt_graph_test_swap_generation handle
+        afterReject @?= beforeGen
+        leftover <- collectRetiredSwapStats handle
+        leftover @?= Nothing
 
   , testCase "hotSwapRuntimeGraph failed publish disposes the prepared swap" $ do
       let nframes = 256

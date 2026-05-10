@@ -834,11 +834,32 @@ problem from Phase 5.2's internal migration plan:
 Design note:
 [notes/2026-05-10-phase-5-4-producer-identity-after-install-design.md](notes/2026-05-10-phase-5-4-producer-identity-after-install-design.md)
 
-**5.4.B next:** add per-template identity tokens to the construction
-path, set them from Haskell `TemplateGraph.tplName`, and reject
-`prepare_swap_from_graph` when live old slots would migrate across a
-mismatched template token. Keep node retargeting and bus naming on the
-producer/Haskell side unless a real caller proves that insufficient.
+**5.4.B done: template identity precondition.**
+
+- C++: `MetaDef::identity` (16-byte fixed-width token, same shape as
+  the node migration key) plus a construction-only ABI entry
+  `rt_graph_template_set_identity(g, template_id, key, key_len)`.
+- `rt_graph_prepare_swap_from_graph` adds a precondition: for every
+  live (Active or Releasing) old instance, if the old and new defs at
+  that `template_id` both carry an identity, the tokens must match or
+  prepare returns `nullptr`. Empty tokens on either side opt out, so
+  legacy single-template flows and gradual adoption stay permissive.
+- Haskell: `loadTemplateGraph` and `loadTemplateGraphFused` ship
+  `tplName` through the new ABI as the identity. Names that exceed 16
+  bytes or contain NUL fail during the pre-clear validation gate, so
+  the currently loaded graph is preserved.
+- Counter / test coverage: 5 doctest cases (setter validation, matching
+  tokens succeed, differing tokens reject, missing-token-on-one-side
+  permissive, no-live-slot bypass) and 4 Haskell tests (same-name
+  same-order swap publishes; reordered named-template swap rejects
+  before install and lets a same-shape recovery publish succeed;
+  overlong identity fails before clear; fused reordered swap rejects).
+
+**5.4.C next, optional:** producer-side mapping helpers for resolving
+post-install node / control coordinates from migration keys, and a
+small set of name-stable bus helpers. Defer until a real caller hits
+the friction; Haskell-side `RuntimeGraph` knowledge is sufficient for
+v1 producers.
 
 ---
 

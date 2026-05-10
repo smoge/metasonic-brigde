@@ -1,7 +1,10 @@
 # Phase 5.4 - Producer Identity After Install
 
 Date: 2026-05-10
-Status: design note, no runtime change yet.
+Status: 5.4.A design landed; 5.4.B template identity precondition
+implemented (rt_graph_template_set_identity ABI, prepare-time live-slot
+check, Haskell loaders set the token from tplName). 5.4.C/D remain
+deferred until a real producer surfaces friction.
 
 Phase 5.2 solved identity for the runtime migration pass: during
 `prepare_swap_from_graph`, the old world and new world are matched by
@@ -155,17 +158,49 @@ should say "no" instead of relying on out-of-band knowledge.
 
 This note. No runtime behavior change.
 
-### 5.4.B - Template identity precondition
+### 5.4.B - Template identity precondition (done)
 
-- Add a construction-path C ABI for per-template identity tokens.
-- Store the token on `MetaDef`.
-- Set tokens from Haskell `TemplateGraph.tplName` in
-  `loadTemplateGraph` and `loadTemplateGraphFused`.
-- During `prepare_swap_from_graph`, reject swaps where live old slots
-  would migrate across mismatched template tokens.
-- Add C++ tests for publish/prepare rejection on template reorder.
-- Add Haskell tests that a reordered named-template swap is rejected,
-  while same-order same-name swaps continue to migrate.
+Implemented as designed. Concretely:
+
+- `MetaDef::identity` is a fixed 16-byte token (the same `MigrationKey`
+  shape Phase 5.2 already uses for nodes, repurposed per-template).
+- `rt_graph_template_set_identity(g, template_id, key, key_len)` is the
+  construction-path setter; setter validation matches the node setter
+  (1..16 bytes, no NUL, valid `template_id`). Identity is single-valued
+  per template — overwriting is allowed and intentional.
+- `loadTemplateGraph` and `loadTemplateGraphFused` ship `tplName` as
+  the identity. Names that exceed 16 UTF-8 bytes or contain NUL fail
+  during the pre-clear validation gate, so the producer sees the
+  contract violation up front and the currently loaded graph is
+  preserved.
+- `rt_graph_prepare_swap_from_graph` runs
+  `template_identity_precondition_ok` before allocating a swap. Walk
+  every Active or Releasing old instance, look up
+  `defs[template_id]` in both old and new state; if both have an
+  identity and they differ, return `nullptr`. Empty tokens on either
+  side opt out.
+- Templates with no live slot are not checked. A renumber that happens
+  before any voice is active is not observable through migration; the
+  rejection rule is scoped to the live-slot case so dormant pools stay
+  rebuilable.
+
+Tests:
+
+- C++ doctests (5 cases): setter validation; matching tokens succeed;
+  differing tokens reject; missing token on one side stays permissive;
+  differing tokens with no live slot still succeed.
+- Haskell (4 cases): same-name same-order swap publishes and migrates
+  two lifecycle copies; reordered named-template swap rejects before
+  install (no generation advance, no retired swap), and a same-shape
+  recovery publish afterwards still works; overlong template identity
+  fails before `c_rt_graph_clear`; fused-template reorder rejects on
+  the fused loader path.
+
+The single-template `loadRuntimeGraph[Fused]` path deliberately does
+not set an identity. The flat graph has only `template_id 0`; with
+nothing to disambiguate, the precondition has nothing to enforce. The
+setter is available for any caller that wants stricter behavior on the
+flat path.
 
 ### 5.4.C - Optional producer-side mapping helpers
 

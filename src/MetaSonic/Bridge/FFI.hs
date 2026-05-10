@@ -104,6 +104,7 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_ensure_bus
   , c_rt_graph_template_set_default
   , c_rt_graph_template_set_node_migration_key
+  , c_rt_graph_template_set_identity
   , c_rt_graph_template_connect
   , c_rt_graph_template_add_region
   , c_rt_graph_template_add_schedule_step
@@ -425,6 +426,48 @@ setMigrationKeyForNode g cTid node =
             "rt_graph_template_set_node_migration_key rejected key "
             <> show key <> " for node " <> show (rnIndex node)
 
+-- | Phase 5.4.B helper. Encode a template name as the byte token used
+-- by 'c_rt_graph_template_set_identity'. Empty names opt out of the
+-- runtime precondition. Non-empty names must satisfy the runtime's
+-- fixed-width identity contract.
+--
+-- This validation is deliberately separated from the C setter so
+-- 'loadTemplateGraph' and 'loadTemplateGraphFused' can run it before
+-- 'c_rt_graph_clear'. A bad template identity must fail without
+-- disturbing the currently loaded graph.
+templateIdentityBytesFromName :: String -> String -> IO (Maybe String)
+templateIdentityBytesFromName loaderName name
+  | null name = pure Nothing
+  | otherwise = do
+      let bytes = migrationKeyUtf8Bytes (MigrationKey name)
+          n    = length bytes
+      when (n > 16) $
+        fail $
+          loaderName <> ": template name " <> show name
+          <> " encodes to " <> show n
+          <> " bytes; rt_graph_template_set_identity rejects > 16."
+      when (any (== '\NUL') bytes) $
+        fail $
+          loaderName <> ": template name " <> show name
+          <> " contains a NUL byte after UTF-8 encoding; "
+          <> "rt_graph_template_set_identity rejects NUL."
+      pure (Just bytes)
+
+-- | Ship a prevalidated Phase 5.4.B template identity token through
+-- the C ABI. The token is validated before clearing the target graph;
+-- this setter step only reports unexpected ABI rejection.
+setTemplateIdentityBytes
+  :: Ptr RTGraph -> CInt -> String -> Maybe String -> IO ()
+setTemplateIdentityBytes _ _ _ Nothing = pure ()
+setTemplateIdentityBytes g cTid name (Just bytes) =
+  withCAStringLen bytes $ \(ptr, len) -> do
+    ok <- c_rt_graph_template_set_identity
+      g cTid ptr (fromIntegral len)
+    when (ok == 0) $
+      fail $
+        "rt_graph_template_set_identity rejected "
+        <> show name <> " for template " <> show cTid
+
 foreign import ccall unsafe "rt_graph_connect"
   c_rt_graph_connect :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
 
@@ -717,6 +760,10 @@ foreign import ccall unsafe "rt_graph_template_set_default"
 foreign import ccall unsafe "rt_graph_template_set_node_migration_key"
   c_rt_graph_template_set_node_migration_key
     :: Ptr RTGraph -> CInt -> CInt -> CString -> CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_template_set_identity"
+  c_rt_graph_template_set_identity
+    :: Ptr RTGraph -> CInt -> CString -> CInt -> IO CInt
 
 -- | Connect ports within a single template. Cross-template signal
 -- flow goes through the shared bus pool, not direct port wiring; this
@@ -1592,30 +1639,35 @@ synchronous, non-blocking).
 -}
 
 -- | Transfer a compiled 'TemplateGraph' to the C++ runtime.
--- Validates the per-template region schedule for every template
--- /before/ clearing, then registers each template in execution
--- order, populates its nodes and wiring, and spawns one instance
--- per template. A malformed schedule on /any/ template raises
--- 'fail' before 'c_rt_graph_clear' so the currently loaded graph
--- is preserved.
+-- Validates the per-template region schedule and template identity
+-- token for every template /before/ clearing, then registers each
+-- template in execution order, populates its nodes and wiring, and
+-- spawns one instance per template. A malformed schedule or invalid
+-- identity on /any/ template raises 'fail' before 'c_rt_graph_clear'
+-- so the currently loaded graph is preserved.
 --
 -- See Note [loadTemplateGraph protocol].
 loadTemplateGraph :: Ptr RTGraph -> TemplateGraph -> IO ()
 loadTemplateGraph g tg = do
-  -- §4.E.2b / §4.E.2.C0a: compute the scheduled region list and
-  -- the layered schedule for every template /before/ touching the
-  -- C++ handle. If any template's schedule is malformed we fail
-  -- fast and leave the existing graph alone.
+  -- §4.E.2b / §4.E.2.C0a / §5.4.B: compute the scheduled region list,
+  -- layered schedule, and template identity token for every template
+  -- /before/ touching the C++ handle. If any template's metadata is
+  -- malformed we fail fast and leave the existing graph alone.
   scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
   c_rt_graph_clear g
   -- The clear left an auto-created instance 0 for legacy callers.
   -- Multi-template loading spawns its own instances per template
   -- below, so remove it first to start with a clean slate.
   c_rt_graph_instance_remove g 0
-  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled, steps)) -> do
+  forM_ (zip [0 ..] scheduledByTpl) $
+    \(i, (tpl, identityBytes, scheduled, steps)) -> do
     cTid <- if i == (0 :: Int)
               then pure 0           -- auto-created template 0
               else c_rt_graph_template_add g
+    -- Phase 5.4.B: ship the template name as the runtime's identity
+    -- token so swap prepare can reject reorders that would migrate
+    -- live state across semantically-different templates.
+    setTemplateIdentityBytes g cTid (tplName tpl) identityBytes
     populateTemplate cTid (tplGraph tpl) scheduled steps
     -- Spawn one instance per template so the typical single-voice
     -- ensemble case works without explicit instance spawning. For
@@ -1625,9 +1677,11 @@ loadTemplateGraph g tg = do
   where
     scheduleOrFail
       :: Template
-      -> IO (Template, [RuntimeRegion], [ScheduleStep])
+      -> IO (Template, Maybe String, [RuntimeRegion], [ScheduleStep])
     scheduleOrFail tpl = do
       let rg = tplGraph tpl
+      identityBytes <- templateIdentityBytesFromName
+        "loadTemplateGraph" (tplName tpl)
       rs <- case scheduledRuntimeRegions rg of
         Right rs  -> pure rs
         Left err  -> fail $
@@ -1638,7 +1692,7 @@ loadTemplateGraph g tg = do
         Left err  -> fail $
           "loadTemplateGraph: template "
           <> show (tplName tpl) <> ": " <> err
-      pure (tpl, rs, ss)
+      pure (tpl, identityBytes, rs, ss)
 
     populateTemplate
       :: CInt -> RuntimeGraph
@@ -1712,24 +1766,31 @@ loadTemplateGraph g tg = do
 -- Note [loadRuntimeGraphFused protocol] for the rationale on order.
 loadTemplateGraphFused :: Ptr RTGraph -> TemplateGraph -> IO ()
 loadTemplateGraphFused g tg = do
-  -- §4.E.2b / §4.E.2.C0a: pre-validate every template's schedule
-  -- and derive its layered view, same fail-fast contract as
-  -- 'loadTemplateGraph'.
+  -- §4.E.2b / §4.E.2.C0a / §5.4.B: pre-validate every
+  -- template's schedule and identity, then derive its layered view;
+  -- same fail-fast contract as 'loadTemplateGraph'.
   scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
   c_rt_graph_clear g
   c_rt_graph_instance_remove g 0
-  forM_ (zip [0 ..] scheduledByTpl) $ \(i, (tpl, scheduled, steps)) -> do
+  forM_ (zip [0 ..] scheduledByTpl) $
+    \(i, (tpl, identityBytes, scheduled, steps)) -> do
     cTid <- if i == (0 :: Int)
               then pure 0
               else c_rt_graph_template_add g
+    -- Phase 5.4.B: same identity wiring as the non-fused loader so
+    -- fused and unfused multi-template paths reject reorders the
+    -- same way.
+    setTemplateIdentityBytes g cTid (tplName tpl) identityBytes
     populateTemplate cTid (tplGraph tpl) scheduled steps
     M.void $ c_rt_graph_template_instance_add g cTid
   where
     scheduleOrFail
       :: Template
-      -> IO (Template, [RuntimeRegion], [ScheduleStep])
+      -> IO (Template, Maybe String, [RuntimeRegion], [ScheduleStep])
     scheduleOrFail tpl = do
       let rg = tplGraph tpl
+      identityBytes <- templateIdentityBytesFromName
+        "loadTemplateGraphFused" (tplName tpl)
       rs <- case scheduledRuntimeRegions rg of
         Right rs  -> pure rs
         Left err  -> fail $
@@ -1740,7 +1801,7 @@ loadTemplateGraphFused g tg = do
         Left err  -> fail $
           "loadTemplateGraphFused: template "
           <> show (tplName tpl) <> ": " <> err
-      pure (tpl, rs, ss)
+      pure (tpl, identityBytes, rs, ss)
 
     populateTemplate
       :: CInt -> RuntimeGraph

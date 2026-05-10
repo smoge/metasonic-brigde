@@ -8738,6 +8738,146 @@ TEST_CASE("hot-swap migration: available old slot does not overwrite new active 
     rt_graph_destroy(g);
 }
 
+// Phase 5.4.B template-identity precondition coverage. The setter's
+// validation surface mirrors rt_graph_template_set_node_migration_key
+// and the prepare-time rule is a graceful guard: it fires only when
+// both old and new defs[template_id] carry an identity and the
+// matched template_id has at least one live (Active or Releasing)
+// instance in the old world.
+TEST_CASE("hot-swap template identity: setter validation") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    add_const_node(g, 0, 0.5f, 0.0f);
+
+    CHECK(rt_graph_template_set_identity(nullptr, 0, "voice", 5) == 0);
+    CHECK(rt_graph_template_set_identity(g, 0, nullptr, 5) == 0);
+    CHECK(rt_graph_template_set_identity(g, 0, "voice", 0) == 0);
+    CHECK(rt_graph_template_set_identity(g, 0, "voice", -1) == 0);
+    CHECK(rt_graph_template_set_identity(g, 0, "0123456789abcdefX", 17) == 0);
+
+    char with_nul[3] = {'a', '\0', 'b'};
+    CHECK(rt_graph_template_set_identity(g, 0, with_nul, 3) == 0);
+
+    CHECK(rt_graph_template_set_identity(g, 99, "voice", 5) == 0);
+
+    CHECK(rt_graph_template_set_identity(g, 0, "voice", 5) == 1);
+    // Overwrite is allowed: identity is single-valued, not unique-keyed.
+    CHECK(rt_graph_template_set_identity(g, 0, "other", 5) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap template identity: matching identities prepare succeeds") {
+    auto *g = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    add_const_node(g, 0, 0.25f, 0.0f);
+    rt_graph_add_node(g, 1, kKindOut);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    REQUIRE(rt_graph_template_set_identity(g, 0, "voice", 5) == 1);
+
+    add_const_node(builder, 0, 0.5f, 0.0f);
+    rt_graph_add_node(builder, 1, kKindOut);
+    rt_graph_set_control(builder, 1, 0, 0.0f);
+    rt_graph_connect(builder, 0, 0, 1, 0);
+    REQUIRE(rt_graph_template_set_identity(builder, 0, "voice", 5) == 1);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+    rt_graph_cancel_swap(g, swap);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap template identity: differing identities reject prepare") {
+    auto *g = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    add_const_node(g, 0, 0.25f, 0.0f);
+    rt_graph_add_node(g, 1, kKindOut);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+    REQUIRE(rt_graph_template_set_identity(g, 0, "voice", 5) == 1);
+
+    add_const_node(builder, 0, 0.5f, 0.0f);
+    rt_graph_add_node(builder, 1, kKindOut);
+    rt_graph_set_control(builder, 1, 0, 0.0f);
+    rt_graph_connect(builder, 0, 0, 1, 0);
+    REQUIRE(rt_graph_template_set_identity(builder, 0, "delay", 5) == 1);
+
+    REQUIRE(rt_graph_instance_alive(g, 0) == 1);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    CHECK(swap == nullptr);
+
+    rt_graph_destroy(builder);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap template identity: missing token on either side stays permissive") {
+    // Old identity set, new identity absent: prepare must still succeed
+    // so producers can adopt template identity gradually.
+    {
+        auto *g = rt_graph_create(4, kFrames);
+        auto *builder = rt_graph_create(4, kFrames);
+        REQUIRE(g != nullptr);
+        REQUIRE(builder != nullptr);
+
+        add_const_node(g, 0, 0.25f, 0.0f);
+        REQUIRE(rt_graph_template_set_identity(g, 0, "voice", 5) == 1);
+        add_const_node(builder, 0, 0.5f, 0.0f);
+
+        auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+        REQUIRE(swap != nullptr);
+        rt_graph_destroy(builder);
+        rt_graph_cancel_swap(g, swap);
+        rt_graph_destroy(g);
+    }
+    // New identity set, old identity absent: same.
+    {
+        auto *g = rt_graph_create(4, kFrames);
+        auto *builder = rt_graph_create(4, kFrames);
+        REQUIRE(g != nullptr);
+        REQUIRE(builder != nullptr);
+
+        add_const_node(g, 0, 0.25f, 0.0f);
+        add_const_node(builder, 0, 0.5f, 0.0f);
+        REQUIRE(rt_graph_template_set_identity(builder, 0, "voice", 5) == 1);
+
+        auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+        REQUIRE(swap != nullptr);
+        rt_graph_destroy(builder);
+        rt_graph_cancel_swap(g, swap);
+        rt_graph_destroy(g);
+    }
+}
+
+TEST_CASE("hot-swap template identity: differing identities allowed when no slot is live") {
+    auto *g = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    add_const_node(g, 0, 0.25f, 0.0f);
+    REQUIRE(rt_graph_template_set_identity(g, 0, "voice", 5) == 1);
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_instance_status(g, 0) == -1);
+
+    add_const_node(builder, 0, 0.5f, 0.0f);
+    REQUIRE(rt_graph_template_set_identity(builder, 0, "delay", 5) == 1);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+    rt_graph_cancel_swap(g, swap);
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("hot-swap migration: oscillator state survives payload install") {
     auto build = [](RTGraph *g, int osc_kind) {
         rt_graph_add_node(g, 0, osc_kind);

@@ -1,11 +1,11 @@
 # Phase 5 — RCU Hot-Swap Protocol
 
 Date: 2026-05-10
-Status: Phase 5.1.A/B, 5.2.A/B/C, 5.3.A/B/C, and 5.4.A
-implemented. 5.3.D (`rt_graph_wait_swap_installed`) is deferred until
-producer workloads justify another synchronization surface. 5.4.B is
-the next proposed runtime slice: template identity preconditions before
-state/lifecycle migration.
+Status: Phase 5.1.A/B, 5.2.A/B/C, 5.3.A/B/C, and 5.4.A/B implemented.
+5.3.D (`rt_graph_wait_swap_installed`) is deferred — the 5.3.C bench
+shows producer detection is microsecond-scale and not the bottleneck.
+5.4.B turns template-id reorder into a publish failure rather than a
+silent migration foot-gun.
 
 This note pins the protocol for swapping a running MetaSonic graph
 without a stop/start cycle. It records what the runtime did before the
@@ -14,8 +14,9 @@ audio-thread boundary and what does not, and what state migration had
 to commit to. Phase 5.1.A first stood up the publish / install / retire
 dance with an empty payload; Phase 5.1.B moves the swappable runtime
 world into `RTGraphState` and makes `RTGraphSwap` carry a real
-next-world payload. Phase 5.2 adds caller-tagged state migration, and
-Phase 5.3.A/B/C wraps and measures the protocol for Haskell producers.
+next-world payload. Phase 5.2 adds caller-tagged state migration,
+Phase 5.3.A/B/C wraps and measures the protocol for Haskell producers,
+and Phase 5.4.B adds a template identity precondition.
 
 ## 1. Today: stop / rebuild semantics
 
@@ -258,6 +259,56 @@ demonstrated yet. The next Phase 5 work that *might* prompt it is
 producer-side bus identity / template renumbering — questions about
 *what* the producer wants to do after install, not about *whether* the
 producer can tell that install happened.
+
+### 4.3 Phase 5.4.B template identity precondition
+
+State and lifecycle migration in Phase 5.2 are keyed by `template_id`.
+That works as long as `defs[template_id]` refers to the same semantic
+template across old and new worlds. If a producer accidentally reorders
+templates in the new world — say `[("a", g1), ("b", g2)]` becomes
+`[("b", g2), ("a", g1)]` — the runtime would happily migrate template
+0's live state into the new world's `template_id = 0`, which now
+belongs to a different semantic template. The structural shape would
+match (same node count, same kinds, same arities for many corpora), so
+the migration plan would commit and the audible result would be a
+state cross-talk that's hard to debug.
+
+5.4.B turns this into a publish failure:
+
+- `MetaDef::identity` is a fixed 16-byte token, same shape as the
+  Phase 5.2 node migration key. It is set off-audio via
+  `rt_graph_template_set_identity(g, template_id, key, key_len)` on
+  the construction path and is reset by `reset_to_default_state` along
+  with the rest of the template metadata.
+- `rt_graph_prepare_swap_from_graph` adds a precondition: walk
+  `target->active->instances`, and for every Active or Releasing slot,
+  if both old and new `defs[slot.template_id]` carry an identity, the
+  tokens must match. On any mismatch the function returns `nullptr`
+  before allocating a swap or building a migration plan.
+- Empty identities on either side are treated as opt-out. Single-
+  template legacy callers that never set an identity, and producers
+  who haven't adopted 5.4.B yet, see the previous behavior — the
+  precondition is graceful so adoption can be incremental.
+- Templates without a live slot are not checked. A renumber that
+  happens before any voice is active is not observable through
+  migration anyway, and rejecting on a dormant pool would block legal
+  rebuilds.
+
+Haskell side: `loadTemplateGraph` and `loadTemplateGraphFused` ship
+`tplName` through the new ABI as the per-template identity. Names that
+exceed 16 UTF-8 bytes or contain NUL fail during the pre-clear
+validation gate with a clear diagnostic; that is a load contract, not
+a runtime contract, so the error is surfaced as a Haskell `IOError`
+rather than a silent untagged template that publishes anyway. Because
+validation happens before `c_rt_graph_clear`, a bad next graph does
+not erase the currently loaded graph.
+
+The single-template `loadRuntimeGraph[Fused]` path deliberately does
+not set an identity. v1 keeps single-template flows permissive: the
+flat graph has only `template_id 0` and the rejection rule has nothing
+to reject against. If a future caller wants identity for the flat
+path, the same setter applies — the runtime treats template 0
+uniformly.
 
 ## 5. Realtime control queue across a swap
 
