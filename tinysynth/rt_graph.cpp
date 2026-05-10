@@ -47,6 +47,14 @@ namespace q = cycfi::q;
 
 struct RTGraph;
 
+// Phase 5.1.A: RCU hot-swap protocol substrate. The empty payload is
+// deliberate — this slice exists to pin the publish/install/retire
+// dance before later slices add real world content. Defined at file
+// scope (outside the anonymous namespace) so the C ABI's
+// extern "C" entries can name it. See
+// notes/2026-05-10-phase-5-rcu-hot-swap-design.md.
+struct RTGraphSwap {};
+
 /* Note [Dense runtime model]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The runtime operates entirely on dense indices.
@@ -1571,6 +1579,8 @@ one of these categories:
       rt_graph_add_node          (template-0 shim)
       rt_graph_set_control       (template-0 shim — see note below)
       rt_graph_connect           (template-0 shim)
+      rt_graph_prepare_swap
+      rt_graph_cancel_swap       (for unpublished swaps)
 
   Control-thread (audio-stopped only) — mutates per-instance
     state and/or the instance vector. Audio thread reads and writes
@@ -1610,6 +1620,8 @@ one of these categories:
       rt_graph_realtime_release
       rt_graph_realtime_remove
       rt_graph_realtime_set_control
+      rt_graph_publish_swap
+      rt_graph_collect_retired_swap
 
   Read-only introspection — reads small scalar or std::optional
     fields. Safe to call concurrently with the callback in the
@@ -1621,6 +1633,9 @@ one of these categories:
       rt_graph_instance_count
       rt_graph_instance_alive
       rt_graph_instance_status
+      rt_graph_test_swap_generation
+      rt_graph_test_swap_pending
+      rt_graph_test_swap_retired_pending
 
   Bus read — copies samples out of server.output_buses. The audio
     callback writes to those vectors during process_graph. Bus pool
@@ -2175,6 +2190,29 @@ struct RTGraph {
   // region-item-granularity dispatch was the path actually exercised.
   int last_c1d_parallel_entry_count = 0;
   int last_c1d_parallel_region_item_count = 0;
+
+  // Phase 5.1.A: RCU hot-swap protocol substrate. The pending slot
+  // holds a producer-published RTGraphSwap until the audio thread
+  // acquires it at the top of the next process_graph block. The
+  // retired slot holds an installed swap until the producer reaps it.
+  // Both are one-deep: a publish-while-pending is rejected by
+  // rt_graph_publish_swap; an install-while-retired-pending overwrites
+  // the retire slot (the substrate's swap payload is empty so the
+  // overwrite is detectable but not load-bearing — the producer is
+  // contractually required to reap after each publish).
+  //
+  // swap_generation_observed is the count of installs the audio thread
+  // has performed since construction or rt_graph_clear. It is atomic
+  // because the producer may poll it after rt_graph_publish_swap to
+  // wait until commands can target the new world.
+  //
+  // No allocation runs on the audio thread: the install path is one
+  // atomic exchange (pending -> null), one retired-slot exchange, and
+  // one generation increment. See
+  // notes/2026-05-10-phase-5-rcu-hot-swap-design.md.
+  std::atomic<RTGraphSwap *> pending_swap{nullptr};
+  std::atomic<RTGraphSwap *> retired_swap{nullptr};
+  std::atomic<int> swap_generation_observed{0};
 };
 
 namespace {
@@ -6119,7 +6157,23 @@ static void process_legacy_schedule(
 }
 
 static void process_graph(RTGraph &g, int nframes) noexcept {
-  // Drain the realtime control queue *before* anything else runs.
+  // Phase 5.1.A: first acquire any pending hot-swap, but do not install
+  // it until after the realtime control queue is drained below. The
+  // acquire on pending_swap synchronizes-with the producer's
+  // release-store in rt_graph_publish_swap. Because producers must
+  // enqueue old-world realtime commands before publish, this acquire
+  // orders those queue writes before drain_control_queue's later
+  // write_idx snapshot; such commands are therefore applied to the old
+  // world before it retires.
+  //
+  // The substrate's payload is empty, so install is a no-op for
+  // rendering; only swap_generation_observed advances. Future slices
+  // attach the new world's defs/instances/server payload to this same
+  // acquired pointer.
+  RTGraphSwap *pending_install =
+      g.pending_swap.exchange(nullptr, std::memory_order_acquire);
+
+  // Drain the realtime control queue before the world install.
   // This snapshots the producer's published-up-to point once and
   // applies every command published before the snapshot, so any
   // Activate / Release / Remove / SetControl that arrived between
@@ -6129,6 +6183,23 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // node-state preparation) to this thread. See Note [A.2: realtime
   // control queue].
   drain_control_queue(g);
+
+  // Install the acquired swap before bus ping-pong and any kernel runs.
+  //
+  // Allocation-free: the install is one earlier atomic exchange
+  // (pending -> null), one atomic store/exchange into the retired slot,
+  // and one atomic generation increment. The retire slot is one-deep;
+  // overwriting an unreaped retired swap is permitted by the substrate
+  // (the payload is trivially destructible) but flagged as a test
+  // failure — the producer is contractually required to reap after each
+  // publish. Future slices with non-trivial payloads will likely tighten
+  // this to reject publish-while-retired-pending.
+  if (pending_install) {
+    RTGraphSwap *prev =
+        g.retired_swap.exchange(pending_install, std::memory_order_release);
+    (void)prev;
+    g.swap_generation_observed.fetch_add(1, std::memory_order_release);
+  }
 
   // Ping-pong the server bus pool, then zero the new live buffer.
   // This runs ONCE per block, before any instance executes — every
@@ -6468,6 +6539,22 @@ static void reset_to_default_state(RTGraph &g) {
   g.last_c1d_parallel_entry_count = 0;
   g.last_c1d_parallel_region_item_count = 0;
 
+  // Phase 5.1.A: reset the hot-swap protocol slots. rt_graph_clear
+  // already called stop_audio_stream, so there is no concurrent
+  // audio thread and no concurrent producer (publish is
+  // [T:realtime-producer] which by §1's contract is only safe to
+  // call while audio is running). Free any unreaped pending /
+  // retired swaps so a clear-then-destroy sequence does not leak.
+  if (RTGraphSwap *pending = g.pending_swap.exchange(
+          nullptr, std::memory_order_relaxed)) {
+    delete pending;
+  }
+  if (RTGraphSwap *retired = g.retired_swap.exchange(
+          nullptr, std::memory_order_relaxed)) {
+    delete retired;
+  }
+  g.swap_generation_observed.store(0, std::memory_order_relaxed);
+
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
   // commands against the freshly-rebuilt template / instance pool
@@ -6628,6 +6715,19 @@ void rt_graph_destroy(RTGraph *g) {
   }
   stop_audio_stream(*g);
   g->worker_pool.stop_workers();
+  // Phase 5.1.A: stop_audio_stream has joined the audio thread, so the
+  // pending / retired swap slots can no longer be touched concurrently.
+  // Free any unreaped swap so destroying a graph mid-protocol does not
+  // leak. Mirrors the reset_to_default_state path; matters here for
+  // callers that destroy without first calling rt_graph_clear.
+  if (RTGraphSwap *pending = g->pending_swap.exchange(
+          nullptr, std::memory_order_relaxed)) {
+    delete pending;
+  }
+  if (RTGraphSwap *retired = g->retired_swap.exchange(
+          nullptr, std::memory_order_relaxed)) {
+    delete retired;
+  }
   delete g;
 }
 
@@ -7079,6 +7179,57 @@ int rt_graph_test_last_c1d_parallel_entry_count(const RTGraph *g) {
 
 int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g) {
   return g ? g->last_c1d_parallel_region_item_count : 0;
+}
+
+// ----------------------------------------------------------------
+// Phase 5.1.A: RCU hot-swap protocol substrate
+// ----------------------------------------------------------------
+
+RTGraphSwap *rt_graph_prepare_swap(RTGraph *g) {
+  if (!g) return nullptr;
+  return new RTGraphSwap{};
+}
+
+void rt_graph_cancel_swap(RTGraph * /*g*/, RTGraphSwap *swap) {
+  delete swap;
+}
+
+int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap) {
+  if (!g || !swap) return 0;
+  // CAS the pending slot from null → swap. A failure means a
+  // previous publish has not yet been installed; the producer must
+  // wait (poll rt_graph_test_swap_pending) and retry. Release on
+  // success publishes the swap object's contents to the audio
+  // thread's acquire-load in process_graph.
+  RTGraphSwap *expected = nullptr;
+  if (!g->pending_swap.compare_exchange_strong(
+          expected, swap,
+          std::memory_order_release,
+          std::memory_order_relaxed)) {
+    return 0;
+  }
+  return 1;
+}
+
+RTGraphSwap *rt_graph_collect_retired_swap(RTGraph *g) {
+  if (!g) return nullptr;
+  // Acquire so any payload future slices stash on the retired swap
+  // before the audio thread releases it is visible here.
+  return g->retired_swap.exchange(nullptr, std::memory_order_acquire);
+}
+
+int rt_graph_test_swap_generation(const RTGraph *g) {
+  return g ? g->swap_generation_observed.load(std::memory_order_acquire) : 0;
+}
+
+int rt_graph_test_swap_pending(const RTGraph *g) {
+  if (!g) return 0;
+  return g->pending_swap.load(std::memory_order_acquire) != nullptr ? 1 : 0;
+}
+
+int rt_graph_test_swap_retired_pending(const RTGraph *g) {
+  if (!g) return 0;
+  return g->retired_swap.load(std::memory_order_acquire) != nullptr ? 1 : 0;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named

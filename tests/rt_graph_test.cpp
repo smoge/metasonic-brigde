@@ -8296,3 +8296,231 @@ TEST_CASE("contribution capacity: parallel vector sizing across many capacities"
 
     rt_graph_destroy(g);
 }
+
+// ----------------------------------------------------------------
+// Phase 5.1.A: RCU hot-swap protocol substrate
+// ----------------------------------------------------------------
+//
+// The substrate carries an empty payload. These tests pin the
+// publish/install/retire dance — generation advances at a block
+// boundary, retired-slot reaping returns ownership to the producer,
+// publish-while-pending fails, lifecycle entries do not leak, and
+// rt_graph_clear resets the protocol to a clean slate. Once the
+// dance is pinned here, future slices can add real world content
+// without re-litigating the protocol.
+
+TEST_CASE("hot-swap substrate: prepare + publish + install advances generation") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    CHECK(rt_graph_test_swap_generation(g) == 0);
+    CHECK(rt_graph_test_swap_pending(g) == 0);
+    CHECK(rt_graph_test_swap_retired_pending(g) == 0);
+
+    auto *swap = rt_graph_prepare_swap(g);
+    REQUIRE(swap != nullptr);
+    CHECK(rt_graph_test_swap_pending(g) == 0);  // not yet published
+
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+    CHECK(rt_graph_test_swap_pending(g) == 1);
+    CHECK(rt_graph_test_swap_generation(g) == 0);  // not yet installed
+
+    // Block boundary installs the swap.
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_swap_pending(g) == 0);
+    CHECK(rt_graph_test_swap_generation(g) == 1);
+    CHECK(rt_graph_test_swap_retired_pending(g) == 1);
+
+    // Producer reaps and disposes.
+    auto *retired = rt_graph_collect_retired_swap(g);
+    CHECK(retired == swap);
+    CHECK(rt_graph_test_swap_retired_pending(g) == 0);
+    rt_graph_cancel_swap(g, retired);
+
+    // Subsequent blocks without a publish do not advance generation.
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_swap_generation(g) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap substrate: pre-publish realtime commands drain before install") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    build_constant_template(g);
+    // Free the construction-spawned instance so the realtime path can
+    // reserve and activate a slot through the same queue producers use
+    // while audio is running.
+    rt_graph_instance_remove(g, 0);
+
+    int slot = rt_graph_realtime_reserve(g, 0);
+    REQUIRE(slot >= 0);
+    REQUIRE(rt_graph_realtime_activate(g, slot) == 1);
+    REQUIRE(rt_graph_realtime_set_control(
+        g, slot, /*node*/0, /*ctl*/0, 0.5) == 1);
+
+    auto *swap = rt_graph_prepare_swap(g);
+    REQUIRE(swap != nullptr);
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_swap_generation(g) == 1);
+    CHECK(rt_graph_test_swap_pending(g) == 0);
+    CHECK(rt_graph_test_swap_retired_pending(g) == 1);
+
+    const auto bus0 = read_bus_vec(g, 0, kFrames);
+    for (float sample : bus0) {
+        CHECK(sample == doctest::Approx(0.5f).epsilon(1e-6));
+    }
+
+    rt_graph_cancel_swap(g, rt_graph_collect_retired_swap(g));
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap substrate: cancel before publish does not install") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    auto *swap = rt_graph_prepare_swap(g);
+    REQUIRE(swap != nullptr);
+    rt_graph_cancel_swap(g, swap);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_swap_pending(g) == 0);
+    CHECK(rt_graph_test_swap_retired_pending(g) == 0);
+    CHECK(rt_graph_test_swap_generation(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap substrate: publish while pending fails") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    auto *first  = rt_graph_prepare_swap(g);
+    auto *second = rt_graph_prepare_swap(g);
+    REQUIRE(first  != nullptr);
+    REQUIRE(second != nullptr);
+    REQUIRE(first != second);
+
+    REQUIRE(rt_graph_publish_swap(g, first) == 1);
+    // Second publish must be rejected — the substrate contract is
+    // single-pending. The runtime owns `first`; `second` stays with
+    // the caller.
+    CHECK(rt_graph_publish_swap(g, second) == 0);
+    CHECK(rt_graph_test_swap_pending(g) == 1);
+
+    rt_graph_cancel_swap(g, second);  // caller still owns second
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_swap_generation(g) == 1);
+    rt_graph_cancel_swap(g, rt_graph_collect_retired_swap(g));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap substrate: multiple publishes serialize across blocks") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    for (int i = 1; i <= 4; ++i) {
+        auto *swap = rt_graph_prepare_swap(g);
+        REQUIRE(swap != nullptr);
+        REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+
+        rt_graph_process(g, kFrames);
+        CHECK(rt_graph_test_swap_generation(g) == i);
+
+        // Producer reaps so the next publish has a clean retire slot.
+        auto *retired = rt_graph_collect_retired_swap(g);
+        CHECK(retired == swap);
+        rt_graph_cancel_swap(g, retired);
+    }
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap substrate: rt_graph_clear resets generation and reaps slots") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Run one swap cycle, then leave one publish pending and one
+    // retired-but-not-reaped to prove rt_graph_clear releases both.
+    auto *first  = rt_graph_prepare_swap(g);
+    REQUIRE(rt_graph_publish_swap(g, first) == 1);
+    rt_graph_process(g, kFrames);
+    REQUIRE(rt_graph_test_swap_generation(g) == 1);
+    REQUIRE(rt_graph_test_swap_retired_pending(g) == 1);
+
+    auto *second = rt_graph_prepare_swap(g);
+    REQUIRE(rt_graph_publish_swap(g, second) == 1);
+    REQUIRE(rt_graph_test_swap_pending(g) == 1);
+
+    // Clear must drop both swaps without leaking and reset the
+    // generation counter. After clear, the protocol slots are clean.
+    rt_graph_clear(g);
+    CHECK(rt_graph_test_swap_generation(g) == 0);
+    CHECK(rt_graph_test_swap_pending(g) == 0);
+    CHECK(rt_graph_test_swap_retired_pending(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap substrate: install does not change rendering output") {
+    // Behavior preservation. The substrate's empty payload means
+    // rendering must be byte-identical with and without an install
+    // happening at the block boundary. Render two graphs in lockstep
+    // — one swaps each block, one does not — and compare bus 0.
+    auto build = [](RTGraph *g) {
+        add_const_node(g, 0, 0.25f, 0.5f);  // const 0.75
+        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+    };
+
+    auto *plain   = rt_graph_create(4, kFrames);
+    auto *swapped = rt_graph_create(4, kFrames);
+    REQUIRE(plain   != nullptr);
+    REQUIRE(swapped != nullptr);
+    build(plain);
+    build(swapped);
+
+    constexpr int kBlocks = 4;
+    for (int i = 0; i < kBlocks; ++i) {
+        auto *swap = rt_graph_prepare_swap(swapped);
+        REQUIRE(rt_graph_publish_swap(swapped, swap) == 1);
+
+        rt_graph_process(plain,   kFrames);
+        rt_graph_process(swapped, kFrames);
+
+        auto plain_bus0   = read_bus_vec(plain,   0, kFrames);
+        auto swapped_bus0 = read_bus_vec(swapped, 0, kFrames);
+        check_exact_same(plain_bus0, swapped_bus0);
+
+        rt_graph_cancel_swap(swapped, rt_graph_collect_retired_swap(swapped));
+    }
+    CHECK(rt_graph_test_swap_generation(swapped) == kBlocks);
+
+    rt_graph_destroy(plain);
+    rt_graph_destroy(swapped);
+}
+
+TEST_CASE("hot-swap substrate: null-arg paths are silent no-ops") {
+    CHECK(rt_graph_prepare_swap(nullptr) == nullptr);
+    CHECK(rt_graph_publish_swap(nullptr, nullptr) == 0);
+    CHECK(rt_graph_collect_retired_swap(nullptr) == nullptr);
+    rt_graph_cancel_swap(nullptr, nullptr);  // must not crash
+    CHECK(rt_graph_test_swap_generation(nullptr) == 0);
+    CHECK(rt_graph_test_swap_pending(nullptr) == 0);
+    CHECK(rt_graph_test_swap_retired_pending(nullptr) == 0);
+
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    // publish_swap with non-null g but null swap returns 0 and
+    // does not mutate state.
+    CHECK(rt_graph_publish_swap(g, nullptr) == 0);
+    CHECK(rt_graph_test_swap_pending(g) == 0);
+    rt_graph_destroy(g);
+}
