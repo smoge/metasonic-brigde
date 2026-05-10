@@ -109,7 +109,7 @@ static inline T sanitize_finite_clamp(T v, T lo, T hi, T fallback) noexcept {
   return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
 }
 
-// Domain bounds. Centralised so a future policy change touches one place.
+// Domain bounds. Centralized so a future policy change touches one place.
 constexpr double kFreqFallbackHz   = 440.0;
 constexpr double kQMin             = 0.05;
 constexpr double kQMax             = 100.0;
