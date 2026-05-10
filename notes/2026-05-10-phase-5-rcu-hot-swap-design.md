@@ -154,6 +154,10 @@ Phase 5.3.A/B wraps the C ownership protocol in
   `withRTGraph`; the helper does not infer capacity from graph shape or
   node count. Producers should use the same sizing policy they used for
   the live target.
+- The Haskell surface exports `BuilderCapacity`, `MaxFrames`,
+  `TimeoutMs`, and `SwapGeneration` aliases to label adjacent integer
+  roles. They document intent without changing the ABI; promote them to
+  newtypes only if producer-side misuse becomes a real problem.
 - If publish fails, the helper cancels the prepared swap before
   returning `False`. If publish succeeds, ownership moves to the C++
   runtime and the helper returns `True`.

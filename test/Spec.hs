@@ -4856,18 +4856,23 @@ crossCuttingTests = testGroup "End-to-end FFI"
 
         done <- newEmptyMVar
         _ <- forkIO $ do
-          let drive 0 = putMVar done ()
+          -- This fork stands in for the audio callback while the main
+          -- thread stays on the producer side. It only runs process
+          -- blocks and reads the atomic generation counter.
+          let drive 0 = putMVar done False
               drive remaining = do
                 threadDelay 1000
                 c_rt_graph_process handle (fromIntegral nframes)
                 gen <- c_rt_graph_test_swap_generation handle
                 if gen > 0
-                  then putMVar done ()
+                  then putMVar done True
                   else drive (remaining - 1)
           drive (64 :: Int)
 
         result <- hotSwapRuntimeGraphAndWait handle capacity nframes 1000 rt
-        takeMVar done
+        driverSawInstall <- takeMVar done
+        assertBool "audio driver did not observe the installed swap"
+          driverSawInstall
         result @?= HotSwapInstalled SwapMigrationStats
           { smsCommittedCount = 1
           , smsSkippedCount = 1

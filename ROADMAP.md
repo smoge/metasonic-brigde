@@ -768,6 +768,10 @@ forcing callers to manually juggle every ownership edge:
   without calling `rt_graph_clear`.
 - `hotSwapTemplateGraph` / `hotSwapTemplateGraphFused` provide the same
   helper for template ensembles.
+- `BuilderCapacity`, `MaxFrames`, `TimeoutMs`, and `SwapGeneration`
+  aliases label the adjacent integer roles in the Haskell API. They are
+  documentation, not type-safety; use newtypes later only if callers
+  start mixing them up.
 - `collectRetiredSwapStats` reaps the installed retired swap, returns
   the Phase 5.2 migration counters, and disposes the old world off-audio.
 - Failed publish cancels the prepared swap before returning, so callers

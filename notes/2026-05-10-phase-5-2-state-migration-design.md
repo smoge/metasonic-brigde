@@ -283,6 +283,7 @@ source/destination relation. 5.2.C extends the same slot match to the
 slot state plus lifecycle fields (`block_lifecycle_active`,
 `block_state_at_start`, `silent_blocks`, `block_sink_peak`) and richer
 live-voice survival tests.
+
 `block_sink_peak` is carried as part of the current slot lifecycle
 snapshot so release/drain decisions continue across the install; normal
 block accounting updates it on subsequent blocks, and callers should not
@@ -405,7 +406,8 @@ returning false from a per-kind capability function.
     new agree on `(template_id, state ∈ {Active, Releasing})`.
   - Tests: Active slot copies are counter-confirmed; Releasing slots
     keep silence-window progress across install; missing new slots do
-    not inherit old lifecycle state.
+    not inherit old lifecycle state; an old Available slot does not
+    overwrite a new Active slot built offline.
 - **5.2.D — Optional, deferred:** structural-alignment fallback for
   untagged nodes. Only landed if a real workload demands it; v1 omits
   it on purpose.

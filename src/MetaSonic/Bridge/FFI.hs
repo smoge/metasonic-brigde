@@ -16,6 +16,10 @@ module MetaSonic.Bridge.FFI
   ( -- * Opaque handle
     RTGraph
   , RTGraphSwap
+  , BuilderCapacity
+  , MaxFrames
+  , TimeoutMs
+  , SwapGeneration
   , SwapMigrationStats (..)
   , HotSwapWaitResult (..)
   , -- * Lifecycle
@@ -316,6 +320,24 @@ data RTGraph
 -- publish it or collect/cancel it through the C ABI.
 data RTGraphSwap
 
+-- | Advisory pre-allocation capacity passed to 'withRTGraph'.
+--
+-- This is a type alias, not a safety boundary. It labels the public
+-- hot-swap helper surface while keeping the C ABI and existing call
+-- sites simple. Promote to a newtype if producer-side misuse becomes
+-- a real problem.
+type BuilderCapacity = Int
+
+-- | Maximum frame count accepted by 'c_rt_graph_process'.
+type MaxFrames = Int
+
+-- | Producer-side wait timeout in milliseconds. Negative waits
+-- indefinitely; zero performs one non-blocking poll.
+type TimeoutMs = Int
+
+-- | Value returned by the runtime's install-generation counter.
+type SwapGeneration = Int
+
 -- | Phase 5.2 migration counters observed on a collected swap just
 -- before the Haskell helper disposes it. Counts are representative of
 -- the audio-thread install that consumed the swap.
@@ -330,9 +352,14 @@ data SwapMigrationStats = SwapMigrationStats
 -- | Result of the 5.3.B publish + wait + collect helpers.
 data HotSwapWaitResult
   = HotSwapPublishRejected
+    -- ^ Publish failed; the helper cancelled the prepared swap.
   | HotSwapInstallTimedOut
+    -- ^ Publish succeeded, but generation did not advance in time.
   | HotSwapInstalled !SwapMigrationStats
+    -- ^ The swap installed and the retired world was collected.
   | HotSwapInstalledButRetiredMissing
+    -- ^ Defensive for future multi-collector code. Under the v1
+    -- single-producer/single-collector model this should not occur.
   deriving (Eq, Show)
 
 -- Foreign imports.
@@ -908,7 +935,7 @@ foreign import ccall unsafe "rt_graph_realtime_set_control"
 -- stream before releasing runtime memory.
 --
 -- See Note [FFI boundary design].
-withRTGraph :: Int -> Int -> (Ptr RTGraph -> IO a) -> IO a
+withRTGraph :: BuilderCapacity -> MaxFrames -> (Ptr RTGraph -> IO a) -> IO a
 withRTGraph capacity maxFrames =
   bracket
     (c_rt_graph_create (fromIntegral capacity) (fromIntegral maxFrames))
@@ -944,6 +971,10 @@ hint accepted by 'withRTGraph'. It is deliberately explicit: graph
 shape is not an instance-capacity contract, and producers should size
 the offline builder using the same policy they used for the live
 target.
+The exported 'BuilderCapacity', 'MaxFrames', 'TimeoutMs', and
+'SwapGeneration' aliases label the adjacent integer roles in the API
+without changing the C ABI. If callers start mixing these up in real
+producer code, promote them to newtypes.
 
 The waited helpers assume the v1 producer model: one hot-swap producer
 and one collector per target. They capture @swap_generation@ before
@@ -962,8 +993,8 @@ timeout in milliseconds.
 
 hotSwapWith
   :: (Ptr RTGraph -> a -> IO ())
-  -> Int
-  -> Int
+  -> BuilderCapacity
+  -> MaxFrames
   -> Ptr RTGraph
   -> a
   -> IO Bool
@@ -979,8 +1010,8 @@ hotSwapWith loader capacity maxFrames target payload = do
 
 prepareSwapWith
   :: (Ptr RTGraph -> a -> IO ())
-  -> Int
-  -> Int
+  -> BuilderCapacity
+  -> MaxFrames
   -> Ptr RTGraph
   -> a
   -> IO (Maybe (Ptr RTGraphSwap))
@@ -1003,23 +1034,26 @@ prepareSwapWith loader capacity maxFrames target payload =
 -- The caller must later call 'collectRetiredSwapStats' after a block
 -- boundary has installed the swap; otherwise the C++ one-deep retire
 -- slot remains occupied and the next publish will fail.
-hotSwapRuntimeGraph :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO Bool
+hotSwapRuntimeGraph
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> RuntimeGraph -> IO Bool
 hotSwapRuntimeGraph target capacity maxFrames rg =
   hotSwapWith loadRuntimeGraph capacity maxFrames target rg
 
 -- | Fused-aware sibling of 'hotSwapRuntimeGraph'.
-hotSwapRuntimeGraphFused :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO Bool
+hotSwapRuntimeGraphFused
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> RuntimeGraph -> IO Bool
 hotSwapRuntimeGraphFused target capacity maxFrames rg =
   hotSwapWith loadRuntimeGraphFused capacity maxFrames target rg
 
 -- | Multi-template sibling of 'hotSwapRuntimeGraph'.
-hotSwapTemplateGraph :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO Bool
+hotSwapTemplateGraph
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> TemplateGraph -> IO Bool
 hotSwapTemplateGraph target capacity maxFrames tg =
   hotSwapWith loadTemplateGraph capacity maxFrames target tg
 
 -- | Fused-aware multi-template sibling of 'hotSwapTemplateGraph'.
 hotSwapTemplateGraphFused
-  :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO Bool
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> TemplateGraph -> IO Bool
 hotSwapTemplateGraphFused target capacity maxFrames tg =
   hotSwapWith loadTemplateGraphFused capacity maxFrames target tg
 
@@ -1053,7 +1087,7 @@ collectRetiredSwapStats target = do
 -- @priorGeneration@. A negative timeout waits indefinitely; zero
 -- performs a single non-blocking poll; positive values are
 -- milliseconds. Returns 'False' on timeout.
-waitForSwapGeneration :: Ptr RTGraph -> Int -> Int -> IO Bool
+waitForSwapGeneration :: Ptr RTGraph -> SwapGeneration -> TimeoutMs -> IO Bool
 waitForSwapGeneration target priorGeneration timeoutMs = do
   let wanted = fromIntegral priorGeneration
       installed = (> wanted)
@@ -1074,11 +1108,11 @@ waitForSwapGeneration target priorGeneration timeoutMs = do
           pure (maybe False id result)
 
 hotSwapAndWaitWith
-  :: (Ptr RTGraph -> Int -> Int -> a -> IO Bool)
+  :: (Ptr RTGraph -> BuilderCapacity -> MaxFrames -> a -> IO Bool)
   -> Ptr RTGraph
-  -> Int
-  -> Int
-  -> Int
+  -> BuilderCapacity
+  -> MaxFrames
+  -> TimeoutMs
   -> a
   -> IO HotSwapWaitResult
 hotSwapAndWaitWith publish target capacity maxFrames timeoutMs payload = do
@@ -1100,28 +1134,28 @@ hotSwapAndWaitWith publish target capacity maxFrames timeoutMs payload = do
 -- installs it, collect migration stats, and dispose the retired old
 -- world. The timeout is in milliseconds; negative waits indefinitely.
 hotSwapRuntimeGraphAndWait
-  :: Ptr RTGraph -> Int -> Int -> Int -> RuntimeGraph
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> TimeoutMs -> RuntimeGraph
   -> IO HotSwapWaitResult
 hotSwapRuntimeGraphAndWait =
   hotSwapAndWaitWith hotSwapRuntimeGraph
 
 -- | Fused-aware sibling of 'hotSwapRuntimeGraphAndWait'.
 hotSwapRuntimeGraphFusedAndWait
-  :: Ptr RTGraph -> Int -> Int -> Int -> RuntimeGraph
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> TimeoutMs -> RuntimeGraph
   -> IO HotSwapWaitResult
 hotSwapRuntimeGraphFusedAndWait =
   hotSwapAndWaitWith hotSwapRuntimeGraphFused
 
 -- | Multi-template sibling of 'hotSwapRuntimeGraphAndWait'.
 hotSwapTemplateGraphAndWait
-  :: Ptr RTGraph -> Int -> Int -> Int -> TemplateGraph
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> TimeoutMs -> TemplateGraph
   -> IO HotSwapWaitResult
 hotSwapTemplateGraphAndWait =
   hotSwapAndWaitWith hotSwapTemplateGraph
 
 -- | Fused-aware multi-template sibling of 'hotSwapTemplateGraphAndWait'.
 hotSwapTemplateGraphFusedAndWait
-  :: Ptr RTGraph -> Int -> Int -> Int -> TemplateGraph
+  :: Ptr RTGraph -> BuilderCapacity -> MaxFrames -> TimeoutMs -> TemplateGraph
   -> IO HotSwapWaitResult
 hotSwapTemplateGraphFusedAndWait =
   hotSwapAndWaitWith hotSwapTemplateGraphFused
