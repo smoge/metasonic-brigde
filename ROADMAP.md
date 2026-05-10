@@ -319,7 +319,16 @@ produces silence across a configured threshold + window. Hard-free
 (panic stops, voice stealing in extremis). A polyphonic stress test
 exercises many voices with staggered release and slot reuse.
 
-### 2.F Groups — declined
+### 2.F Groups — DECLINED
+
+SuperCollider-style Groups are declined as a runtime primitive for
+now. The jobs they usually perform, namely ordering, routing, coordinated
+instance control, and lifecycle management, should remain consequences
+of compiled templates, bus-footprint precedence, voice allocation, and
+the release-then-free instance model rather than a mutable runtime tree.
+
+Reevaluate this only if a concrete workflow cannot be expressed cleanly
+through the compiler-owned model.
 
 ---
 
