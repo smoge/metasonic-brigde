@@ -59,10 +59,12 @@ need for a more specialized algorithm.
 
 ### The file structure
 
-The `q_lib` core is organized into five functional directories:
+The `q_lib` core is organized into the following functional directories:
 
 ```
 q_lib/include/q/
+├── detail/     internal helpers used by the rest of the library
+├── fft/        FFT primitives
 ├── fx/         effects processors (delay, filters, dynamics, etc.)
 ├── pitch/      pitch detection facilities
 ├── support/    fundamental types, units, literals, concepts
@@ -95,15 +97,16 @@ The compiler cannot distinguish between 440 (Hz), 440 (samples), or 440
 
 Q addresses this through distinct wrapper types — frequency, duration, decibel,
 phase, period — that are structurally separate at the type level. A frequency is
-not a duration, and no implicit conversion exists between them. Explicit
-conversions (`lin_float`, `lin_double`) are required to extract raw numeric
-values (on v.1.0 it was (`as_float` and `as_double` ). User-defined literals
-(`440_Hz`, `350_ms`, `24_dB`) construct these types from numeric constants with
-both readability and compile-time safety. Separately, Q uses C++20 concepts
-(`Arithmetic`, `IndexableContainer`, `RandomAccessIteratable`) to constrain its
-generic interfaces — ensuring that containers, buffers, and iterators satisfy
-structural requirements checked at compile time rather than failing silently at
-runtime.
+not a duration, and no implicit conversion exists between them. Extracting raw
+numeric values requires an explicit conversion: `as_float` / `as_double` pull
+the stored value out of `frequency`, `duration`, `pitch`, and `interval`, while
+`lin_float` / `lin_double` perform the log-to-linear conversion specific to
+`decibel`. User-defined literals (`440_Hz`, `350_ms`, `24_dB`) construct these
+types from numeric constants with both readability and compile-time safety.
+Separately, Q uses C++20 concepts (`Arithmetic`, `IndexableContainer`,
+`RandomAccessIteratable`) to constrain its generic interfaces — ensuring that
+containers, buffers, and iterators satisfy structural requirements checked at
+compile time rather than failing silently at runtime.
 
 
 ### The unit types
@@ -113,7 +116,7 @@ Q provides six core unit types:
 `frequency` — cycles per second. Constructed via `440_Hz`, `1.5_kHz`,
  `0.5_MHz`. Internally stores a `double`. Provides a `.period()` method
  returning the reciprocal as a `period` type. Explicit conversion back to raw
- float via `lin_float(f)` or `lin_double(f)`.
+ float via `as_float(f)` or `as_double(f)`.
 
 `duration` — a span of time. Constructed via `350_ms`, `1_s`, `10.5_us`.
  Also backed by `double`. Cannot be accidentally used where a `frequency` is
@@ -239,22 +242,26 @@ float sample = osc(phase++); // advance phase, compute sample
 
 ### Stateful processors
 
-Processors that need memory — filters, delays, envelopes — carry their state as
-member data. A `lowpass` filter holds its biquad coefficients and the last two
-input/output samples (the z⁻¹ and z⁻² state). A `delay` holds a ring buffer. An
-`envelope` holds its current segment and accumulated time.
+Processors that need memory — filters, delays, envelope followers — carry
+their state as member data. A `lowpass` filter holds its biquad coefficients
+and the last two input/output samples (the z⁻¹ and z⁻² state). A `delay`
+holds a ring buffer. A `peak_envelope_follower` holds the current peak and
+its decay state.
 
 ```cpp
-q::lowpass lpf{1_kHz, 44100};            // stateful: filter coefficients + state
-q::delay   dly{350_ms, 44100};           // stateful: ring buffer
-q::compressor comp{-10_dB, 1.0/4.0};     // stateful: threshold + ratio
+q::lowpass               lpf{1_kHz, 44100};   // biquad coefficients + z⁻¹/z⁻² state
+q::delay                 dly{350_ms, 44100};  // ring buffer
+q::peak_envelope_follower env{30_ms, 44100};  // running peak + decay state
 ```
 
 The interface is uniform: you call them with `operator()` just like the
 stateless processors. The difference is visible in the type: stateless
 processors are `const`-callable; stateful ones are not. This is the same
-const-correctness principle the language already provides — `q_lib` just uses it
-consistently.
+const-correctness principle the language already provides — `q_lib` just uses
+it consistently. Configuration-only objects like `compressor` — which
+construct with a threshold and ratio but expose a `const operator()` because
+they accumulate no per-sample state — sit on the stateless side of this
+boundary even though they look heavier at a glance.
 
 ### Composition
 
@@ -263,9 +270,10 @@ function application:
 
 ```cpp
 float process(float s) {
-    auto delayed = dly(s);              // delay the signal
+    dly.push(s);                        // advance the delay line
+    auto delayed  = dly();              // read the delayed sample
     auto filtered = lpf(delayed);       // filter the delayed signal
-    return s + filtered * feedback;     // mix
+    return s + filtered * wet;          // dry + filtered wet
 }
 ```
 
@@ -344,7 +352,7 @@ rate:
 ```cpp
 q::lowpass  lp{1_kHz, 44100};
 q::highpass hp{80_Hz, 44100};
-q::peaking  pk{2_kHz, 6_dB, 1.5, 44100}; // freq, gain, Q, srate
+q::peaking  pk{6.0, 2_kHz, 44100, 1.5}; // gain (raw dB), freq, srate, Q
 ```
 
 They share a common biquad implementation internally but present distinct
@@ -954,37 +962,3 @@ high-level musical abstractions. The bridge translates them into graph
 topologies. And `q_lib` provides the DSP primitives at the leaves of those
 graphs, processing samples with no unnecessary coupling to any runtime we might
 outgrow.
-
----
-
-## References
-
-### Documentation & Source
-
-- [Q DSP Library — GitHub Repository](https://github.com/cycfi/q)
-
-### Articles by Joel de Guzman (Cycfi Research)
-
-- ["My Sonic Quest: Adventures in DSP"](https://www.cycfi.com/2023/05/my-sonic-quest-adventures-in-dsp/) (May 2023) — Origin and design philosophy of the Q library.
-- ["Q Audio DSP Library"](https://www.cycfi.com/2019/02/q-audio-dsp-library/) (February 2019) — Initial v0.9 beta announcement.
-- ["Q Onwards to 1.0"](https://www.cycfi.com/2020/05/q-onwards-to-1-0/) (May 2020) — Synth examples, documentation progress, and design notes.
-- ["Q Audio DSP Library 1.0 Beta"](https://www.cycfi.com/2023/06/q-audio-dsp-library-1-0-beta/) (June 2023) — 1.0 beta release and documentation approach.
-
-### Pitch Detection Series (Cycfi Research)
-
-- ["Fast and Efficient Pitch Detection: Bitstream Autocorrelation"](https://www.cycfi.com/2018/03/fast-and-efficient-pitch-detection-bitstream-autocorrelation/) (March 2018)
-- ["Fast and Efficient Pitch Detection: Bliss!"](https://www.cycfi.com/2018/04/fast-and-efficient-pitch-detection-bliss/) (April 2018)
-- ["Fast and Efficient Pitch Detection: Revisited"](https://www.cycfi.com/2020/07/fast-and-efficient-pitch-detection-revisited/) (July 2020)
-- ["Fast and Efficient Pitch Detection: Power of Two"](https://www.cycfi.com/2021/02/fast-and-efficient-pitch-detection-power-of-two/) (February 2021)
-- ["Pitch Perfect: Enhanced Pitch Detection Techniques (Part 1)"](https://www.cycfi.com/2024/09/pitch-perfect-enhanced-pitch-detection-techniques-part-1/) (September 2024) — The new Hz pitch detection system replacing BACF.
-
-### Community
-
-- [Cycfi Research Discord](https://github.com/cycfi/q) 
----
-
-*MetaSonic is a Haskell-to-C++20 compiler pipeline for real-time audio
- synthesis. The Q DSP Library documentation is at
- [cycfi.github.io/q](https://cycfi.github.io/q/q/v1.5-dev/index.html). Follow
- MetaSonic development at
- [smoge.github.io/metasonic-bridge](https://smoge.github.io/metasonic-bridge).*
