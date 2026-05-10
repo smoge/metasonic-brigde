@@ -956,20 +956,23 @@ int rt_graph_test_retired_swap_control_value(
     int control_index,
     double *out_value);
 
-// [T:read-only] Phase 5.2.A/B migration-plan counters on a prepared or
+// [T:read-only] Phase 5.2.A/B/C migration-plan counters on a prepared or
 // collected swap. `committed_count` counts node matches committed into
 // the off-audio plan. `skipped_count` counts nodes that could not
 // participate in the selected migration slice. `instance_copy_count`
 // is written by the audio thread during install and counts per-instance
 // control-vector copies actually performed. `state_copy_count` counts
-// allocation-free DSP-state copies for supported stateful kinds. All
-// return 0 on null swap.
+// allocation-free DSP-state copies for supported stateful kinds.
+// `lifecycle_copy_count` counts slot lifecycle snapshots copied for
+// slot-index/template-matched Active or Releasing instances. All return
+// 0 on null swap.
 int rt_graph_swap_migration_committed_count(const RTGraphSwap *swap);
 int rt_graph_swap_migration_skipped_count(const RTGraphSwap *swap);
 int rt_graph_swap_migration_instance_copy_count(const RTGraphSwap *swap);
 int rt_graph_swap_migration_state_copy_count(const RTGraphSwap *swap);
+int rt_graph_swap_migration_lifecycle_copy_count(const RTGraphSwap *swap);
 
-// [T:read-only] Phase 5.2.A/B test surface: reason code for a skipped
+// [T:read-only] Phase 5.2.A/B/C test surface: reason code for a skipped
 // migration-plan entry. Returns -1 on null swap or out-of-range index.
 // Values:
 //   1 = MissingTag

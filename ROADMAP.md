@@ -739,16 +739,23 @@ real world-payload replacement:
   a swap with `rt_graph_prepare_swap_from_graph`, and install it without
   stopping the target audio handle.
 
-State is not migrated yet: the installed world starts with whatever
-fresh instances the builder graph prepared. The old world is moved into
-the collected swap and destroyed off-audio.
-
-Next slice: §5.2 state migration policy.
+State migration is implemented by §5.2 for caller-tagged nodes and
+slot-index-matched live instances. The old world is moved into the
+collected swap and destroyed off-audio.
 
 ### 5.2 State migration policy
 
-Define which node states survive a hot swap (phase continuity for oscillators,
-filter memory, envelope position) and which are reinitialized.
+**5.2.A/B/C done.** The first migration policy is caller-supplied node
+tags plus slot-index instance identity:
+
+- Haskell `tagged` migration keys survive lowering and FFI loading as
+  1..16 non-NUL bytes.
+- `rt_graph_prepare_swap_from_graph` builds the migration plan off-audio.
+- The audio-thread install loop copies matched controls, copy-safe DSP
+  state (oscillators, noise, biquads), and live-slot lifecycle metadata
+  without allocation.
+- Env, Delay, and Smooth DSP state remain default-init until a later
+  prewarm/custom-state slice makes them allocation-free to migrate.
 
 Edit a graph in the Haskell DSL, recompile, and hear the change without
 restarting audio.

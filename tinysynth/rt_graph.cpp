@@ -2134,12 +2134,14 @@ struct RTGraphSwap {
   // Phase 5.2.A/B: off-audio migration plan. The audio thread
   // consumes `migration_copies` during install, copying per-instance
   // control vectors and supported DSP state for slot-index-matched
-  // instances. Skip reasons are observational; the audio thread never
-  // branches on them.
+  // instances. The same slot match copies lifecycle metadata once per
+  // matched slot, independent of node-level migration keys. Skip
+  // reasons are observational; the audio thread never branches on them.
   std::vector<MigrationCopy> migration_copies;
   std::vector<MigrationSkip> migration_skips;
   int migration_instance_copy_count = 0;
   int migration_state_copy_count = 0;
+  int migration_lifecycle_copy_count = 0;
 };
 
 struct RTGraph {
@@ -2327,6 +2329,7 @@ static void build_migration_plan(
   swap.migration_skips.clear();
   swap.migration_instance_copy_count = 0;
   swap.migration_state_copy_count = 0;
+  swap.migration_lifecycle_copy_count = 0;
   if (!swap.state) return;
 
   const RTGraphState &new_state = *swap.state;
@@ -2483,7 +2486,20 @@ enum class StateMigrationResult {
 struct MigrationApplyCounts {
   int control_vector_copies = 0;
   int state_copies = 0;
+  int lifecycle_copies = 0;
 };
+
+static void copy_instance_lifecycle(
+    SlotState old_slot_state,
+    const GraphInstance &old_inst,
+    GraphInstance &new_inst
+) noexcept {
+  new_inst.state.store(old_slot_state);
+  new_inst.silent_blocks = old_inst.silent_blocks;
+  new_inst.block_sink_peak = old_inst.block_sink_peak;
+  new_inst.block_lifecycle_active = old_inst.block_lifecycle_active;
+  new_inst.block_state_at_start = old_inst.block_state_at_start;
+}
 
 static MigrationApplyCounts apply_migration(
     const RTGraphState &old_state,
@@ -2507,6 +2523,9 @@ static MigrationApplyCounts apply_migration(
     if (old_inst.template_id != new_inst.template_id) {
       continue;
     }
+
+    copy_instance_lifecycle(old_slot_state, old_inst, new_inst);
+    ++counts.lifecycle_copies;
 
     for (const MigrationCopy &copy : copies) {
       if (copy.template_id != old_inst.template_id) continue;
@@ -6523,6 +6542,8 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
         migration_counts.control_vector_copies;
     pending_install->migration_state_copy_count =
         migration_counts.state_copies;
+    pending_install->migration_lifecycle_copy_count =
+        migration_counts.lifecycle_copies;
     pending_install->retired_state = std::move(g.active);
     g.active = std::move(pending_install->state);
     g.retired_swap.store(pending_install, std::memory_order_release);
@@ -7640,6 +7661,11 @@ int rt_graph_swap_migration_instance_copy_count(const RTGraphSwap *swap) {
 int rt_graph_swap_migration_state_copy_count(const RTGraphSwap *swap) {
   if (!swap) return 0;
   return swap->migration_state_copy_count;
+}
+
+int rt_graph_swap_migration_lifecycle_copy_count(const RTGraphSwap *swap) {
+  if (!swap) return 0;
+  return swap->migration_lifecycle_copy_count;
 }
 
 int rt_graph_swap_migration_skipped_reason(

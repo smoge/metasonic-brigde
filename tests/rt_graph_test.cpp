@@ -8329,6 +8329,18 @@ constexpr int kKindHPF          = 17;
 constexpr int kKindBPF          = 18;
 constexpr int kKindNotch        = 19;
 
+void build_env_out_graph(RTGraph *g, double gate) {
+    rt_graph_add_node(g, 0, kKindEnv);
+    rt_graph_set_control(g, 0, 0, gate);
+    rt_graph_set_control(g, 0, 1, 0.0005);
+    rt_graph_set_control(g, 0, 2, 0.001);
+    rt_graph_set_control(g, 0, 3, 0.0);
+    rt_graph_set_control(g, 0, 4, 0.001);
+    rt_graph_add_node(g, 1, kKindOut);
+    rt_graph_set_control(g, 1, 0, 0.0);
+    rt_graph_connect(g, 0, 0, 1, 0);
+}
+
 } // namespace
 
 TEST_CASE("hot-swap substrate: prepare + publish + install advances generation") {
@@ -8611,7 +8623,84 @@ TEST_CASE("hot-swap migration: tagged controls survive payload install") {
     REQUIRE(retired == swap);
     CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 1);
     CHECK(rt_graph_swap_migration_state_copy_count(retired) == 0);
+    CHECK(rt_graph_swap_migration_lifecycle_copy_count(retired) == 1);
 
+    rt_graph_cancel_swap(g, retired);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap migration: releasing lifecycle survives payload install") {
+    constexpr int kBlock = 256;
+    auto *g = rt_graph_create(4, kBlock);
+    auto *builder = rt_graph_create(4, kBlock);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    build_env_out_graph(g, 0.0);
+    build_env_out_graph(builder, 0.0);
+
+    rt_graph_instance_release(g, 0);
+    REQUIRE(rt_graph_instance_status(g, 0) == 1);
+
+    for (int i = 0; i < 4; ++i) {
+        rt_graph_process(g, kBlock);
+        REQUIRE(rt_graph_instance_status(g, 0) == 1);
+    }
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+
+    for (int i = 0; i < 3; ++i) {
+        rt_graph_process(g, kBlock);
+        CHECK(rt_graph_instance_status(g, 0) == 1);
+        if (i == 0) {
+            auto *retired = rt_graph_collect_retired_swap(g);
+            REQUIRE(retired == swap);
+            CHECK(rt_graph_swap_migration_lifecycle_copy_count(retired) == 1);
+            CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 0);
+            CHECK(rt_graph_swap_migration_state_copy_count(retired) == 0);
+            rt_graph_cancel_swap(g, retired);
+        }
+    }
+
+    rt_graph_process(g, kBlock);
+    CHECK(rt_graph_instance_status(g, 0) == -1);
+    CHECK(rt_graph_instance_alive(g, 0) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap migration: missing new slot does not inherit lifecycle") {
+    constexpr int kBlock = 256;
+    auto *g = rt_graph_create(4, kBlock);
+    auto *builder = rt_graph_create(4, kBlock);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    build_env_out_graph(g, 0.0);
+    build_env_out_graph(builder, 0.0);
+    rt_graph_instance_remove(builder, 0);
+    REQUIRE(rt_graph_instance_status(builder, 0) == -1);
+
+    rt_graph_instance_release(g, 0);
+    REQUIRE(rt_graph_instance_status(g, 0) == 1);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+    rt_graph_process(g, kBlock);
+
+    CHECK(rt_graph_instance_status(g, 0) == -1);
+    CHECK(rt_graph_instance_alive(g, 0) == 0);
+
+    auto *retired = rt_graph_collect_retired_swap(g);
+    REQUIRE(retired == swap);
+    CHECK(rt_graph_swap_migration_lifecycle_copy_count(retired) == 0);
     rt_graph_cancel_swap(g, retired);
     rt_graph_destroy(g);
 }
@@ -8934,6 +9023,7 @@ TEST_CASE("hot-swap substrate: null-arg paths are silent no-ops") {
     CHECK(rt_graph_test_swap_generation(nullptr) == 0);
     CHECK(rt_graph_test_swap_pending(nullptr) == 0);
     CHECK(rt_graph_test_swap_retired_pending(nullptr) == 0);
+    CHECK(rt_graph_swap_migration_lifecycle_copy_count(nullptr) == 0);
 
     auto *g = rt_graph_create(2, kFrames);
     REQUIRE(g != nullptr);

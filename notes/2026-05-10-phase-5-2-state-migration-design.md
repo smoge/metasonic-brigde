@@ -1,7 +1,7 @@
 # Phase 5.2 — State Migration Design
 
 Date: 2026-05-10
-Status: 5.2.A/B implemented; 5.2.C pending.
+Status: 5.2.A/B/C implemented.
 Scope: Phase 5.2.A–C (controls, DSP state, live-instance survival).
 Companion: [2026-05-10-phase-5-rcu-hot-swap-design.md](2026-05-10-phase-5-rcu-hot-swap-design.md) §7.
 
@@ -12,9 +12,9 @@ phase, a filter loses its memory. This note pins how 5.2 closes that
 gap without giving up the audio-thread invariants 5.1 established.
 
 The companion design note left three sub-decisions open in §7:
-identity, live-instance survival, bus-pool stability. This note picks
-identity, schedules the rest, and writes down what the migration pass
-is allowed to touch on the audio thread.
+identity, live-instance survival, bus-pool stability. This note records
+the v1 choices now implemented by 5.2.A/B/C and writes down what the
+migration pass is allowed to touch on the audio thread.
 
 ## 1. Decision: caller-supplied stable identity tags
 
@@ -68,10 +68,9 @@ Properties:
   compile-time error on the Haskell path (`validateAndSort` rejects
   them). The C ABI setter also rejects duplicates so direct C/C++
   construction cannot bypass the uniqueness contract.
-- **Opaque to the runtime.** The C++ side stores the key as a small
-  byte sequence (probably a `std::array<char, K>` for fixed-width or a
-  `std::string` for variable; v1 picks fixed-width to avoid per-key
-  heap storage in `NodeSpec`). The runtime never interprets it.
+- **Opaque to the runtime.** The C++ side stores the key as a fixed
+  16-byte array plus explicit length to avoid per-key heap storage in
+  `NodeSpec`. The runtime never interprets it.
 - **Byte-limited, not ASCII-limited.** The Haskell surface spells keys
   as `String`, then ships their UTF-8 byte sequence through the C ABI.
   v1 accepts 1..16 non-NUL bytes. Non-ASCII characters are allowed when
@@ -164,7 +163,8 @@ The audio-thread approach is acceptable because:
   `controls` with same-size vector assignment into vectors already
   sized by `init_node_state` in the new world's prepare pass. 5.2.B
   adds per-kind DSP-state migrators only for kinds whose copy path is
-  known not to allocate.
+  known not to allocate. 5.2.C copies slot lifecycle metadata once for
+  the same slot match, independent of node-level migration keys.
 - The cost is `O(N_tagged_nodes × N_instances)` per install, bounded
   by template size × polyphony cap. Same order as one block of
   rendering work; one extra block-equivalent of work at install time
@@ -279,8 +279,8 @@ identity. v1 strategy:
 
 5.2.A needs this slot-index identity immediately for control
 migration; otherwise "per-instance controls migrate" has no defined
-source/destination relation. 5.2.C is the later slice that extends the
-same slot match to lifecycle fields (`block_lifecycle_active`,
+source/destination relation. 5.2.C extends the same slot match to the
+slot state plus lifecycle fields (`block_lifecycle_active`,
 `block_state_at_start`, `silent_blocks`, `block_sink_peak`) and richer
 live-voice survival tests.
 
@@ -327,6 +327,8 @@ accessor entries:
   written by the audio thread during install)
 - `rt_graph_swap_migration_state_copy_count(swap)` (test surface,
   written by the audio thread during install)
+- `rt_graph_swap_migration_lifecycle_copy_count(swap)` (test surface,
+  written by the audio thread during install)
 
 This gives the producer a way to verify migration intent matched
 reality before disposing the swap.
@@ -349,6 +351,10 @@ must preserve this:
   already-initialized target state. EnvState, DelayState, and
   SmoothState are excluded until their targets can be prewarmed
   off-audio or copied through a custom no-allocation representation.
+- The 5.2.C lifecycle copy is scalar slot metadata only: atomic
+  `SlotState` store plus `silent_blocks`, `block_sink_peak`,
+  `block_lifecycle_active`, and `block_state_at_start`. It does not
+  allocate and does not inspect node-level migration keys.
 - Mismatch handling is silent skip — the plan records the skip
   off-audio; install only branches on slot state/template agreement
   and the committed plan entries.
@@ -386,13 +392,14 @@ returning false from a per-kind capability function.
   - Tests: oscillator phase continues across swap; filter memory
     survives swap; unsupported Env/Delay/Smooth state reports skip
     rather than allocating or half-migrating.
-- **5.2.C — Live-instance lifecycle survival.**
+- **5.2.C — Live-instance lifecycle survival.** Done.
   - Reuse the 5.2.A slot-index identity and add copying for
-    `block_lifecycle_active`, `block_state_at_start`,
+    slot state, `block_lifecycle_active`, `block_state_at_start`,
     `silent_blocks`, and `block_sink_peak` for slots where old and
     new agree on `(template_id, state ∈ {Active, Releasing})`.
-  - Tests: held instance survives swap with correct envelope and
-    audible continuity; mismatched slot is cut cleanly.
+  - Tests: Active slot copies are counter-confirmed; Releasing slots
+    keep silence-window progress across install; missing new slots do
+    not inherit old lifecycle state.
 - **5.2.D — Optional, deferred:** structural-alignment fallback for
   untagged nodes. Only landed if a real workload demands it; v1 omits
   it on purpose.
@@ -418,31 +425,27 @@ returning false from a per-kind capability function.
 
 ## 11. Open questions
 
-- **Q1.** Should migration keys be fixed-width (`std::array<char, 16>`)
-  or variable-width (`std::string`)? Fixed-width keeps `MetaDef`
-  free of per-key heap storage and makes the C ABI simple; variable-
-  width is more flexible. Lean: fixed-width 16-byte plus explicit
-  length, rejecting overlong keys rather than hashing or truncating.
-- **Q2.** Should the migration plan record `KeyNotFound` only, or
+- **Q1.** Should the migration plan record `KeyNotFound` only, or
   also `KeyDiscarded` (old key in the old world that has no
   destination in the new)? The first is enough to debug producer
   intent; the second is useful for tooling. Lean: record both at the
   test surface, expose only "skipped count" through the public ABI.
-- **Q3.** Does the bus-pool sizing change between worlds count as a
+- **Q2.** Does the bus-pool sizing change between worlds count as a
   publish precondition (rejects with mismatched bus count) or a
   caller responsibility (proceeds with new sizing, caller handles)?
   The parent note §7.3 leaves this open. Lean: caller responsibility
   in v1, runtime asserts only when migration would reach beyond the
   new world's bus count.
-- **Q4.** Should `prepare_swap_from_graph` accept a separate
+- **Q3.** Should `prepare_swap_from_graph` accept a separate
   `MigrationPolicy` enum (Strict, Permissive, Disabled) or always run
   the standard match predicate? Lean: always run; opt-out is
   per-node via not setting a tag.
-- **Q5.** Are there existing migration tests we can lean on as
-  byte-equivalence baselines? For 5.2.A, no: controls-only migration
-  still resets oscillator/filter/envelope state, so a self-swap is
-  not byte-identical to a no-swap render. The 5.2.A headline test is
-  counter-confirmed control survival. Byte-equivalence to no-swap
-  becomes a later 5.2.B/C goal for graphs whose every stateful kind is
-  supported by allocation-free migration and whose bus contents do not
-  need preservation.
+- **Q4.** Should bus-content preservation (`output_buses_prev`) join
+  the install copy for delayed feedback continuity? v1 deliberately
+  leaves bus storage fresh after install; preserving it requires a
+  bus-count reconciliation rule.
+- **Q5.** Should Env, Delay, and Smooth gain prewarm/custom-copy
+  migrators? v1 keeps their DSP state default-init because their
+  current optional q payloads can allocate when engaged. A later slice
+  can make them copy-safe by constructing the target payloads
+  off-audio before publish.
