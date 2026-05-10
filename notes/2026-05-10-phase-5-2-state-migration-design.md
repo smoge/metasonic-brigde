@@ -1,7 +1,7 @@
 # Phase 5.2 — State Migration Design
 
 Date: 2026-05-10
-Status: Design only. No code yet.
+Status: 5.2.A implemented; 5.2.B/C pending.
 Scope: Phase 5.2.A–C (controls, DSP state, live-instance survival).
 Companion: [2026-05-10-phase-5-rcu-hot-swap-design.md](2026-05-10-phase-5-rcu-hot-swap-design.md) §7.
 
@@ -170,8 +170,9 @@ For every planned node match and every slot-index-matched instance,
 copy the per-instance `controls` vector from old to new, slot-by-slot.
 Controls are the user-visible parameters (filter cutoff, oscillator
 frequency, gain, bus index). Migrating them is the single biggest
-perceptible win and is trivially allocation-free: `assign(begin, end)`
-into a same-size vector is an in-place copy.
+perceptible win and is trivially allocation-free: `std::copy` writes
+into same-size vectors that were already allocated by the new world's
+prepare pass.
 
 This does overwrite the builder-prepared controls for tagged nodes in
 matched live slots. That is intentional: setting a migration key means
@@ -335,7 +336,8 @@ returning false from a per-kind capability function.
 
 ## 9. Phased plan inside 5.2
 
-- **5.2.A — Tag plumbing + slot-index controls migration.**
+- **5.2.A — Tag plumbing + slot-index controls migration.** Done in
+  the first implementation slice.
   - `nodeMigrationKey` on `NodeIR`; `tagged` builder in `Bridge.Source`;
     plumbing through `validateAndSort`, `lowerGraph`,
     `compileRuntimeGraph`, `loadRuntimeGraph`.

@@ -26,6 +26,7 @@ module MetaSonic.Bridge.Validate
   ) where
 
 import           Data.Foldable           (foldlM)
+import           Data.Char               (ord)
 import qualified Data.Map.Strict         as M
 import qualified Data.Set                as S
 
@@ -347,4 +348,47 @@ topoSort g = do
 validateAndSort :: SynthGraph -> Either String [NodeID]
 validateAndSort g = do
   checkDependencies g
+  checkMigrationKeys g
   topoSort g
+
+-- | Phase 5.2 migration keys are optional, but when present they must fit
+-- the C ABI's fixed-width byte representation and be unique within this
+-- source graph/template. Multi-template validation runs this per template
+-- because keys are scoped per template.
+checkMigrationKeys :: SynthGraph -> Either String ()
+checkMigrationKeys g = do
+  let keyed =
+        [ (key, nsID spec)
+        | spec <- M.elems (sgNodes g)
+        , Just key <- [nsMigrationKey spec]
+        ]
+  mapM_ validateKey keyed
+  let seenOrDup = foldl' step (M.empty, Nothing) keyed
+  case seenOrDup of
+    (_, Nothing) -> Right ()
+    (_, Just (key, firstID, dupID)) ->
+      Left $
+        "Duplicate migration key " <> show (unMigrationKey key)
+        <> " on " <> show firstID <> " and " <> show dupID
+  where
+    validateKey (MigrationKey key, nid)
+      | null key =
+          Left $ "Invalid empty migration key on " <> show nid
+      | length key > 16 =
+          Left $ "Migration key too long on " <> show nid
+              <> ": " <> show key <> " (max 16 ASCII bytes)"
+      | any ((== 0) . ord) key =
+          Left $ "Migration key contains NUL on " <> show nid
+      | any ((> 127) . ord) key =
+          Left $ "Migration key must be ASCII on " <> show nid
+              <> ": " <> show key
+      | otherwise =
+          Right ()
+
+    step (seen, dup) (key, nid) =
+      case dup of
+        Just _ -> (seen, dup)
+        Nothing ->
+          case M.lookup key seen of
+            Just firstID -> (seen, Just (key, firstID, nid))
+            Nothing      -> (M.insert key nid seen, Nothing)

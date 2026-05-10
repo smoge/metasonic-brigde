@@ -71,6 +71,7 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_template_add_node
   , c_rt_graph_ensure_bus
   , c_rt_graph_template_set_default
+  , c_rt_graph_template_set_node_migration_key
   , c_rt_graph_template_connect
   , c_rt_graph_template_add_region
   , c_rt_graph_template_add_schedule_step
@@ -101,6 +102,7 @@ import           Control.Exception          (bracket)
 import qualified Control.Monad              as M (void)
 import           Control.Monad              (forM_, when)
 import           Foreign
+import           Foreign.C.String          (CString, withCStringLen)
 import           Foreign.C.Types
 
 import           MetaSonic.Bridge.Compile   (AffineStep (..),
@@ -116,6 +118,7 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              kernelTag,
                                              layeredRegionSchedule,
                                              scheduledRuntimeRegions)
+import           MetaSonic.Bridge.Source    (MigrationKey (..))
 import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
                                              TemplateID (..))
 import           MetaSonic.Types
@@ -316,6 +319,22 @@ busIndexOf node
     kindUsesBus KBusIn        = True
     kindUsesBus KBusInDelayed = True
     kindUsesBus _             = False
+
+setMigrationKeyForNode :: Ptr RTGraph -> CInt -> RuntimeNode -> IO ()
+setMigrationKeyForNode g cTid node =
+  case rnMigrationKey node of
+    Nothing -> pure ()
+    Just (MigrationKey key) ->
+      withCStringLen key $ \(ptr, len) -> do
+        ok <- c_rt_graph_template_set_node_migration_key
+          g cTid
+          (cNodeIndex (rnIndex node))
+          ptr
+          (fromIntegral len)
+        when (ok == 0) $
+          fail $
+            "rt_graph_template_set_node_migration_key rejected key "
+            <> show key <> " for node " <> show (rnIndex node)
 
 foreign import ccall unsafe "rt_graph_connect"
   c_rt_graph_connect :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
@@ -554,6 +573,10 @@ foreign import ccall unsafe "rt_graph_template_add_node"
 foreign import ccall unsafe "rt_graph_template_set_default"
   c_rt_graph_template_set_default
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO ()
+
+foreign import ccall unsafe "rt_graph_template_set_node_migration_key"
+  c_rt_graph_template_set_node_migration_key
+    :: Ptr RTGraph -> CInt -> CInt -> CString -> CInt -> IO CInt
 
 -- | Connect ports within a single template. Cross-template signal
 -- flow goes through the shared bus pool, not direct port wiring; this
@@ -1008,6 +1031,7 @@ loadRuntimeGraph g rg = do
       c_rt_graph_add_node g
         (cNodeIndex (rnIndex node))
         (kindTag    (rnKind  node))
+      setMigrationKeyForNode g 0 node
       forM_ (zip [0 ..] (rnControls node)) $ \(i, v) ->
         c_rt_graph_set_control g
           (cNodeIndex    (rnIndex node))
@@ -1118,6 +1142,7 @@ loadRuntimeGraphFused g rg = do
       c_rt_graph_add_node g
         (cNodeIndex (rnIndex node))
         (kindTag    (rnKind  node))
+      setMigrationKeyForNode g 0 node
       forM_ (zip [0 ..] (rnControls node)) $ \(i, v) ->
         c_rt_graph_set_control g
           (cNodeIndex    (rnIndex node))
@@ -1269,6 +1294,7 @@ loadTemplateGraph g tg = do
         c_rt_graph_template_add_node g cTid
           (cNodeIndex (rnIndex node))
           (kindTag    (rnKind  node))
+        setMigrationKeyForNode g cTid node
         forM_ (zip [0 ..] (rnControls node)) $ \(ci, v) ->
           c_rt_graph_template_set_default g cTid
             (cNodeIndex    (rnIndex node))
@@ -1365,6 +1391,7 @@ loadTemplateGraphFused g tg = do
         c_rt_graph_template_add_node g cTid
           (cNodeIndex (rnIndex node))
           (kindTag    (rnKind  node))
+        setMigrationKeyForNode g cTid node
         forM_ (zip [0 ..] (rnControls node)) $ \(ci, v) ->
           c_rt_graph_template_set_default g cTid
             (cNodeIndex    (rnIndex node))

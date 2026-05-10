@@ -21,6 +21,7 @@
 module MetaSonic.Bridge.Source
   ( -- * Source-level types
     Connection (..)
+  , MigrationKey (..)
   , UGen (..)
   , NodeSpec (..)
   , SynthGraph (..)
@@ -53,6 +54,7 @@ module MetaSonic.Bridge.Source
   , busInDelayed
   , delayL
   , smooth
+  , tagged
   , cc
   , -- * Connection helpers
     audio
@@ -214,6 +216,14 @@ audioArithErr op _ = error $
   "Num/Fractional Connection: " <> op
   <> " on an audio-rate Connection is undefined at compile time. "
   <> "Use the 'add' or 'gain' graph nodes for runtime arithmetic."
+
+-- | Stable node identity used by Phase 5.2 state migration. The key is
+-- optional and caller-chosen: untagged nodes explicitly opt out of
+-- migration. Validation enforces the runtime ABI's v1 fixed-width
+-- contract: non-empty, ASCII, no NUL bytes, and at most 16 bytes.
+newtype MigrationKey = MigrationKey { unMigrationKey :: String }
+  deriving stock    (Eq, Ord, Show, Generic)
+  deriving anyclass (NFData)
 
 
 {- Note [UGen extensibility]
@@ -486,6 +496,7 @@ data NodeSpec = NodeSpec
   , nsName :: !String
     -- ^ Human-readable label (for debugging / printing).
   , nsUgen :: !UGen
+  , nsMigrationKey :: !(Maybe MigrationKey)
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -606,7 +617,7 @@ insertNode :: String -> UGen -> SynthM NodeID
 insertNode name ugen = do
   nid <- freshNodeID
   st  <- get
-  let !spec  = NodeSpec nid name ugen
+  let !spec  = NodeSpec nid name ugen Nothing
       !graph = ssGraph st
       !nodes = M.insert nid spec (sgNodes graph)
   put st { ssGraph = graph { sgNodes = nodes } }
@@ -676,6 +687,32 @@ connectionNodeID (Param _)     = Nothing
 -- 'Connection' on port 0.
 insertNodeC :: String -> UGen -> SynthM Connection
 insertNodeC name ugen = audio <$> insertNode name ugen
+
+-- | Attach a Phase 5.2 migration key to the node returned by a builder.
+-- Intended for primitive UGen builders:
+--
+-- @
+-- osc <- tagged "voice-osc" (sinOsc freq 0)
+-- @
+--
+-- If the wrapped builder returns an audio connection to a node, that
+-- node receives the key. If it returns a Param, this is a programming
+-- error: there is no node to tag.
+tagged :: String -> SynthM Connection -> SynthM Connection
+tagged key action = do
+  conn <- action
+  case connectionNodeID conn of
+    Nothing ->
+      error "tagged: wrapped builder did not return an audio node"
+    Just nid -> do
+      st <- get
+      let !graph = ssGraph st
+          !nodes = M.adjust
+            (\spec -> spec { nsMigrationKey = Just (MigrationKey key) })
+            nid
+            (sgNodes graph)
+      put st { ssGraph = graph { sgNodes = nodes } }
+      pure conn
 
 -- | Sine oscillator. Either input may be a numeric literal (which
 -- becomes a 'Param' constant) or another node's 'Connection', so this

@@ -134,6 +134,16 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
 void rt_graph_template_add_node(RTGraph *g, int template_id,
                                 int node_index, int node_kind);
 
+// [T:construction] Attach a Phase 5.2 migration identity key to one
+// node in a template. Keys are optional, scoped per template, and used
+// by rt_graph_prepare_swap_from_graph to build a controls/state
+// migration plan. key_len must be in 1..16; bytes are opaque but may
+// not include NUL. Returns 1 on success, 0 on invalid args, duplicate
+// key in the same template, or overlong key.
+int rt_graph_template_set_node_migration_key(
+    RTGraph *g, int template_id, int node_index,
+    const char *key, int key_len);
+
 // [T:construction] Set one entry of a template's spec.default_controls.
 // New instances created later via rt_graph_template_instance_add inherit
 // the value; existing instances are *not* mutated. Use
@@ -945,6 +955,28 @@ int rt_graph_test_retired_swap_control_value(
     int node_index,
     int control_index,
     double *out_value);
+
+// [T:read-only] Phase 5.2.A migration-plan counters on a prepared or
+// collected swap. `committed_count` counts node matches committed into
+// the off-audio plan. `skipped_count` counts nodes that could not
+// participate in the selected migration slice. `instance_copy_count`
+// is written by the audio thread during install and counts per-instance
+// control-vector copies actually performed. All return 0 on null swap.
+int rt_graph_swap_migration_committed_count(const RTGraphSwap *swap);
+int rt_graph_swap_migration_skipped_count(const RTGraphSwap *swap);
+int rt_graph_swap_migration_instance_copy_count(const RTGraphSwap *swap);
+
+// [T:read-only] Phase 5.2.A test surface: reason code for a skipped
+// migration-plan entry. Returns -1 on null swap or out-of-range index.
+// Values:
+//   1 = MissingTag
+//   2 = KeyNotFound
+//   3 = DuplicateKey
+//   4 = KindMismatch
+//   5 = ArityMismatch
+//   6 = StateUnsupported
+int rt_graph_swap_migration_skipped_reason(
+    const RTGraphSwap *swap, int skip_index);
 
 // ----------------------------------------------------------------
 // Multi-instance support

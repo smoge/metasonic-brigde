@@ -8308,6 +8308,13 @@ TEST_CASE("contribution capacity: parallel vector sizing across many capacities"
 // entries do not leak, and rt_graph_clear resets the protocol to a
 // clean slate.
 
+namespace {
+
+constexpr int kMigrationSkipMissingTag   = 1;
+constexpr int kMigrationSkipKindMismatch = 4;
+
+} // namespace
+
 TEST_CASE("hot-swap substrate: prepare + publish + install advances generation") {
     auto *g = rt_graph_create(2, kFrames);
     REQUIRE(g != nullptr);
@@ -8547,6 +8554,121 @@ TEST_CASE("hot-swap substrate: payload replacement matches rebuilt graph") {
     rt_graph_cancel_swap(swapped, rt_graph_collect_retired_swap(swapped));
     rt_graph_destroy(swapped);
     rt_graph_destroy(expected);
+}
+
+TEST_CASE("hot-swap migration: tagged controls survive payload install") {
+    auto build = [](RTGraph *g, float value) {
+        add_const_node(g, 0, value, 0.0f);
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 0, "const", 5) == 1);
+        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+    };
+
+    auto *g = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    build(g, 0.75f);
+    build(builder, 0.25f);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+
+    CHECK(rt_graph_swap_migration_committed_count(swap) == 1);
+    CHECK(rt_graph_swap_migration_skipped_count(swap) == 1);
+    CHECK(rt_graph_swap_migration_skipped_reason(swap, 0)
+          == kMigrationSkipMissingTag);
+    CHECK(rt_graph_swap_migration_instance_copy_count(swap) == 0);
+
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+    rt_graph_process(g, kFrames);
+
+    for (float sample : read_bus_vec(g, 0, kFrames)) {
+        CHECK(sample == doctest::Approx(0.75f).epsilon(1e-6));
+    }
+
+    auto *retired = rt_graph_collect_retired_swap(g);
+    REQUIRE(retired == swap);
+    CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 1);
+
+    rt_graph_cancel_swap(g, retired);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap migration: tagged kind mismatch skips controls") {
+    auto *g = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    add_const_node(g, 0, 0.75f, 0.0f);
+    REQUIRE(rt_graph_template_set_node_migration_key(
+                g, 0, 0, "shape", 5) == 1);
+    rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_add_node(builder, 0, 3);    // Gain, same key as old Add
+    rt_graph_set_control(builder, 0, 0, 0.25f);
+    REQUIRE(rt_graph_template_set_node_migration_key(
+                builder, 0, 0, "shape", 5) == 1);
+    rt_graph_add_node(builder, 1, 2);    // Out(bus 0)
+    rt_graph_set_control(builder, 1, 0, 0.0f);
+    rt_graph_connect(builder, 0, 0, 1, 0);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+
+    CHECK(rt_graph_swap_migration_committed_count(swap) == 0);
+    CHECK(rt_graph_swap_migration_skipped_count(swap) == 2);
+    CHECK(rt_graph_swap_migration_skipped_reason(swap, 0)
+          == kMigrationSkipKindMismatch);
+    CHECK(rt_graph_swap_migration_skipped_reason(swap, 1)
+          == kMigrationSkipMissingTag);
+
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+    rt_graph_process(g, kFrames);
+
+    for (float sample : read_bus_vec(g, 0, kFrames)) {
+        CHECK(sample == doctest::Approx(0.0f).epsilon(1e-6));
+    }
+
+    auto *retired = rt_graph_collect_retired_swap(g);
+    REQUIRE(retired == swap);
+    CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 0);
+
+    rt_graph_cancel_swap(g, retired);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap migration: key setter rejects invalid and duplicate keys") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.75f, 0.0f);
+    rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+
+    CHECK(rt_graph_template_set_node_migration_key(
+              nullptr, 0, 0, "dup", 3) == 0);
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 0, nullptr, 3) == 0);
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 0, "", 0) == 0);
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 0, "0123456789abcdefX", 17) == 0);
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 0, "dup", 3) == 1);
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 1, "dup", 3) == 0);
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 99, "other", 5) == 0);
+
+    rt_graph_destroy(g);
 }
 
 TEST_CASE("hot-swap substrate: null-arg paths are silent no-ops") {

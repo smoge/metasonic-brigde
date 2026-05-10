@@ -45,7 +45,7 @@ import qualified Data.Set            as S
 import           Foreign.C.Types     (CInt)
 import           GHC.Generics        (Generic)
 
-import           MetaSonic.Bridge.IR
+import           MetaSonic.Bridge.Source (MigrationKey)
 import           MetaSonic.Types
 
 {- Note [Dense lowering]
@@ -98,6 +98,8 @@ A RuntimeNode carries:
                      a node earlier in the array (guaranteed by
                      topological ordering)
   rnControls       — default control values, sent to C++ at load time
+  rnMigrationKey   — optional Phase 5.2 state-migration identity,
+                     preserved from source through IR and FFI
   rnOutputUse      — Step B-Light analysis: whether this node's output
                      buffer is consumed only within its region
                      ('RegionLocal'), escapes to a different region
@@ -311,6 +313,10 @@ data RuntimeNode = RuntimeNode
     -- by topological ordering).
   , rnControls   :: ![Double]
     -- ^ Default control values, sent to C++ at load time.
+  , rnMigrationKey :: !(Maybe MigrationKey)
+    -- ^ Optional Phase 5.2 state-migration identity. The C++ runtime
+    -- stores it on NodeSpec and uses it to build hot-swap migration
+    -- plans; untagged nodes opt out.
   , rnOutputUse  :: !NodeOutputUse
     -- ^ How this node's output buffer is consumed across the
     -- region overlay (Step B-Light). Computed by

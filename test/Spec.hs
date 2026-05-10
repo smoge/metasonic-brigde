@@ -257,6 +257,55 @@ unitTests = testGroup "Unit tests"
                Right rt -> resolveNodeIndex rt (NodeID 999) @?= Nothing
       ]
 
+  , testGroup "migration keys"
+      [ testCase "tagged builder survives lowering and runtime compile" $
+          let sg = runSynth $ do
+                osc <- tagged "voice-osc" (sinOsc 440 0)
+                _   <- out 0 osc
+                pure ()
+          in case lowerGraph sg >>= compileRuntimeGraph of
+               Left err -> assertFailure err
+               Right rt -> do
+                 let taggedNodes =
+                       [ n
+                       | n <- rgNodes rt
+                       , rnMigrationKey n == Just (MigrationKey "voice-osc")
+                       ]
+                 case taggedNodes of
+                   [n] -> rnKind n @?= KSinOsc
+                   _   -> assertFailure $
+                            "expected exactly one tagged node, got "
+                         <> show (length taggedNodes)
+
+      , testCase "validateAndSort rejects duplicate migration keys" $
+          let sg = runSynth $ do
+                a <- tagged "dup" (sinOsc 440 0)
+                b <- tagged "dup" (sawOsc 220 0)
+                _ <- out 0 a
+                _ <- out 1 b
+                pure ()
+          in case validateAndSort sg of
+               Right _  ->
+                 assertFailure "expected duplicate migration key rejection"
+               Left err ->
+                 assertBool
+                   ("expected duplicate-key diagnostic, got: " <> err)
+                   ("Duplicate migration key" `isInfixOf` err)
+
+      , testCase "validateAndSort rejects overlong migration keys" $
+          let sg = runSynth $ do
+                osc <- tagged "0123456789abcdefX" (sinOsc 440 0)
+                _   <- out 0 osc
+                pure ()
+          in case validateAndSort sg of
+               Right _  ->
+                 assertFailure "expected overlong migration key rejection"
+               Left err ->
+                 assertBool
+                   ("expected too-long diagnostic, got: " <> err)
+                   ("too long" `isInfixOf` err)
+      ]
+
   , testGroup "cc builder: auto-records CCSpec + auto-inserts Smooth"
       [ testCase "cc inserts a Smooth node and records the binding" $
           let ((vol, target), _, specs) = runSynthCCs $ do
@@ -831,6 +880,7 @@ unitTests = testGroup "Unit tests"
                 [ ( NodeID 0
                   , NodeSpec (NodeID 0) "out"
                       (Out 0 (Audio (NodeID 99) (PortIndex 0)))
+                      Nothing
                   )
                 ]
           case compileTemplateGraph [("naughty", badGraph)] of
@@ -3850,6 +3900,7 @@ missingDepGraph = SynthGraph $ M.singleton (NodeID 0) NodeSpec
   { nsID   = NodeID 0
   , nsName = "out"
   , nsUgen = Out 0 (Audio (NodeID 99) (PortIndex 0))
+  , nsMigrationKey = Nothing
   }
 
 -- A hand-built graph with a 0 -> 1 -> 0 cycle.
@@ -3857,10 +3908,12 @@ cycleGraph :: SynthGraph
 cycleGraph = SynthGraph $ M.fromList
   [ ( NodeID 0
     , NodeSpec (NodeID 0) "gain-a"
-        (Gain (Audio (NodeID 1) (PortIndex 0)) (Param 0.5)) )
+        (Gain (Audio (NodeID 1) (PortIndex 0)) (Param 0.5))
+        Nothing )
   , ( NodeID 1
     , NodeSpec (NodeID 1) "gain-b"
-        (Gain (Audio (NodeID 0) (PortIndex 0)) (Param 0.5)) )
+        (Gain (Audio (NodeID 0) (PortIndex 0)) (Param 0.5))
+        Nothing )
   ]
 
 -- | The propagated 'irRate' of the first node of the given kind in

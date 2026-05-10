@@ -91,6 +91,10 @@ data NodeIR = NodeIR
     -- ^ Default control values, sent to C++ at graph load
     -- time. Serve as fallbacks when no audio-rate input
     -- is connected.
+  , irMigrationKey :: !(Maybe MigrationKey)
+    -- ^ Optional Phase 5.2 state-migration identity. Preserved
+    -- verbatim through dense lowering and shipped to C++ before
+    -- any hot-swap prepare step can build a migration plan.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -369,6 +373,7 @@ lowerNode nodeMap nid =
             , irEffects  = inferEff ugen
             , irInputs   = lowerInputs ugen
             , irControls = extractControls ugen
+            , irMigrationKey = nsMigrationKey spec
             }
 
 -- | Lower UGen connections to IR InputConns.

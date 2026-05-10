@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
@@ -651,6 +652,34 @@ using NodeState =
                  DelayState, SmoothState, PulseOscState,
                  HPFState, BPFState, NotchState>;
 
+constexpr int kMigrationKeyMaxBytes = 16;
+
+struct MigrationKey {
+  std::array<char, kMigrationKeyMaxBytes> bytes{};
+  int length = 0;
+
+  [[nodiscard]] bool present() const noexcept {
+    return length > 0;
+  }
+};
+
+[[nodiscard]] static bool
+migration_key_equals(const MigrationKey &a, const MigrationKey &b) noexcept {
+  if (a.length != b.length) return false;
+  if (a.length <= 0) return false;
+  return std::memcmp(a.bytes.data(), b.bytes.data(),
+                     static_cast<std::size_t>(a.length)) == 0;
+}
+
+[[nodiscard]] static bool
+migration_key_equals_raw(
+    const MigrationKey &a, const char *key, int key_len
+) noexcept {
+  if (!key || key_len <= 0 || a.length != key_len) return false;
+  return std::memcmp(a.bytes.data(), key,
+                     static_cast<std::size_t>(key_len)) == 0;
+}
+
 /* Note [Spec/state split: NodeSpec vs NodeInstanceState]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Each node's *spec* (immutable per template) is separated from its
@@ -696,6 +725,7 @@ struct NodeSpec {
   NodeKind kind = NodeKind::Out;
   std::vector<double> default_controls;
   std::vector<InputRef> input_refs;
+  MigrationKey migration_key{};
 
   // Step C: per-input fused override. Parallel-sized to input_refs
   // whenever populated. An empty optional means "use the regular
@@ -1128,6 +1158,7 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
   // node's still-live slot index.
   spec.fused_inputs.clear();
   spec.elided = false;
+  spec.migration_key = {};
 
   switch (kind) {
   case NodeKind::SinOsc:
@@ -2070,6 +2101,27 @@ struct RTGraphState {
   std::vector<GlobalScheduleBand> global_schedule_bands;
 };
 
+enum class MigrationSkipReason : int {
+  MissingTag = 1,
+  KeyNotFound = 2,
+  DuplicateKey = 3,
+  KindMismatch = 4,
+  ArityMismatch = 5,
+  StateUnsupported = 6,
+};
+
+struct MigrationCopy {
+  int template_id = -1;
+  int old_node_index = -1;
+  int new_node_index = -1;
+};
+
+struct MigrationSkip {
+  MigrationSkipReason reason = MigrationSkipReason::MissingTag;
+  int template_id = -1;
+  int node_index = -1;
+};
+
 // Phase 5.1.B: prepared next-world payload. `state` is installed on
 // the audio thread; the previous active state is moved into
 // `retired_state` and freed when the producer disposes the collected
@@ -2077,6 +2129,14 @@ struct RTGraphState {
 struct RTGraphSwap {
   std::unique_ptr<RTGraphState> state;
   std::unique_ptr<RTGraphState> retired_state;
+
+  // Phase 5.2.A: off-audio migration plan. The audio thread consumes
+  // `control_copies` during install, copying only per-instance control
+  // vectors for slot-index-matched instances. Skip reasons are
+  // observational; the audio thread never branches on them.
+  std::vector<MigrationCopy> control_copies;
+  std::vector<MigrationSkip> migration_skips;
+  int migration_instance_copy_count = 0;
 };
 
 struct RTGraph {
@@ -2201,6 +2261,138 @@ namespace {
 [[nodiscard]] static const RTGraphState &world(const RTGraph &g) noexcept {
   assert(g.active != nullptr);
   return *g.active;
+}
+
+[[nodiscard]] static bool slot_is_migration_live(SlotState s) noexcept {
+  return s == SlotState::Active || s == SlotState::Releasing;
+}
+
+[[nodiscard]] static int find_node_by_migration_key(
+    const MetaDef &def, const MigrationKey &key
+) noexcept {
+  if (!key.present()) return -1;
+  for (std::size_t i = 0; i < def.nodes.size(); ++i) {
+    if (migration_key_equals(def.nodes[i].migration_key, key)) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+static void record_migration_skip(
+    RTGraphSwap &swap,
+    MigrationSkipReason reason,
+    int template_id,
+    int node_index
+) {
+  swap.migration_skips.push_back(MigrationSkip{reason, template_id, node_index});
+}
+
+static void build_control_migration_plan(
+    const RTGraphState &old_state,
+    RTGraphSwap &swap
+) {
+  swap.control_copies.clear();
+  swap.migration_skips.clear();
+  swap.migration_instance_copy_count = 0;
+  if (!swap.state) return;
+
+  const RTGraphState &new_state = *swap.state;
+  for (std::size_t tid = 0; tid < new_state.defs.size(); ++tid) {
+    const MetaDef &new_def = new_state.defs[tid];
+    const MetaDef *old_def =
+        tid < old_state.defs.size() ? &old_state.defs[tid] : nullptr;
+
+    for (std::size_t ni = 0; ni < new_def.nodes.size(); ++ni) {
+      const NodeSpec &new_spec = new_def.nodes[ni];
+      const int template_id = static_cast<int>(tid);
+      const int node_index = static_cast<int>(ni);
+
+      if (!new_spec.migration_key.present()) {
+        record_migration_skip(
+            swap, MigrationSkipReason::MissingTag, template_id, node_index);
+        continue;
+      }
+
+      if (!old_def) {
+        record_migration_skip(
+            swap, MigrationSkipReason::KeyNotFound, template_id, node_index);
+        continue;
+      }
+
+      const int old_node_index =
+          find_node_by_migration_key(*old_def, new_spec.migration_key);
+      if (old_node_index < 0) {
+        record_migration_skip(
+            swap, MigrationSkipReason::KeyNotFound, template_id, node_index);
+        continue;
+      }
+
+      const NodeSpec &old_spec =
+          old_def->nodes[static_cast<std::size_t>(old_node_index)];
+      if (old_spec.kind != new_spec.kind) {
+        record_migration_skip(
+            swap, MigrationSkipReason::KindMismatch, template_id, node_index);
+        continue;
+      }
+      if (old_spec.default_controls.size() != new_spec.default_controls.size()) {
+        record_migration_skip(
+            swap, MigrationSkipReason::ArityMismatch, template_id, node_index);
+        continue;
+      }
+
+      swap.control_copies.push_back(
+          MigrationCopy{template_id, old_node_index, node_index});
+    }
+  }
+}
+
+static int apply_control_migration(
+    const RTGraphState &old_state,
+    RTGraphState &new_state,
+    const std::vector<MigrationCopy> &copies
+) noexcept {
+  int copied_vectors = 0;
+  const std::size_t instance_count =
+      std::min(old_state.instances.size(), new_state.instances.size());
+
+  for (std::size_t slot = 0; slot < instance_count; ++slot) {
+    const GraphInstance &old_inst = old_state.instances[slot];
+    GraphInstance &new_inst = new_state.instances[slot];
+
+    const SlotState old_slot_state = old_inst.state.load();
+    const SlotState new_slot_state = new_inst.state.load();
+    if (!slot_is_migration_live(old_slot_state)
+        || !slot_is_migration_live(new_slot_state)) {
+      continue;
+    }
+    if (old_inst.template_id != new_inst.template_id) {
+      continue;
+    }
+
+    for (const MigrationCopy &copy : copies) {
+      if (copy.template_id != old_inst.template_id) continue;
+
+      const std::size_t old_idx =
+          static_cast<std::size_t>(copy.old_node_index);
+      const std::size_t new_idx =
+          static_cast<std::size_t>(copy.new_node_index);
+      if (old_idx >= old_inst.nodes.size() || new_idx >= new_inst.nodes.size()) {
+        continue;
+      }
+
+      const auto &old_controls = old_inst.nodes[old_idx].controls;
+      auto &new_controls = new_inst.nodes[new_idx].controls;
+      if (old_controls.size() != new_controls.size()) {
+        continue;
+      }
+
+      std::copy(old_controls.begin(), old_controls.end(), new_controls.begin());
+      ++copied_vectors;
+    }
+  }
+
+  return copied_vectors;
 }
 
 // Lookup a template's MetaDef by id. Returns nullptr for negative /
@@ -6179,6 +6371,10 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // holds swap_in_flight true until collection, so an unreaped retired
   // payload cannot be overwritten by a second install.
   if (pending_install) {
+    pending_install->migration_instance_copy_count =
+        apply_control_migration(
+            *g.active, *pending_install->state,
+            pending_install->control_copies);
     pending_install->retired_state = std::move(g.active);
     g.active = std::move(pending_install->state);
     g.retired_swap.store(pending_install, std::memory_order_release);
@@ -7168,6 +7364,15 @@ RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
                                               RTGraph *source) {
   if (!target || !source || target == source) return nullptr;
   if (target->max_frames != source->max_frames) return nullptr;
+  if (target->pending_swap.load(std::memory_order_acquire) != nullptr) {
+    return nullptr;
+  }
+  if (target->retired_swap.load(std::memory_order_acquire) != nullptr) {
+    return nullptr;
+  }
+  if (target->swap_in_flight.load(std::memory_order_acquire)) {
+    return nullptr;
+  }
   if (source->pending_swap.load(std::memory_order_acquire) != nullptr) {
     return nullptr;
   }
@@ -7180,6 +7385,7 @@ RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
 
   auto *swap = new RTGraphSwap{};
   swap->state = std::move(source->active);
+  build_control_migration_plan(world(*target), *swap);
   reset_to_default_state(*source);
   return swap;
 }
@@ -7268,6 +7474,31 @@ int rt_graph_test_retired_swap_control_value(
   return 1;
 }
 
+int rt_graph_swap_migration_committed_count(const RTGraphSwap *swap) {
+  if (!swap) return 0;
+  return static_cast<int>(swap->control_copies.size());
+}
+
+int rt_graph_swap_migration_skipped_count(const RTGraphSwap *swap) {
+  if (!swap) return 0;
+  return static_cast<int>(swap->migration_skips.size());
+}
+
+int rt_graph_swap_migration_instance_copy_count(const RTGraphSwap *swap) {
+  if (!swap) return 0;
+  return swap->migration_instance_copy_count;
+}
+
+int rt_graph_swap_migration_skipped_reason(
+    const RTGraphSwap *swap,
+    int skip_index
+) {
+  if (!swap || skip_index < 0) return -1;
+  const std::size_t idx = static_cast<std::size_t>(skip_index);
+  if (idx >= swap->migration_skips.size()) return -1;
+  return static_cast<int>(swap->migration_skips[idx].reason);
+}
+
 // Add or reconfigure one node at its dense runtime index in the named
 // template.
 //
@@ -7328,6 +7559,41 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
   // may need more rows. Other kinds don't change the bound but the
   // call is cheap (resize_for is a no-op when nothing grew).
   ensure_contribution_capacity(*g);
+}
+
+int rt_graph_template_set_node_migration_key(
+    RTGraph *g,
+    int template_id,
+    int node_index,
+    const char *key,
+    int key_len
+) {
+  if (!g || !key) return 0;
+  if (key_len <= 0 || key_len > kMigrationKeyMaxBytes) return 0;
+  for (int i = 0; i < key_len; ++i) {
+    if (key[i] == '\0') return 0;
+  }
+
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return 0;
+
+  const NodeIndex idx{node_index};
+  if (!valid(idx)) return 0;
+  const std::size_t node_idx = to_size(idx);
+  if (node_idx >= def->nodes.size()) return 0;
+
+  for (std::size_t i = 0; i < def->nodes.size(); ++i) {
+    if (i == node_idx) continue;
+    if (migration_key_equals_raw(def->nodes[i].migration_key, key, key_len)) {
+      return 0;
+    }
+  }
+
+  MigrationKey next{};
+  next.length = key_len;
+  std::memcpy(next.bytes.data(), key, static_cast<std::size_t>(key_len));
+  def->nodes[node_idx].migration_key = next;
+  return 1;
 }
 
 // Set one entry of a template's spec.default_controls. New instances

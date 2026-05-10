@@ -234,6 +234,7 @@ compileRuntimeGraph ir = do
         , rnKind          = kind
         , rnInputs        = inputs
         , rnControls      = irControls node
+        , rnMigrationKey  = irMigrationKey node
         , rnOutputUse     = classify ix kind
         , rnConsumerCount = consumerCount ix
         , rnElided        = False
