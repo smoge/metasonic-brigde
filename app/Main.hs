@@ -16,6 +16,7 @@ import           System.Exit                (die)
 import           MetaSonic.App.Demos
 import           MetaSonic.App.Survey       (printFusionSummary,
                                              runFusionSurvey)
+import           MetaSonic.App.SwapBench    (runSwapBench)
 import           MetaSonic.App.WorkerBench  (runWorkerBench)
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
@@ -45,6 +46,11 @@ data RunMode
     -- ^ Non-audio reporting mode (--worker-bench). Compiles demos
     -- plus the fixed corpus, loads them through the Haskell FFI path,
     -- and times legacy vs schedule-worker modes.
+  | SwapBench
+    -- ^ Non-audio reporting mode (--swap-bench). Phase 5.3.C1 micro-
+    -- benchmark of the Haskell hot-swap helper path against a fixed
+    -- corpus of rows (unchanged, tagged osc, tagged biquad, lifecycle-
+    -- only, fused, template). Targets are ignored.
   deriving (Eq, Show)
 
 data Options = Options
@@ -84,6 +90,8 @@ parseArgs = go defaultOptions
       go opts { optMode = FusionSurvey } xs
     go opts ("--worker-bench" : xs) =
       go opts { optMode = WorkerBench } xs
+    go opts ("--swap-bench" : xs) =
+      go opts { optMode = SwapBench } xs
     go opts (x : xs)
       | "--" `prefixOf` x = Left ("Unknown option: " <> x)
       | otherwise         = go opts { optTargets = optTargets opts <> [x] } xs
@@ -114,6 +122,7 @@ usage prog = unlines
   , "  " <> prog <> " --inspect-only [--fused] [DEMO ...]"
   , "  " <> prog <> " --fusion-survey [DEMO ...]"
   , "  " <> prog <> " --worker-bench [DEMO ...]"
+  , "  " <> prog <> " --swap-bench"
   , ""
   , "If no demo names are given, all demos are run."
   , ""
@@ -145,6 +154,13 @@ usage prog = unlines
   , "                   legacy direct executor against schedule-serial,"
   , "                   pool direct, and pool reduction modes. No audio,"
   , "                   no TUI."
+  , "  --swap-bench     Phase 5.3.C1 micro-benchmark of the Haskell"
+  , "                   hot-swap helper path. Walks a fixed corpus"
+  , "                   (unchanged, tagged-osc, tagged-biquad,"
+  , "                   lifecycle-only, fused, template) and prints one"
+  , "                   CSV row per case with publish/install timing"
+  , "                   and migration counters. No audio, no TUI; demo"
+  , "                   targets are ignored."
   , ""
   , "Availavle demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
@@ -191,20 +207,25 @@ main = do
       Right x ->
         pure x
 
-  demos <- either die pure (resolveTargets (optTargets opts))
-
-  let runDemos banner = do
+  let resolveSelectedDemos = either die pure (resolveTargets (optTargets opts))
+      runDemos banner = do
+        demos <- resolveSelectedDemos
         putStrLn banner
         forM_ demos (runDemo opts)
         putStrLn "Done."
 
   case optMode opts of
     FusionSurvey -> do
+      demos <- resolveSelectedDemos
       putStrLn "Surveying demos for §4.B / §4.C fusion coverage."
       runFusionSurvey demos
     WorkerBench -> do
+      demos <- resolveSelectedDemos
       putStrLn "Benchmarking Haskell-loaded schedule worker modes."
       runWorkerBench demos
+    SwapBench -> do
+      putStrLn "Benchmarking Haskell hot-swap helper path."
+      runSwapBench
     AudioOnly      -> runDemos "Running selected demos."
     InspectThenRun -> runDemos "Inspecting selected demos before audio."
     InspectOnly    -> runDemos "Inspecting selected demos without audio."
@@ -217,7 +238,9 @@ runDemo opts demo
   -- Guard the dispatch boundary explicitly so a future re-routing
   -- mistake fails loudly here, rather than silently running audio.
   -- The single guard covers all three body-specific runners.
-  | optMode opts == FusionSurvey || optMode opts == WorkerBench =
+  | optMode opts == FusionSurvey
+    || optMode opts == WorkerBench
+    || optMode opts == SwapBench =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -271,6 +294,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: FusionSurvey should be handled by main, never reach here"
     WorkerBench ->
       error "runSingleDemo: WorkerBench should be handled by main, never reach here"
+    SwapBench ->
+      error "runSingleDemo: SwapBench should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare

@@ -80,10 +80,8 @@ executable metasonic-bridge
   other-modules:
       MetaSonic.App.Demos
       MetaSonic.App.Survey
+      MetaSonic.App.SwapBench
       MetaSonic.App.WorkerBench
-      Paths_metasonic_bridge
-  autogen-modules:
-      Paths_metasonic_bridge
   hs-source-dirs:
       app
   ghc-options: -Wall -O2 -threaded

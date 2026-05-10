@@ -82,6 +82,11 @@ executables:
   metasonic-bridge:
     main: Main.hs
     source-dirs: app
+    other-modules:
+      - MetaSonic.App.Demos
+      - MetaSonic.App.Survey
+      - MetaSonic.App.SwapBench
+      - MetaSonic.App.WorkerBench
     ghc-options:
       - -O2
       - -threaded
