@@ -8312,6 +8312,7 @@ namespace {
 
 constexpr int kMigrationSkipMissingTag   = 1;
 constexpr int kMigrationSkipKindMismatch = 4;
+constexpr int kMigrationSkipStateUnsupported = 6;
 
 } // namespace
 
@@ -8594,6 +8595,236 @@ TEST_CASE("hot-swap migration: tagged controls survive payload install") {
     auto *retired = rt_graph_collect_retired_swap(g);
     REQUIRE(retired == swap);
     CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 1);
+    CHECK(rt_graph_swap_migration_state_copy_count(retired) == 0);
+
+    rt_graph_cancel_swap(g, retired);
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("hot-swap migration: oscillator state survives payload install") {
+    auto build = [](RTGraph *g, int osc_kind) {
+        rt_graph_add_node(g, 0, osc_kind);
+        rt_graph_set_control(g, 0, 0, 440.0f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        if (osc_kind == 15) {  // PulseOsc width
+            rt_graph_set_control(g, 0, 2, 0.25f);
+        }
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 0, "osc", 3) == 1);
+        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+    };
+
+    for (int osc_kind : {1, 5, 16, 15}) {  // Sin, Saw, Tri, Pulse
+        auto *swapped = rt_graph_create(4, kFrames);
+        auto *builder = rt_graph_create(4, kFrames);
+        auto *expected = rt_graph_create(4, kFrames);
+        REQUIRE(swapped != nullptr);
+        REQUIRE(builder != nullptr);
+        REQUIRE(expected != nullptr);
+
+        build(swapped, osc_kind);
+        build(builder, osc_kind);
+        build(expected, osc_kind);
+
+        rt_graph_process(swapped, kFrames);
+        rt_graph_process(expected, kFrames);
+
+        auto *swap = rt_graph_prepare_swap_from_graph(swapped, builder);
+        REQUIRE(swap != nullptr);
+        rt_graph_destroy(builder);
+        CHECK(rt_graph_swap_migration_committed_count(swap) == 1);
+        CHECK(rt_graph_swap_migration_skipped_count(swap) == 1);
+
+        REQUIRE(rt_graph_publish_swap(swapped, swap) == 1);
+        rt_graph_process(swapped, kFrames);
+        rt_graph_process(expected, kFrames);
+
+        check_exact_same(read_bus_vec(swapped, 0, kFrames),
+                         read_bus_vec(expected, 0, kFrames));
+
+        auto *retired = rt_graph_collect_retired_swap(swapped);
+        REQUIRE(retired == swap);
+        CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 1);
+        CHECK(rt_graph_swap_migration_state_copy_count(retired) == 1);
+
+        rt_graph_cancel_swap(swapped, retired);
+        rt_graph_destroy(swapped);
+        rt_graph_destroy(expected);
+    }
+}
+
+TEST_CASE("hot-swap migration: noise generator state survives payload install") {
+    auto build = [](RTGraph *g) {
+        rt_graph_add_node(g, 0, 6);          // NoiseGen
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 0, "noise", 5) == 1);
+        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+    };
+
+    auto *swapped = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    auto *expected = rt_graph_create(4, kFrames);
+    REQUIRE(swapped != nullptr);
+    REQUIRE(builder != nullptr);
+    REQUIRE(expected != nullptr);
+
+    build(swapped);
+    build(builder);
+    build(expected);
+
+    rt_graph_process(swapped, kFrames);
+    rt_graph_process(expected, kFrames);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(swapped, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+
+    REQUIRE(rt_graph_publish_swap(swapped, swap) == 1);
+    rt_graph_process(swapped, kFrames);
+    rt_graph_process(expected, kFrames);
+
+    check_exact_same(read_bus_vec(swapped, 0, kFrames),
+                     read_bus_vec(expected, 0, kFrames));
+
+    auto *retired = rt_graph_collect_retired_swap(swapped);
+    REQUIRE(retired == swap);
+    CHECK(rt_graph_swap_migration_state_copy_count(retired) == 1);
+
+    rt_graph_cancel_swap(swapped, retired);
+    rt_graph_destroy(swapped);
+    rt_graph_destroy(expected);
+}
+
+TEST_CASE("hot-swap migration: biquad filter state survives payload install") {
+    auto build = [](RTGraph *g, int filter_kind) {
+        add_const_node(g, 0, 1.0f, 0.0f);
+        rt_graph_add_node(g, 1, filter_kind);
+        rt_graph_set_control(g, 1, 0, 800.0f);
+        rt_graph_set_control(g, 1, 1, 0.707f);
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 1, "flt", 3) == 1);
+        rt_graph_add_node(g, 2, 2);          // Out(bus 0)
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+    };
+
+    for (int filter_kind : {7, 17, 18, 19}) {  // LPF, HPF, BPF, Notch
+        auto *swapped = rt_graph_create(4, kFrames);
+        auto *builder = rt_graph_create(4, kFrames);
+        auto *expected = rt_graph_create(4, kFrames);
+        REQUIRE(swapped != nullptr);
+        REQUIRE(builder != nullptr);
+        REQUIRE(expected != nullptr);
+
+        build(swapped, filter_kind);
+        build(builder, filter_kind);
+        build(expected, filter_kind);
+
+        rt_graph_process(swapped, kFrames);
+        rt_graph_process(expected, kFrames);
+
+        auto *swap = rt_graph_prepare_swap_from_graph(swapped, builder);
+        REQUIRE(swap != nullptr);
+        rt_graph_destroy(builder);
+        CHECK(rt_graph_swap_migration_committed_count(swap) == 1);
+        CHECK(rt_graph_swap_migration_skipped_count(swap) == 2);
+
+        REQUIRE(rt_graph_publish_swap(swapped, swap) == 1);
+        rt_graph_process(swapped, kFrames);
+        rt_graph_process(expected, kFrames);
+
+        check_exact_same(read_bus_vec(swapped, 0, kFrames),
+                         read_bus_vec(expected, 0, kFrames));
+
+        auto *retired = rt_graph_collect_retired_swap(swapped);
+        REQUIRE(retired == swap);
+        CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 1);
+        CHECK(rt_graph_swap_migration_state_copy_count(retired) == 1);
+
+        rt_graph_cancel_swap(swapped, retired);
+        rt_graph_destroy(swapped);
+        rt_graph_destroy(expected);
+    }
+}
+
+TEST_CASE("hot-swap migration: unsupported lazy state skips without control copy") {
+    auto build_unsupported_plan_only = [](RTGraph *g, int node_kind) {
+        rt_graph_add_node(g, 0, node_kind);
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 0, "lazy", 4) == 1);
+    };
+
+    for (int unsupported_kind : {13, 14}) {  // Delay, Smooth
+        auto *old_world = rt_graph_create(4, kFrames);
+        auto *builder_world = rt_graph_create(4, kFrames);
+        REQUIRE(old_world != nullptr);
+        REQUIRE(builder_world != nullptr);
+
+        build_unsupported_plan_only(old_world, unsupported_kind);
+        build_unsupported_plan_only(builder_world, unsupported_kind);
+
+        auto *swap = rt_graph_prepare_swap_from_graph(old_world, builder_world);
+        REQUIRE(swap != nullptr);
+        rt_graph_destroy(builder_world);
+
+        CHECK(rt_graph_swap_migration_committed_count(swap) == 0);
+        REQUIRE(rt_graph_swap_migration_skipped_count(swap) == 1);
+        CHECK(rt_graph_swap_migration_skipped_reason(swap, 0)
+              == kMigrationSkipStateUnsupported);
+
+        rt_graph_cancel_swap(old_world, swap);
+        rt_graph_destroy(old_world);
+    }
+
+    auto build = [](RTGraph *g, double gate) {
+        rt_graph_add_node(g, 0, 9);          // Env
+        rt_graph_set_control(g, 0, 0, gate);
+        rt_graph_set_control(g, 0, 1, 0.001);
+        rt_graph_set_control(g, 0, 2, 0.001);
+        rt_graph_set_control(g, 0, 3, 1.0);
+        rt_graph_set_control(g, 0, 4, 0.001);
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 0, "env", 3) == 1);
+        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_set_control(g, 1, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+    };
+
+    auto *g = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    build(g, 1.0);
+    build(builder, 0.0);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+
+    CHECK(rt_graph_swap_migration_committed_count(swap) == 0);
+    REQUIRE(rt_graph_swap_migration_skipped_count(swap) == 2);
+    CHECK(rt_graph_swap_migration_skipped_reason(swap, 0)
+          == kMigrationSkipStateUnsupported);
+    CHECK(rt_graph_swap_migration_skipped_reason(swap, 1)
+          == kMigrationSkipMissingTag);
+
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+    rt_graph_process(g, kFrames);
+
+    for (float sample : read_bus_vec(g, 0, kFrames)) {
+        CHECK(sample == 0.0f);
+    }
+
+    auto *retired = rt_graph_collect_retired_swap(g);
+    REQUIRE(retired == swap);
+    CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 0);
+    CHECK(rt_graph_swap_migration_state_copy_count(retired) == 0);
 
     rt_graph_cancel_swap(g, retired);
     rt_graph_destroy(g);

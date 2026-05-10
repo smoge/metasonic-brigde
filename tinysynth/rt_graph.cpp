@@ -2114,6 +2114,7 @@ struct MigrationCopy {
   int template_id = -1;
   int old_node_index = -1;
   int new_node_index = -1;
+  NodeKind kind = NodeKind::Out;
 };
 
 struct MigrationSkip {
@@ -2130,13 +2131,15 @@ struct RTGraphSwap {
   std::unique_ptr<RTGraphState> state;
   std::unique_ptr<RTGraphState> retired_state;
 
-  // Phase 5.2.A: off-audio migration plan. The audio thread consumes
-  // `control_copies` during install, copying only per-instance control
-  // vectors for slot-index-matched instances. Skip reasons are
-  // observational; the audio thread never branches on them.
-  std::vector<MigrationCopy> control_copies;
+  // Phase 5.2.A/B: off-audio migration plan. The audio thread
+  // consumes `migration_copies` during install, copying per-instance
+  // control vectors and supported DSP state for slot-index-matched
+  // instances. Skip reasons are observational; the audio thread never
+  // branches on them.
+  std::vector<MigrationCopy> migration_copies;
   std::vector<MigrationSkip> migration_skips;
   int migration_instance_copy_count = 0;
+  int migration_state_copy_count = 0;
 };
 
 struct RTGraph {
@@ -2288,13 +2291,42 @@ static void record_migration_skip(
   swap.migration_skips.push_back(MigrationSkip{reason, template_id, node_index});
 }
 
-static void build_control_migration_plan(
+[[nodiscard]] static bool
+node_kind_supports_state_migration(NodeKind kind) noexcept {
+  switch (kind) {
+  case NodeKind::Env:
+  case NodeKind::Delay:
+  case NodeKind::Smooth:
+    return false;
+
+  case NodeKind::SinOsc:
+  case NodeKind::Out:
+  case NodeKind::Gain:
+  case NodeKind::SawOsc:
+  case NodeKind::NoiseGen:
+  case NodeKind::LPF:
+  case NodeKind::Add:
+  case NodeKind::BusOut:
+  case NodeKind::BusIn:
+  case NodeKind::BusInDelayed:
+  case NodeKind::PulseOsc:
+  case NodeKind::TriOsc:
+  case NodeKind::HPF:
+  case NodeKind::BPF:
+  case NodeKind::Notch:
+    return true;
+  }
+  return false;
+}
+
+static void build_migration_plan(
     const RTGraphState &old_state,
     RTGraphSwap &swap
 ) {
-  swap.control_copies.clear();
+  swap.migration_copies.clear();
   swap.migration_skips.clear();
   swap.migration_instance_copy_count = 0;
+  swap.migration_state_copy_count = 0;
   if (!swap.state) return;
 
   const RTGraphState &new_state = *swap.state;
@@ -2340,19 +2372,125 @@ static void build_control_migration_plan(
             swap, MigrationSkipReason::ArityMismatch, template_id, node_index);
         continue;
       }
+      if (!node_kind_supports_state_migration(new_spec.kind)) {
+        record_migration_skip(
+            swap, MigrationSkipReason::StateUnsupported, template_id, node_index);
+        continue;
+      }
 
-      swap.control_copies.push_back(
-          MigrationCopy{template_id, old_node_index, node_index});
+      swap.migration_copies.push_back(
+          MigrationCopy{template_id, old_node_index, node_index, new_spec.kind});
     }
   }
 }
 
-static int apply_control_migration(
+enum class StateMigrationResult {
+  Unsupported,
+  NoState,
+  Copied,
+};
+
+[[nodiscard]] static StateMigrationResult copy_supported_dsp_state(
+    NodeKind kind,
+    const NodeInstanceState &old_node,
+    NodeInstanceState &new_node
+) noexcept {
+  switch (kind) {
+  case NodeKind::SinOsc:
+  case NodeKind::SawOsc:
+  case NodeKind::TriOsc: {
+    const auto *src = std::get_if<OscState>(&old_node.state);
+    auto *dst = std::get_if<OscState>(&new_node.state);
+    if (!src || !dst) return StateMigrationResult::Unsupported;
+    dst->phase_iter = src->phase_iter;
+    return StateMigrationResult::Copied;
+  }
+
+  case NodeKind::PulseOsc: {
+    const auto *src = std::get_if<PulseOscState>(&old_node.state);
+    auto *dst = std::get_if<PulseOscState>(&new_node.state);
+    if (!src || !dst) return StateMigrationResult::Unsupported;
+    dst->phase_iter = src->phase_iter;
+    dst->osc = src->osc;
+    dst->last_width = src->last_width;
+    return StateMigrationResult::Copied;
+  }
+
+  case NodeKind::NoiseGen: {
+    const auto *src = std::get_if<NoiseGenState>(&old_node.state);
+    auto *dst = std::get_if<NoiseGenState>(&new_node.state);
+    if (!src || !dst) return StateMigrationResult::Unsupported;
+    dst->noise = src->noise;
+    return StateMigrationResult::Copied;
+  }
+
+  case NodeKind::LPF: {
+    const auto *src = std::get_if<LPFState>(&old_node.state);
+    auto *dst = std::get_if<LPFState>(&new_node.state);
+    if (!src || !dst) return StateMigrationResult::Unsupported;
+    dst->filter = src->filter;
+    dst->last_freq = src->last_freq;
+    dst->last_q = src->last_q;
+    return StateMigrationResult::Copied;
+  }
+
+  case NodeKind::HPF: {
+    const auto *src = std::get_if<HPFState>(&old_node.state);
+    auto *dst = std::get_if<HPFState>(&new_node.state);
+    if (!src || !dst) return StateMigrationResult::Unsupported;
+    dst->filter = src->filter;
+    dst->last_freq = src->last_freq;
+    dst->last_q = src->last_q;
+    return StateMigrationResult::Copied;
+  }
+
+  case NodeKind::BPF: {
+    const auto *src = std::get_if<BPFState>(&old_node.state);
+    auto *dst = std::get_if<BPFState>(&new_node.state);
+    if (!src || !dst) return StateMigrationResult::Unsupported;
+    dst->filter = src->filter;
+    dst->last_freq = src->last_freq;
+    dst->last_q = src->last_q;
+    return StateMigrationResult::Copied;
+  }
+
+  case NodeKind::Notch: {
+    const auto *src = std::get_if<NotchState>(&old_node.state);
+    auto *dst = std::get_if<NotchState>(&new_node.state);
+    if (!src || !dst) return StateMigrationResult::Unsupported;
+    dst->filter = src->filter;
+    dst->last_freq = src->last_freq;
+    dst->last_q = src->last_q;
+    return StateMigrationResult::Copied;
+  }
+
+  case NodeKind::Out:
+  case NodeKind::Gain:
+  case NodeKind::Add:
+  case NodeKind::BusOut:
+  case NodeKind::BusIn:
+  case NodeKind::BusInDelayed:
+    return StateMigrationResult::NoState;
+
+  case NodeKind::Env:
+  case NodeKind::Delay:
+  case NodeKind::Smooth:
+    return StateMigrationResult::Unsupported;
+  }
+  return StateMigrationResult::Unsupported;
+}
+
+struct MigrationApplyCounts {
+  int control_vector_copies = 0;
+  int state_copies = 0;
+};
+
+static MigrationApplyCounts apply_migration(
     const RTGraphState &old_state,
     RTGraphState &new_state,
     const std::vector<MigrationCopy> &copies
 ) noexcept {
-  int copied_vectors = 0;
+  MigrationApplyCounts counts;
   const std::size_t instance_count =
       std::min(old_state.instances.size(), new_state.instances.size());
 
@@ -2388,11 +2526,17 @@ static int apply_control_migration(
       }
 
       std::copy(old_controls.begin(), old_controls.end(), new_controls.begin());
-      ++copied_vectors;
+      ++counts.control_vector_copies;
+
+      if (copy_supported_dsp_state(copy.kind, old_inst.nodes[old_idx],
+                                   new_inst.nodes[new_idx])
+          == StateMigrationResult::Copied) {
+        ++counts.state_copies;
+      }
     }
   }
 
-  return copied_vectors;
+  return counts;
 }
 
 // Lookup a template's MetaDef by id. Returns nullptr for negative /
@@ -6371,10 +6515,14 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // holds swap_in_flight true until collection, so an unreaped retired
   // payload cannot be overwritten by a second install.
   if (pending_install) {
-    pending_install->migration_instance_copy_count =
-        apply_control_migration(
+    const MigrationApplyCounts migration_counts =
+        apply_migration(
             *g.active, *pending_install->state,
-            pending_install->control_copies);
+            pending_install->migration_copies);
+    pending_install->migration_instance_copy_count =
+        migration_counts.control_vector_copies;
+    pending_install->migration_state_copy_count =
+        migration_counts.state_copies;
     pending_install->retired_state = std::move(g.active);
     g.active = std::move(pending_install->state);
     g.retired_swap.store(pending_install, std::memory_order_release);
@@ -7385,7 +7533,7 @@ RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
 
   auto *swap = new RTGraphSwap{};
   swap->state = std::move(source->active);
-  build_control_migration_plan(world(*target), *swap);
+  build_migration_plan(world(*target), *swap);
   reset_to_default_state(*source);
   return swap;
 }
@@ -7476,7 +7624,7 @@ int rt_graph_test_retired_swap_control_value(
 
 int rt_graph_swap_migration_committed_count(const RTGraphSwap *swap) {
   if (!swap) return 0;
-  return static_cast<int>(swap->control_copies.size());
+  return static_cast<int>(swap->migration_copies.size());
 }
 
 int rt_graph_swap_migration_skipped_count(const RTGraphSwap *swap) {
@@ -7487,6 +7635,11 @@ int rt_graph_swap_migration_skipped_count(const RTGraphSwap *swap) {
 int rt_graph_swap_migration_instance_copy_count(const RTGraphSwap *swap) {
   if (!swap) return 0;
   return swap->migration_instance_copy_count;
+}
+
+int rt_graph_swap_migration_state_copy_count(const RTGraphSwap *swap) {
+  if (!swap) return 0;
+  return swap->migration_state_copy_count;
 }
 
 int rt_graph_swap_migration_skipped_reason(

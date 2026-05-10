@@ -1,7 +1,7 @@
 # Phase 5.2 — State Migration Design
 
 Date: 2026-05-10
-Status: 5.2.A implemented; 5.2.B/C pending.
+Status: 5.2.A/B implemented; 5.2.C pending.
 Scope: Phase 5.2.A–C (controls, DSP state, live-instance survival).
 Companion: [2026-05-10-phase-5-rcu-hot-swap-design.md](2026-05-10-phase-5-rcu-hot-swap-design.md) §7.
 
@@ -191,6 +191,12 @@ copy state only through a per-kind migrator that is proven
 allocation-free for the current runtime representation. There is no
 blanket `NodeState` variant assignment contract.
 
+5.2.B is implemented for the copy-safe set below. The install loop
+still copies controls for committed matches, then calls an explicit
+per-kind state copier. Unsupported stateful kinds are rejected during
+plan construction with `StateUnsupported`, so they are not
+half-migrated by copying controls while resetting DSP state.
+
 State is held in `std::variant<OscState, NoiseGenState, LPFState,
 EnvState, DelayState, SmoothState, PulseOscState, HPFState, BPFState,
 NotchState, std::monostate>`. Migration is per-alternative because
@@ -352,7 +358,7 @@ returning false from a per-kind capability function.
   - Tests: held-control survives swap (counter-confirmed via match
     count); untagged node defaults; tag clash rejected at compile
     time; arity mismatch surfaces as skip.
-- **5.2.B — DSP state migration.**
+- **5.2.B — DSP state migration.** Done for the copy-safe v1 set.
   - Per-kind migrators for copy-safe state only: oscillator phase,
     pulse state, noise generator, and biquad filter memories.
   - Per-kind capability flag so adding a kind cannot accidentally
