@@ -26,6 +26,7 @@ module MetaSonic.Pattern.Corpus
   , arpeggioSendReturnTemplates
   , polyphonicStabTemplates
   , hotSwapEditTemplates
+  , hotSwapEditAfterTemplates
   , layeredEnsembleTemplates
     -- * Verification-gate reference range
   , corpusRange
@@ -205,6 +206,14 @@ polyphonicStabEvents =
 
 hotSwapEditTemplates :: [(String, SynthGraph)]
 hotSwapEditTemplates = [("drone", droneEditInitial)]
+
+-- | Swap-target template list. The 'PEHotSwap' event in
+-- 'hotSwapEditEvents' carries the compiled form of this list as its
+-- payload. Exposed separately so the §6.A.3 corpus survey can scan
+-- the post-swap shape too — without this, future drift in
+-- 'droneEditAfter' would be invisible to the survey baseline.
+hotSwapEditAfterTemplates :: [(String, SynthGraph)]
+hotSwapEditAfterTemplates = [("drone", droneEditAfter)]
 
 hotSwapEdit :: Pattern
 hotSwapEdit = Pattern

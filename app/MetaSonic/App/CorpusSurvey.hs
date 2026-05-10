@@ -20,20 +20,76 @@ module MetaSonic.App.CorpusSurvey
 
 import           Data.List                 (intercalate)
 import qualified Data.Map.Strict           as M
+import           System.Exit               (die)
 
 import           MetaSonic.App.Survey      (CorpusGraphSummary (..),
                                              renderShape,
                                              shapeHasKernel,
                                              surveyCorpusGraph)
 import           MetaSonic.Bridge.Compile  (RegionKernel)
+import           MetaSonic.Bridge.Source   (SynthGraph)
 import qualified MetaSonic.Pattern.Corpus  as Corpus
 
 ------------------------------------------------------------
 -- Corpus catalog
 ------------------------------------------------------------
 
--- | A flat (row, template, summary) record used as the iteration
--- unit through the survey output sections.
+-- | One corpus row: an initial template list plus any swap-target
+-- template lists referenced by 'PEHotSwap' events in the row's
+-- event stream.
+--
+-- 'cceSwapTargets' is the list of @(SwapLabel, templateList)@
+-- pairs the row's events install via 'PEHotSwap'. Including swap
+-- targets in the survey means future drift in a swap payload's
+-- shape shows up here, not silently in the next bug report.
+data CorpusCatalogEntry = CorpusCatalogEntry
+  { cceRow         :: !String
+  , cceInitial     :: ![(String, SynthGraph)]
+  , cceSwapTargets :: ![(String, [(String, SynthGraph)])]
+  }
+
+corpusCatalog :: [CorpusCatalogEntry]
+corpusCatalog =
+  [ CorpusCatalogEntry "drone-with-vibrato"
+      Corpus.droneVibratoTemplates       []
+  , CorpusCatalogEntry "arpeggio-send-return"
+      Corpus.arpeggioSendReturnTemplates []
+  , CorpusCatalogEntry "polyphonic-stab"
+      Corpus.polyphonicStabTemplates     []
+  , CorpusCatalogEntry "hot-swap-edit"
+      Corpus.hotSwapEditTemplates
+      [("edit-cutoff", Corpus.hotSwapEditAfterTemplates)]
+  , CorpusCatalogEntry "layered-ensemble"
+      Corpus.layeredEnsembleTemplates    []
+  ]
+
+-- | A single survey iteration unit. The 'fpVariant' field labels
+-- initial templates ('Nothing') and swap-target templates ('Just
+-- swapLabel') distinctly so the report does not collapse them.
+data FlatPick = FlatPick
+  { fpRow      :: !String
+  , fpTemplate :: !String
+  , fpVariant  :: !(Maybe String)
+  , fpGraph    :: !SynthGraph
+  }
+
+flattenCatalog :: CorpusCatalogEntry -> [FlatPick]
+flattenCatalog e =
+     [ FlatPick (cceRow e) tn Nothing g
+     | (tn, g) <- cceInitial e
+     ]
+  ++ [ FlatPick (cceRow e) tn (Just swapLabel) g
+     | (swapLabel, templates) <- cceSwapTargets e
+     , (tn, g) <- templates
+     ]
+
+displayTemplate :: FlatPick -> String
+displayTemplate p = case fpVariant p of
+  Nothing  -> fpTemplate p
+  Just lbl -> fpTemplate p <> " (swap:" <> lbl <> ")"
+
+-- | A flat (row, template-display, summary) record used as the
+-- iteration unit through the print sections.
 data FlatRow = FlatRow
   { frRow      :: !String
   , frTemplate :: !String
@@ -46,16 +102,12 @@ data FlatRow = FlatRow
 
 runCorpusSurvey :: IO ()
 runCorpusSurvey = do
-  let allResults =
-        [ (rowName, tn, surveyCorpusGraph rowName (Just tn) g)
-        | (rowName, templates) <-
-            [ ("drone-with-vibrato",   Corpus.droneVibratoTemplates)
-            , ("arpeggio-send-return", Corpus.arpeggioSendReturnTemplates)
-            , ("polyphonic-stab",      Corpus.polyphonicStabTemplates)
-            , ("hot-swap-edit",        Corpus.hotSwapEditTemplates)
-            , ("layered-ensemble",     Corpus.layeredEnsembleTemplates)
-            ]
-        , (tn, g) <- templates
+  let picks      = concatMap flattenCatalog corpusCatalog
+      allResults =
+        [ ( fpRow p, displayTemplate p
+          , surveyCorpusGraph (fpRow p) (Just (displayTemplate p)) (fpGraph p)
+          )
+        | p <- picks
         ]
       flatRows =
         [ FlatRow rn tn s | (rn, tn, Right s) <- allResults ]
@@ -67,13 +119,6 @@ runCorpusSurvey = do
   putStrLn "Phase 6.A.3 — Pattern corpus layer-(b) survey"
   putStrLn ""
 
-  case errs of
-    [] -> pure ()
-    _  -> do
-      putStrLn "─── Compile failures ───"
-      mapM_ (putStrLn . ("  " <>)) errs
-      putStrLn ""
-
   printKernelCoverage flatRows
   putStrLn ""
   printKernelTotals flatRows
@@ -82,7 +127,18 @@ runCorpusSurvey = do
   putStrLn ""
   printOpportunities flatRows
   putStrLn ""
-  putStrLn "Done."
+
+  -- Mirror '--fusion-survey's precedent: print successful sections
+  -- first, then surface failures, then exit non-zero so a partial
+  -- baseline does not look valid to scripts / CI.
+  case errs of
+    [] -> putStrLn "Done."
+    _  -> do
+      putStrLn "─── Compile failures ───"
+      mapM_ (putStrLn . ("  " <>)) errs
+      putStrLn ""
+      die $ "Done with " <> show (length errs)
+          <> " compile failure(s); the report above excludes them."
 
 ------------------------------------------------------------
 -- Per-(row, template) §4.B kernel coverage table

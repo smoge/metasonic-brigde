@@ -14,24 +14,35 @@ the pattern corpus is run through the §4 survey machinery.
 stack exec -- metasonic-bridge --corpus-survey
 ```
 
-No audio, no TUI. Compiles the five corpus rows through
-`compileRuntimeGraph` and `compileRuntimeGraphFused`, then prints the
-sections below.
+No audio, no TUI. Compiles each corpus row's initial template set
+plus any `PEHotSwap` payload templates through
+`compileRuntimeGraph` and `compileRuntimeGraphFused`, then prints
+the sections below. Exits non-zero on any compile failure so a
+partial baseline does not look valid to scripts or CI.
 
 ## Baseline run (2026-05-10)
 
 ### §4.B kernel coverage per (row, template)
 
-| Row                  | Template | Nodes | Regs | §4.B-regs | Kernels               |
-|----------------------|----------|------:|-----:|----------:|-----------------------|
-| drone-with-vibrato   | drone    | 7     | 1    | 0         | —                     |
-| arpeggio-send-return | voice    | 4     | 1    | 0         | —                     |
-| arpeggio-send-return | fx       | 4     | 1    | 1         | `RBusInLpfGainOut`×1  |
-| polyphonic-stab      | stab     | 5     | 1    | 0         | —                     |
-| hot-swap-edit        | drone    | 3     | 1    | 0         | —                     |
-| layered-ensemble     | bass     | 5     | 1    | 0         | —                     |
-| layered-ensemble     | pad      | 6     | 1    | 0         | —                     |
-| layered-ensemble     | fx       | 4     | 1    | 1         | `RBusInLpfGainOut`×1  |
+| Row                  | Template                  | Nodes | Regs | §4.B-regs | Kernels               |
+|----------------------|---------------------------|------:|-----:|----------:|-----------------------|
+| drone-with-vibrato   | drone                     | 7     | 1    | 0         | —                     |
+| arpeggio-send-return | voice                     | 4     | 1    | 0         | —                     |
+| arpeggio-send-return | fx                        | 4     | 1    | 1         | `RBusInLpfGainOut`×1  |
+| polyphonic-stab      | stab                      | 5     | 1    | 0         | —                     |
+| hot-swap-edit        | drone                     | 3     | 1    | 0         | —                     |
+| hot-swap-edit        | drone (swap:edit-cutoff)  | 3     | 1    | 0         | —                     |
+| layered-ensemble     | bass                      | 5     | 1    | 0         | —                     |
+| layered-ensemble     | pad                       | 6     | 1    | 0         | —                     |
+| layered-ensemble     | fx                        | 4     | 1    | 1         | `RBusInLpfGainOut`×1  |
+
+The `drone (swap:edit-cutoff)` row is the `PEHotSwap` payload from
+`hotSwapEditEvents`. It is surveyed under a decorated template
+label so that future drift in the swap payload's structural shape
+surfaces here, not silently. Today the payload is structurally
+identical to the initial graph (only LPF cutoff / Q defaults
+differ), so the survey numbers match across the two `hot-swap-edit`
+rows.
 
 ### §4.B kernel totals across the corpus
 
