@@ -942,6 +942,15 @@ struct GlobalScheduleEntry {
   int step_index    = 0;
   int first_writer_slot = 0;
   int writer_slot_count = 0;
+  // Phase §4.E.2.C1d-b: contiguous slice of RTGraph::region_layer_work_items
+  // that expanded this entry. Populated by build_region_layer_work_items
+  // alongside the items themselves; the C1d-b serial executor uses the
+  // slice to dispatch process_region per item without re-walking
+  // schedule_step_regions. -1 / 0 when the entry produced no items
+  // (malformed / out-of-range step metadata) and the C1d-b path falls
+  // back to a no-op for that entry.
+  int first_work_item   = -1;
+  int work_item_count   = 0;
 };
 
 // Phase §4.E.2.C1d-a: descriptive work item for a single scheduled
@@ -2146,6 +2155,15 @@ struct RTGraph {
   int last_c1d_candidate_entry_count = 0;
   int last_c1d_candidate_item_count = 0;
   int last_c1d_serialized_sink_entry_count = 0;
+
+  // Phase §4.E.2.C1d-b test/debug counter for the most recent block.
+  // Incremented exactly once per scheduled region item dispatched
+  // through the C1d-b serial executor in process_schedule_band_serial.
+  // The legacy schedule executor (no global-schedule switch) and the
+  // C1c worker pool both bypass this path; tests assert non-zero only
+  // when global-schedule execution is enabled and a Free band lands on
+  // the audio thread.
+  int last_c1d_serial_region_item_execution_count = 0;
 };
 
 namespace {
@@ -5424,11 +5442,14 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
   g.last_c1d_candidate_entry_count = 0;
   g.last_c1d_candidate_item_count = 0;
   g.last_c1d_serialized_sink_entry_count = 0;
+  g.last_c1d_serial_region_item_execution_count = 0;
 
   const int entry_count = static_cast<int>(g.global_schedule.size());
   for (int entry_index = 0; entry_index < entry_count; ++entry_index) {
-    const auto &entry =
+    auto &entry =
         g.global_schedule[static_cast<std::size_t>(entry_index)];
+    entry.first_work_item = -1;
+    entry.work_item_count = 0;
     if (entry.template_id < 0 || entry.step_index < 0) continue;
     const std::size_t tid = static_cast<std::size_t>(entry.template_id);
     if (tid >= g.defs.size()) continue;
@@ -5444,6 +5465,9 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
         || item_count > def.schedule_step_regions.size() - first_item) {
       continue;
     }
+
+    const int items_begin =
+        static_cast<int>(g.region_layer_work_items.size());
 
     int next_writer_slot = entry.first_writer_slot;
     bool has_sink_writer = false;
@@ -5470,6 +5494,11 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
           });
       next_writer_slot += writer_count;
       ++emitted_items;
+    }
+
+    if (emitted_items > 0) {
+      entry.first_work_item = items_begin;
+      entry.work_item_count = emitted_items;
     }
 
     if (step.kind == ScheduleStepKind::FreeLayer && emitted_items > 1) {
@@ -5717,6 +5746,59 @@ static bool schedule_band_has_duplicate_instances(
   return false;
 }
 
+// Phase §4.E.2.C1d-b: dispatch one GlobalScheduleEntry by walking its
+// pre-built RegionLayerWorkItem slice instead of re-reading
+// schedule_step_regions. Behavior is byte-identical to
+// ScheduleEntryExecutionContext::process_entry +
+// process_schedule_step: build_region_layer_work_items applies the
+// same skip rules (region_ordinal < 0, region_pos out of range) and
+// preserves source order, so the regions visited and the sequence of
+// process_region calls match.
+//
+// The counter increment is the load-bearing piece for C1d-b's
+// "the new path actually ran" assertion. C1c worker dispatch and the
+// legacy schedule executor both bypass this function, so the counter
+// only ticks when global-schedule execution is enabled and a Free band
+// stays on the audio thread.
+static void process_entry_via_work_items(
+    RTGraph &g, const GlobalScheduleEntry &entry,
+    int nframes, BlockExecutionContext &block_ctx
+) noexcept {
+  if (entry.instance_slot < 0) return;
+  const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
+  if (slot >= g.instances.size()) return;
+
+  GraphInstance &inst = g.instances[slot];
+  const SlotState s = inst.state.load();
+  if (!is_audio_scheduled_state(s)) return;
+  if (inst.template_id != entry.template_id) return;
+
+  const MetaDef *def = template_at(g, entry.template_id);
+  if (!def) return;
+
+  if (entry.first_work_item < 0 || entry.work_item_count <= 0) return;
+  const std::size_t first =
+      static_cast<std::size_t>(entry.first_work_item);
+  const std::size_t count =
+      static_cast<std::size_t>(entry.work_item_count);
+  if (first > g.region_layer_work_items.size()
+      || count > g.region_layer_work_items.size() - first) {
+    return;
+  }
+
+  for (std::size_t i = 0; i < count; ++i) {
+    const RegionLayerWorkItem &item =
+        g.region_layer_work_items[first + i];
+    if (item.region_ordinal < 0) continue;
+    const std::size_t region_pos =
+        static_cast<std::size_t>(item.region_ordinal);
+    if (region_pos >= def->regions.size()) continue;
+    process_region(g, *def, inst, def->regions[region_pos],
+                   nframes, block_ctx);
+    ++g.last_c1d_serial_region_item_execution_count;
+  }
+}
+
 static void process_schedule_band_serial(
     RTGraph &g,
     const GlobalScheduleBand &band,
@@ -5728,6 +5810,22 @@ static void process_schedule_band_serial(
   if (!band_range_valid(g, band)) return;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
+
+  // C1d-b: Free bands consume the prebuilt RegionLayerWorkItem slice
+  // per entry. Barrier bands stay on the legacy per-entry path —
+  // they are always singletons and gain nothing from per-region
+  // dispatch, and the narrower change keeps the C1d-b path's surface
+  // strictly inside FreeLayer execution. The C1c worker pool path
+  // (process_parallel_band_worker) keeps using process_entry, so the
+  // C1d-b counter is never touched from a worker thread.
+  if (band.kind == GlobalScheduleBandKind::Free) {
+    for (std::size_t i = 0; i < count; ++i) {
+      process_entry_via_work_items(g, g.global_schedule[first + i],
+                                   worker_ctx.nframes,
+                                   worker_ctx.block_ctx);
+    }
+    return;
+  }
 
   for (std::size_t i = 0; i < count; ++i) {
     worker_ctx.process_entry(g.global_schedule[first + i]);
@@ -6232,6 +6330,7 @@ static void reset_to_default_state(RTGraph &g) {
   g.last_c1d_candidate_entry_count = 0;
   g.last_c1d_candidate_item_count = 0;
   g.last_c1d_serialized_sink_entry_count = 0;
+  g.last_c1d_serial_region_item_execution_count = 0;
 
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
@@ -6831,6 +6930,11 @@ int rt_graph_test_last_c1d_candidate_item_count(const RTGraph *g) {
 
 int rt_graph_test_last_c1d_serialized_sink_entry_count(const RTGraph *g) {
   return g ? g->last_c1d_serialized_sink_entry_count : 0;
+}
+
+int rt_graph_test_last_c1d_serial_region_item_execution_count(
+    const RTGraph *g) {
+  return g ? g->last_c1d_serial_region_item_execution_count : 0;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named

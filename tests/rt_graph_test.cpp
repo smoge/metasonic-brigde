@@ -7744,6 +7744,53 @@ TEST_CASE("region-layer work items: writer slot subranges follow region order") 
     rt_graph_destroy(g);
 }
 
+TEST_CASE("region-layer work items: mixed sink-free + sink-bearing FreeLayer is serialized") {
+    // C1d-b precondition: the has_sink_writer OR rule must flip a
+    // multi-region FreeLayer into the serialized-sink bucket as soon as
+    // any one item owns a sink writer, even if its sibling is sink-free.
+    // Pinning this before C1d-c starts using candidate_* counters keeps
+    // a sink-bearing region from sneaking into a future parallel
+    // dispatch group.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    // Region 0: sink-free Add (one node, no Out / BusOut writer).
+    add_const_node(g, 0, 0.25f, 0.0f);
+
+    // Region 1: const → Out, two contiguous nodes; the second node is
+    // the sink writer that should flip the entry to serialized.
+    add_const_node(g, 1, 0.5f, 0.0f);
+    rt_graph_add_node(g, 2, 2);  // Out(bus 0)
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/2);
+
+    const int items[] = {0, 1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, items);
+
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(g) == 1);
+
+    REQUIRE(rt_graph_test_region_layer_work_item_count(g) == 2);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_first_writer_slot(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_writer_slot_count(g, 0) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_region(g, 1) == 1);
+    CHECK(rt_graph_test_region_layer_work_item_first_writer_slot(g, 1) == 0);
+    CHECK(rt_graph_test_region_layer_work_item_writer_slot_count(g, 1) == 1);
+    CHECK(rt_graph_test_last_writer_slot_count(g) == 1);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("region-layer work items: capacity uses occupied count above lowered cap") {
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
@@ -7778,6 +7825,149 @@ TEST_CASE("region-layer work items: capacity uses occupied count above lowered c
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase §4.E.2.C1d-b: serial region-item executor
+// ----------------------------------------------------------------
+
+TEST_CASE("c1d-b serial executor: free band consumes region work items") {
+    // Two sink-free Add producers in one FreeLayer (regions 0 and 1)
+    // followed by an Add summing them and an Out writing bus 0
+    // (regions 2 and 3 in a Barrier). The C1d-b path runs the
+    // FreeLayer band; the legacy path renders without it.
+    //
+    // Output equivalence proves no regression. The counter proves the
+    // new RegionLayerWorkItem-driven dispatch was actually exercised:
+    // byte-equivalence alone could pass with the serial Free band path
+    // dead and a fallback running, which would defeat C1d-b's purpose.
+    auto build = [](RTGraph *g) {
+        add_const_node(g, 0, 0.25f, 0.0f); // const 0.25 (region 0, sink-free)
+        add_const_node(g, 1, 0.5f,  0.0f); // const 0.5  (region 1, sink-free)
+
+        rt_graph_add_node(g, 2, 8); // Add summing node 0 + node 1
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_set_control(g, 2, 1, 0.0f);
+        rt_graph_connect(g, 0, 0, 2, 0);
+        rt_graph_connect(g, 1, 0, 2, 1);
+
+        rt_graph_add_node(g, 3, 2); // Out(bus 0)
+        rt_graph_set_control(g, 3, 0, 0.0f);
+        rt_graph_connect(g, 2, 0, 3, 0);
+
+        rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                     /*first_node=*/0, /*node_count=*/1);
+        rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                     /*first_node=*/1, /*node_count=*/1);
+        rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                     /*first_node=*/2, /*node_count=*/1);
+        rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                     /*first_node=*/3, /*node_count=*/1);
+
+        const int free_items[]   = {0, 1};
+        const int sum_item[]     = {2};
+        const int sink_item[]    = {3};
+        rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                            /*item_count=*/2, free_items);
+        rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                            /*item_count=*/1, sum_item);
+        rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                            /*item_count=*/1, sink_item);
+    };
+
+    auto *legacy = rt_graph_create(8, kFrames);
+    auto *sched  = rt_graph_create(8, kFrames);
+    REQUIRE(legacy != nullptr);
+    REQUIRE(sched  != nullptr);
+    build(legacy);
+    build(sched);
+
+    // No worker pool configured, so should_parallelize_schedule_band
+    // returns false and the Free band stays on the audio thread —
+    // exactly the C1d-b serial path.
+    rt_graph_test_set_global_schedule_execution(sched, 1);
+
+    rt_graph_process(legacy, kFrames);
+    rt_graph_process(sched,  kFrames);
+
+    const auto legacy_bus0 = read_bus_vec(legacy, 0, kFrames);
+    const auto sched_bus0  = read_bus_vec(sched,  0, kFrames);
+    check_exact_same(legacy_bus0, sched_bus0);
+    for (auto v : sched_bus0) CHECK(v == doctest::Approx(0.75f).epsilon(1e-6));
+
+    // The Free band has 2 region work items; the two Barrier bands
+    // stay on the legacy per-entry path. Counter must reflect both
+    // free-band items.
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(sched)
+          == 2);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(legacy)
+          == 0);
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(sched) == 1);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(sched) == 2);
+    CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(sched) == 0);
+    CHECK(rt_graph_test_last_parallel_band_count(sched) == 0);
+
+    rt_graph_destroy(legacy);
+    rt_graph_destroy(sched);
+}
+
+TEST_CASE("c1d-b serial executor: counter stays zero without global-schedule switch") {
+    // With global_schedule_execution off, process_legacy_schedule runs
+    // and never touches the C1d-b path. The counter must stay 0 even
+    // though build_region_layer_work_items still populates the table.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.5f, 0.0f);
+    rt_graph_add_node(g, 1, 2); // Out(bus 0)
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    const int free_items[] = {0};
+    const int sink_item[]  = {1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, free_items);
+    rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                        /*item_count=*/1, sink_item);
+
+    rt_graph_process(g, kFrames);
+
+    REQUIRE(rt_graph_test_region_layer_work_item_count(g) == 2);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 0);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("c1d-b serial executor: counter resets between blocks") {
+    // The counter must not accumulate across blocks; otherwise tests
+    // that assert "actually ran this block" would silently pass on a
+    // dead path that ran in a previous block.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.25f, 0.0f);
+    add_const_node(g, 1, 0.5f,  0.0f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    const int items[] = {0, 1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, items);
+
+    rt_graph_test_set_global_schedule_execution(g, 1);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 2);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 2);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("region-layer work items: clear resets snapshot and counters") {
     auto *g = rt_graph_create(8, kFrames);
     REQUIRE(g != nullptr);
@@ -7801,6 +7991,7 @@ TEST_CASE("region-layer work items: clear resets snapshot and counters") {
     CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 0);
     CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 0);
     CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 0);
 
     rt_graph_destroy(g);
 }

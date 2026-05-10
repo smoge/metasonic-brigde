@@ -803,6 +803,16 @@ int rt_graph_test_last_c1d_candidate_entry_count(const RTGraph *g);
 int rt_graph_test_last_c1d_candidate_item_count(const RTGraph *g);
 int rt_graph_test_last_c1d_serialized_sink_entry_count(const RTGraph *g);
 
+// [T:read-only] Phase §4.E.2.C1d-b counter from the most recent process
+// block. Counts scheduled region items dispatched through the C1d-b
+// serial region-item executor in process_schedule_band_serial. The
+// legacy executor (no rt_graph_test_set_global_schedule_execution) and
+// the C1c worker pool both bypass this path; tests assert non-zero
+// only when the C1d-b path actually consumed RegionLayerWorkItem
+// entries. Returns 0 on null g.
+int rt_graph_test_last_c1d_serial_region_item_execution_count(
+    const RTGraph *g);
+
 // ----------------------------------------------------------------
 // Multi-instance support
 // ----------------------------------------------------------------
