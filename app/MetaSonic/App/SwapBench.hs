@@ -1,6 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 
--- | Phase 5.3.C1 — Haskell-driven micro-bench of the hot-swap helper
+-- | Phase 5.3.C — Haskell-driven micro-bench of the hot-swap helper
 -- path. No C++ is added by this slice; it exercises the existing
 -- 'hotSwap*' / 'collectRetiredSwapStats' surface against a small fixed
 -- corpus and prints a CSV-shaped row per case.
@@ -11,14 +11,20 @@
 -- expected to be 1 in the happy path; a higher value or a budget
 -- timeout is a regression signal.
 --
--- 5.3.C2 will layer repetition / statistics on top; this slice keeps
--- one prepare+publish per row so the reported counters and the audio
--- thread's install pass are unambiguously paired.
+-- 5.3.C2 layers per-row repetition on top: each row runs
+-- 'kSwapBenchRepeats' times in a fresh 'withRTGraph' handle so prior
+-- runs cannot leak state into a later run's lifecycle slot or pending
+-- swap. Timing is summarised as min / median / max in nanoseconds; the
+-- migration counters and 'blocks_to_install' are required to be stable
+-- across runs and to match each row's expected signature; the bench
+-- fails loudly if either property is lost, because counters are still
+-- the primary path-proof signal.
 module MetaSonic.App.SwapBench
   ( runSwapBench
   ) where
 
-import           Control.Monad              (replicateM_, (>=>))
+import           Control.Monad              (replicateM, replicateM_, (>=>))
+import           Data.List                  (sort)
 import           Data.Word                  (Word64)
 import           Foreign.C.Types            (CInt)
 import           Foreign.Ptr                (Ptr)
@@ -47,6 +53,13 @@ kSwapBenchInstallBudget = 64
 kSwapBenchCapacityPad :: Int
 kSwapBenchCapacityPad = 4
 
+-- Per-row repetition count. Odd so the median is the middle element
+-- without averaging. 11 is large enough to expose the cold-vs-warm
+-- spread (visible as min ≪ max) while keeping wall-clock overhead
+-- well under a second across the corpus.
+kSwapBenchRepeats :: Int
+kSwapBenchRepeats = 11
+
 data RowSetup
   = NoSetup
   | ReleaseDefaultThenWarm !Int
@@ -64,6 +77,8 @@ data SwapRow
       , srFused    :: !Bool
       , srCapacity :: !BuilderCapacity
       , srSetup    :: !RowSetup
+      , srExpectedBlocks :: !Int
+      , srExpectedStats  :: !SwapMigrationStats
       }
   | TemplateRow
       { srName     :: !String
@@ -73,17 +88,37 @@ data SwapRow
       , srFused    :: !Bool
       , srCapacity :: !BuilderCapacity
       , srSetup    :: !RowSetup
+      , srExpectedBlocks :: !Int
+      , srExpectedStats  :: !SwapMigrationStats
       }
 
-data SwapRowResult = SwapRowResult
-  { rrName             :: !String
-  , rrLoader           :: !String
-  , rrCapacity         :: !Int
-  , rrPublished        :: !Bool
-  , rrBlocksToInstall  :: !(Maybe Int)
-  , rrPreparePublishNs :: !Word64
-  , rrCollectNs        :: !Word64
-  , rrStats            :: !(Maybe SwapMigrationStats)
+-- One per-run measurement. Aggregated into 'SwapRowSummary' before
+-- printing. Successful runs have 'srPublished' True and an install
+-- block index plus migration stats.
+data SwapRowSample = SwapRowSample
+  { ssPublished        :: !Bool
+  , ssBlocksToInstall  :: !(Maybe Int)
+  , ssPreparePublishNs :: !Word64
+  , ssCollectNs        :: !Word64
+  , ssStats            :: !(Maybe SwapMigrationStats)
+  } deriving (Eq, Show)
+
+data TimingSummary = TimingSummary
+  { tsMin    :: !Word64
+  , tsMedian :: !Word64
+  , tsMax    :: !Word64
+  } deriving (Eq, Show)
+
+data SwapRowSummary = SwapRowSummary
+  { rsName              :: !String
+  , rsLoader            :: !String
+  , rsCapacity          :: !Int
+  , rsRuns              :: !Int
+  , rsPublished         :: !Bool
+  , rsBlocksMedian      :: !(Maybe Int)
+  , rsPreparePublishNs  :: !TimingSummary
+  , rsCollectNs         :: !TimingSummary
+  , rsStats             :: !(Maybe SwapMigrationStats)
   }
 
 runSwapBench :: IO ()
@@ -95,17 +130,33 @@ runSwapBench = do
 buildRows :: IO [SwapRow]
 buildRows = do
   unchanged    <- mkRuntimeRow "unchanged"      False untaggedSinOscGraph NoSetup
+                    (expectedStats 0 2 0 0 1)
   taggedOsc    <- mkRuntimeRow "tagged-osc"     False (taggedSinOscGraph "voice") NoSetup
+                    (expectedStats 1 1 1 1 1)
   taggedFlt    <- mkRuntimeRow "tagged-biquad"  False taggedLpfGraph NoSetup
+                    (expectedStats 1 2 1 1 1)
   -- envOutGraph + release puts the auto-spawned slot into Releasing
   -- so the lifecycle-copy path sees a non-Active slot to migrate.
   -- Releasing an Env-less graph is equivalent to instance_remove and
   -- would defeat the row.
   lifecycle    <- mkRuntimeRow "lifecycle-only" False envOutGraph
                     (ReleaseDefaultThenWarm 4)
+                    (expectedStats 0 2 0 0 1)
   fused        <- mkRuntimeRow "fused"          True  (taggedSinOscGraph "voice") NoSetup
+                    (expectedStats 1 1 1 1 1)
   template     <- mkTemplateRow "template"      False twoVoiceTemplates NoSetup
+                    (expectedStats 0 4 0 0 2)
   pure [unchanged, taggedOsc, taggedFlt, lifecycle, fused, template]
+
+expectedStats :: Int -> Int -> Int -> Int -> Int -> SwapMigrationStats
+expectedStats committed skipped instances states lifecycles =
+  SwapMigrationStats
+    { smsCommittedCount     = committed
+    , smsSkippedCount       = skipped
+    , smsInstanceCopyCount  = instances
+    , smsStateCopyCount     = states
+    , smsLifecycleCopyCount = lifecycles
+    }
 
 untaggedSinOscGraph :: SynthGraph
 untaggedSinOscGraph = runSynth $ do
@@ -147,8 +198,8 @@ twoVoiceTemplates =
   ]
 
 mkRuntimeRow
-  :: String -> Bool -> SynthGraph -> RowSetup -> IO SwapRow
-mkRuntimeRow name fused graph setup = do
+  :: String -> Bool -> SynthGraph -> RowSetup -> SwapMigrationStats -> IO SwapRow
+mkRuntimeRow name fused graph setup expected = do
   let loader = if fused then "loadRuntimeGraphFused" else "loadRuntimeGraph"
       compileFn = if fused then compileRuntimeGraphFused else compileRuntimeGraph
   rg <- compileOrFail (lowerGraph graph >>= compileFn)
@@ -161,11 +212,14 @@ mkRuntimeRow name fused graph setup = do
     , srFused    = fused
     , srCapacity = cap
     , srSetup    = setup
+    , srExpectedBlocks = 1
+    , srExpectedStats  = expected
     }
 
 mkTemplateRow
-  :: String -> Bool -> [(String, SynthGraph)] -> RowSetup -> IO SwapRow
-mkTemplateRow name fused templates setup = do
+  :: String -> Bool -> [(String, SynthGraph)] -> RowSetup -> SwapMigrationStats
+  -> IO SwapRow
+mkTemplateRow name fused templates setup expected = do
   let loader = if fused then "loadTemplateGraphFused" else "loadTemplateGraph"
       compileFn =
         if fused then compileTemplateGraphFused else compileTemplateGraph
@@ -181,13 +235,130 @@ mkTemplateRow name fused templates setup = do
     , srFused    = fused
     , srCapacity = cap
     , srSetup    = setup
+    , srExpectedBlocks = 1
+    , srExpectedStats  = expected
     }
 
 compileOrFail :: Either String a -> IO a
 compileOrFail = either (fail . ("swap-bench compile error: " <>)) pure
 
-runSwapRow :: SwapRow -> IO SwapRowResult
-runSwapRow row =
+-- Run the row 'kSwapBenchRepeats' times with a fresh handle each time,
+-- aggregate the timing samples, and assert that the path-proof signal
+-- (counters + blocks_to_install) is stable and matches the row's
+-- expected signature.
+runSwapRow :: SwapRow -> IO SwapRowSummary
+runSwapRow row = do
+  samples <- replicateM kSwapBenchRepeats (runSwapRowOnce row)
+  case samples of
+    [] -> fail "swap-bench: kSwapBenchRepeats must be > 0"
+    (first : _) -> do
+      assertSamplesStable row samples
+      assertSampleExpected row first
+      let preps    = map ssPreparePublishNs samples
+          collects = map ssCollectNs        samples
+      pure SwapRowSummary
+        { rsName             = srName row
+        , rsLoader           = srLoader row
+        , rsCapacity         = srCapacity row
+        , rsRuns             = length samples
+        , rsPublished        = ssPublished first
+        , rsBlocksMedian     = ssBlocksToInstall first
+        , rsPreparePublishNs = summarize preps
+        , rsCollectNs        = summarize collects
+        , rsStats            = ssStats first
+        }
+
+-- Bench correctness contract: for a fixed row, every run must publish,
+-- install on the same block index, and produce identical migration
+-- counters. If any of those drift across runs, that is a regression
+-- signal in either the helper path or the bench setup, and we abort
+-- rather than silently averaging it away.
+assertSamplesStable :: SwapRow -> [SwapRowSample] -> IO ()
+assertSamplesStable row samples = do
+  let publishes = map ssPublished samples
+      blocks    = map ssBlocksToInstall samples
+      stats     = map ssStats samples
+      ctx       = "row=" <> srName row
+  case allEqual publishes of
+    Nothing -> pure ()
+    Just (a, b) ->
+      fail $ "swap-bench: publish result drift in " <> ctx
+          <> ": saw " <> show a <> " then " <> show b
+  case allEqual blocks of
+    Nothing -> pure ()
+    Just (a, b) ->
+      fail $ "swap-bench: blocks_to_install drift in " <> ctx
+          <> ": saw " <> show a <> " then " <> show b
+  case allEqual stats of
+    Nothing -> pure ()
+    Just (a, b) ->
+      fail $ "swap-bench: migration counter drift in " <> ctx
+          <> ": saw " <> show a <> " then " <> show b
+
+-- Stability alone is not enough: a helper regression could produce the
+-- same wrong counter set on every repeat. Each fixed row therefore
+-- carries the expected install block and migration signature.
+assertSampleExpected :: SwapRow -> SwapRowSample -> IO ()
+assertSampleExpected row sample =
+  case (ssPublished sample, ssBlocksToInstall sample, ssStats sample) of
+    (True, Just blocks, Just stats)
+      | blocks == srExpectedBlocks row && stats == srExpectedStats row ->
+          pure ()
+      | otherwise ->
+          fail $ "swap-bench: unexpected path-proof signal in row="
+              <> srName row
+              <> ": expected blocks="
+              <> show (srExpectedBlocks row)
+              <> ", stats="
+              <> show (srExpectedStats row)
+              <> "; saw blocks="
+              <> show blocks
+              <> ", stats="
+              <> show stats
+    (published, blocks, stats) ->
+      fail $ "swap-bench: row=" <> srName row
+          <> " did not complete the expected publish/install/collect path: "
+          <> "published=" <> show published
+          <> ", blocks=" <> show blocks
+          <> ", stats=" <> show stats
+
+-- Returns 'Nothing' when every element is equal, or 'Just (a, b)' for
+-- the first pair that disagrees.
+allEqual :: Eq a => [a] -> Maybe (a, a)
+allEqual []         = Nothing
+allEqual (x : rest) = go rest
+  where
+    go []                   = Nothing
+    go (y : ys) | y == x    = go ys
+                | otherwise = Just (x, y)
+
+summarize :: [Word64] -> TimingSummary
+summarize [] = TimingSummary 0 0 0
+summarize xs =
+  let sorted = sort xs
+      n      = length sorted
+      lo     = firstOr 0 sorted
+      mid    = firstOr 0 (drop (n `div` 2) sorted)
+      hi     = lastOr 0 sorted
+  in TimingSummary
+       { tsMin    = lo
+       , tsMedian = mid
+       , tsMax    = hi
+       }
+
+firstOr :: a -> [a] -> a
+firstOr fallback []      = fallback
+firstOr _        (x : _) = x
+
+lastOr :: a -> [a] -> a
+lastOr fallback []       = fallback
+lastOr _        (x : xs) = go x xs
+  where
+    go !latest []       = latest
+    go _       (y : ys) = go y ys
+
+runSwapRowOnce :: SwapRow -> IO SwapRowSample
+runSwapRowOnce row =
   withRTGraph (srCapacity row) kSwapBenchFrames $ \handle -> do
     loadOldWorld handle row
     applySetup handle (srSetup row)
@@ -200,50 +371,34 @@ runSwapRow row =
     let preparePublishNs = t1 - t0
 
     if not published
-      then pure (failedPublishResult row preparePublishNs)
+      then pure SwapRowSample
+        { ssPublished        = False
+        , ssBlocksToInstall  = Nothing
+        , ssPreparePublishNs = preparePublishNs
+        , ssCollectNs        = 0
+        , ssStats            = Nothing
+        }
       else do
         blocks <- driveUntilInstall handle beforeGen
         case blocks of
-          Nothing ->
-            pure (timedOutInstallResult row preparePublishNs)
+          Nothing -> pure SwapRowSample
+            { ssPublished        = True
+            , ssBlocksToInstall  = Nothing
+            , ssPreparePublishNs = preparePublishNs
+            , ssCollectNs        = 0
+            , ssStats            = Nothing
+            }
           Just n -> do
             !t2 <- getMonotonicTimeNSec
             stats <- collectRetiredSwapStats handle
             !t3 <- getMonotonicTimeNSec
-            pure SwapRowResult
-              { rrName             = srName row
-              , rrLoader           = srLoader row
-              , rrCapacity         = srCapacity row
-              , rrPublished        = True
-              , rrBlocksToInstall  = Just n
-              , rrPreparePublishNs = preparePublishNs
-              , rrCollectNs        = t3 - t2
-              , rrStats            = stats
+            pure SwapRowSample
+              { ssPublished        = True
+              , ssBlocksToInstall  = Just n
+              , ssPreparePublishNs = preparePublishNs
+              , ssCollectNs        = t3 - t2
+              , ssStats            = stats
               }
-
-failedPublishResult :: SwapRow -> Word64 -> SwapRowResult
-failedPublishResult row preparePublishNs = SwapRowResult
-  { rrName             = srName row
-  , rrLoader           = srLoader row
-  , rrCapacity         = srCapacity row
-  , rrPublished        = False
-  , rrBlocksToInstall  = Nothing
-  , rrPreparePublishNs = preparePublishNs
-  , rrCollectNs        = 0
-  , rrStats            = Nothing
-  }
-
-timedOutInstallResult :: SwapRow -> Word64 -> SwapRowResult
-timedOutInstallResult row preparePublishNs = SwapRowResult
-  { rrName             = srName row
-  , rrLoader           = srLoader row
-  , rrCapacity         = srCapacity row
-  , rrPublished        = True
-  , rrBlocksToInstall  = Nothing
-  , rrPreparePublishNs = preparePublishNs
-  , rrCollectNs        = 0
-  , rrStats            = Nothing
-  }
 
 loadOldWorld :: Ptr RTGraph -> SwapRow -> IO ()
 loadOldWorld handle RuntimeRow{srOldRG = rg, srFused = fused}
@@ -295,32 +450,42 @@ printHeader nRows = do
   putStrLn $ "# frames=" <> show kSwapBenchFrames
           <> ", install_budget=" <> show kSwapBenchInstallBudget
           <> ", capacity_pad=" <> show kSwapBenchCapacityPad
+          <> ", repeats=" <> show kSwapBenchRepeats
           <> ", rows=" <> show nRows
-  putStrLn "# note: blocks_to_install is the number of process blocks \
-           \driven after publish until the install-generation counter \
-           \advances; under the offline driver one block is the \
-           \expected value."
-  putStrLn "# note: counter columns show '-' when no swap was \
-           \collected (publish rejected or install budget exceeded)."
-  putStrLn $ "# columns: row,loader,capacity,publish,blocks_to_install,"
-          <> "prepare_publish_ns,collect_ns,committed,skipped,"
-          <> "instance_copies,state_copies,lifecycle_copies"
+  putStrLn "# note: each row runs 'repeats' times in a fresh \
+           \withRTGraph handle so prior runs cannot leak lifecycle \
+           \state or pending swaps into the next run."
+  putStrLn "# note: counters and blocks_to_install must be stable \
+           \across runs and match the row's expected signature (the \
+           \path-proof signal); the bench aborts if either property \
+           \is lost. Timing is reported as min / median / max over \
+           \'repeats'."
+  putStrLn $ "# columns: row,loader,capacity,publish,runs,"
+          <> "blocks_to_install_median,prepare_publish_min_ns,"
+          <> "prepare_publish_median_ns,prepare_publish_max_ns,"
+          <> "collect_median_ns,committed,skipped,instance_copies,"
+          <> "state_copies,lifecycle_copies"
 
-printResult :: SwapRowResult -> IO ()
+printResult :: SwapRowSummary -> IO ()
 printResult r = do
-  let publishStr = if rrPublished r then "published" else "rejected"
-      blocksStr  = maybe "-" show (rrBlocksToInstall r)
-      countStr f = case rrStats r of
+  let publishStr = if rsPublished r then "published" else "rejected"
+      blocksStr  = maybe "-" show (rsBlocksMedian r)
+      countStr f = case rsStats r of
         Just s  -> show (f s)
         Nothing -> "-"
-  printf "%s,%s,%d,%s,%s,%d,%d,%s,%s,%s,%s,%s\n"
-    (rrName r)
-    (rrLoader r)
-    (rrCapacity r)
+      prep       = rsPreparePublishNs r
+      collectMed = tsMedian (rsCollectNs r)
+  printf "%s,%s,%d,%s,%d,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s\n"
+    (rsName r)
+    (rsLoader r)
+    (rsCapacity r)
     publishStr
+    (rsRuns r)
     blocksStr
-    (rrPreparePublishNs r)
-    (rrCollectNs r)
+    (tsMin prep)
+    (tsMedian prep)
+    (tsMax prep)
+    collectMed
     (countStr smsCommittedCount)
     (countStr smsSkippedCount)
     (countStr smsInstanceCopyCount)

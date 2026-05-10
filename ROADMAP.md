@@ -788,39 +788,31 @@ forcing callers to manually juggle every ownership edge:
 Edit a graph in the Haskell DSL, recompile, and hear the change without
 restarting audio.
 
-**5.3.C next: swap-bench instrumentation.** Measure before adding more
-synchronization surface:
-
-- Add an opt-in producer-side benchmark path that repeatedly prepares,
-  publishes, drives install, collects retired stats, and reports
-  prepare time, publish-to-install block count, collect time, and
-  Phase 5.2 migration counters.
-- Cover unchanged graph, tagged oscillator, tagged biquad,
-  lifecycle-only graph, fused graph, and template graph shapes.
-- Do not add `rt_graph_wait_swap_installed` in 5.3.C. A C-side blocking
-  wait primitive is deferred until swap-bench data or a real producer
-  shows polling is the wrong abstraction.
-
-**5.3.C1 done: Haskell swap-bench scaffold.**
+**5.3.C done: swap-bench instrumentation.** Measured before deciding
+whether to add more synchronization surface.
 
 - `--swap-bench` is wired beside `--fusion-survey` and
   `--worker-bench`, backed by `MetaSonic.App.SwapBench`.
-- The first corpus is fixed and deterministic: unchanged graph, tagged
-  oscillator, tagged biquad, lifecycle-only graph, fused graph, and
-  template graph.
-- Rows are grep-friendly CSV with row name, loader shape, builder
-  capacity, publish result, blocks-to-install, prepare/publish time,
-  collect time, and the Phase 5.2 migration counters.
-- The scaffold intentionally stays Haskell-only: it reuses the existing
-  hot-swap helpers and `c_rt_graph_process`, with no runtime ABI or C++
-  synchronization primitive added.
-- Gate passed with `just stack-test` and manual `--swap-bench`; every
-  row installs in one offline process block and reports the expected
-  counter-confirmed migration shape.
+- The corpus is fixed and deterministic: unchanged graph, tagged
+  oscillator, tagged biquad, lifecycle-only graph (Env + release →
+  Releasing slot), fused graph, and two-template ensemble.
+- 5.3.C2 adds 11 repetitions per row in fresh `withRTGraph` handles.
+  Timing is reported as min / median / max in nanoseconds; counters
+  and `blocks_to_install` must be identical across runs and match the
+  row's expected signature. The bench aborts on drift or stable wrong
+  counters, because counters remain the path-proof signal.
+- Observed envelope (medians, single-template ~5 µs prepare+publish,
+  two-template ~8.5 µs, collect 0.3–0.5 µs, install reliably one block
+  on the offline driver) is recorded in
+  [notes/2026-05-10-phase-5-rcu-hot-swap-design.md](notes/2026-05-10-phase-5-rcu-hot-swap-design.md)
+  §4.2.
 
-**5.3.C2 next:** add repetition/statistics around the same corpus and
-refresh the RCU design note with the observed envelope. Only then
-decide whether 5.3.D (`rt_graph_wait_swap_installed`) is still needed.
+**Decision: 5.3.D (`rt_graph_wait_swap_installed`) deferred.** The
+bench shows producer cost is microseconds and install is one process
+block under the offline driver. A C-side blocking wait could at most
+reduce producer notification granularity; it would not make the audio
+thread install before a block boundary. Revisit only if a real producer
+demonstrates that polling is the wrong abstraction.
 
 ---
 

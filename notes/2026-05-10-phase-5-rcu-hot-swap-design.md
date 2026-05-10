@@ -190,25 +190,73 @@ realtime callers can either poll manually or use the 5.3.B waited
 helpers so control producers know when it is safe to resume commands
 against the new world.
 
-### 4.2 Next slice: measure before synchronizing
+### 4.2 Measurement landed: --swap-bench
 
-The next 5.3 slice is **5.3.C — swap-bench instrumentation**:
+5.3.C landed in two slices.
 
-- Add a producer-side benchmark path that repeatedly prepares,
-  publishes, drives install, collects retired stats, and reports
-  prepare time, publish-to-install block count, collect time, and
-  migration counters.
-- Cover representative shapes: unchanged graph, tagged oscillator,
-  tagged biquad, lifecycle-only graph, fused graph, and template graph.
-- Keep the benchmark off-audio and opt-in. It must not change the C
-  runtime contract, Haskell helper behavior, or default execution path.
+**5.3.C1 — scaffold.** `MetaSonic.App.SwapBench` plus a `--swap-bench`
+mode on `metasonic-bridge`. One prepare+publish per row over a fixed
+corpus: unchanged graph, tagged oscillator, tagged biquad,
+lifecycle-only graph (Env + release → Releasing slot), fused graph,
+two-template ensemble. Output is CSV-shaped with one row per case;
+columns include prepare/publish time, install block count, collect
+time, and the Phase 5.2 migration counters. No C++ change, no library
+API change.
 
-Do **not** add `rt_graph_wait_swap_installed` in this slice. A C-side
-blocking wait would introduce a new synchronization contract across the
-audio and producer threads. The current polling helper is adequate for
-v1 producer ergonomics; implement the C wait primitive only after
-`--swap-bench` or a real producer demonstrates that polling is the
-wrong abstraction.
+**5.3.C2 — repetition + counter assertion.** Each row now runs
+`kSwapBenchRepeats = 11` times in a fresh `withRTGraph` handle so prior
+runs cannot leak lifecycle state or pending swaps into a later run.
+Timing is reported as min / median / max in nanoseconds; counters and
+`blocks_to_install` are required to be **identical** across runs and to
+match the row's expected signature. The bench aborts loudly on drift or
+stable wrong counters, because counters remain the primary path-proof
+signal — the timing summary is descriptive, the counters are the
+contract.
+
+**Observed envelope** (3 invocations × 11 repeats per row, host varies).
+The medians are stable across consecutive bench invocations; the spread
+between min and max is mostly first-iteration warm-up, not contention.
+
+| row | committed / skipped / inst / state / lifecycle | prepare+publish median | collect median |
+|---|---|---|---|
+| `unchanged`        | 0 / 2 / 0 / 0 / 1 | ~4.9 µs | ~330 ns |
+| `tagged-osc`       | 1 / 1 / 1 / 1 / 1 | ~4.7 µs | ~330 ns |
+| `tagged-biquad`    | 1 / 2 / 1 / 1 / 1 | ~5.4 µs | ~380 ns |
+| `lifecycle-only`   | 0 / 2 / 0 / 0 / 1 | ~4.6 µs | ~370 ns |
+| `fused`            | 1 / 1 / 1 / 1 / 1 | ~4.9 µs | ~340 ns |
+| `template` (×2)    | 0 / 4 / 0 / 0 / 2 | ~8.5 µs | ~490 ns |
+
+`blocks_to_install` is `1` in every row, every run (66 measurements per
+invocation). Install is reliably synchronous on the next process call
+under the offline driver.
+
+The producer cost is dominated by graph load into the offline builder
+(`hotSwap*` walks `rgNodes` and emits one FFI call per node, plus the
+controls and the migration-key setter). Migration counters do not
+materially change the median timing — `tagged-biquad` is the most
+expensive single-template row only because it has one extra node.
+Collect-side cost is sub-microsecond for every row; six FFI reads plus
+one cancel.
+
+**Decision: still defer `rt_graph_wait_swap_installed`.** The bench
+makes two things visible:
+
+1. The producer-side cost is microseconds, not milliseconds. There is
+   no measurement gap a C-side blocking wait would close.
+2. `blocks_to_install` is 1 in every row under the offline driver. In a
+   realtime producer, a C-side wait could at most reduce producer
+   notification granularity; it would not make the audio thread install
+   before a block boundary. No current measurement shows that the 1 ms
+   `threadDelay` in `waitForSwapGeneration` is the limiting factor.
+
+A C-side wait may still be justified later if either (a) producers
+under heavy load report measurable polling jitter, or (b) realtime
+callers need a `wait_swap_installed_or_timeout` primitive that integrates
+with their existing control-thread synchronization. Neither has been
+demonstrated yet. The next Phase 5 work that *might* prompt it is
+producer-side bus identity / template renumbering — questions about
+*what* the producer wants to do after install, not about *whether* the
+producer can tell that install happened.
 
 ## 5. Realtime control queue across a swap
 
