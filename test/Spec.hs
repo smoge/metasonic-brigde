@@ -304,6 +304,36 @@ unitTests = testGroup "Unit tests"
                  assertBool
                    ("expected too-long diagnostic, got: " <> err)
                    ("too long" `isInfixOf` err)
+
+      , testCase "migration keys accept UTF-8 bytes through the FFI" $ do
+          let key = "voice-" <> [toEnum 0xe9 :: Char]
+              sg = runSynth $ do
+                osc <- tagged key (sinOsc 440 0)
+                _   <- out 0 osc
+                pure ()
+          case lowerGraph sg >>= compileRuntimeGraph of
+            Left err -> assertFailure err
+            Right rt -> do
+              assertBool
+                "expected compiled runtime node to preserve UTF-8 key"
+                (any ((== Just (MigrationKey key)) . rnMigrationKey)
+                     (rgNodes rt))
+              withRTGraph (length (rgNodes rt)) 64 $ \handle ->
+                loadRuntimeGraph handle rt
+
+      , testCase "validateAndSort rejects keys over 16 UTF-8 bytes" $
+          let key = replicate 9 (toEnum 0xe9 :: Char)
+              sg = runSynth $ do
+                osc <- tagged key (sinOsc 440 0)
+                _   <- out 0 osc
+                pure ()
+          in case validateAndSort sg of
+               Right _  ->
+                 assertFailure "expected overlong UTF-8 migration key rejection"
+               Left err ->
+                 assertBool
+                   ("expected UTF-8 byte-length diagnostic, got: " <> err)
+                   ("too long" `isInfixOf` err)
       ]
 
   , testGroup "cc builder: auto-records CCSpec + auto-inserts Smooth"

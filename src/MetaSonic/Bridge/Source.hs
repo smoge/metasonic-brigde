@@ -22,6 +22,8 @@ module MetaSonic.Bridge.Source
   ( -- * Source-level types
     Connection (..)
   , MigrationKey (..)
+  , migrationKeyUtf8Bytes
+  , migrationKeyUtf8ByteLength
   , UGen (..)
   , NodeSpec (..)
   , SynthGraph (..)
@@ -73,6 +75,8 @@ module MetaSonic.Bridge.Source
 import           Control.DeepSeq            (NFData)
 import           Control.Monad              (void)
 import           Control.Monad.State.Strict
+import           Data.Bits                  ((.&.), (.|.), shiftR)
+import           Data.Char                  (chr, ord)
 import qualified Data.Map.Strict            as M
 import           Data.Word                  (Word8)
 import           GHC.Generics               (Generic)
@@ -219,11 +223,45 @@ audioArithErr op _ = error $
 
 -- | Stable node identity used by Phase 5.2 state migration. The key is
 -- optional and caller-chosen: untagged nodes explicitly opt out of
--- migration. Validation enforces the runtime ABI's v1 fixed-width
--- contract: non-empty, ASCII, no NUL bytes, and at most 16 bytes.
+-- migration. Validation enforces the runtime ABI's v1 fixed-width byte
+-- contract: non-empty, no NUL codepoint, and at most 16 UTF-8 bytes.
 newtype MigrationKey = MigrationKey { unMigrationKey :: String }
   deriving stock    (Eq, Ord, Show, Generic)
   deriving anyclass (NFData)
+
+-- | Encode a migration key to the exact byte sequence shipped through the C
+-- ABI. The runtime treats these bytes as opaque identity; UTF-8 is only the
+-- Haskell-side spelling of that byte sequence.
+migrationKeyUtf8Bytes :: MigrationKey -> String
+migrationKeyUtf8Bytes (MigrationKey key) =
+  concatMap encodeUtf8Char key
+  where
+    byte n = chr (n .&. 0xff)
+
+    encodeUtf8Char c =
+      let cp = ord c
+      in case () of
+        _ | cp <= 0x7f ->
+            [byte cp]
+          | cp <= 0x7ff ->
+            [ byte (0xc0 .|. (cp `shiftR` 6))
+            , byte (0x80 .|. (cp .&. 0x3f))
+            ]
+          | cp <= 0xffff ->
+            [ byte (0xe0 .|. (cp `shiftR` 12))
+            , byte (0x80 .|. ((cp `shiftR` 6) .&. 0x3f))
+            , byte (0x80 .|. (cp .&. 0x3f))
+            ]
+          | otherwise ->
+            [ byte (0xf0 .|. (cp `shiftR` 18))
+            , byte (0x80 .|. ((cp `shiftR` 12) .&. 0x3f))
+            , byte (0x80 .|. ((cp `shiftR` 6) .&. 0x3f))
+            , byte (0x80 .|. (cp .&. 0x3f))
+            ]
+
+migrationKeyUtf8ByteLength :: MigrationKey -> Int
+migrationKeyUtf8ByteLength =
+  length . migrationKeyUtf8Bytes
 
 
 {- Note [UGen extensibility]

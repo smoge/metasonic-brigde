@@ -102,7 +102,7 @@ import           Control.Exception          (bracket)
 import qualified Control.Monad              as M (void)
 import           Control.Monad              (forM_, when)
 import           Foreign
-import           Foreign.C.String          (CString, withCStringLen)
+import           Foreign.C.String          (CString, withCAStringLen)
 import           Foreign.C.Types
 
 import           MetaSonic.Bridge.Compile   (AffineStep (..),
@@ -118,9 +118,9 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              kernelTag,
                                              layeredRegionSchedule,
                                              scheduledRuntimeRegions)
-import           MetaSonic.Bridge.Source    (MigrationKey (..))
-import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
-                                             TemplateID (..))
+import           MetaSonic.Bridge.Source    (MigrationKey (..),
+                                             migrationKeyUtf8Bytes)
+import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..))
 import           MetaSonic.Types
 
 
@@ -324,8 +324,8 @@ setMigrationKeyForNode :: Ptr RTGraph -> CInt -> RuntimeNode -> IO ()
 setMigrationKeyForNode g cTid node =
   case rnMigrationKey node of
     Nothing -> pure ()
-    Just (MigrationKey key) ->
-      withCStringLen key $ \(ptr, len) -> do
+    Just migrationKey@(MigrationKey key) ->
+      withCAStringLen (migrationKeyUtf8Bytes migrationKey) $ \(ptr, len) -> do
         ok <- c_rt_graph_template_set_node_migration_key
           g cTid
           (cNodeIndex (rnIndex node))

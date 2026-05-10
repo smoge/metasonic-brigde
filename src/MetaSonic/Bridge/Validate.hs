@@ -26,7 +26,6 @@ module MetaSonic.Bridge.Validate
   ) where
 
 import           Data.Foldable           (foldlM)
-import           Data.Char               (ord)
 import qualified Data.Map.Strict         as M
 import qualified Data.Set                as S
 
@@ -371,17 +370,14 @@ checkMigrationKeys g = do
         "Duplicate migration key " <> show (unMigrationKey key)
         <> " on " <> show firstID <> " and " <> show dupID
   where
-    validateKey (MigrationKey key, nid)
+    validateKey (migrationKey@(MigrationKey key), nid)
       | null key =
           Left $ "Invalid empty migration key on " <> show nid
-      | length key > 16 =
+      | migrationKeyUtf8ByteLength migrationKey > 16 =
           Left $ "Migration key too long on " <> show nid
-              <> ": " <> show key <> " (max 16 ASCII bytes)"
-      | any ((== 0) . ord) key =
+              <> ": " <> show key <> " (max 16 UTF-8 bytes)"
+      | any (== '\0') key =
           Left $ "Migration key contains NUL on " <> show nid
-      | any ((> 127) . ord) key =
-          Left $ "Migration key must be ASCII on " <> show nid
-              <> ": " <> show key
       | otherwise =
           Right ()
 

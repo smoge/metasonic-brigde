@@ -8314,6 +8314,21 @@ constexpr int kMigrationSkipMissingTag   = 1;
 constexpr int kMigrationSkipKindMismatch = 4;
 constexpr int kMigrationSkipStateUnsupported = 6;
 
+constexpr int kKindSinOsc       = 1;
+constexpr int kKindOut          = 2;
+constexpr int kKindGain         = 3;
+constexpr int kKindSawOsc       = 5;
+constexpr int kKindNoiseGen     = 6;
+constexpr int kKindLPF          = 7;
+constexpr int kKindEnv          = 9;
+constexpr int kKindDelay        = 13;
+constexpr int kKindSmooth       = 14;
+constexpr int kKindPulseOsc     = 15;
+constexpr int kKindTriOsc       = 16;
+constexpr int kKindHPF          = 17;
+constexpr int kKindBPF          = 18;
+constexpr int kKindNotch        = 19;
+
 } // namespace
 
 TEST_CASE("hot-swap substrate: prepare + publish + install advances generation") {
@@ -8606,17 +8621,18 @@ TEST_CASE("hot-swap migration: oscillator state survives payload install") {
         rt_graph_add_node(g, 0, osc_kind);
         rt_graph_set_control(g, 0, 0, 440.0f);
         rt_graph_set_control(g, 0, 1, 0.0f);
-        if (osc_kind == 15) {  // PulseOsc width
+        if (osc_kind == kKindPulseOsc) {
             rt_graph_set_control(g, 0, 2, 0.25f);
         }
         REQUIRE(rt_graph_template_set_node_migration_key(
                     g, 0, 0, "osc", 3) == 1);
-        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_add_node(g, 1, kKindOut);
         rt_graph_set_control(g, 1, 0, 0.0f);
         rt_graph_connect(g, 0, 0, 1, 0);
     };
 
-    for (int osc_kind : {1, 5, 16, 15}) {  // Sin, Saw, Tri, Pulse
+    for (int osc_kind : {kKindSinOsc, kKindSawOsc,
+                         kKindTriOsc, kKindPulseOsc}) {
         auto *swapped = rt_graph_create(4, kFrames);
         auto *builder = rt_graph_create(4, kFrames);
         auto *expected = rt_graph_create(4, kFrames);
@@ -8657,10 +8673,10 @@ TEST_CASE("hot-swap migration: oscillator state survives payload install") {
 
 TEST_CASE("hot-swap migration: noise generator state survives payload install") {
     auto build = [](RTGraph *g) {
-        rt_graph_add_node(g, 0, 6);          // NoiseGen
+        rt_graph_add_node(g, 0, kKindNoiseGen);
         REQUIRE(rt_graph_template_set_node_migration_key(
                     g, 0, 0, "noise", 5) == 1);
-        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_add_node(g, 1, kKindOut);
         rt_graph_set_control(g, 1, 0, 0.0f);
         rt_graph_connect(g, 0, 0, 1, 0);
     };
@@ -8707,13 +8723,13 @@ TEST_CASE("hot-swap migration: biquad filter state survives payload install") {
         rt_graph_set_control(g, 1, 1, 0.707f);
         REQUIRE(rt_graph_template_set_node_migration_key(
                     g, 0, 1, "flt", 3) == 1);
-        rt_graph_add_node(g, 2, 2);          // Out(bus 0)
+        rt_graph_add_node(g, 2, kKindOut);
         rt_graph_set_control(g, 2, 0, 0.0f);
         rt_graph_connect(g, 0, 0, 1, 0);
         rt_graph_connect(g, 1, 0, 2, 0);
     };
 
-    for (int filter_kind : {7, 17, 18, 19}) {  // LPF, HPF, BPF, Notch
+    for (int filter_kind : {kKindLPF, kKindHPF, kKindBPF, kKindNotch}) {
         auto *swapped = rt_graph_create(4, kFrames);
         auto *builder = rt_graph_create(4, kFrames);
         auto *expected = rt_graph_create(4, kFrames);
@@ -8759,7 +8775,7 @@ TEST_CASE("hot-swap migration: unsupported lazy state skips without control copy
                     g, 0, 0, "lazy", 4) == 1);
     };
 
-    for (int unsupported_kind : {13, 14}) {  // Delay, Smooth
+    for (int unsupported_kind : {kKindDelay, kKindSmooth}) {
         auto *old_world = rt_graph_create(4, kFrames);
         auto *builder_world = rt_graph_create(4, kFrames);
         REQUIRE(old_world != nullptr);
@@ -8782,7 +8798,7 @@ TEST_CASE("hot-swap migration: unsupported lazy state skips without control copy
     }
 
     auto build = [](RTGraph *g, double gate) {
-        rt_graph_add_node(g, 0, 9);          // Env
+        rt_graph_add_node(g, 0, kKindEnv);
         rt_graph_set_control(g, 0, 0, gate);
         rt_graph_set_control(g, 0, 1, 0.001);
         rt_graph_set_control(g, 0, 2, 0.001);
@@ -8790,7 +8806,7 @@ TEST_CASE("hot-swap migration: unsupported lazy state skips without control copy
         rt_graph_set_control(g, 0, 4, 0.001);
         REQUIRE(rt_graph_template_set_node_migration_key(
                     g, 0, 0, "env", 3) == 1);
-        rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+        rt_graph_add_node(g, 1, kKindOut);
         rt_graph_set_control(g, 1, 0, 0.0f);
         rt_graph_connect(g, 0, 0, 1, 0);
     };
@@ -8839,15 +8855,15 @@ TEST_CASE("hot-swap migration: tagged kind mismatch skips controls") {
     add_const_node(g, 0, 0.75f, 0.0f);
     REQUIRE(rt_graph_template_set_node_migration_key(
                 g, 0, 0, "shape", 5) == 1);
-    rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+    rt_graph_add_node(g, 1, kKindOut);
     rt_graph_set_control(g, 1, 0, 0.0f);
     rt_graph_connect(g, 0, 0, 1, 0);
 
-    rt_graph_add_node(builder, 0, 3);    // Gain, same key as old Add
+    rt_graph_add_node(builder, 0, kKindGain);    // Same key as old Add.
     rt_graph_set_control(builder, 0, 0, 0.25f);
     REQUIRE(rt_graph_template_set_node_migration_key(
                 builder, 0, 0, "shape", 5) == 1);
-    rt_graph_add_node(builder, 1, 2);    // Out(bus 0)
+    rt_graph_add_node(builder, 1, kKindOut);
     rt_graph_set_control(builder, 1, 0, 0.0f);
     rt_graph_connect(builder, 0, 0, 1, 0);
 
@@ -8882,7 +8898,8 @@ TEST_CASE("hot-swap migration: key setter rejects invalid and duplicate keys") {
     REQUIRE(g != nullptr);
 
     add_const_node(g, 0, 0.75f, 0.0f);
-    rt_graph_add_node(g, 1, 2);          // Out(bus 0)
+    rt_graph_add_node(g, 1, kKindOut);
+    rt_graph_add_node(g, 2, kKindGain);
 
     CHECK(rt_graph_template_set_node_migration_key(
               nullptr, 0, 0, "dup", 3) == 0);
@@ -8896,6 +8913,12 @@ TEST_CASE("hot-swap migration: key setter rejects invalid and duplicate keys") {
               g, 0, 0, "dup", 3) == 1);
     CHECK(rt_graph_template_set_node_migration_key(
               g, 0, 1, "dup", 3) == 0);
+    const char opaque_key[] = {'o', static_cast<char>(0xff), 'k'};
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 2, opaque_key, 3) == 1);
+    const char nul_key[] = {'n', 'u', '\0', 'l'};
+    CHECK(rt_graph_template_set_node_migration_key(
+              g, 0, 2, nul_key, 4) == 0);
     CHECK(rt_graph_template_set_node_migration_key(
               g, 0, 99, "other", 5) == 0);
 

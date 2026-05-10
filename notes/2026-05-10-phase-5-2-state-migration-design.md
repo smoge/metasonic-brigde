@@ -72,6 +72,10 @@ Properties:
   byte sequence (probably a `std::array<char, K>` for fixed-width or a
   `std::string` for variable; v1 picks fixed-width to avoid per-key
   heap storage in `NodeSpec`). The runtime never interprets it.
+- **Byte-limited, not ASCII-limited.** The Haskell surface spells keys
+  as `String`, then ships their UTF-8 byte sequence through the C ABI.
+  v1 accepts 1..16 non-NUL bytes. Non-ASCII characters are allowed when
+  their UTF-8 encoding fits that byte budget.
 
 Tag origin (Haskell side):
 
@@ -116,6 +120,19 @@ Mismatches are not errors — they are a routine consequence of editing
 a graph. v1 surfaces them through plan counters on `RTGraphSwap`
 before and after install; v1 does not fail publish because one tagged
 node could not migrate.
+
+`ArityMismatch` is a defensive skip reason in the current public ABI:
+all supported `NodeKind` values have fixed control arity, so same-kind
+control arity drift cannot be constructed through normal C/Haskell
+builders today. It remains in the plan surface to pin the intended
+behavior if a future kind or construction API makes same-kind arity
+variation possible.
+
+`sample_rate` is handle-owned in 5.2.A/B, not part of the prepared
+world payload, and both old/new state run under the target handle's
+rate after install. If a future change makes sample rate configurable
+per prepared world, it must join this predicate before filter state is
+copied.
 
 ## 4. Where migration runs
 
@@ -308,6 +325,8 @@ accessor entries:
 - `rt_graph_swap_migration_skipped_reason(swap, i)` (test surface)
 - `rt_graph_swap_migration_instance_copy_count(swap)` (test surface,
   written by the audio thread during install)
+- `rt_graph_swap_migration_state_copy_count(swap)` (test surface,
+  written by the audio thread during install)
 
 This gives the producer a way to verify migration intent matched
 reality before disposing the swap.
@@ -357,7 +376,8 @@ returning false from a per-kind capability function.
     every matched node and slot-index-matched instance.
   - Tests: held-control survives swap (counter-confirmed via match
     count); untagged node defaults; tag clash rejected at compile
-    time; arity mismatch surfaces as skip.
+    time; runtime setter rejects duplicates and NUL-bearing keys while
+    accepting opaque non-NUL bytes.
 - **5.2.B — DSP state migration.** Done for the copy-safe v1 set.
   - Per-kind migrators for copy-safe state only: oscillator phase,
     pulse state, noise generator, and biquad filter memories.
