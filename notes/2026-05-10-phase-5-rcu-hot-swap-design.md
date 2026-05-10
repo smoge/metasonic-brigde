@@ -1,10 +1,11 @@
 # Phase 5 — RCU Hot-Swap Protocol
 
 Date: 2026-05-10
-Status: Phase 5.1.A/B, 5.2.A/B/C, and 5.3.A/B implemented.
-5.3.C is selected as a measurement-only swap-bench slice; a C-side
-wait primitive is deferred until measurements or producer workloads
-justify another synchronization surface.
+Status: Phase 5.1.A/B, 5.2.A/B/C, 5.3.A/B/C, and 5.4.A
+implemented. 5.3.D (`rt_graph_wait_swap_installed`) is deferred until
+producer workloads justify another synchronization surface. 5.4.B is
+the next proposed runtime slice: template identity preconditions before
+state/lifecycle migration.
 
 This note pins the protocol for swapping a running MetaSonic graph
 without a stop/start cycle. It records what the runtime did before the
@@ -14,7 +15,7 @@ to commit to. Phase 5.1.A first stood up the publish / install / retire
 dance with an empty payload; Phase 5.1.B moves the swappable runtime
 world into `RTGraphState` and makes `RTGraphSwap` carry a real
 next-world payload. Phase 5.2 adds caller-tagged state migration, and
-Phase 5.3.A/B wraps the protocol for Haskell producers.
+Phase 5.3.A/B/C wraps and measures the protocol for Haskell producers.
 
 ## 1. Today: stop / rebuild semantics
 
@@ -393,12 +394,20 @@ loops don't shift content.
 - **5.3.A/B — Producer ergonomics.** Haskell hot-swap helpers build
   offline worlds, publish them, optionally wait by polling the install
   generation, and collect migration stats.
-- **5.3.C — Swap-bench instrumentation.** Next. Measure prepare,
+- **5.3.C — Swap-bench instrumentation.** Done. Measured prepare,
   publish-to-install, collect, and migration-counter behavior before
-  adding a C-side blocking wait primitive.
+  adding any C-side blocking wait primitive.
 - **5.3.D — Optional wait primitive.** Deferred. Only add
   `rt_graph_wait_swap_installed` if 5.3.C data or a real producer shows
   polling is insufficient.
+- **5.4.A — Producer identity after install.** Done as
+  [notes/2026-05-10-phase-5-4-producer-identity-after-install-design.md](2026-05-10-phase-5-4-producer-identity-after-install-design.md).
+  Node retargeting remains producer-owned, bus identity remains numeric
+  and caller-owned, and template identity is selected as the runtime
+  precondition gap.
+- **5.4.B — Template identity precondition.** Next proposed runtime
+  slice. Store per-template identity tokens and reject prepare when
+  live old slots would migrate across mismatched template tokens.
 
 ## 9. What this design is *not*
 
@@ -426,8 +435,9 @@ loops don't shift content.
   queue can be added later if a use case demands it.)
 - **Q4.** What's the producer-side blocking primitive for "wait until
   installed"? (Current helper: poll the install-generation counter.
-  Next step: measure with 5.3.C before adding a C-side
-  `rt_graph_wait_swap_installed` primitive.)
+  5.3.C measured the helper path and did not justify a C-side
+  `rt_graph_wait_swap_installed` primitive. Keep deferred until a real
+  producer shows polling is insufficient.)
 - **Q5.** Does the swap need to preserve the realtime control queue
   contents across publish? (Substrate: yes, by ordering — drain runs
   before install. The queue ring is graph-handle-owned and outlives

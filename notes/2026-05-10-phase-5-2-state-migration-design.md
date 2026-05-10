@@ -421,7 +421,9 @@ returning false from a per-kind capability function.
   identity; bus storage starts fresh.
 - **No template-id renumbering.** New world's `template_id` for a
   given semantic template must match old world's. Renaming /
-  reordering templates is a separate identity problem.
+  reordering templates is a separate identity problem. Phase 5.4.A
+  records the follow-up design: make semantic template-id stability a
+  prepare-time runtime precondition for Haskell-loaded template graphs.
 - **No producer-side migration.** All migration runs on the audio
   thread at install. Producer's job is to publish a well-formed plan.
 - **No lazy optional DSP-state migration in v1.** Env, Delay, and
@@ -441,9 +443,10 @@ returning false from a per-kind capability function.
 - **Q2.** Does the bus-pool sizing change between worlds count as a
   publish precondition (rejects with mismatched bus count) or a
   caller responsibility (proceeds with new sizing, caller handles)?
-  The parent note §7.3 leaves this open. Lean: caller responsibility
-  in v1, runtime asserts only when migration would reach beyond the
-  new world's bus count.
+  Phase 5.4.A keeps this as caller responsibility in v1: bus index is
+  identity, bus contents are not migrated, and named buses are a
+  possible Haskell-side producer convenience rather than a runtime
+  precondition.
 - **Q3.** Should `prepare_swap_from_graph` accept a separate
   `MigrationPolicy` enum (Strict, Permissive, Disabled) or always run
   the standard match predicate? Lean: always run; opt-out is

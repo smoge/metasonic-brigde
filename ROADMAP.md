@@ -814,6 +814,32 @@ reduce producer notification granularity; it would not make the audio
 thread install before a block boundary. Revisit only if a real producer
 demonstrates that polling is the wrong abstraction.
 
+### 5.4 Producer identity after install
+
+**5.4.A design note written.** Producer retargeting is a separate
+problem from Phase 5.2's internal migration plan:
+
+- Node migration keys let the runtime copy old state to new nodes, but
+  they do not expose a post-install `MigrationKey -> NodeIndex` query.
+  v1 keeps that mapping producer-owned: derive it from the new
+  `RuntimeGraph` / `TemplateGraph` that the producer just compiled.
+- Bus identity remains numeric and caller-owned in v1. There is no bus
+  migration key, no bus-content preservation, and no automatic bus
+  remap in the runtime.
+- Template identity is the runtime-side gap. State/lifecycle migration
+  assumes a stable semantic template at each `template_id`; reordering
+  templates can violate that while looking structurally valid. The
+  design recommends turning this into a prepare-time precondition.
+
+Design note:
+[notes/2026-05-10-phase-5-4-producer-identity-after-install-design.md](notes/2026-05-10-phase-5-4-producer-identity-after-install-design.md)
+
+**5.4.B next:** add per-template identity tokens to the construction
+path, set them from Haskell `TemplateGraph.tplName`, and reject
+`prepare_swap_from_graph` when live old slots would migrate across a
+mismatched template token. Keep node retargeting and bus naming on the
+producer/Haskell side unless a real caller proves that insufficient.
+
 ---
 
 ## Phase 6 — Extended DSP and Ecosystem
