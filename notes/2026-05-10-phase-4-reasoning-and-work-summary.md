@@ -124,7 +124,9 @@ leaves behind:
 - a disciplined kernel-add process grounded in corpus recurrence and benches;
 - an edge-fusion model that preserves node identity and live controls;
 - per-port consumption metadata for future block-rate decisions;
-- global schedule and band introspection;
+- global schedule and band introspection, later carried as swappable
+  `RTGraphState` scratch in
+  [Phase 5.1.B](2026-05-10-phase-5-rcu-hot-swap-design.md);
 - deterministic writer-slot reservation and reduction infrastructure;
 - worker dispatch counters that separate "ran in parallel" from "looked
   faster in a benchmark row."
@@ -135,4 +137,3 @@ way to rebuild schedule-derived scratch from the active graph. Phase 4 created
 that shape. Phase 5 should build on it, but it should not reopen Phase 4.E
 parallelism unless a successor decision record replaces the default-off
 decision with representative evidence.
-
