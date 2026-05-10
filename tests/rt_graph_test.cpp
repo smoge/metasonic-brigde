@@ -8027,6 +8027,44 @@ TEST_CASE("c1d-c parallel executor: sink-free free entry uses worker pool") {
     rt_graph_destroy(sched);
 }
 
+TEST_CASE("c1d-c parallel executor: C1c band dispatch takes precedence") {
+    // Multiple instances of a sink-free multi-region FreeLayer form the
+    // existing C1c sweet spot: one Free band containing several global
+    // schedule entries. That band must dispatch as whole entries through
+    // C1c, not nest C1d-c region-item dispatch inside each entry.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.25f, 0.0f);
+    add_const_node(g, 1, 0.5f,  0.0f);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    const int free_items[] = {0, 1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, free_items);
+
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 1);
+    REQUIRE(rt_graph_template_instance_add(g, 0) == 2);
+
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_global_schedule_band_count(g) == 1);
+    CHECK(rt_graph_test_last_parallel_band_count(g) == 1);
+    CHECK(rt_graph_test_last_parallel_entry_count(g) == 3);
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 0);
+
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(g) == 3);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 6);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("c1d-c parallel executor: reduction mode + pool=3 stays bit-identical") {
     auto *direct  = rt_graph_create(8, kFrames);
     auto *reduced = rt_graph_create(8, kFrames);

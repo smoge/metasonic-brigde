@@ -5909,6 +5909,10 @@ static void dispatch_c1d_parallel_entry(
     nframes
   };
   ++g.last_c1d_parallel_entry_count;
+  // Count region items queued through the worker pool. Eligibility and
+  // construction validation make queued == executed for well-formed
+  // schedules; worker-side defensive skips still avoid unsafe access if a
+  // future malformed/debug path corrupts metadata.
   g.last_c1d_parallel_region_item_count += entry.work_item_count;
   // Hard join: run_parallel returns only after every worker has
   // observed its claim past the end of work_item_count. No later band
