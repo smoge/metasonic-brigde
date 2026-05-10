@@ -32,6 +32,8 @@ library
       MetaSonic.Bridge.Templates
       MetaSonic.Bridge.FFI
       MetaSonic.Bridge.MidiDemo
+      MetaSonic.Pattern
+      MetaSonic.Pattern.Corpus
       MetaSonic.Visualize.Trace
       MetaSonic.Visualize.TUI
   other-modules:

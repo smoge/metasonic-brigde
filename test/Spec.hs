@@ -27,13 +27,14 @@ module Main (main) where
 
 import qualified Data.Map.Strict           as M
 import qualified Data.Set                  as S
-import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
-                                            sortBy)
+import           Data.List                 (find, isInfixOf, isPrefixOf, nub,
+                                            sort, sortBy)
 import           Control.Concurrent        (forkIO, newEmptyMVar, putMVar,
                                             takeMVar, threadDelay)
 import           Control.Exception         (try)
 import           Control.Monad             (forM, forM_, when)
-import           Data.Maybe                (mapMaybe)
+import           Data.Maybe                (isJust, isNothing, listToMaybe,
+                                            mapMaybe)
 import           Data.Ord                  (comparing)
 import           Data.Word                 (Word8)
 import           Foreign.C.Types           (CDouble (..), CFloat (..), CInt)
@@ -97,6 +98,8 @@ import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Bridge.Validate
+import           MetaSonic.Pattern
+import           MetaSonic.Pattern.Corpus
 import           MetaSonic.Types
 
 main :: IO ()
@@ -110,6 +113,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , c0cScheduleExecutorTests
   , c0dGlobalScheduleBandTests
   , c1cWorkerScheduleTests
+  , patternCorpusTests
   ]
 
 ------------------------------------------------------------
@@ -8813,3 +8817,284 @@ c1cWorkerScheduleTests =
                         (bands > 0)
              entries @?= 3
        ]
+
+------------------------------------------------------------
+-- Phase 6.A.2: pattern corpus
+--
+-- Three verification layers:
+--   1. Deterministic expansion: 'expandPattern' over the fixed
+--      'corpusRange' produces an inline-pinned event list per row.
+--   2. Corpus shape: each row's compiled 'TemplateGraph' carries the
+--      kernels / template-count / ordering hypothesized in the
+--      Phase 6.A.2 design note.
+--   3. Driver-stub feasibility: 'checkDriverFeasibility' walks each
+--      row's events and confirms every PEControlWrite / PEVoiceOff
+--      has a prior PEVoiceOn for the same VoiceKey, every TemplateName
+--      resolves against patternTemplates, every ControlTag's NodeTag
+--      resolves to a tagged node in the referenced template, and
+--      SamplePos is non-decreasing.
+------------------------------------------------------------
+
+-- | Anything a driver would need to refuse the pattern.
+data DriverIssue
+  = OutOfOrderEvent      !SamplePos !SamplePos
+  | UnknownTemplate      !TemplateName
+  | DuplicateVoiceOn     !VoiceKey
+  | UnknownVoiceForOff   !VoiceKey
+  | UnknownVoiceForWrite !VoiceKey
+  | UnknownControlNode   !TemplateName !MigrationKey
+  | InvalidControlSlot   !TemplateName !MigrationKey !Int !Int
+    -- ^ ctSlot is out of range. Fields: requested slot, the
+    -- resolved node's actual control count.
+  | HotSwapTemplateLost  !VoiceKey !TemplateName
+    -- ^ A 'PEHotSwap' payload omits a template for which a voice
+    -- was still open. The driver would have to either force-release
+    -- the orphan voice or refuse the swap; v1 validator reports it
+    -- and drops the voice from the open set so subsequent writes
+    -- against it surface as 'UnknownVoiceForWrite'.
+  deriving (Eq, Show)
+
+-- | Walk a pattern's events against its 'patternTemplates' and
+-- collect every reason a driver could not execute them. Returns the
+-- empty list iff the pattern is feasible.
+--
+-- The active 'TemplateGraph' is threaded through the fold: a
+-- 'PEHotSwap' event replaces it, so subsequent 'TemplateName' /
+-- 'ControlTag' resolution runs against the new payload. This means
+-- a row that opens a voice, hot-swaps, and writes to that voice
+-- post-swap is rejected if the new payload no longer carries the
+-- voice's template or tagged nodes.
+--
+-- Deferred to 6.A.3: §5.2 state-preservation invariants across a
+-- hot-swap. A swap payload that retains a voice's template name but
+-- moves the voice's migration-keyed nodes to different 'NodeKind's
+-- would still pass this validator while breaking state migration.
+-- Naming the gap here lets 6.A.3 inherit a specific TODO rather
+-- than rediscover it empirically.
+checkDriverFeasibility
+  :: Pattern
+  -> [(SamplePos, PatternEvent)]
+  -> [DriverIssue]
+checkDriverFeasibility pat = go (patternTemplates pat) M.empty Nothing
+  where
+    go :: TemplateGraph
+       -> M.Map VoiceKey TemplateName
+       -> Maybe SamplePos
+       -> [(SamplePos, PatternEvent)]
+       -> [DriverIssue]
+    go _  _    _        []                 = []
+    go tg open lastPos  ((pos, ev) : rest) =
+      let templates = tgTemplates tg
+
+          lookupT :: TemplateName -> Maybe Template
+          lookupT (TemplateName n) = find ((== n) . tplName) templates
+
+          resolveNode :: TemplateName -> MigrationKey -> Maybe RuntimeNode
+          resolveNode tname key = do
+            t <- lookupT tname
+            find (\n -> rnMigrationKey n == Just key)
+                 (rgNodes (tplGraph t))
+
+          checkCtrl :: TemplateName -> ControlTag -> [DriverIssue]
+          checkCtrl tname (ControlTag key slot) =
+            case resolveNode tname key of
+              Nothing -> [UnknownControlNode tname key]
+              Just n  ->
+                let count = length (rnControls n)
+                in if slot < 0 || slot >= count
+                     then [InvalidControlSlot tname key slot count]
+                     else []
+
+          orderIssue = case lastPos of
+            Just lp | pos < lp -> [OutOfOrderEvent pos lp]
+            _                  -> []
+      in case ev of
+        PEVoiceOn tname vkey ctrls ->
+          let tIssue  = if isJust (lookupT tname) then [] else [UnknownTemplate tname]
+              dIssue  = if M.member vkey open then [DuplicateVoiceOn vkey] else []
+              cIssue  = concatMap (checkCtrl tname . fst) ctrls
+              open'   = M.insert vkey tname open
+          in orderIssue ++ tIssue ++ dIssue ++ cIssue
+             ++ go tg open' (Just pos) rest
+
+        PEVoiceOff vkey ->
+          case M.lookup vkey open of
+            Nothing -> orderIssue ++ [UnknownVoiceForOff vkey]
+                       ++ go tg open (Just pos) rest
+            Just _  -> orderIssue
+                       ++ go tg (M.delete vkey open) (Just pos) rest
+
+        PEControlWrite vkey ct _ ->
+          case M.lookup vkey open of
+            Nothing -> orderIssue ++ [UnknownVoiceForWrite vkey]
+                       ++ go tg open (Just pos) rest
+            Just tname ->
+              let cIssue = checkCtrl tname ct
+              in orderIssue ++ cIssue ++ go tg open (Just pos) rest
+
+        PEHotSwap _ newTg ->
+          let newNames = S.fromList (map tplName (tgTemplates newTg))
+              isLost (TemplateName n) = not (S.member n newNames)
+              lostIssues =
+                [ HotSwapTemplateLost vk tname
+                | (vk, tname) <- M.toList open
+                , isLost tname
+                ]
+              remainingOpen = M.filter (not . isLost) open
+          in orderIssue ++ lostIssues
+             ++ go newTg remainingOpen (Just pos) rest
+
+patternCorpusTests :: TestTree
+patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
+  [ testGroup "deterministic expansion pins"
+      [ testCase "droneVibrato" $
+          expandPattern droneVibrato corpusRange @?= droneVibratoEvents
+      , testCase "arpeggioSendReturn" $
+          expandPattern arpeggioSendReturn corpusRange @?= arpeggioSendReturnEvents
+      , testCase "polyphonicStab" $
+          expandPattern polyphonicStab corpusRange @?= polyphonicStabEvents
+      , testCase "hotSwapEdit" $
+          expandPattern hotSwapEdit corpusRange @?= hotSwapEditEvents
+      , testCase "layeredEnsemble" $
+          expandPattern layeredEnsemble corpusRange @?= layeredEnsembleEvents
+      ]
+
+  , testGroup "corpus shape pins"
+      [ testCase "droneVibrato: one template named 'drone'" $ do
+          let names = map tplName (tgTemplates (patternTemplates droneVibrato))
+          names @?= ["drone"]
+
+      , testCase "arpeggioSendReturn: voice + fx; fx claims RBusInLpfGainOut" $ do
+          let tg   = patternTemplates arpeggioSendReturn
+              names = sort (map tplName (tgTemplates tg))
+          names @?= ["fx", "voice"]
+          -- fx must come after voice (voice writes bus 5, fx reads it).
+          map tplName (tgTemplates tg) @?= ["voice", "fx"]
+          let fxKernels =
+                [ rrKernel r
+                | t <- tgTemplates tg
+                , tplName t == "fx"
+                , r <- rgRuntimeRegions (tplGraph t)
+                ]
+          assertBool
+            ("expected RBusInLpfGainOut in fx kernels: " <> show fxKernels)
+            (RBusInLpfGainOut `elem` fxKernels)
+
+      , testCase "polyphonicStab: audio-modulated Gain blocks RNoiseLpfGainOut" $ do
+          let tg      = patternTemplates polyphonicStab
+              names   = map tplName (tgTemplates tg)
+              kernels = concat
+                [ map rrKernel (rgRuntimeRegions (tplGraph t))
+                | t <- tgTemplates tg
+                ]
+          names @?= ["stab"]
+          assertBool
+            ("expected RNoiseLpfGainOut absent (envelope-modulated Gain): "
+             <> show kernels)
+            (RNoiseLpfGainOut `notElem` kernels)
+
+      , testCase "hotSwapEdit: 'drone' template and swap payload" $ do
+          let names = map tplName (tgTemplates (patternTemplates hotSwapEdit))
+          names @?= ["drone"]
+          let swapPayloadNames =
+                [ map tplName (tgTemplates tg2)
+                | (_, PEHotSwap _ tg2) <- hotSwapEditEvents
+                ]
+          swapPayloadNames @?= [["drone"]]
+
+      , testCase "layeredEnsemble: bass + pad + fx; fx is scheduled last" $ do
+          let tg     = patternTemplates layeredEnsemble
+              names  = map tplName (tgTemplates tg)
+          sort names @?= ["bass", "fx", "pad"]
+          -- fx reads bus 5, bass and pad both write it; fx must
+          -- follow both in the inter-template precedence order.
+          last names @?= "fx"
+          let fxKernels =
+                [ rrKernel r
+                | t <- tgTemplates tg
+                , tplName t == "fx"
+                , r <- rgRuntimeRegions (tplGraph t)
+                ]
+          assertBool
+            ("expected RBusInLpfGainOut in ensemble fx kernels: "
+             <> show fxKernels)
+            (RBusInLpfGainOut `elem` fxKernels)
+      ]
+
+  , testGroup "driver-stub feasibility"
+      [ testCase "droneVibrato"       $
+          checkDriverFeasibility droneVibrato       droneVibratoEvents       @?= []
+      , testCase "arpeggioSendReturn" $
+          checkDriverFeasibility arpeggioSendReturn arpeggioSendReturnEvents @?= []
+      , testCase "polyphonicStab"     $
+          checkDriverFeasibility polyphonicStab     polyphonicStabEvents     @?= []
+      , testCase "hotSwapEdit"        $
+          checkDriverFeasibility hotSwapEdit        hotSwapEditEvents        @?= []
+      , testCase "layeredEnsemble"    $
+          checkDriverFeasibility layeredEnsemble    layeredEnsembleEvents    @?= []
+      ]
+
+  , testGroup "driver-stub negative cases"
+      [ testCase "out-of-range ctSlot reports InvalidControlSlot" $ do
+          -- droneVibrato's "lpf" node has 2 controls (freq + q);
+          -- slot 99 is well out of range.
+          let badEvents =
+                [ (SamplePos 0,
+                     PEVoiceOn (TemplateName "drone") (VoiceKey "v0")
+                       [(ControlTag (MigrationKey "lpf") 99, 1500.0)])
+                ]
+              badPattern = droneVibrato
+                { patternEvents = const badEvents }
+          case checkDriverFeasibility badPattern badEvents of
+            [InvalidControlSlot
+              (TemplateName "drone") (MigrationKey "lpf") 99 _] ->
+              pure ()
+            issues ->
+              assertFailure $
+                "expected InvalidControlSlot, got: " <> show issues
+
+      , testCase "unknown NodeTag reports UnknownControlNode" $ do
+          let badEvents =
+                [ (SamplePos 0,
+                     PEVoiceOn (TemplateName "drone") (VoiceKey "v0")
+                       [(ControlTag (MigrationKey "no-such-tag") 0,
+                         1.0)])
+                ]
+              badPattern = droneVibrato
+                { patternEvents = const badEvents }
+          case checkDriverFeasibility badPattern badEvents of
+            [UnknownControlNode
+              (TemplateName "drone")
+              (MigrationKey "no-such-tag")] ->
+              pure ()
+            issues ->
+              assertFailure $
+                "expected UnknownControlNode, got: " <> show issues
+
+      , testCase
+          "hot-swap losing an open voice's template reports HotSwapTemplateLost"
+          $ do
+            -- Open a "drone" voice, then swap to a payload that
+            -- only carries a "stab" template. The validator should
+            -- flag the orphaned voice and drop it from the open
+            -- set; the subsequent PEControlWrite then surfaces as
+            -- UnknownVoiceForWrite.
+            let orphanTg = patternTemplates polyphonicStab
+                badEvents =
+                  [ (SamplePos 0,
+                       PEVoiceOn (TemplateName "drone") (VoiceKey "v0")
+                         [(ControlTag (MigrationKey "lpf") 0, 1500.0)])
+                  , (SamplePos 96000,
+                       PEHotSwap (SwapLabel "drop-drone") orphanTg)
+                  , (SamplePos 120000,
+                       PEControlWrite (VoiceKey "v0")
+                         (ControlTag (MigrationKey "lpf") 0) 2000.0)
+                  ]
+                badPattern = droneVibrato
+                  { patternEvents = const badEvents }
+            checkDriverFeasibility badPattern badEvents @?=
+              [ HotSwapTemplateLost (VoiceKey "v0") (TemplateName "drone")
+              , UnknownVoiceForWrite (VoiceKey "v0")
+              ]
+      ]
+  ]
