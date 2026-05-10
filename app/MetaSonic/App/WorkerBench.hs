@@ -52,6 +52,8 @@ data BenchResult = BenchResult
   , brParallelBands       :: !Int
   , brParallelEntries     :: !Int
   , brSerializedSinkBands :: !Int
+  , brC1dParallelEntries  :: !Int
+  , brC1dParallelItems    :: !Int
   } deriving (Eq, Show)
 
 kWorkerBenchFrames :: Int
@@ -90,7 +92,16 @@ runWorkerBench demos = do
   putStrLn $ "# note: ns_per_block includes equal output-bus readback "
           <> "in every mode for graphs that touch buses; bus-less "
           <> "compute probes read no buses."
-  putStrLn "# columns: case,loader,mode,ns_per_block,ns_per_sample,parallel_bands,parallel_entries,serialized_sink_bands,speedup"
+  putStrLn $ "# note: parallel_bands / parallel_entries / "
+          <> "serialized_sink_bands / c1d_parallel_entries / "
+          <> "c1d_parallel_items are last-processed-block "
+          <> "representative counters (the runtime overwrites them "
+          <> "every rt_graph_process call); they are not totals over "
+          <> "the timed run, and the summary's cumulative counters "
+          <> "sum only the last-block snapshot from each row."
+  putStrLn $ "# columns: case,loader,mode,ns_per_block,ns_per_sample,"
+          <> "parallel_bands,parallel_entries,serialized_sink_bands,"
+          <> "c1d_parallel_entries,c1d_parallel_items,speedup"
   rows <- concat <$> forM cases (\c -> do
     results <- forM kWorkerBenchModes $ \mode -> do
       result <- runBenchMode c mode
@@ -105,7 +116,7 @@ runWorkerBench demos = do
           | (mode, result) <- results
           ]
     forM_ rendered $ \(c', mode, result, speedup) -> do
-      printf "%s,%s,%s,%.2f,%.2f,%d,%d,%d,%.2fx\n"
+      printf "%s,%s,%s,%.2f,%.2f,%d,%d,%d,%d,%d,%.2fx\n"
         (bcName c')
         (bcLoader c')
         (bmName mode)
@@ -114,6 +125,8 @@ runWorkerBench demos = do
         (brParallelBands result)
         (brParallelEntries result)
         (brSerializedSinkBands result)
+        (brC1dParallelEntries result)
+        (brC1dParallelItems result)
         speedup
     pure rendered)
   let workerRows = [row | row@(_, mode, _, _) <- rows, bmWorkerPool mode > 1]
@@ -124,21 +137,44 @@ runWorkerBench demos = do
           | (_, _, result, speedup) <- workerRows
           , brParallelBands result > 0
           ]
+      -- Pure C1d-c row predicate: no C1c band-level dispatch in this
+      -- block, only region-item dispatch. Mixed rows (parallel_bands
+      -- > 0 and c1d_parallel_entries > 0) would attribute a C1c
+      -- speedup to C1d-c if filtered on the C1d counter alone.
+      -- Today's corpus has no mixed rows; the predicate keeps the
+      -- summary honest if one is added later.
+      isPureC1dRow result =
+        brParallelBands result == 0 && brC1dParallelEntries result > 0
+      bestC1dWorker =
+        maximumOr0
+          [ speedup
+          | (_, _, result, speedup) <- workerRows
+          , isPureC1dRow result
+          ]
   putStrLn $ "# summary: cases=" <> show (length cases)
           <> ", rows=" <> show (length rows)
           <> ", worker_rows=" <> show (length workerRows)
           <> ", worker_rows_with_parallel="
           <> show (length [() | (_, _, r, _) <- workerRows
                               , brParallelBands r > 0])
+          <> ", worker_rows_with_c1d_parallel="
+          <> show (length [() | (_, _, r, _) <- workerRows
+                              , isPureC1dRow r])
           <> ", parallel_bands="
           <> show (sum [brParallelBands r | (_, _, r, _) <- rows])
           <> ", parallel_entries="
           <> show (sum [brParallelEntries r | (_, _, r, _) <- rows])
           <> ", serialized_sink_bands="
           <> show (sum [brSerializedSinkBands r | (_, _, r, _) <- rows])
+          <> ", c1d_parallel_entries="
+          <> show (sum [brC1dParallelEntries r | (_, _, r, _) <- rows])
+          <> ", c1d_parallel_items="
+          <> show (sum [brC1dParallelItems r | (_, _, r, _) <- rows])
           <> ", best_worker_speedup=" <> printf "%.2fx" bestWorker
           <> ", best_parallel_worker_speedup="
           <> printf "%.2fx" bestParallelWorker
+          <> ", best_c1d_worker_speedup="
+          <> printf "%.2fx" bestC1dWorker
 
 workerBenchCases :: [Demo] -> Either String [BenchCase]
 workerBenchCases demos = do
@@ -224,6 +260,10 @@ runBenchOnce c mode =
     entries <- fromIntegral <$> c_rt_graph_test_last_parallel_entry_count handle
     serialized <- fromIntegral <$>
       c_rt_graph_test_last_serialized_free_band_count handle
+    c1dEntries <- fromIntegral <$>
+      c_rt_graph_test_last_c1d_parallel_entry_count handle
+    c1dItems <- fromIntegral <$>
+      c_rt_graph_test_last_c1d_parallel_region_item_count handle
 
     let nsPerBlock = fromIntegral (end - start)
                    / fromIntegral kWorkerBenchBlocks
@@ -234,6 +274,8 @@ runBenchOnce c mode =
       , brParallelBands       = bands
       , brParallelEntries     = entries
       , brSerializedSinkBands = serialized
+      , brC1dParallelEntries  = c1dEntries
+      , brC1dParallelItems    = c1dItems
       }
 
 loadCase :: Ptr RTGraph -> BenchCase -> IO ()

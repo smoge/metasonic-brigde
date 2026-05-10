@@ -41,6 +41,8 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_test_last_parallel_band_count
   , c_rt_graph_test_last_parallel_entry_count
   , c_rt_graph_test_last_serialized_free_band_count
+  , c_rt_graph_test_last_c1d_parallel_entry_count
+  , c_rt_graph_test_last_c1d_parallel_region_item_count
   , -- * §4.E.2.C0a layered-schedule metadata (test-only introspection)
     c_rt_graph_test_template_schedule_step_count
   , c_rt_graph_test_template_schedule_step_kind
@@ -387,6 +389,24 @@ foreign import ccall unsafe "rt_graph_test_last_parallel_entry_count"
 -- sink writers while reduction mode is off.
 foreign import ccall unsafe "rt_graph_test_last_serialized_free_band_count"
   c_rt_graph_test_last_serialized_free_band_count :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C1d-c test counter from the most recent process block:
+-- number of multi-region sink-free FreeLayer entries dispatched
+-- through the worker pool at region-item granularity inside
+-- 'process_schedule_band_serial'. The C1c band-level worker path and
+-- the C1d-b serial path both bypass this counter, so non-zero values
+-- prove region-item dispatch was the path actually exercised.
+foreign import ccall unsafe "rt_graph_test_last_c1d_parallel_entry_count"
+  c_rt_graph_test_last_c1d_parallel_entry_count :: Ptr RTGraph -> IO CInt
+
+-- | §4.E.2.C1d-c test counter from the most recent process block:
+-- total region items handed to the worker pool by C1d-c parallel
+-- entry dispatch. Counts items as queued (eligibility-validated),
+-- not as executed; defensive in-worker skips would not occur under a
+-- well-formed schedule.
+foreign import ccall unsafe "rt_graph_test_last_c1d_parallel_region_item_count"
+  c_rt_graph_test_last_c1d_parallel_region_item_count
+    :: Ptr RTGraph -> IO CInt
 
 -- | §4.E.2.C0a test surface: number of schedule steps registered
 -- for the named template. Returns 0 on null g or unknown

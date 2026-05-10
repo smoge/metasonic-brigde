@@ -38,8 +38,32 @@
 // The second section is the §4.E bench slice: it compares the
 // legacy executor, global-schedule serial executor, and worker-pool
 // Free-band dispatch at pool sizes 2/3/4. Those rows also report the
-// C1c debug counters (parallel bands, parallel entries, serialized
-// sink bands) so timing data can be read against the schedule shape.
+// C1c debug counters (parallel_bands, parallel_entries,
+// serialized_sink_bands) and the C1d-c counters
+// (c1d_parallel_entries, c1d_parallel_items) so timing data can be
+// read against the schedule shape — a row class is C1c when
+// parallel_bands > 0, C1d-c when parallel_bands == 0 ∧
+// c1d_parallel_entries > 0, and schedule/serial noise when both are
+// zero. The counter columns are last-processed-block representative
+// snapshots taken after one untimed introspection block at the end
+// of each cell; they are not totals across the timed run.
+//
+// Schedule shapes:
+//   * FreeCompute  — N instances × one sink-free Saw→LPF→Gain region
+//                    in one FreeLayer step. Multi-entry Free band, so
+//                    C1c band-level dispatch fires when the worker
+//                    pool is configured.
+//   * FreeSink     — N instances × one sink-terminal SinGainOut region
+//                    deliberately tagged FreeLayer. Direct mode
+//                    serializes; reduction mode may dispatch and fold.
+//   * SendReturn   — N sender voices write a bus in one Free band; a
+//                    single reader template reads it live in a later
+//                    Barrier. Reduction-mode dispatch must join + fold
+//                    before the reader runs.
+//   * RegionItems  — One instance × N parallel sink-free Saw→LPF→Gain
+//                    chains in one FreeLayer step. The free band has
+//                    only one entry, so C1c never fires; any speedup
+//                    is unambiguously C1d-c region-item dispatch.
 //
 // Build with -O3 / RelWithDebInfo — debug timings are dominated by
 // libstdc++ checks and the kernel-vs-loop ratio is noise. The CMake
@@ -453,6 +477,8 @@ struct ScheduleBenchResult {
   int parallel_bands = 0;
   int parallel_entries = 0;
   int serialized_sink_bands = 0;
+  int c1d_parallel_entries = 0;
+  int c1d_parallel_items = 0;
 };
 
 const ScheduleModeSpec kScheduleModes[] = {
@@ -578,10 +604,55 @@ void build_schedule_send_return_graph(RTGraph *g, int voices) {
   spawn_exact_voices(g, reader, 1);
 }
 
+// Single-instance, multi-region sink-free FreeLayer. The voices
+// argument controls the number of parallel Saw→LPF→Gain chains
+// inside one instance, all listed in one FreeLayer step. The global
+// schedule has exactly one entry per block whose RegionLayerWorkItem
+// slice has 'voices' items, all sink-free — exactly the C1d-c shape.
+//
+// C1c band-level dispatch never fires (free band has only one entry),
+// so any worker speedup on this shape is C1d-c, not C1c. Direct mode
+// is safe because no item opens a writer slot.
+void build_schedule_region_items_graph(RTGraph *g, int voices) {
+  rt_graph_instance_remove(g, 0);
+  rt_graph_template_set_polyphony(g, 0, 1);
+
+  constexpr int kNodesPerChain = 3;
+  std::vector<int> region_ordinals;
+  region_ordinals.reserve(static_cast<std::size_t>(voices));
+
+  for (int chain = 0; chain < voices; ++chain) {
+    const int base = chain * kNodesPerChain;
+    rt_graph_template_add_node(g, 0, base + 0, kNkSawOsc);
+    rt_graph_template_add_node(g, 0, base + 1, kNkLPF);
+    rt_graph_template_add_node(g, 0, base + 2, kNkGain);
+    rt_graph_template_connect(g, 0, base + 0, 0, base + 1, 0);
+    rt_graph_template_connect(g, 0, base + 1, 0, base + 2, 0);
+    rt_graph_template_set_default(g, 0, base + 0, 0,
+                                  220.0 + 30.0 * chain);
+    rt_graph_template_set_default(g, 0, base + 1, 0,
+                                  800.0 + 100.0 * chain);
+    rt_graph_template_set_default(g, 0, base + 1, 1, 4.0);
+    rt_graph_template_set_default(g, 0, base + 2, 0, 0.4);
+    rt_graph_template_add_region_kernel(
+        g, 0, kKernelSawLpfGain,
+        kRateSampleRate, base, kNodesPerChain);
+    region_ordinals.push_back(chain);
+  }
+
+  rt_graph_template_add_schedule_step(
+      g, 0, kScheduleFreeLayer,
+      static_cast<int>(region_ordinals.size()),
+      region_ordinals.data());
+
+  spawn_exact_voices(g, 0, 1);
+}
+
 const ScheduleBenchSpec kScheduleShapes[] = {
   { "FreeCompute", &build_schedule_free_compute_graph },
   { "FreeSink",    &build_schedule_free_sink_graph    },
   { "SendReturn",  &build_schedule_send_return_graph  },
+  { "RegionItems", &build_schedule_region_items_graph },
 };
 
 RTGraph *build_schedule_graph(
@@ -644,9 +715,10 @@ ScheduleBenchResult run_schedule_cell(
                            static_cast<double>(iters));
 
     if (run == kScheduleRepeatRuns - 1) {
-      // One untimed block records representative C1c counters for
-      // this shape/mode. Reading the counters inside the timed loop
-      // would benchmark introspection overhead instead of rendering.
+      // One untimed block records representative C1c and C1d-c
+      // counters for this shape/mode. Reading the counters inside the
+      // timed loop would benchmark introspection overhead instead of
+      // rendering.
       rt_graph_process(g, nframes);
       observed.parallel_bands =
           rt_graph_test_last_parallel_band_count(g);
@@ -654,6 +726,10 @@ ScheduleBenchResult run_schedule_cell(
           rt_graph_test_last_parallel_entry_count(g);
       observed.serialized_sink_bands =
           rt_graph_test_last_serialized_free_band_count(g);
+      observed.c1d_parallel_entries =
+          rt_graph_test_last_c1d_parallel_entry_count(g);
+      observed.c1d_parallel_items =
+          rt_graph_test_last_c1d_parallel_region_item_count(g);
       drain_into_sink(g, nframes, scratch);
     }
 
@@ -696,7 +772,8 @@ int main() {
               kScheduleWarmupBlocks, kScheduleRepeatRuns);
   std::printf(
       "# columns: shape,mode,block,voices,ns_per_block,ns_per_sample,"
-      "parallel_bands,parallel_entries,serialized_sink_bands,speedup\n");
+      "parallel_bands,parallel_entries,serialized_sink_bands,"
+      "c1d_parallel_entries,c1d_parallel_items,speedup\n");
 
   for (const auto &shape : kScheduleShapes) {
     for (const int voices : kScheduleVoiceCounts) {
@@ -716,11 +793,14 @@ int main() {
               ? legacy_ns_per_block / result.ns_per_block
               : 0.0;
           std::printf(
-              "%-12s,%-20s,%4d,%3d,%12.2f,%9.2f,%3d,%4d,%3d,%5.2fx\n",
+              "%-12s,%-20s,%4d,%3d,%12.2f,%9.2f,%3d,%4d,%3d,%4d,%4d,"
+              "%5.2fx\n",
               shape.name, mode.name, nframes, voices,
               result.ns_per_block, result.ns_per_sample,
               result.parallel_bands, result.parallel_entries,
-              result.serialized_sink_bands, speedup);
+              result.serialized_sink_bands,
+              result.c1d_parallel_entries, result.c1d_parallel_items,
+              speedup);
         }
       }
     }
