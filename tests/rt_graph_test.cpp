@@ -7940,6 +7940,234 @@ TEST_CASE("c1d-b serial executor: counter stays zero without global-schedule swi
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase §4.E.2.C1d-c: parallel sink-free region-item dispatch
+// ----------------------------------------------------------------
+
+namespace {
+
+void build_c1d_c_two_producer_graph(RTGraph *g) {
+    // Two sink-free Add producers in one FreeLayer; an Add summing
+    // them in a Barrier; an Out writing bus 0 in a Barrier. The free
+    // band is a singleton entry with two sink-free regions — exactly
+    // the C1d-c shape.
+    add_const_node(g, 0, 0.25f, 0.0f);
+    add_const_node(g, 1, 0.5f,  0.0f);
+
+    rt_graph_add_node(g, 2, 8); // Add summing node 0 + node 1
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_set_control(g, 2, 1, 0.0f);
+    rt_graph_connect(g, 0, 0, 2, 0);
+    rt_graph_connect(g, 1, 0, 2, 1);
+
+    rt_graph_add_node(g, 3, 2); // Out(bus 0)
+    rt_graph_set_control(g, 3, 0, 0.0f);
+    rt_graph_connect(g, 2, 0, 3, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/2, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/3, /*node_count=*/1);
+
+    const int free_items[] = {0, 1};
+    const int sum_item[]   = {2};
+    const int sink_item[]  = {3};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, free_items);
+    rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                        /*item_count=*/1, sum_item);
+    rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                        /*item_count=*/1, sink_item);
+}
+
+} // namespace
+
+TEST_CASE("c1d-c parallel executor: sink-free free entry uses worker pool") {
+    auto *legacy = rt_graph_create(8, kFrames);
+    auto *sched  = rt_graph_create(8, kFrames);
+    REQUIRE(legacy != nullptr);
+    REQUIRE(sched  != nullptr);
+    build_c1d_c_two_producer_graph(legacy);
+    build_c1d_c_two_producer_graph(sched);
+
+    rt_graph_test_set_worker_pool_size(sched, 3);
+    rt_graph_test_set_global_schedule_execution(sched, 1);
+
+    rt_graph_process(legacy, kFrames);
+    rt_graph_process(sched,  kFrames);
+
+    // Bit-identical output across legacy (no schedule, no pool) and
+    // C1d-c (schedule on, pool=3, region-item dispatch).
+    const auto legacy_bus0 = read_bus_vec(legacy, 0, kFrames);
+    const auto sched_bus0  = read_bus_vec(sched,  0, kFrames);
+    check_exact_same(legacy_bus0, sched_bus0);
+    for (auto v : sched_bus0) CHECK(v == doctest::Approx(0.75f).epsilon(1e-6));
+
+    // Counter-confirmed dispatch: the new region-item path actually
+    // ran, the C1d-b serial path stayed out of the free band, and
+    // C1c band-level parallelism never fired (free band has only one
+    // entry, so should_parallelize_schedule_band returns false).
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(sched) == 1);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(sched) == 2);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(sched)
+          == 0);
+    CHECK(rt_graph_test_last_parallel_band_count(sched) == 0);
+    CHECK(rt_graph_test_last_parallel_entry_count(sched) == 0);
+
+    // C1d-a candidate metadata still classifies the entry the same way.
+    CHECK(rt_graph_test_last_c1d_candidate_entry_count(sched) == 1);
+    CHECK(rt_graph_test_last_c1d_candidate_item_count(sched) == 2);
+    CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(sched) == 0);
+
+    rt_graph_destroy(legacy);
+    rt_graph_destroy(sched);
+}
+
+TEST_CASE("c1d-c parallel executor: reduction mode + pool=3 stays bit-identical") {
+    auto *direct  = rt_graph_create(8, kFrames);
+    auto *reduced = rt_graph_create(8, kFrames);
+    REQUIRE(direct  != nullptr);
+    REQUIRE(reduced != nullptr);
+    build_c1d_c_two_producer_graph(direct);
+    build_c1d_c_two_producer_graph(reduced);
+
+    rt_graph_test_set_worker_pool_size(direct,  3);
+    rt_graph_test_set_worker_pool_size(reduced, 3);
+    rt_graph_test_set_global_schedule_execution(direct,  1);
+    rt_graph_test_set_global_schedule_execution(reduced, 1);
+    rt_graph_test_set_reduction_capture(reduced, 1);
+
+    rt_graph_process(direct,  kFrames);
+    rt_graph_process(reduced, kFrames);
+
+    // C1d-c does not interact with reduction mode — sink-free items
+    // never open contribution slots — so direct and reduction outputs
+    // must agree byte-for-byte across the C1d-c path.
+    check_exact_same(read_bus_vec(direct,  0, kFrames),
+                     read_bus_vec(reduced, 0, kFrames));
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(direct) == 1);
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(reduced) == 1);
+
+    rt_graph_destroy(direct);
+    rt_graph_destroy(reduced);
+}
+
+TEST_CASE("c1d-c parallel executor: sink-bearing entry stays serial") {
+    // A multi-region FreeLayer entry with at least one sink writer
+    // must NOT enter C1d-c — sink ordering and bus reduction stay on
+    // the audio thread. The C1d-b serial counter must reflect every
+    // emitted region item; the C1d-c counters must stay 0.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.25f, 0.0f); // sink-free region 0
+
+    add_const_node(g, 1, 0.5f, 0.0f);
+    rt_graph_add_node(g, 2, 2);        // Out(bus 0) — sink writer
+    rt_graph_set_control(g, 2, 0, 0.0f);
+    rt_graph_connect(g, 1, 0, 2, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/2);
+
+    const int items[] = {0, 1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/2, items);
+
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 2);
+    CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(g) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("c1d-c parallel executor: singleton free entry stays serial") {
+    // A FreeLayer entry with one work item is not C1d-c-eligible
+    // (work_item_count <= 1). The C1d-b serial path runs and the
+    // C1d-c counters stay 0 even with worker pool > 1.
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    add_const_node(g, 0, 0.5f, 0.0f);
+    rt_graph_add_node(g, 1, 2);
+    rt_graph_set_control(g, 1, 0, 0.0f);
+    rt_graph_connect(g, 0, 0, 1, 0);
+
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/0, /*node_count=*/1);
+    rt_graph_template_add_region(g, 0, /*rate=*/0,
+                                 /*first_node=*/1, /*node_count=*/1);
+    const int free_item[] = {0};
+    const int sink_item[] = {1};
+    rt_graph_template_add_schedule_step(g, 0, /*FreeLayer=*/1,
+                                        /*item_count=*/1, free_item);
+    rt_graph_template_add_schedule_step(g, 0, /*Barrier=*/0,
+                                        /*item_count=*/1, sink_item);
+
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("c1d-c parallel executor: pool size 1 falls back to serial") {
+    // Even with global-schedule execution on, a worker pool sized to
+    // a single logical lane (zero background workers) must stay on
+    // the C1d-b serial path. Otherwise C1d-c would call run_parallel
+    // with no workers to parallelize against.
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    build_c1d_c_two_producer_graph(g);
+
+    rt_graph_test_set_worker_pool_size(g, 1);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+    rt_graph_process(g, kFrames);
+
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 2);
+
+    auto bus0 = read_bus_vec(g, 0, kFrames);
+    for (auto v : bus0) CHECK(v == doctest::Approx(0.75f).epsilon(1e-6));
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("c1d-c parallel executor: counters reset between blocks") {
+    auto *g = rt_graph_create(8, kFrames);
+    REQUIRE(g != nullptr);
+    build_c1d_c_two_producer_graph(g);
+
+    rt_graph_test_set_worker_pool_size(g, 3);
+    rt_graph_test_set_global_schedule_execution(g, 1);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(g) == 1);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(g) == 2);
+
+    rt_graph_process(g, kFrames);
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(g) == 1);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(g) == 2);
+
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("c1d-b serial executor: counter resets between blocks") {
     // The counter must not accumulate across blocks; otherwise tests
     // that assert "actually ran this block" would silently pass on a
@@ -7992,6 +8220,8 @@ TEST_CASE("region-layer work items: clear resets snapshot and counters") {
     CHECK(rt_graph_test_last_c1d_candidate_item_count(g) == 0);
     CHECK(rt_graph_test_last_c1d_serialized_sink_entry_count(g) == 0);
     CHECK(rt_graph_test_last_c1d_serial_region_item_execution_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_parallel_entry_count(g) == 0);
+    CHECK(rt_graph_test_last_c1d_parallel_region_item_count(g) == 0);
 
     rt_graph_destroy(g);
 }

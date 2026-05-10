@@ -79,9 +79,10 @@ Parked / deferred:
   is preserved; the runtime path waits for the signal to grow.
 - **Region-level parallelism (§4.E).** Worker-pool Free-band dispatch is
   test-gated and default-off; only targeted probes win. C1d-a region
-  work-item metadata and C1d-b serial region-item execution are in
-  place behind the global-schedule test switch. C1d-c sink-free
-  region-item worker dispatch is the next implementation slice.
+  work-item metadata, C1d-b serial region-item execution, and C1d-c
+  sink-free region-item worker dispatch are in place behind test/bench
+  switches. C1d-d instrumentation and decision refresh is the next
+  slice.
 - **Whole-region kernel codegen.** Deferred indefinitely. Hand-written DSP
   bodies plus narrow helpers (`SinkAccumulator`, `drive_oscillator`) are
   the working approach.
@@ -660,23 +661,27 @@ Current status:
    keep the legacy whole-entry executor. A test-only counter proves
    non-vacuous region-item execution, and C++ equivalence tests plus the
    Haskell T-9 corpus preserve byte-equivalence.
+11. **C1d-c sink-free parallel region items — done, test-gated.**
+   Sink-free multi-region `FreeLayer` entries can dispatch their region
+   work items through the existing worker pool when global-schedule
+   execution and a worker pool are enabled. Sink-bearing, mixed, singleton,
+   and pool-size-1 entries stay on the C1d-b serial path. Test-only C1d-c
+   counters prove region-item worker dispatch separately from C1c
+   band-level dispatch, and C++ tests cover legacy equivalence, reduction
+   equivalence, fallback cases, and per-block counter reset. The standing
+   default-off decision remains unchanged.
 
 Next §4.E slice:
 
-1. **C1d-c sink-free parallel region items — next implementation slice.**
-   Dispatch sink-free multi-region `FreeLayer` items through the
-   existing worker pool. Required gates: counter-confirmed region-item
-   dispatch, bit-identical output, unconditional join before the next
-   schedule band, release/free lifecycle unchanged, and full T-9 under
-   schedule execution + reduction mode + `pool_size=3`.
-2. **C1d-d bench and decision refresh.** Rerun `--fusion-survey`,
-   `--worker-bench`, and the C++ synthetic worker bench after C1d-c.
+1. **C1d-d bench instrumentation and decision refresh.** Add C1d-c
+   counter columns to `--worker-bench` and the C++ synthetic worker bench,
+   then rerun `--fusion-survey`, `--worker-bench`, and the C++ bench.
    Keep timing claims subordinate to counters: only rows with
    region-item worker dispatch actually happening can support a
    turn-on decision. Update
    `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` after the
    data is collected.
-3. **More representative workload only if C1d is pursued further.** The
+2. **More representative workload only if C1d is pursued further.** The
    current C1d candidates are survey rows, not default-on evidence.
    Before spending runtime complexity, add or identify real
    Haskell-loaded demos with enough region-layer DSP work to have a
@@ -687,7 +692,7 @@ Next §4.E slice:
      - multi-band processing (input → N band splits → per-band chains
        → join);
      - drum machine (N drum templates writing the same master BusOut).
-4. **No public switch or default-on path yet.** Do not expose worker
+3. **No public switch or default-on path yet.** Do not expose worker
    scheduling outside the test/bench ABI until a successor decision
    record replaces the current default-off decision with explicit
    corpus and threshold criteria.

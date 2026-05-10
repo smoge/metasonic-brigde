@@ -2164,6 +2164,17 @@ struct RTGraph {
   // when global-schedule execution is enabled and a Free band lands on
   // the audio thread.
   int last_c1d_serial_region_item_execution_count = 0;
+
+  // Phase §4.E.2.C1d-c test/debug counters for the most recent block.
+  // `parallel_entry_count` increments once per multi-region sink-free
+  // FreeLayer entry whose work items were dispatched through the worker
+  // pool inside process_schedule_band_serial. `parallel_region_item_count`
+  // is the total number of region items handed to the worker pool. The
+  // C1c band-level path (process_parallel_band_worker) and the C1d-b
+  // serial path both bypass these counters; non-zero values prove
+  // region-item-granularity dispatch was the path actually exercised.
+  int last_c1d_parallel_entry_count = 0;
+  int last_c1d_parallel_region_item_count = 0;
 };
 
 namespace {
@@ -5443,6 +5454,8 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
   g.last_c1d_candidate_item_count = 0;
   g.last_c1d_serialized_sink_entry_count = 0;
   g.last_c1d_serial_region_item_execution_count = 0;
+  g.last_c1d_parallel_entry_count = 0;
+  g.last_c1d_parallel_region_item_count = 0;
 
   const int entry_count = static_cast<int>(g.global_schedule.size());
   for (int entry_index = 0; entry_index < entry_count; ++entry_index) {
@@ -5799,6 +5812,111 @@ static void process_entry_via_work_items(
   }
 }
 
+// Phase §4.E.2.C1d-c: dispatch state for parallel region-item execution
+// inside one GlobalScheduleEntry. Workers claim items by atomic offset
+// increment and each worker materializes a private BlockExecutionContext
+// — sink-free items never open contribution slots, so direct mode is
+// always safe and no fold step is needed after the join.
+struct ParallelEntryRegionItemDispatch {
+  RTGraph &g;
+  int first_work_item = 0;
+  int work_item_count = 0;
+  int nframes = 0;
+  std::atomic<int> next_offset{0};
+};
+
+static void process_parallel_entry_region_item_worker(
+    void *user, int /*worker_id*/) noexcept {
+  auto &dispatch = *static_cast<ParallelEntryRegionItemDispatch *>(user);
+  while (true) {
+    const int offset = dispatch.next_offset.fetch_add(
+        1, std::memory_order_relaxed);
+    if (offset >= dispatch.work_item_count) return;
+
+    const int item_index = dispatch.first_work_item + offset;
+    if (item_index < 0) continue;
+    const std::size_t i = static_cast<std::size_t>(item_index);
+    if (i >= dispatch.g.region_layer_work_items.size()) continue;
+
+    const RegionLayerWorkItem &item =
+        dispatch.g.region_layer_work_items[i];
+    if (item.instance_slot < 0) continue;
+    const std::size_t slot =
+        static_cast<std::size_t>(item.instance_slot);
+    if (slot >= dispatch.g.instances.size()) continue;
+
+    GraphInstance &inst = dispatch.g.instances[slot];
+    const SlotState s = inst.state.load();
+    if (!is_audio_scheduled_state(s)) continue;
+    if (inst.template_id != item.template_id) continue;
+
+    const MetaDef *def = template_at(dispatch.g, item.template_id);
+    if (!def) continue;
+
+    if (item.region_ordinal < 0) continue;
+    const std::size_t region_pos =
+        static_cast<std::size_t>(item.region_ordinal);
+    if (region_pos >= def->regions.size()) continue;
+
+    BlockExecutionContext local_ctx;
+    process_region(dispatch.g, *def, inst, def->regions[region_pos],
+                   dispatch.nframes, local_ctx);
+  }
+}
+
+// C1d-c eligibility: the entry is a multi-region FreeLayer step whose
+// items are all sink-free, and the worker pool has at least one
+// background lane. Caller should only consult this from the serial
+// band path — the C1c band-level dispatch already runs whole entries
+// through workers and must not be double-parallelized.
+static bool entry_is_c1d_parallel_candidate(
+    const RTGraph &g, const GlobalScheduleEntry &entry
+) noexcept {
+  if (g.worker_pool.logical_size() <= 1) return false;
+  if (entry.work_item_count <= 1) return false;
+  if (entry.first_work_item < 0) return false;
+
+  const std::size_t first =
+      static_cast<std::size_t>(entry.first_work_item);
+  const std::size_t count =
+      static_cast<std::size_t>(entry.work_item_count);
+  if (first > g.region_layer_work_items.size()
+      || count > g.region_layer_work_items.size() - first) {
+    return false;
+  }
+
+  const ScheduleStepSpec *step = schedule_step_for_entry(g, entry);
+  if (!step || step->kind != ScheduleStepKind::FreeLayer) return false;
+
+  // Sink-free: every work item must contribute zero canonical writer
+  // slots. C1d-c never carries a sink writer through worker dispatch
+  // — sink ordering and bus-reduction folding stay on the audio thread.
+  for (std::size_t i = 0; i < count; ++i) {
+    if (g.region_layer_work_items[first + i].writer_slot_count > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void dispatch_c1d_parallel_entry(
+    RTGraph &g, const GlobalScheduleEntry &entry, int nframes
+) noexcept {
+  ParallelEntryRegionItemDispatch dispatch{
+    g,
+    entry.first_work_item,
+    entry.work_item_count,
+    nframes
+  };
+  ++g.last_c1d_parallel_entry_count;
+  g.last_c1d_parallel_region_item_count += entry.work_item_count;
+  // Hard join: run_parallel returns only after every worker has
+  // observed its claim past the end of work_item_count. No later band
+  // can read the regions' node output buffers until then.
+  g.worker_pool.run_parallel(
+      process_parallel_entry_region_item_worker, &dispatch);
+}
+
 static void process_schedule_band_serial(
     RTGraph &g,
     const GlobalScheduleBand &band,
@@ -5811,18 +5929,30 @@ static void process_schedule_band_serial(
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
 
-  // C1d-b: Free bands consume the prebuilt RegionLayerWorkItem slice
-  // per entry. Barrier bands stay on the legacy per-entry path —
-  // they are always singletons and gain nothing from per-region
-  // dispatch, and the narrower change keeps the C1d-b path's surface
-  // strictly inside FreeLayer execution. The C1c worker pool path
-  // (process_parallel_band_worker) keeps using process_entry, so the
-  // C1d-b counter is never touched from a worker thread.
+  // C1d-b/C1d-c: Free bands consume the prebuilt RegionLayerWorkItem
+  // slice per entry. Each entry chooses between two paths:
+  //
+  //   * C1d-c parallel: multi-region sink-free FreeLayer entry with
+  //     a worker pool > 1 — region items are dispatched through the
+  //     pool with a hard join before the next entry.
+  //   * C1d-b serial:   anything else (singleton entry, sink-bearing,
+  //     pool size <= 1). The audio thread walks the work-item slice
+  //     and increments the C1d-b serial counter per item.
+  //
+  // Barrier bands stay on the legacy per-entry path — they are always
+  // singletons and gain nothing from per-region dispatch. The C1c
+  // band-level worker path (process_parallel_band_worker) keeps using
+  // process_entry, so the C1d counters are never touched from a
+  // band-level worker thread.
   if (band.kind == GlobalScheduleBandKind::Free) {
     for (std::size_t i = 0; i < count; ++i) {
-      process_entry_via_work_items(g, g.global_schedule[first + i],
-                                   worker_ctx.nframes,
-                                   worker_ctx.block_ctx);
+      const GlobalScheduleEntry &entry = g.global_schedule[first + i];
+      if (entry_is_c1d_parallel_candidate(g, entry)) {
+        dispatch_c1d_parallel_entry(g, entry, worker_ctx.nframes);
+      } else {
+        process_entry_via_work_items(g, entry, worker_ctx.nframes,
+                                     worker_ctx.block_ctx);
+      }
     }
     return;
   }
@@ -6331,6 +6461,8 @@ static void reset_to_default_state(RTGraph &g) {
   g.last_c1d_candidate_item_count = 0;
   g.last_c1d_serialized_sink_entry_count = 0;
   g.last_c1d_serial_region_item_execution_count = 0;
+  g.last_c1d_parallel_entry_count = 0;
+  g.last_c1d_parallel_region_item_count = 0;
 
   // Discard any control commands that were enqueued before the
   // reload. Without this, drain_control_queue would replay stale
@@ -6935,6 +7067,14 @@ int rt_graph_test_last_c1d_serialized_sink_entry_count(const RTGraph *g) {
 int rt_graph_test_last_c1d_serial_region_item_execution_count(
     const RTGraph *g) {
   return g ? g->last_c1d_serial_region_item_execution_count : 0;
+}
+
+int rt_graph_test_last_c1d_parallel_entry_count(const RTGraph *g) {
+  return g ? g->last_c1d_parallel_entry_count : 0;
+}
+
+int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g) {
+  return g ? g->last_c1d_parallel_region_item_count : 0;
 }
 
 // Add or reconfigure one node at its dense runtime index in the named

@@ -813,6 +813,17 @@ int rt_graph_test_last_c1d_serialized_sink_entry_count(const RTGraph *g);
 int rt_graph_test_last_c1d_serial_region_item_execution_count(
     const RTGraph *g);
 
+// [T:read-only] Phase §4.E.2.C1d-c counters from the most recent
+// process block. `parallel_entry_count` increments once per multi-
+// region sink-free FreeLayer entry dispatched through the worker pool
+// at region-item granularity inside process_schedule_band_serial.
+// `parallel_region_item_count` totals the region items handed to the
+// pool. The C1c band-level worker path and the C1d-b serial path both
+// bypass these counters, so non-zero values prove region-item dispatch
+// was the path actually exercised this block. All return 0 on null g.
+int rt_graph_test_last_c1d_parallel_entry_count(const RTGraph *g);
+int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g);
+
 // ----------------------------------------------------------------
 // Multi-instance support
 // ----------------------------------------------------------------
