@@ -151,6 +151,16 @@ runWorkerBench demos = do
           | (_, _, result, speedup) <- workerRows
           , isPureC1dRow result
           ]
+  -- The cumulative `parallel_*` and `c1d_parallel_*` totals below sum
+  -- last-block snapshots across every row, including any future row
+  -- whose representative snapshot has both C1c and C1d-c activity.
+  -- Those totals describe overall dispatch *activity*. The
+  -- `worker_rows_with_*` counts and the `best_*` speedups instead use
+  -- attribution-safe predicates (`brParallelBands > 0` for C1c,
+  -- `isPureC1dRow` for C1d-c) so a mixed row never lets a C1c speedup
+  -- be reported as a C1d-c win. Today's corpus has no mixed rows;
+  -- both views agree numerically. They are intentionally distinct
+  -- concepts and the names should be read as such.
   putStrLn $ "# summary: cases=" <> show (length cases)
           <> ", rows=" <> show (length rows)
           <> ", worker_rows=" <> show (length workerRows)

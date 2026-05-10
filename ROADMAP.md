@@ -77,12 +77,17 @@ Parked / deferred:
   view shows a small but non-zero signal (4 sample-rate producer nodes
   across 4 distinct kinds wired only into block-latched ports). Metadata
   is preserved; the runtime path waits for the signal to grow.
-- **Region-level parallelism (§4.E).** Worker-pool Free-band dispatch is
-  test-gated and default-off; only targeted probes win. C1d-a region
-  work-item metadata, C1d-b serial region-item execution, and C1d-c
-  sink-free region-item worker dispatch are in place behind test/bench
-  switches. C1d-d instrumentation and decision refresh is the next
-  slice.
+- **Region-level parallelism (§4.E).** Frozen as test/bench-gated.
+  C1d-a region work-item metadata, C1d-b serial region-item execution,
+  C1d-c sink-free region-item worker dispatch, and C1d-d bench
+  instrumentation are all in place; the bench can now distinguish C1c
+  band-level wins from C1d-c region-item wins from schedule noise.
+  Decision recorded in
+  `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` remains
+  default-off: the synthetic envelope wins at scale, the Haskell-loaded
+  corpus barely crosses 1.0x on the best C1d-c row, and no
+  representative workload demands runtime parallelism today. No further
+  §4.E implementation work until a real workload demands it.
 - **Whole-region kernel codegen.** Deferred indefinitely. Hand-written DSP
   bodies plus narrow helpers (`SinkAccumulator`, `drive_oscillator`) are
   the working approach.
@@ -670,39 +675,43 @@ Current status:
    band-level dispatch, and C++ tests cover legacy equivalence, reduction
    equivalence, fallback cases, and per-block counter reset. The standing
    default-off decision remains unchanged.
+12. **C1d-d bench instrumentation and decision refresh — done,
+   default-off.** `--worker-bench` and the C++ synthetic bench now
+   expose `c1d_parallel_entries` / `c1d_parallel_items` per row plus a
+   `best_c1d_worker_speedup` summary; the synthetic bench gained a
+   dedicated `RegionItems` shape (single-instance, multi-region
+   sink-free FreeLayer) so the C1d-c path can be measured without C1c
+   contamination. The bench can now partition every row into C1c
+   (`parallel_bands > 0`), C1d-c (`parallel_bands == 0 ∧
+   c1d_parallel_entries > 0`), or schedule/serial noise. Synthetic
+   `RegionItems` reaches 2.20x at width 32 / block 512 / pool 4;
+   Haskell-loaded best C1d-c is 1.14x on a single targeted probe with
+   another row losing. Decision in
+   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` remains
+   default-off.
 
-Next §4.E slice:
+**Phase 4.E is now frozen as test/bench-gated.** No further §4.E
+implementation work — no C1d-e, no public switch, no additional
+synthetic workloads, no policy prototype — until a real workload
+appears whose region-layer shape and DSP weight argue for runtime
+parallelism. The bench is honest enough to recognize such a workload
+when it shows up; it is not honest enough to manufacture one.
 
-1. **C1d-d bench instrumentation and decision refresh.** Add C1d-c
-   counter columns to `--worker-bench` and the C++ synthetic worker bench,
-   then rerun `--fusion-survey`, `--worker-bench`, and the C++ bench.
-   Keep timing claims subordinate to counters: only rows with
-   region-item worker dispatch actually happening can support a
-   turn-on decision. Update
-   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` after the
-   data is collected.
-2. **More representative workload only if C1d is pursued further.** The
-   current C1d candidates are survey rows, not default-on evidence.
-   Before spending runtime complexity, add or identify real
-   Haskell-loaded demos with enough region-layer DSP work to have a
-   plausible crossover point. Useful target shapes remain:
-     - polyphonic synth with shared master FX (N voice templates →
-       BusOut → master template BusIn → master FX → Out);
-     - parallel FX rack (split → N parallel processing chains → join);
-     - multi-band processing (input → N band splits → per-band chains
-       → join);
-     - drum machine (N drum templates writing the same master BusOut).
-3. **No public switch or default-on path yet.** Do not expose worker
-   scheduling outside the test/bench ABI until a successor decision
-   record replaces the current default-off decision with explicit
-   corpus and threshold criteria.
+When a workload candidate does appear, the next §4.E slice is:
 
-**Stop condition.** After two corpus + bench iterations with no row
-showing > 1.0x parallel speedup (counter-confirmed `parallel_bands
-> 0`), freeze Phase C as test/bench gated and revisit only when a
-specific use case demands runtime parallelism. This bounds the work;
-the absence of such a bound is how parallelism projects accrete
-indefinitely.
+1. **Identify the load-bearing user.** Name the demo, plugin host,
+   pattern engine, or hosted graph that the workload comes from. A
+   benchmark row added purely to feed the bench is circular evidence
+   and is not authorized as a workload candidate by this freeze.
+2. **Prove the shape and weight.** Show the row registers as C1c or
+   C1d-c (counter-confirmed) and that legacy direct execution costs
+   enough block time to put a worker speedup near or above the
+   synthetic envelope (`RegionItems` at comparable width / block).
+3. **Replace the decision record.** Open a successor to
+   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` that names
+   the corpus, threshold, and proposed switch policy. Do not extend
+   that note in place — the freeze is recorded against its current
+   text.
 
 **The C0–C1 substrate has value independent of parallel dispatch.**
 Even if Phase C parallelism never ships, the global schedule, banded

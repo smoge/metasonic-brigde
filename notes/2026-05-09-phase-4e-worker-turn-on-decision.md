@@ -203,6 +203,17 @@ best_parallel_worker_speedup=1.39x   (C1c band-level)
 best_c1d_worker_speedup=1.03x        (C1d-c region-item)
 ```
 
+The cumulative totals (`parallel_bands`, `parallel_entries`,
+`serialized_sink_bands`, `c1d_parallel_entries`, `c1d_parallel_items`)
+sum last-block snapshots across every row and describe overall
+dispatch activity. The row counts and best-speedup fields
+(`worker_rows_with_*`, `best_*_worker_speedup`) instead use
+attribution-safe predicates — `parallel_bands > 0` for C1c,
+`parallel_bands == 0 ∧ c1d_parallel_entries > 0` for C1d-c — so a
+mixed row never lets a C1c speedup be reported as a C1d-c win. Today's
+corpus has no mixed rows, so the two views agree; they are
+intentionally distinct concepts and the names should be read that way.
+
 C1c rows (parallel_bands > 0):
 
 - `sched/free-only-parallel-compute` pool3-direct: 1.25x.
