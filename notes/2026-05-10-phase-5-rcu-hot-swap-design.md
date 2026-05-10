@@ -1,7 +1,7 @@
 # Phase 5 — RCU Hot-Swap Protocol
 
 Date: 2026-05-10
-Status: Phase 5.1.A/B, 5.2.A/B/C, and 5.3.A implemented.
+Status: Phase 5.1.A/B, 5.2.A/B/C, and 5.3.A/B implemented.
 
 This note pins the protocol for swapping a running MetaSonic graph
 without a stop/start cycle. It records what the runtime did before the
@@ -11,7 +11,7 @@ to commit to. Phase 5.1.A first stood up the publish / install / retire
 dance with an empty payload; Phase 5.1.B moves the swappable runtime
 world into `RTGraphState` and makes `RTGraphSwap` carry a real
 next-world payload. Phase 5.2 adds caller-tagged state migration, and
-Phase 5.3.A wraps the protocol for Haskell producers.
+Phase 5.3.A/B wraps the protocol for Haskell producers.
 
 ## 1. Today: stop / rebuild semantics
 
@@ -140,7 +140,8 @@ What the substrate provides:
 
 ## 4.1 Haskell producer helper landing
 
-Phase 5.3.A wraps the C ownership protocol in `MetaSonic.Bridge.FFI`:
+Phase 5.3.A/B wraps the C ownership protocol in
+`MetaSonic.Bridge.FFI`:
 
 - `hotSwapRuntimeGraph(target, maxFrames, rg)` and
   `hotSwapRuntimeGraphFused(target, maxFrames, rg)` build a temporary
@@ -155,10 +156,21 @@ Phase 5.3.A wraps the C ownership protocol in `MetaSonic.Bridge.FFI`:
   collects the installed retired swap if present, snapshots the Phase
   5.2 migration counters, disposes the old world off-audio, and returns
   `Nothing` when no retired swap is waiting.
+- `waitForSwapGeneration(target, priorGeneration, timeoutMs)` polls the
+  install-generation counter until it advances. Negative timeout waits
+  indefinitely, zero performs one non-blocking poll, and positive values
+  are milliseconds.
+- `hotSwapRuntimeGraphAndWait`, fused/template siblings included, are
+  the live-producer convenience path: capture the generation before
+  publish, publish the prepared world, wait for install, collect stats,
+  and return a result that distinguishes rejected publish from install
+  timeout.
 
-The helpers intentionally do not wait for installation. Offline tests
-drive one `rt_graph_process` block after publish; realtime callers let
-the callback advance and poll collection from the producer side.
+The plain 5.3.A helpers intentionally do not wait for installation.
+Offline tests drive one `rt_graph_process` block after publish;
+realtime callers can either poll manually or use the 5.3.B waited
+helpers so control producers know when it is safe to resume commands
+against the new world.
 
 ## 5. Realtime control queue across a swap
 

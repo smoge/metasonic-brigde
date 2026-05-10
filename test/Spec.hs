@@ -29,6 +29,7 @@ import qualified Data.Map.Strict           as M
 import qualified Data.Set                  as S
 import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
                                             sortBy)
+import           Control.Concurrent        (forkIO, threadDelay)
 import           Control.Exception         (try)
 import           Control.Monad             (forM, forM_, when)
 import           Data.Maybe                (mapMaybe)
@@ -45,6 +46,7 @@ import           Test.Tasty.QuickCheck     as QC
 
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI      (RTGraph,
+                                            HotSwapWaitResult (..),
                                             SwapMigrationStats (..),
                                             c_rt_graph_test_swap_generation,
                                             c_rt_graph_ensure_bus,
@@ -81,6 +83,7 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             instanceStatusReleasing,
                                             collectRetiredSwapStats,
                                             hotSwapRuntimeGraph,
+                                            hotSwapRuntimeGraphAndWait,
                                             loadRuntimeGraph,
                                             loadRuntimeGraphFused,
                                             loadTemplateGraph,
@@ -4734,6 +4737,64 @@ crossCuttingTests = testGroup "End-to-end FFI"
         secondStats <- collectRetiredSwapStats handle
         assertBool "expected second retired swap stats"
           (case secondStats of
+             Just _  -> True
+             Nothing -> False)
+
+  , testCase "hotSwapRuntimeGraphAndWait waits for install and reaps stats" $ do
+      let nframes = 256
+          graph = runSynth $ do
+            o <- tagged "voice-osc" (sinOsc 440.0 0.0)
+            out 0 o
+          compileOrFail g =
+            case lowerGraph g >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+
+      rt <- compileOrFail graph
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        _ <- forkIO $ do
+          threadDelay 10000
+          c_rt_graph_process handle (fromIntegral nframes)
+
+        result <- hotSwapRuntimeGraphAndWait handle nframes 1000 rt
+        result @?= HotSwapInstalled SwapMigrationStats
+          { smsCommittedCount = 1
+          , smsSkippedCount = 1
+          , smsInstanceCopyCount = 1
+          , smsStateCopyCount = 1
+          , smsLifecycleCopyCount = 1
+          }
+
+        none <- collectRetiredSwapStats handle
+        none @?= Nothing
+
+  , testCase "hotSwapRuntimeGraphAndWait reports timeout without reaping early" $ do
+      let nframes = 256
+          graph = runSynth $ do
+            o <- tagged "voice-osc" (sinOsc 550.0 0.0)
+            out 0 o
+          compileOrFail g =
+            case lowerGraph g >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+
+      rt <- compileOrFail graph
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+        result <- hotSwapRuntimeGraphAndWait handle nframes 0 rt
+        result @?= HotSwapInstallTimedOut
+
+        -- The timed-out publish is still owned by the runtime. Once
+        -- a block installs it, normal collection must still work.
+        c_rt_graph_process handle (fromIntegral nframes)
+        stats <- collectRetiredSwapStats handle
+        assertBool "expected delayed retired swap stats"
+          (case stats of
              Just _  -> True
              Nothing -> False)
 

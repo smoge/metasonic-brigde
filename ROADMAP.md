@@ -759,7 +759,7 @@ tags plus slot-index instance identity:
 
 ### 5.3 Producer ergonomics
 
-**5.3.A done.** The Haskell FFI now exposes the swap protocol without
+**5.3.A/B done.** The Haskell FFI now exposes the swap protocol without
 forcing callers to manually juggle every ownership edge:
 
 - `hotSwapRuntimeGraph` / `hotSwapRuntimeGraphFused` build a next
@@ -772,6 +772,10 @@ forcing callers to manually juggle every ownership edge:
 - Failed publish cancels the prepared swap before returning, so callers
   do not leak a next-world payload when the target already has a swap in
   flight or a retired swap waiting.
+- `waitForSwapGeneration` and the `hotSwap*AndWait` helpers add the
+  live-producer protocol: publish, wait for the install generation to
+  advance with a timeout, reap stats, then resume realtime commands
+  against the new world.
 
 Edit a graph in the Haskell DSL, recompile, and hear the change without
 restarting audio.

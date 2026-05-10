@@ -17,6 +17,7 @@ module MetaSonic.Bridge.FFI
     RTGraph
   , RTGraphSwap
   , SwapMigrationStats (..)
+  , HotSwapWaitResult (..)
   , -- * Lifecycle
     withRTGraph
   , -- * Loading a compiled graph (single-template, legacy)
@@ -25,12 +26,17 @@ module MetaSonic.Bridge.FFI
   , -- * Loading a compiled template graph (multi-template, §2.D.3)
     loadTemplateGraph
   , loadTemplateGraphFused
-  , -- * Phase 5.3.A hot-swap producer helpers
+  , -- * Phase 5.3 hot-swap producer helpers
     hotSwapRuntimeGraph
   , hotSwapRuntimeGraphFused
   , hotSwapTemplateGraph
   , hotSwapTemplateGraphFused
   , collectRetiredSwapStats
+  , waitForSwapGeneration
+  , hotSwapRuntimeGraphAndWait
+  , hotSwapRuntimeGraphFusedAndWait
+  , hotSwapTemplateGraphAndWait
+  , hotSwapTemplateGraphFusedAndWait
   , -- * Realtime audio lifecycle
     startAudio
   , waitAudioStarted
@@ -120,12 +126,14 @@ module MetaSonic.Bridge.FFI
   , instanceStatusReleasing
   ) where
 
+import           Control.Concurrent        (threadDelay)
 import           Control.Exception          (bracket)
 import qualified Control.Monad              as M (void)
 import           Control.Monad              (forM_, when)
 import           Foreign
 import           Foreign.C.String          (CString, withCAStringLen)
 import           Foreign.C.Types
+import           System.Timeout             (timeout)
 
 import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              FreeLayer (..),
@@ -318,6 +326,14 @@ data SwapMigrationStats = SwapMigrationStats
   , smsStateCopyCount      :: !Int
   , smsLifecycleCopyCount  :: !Int
   } deriving (Eq, Show)
+
+-- | Result of the 5.3.B publish + wait + collect helpers.
+data HotSwapWaitResult
+  = HotSwapPublishRejected
+  | HotSwapInstallTimedOut
+  | HotSwapInstalled !SwapMigrationStats
+  | HotSwapInstalledButRetiredMissing
+  deriving (Eq, Show)
 
 -- Foreign imports.
 -- See Note [Why ccall, not capi].
@@ -906,7 +922,7 @@ the audio thread to install it, collect the retired swap, then dispose
 it. That is the right C contract, but it is too easy for Haskell
 callers to leak a rejected swap or forget the retire-slot collection.
 
-The 5.3.A helpers below keep the same semantics while packaging the
+The 5.3 helpers below keep the same semantics while packaging the
 producer boilerplate:
 
   * hotSwap* builds the next world in a temporary RTGraph by reusing
@@ -918,10 +934,16 @@ producer boilerplate:
   * collectRetiredSwapStats is the reap point after an audio block has
     installed the swap. It snapshots the Phase 5.2 counters, disposes
     the retired swap, and returns Nothing when no retired swap exists.
+  * waitForSwapGeneration and the hotSwap*AndWait family add the
+    producer-side "publish, wait for install, collect, then resume
+    realtime commands" protocol. They poll the install-generation
+    counter rather than blocking inside C++.
 
-These helpers do not block waiting for installation. Offline callers
-drive one rt_graph_process block; realtime callers let the audio
-callback advance and poll collection from the producer side.
+The 5.3.A hotSwap* helpers do not block waiting for installation.
+Offline callers drive one rt_graph_process block; realtime callers let
+the audio callback advance and poll collection from the producer side.
+The 5.3.B hotSwap*AndWait helpers do wait, with a caller-supplied
+timeout in milliseconds.
 -}
 
 hotSwapWith
@@ -1015,6 +1037,78 @@ collectRetiredSwapStats target = do
         , smsStateCopyCount = fromIntegral states
         , smsLifecycleCopyCount = fromIntegral lifecycles
         }
+
+-- | Poll until the target's swap generation is greater than
+-- @priorGeneration@. A negative timeout waits indefinitely; zero
+-- performs a single non-blocking poll; positive values are
+-- milliseconds. Returns 'False' on timeout.
+waitForSwapGeneration :: Ptr RTGraph -> Int -> Int -> IO Bool
+waitForSwapGeneration target priorGeneration timeoutMs = do
+  let wanted = fromIntegral priorGeneration
+      installed = (> wanted)
+      poll = do
+        gen <- c_rt_graph_test_swap_generation target
+        if installed gen
+          then pure True
+          else threadDelay 1000 >> poll
+  first <- c_rt_graph_test_swap_generation target
+  if installed first
+    then pure True
+    else if timeoutMs == 0
+      then pure False
+      else if timeoutMs < 0
+        then poll
+        else do
+          result <- timeout (timeoutMs * 1000) poll
+          pure (maybe False id result)
+
+hotSwapAndWaitWith
+  :: (Ptr RTGraph -> Int -> a -> IO Bool)
+  -> Ptr RTGraph
+  -> Int
+  -> Int
+  -> a
+  -> IO HotSwapWaitResult
+hotSwapAndWaitWith publish target maxFrames timeoutMs payload = do
+  before <- c_rt_graph_test_swap_generation target
+  published <- publish target maxFrames payload
+  if not published
+    then pure HotSwapPublishRejected
+    else do
+      installed <- waitForSwapGeneration target (fromIntegral before) timeoutMs
+      if not installed
+        then pure HotSwapInstallTimedOut
+        else do
+          stats <- collectRetiredSwapStats target
+          pure $ case stats of
+            Just s  -> HotSwapInstalled s
+            Nothing -> HotSwapInstalledButRetiredMissing
+
+-- | Publish a single-template next world, wait until the audio thread
+-- installs it, collect migration stats, and dispose the retired old
+-- world. The timeout is in milliseconds; negative waits indefinitely.
+hotSwapRuntimeGraphAndWait
+  :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO HotSwapWaitResult
+hotSwapRuntimeGraphAndWait =
+  hotSwapAndWaitWith hotSwapRuntimeGraph
+
+-- | Fused-aware sibling of 'hotSwapRuntimeGraphAndWait'.
+hotSwapRuntimeGraphFusedAndWait
+  :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO HotSwapWaitResult
+hotSwapRuntimeGraphFusedAndWait =
+  hotSwapAndWaitWith hotSwapRuntimeGraphFused
+
+-- | Multi-template sibling of 'hotSwapRuntimeGraphAndWait'.
+hotSwapTemplateGraphAndWait
+  :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO HotSwapWaitResult
+hotSwapTemplateGraphAndWait =
+  hotSwapAndWaitWith hotSwapTemplateGraph
+
+-- | Fused-aware multi-template sibling of 'hotSwapTemplateGraphAndWait'.
+hotSwapTemplateGraphFusedAndWait
+  :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO HotSwapWaitResult
+hotSwapTemplateGraphFusedAndWait =
+  hotSwapAndWaitWith hotSwapTemplateGraphFused
 
 {- Note [Marshaling newtypes to C]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
