@@ -63,20 +63,19 @@ import           Foreign.Storable           (Storable (..))
 import           MetaSonic.Bridge.FFI       (RTGraph)
 import           MetaSonic.Types            (NodeIndex (..))
 
--- | Opaque handle to a running MIDI demo session. The pointer
--- target is owned by the C side; do not free it directly — always
--- go through 'closeMidiDemo' (or the 'withMidiDemo' bracket).
+-- | Opaque handle to a running MIDI demo session. The pointer target
+-- is owned by the C side; do not free it directly — always go through
+-- 'closeMidiDemo' (or the 'withMidiDemo' bracket).
 newtype MidiDemo = MidiDemo (Ptr CMidiDemo)
 
 -- Phantom for the C-side @rt_midi_demo@ struct; kept abstract.
 data CMidiDemo
 
 -- | Routing for note-on events. The voice map callback writes
--- frequency to @(vmFreqNode, vmFreqCtl)@, gate=1.0 to
--- @(vmGateNode, vmGateCtl)@, and velocity to @vmVelocity@ when
--- present. Note-offs go through 'VoiceAllocator' release, which
--- triggers the env's release segment — no separate gate=0 write
--- is needed here.
+-- frequency to @(vmFreqNode, vmFreqCtl)@, gate=1.0 to @(vmGateNode,
+-- vmGateCtl)@, and velocity to @vmVelocity@ when present. Note-offs
+-- go through 'VoiceAllocator' release, which triggers the env's
+-- release segment — no separate gate=0 write is needed here.
 data VoiceMapping = VoiceMapping
   { vmFreqNode :: !NodeIndex
   , vmFreqCtl  :: !Int
@@ -108,9 +107,9 @@ data PitchBendBinding = PitchBendBinding
 
 -- ---------------------------------------------------------------------------
 -- C-mirror Storable instances. The structs in midi_demo.h use the
--- platform's natural alignment for int / float, which on x86-64
--- Linux means 4-byte alignment throughout. Each instance is hand-
--- rolled so the size and offsets match the C compiler's layout.
+-- platform's natural alignment for int / float, which on x86-64 Linux
+-- means 4-byte alignment throughout. Each instance is hand-rolled so
+-- the size and offsets match the C compiler's layout.
 -- ---------------------------------------------------------------------------
 
 data CVoiceMapping = CVoiceMapping
@@ -149,8 +148,8 @@ data CCcMapping = CCcMapping
   }
 
 -- @uint8_t cc_number@ has 3 bytes of padding before @int node_index@
--- so that subsequent ints land on a 4-byte boundary; total size is
--- 20 bytes.
+-- so that subsequent ints land on a 4-byte boundary; total size is 20
+-- bytes.
 instance Storable CCcMapping where
   sizeOf    _ = 20
   alignment _ = 4
@@ -269,7 +268,7 @@ foreign import ccall unsafe "rt_midi_demo_has_device"
 
 -- | Open a live MIDI demo session over a loaded 'RTGraph'. Returns
 -- 'Nothing' on hard failure (null graph, allocation failure, thread
--- spawn failure). Returns 'Just' even when no MIDI device is present —
+-- spawn failure). Returns 'Just' even when no MIDI device is present,
 -- in that case the worker stays idle and 'midiHasDevice' reports 0.
 --
 -- The caller retains ownership of the 'Ptr RTGraph' and must keep it
@@ -305,8 +304,8 @@ closeMidiDemo :: MidiDemo -> IO ()
 closeMidiDemo (MidiDemo h) = c_rt_midi_demo_close h
 
 -- | Bracketed wrapper around 'openMidiDemo' \/ 'closeMidiDemo'. Runs
--- the body with a live session and ensures the session is closed
--- on every exit path (normal return, exception, async cancel). When
+-- the body with a live session and ensures the session is closed on
+-- every exit path (normal return, exception, async cancel). When
 -- 'openMidiDemo' returns 'Nothing', the body is invoked with
 -- 'Nothing' and no session is created.
 withMidiDemo
@@ -343,8 +342,8 @@ midiPitchBendCount :: MidiDemo -> IO Int
 midiPitchBendCount (MidiDemo h) = fromIntegral <$> c_rt_midi_demo_pitch_bend_count h
 
 -- | True if the underlying @q::midi_input_stream@ opened a real MIDI
--- device. False on no-device boxes and during the very first ms
--- after open before the worker has snapshot the state.
+-- device. False on no-device boxes and during the very first ms after
+-- open before the worker has snapshot the state.
 midiHasDevice :: MidiDemo -> IO Bool
 midiHasDevice (MidiDemo h) = (== 1) <$> c_rt_midi_demo_has_device h
 

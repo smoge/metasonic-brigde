@@ -9,14 +9,14 @@
 -- Module      : MetaSonic.Bridge.Templates
 -- Description : Inter-template ordering from bus dataflow
 --
--- One pipeline stage above 'MetaSonic.Bridge.Compile'. Where 'Compile'
--- produces a dense per-template 'RuntimeGraph', this module composes
--- several templates into a 'TemplateGraph': an ordered list of
--- templates plus the precedence DAG that the compiler decreed by
+-- One pipeline stage above 'MetaSonic.Bridge.Compile'. Where
+-- 'Compile' produces a dense per-template 'RuntimeGraph', this module
+-- composes several templates into a 'TemplateGraph': an ordered list
+-- of templates plus the precedence DAG that the compiler decreed by
 -- analyzing each template's bus reads/writes.
 --
--- The whole module exists to keep execution order on the Haskell
--- side at compile time, the way intra-graph ordering already is. The
+-- The whole module exists to keep execution order on the Haskell side
+-- at compile time, the way intra-graph ordering already is. The
 -- runtime stays a dumb executor: it iterates templates in the order
 -- it was handed and never reorders. Users do not get SC-style live
 -- 'head'/'tail'/'before'/'after' ordering primitives — instead, they
@@ -54,6 +54,7 @@ import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Types
 
+
 {- Note [Template-level precedence from bus dataflow]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The intra-graph scheduler already derives execution order from data
@@ -63,19 +64,19 @@ that idea applied one tier up.
 
 Each template exposes a 'BusFootprint': the set of bus indices it
 writes (via 'Out' or 'BusOut'), the set it reads live (via 'BusIn'),
-and the set it reads delayed (via 'BusInDelayed'). The 'Eff'
-machinery already classifies these uniformly — see Note [Effects are
-per-UGen, not per-kind] in "MetaSonic.Bridge.Source" — so footprint
-extraction is a single fold over 'irEffects'.
+and the set it reads delayed (via 'BusInDelayed'). The 'Eff' machinery
+already classifies these uniformly — see Note [Effects are per-UGen,
+not per-kind] in "MetaSonic.Bridge.Source" — so footprint extraction
+is a single fold over 'irEffects'.
 
 Precedence between two templates @T_a@ and @T_b@:
 
   T_a precedes T_b   iff   bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅
 
-That is: if @T_b@ reads, in this block, a bus that @T_a@ writes,
-then @T_a@ must run first. This is the inter-template counterpart of
-E_r. 'BusReadDelayed' deliberately does not contribute, exactly as
-within a single graph — see Note [Effect-induced edges (E_r)] in
+That is: if @T_b@ reads, in this block, a bus that @T_a@ writes, then
+@T_a@ must run first. This is the inter-template counterpart of E_r.
+'BusReadDelayed' deliberately does not contribute, exactly as within a
+single graph — see Note [Effect-induced edges (E_r)] in
 "MetaSonic.Bridge.Validate" — so cross-template feedback through
 'BusInDelayed' stays schedulable.
 
@@ -87,9 +88,9 @@ Operationally, the C++ runtime will iterate templates in the order
 this module produces and run every instance of each template before
 moving on. Within a template, instances run in insertion order; cross-
 instance ordering is determined entirely by template-level precedence.
-This is the "groups exist, but as a derivation, not a primitive"
-model — see the project memory entry for why metasonic deliberately
-rejects SC's runtime ordering primitives.
+This is the "groups exist, but as a derivation, not a primitive" model
+— see the project memory entry for why metasonic deliberately rejects
+SC's runtime ordering primitives.
 -}
 
 -- | A dense template identifier, parallel to 'NodeIndex'. Storage
@@ -108,12 +109,11 @@ kinds or controls — so any future 'Eff' constructor that names a bus
 ('BufRead'/'BufWrite' on a shared buffer, etc.) is one pattern-match
 away from contributing to template-level precedence.
 
-The three sets are deliberately disjoint in role even though the
-same bus number can appear in more than one. A template that does
-'BusOut 5' followed by 'BusInDelayed 5' is a valid self-feedback
-shape and contributes both to 'bfWrites' and to 'bfDelayedReads' on
-bus 5; only 'bfWrites' is consulted when computing precedence
-against peers.
+The three sets are deliberately disjoint in role even though the same
+bus number can appear in more than one. A template that does 'BusOut
+5' followed by 'BusInDelayed 5' is a valid self-feedback shape and
+contributes both to 'bfWrites' and to 'bfDelayedReads' on bus 5; only
+'bfWrites' is consulted when computing precedence against peers.
 -}
 
 -- The 'BusFootprint' type and 'emptyFootprint' helper are defined in
@@ -156,15 +156,15 @@ be transferred across an FFI boundary.
 
 Storage order in 'tgTemplates' equals execution order. The runtime
 will iterate templates left-to-right and run every instance of each
-template before moving on. 'tgPrecedence' is a reader-keyed
-dependency map ('reader → set of writers that must precede it'),
-retained for diagnostics, future region-DAG-style scheduling, and
-optional incremental recompilation.
+template before moving on. 'tgPrecedence' is a reader-keyed dependency
+map ('reader → set of writers that must precede it'), retained for
+diagnostics, future region-DAG-style scheduling, and optional
+incremental recompilation.
 
 The 'TemplateID' assigned to each template is its position in the
-input list, *not* its position in 'tgTemplates' — that way callers
-can reference a template by the ID they constructed it with even if
-the topological sort permuted the order. Callers that want a stable,
+input list, *not* its position in 'tgTemplates' — that way callers can
+reference a template by the ID they constructed it with even if the
+topological sort permuted the order. Callers that want a stable,
 content-addressed ID should hash the template themselves.
 -}
 
@@ -188,16 +188,16 @@ The function runs four stages, each of which can fail with a
 diagnostic:
 
   1. Per-template lowering: each '(name, SynthGraph)' pair runs
-     through 'lowerGraph' and 'compileRuntimeGraph'. A failure here
-     is a single-template compile error; it is reported with the
-     template name to disambiguate.
+     through 'lowerGraph' and 'compileRuntimeGraph'. A failure here is
+     a single-template compile error; it is reported with the template
+     name to disambiguate.
 
   2. Name uniqueness check. Templates are referenced by name in
      diagnostics; collisions would make error messages ambiguous.
 
   3. Precedence derivation: pairwise intersection of writes against
-     live reads. O(N²) in the number of templates, which is fine —
-     N is small (a typical synth ensemble has < 100 templates).
+     live reads. O(N²) in the number of templates, which is fine — N
+     is small (a typical synth ensemble has < 100 templates).
 
   4. Topological sort: DFS with cycle detection over the precedence
      DAG. Cycles are reported with the offending template names and
@@ -212,8 +212,8 @@ compileTemplateGraph
   -> Either String TemplateGraph
 compileTemplateGraph entries = do
   -- Stage 1: per-template lowering. The 'TemplateID' is the input
-  -- position so callers can reference templates by construction
-  -- order regardless of the final execution order.
+  -- position so callers can reference templates by construction order
+  -- regardless of the final execution order.
   templates <- mapM compileOne (zip [0..] entries)
 
   -- Stage 2: name uniqueness.
@@ -249,13 +249,13 @@ compileTemplateGraph entries = do
 -- | Step C sibling of 'compileTemplateGraph'. Each template's
 -- 'tplGraph' is produced by 'compileRuntimeGraphFused', so the
 -- resulting 'TemplateGraph' carries 'RFused' inputs and 'rnElided'
--- nodes wherever the single-edge Gain rewrite applies. Stages
--- 2–4 (name uniqueness, precedence DAG, topo sort) are unchanged
--- — fusion does not touch effect annotations or bus footprints.
+-- nodes wherever the single-edge Gain rewrite applies. Stages 2–4
+-- (name uniqueness, precedence DAG, topo sort) are unchanged — fusion
+-- does not touch effect annotations or bus footprints.
 --
--- This is the constructor that 'loadTemplateGraphFused' is
--- designed to consume; passing it to 'loadTemplateGraph' (the
--- unfused loader) raises the documented fail-fast error.
+-- This is the constructor that 'loadTemplateGraphFused' is designed
+-- to consume; passing it to 'loadTemplateGraph' (the unfused loader)
+-- raises the documented fail-fast error.
 compileTemplateGraphFused
   :: [(String, SynthGraph)]
   -> Either String TemplateGraph
@@ -295,9 +295,9 @@ checkUniqueNames ts =
        ns  -> Left $ "duplicate template name(s): "
                   <> intercalate ", " (map show ns)
 
--- | Build the reader-keyed precedence map: for each template @b@,
--- the set of templates @a@ such that @a@'s writes intersect @b@'s
--- live reads.
+-- | Build the reader-keyed precedence map: for each template @b@, the
+-- set of templates @a@ such that @a@'s writes intersect @b@'s live
+-- reads.
 --
 -- Quadratic in the number of templates, which is fine — template
 -- counts are tiny.
@@ -317,16 +317,18 @@ computePrecedence ts = M.fromList
   | b <- ts
   ]
 
+
 {- Note [Template topo-sort]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 The same DFS-with-marks pattern as 'topoSort' in
 "MetaSonic.Bridge.Validate", but operating on the inter-template
 precedence map instead of the intra-graph dependency map. Cycles are
-reported with the chain of template names and the buses that made
-each link.
+reported with the chain of template names and the buses that made each
+link.
 
-Diagnostic shape: "cycle: A → B → A on bus 5". The user's remedy is
-to replace one of the live reads in the cycle with a delayed read,
+Diagnostic shape: "cycle: A → B → A on bus 5". The user's remedy is to
+replace one of the live reads in the cycle with a delayed read,
 exactly as within a single graph.
 -}
 
@@ -371,36 +373,33 @@ topoSortTemplates ts precedence = do
 
 -- | Read-only ensemble-level schedule view used by the
 -- '--fusion-survey' parallel-readiness section. Pairs the
--- template-precedence DAG width with the per-template
--- aggregate produced by 'addScheduleStats'.
+-- template-precedence DAG width with the per-template aggregate
+-- produced by 'addScheduleStats'.
 --
--- The precedence-layer width is the natural cross-template
--- analogue of 'rssMaxFreeLayerWidth' inside a single graph: how
--- many templates land at the same topological layer of
--- 'tgPrecedence' — i.e. have no precedence dependency on each
--- other through bus dataflow. Width 1 means templates form a
--- precedence chain; width @>= 2@ means the precedence DAG has
--- candidate cross-template surface area even when each template
--- is internally barrier-dominated.
+-- The precedence-layer width is the natural cross-template analogue
+-- of 'rssMaxFreeLayerWidth' inside a single graph: how many templates
+-- land at the same topological layer of 'tgPrecedence' — i.e. have no
+-- precedence dependency on each other through bus dataflow. Width 1
+-- means templates form a precedence chain; width @>= 2@ means the
+-- precedence DAG has candidate cross-template surface area even when
+-- each template is internally barrier-dominated.
 --
 -- This is /template precedence width/, not direct schedulable
--- parallelism. Two templates at the same layer may still both
--- write the same bus (no read-after-write between them, but a
--- write-write conflict on shared state). Actually executing them
--- concurrently would require either per-worker bus accumulation
--- with a deterministic reduction step, or serialization of
--- conflicting writers. Designing that policy is out of scope for
--- this descriptive stat.
+-- parallelism. Two templates at the same layer may still both write
+-- the same bus (no read-after-write between them, but a write-write
+-- conflict on shared state). Actually executing them concurrently
+-- would require either per-worker bus accumulation with a
+-- deterministic reduction step, or serialization of conflicting
+-- writers. Designing that policy is out of scope for this descriptive
+-- stat.
 --
--- The runnable/reduction fields split that ambiguity without
--- choosing a policy: a full template layer with no shared writes
--- contributes to 'tssMaxTemplateRunnableWidth'; a full layer with
--- at least one shared-write hazard contributes to
--- 'tssMaxTemplateReductionWidth'.
+-- The runnable/reduction fields split that ambiguity without choosing
+-- a policy: a full template layer with no shared writes contributes
+-- to 'tssMaxTemplateRunnableWidth'; a full layer with at least one
+-- shared-write hazard contributes to 'tssMaxTemplateReductionWidth'.
 --
 -- The C++ side still walks templates in their compile-decreed
--- @tgTemplates@ order; nothing currently consumes the layer
--- width.
+-- @tgTemplates@ order; nothing currently consumes the layer width.
 data TemplateScheduleStats = TemplateScheduleStats
   { tssTemplateCount         :: !Int
     -- ^ Total templates in the ensemble.
@@ -418,18 +417,18 @@ data TemplateScheduleStats = TemplateScheduleStats
     -- runnable without deterministic reduction.
   , tssMaxTemplateReductionWidth
                               :: !Int
-    -- ^ Widest full template layer that has at least one
-    -- shared-write hazard: candidate width that needs a
-    -- deterministic reduction or serialization policy.
+    -- ^ Widest full template layer that has at least one shared-write
+    -- hazard: candidate width that needs a deterministic reduction or
+    -- serialization policy.
   , tssAggregate             :: !RegionScheduleStats
-    -- ^ Per-template stats combined via 'addScheduleStats'
-    -- (counts add; widths take the max).
+    -- ^ Per-template stats combined via 'addScheduleStats' (counts
+    -- add; widths take the max).
   } deriving stock (Eq, Show)
 
 -- | Compute 'TemplateScheduleStats' for an ensemble. Forwards any
 -- per-template 'regionScheduleStats' diagnostic on @Left@ so a
--- malformed template propagates as a survey-row failure rather
--- than a silent zero entry.
+-- malformed template propagates as a survey-row failure rather than a
+-- silent zero entry.
 templateScheduleStats
   :: TemplateGraph -> Either String TemplateScheduleStats
 templateScheduleStats tg = do
@@ -458,12 +457,12 @@ templateScheduleStats tg = do
     }
 
 -- | Kahn's by-layer over 'tgPrecedence': the width of each
--- precedence-DAG layer is the count of templates whose
--- predecessors are all already scheduled.
+-- precedence-DAG layer is the count of templates whose predecessors
+-- are all already scheduled.
 --
--- @tgPrecedence@ is keyed by the /reader/ template (the one
--- that depends), so a template missing from the map has no
--- predecessors and lands in layer 0.
+-- @tgPrecedence@ is keyed by the /reader/ template (the one that
+-- depends), so a template missing from the map has no predecessors
+-- and lands in layer 0.
 templateLayers :: TemplateGraph -> [[Template]]
 templateLayers tg =
   let tids       = map tplID (tgTemplates tg)

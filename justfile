@@ -60,5 +60,5 @@ cpp-bench: cpp-bench-build
 
 build: stack-build cpp-build
 
-push-bitbucket:
+push:
     git push -u bitbucket main

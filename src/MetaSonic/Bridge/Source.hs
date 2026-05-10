@@ -8,15 +8,15 @@
 -- Module      : MetaSonic.Source
 -- Description : Source-level graph construction DSL
 --
--- The user-facing language for building synthesis graphs.
--- This module is entirely surface syntax — it records the
--- user's intent without computing what the graph means.
+-- The user-facing language for building synthesis graphs. This module is
+-- entirely surface syntax — it records the user's intent without computing what
+-- the graph means.
 --
--- See Note [Surface syntax vs semantic syntax] for how this
--- module relates to the deeper compilation passes.
+-- See Note [Surface syntax vs semantic syntax] for how this module
+-- relates to the deeper compilation passes.
 --
--- See Note [Builder monad design] for why graph construction
--- uses strict State rather than a free monad.
+-- See Note [Builder monad design] for why graph construction uses
+-- strict State rather than a free monad.
 
 module MetaSonic.Bridge.Source
   ( -- * Source-level types
@@ -79,10 +79,10 @@ import           MetaSonic.Types
 
 {- Note [Surface syntax vs semantic syntax]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-One can distinguish surface syntax (what the user writes)
-from semantic syntax (the compiler's internal account of signal
-equations, state transitions, staging boundaries, and resource
-constraints).
+
+One can distinguish surface syntax (what the user writes) from
+semantic syntax (the compiler's internal account of signal equations,
+state transitions, staging boundaries, and resource constraints).
 
 This module is entirely surface syntax:
 
@@ -91,71 +91,69 @@ This module is entirely surface syntax:
   - SynthGraph is an unordered map of node specifications
   - No rates, no effects, no execution order
 
-The semantic account begins in MetaSonic.IR, where lowerGraph
-strips the DSL vocabulary and annotates each node with Rate
-and Eff metadata. A future MetaSonic.Semantic module would go
-further, deriving signal expressions by symbolic propagation
-(following Faust's strategy) rather than preserving node
-granularity.
+The semantic account begins in MetaSonic.IR, where lowerGraph strips
+the DSL vocabulary and annotates each node with Rate and Eff metadata.
 
-See Note [Rate discipline] in MetaSonic.Types for the
-annotation system that the IR introduces.
+A MetaSonic.Semantic module would take this further: deriving signal
+expressions by symbolic propagation (following Faust's strategy)
+rather than preserving node granularity.
+
+See Note [Rate discipline] in MetaSonic.Types for the annotation
+system that the IR introduces.
 -}
 
 {- Note [Connection design]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
-A Connection is the atomic unit of wiring in the source graph.
-It is either an audio-rate edge from another node's output
-port (Audio NodeID PortIndex), or a literal parameter value
-(Param Double).
+
+A Connection is the atomic unit of wiring in the source graph. It is
+either an audio-rate edge from another node's output port (Audio
+NodeID PortIndex), or a literal parameter value (Param Double).
 
 This distinction matters for compilation:
 
-  - A Param is a compile-time constant. It carries no
-    dependency, imposes no execution ordering, and will be
-    lowered to a control slot in the C++ runtime.
+  - 'Param' — compile-time constant; no dependency, no ordering
+    constraint; lowered to a C++ control slot.
 
-  - An Audio connection creates a data dependency: the source
-    node must be computed before the destination node. This
-    dependency is extracted by the dependencies function and
-    drives topological sorting in MetaSonic.Validate.
+  - 'Audio' — data dependency; source node must precede destination in
+    topological order; extracted by `dependencies` and drives sorting
+    in MetaSonic.Validate.
 
-Every UGen input is uniformly a Connection, which means the
-compiler can extract the dependency graph from UGen structure
-alone — no special cases, no implicit wiring.
+Every UGen input is uniformly a Connection, which means the compiler
+can extract the dependency graph from UGen structure alone — no
+special cases, no implicit wiring.
 
-See Note [Structural vs implicit dependencies] for how this
-relates to the effect-dependency system.
+See Note [Structural vs implicit dependencies] for how this relates to
+the effect-dependency system.
 -}
+
 
 {- Note [Structural vs implicit dependencies]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The dependencies function extracts only structural
-dependencies — the explicit Audio edges drawn by the user.
-Param values are dependency-free.
 
-This is sufficient for topological sorting and for the current
-sequential runtime, but it is not sufficient for correct
-parallel execution.
+The dependencies function extracts only structural dependencies — the
+explicit Audio edges drawn by the user. Param values are
+dependency-free.
 
-Semantically schedulable graph must also include implicit
-dependencies derived from resource effects:
+This is sufficient for topological sorting and the current sequential
+runtime. It is not sufficient for correct parallel execution.
+
+Semantically schedulable graph must also include implicit dependencies
+derived from resource effects:
 
   G* = (N, E_s ∪ E_r ∪ E_t)
 
-where E_s are structural edges (what dependencies extracts),
-E_r are resource-induced edges, and E_t are temporal or
-rate-boundary edges.
+where E_s are structural edges (what dependencies extracts), E_r are
+resource-induced edges, and E_t are temporal or rate-boundary edges.
 
-Implicit dependencies are computed later, after annotation, in
-a future MetaSonic.Effects module using the Eff annotations on
-NodeIR. At this level (source syntax), we extract only E_s.
+Implicit dependencies are computed later, after annotation, in a
+future MetaSonic.Effects module using the Eff annotations on NodeIR.
+At this level (source syntax), we extract only E_s.
 
 See Note [Resource effects] in MetaSonic.Types.
 -}
 
--- | A connection to a node input: either an audio edge from
--- another node's output, or a literal constant.
+-- | A connection to a node input: either an audio edge from another node's
+-- output, or a literal constant.
 --
 -- See Note [Connection design].
 data Connection
@@ -168,18 +166,20 @@ data Connection
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
+
 {- Note [Num/Fractional Connection]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 'fromInteger' and 'fromRational' make 'Connection' a target of numeric
 literal defaulting, so the user can write @sinOsc 440.0 0.0@ and have
 the literals lower to @Param 440.0@ and @Param 0.0@. Without this,
 every literal would need an explicit @Param@ wrapper.
 
-Arithmetic operators are partial: 'Param a + Param b' folds to a single
-'Param', but operating on an 'Audio' edge is a compile-time error
-because there is no meaningful constant-folding for runtime signals.
-The user-facing remedy is to use the 'add' or 'gain' graph nodes
-instead, which represent that operation at the runtime level.
+Arithmetic operators are partial: 'Param a + Param b' folds to a
+single 'Param', but operating on an 'Audio' edge is a compile-time
+error because there is no meaningful constant-folding for runtime
+signals. The user-facing remedy is to use the 'add' or 'gain' graph
+nodes instead, which represent that operation at the runtime level.
 -}
 
 instance Num Connection where
@@ -215,11 +215,13 @@ audioArithErr op _ = error $
   <> " on an audio-rate Connection is undefined at compile time. "
   <> "Use the 'add' or 'gain' graph nodes for runtime arithmetic."
 
+
 {- Note [UGen extensibility]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Each UGen constructor defines a DSP primitive. The
-constructor's fields are Connections, not raw values — every
-input is uniformly either a constant or a dependency.
+
+Each UGen constructor defines a DSP primitive. The constructor's
+fields are Connections, not raw values — every input is uniformly
+either a constant or a dependency.
 
 The current set covers oscillators, filters, signal transforms,
 envelopes, smoothing, bus routing, and delay:
@@ -246,58 +248,72 @@ envelopes, smoothing, bus routing, and delay:
 Adding a new UGen constructor requires coordinated changes across:
 
   - 'NodeKind' constructor + 'kindSpec' row in "MetaSonic.Types"
+
   - 'UGen' constructor + 'ugenView' row + builder in this module
+
   - per-instance 'inferEff' case in "MetaSonic.Bridge.IR" if effects
     depend on a constructor field (see 'BusOut' / 'BusIn')
+
   - C++ enum value, 'configure_spec' / 'init_node_state' cases,
-    'process_*' kernel, and 'process_instance' dispatch in @rt_graph.cpp@
+    'process_*' kernel, and 'process_instance' dispatch in
+    @rt_graph.cpp@
 
 A property test in @test/Spec.hs@ cross-checks 'kindSpec' against
-'ugenView' so the two sources of per-kind shape information cannot drift.
+'ugenView' so the two sources of per-kind shape information cannot
+drift.
 -}
+
 
 {- Note [Bus model: SC-style same-cycle audio buses]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 'Out', 'BusOut' and 'BusIn' all operate on the same underlying pool of
-audio buses. The C++ runtime stores one 'output_buses' vector indexed by
-bus number; the audio callback routes 'output_buses[0..output_channels-1]'
-to hardware regardless of which UGen wrote to them. So 'Out' is, in the
-runtime, just a 'BusOut' to a bus number that happens to be hardware-routed.
+audio buses. The C++ runtime stores one 'output_buses' vector indexed
+by bus number; the audio callback routes
+'output_buses[0..output_channels-1]' to hardware regardless of which
+UGen wrote to them. So 'Out' is, in the runtime, just a 'BusOut' to a
+bus number that happens to be hardware-routed.
 
   Out 0     ≡  BusOut 0   when bus 0 is a hardware output
   BusOut 5  ≡  Out 5      if you reconfigure bus 5 as a hardware output
 
 We keep 'Out' and 'BusOut' as separate UGen constructors at the source
-level for documentation: 'Out' reads as "final output" while 'BusOut' reads
-as "intermediate routing". They share the same C++ kernel.
+level for documentation: 'Out' reads as "final output" while 'BusOut'
+reads as "intermediate routing". They share the same C++ kernel.
 
 Semantics within a block (mirrors SuperCollider's 'Out.ar' / 'In.ar'):
 
   - At the start of each block, every bus is zeroed.
+
   - 'BusOut n' accumulates its input additively into bus n. Multiple
     writers to the same bus sum.
-  - 'BusIn n' reads the current contents of bus n.
-  - Ordering: 'BusOut n' executes before 'BusIn n' in the same block, so
-    'BusIn' always sees the live value. This is enforced by E_r edges
-    derived from the 'BusWrite n' / 'BusRead n' effects on the writer/
-    reader; the ordering is *not* a runtime convention but a compile-time
-    edge in the dependency graph used by topological sort.
 
-Cross-cycle ("delayed") read: 'BusInDelayed n' is the second reader form.
-It reads the previous block's snapshot of bus n rather than the live
-contents. Concretely:
+  - 'BusIn n' reads the current contents of bus n.
+
+  - Ordering: 'BusOut n' executes before 'BusIn n' in the same block,
+    so 'BusIn' always sees the live value. This is enforced by E_r
+    edges derived from the 'BusWrite n' / 'BusRead n' effects on the
+    writer/ reader; the ordering is *not* a runtime convention but a
+    compile-time edge in the dependency graph used by topological
+    sort.
+
+Cross-cycle ("delayed") read: 'BusInDelayed n' is the second reader
+form. It reads the previous block's snapshot of bus n rather than the
+live contents. Concretely:
 
   - 'BusInDelayed' carries 'BusReadDelayed n' as its effect, *not*
     'BusRead n'. The scheduler's E_r derivation (in
-    "MetaSonic.Bridge.Validate") only pairs 'BusWrite' with 'BusRead' —
-    it ignores 'BusReadDelayed' — so a 'BusInDelayed n' can sit anywhere
-    in the topological order relative to 'BusOut n'.
+    "MetaSonic.Bridge.Validate") only pairs 'BusWrite' with 'BusRead'
+    -- it ignores 'BusReadDelayed' — so a 'BusInDelayed n' can sit
+    anywhere in the topological order relative to 'BusOut n'.
+
   - The runtime maintains a double-buffered bus pool: at the start of
     each block it swaps the live and snapshot buffers and zeroes the
     new live buffer. 'BusOut' writes to live; 'BusIn' reads live;
     'BusInDelayed' reads the frozen snapshot of what the *previous*
     block wrote. See Note [Bus pool double-buffering] in
     @tinysynth/rt_graph.cpp@.
+
   - On the very first block the snapshot is zero (initial state), so a
     first-block 'BusInDelayed' produces silence — same as reading a
     bus that no one ever wrote.
@@ -309,11 +325,11 @@ across the block boundary, where the snapshot buffer breaks the loop.
 A graph that uses live 'BusIn n' instead of 'BusInDelayed n' inside a
 feedback path is rejected by the cycle detector, exactly as before.
 
-In SuperCollider terms, 'BusIn' corresponds to 'In.ar' and 'BusInDelayed'
-corresponds to 'InFeedback.ar'.
+In SuperCollider terms, 'BusIn' corresponds to 'In.ar' and
+'BusInDelayed' corresponds to 'InFeedback.ar'.
 
-See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate" for
-the scheduling pass that derives the BusOut → BusIn edges, Note
+See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate"
+for the scheduling pass that derives the BusOut → BusIn edges, Note
 [Resource effects] in "MetaSonic.Types" for the underlying 'Eff' type,
 and Note [Bus pool double-buffering] in @tinysynth/rt_graph.cpp@ for
 the runtime-side ping-pong implementation.
@@ -321,13 +337,13 @@ the runtime-side ping-pong implementation.
 
 -- | A unit generator specification.
 --
--- 'UGen' is the source-level vocabulary of primitive graph
--- nodes. Each constructor describes one DSP or routing
--- operation before lowering to IR and dense runtime form.
+-- 'UGen' is the source-level vocabulary of primitive graph nodes.
+-- Each constructor describes one DSP or routing operation before
+-- lowering to IR and dense runtime form.
 --
--- At this level, the graph is still expressed as primitive
--- nodes and explicit connections. This makes 'UGen' a unit-
--- node DAG representation in the current prototype.
+-- At this level, the graph is still expressed as primitive nodes and
+-- explicit connections. This makes 'UGen' a unit- node DAG
+-- representation in the current prototype.
 --
 -- Later compilation passes may group source nodes into regions and
 -- may elide some kernels through fusion. That optimization preserves
@@ -344,23 +360,23 @@ data UGen
     --
     -- Operationally identical to 'BusOut' on a bus number that the
     -- audio callback routes to hardware. Kept as a separate
-    -- constructor for source-level documentation ("final output"
-    -- vs. "intermediate routing"). Carries a 'BusWrite' effect on
-    -- its channel number; same-cycle E_r ordering applies.
+    -- constructor for source-level documentation ("final output" vs.
+    -- "intermediate routing"). Carries a 'BusWrite' effect on its
+    -- channel number; same-cycle E_r ordering applies.
   | BusOut !Int !Connection
     -- ^ Audio-bus write: bus index, input signal.
     --
-    -- Accumulates the input signal additively into the named bus
-    -- over the block. Multiple writers to the same bus sum.
-    -- Carries 'BusWrite n' as its effect, which produces an E_r
-    -- edge to every same-bus 'BusIn' in the topological sort.
+    -- Accumulates the input signal additively into the named bus over
+    -- the block. Multiple writers to the same bus sum. Carries
+    -- 'BusWrite n' as its effect, which produces an E_r edge to every
+    -- same-bus 'BusIn' in the topological sort.
   | BusIn !Int
     -- ^ Audio-bus read: bus index.
     --
     -- Reads the current contents of the named bus into its output
-    -- port. Carries 'BusRead n', which makes it execute *after*
-    -- every 'BusOut' / 'Out' on the same bus in the same block —
-    -- so 'BusIn' always sees the live, accumulated value.
+    -- port. Carries 'BusRead n', which makes it execute *after* every
+    -- 'BusOut' / 'Out' on the same bus in the same block — so 'BusIn'
+    -- always sees the live, accumulated value.
   | BusInDelayed !Int
     -- ^ Audio-bus delayed read: bus index. Reads the *previous*
     -- block's accumulated contents of the named bus.
@@ -374,17 +390,18 @@ data UGen
     -- so the snapshot 'BusInDelayed' reads is always exactly what the
     -- previous block wrote (zero on the very first block).
     --
-    -- The delayed read is the SuperCollider 'InFeedback.ar' counterpart;
-    -- see Note [Bus model: SC-style same-cycle audio buses].
+    -- The delayed read is the SuperCollider 'InFeedback.ar'
+    -- counterpart; see Note [Bus model: SC-style same-cycle audio
+    -- buses].
   | SinOsc !Connection !Connection
     -- ^ Sine oscillator: frequency, initial phase.
   | SawOsc !Connection !Connection
     -- ^ Bandlimited sawtooth oscillator: frequency, initial phase.
   | PulseOsc !Connection !Connection !Connection
-    -- ^ Bandlimited pulse oscillator: frequency, initial phase,
-    -- pulse width in [0, 1]. The width input is the intermodulation
-    -- primitive — drive it with an LFO for classic PWM. Width 0.5
-    -- = square wave.
+    -- ^ Bandlimited pulse oscillator: frequency, initial phase, pulse
+    -- width in [0, 1]. The width input is the intermodulation
+    -- primitive — drive it with an LFO for classic PWM. Width 0.5 =
+    -- square wave.
   | TriOsc !Connection !Connection
     -- ^ Bandlimited triangle oscillator: frequency, initial phase.
     -- Same shape as 'SinOsc' \/ 'SawOsc'.
@@ -405,17 +422,17 @@ data UGen
     -- ^ Multiply: input signal, gain amount.
   | Add !Connection !Connection
     -- ^ Sum two inputs sample-by-sample. Either input may be a
-    -- 'Param' constant (acting as a bias) or an 'Audio' edge.
-    -- Used to bias a bipolar modulator off zero (turning ring mod
-    -- into AM, or through-zero FM into vibrato).
+    -- 'Param' constant (acting as a bias) or an 'Audio' edge. Used to
+    -- bias a bipolar modulator off zero (turning ring mod into AM, or
+    -- through-zero FM into vibrato).
   | Delay !Double !Connection !Connection
-    -- ^ Per-node fractional delay line: max-delay (s, compile-time),
-    -- input signal, delay time (s).
+    -- ^ Per-node fractional delay line: max-delay (s, compile-time), input
+    -- signal, delay time (s).
     --
     -- The maximum delay time is a compile-time 'Double' (not a
     -- 'Connection') because it determines the size of the per-node
-    -- ring buffer the runtime allocates at graph load. Choose it
-    -- as the worst-case delay your patch will ever request.
+    -- ring buffer the runtime allocates at graph load. Choose it as
+    -- the worst-case delay your patch will ever request.
     --
     -- The actual delay time is a 'Connection' and may be a constant
     -- ('Param') or an audio-rate signal. With audio-rate modulation
@@ -429,41 +446,41 @@ data UGen
     --
     -- See Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
   | Env !Connection !Connection !Connection !Connection !Connection
-    -- ^ ADSR envelope generator: gate, attack (sec), decay (sec),
-    -- sustain (linear 0..1), release (sec).
+    -- ^ ADSR envelope generator: gate, attack (sec), decay (sec), sustain
+    -- (linear 0..1), release (sec).
     --
-    -- The gate is a sample-accurate trigger: a rising edge
-    -- (0 → > 0.5) starts the attack phase, a falling edge starts
-    -- the release phase. A/D/S/R are block-rate constants; A, D, R
-    -- are durations in seconds, S is a linear amplitude in [0, 1].
-    -- A 'Param' on the gate input acts as a constant gate value:
-    -- @env (Param 1) ...@ holds the gate high indefinitely (handy
-    -- for one-shot test graphs that never release).
+    -- The gate is a sample-accurate trigger: a rising edge (0 → >
+    -- 0.5) starts the attack phase, a falling edge starts the release
+    -- phase. A/D/S/R are block-rate constants; A, D, R are durations
+    -- in seconds, S is a linear amplitude in [0, 1]. A 'Param' on the
+    -- gate input acts as a constant gate value: @env (Param 1) ...@
+    -- holds the gate high indefinitely (handy for one-shot test
+    -- graphs that never release).
     --
-    -- The output is the envelope amplitude in [0, 1] at sample
-    -- rate. Multiply with a signal to apply the envelope.
+    -- The output is the envelope amplitude in [0, 1] at sample rate.
+    -- Multiply with a signal to apply the envelope.
   | Smooth !Double !Connection
     -- ^ Cascaded two-pole self-modulating smoother (Q's
-    -- @q::dynamic_smoother@): @smooth base_freq_hz value@. The
-    -- first argument is a compile-time smoothing speed in Hz
+    -- @q::dynamic_smoother@): @smooth base_freq_hz value@.
+    --
+    -- The first argument is a compile-time smoothing speed in Hz
     -- (smaller = slower / smoother / laggier; ~20 Hz is a typical
-    -- sweet spot for control smoothing). The second argument is
-    -- the value to
-    -- smooth — usually a 'Param' that the producer thread
-    -- updates via the realtime ABI when CC or pitch-bend events
-    -- arrive, so that block-rate jumps in the target value land
-    -- as continuous ramps in the smoothed output.
+    -- sweet spot for control smoothing).
+    --
+    -- The second argument is the value to smooth — usually a 'Param'
+    -- that the producer thread updates via the realtime ABI when CC
+    -- or pitch-bend events arrive, so that block-rate jumps in the
+    -- target value land as continuous ramps in the smoothed output.
     --
     -- Stateful: the smoother carries internal IIR history across
-    -- blocks. Per-instance state (no shared resource), so 'Eff'
-    -- is 'Pure'; rate is 'SampleRate'. See Note [Per-node smooth
-    -- state] in @tinysynth/rt_graph.cpp@.
+    -- blocks. Per-instance state (no shared resource), so 'Eff' is
+    -- 'Pure'; rate is 'SampleRate'. See Note [Per-node smooth state]
+    -- in @tinysynth/rt_graph.cpp@.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
 
--- | A node in the source graph: a named UGen at a
--- particular symbolic identity.
+-- | A node in the source graph: a named UGen at a particular symbolic identity.
 data NodeSpec = NodeSpec
   { nsID   :: !NodeID
   , nsName :: !String
@@ -472,12 +489,11 @@ data NodeSpec = NodeSpec
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
--- | The source graph: a map from symbolic 'NodeID' to
--- 'NodeSpec'. Order is not yet fixed — that is the job of
--- topological sorting in "MetaSonic.Validate".
+-- | The source graph: a map from symbolic 'NodeID' to 'NodeSpec'.
+-- Order is not yet fixed — that is the job of topological sorting in
+-- "MetaSonic.Validate".
 --
--- See Note [Topological sort as compilation target] in
--- MetaSonic.Validate.
+-- See Note [Topological sort as compilation target] in MetaSonic.Validate.
 data SynthGraph = SynthGraph
   { sgNodes :: !(M.Map NodeID NodeSpec)
   } deriving stock    (Eq, Show, Generic)
@@ -486,53 +502,55 @@ data SynthGraph = SynthGraph
 emptyGraph :: SynthGraph
 emptyGraph = SynthGraph M.empty
 
+
+
 {- Note [Builder monad design]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Graph construction is a compilation activity, not a real-time
 activity. The builder monad is a strict State transformer that
-allocates fresh NodeIDs and accumulates NodeSpecs into a
-SynthGraph.
+allocates fresh NodeIDs and accumulates NodeSpecs into a SynthGraph.
 
-The choice of strict State (rather than a free monad or a
-Writer) is pragmatic:
+The choice of strict State (rather than a free monad or a Writer) is
+pragmatic:
 
-  - Strict State with BangPatterns ensures the counter and
-    graph are fully evaluated at each step. No thunks
-    accumulate during the build phase.
+  - Strict State with BangPatterns ensures the counter and graph are
+    fully evaluated at each step. No thunks accumulate during the
+    build phase.
 
-  - The monadic interface (do-notation, fresh ID allocation,
-    returning NodeID for downstream wiring) is natural for
-    graph construction where nodes refer to earlier nodes.
+  - The monadic interface is natural for graph construction: nodes
+    refer to earlier nodes, so do-notation, fresh ID allocation, and
+    returning NodeID for downstream wiring all fall out cleanly.
 
-  - The underlying idea is still algebraic: a synthesis graph
-    is formed by composing primitives and introducing named
-    dependencies between them.
+  - The underlying representation is algebraic: a synthesis graph is
+    formed by composing primitives and introducing named dependencies
+    between them.
 
-The source DSL can be reformulated as a typed algebra over signal
-combinators rather than only as a node-building API. That allows more
-static rejection of ill-typed graphs and cleaner elaboration into
-semantic IR. Currently, sinOsc, out, and gain each produce a
-single primitive node; higher-level combinators (chain,
-parallel, mix) would elaborate down to this level.
+A typed algebra over signal combinators is the natural next step for
+the source DSL — it would allow static rejection of ill-typed graphs
+and cleaner elaboration into semantic IR. Currently `sinOsc`, `out`,
+and `gain` each produce a single primitive node; higher-level
+combinators (`chain`, `parallel`, `mix`) would elaborate down to this
+level.
 -}
+
 
 data SynthState = SynthState
   { ssNextID :: !Int
   , ssGraph  :: !SynthGraph
   , ssCCs    :: ![CCSpec]
-    -- ^ CC bindings accumulated by 'cc' (and any future CC-aware
-    -- combinator). Stored in reverse-registration order; the public
-    -- runner reverses to give callers a stable left-to-right view.
+    -- ^ CC bindings accumulated by 'cc' (and any future CC-aware combinator).
+    -- Stored in reverse-registration order; the public runner reverses to give
+    -- callers a stable left-to-right view.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
--- | A CC-binding declaration: when a 'control_change' on
--- @ccsNumber@ arrives, the producer thread should write
--- @ccsMin + (cc_value / 127) * (ccsMax - ccsMin)@ to the control
--- at @(ccsNode, ccsCtl)@. The Source layer stays MIDI-agnostic —
--- it just records the binding; the live-MIDI runner in
--- "MetaSonic.Bridge.MidiDemo" resolves @ccsNode@ to a dense
--- 'NodeIndex' and converts to 'CCMapping'.
+-- | A CC-binding declaration: when a 'control_change' on @ccsNumber@
+-- arrives, the producer thread should write @ccsMin + (cc_value /
+-- 127) * (ccsMax - ccsMin)@ to the control at @(ccsNode, ccsCtl)@.
+-- The Source layer stays MIDI-agnostic — it just records the binding;
+-- the live-MIDI runner in "MetaSonic.Bridge.MidiDemo" resolves
+-- @ccsNode@ to a dense 'NodeIndex' and converts to 'CCMapping'.
 data CCSpec = CCSpec
   { ccsNumber :: !Word8
   , ccsNode   :: !NodeID
@@ -542,33 +560,31 @@ data CCSpec = CCSpec
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
--- | The graph builder monad. Strict 'State' over a counter
--- and accumulating 'SynthGraph'.
+-- | The graph builder monad. Strict 'State' over a counter and accumulating
+-- 'SynthGraph'.
 --
 -- See Note [Builder monad design].
 type SynthM a = State SynthState a
 
--- | Run a graph builder and extract the resulting
--- 'SynthGraph'. The builder's return value is discarded;
--- the graph is the product.
+-- | Run a graph builder and extract the resulting 'SynthGraph'. The
+-- builder's return value is discarded; the graph is the product.
 runSynth :: SynthM a -> SynthGraph
 runSynth m = ssGraph (execState m (SynthState 0 emptyGraph []))
 
--- | Run a graph builder and return both the builder's value and
--- the resulting 'SynthGraph'. Use this when you need to thread
--- captured 'Connection' / 'NodeID' values out of the builder for
--- post-compile binding (e.g. recording which node carries the
--- gain control that a CC will drive).
+-- | Run a graph builder and return both the builder's value and the
+-- resulting 'SynthGraph'. Use this when you need to thread captured
+-- 'Connection' / 'NodeID' values out of the builder for post-compile
+-- binding (e.g. recording which node carries the gain control that a
+-- CC will drive).
 runSynthWith :: SynthM a -> (a, SynthGraph)
 runSynthWith m =
   let (a, st) = runState m (SynthState 0 emptyGraph [])
   in (a, ssGraph st)
 
--- | Run a graph builder and return the value, the 'SynthGraph',
--- AND the list of CC bindings declared via 'cc' (in declaration
--- order). The live-MIDI demo runner uses this to auto-wire CC
--- mappings without the caller having to maintain a parallel
--- binding list.
+-- | Run a graph builder and return the value, the 'SynthGraph', AND
+-- the list of CC bindings declared via 'cc' (in declaration order).
+-- The live-MIDI demo runner uses this to auto-wire CC mappings
+-- without the caller having to maintain a parallel binding list.
 runSynthCCs :: SynthM a -> (a, SynthGraph, [CCSpec])
 runSynthCCs m =
   let (a, st) = runState m (SynthState 0 emptyGraph [])
@@ -623,8 +639,8 @@ lifting:
 The 'NodeID' machinery still exists internally for the source-graph
 map, but it is wrapped in @Audio nid 0@ before being returned to the
 caller — so the user-facing handle is always 'Connection' and the
-distinction between "constant" and "audio-rate" inputs is invisible
-to type-check, just like 'Param' vs 'Audio' inside 'Connection'.
+distinction between "constant" and "audio-rate" inputs is invisible to
+type-check, just like 'Param' vs 'Audio' inside 'Connection'.
 
 The 'audio' helper survives for hand-built graphs that reference a
 'NodeID' directly. User code rarely needs it.
@@ -638,8 +654,8 @@ rather than identity.
 -}
 
 -- | Lift a 'NodeID' to an audio-rate 'Connection' on output port 0.
--- Rarely needed in user code: combinators already return their
--- output as a 'Connection'. Useful for hand-built graphs.
+-- Rarely needed in user code: combinators already return their output
+-- as a 'Connection'. Useful for hand-built graphs.
 audio :: NodeID -> Connection
 audio n = Audio n (PortIndex 0)
 
@@ -662,8 +678,8 @@ insertNodeC :: String -> UGen -> SynthM Connection
 insertNodeC name ugen = audio <$> insertNode name ugen
 
 -- | Sine oscillator. Either input may be a numeric literal (which
--- becomes a 'Param' constant) or another node's 'Connection', so
--- this is the FM construction site.
+-- becomes a 'Param' constant) or another node's 'Connection', so this
+-- is the FM construction site.
 sinOsc :: Connection -> Connection -> SynthM Connection
 sinOsc freq phase = insertNodeC "sinOsc" (SinOsc freq phase)
 
@@ -671,10 +687,10 @@ sinOsc freq phase = insertNodeC "sinOsc" (SinOsc freq phase)
 sawOsc :: Connection -> Connection -> SynthM Connection
 sawOsc freq phase = insertNodeC "sawOsc" (SawOsc freq phase)
 
--- | Bandlimited pulse oscillator with pulse-width modulation.
--- Wraps Q's @q::pulse_osc@. Width is in [0, 1], where 0.5 = square.
--- Driving @width@ from another oscillator (e.g. a slow @sinOsc@) is
--- the classic PWM patch — the width input is the intermodulation
+-- | Bandlimited pulse oscillator with pulse-width modulation. Wraps
+-- Q's @q::pulse_osc@. Width is in [0, 1], where 0.5 = square. Driving
+-- @width@ from another oscillator (e.g. a slow @sinOsc@) is the
+-- classic PWM patch — the width input is the intermodulation
 -- primitive on this kind.
 pulseOsc :: Connection -> Connection -> Connection -> SynthM Connection
 pulseOsc freq phase width =
@@ -721,16 +737,18 @@ gain :: Connection -> Connection -> SynthM Connection
 gain sig amount = insertNodeC "gain" (Gain sig amount)
 
 -- | Sum two inputs sample-by-sample. Used to bias a bipolar modulator
--- off zero (turning ring mod into AM, or through-zero FM into vibrato).
+-- off zero (turning ring mod into AM, or through-zero FM into
+-- vibrato).
 add :: Connection -> Connection -> SynthM Connection
 add a b = insertNodeC "add" (Add a b)
 
 -- | ADSR envelope generator: @env gate attack decay sustain release@.
 --
--- Gate is sample-accurate: a rising edge starts attack, a falling edge
--- starts release. Attack/decay/release are durations in seconds; sustain
--- is a linear amplitude in [0, 1]. A 'Param' on the gate input acts as a
--- constant gate level (use @Param 1@ for an always-on test envelope).
+-- Gate is sample-accurate: a rising edge starts attack, a falling
+-- edge starts release. Attack/decay/release are durations in seconds;
+-- sustain is a linear amplitude in [0, 1]. A 'Param' on the gate
+-- input acts as a constant gate level (use @Param 1@ for an always-on
+-- test envelope).
 env
   :: Connection -- ^ gate
   -> Connection -- ^ attack (s)
@@ -740,11 +758,11 @@ env
   -> SynthM Connection
 env gate a d s r = insertNodeC "env" (Env gate a d s r)
 
--- | Hardware output: writes a Connection to a hardware output bus.
--- In practice the source is an 'Audio' connection from another
--- node; passing a 'Param' constant would silently produce silence
--- because the runtime does not synthesize from constant-only inputs.
--- Terminal node; produces no downstream signal.
+-- | Hardware output: writes a Connection to a hardware output bus. In
+-- practice the source is an 'Audio' connection from another node;
+-- passing a 'Param' constant would silently produce silence because
+-- the runtime does not synthesize from constant-only inputs. Terminal
+-- node; produces no downstream signal.
 out :: Int -> Connection -> SynthM ()
 out channel src =
   void $ insertNode "out" (Out channel src)
@@ -752,16 +770,16 @@ out channel src =
 -- | Write a signal to a shared audio bus. The bus is part of the
 -- runtime's bus pool; the same pool serves hardware-routed buses
 -- (used by 'Out'). 'BusOut' carries a 'BusWrite' effect, so any
--- 'BusIn' on the same bus is forced to execute after this node in
--- the same block — see Note [Effect-induced edges (E_r)] in
+-- 'BusIn' on the same bus is forced to execute after this node in the
+-- same block — see Note [Effect-induced edges (E_r)] in
 -- "MetaSonic.Bridge.Validate".
 busOut :: Int -> Connection -> SynthM ()
 busOut bus src =
   void $ insertNode "busOut" (BusOut bus src)
 
 -- | Read a signal from a shared audio bus. Returns a 'Connection'
--- that downstream nodes can wire to their inputs. Carries a
--- 'BusRead' effect so it executes after every same-bus writer.
+-- that downstream nodes can wire to their inputs. Carries a 'BusRead'
+-- effect so it executes after every same-bus writer.
 busIn :: Int -> SynthM Connection
 busIn bus = insertNodeC "busIn" (BusIn bus)
 
@@ -772,10 +790,10 @@ busIn bus = insertNodeC "busIn" (BusIn bus)
 -- — modulating it at audio rate yields the standard delay-modulation
 -- effects (chorus, flanger, vibrato by pitch shift).
 --
--- The maximum delay must be known at graph-construction time
--- because it sizes the per-instance buffer; runtime requests for a
--- delay time greater than @maxDelay@ are clamped at the kernel.
--- Choose @maxDelay@ as the worst case your patch will ever need.
+-- The maximum delay must be known at graph-construction time because
+-- it sizes the per-instance buffer; runtime requests for a delay time
+-- greater than @maxDelay@ are clamped at the kernel. Choose
+-- @maxDelay@ as the worst case your patch will ever need.
 --
 -- > -- 50 ms slap-back echo
 -- > slapback = runSynth $ do
@@ -786,8 +804,8 @@ busIn bus = insertNodeC "busIn" (BusIn bus)
 --
 -- The "L" suffix follows SuperCollider's naming
 -- (@DelayN@/@DelayL@/@DelayC@): @delayL@ uses linear interpolation,
--- which is what Q's 'fractional_ring_buffer' provides by default.
--- See Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
+-- which is what Q's 'fractional_ring_buffer' provides by default. See
+-- Note [Per-node delay state] in @tinysynth/rt_graph.cpp@.
 delayL
   :: Double      -- ^ maximum delay time in seconds (compile-time)
   -> Connection  -- ^ input signal
@@ -807,13 +825,13 @@ delayL maxT sig time = insertNodeC "delay" (Delay maxT sig time)
 -- value into continuous ramps in its sample-rate output.
 --
 -- Pathological values are unsafe: the underlying
--- @q::dynamic_smoother@'s @g0@ coefficient is computed from
--- @tan(pi * base_hz / sps)@, which collapses to zero or goes negative
--- at @base <= 0@, returns @NaN@ at non-finite input, and wraps
--- negative once @base@ approaches @sample_rate / 2@. The runtime
--- defensively sanitizes to @[0.001 Hz, 0.49 * sample_rate]@ and
--- substitutes the lower bound for @NaN@\/@Inf@, but you should pick a
--- real, finite, sub-Nyquist smoothing frequency here.
+-- @q::dynamic_smoother@'s @g0@ coefficient is computed from @tan(pi *
+-- base_hz / sps)@, which collapses to zero or goes negative at @base
+-- <= 0@, returns @NaN@ at non-finite input, and wraps negative once
+-- @base@ approaches @sample_rate / 2@. The runtime defensively
+-- sanitizes to @[0.001 Hz, 0.49 * sample_rate]@ and substitutes the
+-- lower bound for @NaN@\/@Inf@, but you should pick a real, finite,
+-- sub-Nyquist smoothing frequency here.
 --
 -- > out <- runSynth $ do
 -- >   target <- pure (Param 0.0)         -- producer-thread updated
@@ -830,10 +848,9 @@ smooth
 smooth baseHz v = insertNodeC "smooth" (Smooth baseHz v)
 
 -- | Declare a CC-bound smoothed control input. Allocates a 'Smooth'
--- node fed by an initially-constant target, records the
--- @(cc_number, smooth_node, ctl=1, min, max)@ binding in the
--- builder state, and returns the smoothed audio-rate 'Connection'
--- for downstream wiring.
+-- node fed by an initially-constant target, records the @(cc_number,
+-- smooth_node, ctl=1, min, max)@ binding in the builder state, and
+-- returns the smoothed audio-rate 'Connection' for downstream wiring.
 --
 -- The live-MIDI runner ('MetaSonic.Bridge.MidiDemo') consumes the
 -- recorded bindings via 'runSynthCCs' and auto-wires them at session
@@ -841,12 +858,13 @@ smooth baseHz v = insertNodeC "smooth" (Smooth baseHz v)
 --
 --   * Manually pair @smooth 20.0 (Param x)@ with a hand-maintained
 --     @CCMapping@ pointing at the smooth node's @control[1]@.
+--
 --   * Track which dense @NodeIndex@ corresponds to which CC.
 --
 -- The smoothing speed is fixed at 20 Hz (~50 ms time constant), the
--- typical sweet spot for de-zippering CC updates. Callers who need
--- a different speed can drop down to @smooth + recordCCBinding@ or
--- (if exposed in a future iteration) a variant that takes the speed
+-- typical sweet spot for de-zippering CC updates. Callers who need a
+-- different speed can drop down to @smooth + recordCCBinding@ or (if
+-- exposed in a future iteration) a variant that takes the speed
 -- explicitly. See §1.7 in the roadmap for the design intent.
 --
 -- > polySynth = do
@@ -875,12 +893,12 @@ cc num initial mn mx = do
   pure (audio nid)
 
 -- | Read the previous block's accumulated contents of a shared audio
--- bus. The feedback primitive: unlike 'busIn', a 'busInDelayed' creates
--- *no* ordering constraint with a same-bus 'busOut', so a graph that
--- closes a feedback loop through a 'busInDelayed' is well-formed and
--- topologically sortable. The runtime serves the read from a snapshot
--- of the previous block's bus pool (the snapshot is zero on the first
--- block), so the delay is exactly one block.
+-- bus. The feedback primitive: unlike 'busIn', a 'busInDelayed'
+-- creates *no* ordering constraint with a same-bus 'busOut', so a
+-- graph that closes a feedback loop through a 'busInDelayed' is
+-- well-formed and topologically sortable. The runtime serves the read
+-- from a snapshot of the previous block's bus pool (the snapshot is
+-- zero on the first block), so the delay is exactly one block.
 --
 -- Use this for self-referential / feedback patches:
 --
@@ -894,40 +912,43 @@ cc num initial mn mx = do
 --
 -- Carries a 'BusReadDelayed' effect; see Note [Bus model: SC-style
 -- same-cycle audio buses] for the same-cycle vs. delayed distinction
--- and Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate"
--- for why 'BusReadDelayed' deliberately *does not* contribute to E_r.
+-- and Note [Effect-induced edges (E_r)] in
+-- "MetaSonic.Bridge.Validate" for why 'BusReadDelayed' deliberately
+-- *does not* contribute to E_r.
 busInDelayed :: Int -> SynthM Connection
 busInDelayed bus = insertNodeC "busInDelayed" (BusInDelayed bus)
 
+
 {- Note [Uniform UGen view]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
-'UGenView' is the canonical projection from a 'UGen' constructor into the
-triple @(NodeKind, audio inputs, control defaults)@. Downstream passes that
-used to enumerate every constructor (kind inference, input lowering, control
-extraction) are derived from this one function.
+'UGenView' is the canonical projection from a 'UGen' constructor into
+the triple @(NodeKind, audio inputs, control defaults)@. Downstream
+passes — kind inference, input lowering, control extraction — are all
+derived from this one function.
 
 The typed 'UGen' constructors are preserved — they are the user-facing
-surface, statically arity-checked, and remain pattern-matchable. 'ugenView'
-is the *only* per-constructor enumeration in the codebase outside the
-'kindSpec' table and the builder layer.
+surface, statically arity-checked, and remain pattern-matchable.
+'ugenView' is the *only* per-constructor enumeration in the codebase
+outside the 'kindSpec' table and the builder layer.
 
 A property test cross-checks 'ugenView' against 'kindSpec' so the two
 sources of per-kind shape information cannot drift apart.
 
-Effects are *not* covered by this projection — 'inferEff' is a separate
-per-UGen function because some kinds ('BusOut', 'BusIn') carry per-instance
-effect data (a bus number) that a kind-level table cannot represent. See
-Note [Effects are per-UGen, not per-kind] in "MetaSonic.Bridge.IR".
+Effects are *not* covered by this projection — 'inferEff' is a
+separate per-UGen function because some kinds ('BusOut', 'BusIn')
+carry per-instance effect data (a bus number) that a kind-level table
+cannot represent. See Note [Effects are per-UGen, not per-kind] in
+"MetaSonic.Bridge.IR".
 -}
 
 -- | A uniform projection of a 'UGen' into kind plus input and control
 -- payload.
 --
--- The control list is given explicitly per kind (rather than derived from
--- the inputs), because the C++ kernel layout is per-kind: signal inputs
--- carry no paired control default ('LPF', 'Gain'), while parameter inputs
--- do ('SinOsc', 'Add'), and some kinds carry metadata-only controls with
--- no input pair ('Out' channel).
+-- The control list is given explicitly per kind (rather than derived
+-- from the inputs), because the C++ kernel layout is per-kind: signal
+-- inputs carry no paired control default ('LPF', 'Gain'), while
+-- parameter inputs do ('SinOsc', 'Add'), and some kinds carry
+-- metadata-only controls with no input pair ('Out' channel).
 --
 -- See Note [Uniform UGen view].
 data UGenView = UGenView
@@ -942,16 +963,16 @@ data UGenView = UGenView
     deriving anyclass (NFData)
 
 -- | Default value carried by a 'Connection' when used as a control: a
--- 'Param' literal contributes its value, an 'Audio' edge contributes 0.0
--- (the runtime fallback when no audio is connected).
+-- 'Param' literal contributes its value, an 'Audio' edge contributes
+-- 0.0 (the runtime fallback when no audio is connected).
 connDefault :: Connection -> Double
 connDefault (Param x)   = x
 connDefault (Audio _ _) = 0.0
 
 -- | The canonical per-constructor projection.
 --
--- Each clause states inputs and control defaults together so the per-kind
--- mapping is visible in one place.
+-- Each clause states inputs and control defaults together so the
+-- per-kind mapping is visible in one place.
 --
 -- See Note [Uniform UGen view].
 ugenView :: UGen -> UGenView
@@ -977,24 +998,28 @@ ugenView = \case
   Delay maxT s t    -> UGenView KDelay        [s, t] [maxT, connDefault t]
   Smooth baseHz v   -> UGenView KSmooth       [v]    [baseHz, connDefault v]
 
+
 {- Note [Per-UGen projections]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-'inferKind', 'inferRate' and 'inferEff' are the source-level projections
-used by every downstream pass (lowering in "MetaSonic.Bridge.IR",
-scheduling in "MetaSonic.Bridge.Validate"). They live here, in the source
-layer, because:
 
-  1. Their input is 'UGen' — the source-level type. They don't need any
-     IR-level vocabulary.
-  2. Both the IR pass and the scheduler need them, and putting them in IR
-     would force a cyclic module dependency
-     (Validate would have to import IR which imports Validate).
+'inferKind', 'inferRate' and 'inferEff' are the source-level
+projections used by every downstream pass (lowering in
+"MetaSonic.Bridge.IR", scheduling in "MetaSonic.Bridge.Validate").
+They live here, in the source layer, because:
 
-'inferKind' and 'inferRate' are derived from 'kindSpec' through 'ugenView',
-so they're one-liners. 'inferEff' is the odd one out: it has explicit
-per-UGen cases for 'BusOut' / 'BusIn' because their effect annotation
-('BusWrite n' / 'BusRead n') depends on a constructor field. See Note
-[Effects are per-UGen, not per-kind].
+  1. Their input is 'UGen' — the source-level type. They don't need
+     any IR-level vocabulary.
+
+  2. Both the IR pass and the scheduler need them; placing them in IR
+     would introduce a cyclic dependency: Validate → IR → Validate.
+
+'inferKind' and 'inferRate' are derived from 'kindSpec' through
+'ugenView', so they're one-liners. 'inferEff' is the odd one out: it
+has explicit per-UGen cases for 'BusOut' / 'BusIn' because their
+effect annotation ('BusWrite n' / 'BusRead n') depends on a
+constructor field.
+
+See Note [Effects are per-UGen, not per-kind].
 -}
 
 -- | Map a UGen constructor to its 'NodeKind' tag.
@@ -1013,55 +1038,61 @@ inferKind = uvKind . ugenView
 -- 'irRate = SampleRate' after propagation, even though 'inferRate'
 -- alone returns 'CompileRate'.
 --
--- Derived from the 'kindSpec' table via 'ugenView'. See Note [Per-kind
--- metadata table] in "MetaSonic.Types" and Note [Rate inference vs rate
--- propagation] in "MetaSonic.Bridge.IR".
+-- Derived from the 'kindSpec' table via 'ugenView'. See Note
+-- [Per-kind metadata table] in "MetaSonic.Types" and Note [Rate
+-- inference vs rate propagation] in "MetaSonic.Bridge.IR".
 inferRate :: UGen -> Rate
 inferRate = ksRate . kindSpec . uvKind . ugenView
 
+
 {- Note [Effects are per-UGen, not per-kind]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-'inferEff' is the single source of truth for the effect set of a UGen. It
-deliberately does *not* go through 'kindSpec' — see Note [Per-kind metadata
-table] in "MetaSonic.Types" for why.
 
-The short version: 'BusOut n' and 'BusIn n' carry a bus number in a
-constructor field, so their effects ('BusWrite n' / 'BusRead n') depend on
-per-instance data that a kind-level table cannot represent. Putting '[Pure]'
-in a kind-level effect column for those kinds would be a lie that defeats
-the scheduling pass — the busEdges derivation in
-"MetaSonic.Bridge.Validate" walks 'inferEff' looking for 'BusWrite' /
-'BusRead' annotations to add E_r edges, and a stale '[Pure]' would silently
-return zero edges.
+'inferEff' is the single source of truth for the effect set of a UGen.
+It deliberately does *not* go through 'kindSpec' — see Note [Per-kind
+metadata table] in "MetaSonic.Types" for why.
 
-So 'inferEff' lists per-UGen cases for the kinds that need per-instance
-overrides, and falls through to '[Pure]' for everything else. It is by
-design less compact than 'inferKind' / 'inferRate' / 'lowerInputs' /
-'extractControls' (all derived through 'ugenView'); honesty wins over
-compactness here.
+'BusOut n' and 'BusIn n' carry a bus number in a constructor field, so
+their effects ('BusWrite n' / 'BusRead n') depend on per-instance data
+a kind-level table cannot represent. A '[Pure]' entry in a kind-level
+effect column would defeat the scheduling pass: 'busEdges' in
+'MetaSonic.Bridge.Validate' walks 'inferEff' looking for 'BusWrite' /
+'BusRead' annotations to build E_r edges, and a stale '[Pure]' would
+silently produce zero edges.
+
+So 'inferEff' lists per-UGen cases for the kinds that need
+per-instance overrides, and falls through to '[Pure]' for everything
+else. It is by design less compact than 'inferKind' / 'inferRate' /
+'lowerInputs' / 'extractControls' (all derived through 'ugenView');
+honesty wins over compactness here.
 -}
+
+
 
 -- | Infer the effect set of a UGen.
 --
--- 'Out' / 'BusOut' / 'BusIn' / 'BusInDelayed' carry per-instance bus numbers,
--- so their effect annotations encode that bus number directly.
+-- 'Out' / 'BusOut' / 'BusIn' / 'BusInDelayed' carry per-instance bus
+-- numbers, so their effect annotations encode that bus number
+-- directly.
 --
--- 'Out n' and 'BusOut n' both produce 'BusWrite n'. The two constructors
--- share a runtime kernel and write into the same bus pool (see Note [Bus
--- model: SC-style same-cycle audio buses]); the source-level split is
--- documentation only ("final output" vs. "intermediate routing"). An 'Out n'
--- in the same graph as a 'BusIn n' must therefore induce the same E_r
--- writer→reader ordering as a 'BusOut n' would.
+-- 'Out n' and 'BusOut n' both produce 'BusWrite n'. The two
+-- constructors share a runtime kernel and write into the same bus
+-- pool (see Note [Bus model: SC-style same-cycle audio buses]); the
+-- source-level split is documentation only ("final output" vs.
+-- "intermediate routing"). An 'Out n' in the same graph as a 'BusIn
+-- n' must therefore induce the same E_r writer→reader ordering as a
+-- 'BusOut n' would.
 --
 -- 'BusInDelayed' produces 'BusReadDelayed' rather than 'BusRead': the
 -- 'Validate' layer treats those two as semantically distinct (only
--- 'BusRead' contributes to E_r), so a 'BusInDelayed n' can sit anywhere in
--- the schedule relative to any 'BusWrite n' — which is exactly what enables
--- feedback loops to typecheck.
+-- 'BusRead' contributes to E_r), so a 'BusInDelayed n' can sit
+-- anywhere in the schedule relative to any 'BusWrite n' — which is
+-- exactly what enables feedback loops to typecheck.
 --
 -- See Note [Effects are per-UGen, not per-kind].
 -- See Note [Resource effects] in "MetaSonic.Types".
 -- See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
+--
 inferEff :: UGen -> [Eff]
 inferEff (Out          bus _) = [BusWrite        bus]
 inferEff (BusOut       bus _) = [BusWrite        bus]
@@ -1069,18 +1100,17 @@ inferEff (BusIn        bus)   = [BusRead         bus]
 inferEff (BusInDelayed bus)   = [BusReadDelayed  bus]
 inferEff _                    = [Pure]
 
--- | Extract explicit structural 'NodeID' dependencies from
--- a 'UGen'.
+
+-- | Extract explicit structural 'NodeID' dependencies from a 'UGen'.
 --
--- Only 'Audio' connections contribute dependencies. 'Param'
--- values are dependency-free.
+-- Only 'Audio' connections contribute dependencies. 'Param' values are
+-- dependency-free.
 --
--- Note that 'BusIn' introduces no explicit structural edge at
--- this level: it reads from a shared bus rather than from the
--- output port of another node. Any ordering constraints induced
--- by bus communication must therefore be recovered later from
--- _effect annotations_ rather than from the structural graph
--- alone.
+-- Note that 'BusIn' introduces no explicit structural edge at this
+-- level: it reads from a shared bus rather than from the output port
+-- of another node. Any ordering constraints induced by bus
+-- communication must therefore be recovered later from _effect
+-- annotations_ rather than from the structural graph alone.
 dependencies :: UGen -> [NodeID]
 dependencies = \case
   Out _ a          -> deps [a]
@@ -1090,7 +1120,8 @@ dependencies = \case
     -- ^ Like 'BusIn', no structural edge: the bus connection is
     -- expressed through the 'BusReadDelayed' effect, not through an
     -- 'Audio' Connection. Unlike 'BusIn', no E_r edge either; see
-    -- Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
+    -- Note [Effect-induced edges (E_r)] in
+    -- "MetaSonic.Bridge.Validate".
   Delay _ s t      -> deps [s, t]
   SinOsc a b       -> deps [a, b]
   SawOsc a b       -> deps [a, b]

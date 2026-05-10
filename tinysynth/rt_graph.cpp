@@ -3,12 +3,11 @@
 // Description : runtime DSP engine and realtime audio backend
 // ================================================================
 //
-// On the Haskell side, compilation ends at TemplateGraph (an ordered
-// ensemble of per-template RuntimeGraphs). On the C++ side, this file
-// turns each template into preallocated NodeSpec state, hosts a vector
-// of GraphInstances (running copies of each template) sharing a single
-// Server bus pool, and runs them in compile-decreed template order
-// every block.
+// On the Haskell side, compilation ends at TemplateGraph (an ordered ensemble
+// of per-template RuntimeGraphs). On the C++ side, this file turns each
+// template into preallocated NodeSpec state, hosts a vector of GraphInstances
+// (running copies of each template) sharing a single Server bus pool, and runs
+// them in compile-decreed template order every block.
 
 #include "rt_graph.h"
 

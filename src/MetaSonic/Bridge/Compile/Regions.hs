@@ -12,9 +12,9 @@
 -- 'NodeIR' into rate-compatible execution regions.
 --
 -- These types are the /compile-time/ region surface — distinct from
--- 'RuntimeRegion' / 'RuntimeGraph' (the runtime-facing dense
--- overlay) which live in 'MetaSonic.Bridge.Compile.Types'. The
--- runtime overlay is built from this graph via 'compileRegion' in
+-- 'RuntimeRegion' / 'RuntimeGraph' (the runtime-facing dense overlay)
+-- which live in 'MetaSonic.Bridge.Compile.Types'. The runtime overlay
+-- is built from this graph via 'compileRegion' in
 -- 'MetaSonic.Bridge.Compile'.
 --
 -- Re-exported by 'MetaSonic.Bridge.Compile' for the public surface.
@@ -34,6 +34,7 @@ import           GHC.Generics        (Generic)
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Types
 
+
 {- Note [Region formation]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 A region is a maximal subgraph or semantic term cluster such that:
@@ -46,12 +47,12 @@ A region is a maximal subgraph or semantic term cluster such that:
   (5) the region can be lowered to scalar code, vector code, or
       a sequential loop nest
 
-The current implementation satisfies (1) and partially (2). It is
-a greedy linear scan: walk the toposorted IR and extend the current
+The current implementation satisfies (1) and partially (2). It is a
+greedy linear scan: walk the toposorted IR and extend the current
 region as long as the next node has the same rate and all its
 dependencies are either inside the current region or in already-
-completed regions. When any condition breaks, the region is closed
-and a new one begins.
+completed regions. When any condition breaks, the region is closed and
+a new one begins.
 
 Conditions (3)–(5) require a cost model, state analysis, and code
 generation strategy that are part of the future architecture.
@@ -62,6 +63,7 @@ the limitations of the greedy strategy.
 See Note [Region DAG as scheduling target] for how the region
 graph relates to parallel scheduling.
 -}
+
 
 {- Note [Region rate compatibility]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

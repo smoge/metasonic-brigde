@@ -118,15 +118,16 @@ import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..),
                                              TemplateID (..))
 import           MetaSonic.Types
 
+
 {- Note [FFI boundary design]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-On the Haskell side, the graph is a rich, typed, annotated
-structure with symbolic identities, rate tags, effect
-annotations, and region membership. On the C++ side, it is a
-flat array of execution units with dense index references.
+On the Haskell side, the graph is a rich, typed, annotated structure
+with symbolic identities, rate tags, effect annotations, and region
+membership. On the C++ side, it is a flat array of execution units
+with dense index references.
 
-This module translates between those two worlds through a
-small C ABI defined in rt_graph.h:
+This module translates between those two worlds through a small C ABI
+defined in rt_graph.h:
 
   rt_graph_create       — allocate a runtime graph handle
   rt_graph_destroy      — free all owned resources
@@ -162,35 +163,34 @@ Step 5a is used by tests, diagnostics, and offline checking.
 Step 5b is the realtime path for q_io / PortAudio output.
 Steps 1 and 6 are managed by withRTGraph via bracket.
 
-The integer-based wire format (node kinds as ints, indices as
-ints, controls as doubles) is deliberately simple: it avoids
-any C++ types in the ABI, ensuring that the boundary is
-portable and trivially serializable.
+The integer-based wire format (node kinds as ints, indices as ints,
+controls as doubles) is deliberately simple: it avoids any C++ types
+in the ABI, ensuring that the boundary is portable and trivially
+serializable.
 
-Graph loading is expected to succeed by construction. If the
-Haskell compiler produces a valid RuntimeGraph, no bad-index
-or unknown-kind paths should fire in the runtime. Realtime
-startup is different: opening an audio device can fail for
-reasons outside compilation (no device, unsupported channel
-count, backend error), so the audio lifecycle calls return
-status codes.
+Graph loading is expected to succeed by construction. If the Haskell
+compiler produces a valid RuntimeGraph, no bad-index or unknown-kind
+paths should fire in the runtime. Realtime startup is different:
+opening an audio device can fail for reasons outside compilation (no
+device, unsupported channel count, backend error), so the audio
+lifecycle calls return status codes.
 
 See Note [Dense lowering] in MetaSonic.Compile for what
 guarantees the runtime indices are valid.
 -}
 
+
 {- Note [Why ccall, not capi]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 These imports use ccall, not capi.
 
-That is intentional. The C++ side exports plain C ABI symbols
-from rt_graph.h via extern "C". There is no varargs API, no
-macro indirection, and no need to route through a C wrapper
-header. capi would work too, but it would not buy us anything
-for this ABI.
+That is intentional. The C++ side exports plain C ABI symbols from
+rt_graph.h via extern "C". There is no varargs API, no macro
+indirection, and no need to route through a C wrapper header. capi
+would work too, but it would not buy us anything for this ABI.
 
-The important distinction for this module is not ccall vs
-capi. It is unsafe vs safe, described below.
+The important distinction for this module is not ccall vs capi. It is
+unsafe vs safe, described below.
 -}
 
 {- Note [Mixed foreign call safety]
@@ -222,17 +222,16 @@ live stream:
   * rt_graph_wait_started
   * rt_graph_stop_audio
 
-A subtle but important consequence of the new realtime path is
-that rt_graph_clear and rt_graph_destroy are no longer
-obviously "cheap": the C++ runtime is allowed to stop an
-active PortAudio stream inside them before clearing or freeing
-state. That makes safe the correct default on the Haskell
-side.
+A subtle but important consequence of the new realtime path is that
+rt_graph_clear and rt_graph_destroy are no longer obviously "cheap":
+the C++ runtime is allowed to stop an active PortAudio stream inside
+them before clearing or freeing state. That makes safe the correct
+default on the Haskell side.
 
-Note that safe does NOT mean "wait until the audio callback is
-ready". Readiness is a separate protocol step handled by
-rt_graph_wait_started. The audio callback itself remains fully
-inside C++; it does not call back into Haskell.
+Note that safe does NOT mean "wait until the audio callback is ready".
+Readiness is a separate protocol step handled by
+rt_graph_wait_started. The audio callback itself remains fully inside
+C++; it does not call back into Haskell.
 -}
 
 {- Note [Two-pass loading]
@@ -249,26 +248,25 @@ loadRuntimeGraph proceeds in two passes:
     call linking the source output port to the destination
     input port.
 
-The two-pass structure is necessary because rt_graph_connect
-requires both the source and destination nodes to already
-exist in the C++ graph. Since nodes are added in execution
-order (source before destination, guaranteed by
-Note [Execution order invariant] in MetaSonic.IR), pass 1
-ensures all endpoints exist before pass 2 wires them.
+The two-pass structure is necessary because rt_graph_connect requires
+both the source and destination nodes to already exist in the C++
+graph. Since nodes are added in execution order (source before
+destination, guaranteed by Note [Execution order invariant] in
+MetaSonic.IR), pass 1 ensures all endpoints exist before pass 2 wires
+them.
 
-RConst inputs do not generate connect calls. Their values are
-already set as control defaults in pass 1.
+RConst inputs do not generate connect calls. Their values are already
+set as control defaults in pass 1.
 
-One more consequence of the realtime engine: loadRuntimeGraph
-begins with rt_graph_clear, and rt_graph_clear is allowed to
-stop a currently running audio stream. So hot reloading is a
-"stop, clear, rebuild" operation from the runtime's point of
-view. If the caller wants audio again after reloading, it must
-call startAudio once loading completes.
+One more consequence of the realtime engine: loadRuntimeGraph begins
+with rt_graph_clear, and rt_graph_clear is allowed to stop a currently
+running audio stream. So hot reloading is a "stop, clear, rebuild"
+operation from the runtime's point of view. If the caller wants audio
+again after reloading, it must call startAudio once loading completes.
 -}
 
--- | Opaque handle to the C++ runtime graph. The Haskell side
--- never inspects its contents.
+-- | Opaque handle to the C++ runtime graph. The Haskell side never
+-- inspects its contents.
 --
 -- See Note [FFI boundary design].
 data RTGraph
@@ -292,10 +290,10 @@ foreign import ccall unsafe "rt_graph_add_node"
 foreign import ccall unsafe "rt_graph_set_control"
   c_rt_graph_set_control :: Ptr RTGraph -> CInt -> CInt -> CDouble -> IO ()
 
--- | Grow the shared Server bus pool to cover @bus_index@. Construction-
--- only — must run before audio starts. The Haskell loaders
--- ('loadRuntimeGraph', 'loadTemplateGraph') call this for every
--- bus-using node before configuring controls.
+-- | Grow the shared Server bus pool to cover @bus_index@.
+-- Construction-only, must run before audio starts. The Haskell
+-- loaders ('loadRuntimeGraph', 'loadTemplateGraph') call this for
+-- every bus-using node before configuring controls.
 foreign import ccall unsafe "rt_graph_ensure_bus"
   c_rt_graph_ensure_bus :: Ptr RTGraph -> CInt -> IO ()
 
@@ -359,8 +357,8 @@ foreign import ccall unsafe "rt_graph_test_set_global_schedule_execution"
 
 -- | §4.E.2.C1 test surface: configure the RTGraph-owned worker pool.
 -- Values <= 1 keep the schedule executor purely serial; values > 1
--- create @worker_count - 1@ background workers. Construction/test-only:
--- call while audio is stopped.
+-- create @worker_count - 1@ background workers.
+-- Construction- test-only: call while audio is stopped.
 foreign import ccall unsafe "rt_graph_test_set_worker_pool_size"
   c_rt_graph_test_set_worker_pool_size :: Ptr RTGraph -> CInt -> IO ()
 
@@ -425,11 +423,10 @@ foreign import ccall unsafe "rt_graph_test_template_schedule_step_region"
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> IO CInt
 
 -- | §4.E.2.C0b test surface: number of entries in the per-block
--- global schedule built by the most recent 'c_rt_graph_process'
--- call. Returns 0 if no block has run yet or g is null. The
--- vector is rebuilt every block from the post-drain instance-
--- state snapshot in canonical
--- (template, instance_slot, step) ascending order.
+-- global schedule built by the most recent 'c_rt_graph_process' call.
+-- Returns 0 if no block has run yet or g is null. The vector is
+-- rebuilt every block from the post-drain instance- state snapshot in
+-- canonical (template, instance_slot, step) ascending order.
 foreign import ccall unsafe "rt_graph_test_global_schedule_entry_count"
   c_rt_graph_test_global_schedule_entry_count
     :: Ptr RTGraph -> IO CInt
@@ -449,8 +446,8 @@ foreign import ccall unsafe "rt_graph_test_global_schedule_entry_instance"
     :: Ptr RTGraph -> CInt -> IO CInt
 
 -- | §4.E.2.C0b test surface: step_index of the @entry_index@-th
--- global-schedule entry (into the template's schedule_steps).
--- Returns -1 on null g or out-of-range entry_index.
+-- global-schedule entry (into the template's schedule_steps). Returns
+-- -1 on null g or out-of-range entry_index.
 foreign import ccall unsafe "rt_graph_test_global_schedule_entry_step"
   c_rt_graph_test_global_schedule_entry_step
     :: Ptr RTGraph -> CInt -> IO CInt
@@ -514,8 +511,8 @@ foreign import ccall unsafe "rt_graph_template_count"
 -- | Set the per-template polyphony cap (max simultaneously-live
 -- instances of this template). Construction-only;
 -- 'c_rt_graph_template_instance_add' returns -1 once the cap is
--- reached. Default per template is 8. Values <= 0 are clamped to 1
--- by the runtime; invalid template_id is a silent no-op.
+-- reached. Default per template is 8. Values <= 0 are clamped to 1 by
+-- the runtime; invalid template_id is a silent no-op.
 --
 -- See Note [Pool model] in @rt_graph.cpp@ for how the cap interacts
 -- with the pre-allocated GraphInstance pool.
@@ -523,8 +520,8 @@ foreign import ccall unsafe "rt_graph_template_set_polyphony"
   c_rt_graph_template_set_polyphony :: Ptr RTGraph -> CInt -> CInt -> IO ()
 
 -- | Add a node to the named template's MetaDef. Walks every live
--- instance of that template to install per-instance state at the
--- same index. Other templates' instances are not touched.
+-- instance of that template to install per-instance state at the same
+-- index. Other templates' instances are not touched.
 foreign import ccall unsafe "rt_graph_template_add_node"
   c_rt_graph_template_add_node
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> IO ()
@@ -539,8 +536,8 @@ foreign import ccall unsafe "rt_graph_template_set_default"
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO ()
 
 -- | Connect ports within a single template. Cross-template signal
--- flow goes through the shared bus pool, not direct port wiring;
--- this entry does not validate that constraint.
+-- flow goes through the shared bus pool, not direct port wiring; this
+-- entry does not validate that constraint.
 foreign import ccall unsafe "rt_graph_template_connect"
   c_rt_graph_template_connect
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> CInt -> IO ()

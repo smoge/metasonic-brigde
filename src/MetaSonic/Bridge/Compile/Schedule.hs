@@ -26,8 +26,8 @@
 -- Today's output is the identity over 'rrIndex' order because
 -- 'compileRuntimeGraph' already produces a topologically valid
 -- 'rrIndex' sequence. The function still exists with explicit
--- barrier-and-topo-sort logic so a future change that breaks
--- that invariant is caught here, not in the scheduler.
+-- barrier-and-topo-sort logic so a future change that breaks that
+-- invariant is caught here, not in the scheduler.
 --
 -- Bit-equivalence with the legacy executor follows from the identity
 -- property; scheduler-side tests catch divergence between the
@@ -80,10 +80,10 @@ import           MetaSonic.Bridge.Compile.Types
                    , RegionIndex (..)
                    )
 
--- | One slice of the schedule. Either a single 'Barrier' region
--- (a live-bus region pinned at its compile-decreed 'rrIndex'
--- position) or a 'FreeSegment' — a maximal run of non-barrier
--- regions that the scheduler may topologically sort.
+-- | One slice of the schedule. Either a single 'Barrier' region (a
+-- live-bus region pinned at its compile-decreed 'rrIndex' position)
+-- or a 'FreeSegment' — a maximal run of non-barrier regions that the
+-- scheduler may topologically sort.
 --
 -- Exported for diagnostic / testability purposes and for building
 -- checked schedule metadata.
@@ -92,20 +92,20 @@ data Segment
   | FreeSegment ![RuntimeRegion]
   deriving stock (Eq, Show)
 
--- | A same-layer write/write conflict on a shared bus. The
--- layer is still a valid descriptive topological layer, but a
--- runtime could not execute every listed writer concurrently
--- against the current shared bus storage without either
--- serialization or a later deterministic reduction policy.
+-- | A same-layer write/write conflict on a shared bus. The layer is
+-- still a valid descriptive topological layer, but a runtime could
+-- not execute every listed writer concurrently against the current
+-- shared bus storage without either serialization or a later
+-- deterministic reduction policy.
 data SharedWriteHazard = SharedWriteHazard
   { swhBus     :: !Int
   , swhRegions :: ![RegionIndex]
   } deriving stock (Eq, Show)
 
 -- | One free topological layer inside a non-barrier segment.
--- 'flRegions' are unordered only in the mathematical sense; the
--- list order is stable 'rrIndex' order. 'flSharedWriteHazards'
--- records same-bus write conflicts within that layer.
+-- 'flRegions' are unordered only in the mathematical sense; the list
+-- order is stable 'rrIndex' order. 'flSharedWriteHazards' records
+-- same-bus write conflicts within that layer.
 data FreeLayer = FreeLayer
   { flRegions             :: ![RegionIndex]
   , flSharedWriteHazards  :: ![SharedWriteHazard]
@@ -122,19 +122,19 @@ data ScheduleStep
   deriving stock (Eq, Show)
 
 -- | Walk regions in 'rrIndex' order, partitioning into a list of
--- 'Segment's. The output preserves the original 'rrIndex' order
--- at the segment level: barriers stay where they were, and free
--- segments are the maximal runs of consecutive non-barrier
--- regions between (or before / after) them.
+-- 'Segment's. The output preserves the original 'rrIndex' order at
+-- the segment level: barriers stay where they were, and free segments
+-- are the maximal runs of consecutive non-barrier regions between (or
+-- before / after) them.
 --
--- Empty 'FreeSegment's are never emitted — adjacent barriers
--- produce no segment between them.
+-- Empty 'FreeSegment's are never emitted — adjacent barriers produce
+-- no segment between them.
 segmentByBarrier :: RuntimeGraph -> [Segment]
 segmentByBarrier rg = go [] (rgRuntimeRegions rg)
   where
     -- 'acc' accumulates the open free segment in /reverse/ order;
-    -- flush it (in correct order) when we hit a barrier or the
-    -- end of the input.
+    -- flush it (in correct order) when we hit a barrier or the end of
+    -- the input.
     flushAcc :: [RuntimeRegion] -> [Segment]
     flushAcc []  = []
     flushAcc acc = [FreeSegment (reverse acc)]
@@ -146,13 +146,13 @@ segmentByBarrier rg = go [] (rgRuntimeRegions rg)
       | otherwise             =
           go (r : acc) rs
 
--- | Compute the deterministic single-thread region schedule
--- under the §4.E.1c barrier policy. See module-level haddock for
--- the full contract.
+-- | Compute the deterministic single-thread region schedule under the
+-- §4.E.1c barrier policy. See module-level haddock for the full
+-- contract.
 --
 -- Returns @Right@ with a list of 'RegionIndex' in execution order
--- when the inputs are well-formed. Returns @Left@ with a
--- diagnostic when:
+-- when the inputs are well-formed. Returns @Left@ with a diagnostic
+-- when:
 --
 --   * 'rgRuntimeRegions' is not dense-ascending by 'rrIndex' from
 --     0 (duplicate, missing, or non-ascending),
@@ -163,8 +163,8 @@ segmentByBarrier rg = go [] (rgRuntimeRegions rg)
 --     later barrier or free segment).
 --
 -- §4.E.2b will consume @Right@ values directly; the @Left@ paths
--- exist so a future change that breaks the input contract is
--- caught here, not by silent reordering at runtime.
+-- exist so a future change that breaks the input contract is caught
+-- here, not by silent reordering at runtime.
 regionSchedule :: RuntimeGraph -> Either String [RegionIndex]
 regionSchedule rg = do
   validateRegionOrder (rgRuntimeRegions rg)
@@ -185,13 +185,13 @@ regionSchedule rg = do
 -- lookup over 'rgRuntimeRegions'. The dense-ascending validation
 -- inside 'regionSchedule' guarantees the lookup is total (every
 -- 'RegionIndex' the planner emits maps to a region in the input
--- list), so the @Left@ paths surface only planner diagnostics —
--- there is no separate "index out of range" failure mode.
+-- list), so the @Left@ paths surface only planner diagnostics — there
+-- is no separate "index out of range" failure mode.
 --
 -- §4.E.2b loaders use this to register regions on the C++ side in
--- scheduled order rather than raw 'rgRuntimeRegions' list order.
--- The two coincide today (the planner's output is the identity
--- over 'rrIndex' order), so this is a behavior-preserving rewire.
+-- scheduled order rather than raw 'rgRuntimeRegions' list order. The
+-- two coincide today (the planner's output is the identity over
+-- 'rrIndex' order), so this is a behavior-preserving rewire.
 scheduledRuntimeRegions
   :: RuntimeGraph -> Either String [RuntimeRegion]
 scheduledRuntimeRegions rg = do

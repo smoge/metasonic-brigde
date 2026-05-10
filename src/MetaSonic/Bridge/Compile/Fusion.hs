@@ -8,14 +8,14 @@
 -- transform that walks 'rgNodes', identifies candidate Gains and
 -- Adds, and rewrites each non-candidate consumer's 'RFrom' inputs
 -- into 'RFused' values that absorb the upstream candidate chain.
--- Every elided node stays in 'rgNodes' with 'rnElided = True' so
--- its 'NodeIndex' remains addressable through 'set_control' and
--- the realtime control queue.
+-- Every elided node stays in 'rgNodes' with 'rnElided = True' so its
+-- 'NodeIndex' remains addressable through 'set_control' and the
+-- realtime control queue.
 --
--- See Note [Scalar affine fusion] for the algorithmic contract:
--- which nodes qualify, how chains are extended, which 'FusedInput'
--- variant is emitted for which chain shape, and the float-rounding
--- identity discipline.
+-- See Note [Scalar affine fusion] for the algorithmic contract: which
+-- nodes qualify, how chains are extended, which 'FusedInput' variant
+-- is emitted for which chain shape, and the float-rounding identity
+-- discipline.
 --
 -- Re-exported by 'MetaSonic.Bridge.Compile' for the public surface.
 module MetaSonic.Bridge.Compile.Fusion
@@ -28,22 +28,26 @@ import qualified Data.Set        as S
 import           MetaSonic.Bridge.Compile.Types
 import           MetaSonic.Types
 
+
 {- Note [Scalar affine fusion]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The Step-C fusion pass elides scalar 'KGain' and 'KAdd' nodes whose
 entire role is to multiply or bias a single-consumer signal by a
-control-rate scalar. After fusion, a non-candidate consumer reads
-the upstream producer directly through an 'RFused' input that
-applies the chain of operations inline.
+control-rate scalar. After fusion, a non-candidate consumer reads the
+upstream producer directly through an 'RFused' input that applies the
+chain of operations inline.
 
 A node @g@ is a /candidate/ iff all of the following hold:
 
   1. @rnOutputUse g == RegionLocal@ — its output never escapes the
      region (Step B-Light).
+
   2. @rnConsumerCount g == 1@ — a single 'FromNode' reader, so
      destructive single-edge rewriting cannot orphan a sibling
      consumer.
+
   3. @not (rnElided g)@ — not already elided by a prior pass.
+
   4. The kind-specific shape:
 
      * 'KGain' with @rnInputs == [RFrom _ _, RConst _]@ — signal on
@@ -55,44 +59,44 @@ A node @g@ is a /candidate/ iff all of the following hold:
        control slot 0, signal on port 1. Audio-rate Add
        (@[RFrom, RFrom]@) stays dispatched.
 
-Chain extension. The rewrite is driven from /non-candidate/
-consumers: for each input @RFrom srcIx _@ whose @srcIx@ is a
-candidate, walk upstream through candidates and collect them into a
-chain @[Sn, …, S1]@ stopping at the first non-candidate source. The
-walked candidates are marked 'rnElided'; the consumer's input
-becomes 'RFused' carrying the upstream source and the chain in
-source-to-sink order @[S1, …, Sn]@. Each chain element is tagged as
-either 'AffScale' (from a Gain) or 'AffBias' (from an Add).
+Chain extension. The rewrite is driven from /non-candidate/ consumers:
+for each input @RFrom srcIx _@ whose @srcIx@ is a candidate, walk
+upstream through candidates and collect them into a chain @[Sn, …,
+S1]@ stopping at the first non-candidate source. The walked candidates
+are marked 'rnElided'; the consumer's input becomes 'RFused' carrying
+the upstream source and the chain in source-to-sink order @[S1, …,
+Sn]@. Each chain element is tagged as either 'AffScale' (from a Gain)
+or 'AffBias' (from an Add).
 
-Variant selection. A pure-scale chain (every step is 'AffScale')
-emits 'FScaleFrom' (length 1) or 'FScaleChainFrom' (length ≥ 2),
-preserving the IR shape that single-edge tests already pin. A chain
-that contains at least one 'AffBias' step emits 'FAffineFrom'
-regardless of length — including a single elided Add. Mixed Gain /
-Add chains in either order compose end-to-end through one
-'FAffineFrom' on the eventual non-candidate sink.
+Variant selection. A pure-scale chain (every step is 'AffScale') emits
+'FScaleFrom' (length 1) or 'FScaleChainFrom' (length ≥ 2), preserving
+the IR shape that single-edge tests already pin. A chain that contains
+at least one 'AffBias' step emits 'FAffineFrom' regardless of length —
+including a single elided Add. Mixed Gain / Add chains in either order
+compose end-to-end through one 'FAffineFrom' on the eventual
+non-candidate sink.
 
 Driving the rewrite from non-candidate consumers means a candidate
-whose own consumer is /also/ a candidate is never the rewriting
-site — the chain is collected once, by the eventual non-candidate
-sink. This is how the algorithm avoids both double-fusion and
-recursion on already-fused inputs.
+whose own consumer is /also/ a candidate is never the rewriting site —
+the chain is collected once, by the eventual non-candidate sink. This
+is how the algorithm avoids both double-fusion and recursion on
+already-fused inputs.
 
 Termination. Each candidate's 'rnConsumerCount' is exactly 1, so a
 chain has a unique sink. The graph is a DAG, so the upstream walk
-cannot loop. The walk terminates at the first non-candidate
-'rnIndex' encountered — typically the producer of the original
-signal (e.g., a 'KSinOsc'), but it can also be an audio-modulated
-Gain or audio-rate Add whose shape gate excludes it.
+cannot loop. The walk terminates at the first non-candidate 'rnIndex'
+encountered — typically the producer of the original signal (e.g., a
+'KSinOsc'), but it can also be an audio-modulated Gain or audio-rate
+Add whose shape gate excludes it.
 
 Identity preservation. Every elided node remains in 'rgNodes' with
 'rnElided = True', preserving its 'NodeIndex'. Direct
 'rt_graph_instance_set_control' / realtime control writes to the
-elided node continue to land on @inst.nodes[node].controls[slot]@;
-the runtime reads each scale or bias live at fused-input evaluation
-time, exactly as the kernel's controls-fallback branch does. No
-control-addressable identity disappears, including for nodes in
-the middle of a chain.
+elided node continue to land on @inst.nodes[node].controls[slot]@; the
+runtime reads each scale or bias live at fused-input evaluation time,
+exactly as the kernel's controls-fallback branch does. No
+control-addressable identity disappears, including for nodes in the
+middle of a chain.
 
 Float-rounding identity. The fused resolver applies steps in
 source-to-sink order, casting each control to 'float' before the
@@ -101,10 +105,10 @@ exactly. Scales are /not/ pre-multiplied and biases are /not/
 pre-summed (float arithmetic is non-associative), so chained-fused
 output is bit-identical to chained-unfused output.
 
-Counter-state. 'rnConsumerCount' and 'rnOutputUse' are not
-recomputed by the rewrite. They reflect the post-compile state,
-not the post-fusion state. A future fusion pass that needs updated
-counts must rebuild them.
+Counter-state. 'rnConsumerCount' and 'rnOutputUse' are not recomputed
+by the rewrite. They reflect the post-compile state, not the
+post-fusion state. A future fusion pass that needs updated counts must
+rebuild them.
 -}
 
 -- | Step C: scalar Gain / Add fusion with chain extension. Walks
@@ -124,11 +128,11 @@ fuseRuntimeGraph :: RuntimeGraph -> RuntimeGraph
 fuseRuntimeGraph rg =
   let nodes = rgNodes rg
 
-      -- §4.B: nodes that are members of a non-'RNodeLoop' region
-      -- have been claimed by a fused region kernel and must be
-      -- left alone here. Eliding them via §4.C would invalidate
-      -- the region kernel's per-sample loop (it expects the saw,
-      -- lpf, and gain nodes to all stay live and addressable).
+      -- §4.B: nodes that are members of a non-'RNodeLoop' region have
+      -- been claimed by a fused region kernel and must be left alone
+      -- here. Eliding them via §4.C would invalidate the region
+      -- kernel's per-sample loop (it expects the saw, lpf, and gain
+      -- nodes to all stay live and addressable).
       regionFused :: S.Set NodeIndex
       regionFused = S.fromList
         [ ix
@@ -191,8 +195,8 @@ fuseRuntimeGraph rg =
                in (term, termPort, ix : elided, stepsUp ++ [here])
 
       -- Try to fuse a single consumer-side input. Returns the
-      -- (possibly rewritten) input plus any node indices that
-      -- should be marked elided as a result.
+      -- (possibly rewritten) input plus any node indices that should
+      -- be marked elided as a result.
       tryFuseInput :: RuntimeInput -> (RuntimeInput, [NodeIndex])
       tryFuseInput inp = case inp of
         RFrom srcIx _port
@@ -223,9 +227,9 @@ fuseRuntimeGraph rg =
           stepToScale (AffBias  _ _) = Nothing
 
       -- Process one node. Candidates are left alone here — they
-      -- become elided once a downstream non-candidate consumer
-      -- walks them. Non-candidates have each input considered for
-      -- chain fusion.
+      -- become elided once a downstream non-candidate consumer walks
+      -- them. Non-candidates have each input considered for chain
+      -- fusion.
       processNode n
         | M.member (rnIndex n) candById = (n, [])
         | otherwise =
