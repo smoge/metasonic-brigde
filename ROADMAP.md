@@ -1019,7 +1019,9 @@ here.
 Departs from §3 MIDI in one deliberate way: OSC parsing and
 dispatch live on the Haskell side, not C++. Reasoning is in the
 design note. OSC is a control plane, not a data plane; the
-realtime control queue absorbs Haskell-side jitter without harm.
+realtime control queue decouples the audio callback from
+producer-side jitter (events may arrive late under a GC pause,
+but the audio thread does not stall).
 
 #### 6.B.1 Design note (current task)
 
@@ -1031,23 +1033,40 @@ implement.
 
 Note: [Phase 6.B OSC design](notes/2026-05-10-phase-6b-osc-design.md).
 
-#### 6.B.2 Minimal handler module
+#### 6.B.2a Wire and dispatch (pure)
 
-Pure `OscMessage` ADT + parser (`MetaSonic.OSC.Wire`), pure
-dispatch resolver (`MetaSonic.OSC.Dispatch`), and an IO entry
-point (`MetaSonic.App.Osc.runOscListen`) that holds a resolution
-table behind an `IORef` and calls the realtime queue helpers.
-Tests parse round-trip + dispatch resolution against the 6.A
-corpus, plus negative cases mirroring 6.A's `DriverIssue` shape
-(unknown voice / node tag / slot).
+`MetaSonic.OSC.Wire` (pure parser + `OscMessage` ADT) and
+`MetaSonic.OSC.Dispatch` (pure resolver, `ResolveState`,
+`DispatchAction`, `DispatchIssue`). No `IO`, no sockets. v1
+grammar is **control writes only**
+(`/<voice-key>/<node-tag>/<slot>`); voice lifecycle and
+hot-swap stay deferred until argument typing supports a clean
+`VoiceOnSpec` encoding. Identifiers used as path segments must
+match an OSC-safe profile (`[A-Za-z0-9_-]+`, ≤16 bytes,
+reserved words excluded); the dispatch layer validates at
+registration time. Tests cover parse round-trip + dispatch
+resolution against the 6.A corpus plus negative cases
+mirroring 6.A's `DriverIssue` shape (unknown voice / node tag
+/ slot, identifier-profile violations).
 
-#### 6.B.3 Verification before live use
+#### 6.B.2b Bracketed UDP listener
 
-End-to-end test using either an in-process loopback or a Haskell
-OSC client driving `runOscListen` against a loaded
-`TemplateGraph`. Asserts the realtime queue writes match what the
-OSC stream specified. No `--osc-listen` subcommand until this
-gate holds.
+`MetaSonic.OSC.Listen` (in `src/`, not `app/`, so tests can
+import it). Exposes a bracketed listener that takes a supplied
+`RTGraph`, an `IORef ResolveState`, and a UDP port; binds the
+socket, runs the listener thread, and tears down cleanly on
+exit. The caller owns the runtime handle and the resolve-state
+ref; the listener only reads them and writes through the
+existing realtime queue helpers.
+
+#### 6.B.3 End-to-end verification
+
+Loopback integration test: a Haskell OSC client (or in-process
+message generator) drives the listener against a loaded
+`TemplateGraph`. Asserts the realtime queue writes match what
+the OSC stream specified. Only after this gate holds does the
+`--osc-listen` subcommand land in `app/` as the CLI wrapper
+over the library entry point.
 
 ### Phase 6.C — Buffer I/O Design Pass
 

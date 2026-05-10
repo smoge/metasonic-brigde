@@ -41,14 +41,22 @@ A small UDP listener that:
    `rt_graph_realtime_reserve / _activate / _release`) and the
    §5.3 swap helpers.
 
-The address space mirrors 6.A's symbolic identifiers:
+The v1 address space is **control writes only**, mirroring 6.A's
+symbolic identifiers for the (voice, node, slot) triple:
 
 ```
 /<voice-key>/<node-tag>/<slot>          control write
-/<voice-key>/on/<template-name>         voice on (initial ctrls in args)
-/<voice-key>/off                        voice off
-/swap/<swap-label>                      (deferred to 6.B post-v1)
 ```
+
+Voice lifecycle (`/on`, `/off`) and hot-swap (`/swap/<label>`) are
+**deferred to a later 6.B slice**. The reason is concrete: a
+voice-on event must encode multiple `(node-tag, slot, value)`
+triples for initial controls, and OSC 1.0's flat type system
+(`,f`, `,i` for v1) does not give a clean encoding without
+defining a positional `VoiceOnSpec` or per-template
+initial-control map. v1 punts on that; 6.A patterns remain the
+voice-emission surface, and 6.B is the parameter-tweaking
+surface.
 
 The address-to-target resolution is the §5.4.C producer-side
 mapping problem made concrete (see "Where §5.4.C lands" below).
@@ -95,8 +103,10 @@ spelling out:
 2. **OSC is a control plane, not a data plane.** MIDI is
    audio-rate input with sub-millisecond hardware timing; OSC
    is high-level command traffic with network jitter already
-   baked in. A Haskell GC pause is absorbed by the realtime
-   queue without harm.
+   baked in. A Haskell GC pause delays event delivery but does
+   not block the audio thread: the realtime control queue
+   decouples the producer from the audio callback, so a stalled
+   producer never stalls audio (events may simply arrive late).
 3. **Smaller C++ surface.** No new realtime ABI entries, no
    vendored OSC library on the C++ side, no socket integration
    with the audio callback. The C++ runtime stays focused on
@@ -140,6 +150,34 @@ feasibility validator (`checkDriverFeasibility` in
 `test/Spec.hs`); 6.B should reuse the same `DriverIssue` ADT
 shape rather than reinventing the issue vocabulary.
 
+### OSC-safe identifier profile
+
+The OSC wire format uses `/` as path separator and treats each
+path segment as an opaque string. The existing `MigrationKey`
+validation (§5.2) permits any non-empty 1–16 UTF-8 bytes
+excluding NUL, which would allow `/`, spaces, and reserved
+words inside an identifier — collisions with the OSC path
+grammar.
+
+6.B therefore defines an *OSC-safe* subset for identifiers that
+appear as OSC path segments (`VoiceKey`, `NodeTag`):
+
+- Must match `[A-Za-z0-9_-]+` (ASCII letters, digits,
+  underscore, hyphen). No `/`, no spaces, no NUL.
+- Length cap inherited from `MigrationKey` (≤16 UTF-8 bytes).
+- The string `swap` is reserved as a future top-level path
+  segment; voice keys may not equal `swap`. Similarly `on` and
+  `off` are reserved for the deferred voice-lifecycle grammar
+  even though v1 does not use them.
+
+The dispatch layer validates these constraints at
+`ResolveState` registration time (not on every incoming
+message). A graph whose tagged nodes use identifiers outside
+the OSC-safe subset can still be loaded — they are simply
+unreachable from OSC, mirroring how an untagged node is
+unreachable from §5.2 state migration. Tests pin the validator
+behavior with both accepting and rejecting cases.
+
 ### Where §5.4.C lands
 
 The Phase 5 status note documents §5.4.C (producer-side
@@ -173,35 +211,62 @@ either:
 Both are deferred until evidence appears. v1 says: one OSC
 producer at a time, no concurrent pattern driver.
 
-## Module shape (preview for 6.B.2)
+## Module shape (preview for 6.B.2a / 6.B.2b)
 
-When the implementation slice lands, the minimum surface is:
+The implementation slice splits into a pure half and an IO half so
+the pure half tests without sockets or FFI.
+
+### 6.B.2a — Wire and dispatch (pure)
 
 - `src/MetaSonic/OSC/Wire.hs` — pure binary parser. Exposes
   `parseMessage :: ByteString -> Either String OscMessage` plus
-  the `OscMessage` ADT (`OscAddr`, `OscArg`).
+  the `OscMessage` ADT (`OscAddr`, `OscArg`). No `IO`, no
+  `Network`.
 - `src/MetaSonic/OSC/Dispatch.hs` — pure resolver. Exposes
   `dispatch :: ResolveState -> OscMessage -> Either DispatchIssue
-  DispatchAction` and the `ResolveState` / `DispatchAction` ADTs.
-- `app/MetaSonic/App/Osc.hs` — IO entry point. Exposes
-  `runOscListen :: Int -> IO ()` (port → listener). Holds a
-  resolution table behind an `IORef`, calls the realtime queue
-  helpers from the library.
+  DispatchAction` and the `ResolveState` / `DispatchAction` /
+  `DispatchIssue` ADTs. `ResolveState` carries the
+  `VoiceKey → slot_id` and `(template_id, NodeTag) →
+  NodeIndex` tables described above, plus the OSC-safe
+  identifier profile validator.
 
 Tests live in `test/Spec.hs` as a new test group covering:
 
 - Parse round-trip on hand-crafted byte sequences (the OSC 1.0
   spec gives plenty of examples).
 - Dispatch resolution against a fixed `ResolveState` derived
-  from the 6.A corpus (so we exercise the 6.A address shape
-  end-to-end without standing up an actual socket).
+  from the 6.A corpus (exercises the 6.A address shape
+  end-to-end without standing up a socket).
 - Negative cases mirroring 6.A's `DriverIssue`: unknown voice,
-  unknown node tag, out-of-range slot.
+  unknown node tag, out-of-range slot, OSC-safe identifier
+  violations.
 
-No new executable subcommand in 6.B.2 — the listener entry point
-ships as a library function so tests drive it directly; a
-`--osc-listen` subcommand can land in 6.B.3 once the contract is
-verified.
+### 6.B.2b — Bracketed UDP listener
+
+- `src/MetaSonic/OSC/Listen.hs` — IO entry point in the
+  library, not `app/`, so tests can import it. Exposes a
+  bracketed listener of approximately this shape:
+
+  ```haskell
+  withOscListener
+    :: RTGraph            -- runtime handle to write through
+    -> IORef ResolveState -- mutable resolution table the listener reads
+    -> Int                -- UDP port to bind
+    -> IO a
+    -> IO a
+  ```
+
+  The bracket binds / closes the UDP socket and tears down the
+  listener thread cleanly on exit. The caller owns the
+  `RTGraph` and the `IORef ResolveState`; the listener reads
+  them and writes through the existing realtime queue helpers.
+  Concurrent updates to `ResolveState` from the caller (e.g.,
+  on hot-swap) use the standard `atomicModifyIORef'` discipline.
+
+The CLI wrapper (`--osc-listen` subcommand under `app/`) is
+**6.B.3 territory**, not 6.B.2b. 6.B.2b lands the library entry
+point; 6.B.3 verifies it end-to-end via loopback / in-process
+client; only after both gates does the CLI wrap them.
 
 ## Out of 6.B scope
 
@@ -219,7 +284,12 @@ verified.
 
 ## Next concrete step
 
-Land 6.B.2: the contract module (`MetaSonic.OSC.Wire`,
-`MetaSonic.OSC.Dispatch`) plus the `runOscListen` IO entry
-point, with the test-group shape above. Do not start ergonomic
-or send-side work before 6.B.3 verification holds.
+Land **6.B.2a only**: the pure modules (`MetaSonic.OSC.Wire`,
+`MetaSonic.OSC.Dispatch`) with the test-group shape above. No
+socket, no FFI, no `IO`. Once that contract is reviewed, 6.B.2b
+adds the bracketed listener in `MetaSonic.OSC.Listen` against a
+supplied runtime handle. The `--osc-listen` CLI is 6.B.3
+territory, gated on end-to-end loopback verification.
+
+Do not start ergonomic, send-side, or voice-lifecycle grammar
+work before 6.B.3 holds.
