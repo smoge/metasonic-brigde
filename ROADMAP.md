@@ -771,7 +771,8 @@ forcing callers to manually juggle every ownership edge:
 - `BuilderCapacity`, `MaxFrames`, `TimeoutMs`, and `SwapGeneration`
   aliases label the adjacent integer roles in the Haskell API. They are
   documentation, not type-safety; use newtypes later only if callers
-  start mixing them up.
+  start mixing them up. `SwapGeneration` stays Haskell-facing `Int`;
+  the raw C counter remains `int`/`CInt` at the FFI boundary.
 - `collectRetiredSwapStats` reaps the installed retired swap, returns
   the Phase 5.2 migration counters, and disposes the old world off-audio.
 - Failed publish cancels the prepared swap before returning, so callers
@@ -786,6 +787,19 @@ forcing callers to manually juggle every ownership edge:
 
 Edit a graph in the Haskell DSL, recompile, and hear the change without
 restarting audio.
+
+**5.3.C next: swap-bench instrumentation.** Measure before adding more
+synchronization surface:
+
+- Add an opt-in producer-side benchmark path that repeatedly prepares,
+  publishes, drives install, collects retired stats, and reports
+  prepare time, publish-to-install block count, collect time, and
+  Phase 5.2 migration counters.
+- Cover unchanged graph, tagged oscillator, tagged biquad,
+  lifecycle-only graph, fused graph, and template graph shapes.
+- Do not add `rt_graph_wait_swap_installed` in 5.3.C. A C-side blocking
+  wait primitive is deferred until swap-bench data or a real producer
+  shows polling is the wrong abstraction.
 
 ---
 

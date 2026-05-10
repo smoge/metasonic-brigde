@@ -2,6 +2,9 @@
 
 Date: 2026-05-10
 Status: Phase 5.1.A/B, 5.2.A/B/C, and 5.3.A/B implemented.
+5.3.C is selected as a measurement-only swap-bench slice; a C-side
+wait primitive is deferred until measurements or producer workloads
+justify another synchronization surface.
 
 This note pins the protocol for swapping a running MetaSonic graph
 without a stop/start cycle. It records what the runtime did before the
@@ -158,6 +161,8 @@ Phase 5.3.A/B wraps the C ownership protocol in
   `TimeoutMs`, and `SwapGeneration` aliases to label adjacent integer
   roles. They document intent without changing the ABI; promote them to
   newtypes only if producer-side misuse becomes a real problem.
+  `SwapGeneration` is a Haskell-side `Int`; the raw C counter remains
+  `int`/`CInt` and is converted at the FFI wrapper boundary.
 - If publish fails, the helper cancels the prepared swap before
   returning `False`. If publish succeeds, ownership moves to the C++
   runtime and the helper returns `True`.
@@ -185,6 +190,26 @@ realtime callers can either poll manually or use the 5.3.B waited
 helpers so control producers know when it is safe to resume commands
 against the new world.
 
+### 4.2 Next slice: measure before synchronizing
+
+The next 5.3 slice is **5.3.C — swap-bench instrumentation**:
+
+- Add a producer-side benchmark path that repeatedly prepares,
+  publishes, drives install, collects retired stats, and reports
+  prepare time, publish-to-install block count, collect time, and
+  migration counters.
+- Cover representative shapes: unchanged graph, tagged oscillator,
+  tagged biquad, lifecycle-only graph, fused graph, and template graph.
+- Keep the benchmark off-audio and opt-in. It must not change the C
+  runtime contract, Haskell helper behavior, or default execution path.
+
+Do **not** add `rt_graph_wait_swap_installed` in this slice. A C-side
+blocking wait would introduce a new synchronization contract across the
+audio and producer threads. The current polling helper is adequate for
+v1 producer ergonomics; implement the C wait primitive only after
+`--swap-bench` or a real producer demonstrates that polling is the
+wrong abstraction.
+
 ## 5. Realtime control queue across a swap
 
 The control queue ([Note [A.2: realtime control queue]]) carries
@@ -203,9 +228,10 @@ exist (or may be at different indices) in the new world.
 > Publish a swap → wait until `swap_generation` advances → resume
 > enqueuing realtime commands against the new world.
 
-The producer-side wait can be a poll on the test counter, or a future
-`rt_graph_wait_swap_installed` that blocks on a condition variable
-populated by the audio thread. v1 leaves this to the caller.
+The producer-side wait is currently a poll on the install-generation
+counter. A future `rt_graph_wait_swap_installed` could block on a
+condition variable populated by the audio thread, but that is deferred
+until 5.3.C measurement proves the polling helper is inadequate.
 
 ## 6. Audio-thread allocation invariants
 
@@ -312,13 +338,19 @@ loops don't shift content.
   through `g.active->...`. `RTGraphSwap` carries an `RTGraphState`.
   A publish actually replaces the world; tests prove byte-equivalence
   with a separately rebuilt graph.
-- **5.2 — State migration policy.** Pick one of §7.1 (a)/(b)/(c), wire
-  it into the install path, define live-instance survival, lift bus-pool
-  stability into a publish precondition.
-- **5.3 — Producer ergonomics.** `rt_graph_wait_swap_installed`,
-  `--swap-bench` for measuring publish-to-install latency,
-  Haskell-side `loadRuntimeGraphSwap` that reuses `RTGraphState`-shaped
-  capacity.
+- **5.2.A/B/C — State migration policy.** Caller-supplied migration
+  tags are implemented for control and copy-safe DSP state; slot-index
+  lifecycle migration preserves live instance state where old and new
+  worlds agree.
+- **5.3.A/B — Producer ergonomics.** Haskell hot-swap helpers build
+  offline worlds, publish them, optionally wait by polling the install
+  generation, and collect migration stats.
+- **5.3.C — Swap-bench instrumentation.** Next. Measure prepare,
+  publish-to-install, collect, and migration-counter behavior before
+  adding a C-side blocking wait primitive.
+- **5.3.D — Optional wait primitive.** Deferred. Only add
+  `rt_graph_wait_swap_installed` if 5.3.C data or a real producer shows
+  polling is insufficient.
 
 ## 9. What this design is *not*
 
@@ -345,8 +377,9 @@ loops don't shift content.
   The producer can poll until pending clears, then republish. A bounded
   queue can be added later if a use case demands it.)
 - **Q4.** What's the producer-side blocking primitive for "wait until
-  installed"? (Substrate: poll the atomic test counter. Future
-  ergonomics slice picks a real primitive.)
+  installed"? (Current helper: poll the install-generation counter.
+  Next step: measure with 5.3.C before adding a C-side
+  `rt_graph_wait_swap_installed` primitive.)
 - **Q5.** Does the swap need to preserve the realtime control queue
   contents across publish? (Substrate: yes, by ordering — drain runs
   before install. The queue ring is graph-handle-owned and outlives

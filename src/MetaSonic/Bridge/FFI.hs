@@ -329,13 +329,16 @@ data RTGraphSwap
 type BuilderCapacity = Int
 
 -- | Maximum frame count accepted by 'c_rt_graph_process'.
+-- Shared by 'withRTGraph' and hot-swap helpers; not 5.3-only.
 type MaxFrames = Int
 
 -- | Producer-side wait timeout in milliseconds. Negative waits
 -- indefinitely; zero performs one non-blocking poll.
 type TimeoutMs = Int
 
--- | Value returned by the runtime's install-generation counter.
+-- | Haskell-side install-generation value. The raw C ABI counter is
+-- 'CInt'; helper wrappers convert at the FFI boundary so callers do
+-- not have to traffic in C integer widths.
 type SwapGeneration = Int
 
 -- | Phase 5.2 migration counters observed on a collected swap just
@@ -975,6 +978,8 @@ The exported 'BuilderCapacity', 'MaxFrames', 'TimeoutMs', and
 'SwapGeneration' aliases label the adjacent integer roles in the API
 without changing the C ABI. If callers start mixing these up in real
 producer code, promote them to newtypes.
+SwapGeneration stays Haskell-facing Int by design; the raw C counter is
+CInt and is converted once at the FFI edge by 'readSwapGeneration'.
 
 The waited helpers assume the v1 producer model: one hot-swap producer
 and one collector per target. They capture @swap_generation@ before
@@ -1083,20 +1088,23 @@ collectRetiredSwapStats target = do
         , smsLifecycleCopyCount = fromIntegral lifecycles
         }
 
+readSwapGeneration :: Ptr RTGraph -> IO SwapGeneration
+readSwapGeneration target =
+  fromIntegral <$> c_rt_graph_test_swap_generation target
+
 -- | Poll until the target's swap generation is greater than
 -- @priorGeneration@. A negative timeout waits indefinitely; zero
 -- performs a single non-blocking poll; positive values are
 -- milliseconds. Returns 'False' on timeout.
 waitForSwapGeneration :: Ptr RTGraph -> SwapGeneration -> TimeoutMs -> IO Bool
 waitForSwapGeneration target priorGeneration timeoutMs = do
-  let wanted = fromIntegral priorGeneration
-      installed = (> wanted)
+  let installed = (> priorGeneration)
       poll = do
-        gen <- c_rt_graph_test_swap_generation target
+        gen <- readSwapGeneration target
         if installed gen
           then pure True
           else threadDelay 1000 >> poll
-  first <- c_rt_graph_test_swap_generation target
+  first <- readSwapGeneration target
   if installed first
     then pure True
     else if timeoutMs == 0
@@ -1116,12 +1124,12 @@ hotSwapAndWaitWith
   -> a
   -> IO HotSwapWaitResult
 hotSwapAndWaitWith publish target capacity maxFrames timeoutMs payload = do
-  before <- c_rt_graph_test_swap_generation target
+  before <- readSwapGeneration target
   published <- publish target capacity maxFrames payload
   if not published
     then pure HotSwapPublishRejected
     else do
-      installed <- waitForSwapGeneration target (fromIntegral before) timeoutMs
+      installed <- waitForSwapGeneration target before timeoutMs
       if not installed
         then pure HotSwapInstallTimedOut
         else do
