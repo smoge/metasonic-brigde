@@ -763,8 +763,9 @@ tags plus slot-index instance identity:
 forcing callers to manually juggle every ownership edge:
 
 - `hotSwapRuntimeGraph` / `hotSwapRuntimeGraphFused` build a next
-  single-template world in an offline runtime handle and publish it to a
-  live target without calling `rt_graph_clear`.
+  single-template world in an offline runtime handle sized by an
+  explicit builder-capacity hint, then publish it to a live target
+  without calling `rt_graph_clear`.
 - `hotSwapTemplateGraph` / `hotSwapTemplateGraphFused` provide the same
   helper for template ensembles.
 - `collectRetiredSwapStats` reaps the installed retired swap, returns
@@ -775,7 +776,9 @@ forcing callers to manually juggle every ownership edge:
 - `waitForSwapGeneration` and the `hotSwap*AndWait` helpers add the
   live-producer protocol: publish, wait for the install generation to
   advance with a timeout, reap stats, then resume realtime commands
-  against the new world.
+  against the new world. These helpers are v1 single-producer /
+  single-collector conveniences; concurrent producers need a stronger
+  attribution token than "generation advanced."
 
 Edit a graph in the Haskell DSL, recompile, and hear the change without
 restarting audio.

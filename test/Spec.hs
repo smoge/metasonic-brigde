@@ -29,7 +29,8 @@ import qualified Data.Map.Strict           as M
 import qualified Data.Set                  as S
 import           Data.List                 (isInfixOf, isPrefixOf, nub, sort,
                                             sortBy)
-import           Control.Concurrent        (forkIO, threadDelay)
+import           Control.Concurrent        (forkIO, newEmptyMVar, putMVar,
+                                            takeMVar, threadDelay)
 import           Control.Exception         (try)
 import           Control.Monad             (forM, forM_, when)
 import           Data.Maybe                (mapMaybe)
@@ -83,7 +84,10 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             instanceStatusReleasing,
                                             collectRetiredSwapStats,
                                             hotSwapRuntimeGraph,
+                                            hotSwapRuntimeGraphFused,
                                             hotSwapRuntimeGraphAndWait,
+                                            hotSwapTemplateGraph,
+                                            hotSwapTemplateGraphFused,
                                             loadRuntimeGraph,
                                             loadRuntimeGraphFused,
                                             loadTemplateGraph,
@@ -4667,15 +4671,16 @@ crossCuttingTests = testGroup "End-to-end FFI"
 
       oldRt <- compileOrFail graph
       newRt <- compileOrFail graph
+      let capacity = runtimeGraphBuilderCapacity oldRt + 4
 
-      withRTGraph (length (rgNodes oldRt)) nframes $ \handle -> do
+      withRTGraph capacity nframes $ \handle -> do
         loadRuntimeGraph handle oldRt
         c_rt_graph_process handle (fromIntegral nframes)
 
         before <- c_rt_graph_test_swap_generation handle
         before @?= 0
 
-        published <- hotSwapRuntimeGraph handle nframes newRt
+        published <- hotSwapRuntimeGraph handle capacity nframes newRt
         published @?= True
 
         -- The helper publishes only; installation still waits for a
@@ -4699,6 +4704,97 @@ crossCuttingTests = testGroup "End-to-end FFI"
         none <- collectRetiredSwapStats handle
         none @?= Nothing
 
+  , testCase "hotSwapRuntimeGraphFused publishes a fused next world" $ do
+      let nframes = 256
+          graph = runSynth $ do
+            e <- env (Param 1.0) 0.0005 0.002 1.0 0.002
+            a <- gain e (Param 0.5)
+            out 0 a
+
+      rt <- case lowerGraph graph >>= compileRuntimeGraphFused of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      assertBool "fused swap fixture produced no RFused inputs"
+        (not (null [() | n <- rgNodes rt, RFused _ <- rnInputs n]))
+      assertBool "fused swap fixture elided no nodes"
+        (any rnElided (rgNodes rt))
+
+      let capacity = runtimeGraphBuilderCapacity rt + 4
+      withRTGraph capacity nframes $ \handle -> do
+        loadRuntimeGraphFused handle rt
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        published <- hotSwapRuntimeGraphFused handle capacity nframes rt
+        published @?= True
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        stats <- collectRetiredSwapStats handle
+        assertBool "expected fused retired swap stats"
+          (case stats of
+             Just s  -> smsLifecycleCopyCount s == 1
+             Nothing -> False)
+
+  , testCase "hotSwapTemplateGraph publishes a multi-template next world" $ do
+      let nframes = 256
+          voiceA = runSynth $ do
+            o <- sinOsc 220.0 0.0
+            out 0 o
+          voiceB = runSynth $ do
+            o <- sinOsc 660.0 0.0
+            out 1 o
+
+      tg <- case compileTemplateGraph [("a", voiceA), ("b", voiceB)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let capacity = templateGraphBuilderCapacity tg + 4
+      withRTGraph capacity nframes $ \handle -> do
+        loadTemplateGraph handle tg
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        published <- hotSwapTemplateGraph handle capacity nframes tg
+        published @?= True
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        stats <- collectRetiredSwapStats handle
+        assertBool "expected template retired swap stats"
+          (case stats of
+             Just s  -> smsLifecycleCopyCount s == 2
+             Nothing -> False)
+
+  , testCase "hotSwapTemplateGraphFused publishes a fused template world" $ do
+      let nframes = 256
+          graph = runSynth $ do
+            e <- env (Param 1.0) 0.0005 0.002 1.0 0.002
+            a <- gain e (Param 0.5)
+            out 0 a
+
+      tg <- case compileTemplateGraphFused [("solo", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      tgRg <- case tgTemplates tg of
+        [tpl] -> pure (tplGraph tpl)
+        _ -> assertFailure "expected one fused template" >> error "unreachable"
+      assertBool "fused template swap fixture carried no RFused inputs"
+        (not (null [() | n <- rgNodes tgRg, RFused _ <- rnInputs n]))
+      assertBool "fused template swap fixture elided no nodes"
+        (any rnElided (rgNodes tgRg))
+
+      let capacity = templateGraphBuilderCapacity tg + 4
+      withRTGraph capacity nframes $ \handle -> do
+        loadTemplateGraphFused handle tg
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        published <- hotSwapTemplateGraphFused handle capacity nframes tg
+        published @?= True
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        stats <- collectRetiredSwapStats handle
+        assertBool "expected fused template retired swap stats"
+          (case stats of
+             Just s  -> smsLifecycleCopyCount s == 1
+             Nothing -> False)
+
   , testCase "hotSwapRuntimeGraph failed publish disposes the prepared swap" $ do
       let nframes = 256
           graph = runSynth $ do
@@ -4710,11 +4806,12 @@ crossCuttingTests = testGroup "End-to-end FFI"
               Left err -> assertFailure err >> error "unreachable"
 
       rt <- compileOrFail graph
+      let capacity = runtimeGraphBuilderCapacity rt + 4
 
-      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+      withRTGraph capacity nframes $ \handle -> do
         loadRuntimeGraph handle rt
 
-        first <- hotSwapRuntimeGraph handle nframes rt
+        first <- hotSwapRuntimeGraph handle capacity nframes rt
         first @?= True
         c_rt_graph_process handle (fromIntegral nframes)
 
@@ -4722,7 +4819,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
         -- helper must cancel the rejected prepared swap; otherwise the
         -- next publish after collection would be contaminated by the
         -- failed attempt.
-        blocked <- hotSwapRuntimeGraph handle nframes rt
+        blocked <- hotSwapRuntimeGraph handle capacity nframes rt
         blocked @?= False
 
         firstStats <- collectRetiredSwapStats handle
@@ -4731,7 +4828,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
              Just _  -> True
              Nothing -> False)
 
-        second <- hotSwapRuntimeGraph handle nframes rt
+        second <- hotSwapRuntimeGraph handle capacity nframes rt
         second @?= True
         c_rt_graph_process handle (fromIntegral nframes)
         secondStats <- collectRetiredSwapStats handle
@@ -4751,16 +4848,26 @@ crossCuttingTests = testGroup "End-to-end FFI"
               Left err -> assertFailure err >> error "unreachable"
 
       rt <- compileOrFail graph
+      let capacity = runtimeGraphBuilderCapacity rt + 4
 
-      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+      withRTGraph capacity nframes $ \handle -> do
         loadRuntimeGraph handle rt
         c_rt_graph_process handle (fromIntegral nframes)
 
+        done <- newEmptyMVar
         _ <- forkIO $ do
-          threadDelay 10000
-          c_rt_graph_process handle (fromIntegral nframes)
+          let drive 0 = putMVar done ()
+              drive remaining = do
+                threadDelay 1000
+                c_rt_graph_process handle (fromIntegral nframes)
+                gen <- c_rt_graph_test_swap_generation handle
+                if gen > 0
+                  then putMVar done ()
+                  else drive (remaining - 1)
+          drive (64 :: Int)
 
-        result <- hotSwapRuntimeGraphAndWait handle nframes 1000 rt
+        result <- hotSwapRuntimeGraphAndWait handle capacity nframes 1000 rt
+        takeMVar done
         result @?= HotSwapInstalled SwapMigrationStats
           { smsCommittedCount = 1
           , smsSkippedCount = 1
@@ -4783,10 +4890,11 @@ crossCuttingTests = testGroup "End-to-end FFI"
               Left err -> assertFailure err >> error "unreachable"
 
       rt <- compileOrFail graph
+      let capacity = runtimeGraphBuilderCapacity rt + 4
 
-      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+      withRTGraph capacity nframes $ \handle -> do
         loadRuntimeGraph handle rt
-        result <- hotSwapRuntimeGraphAndWait handle nframes 0 rt
+        result <- hotSwapRuntimeGraphAndWait handle capacity nframes 0 rt
         result @?= HotSwapInstallTimedOut
 
         -- The timed-out publish is still owned by the runtime. Once
@@ -6323,6 +6431,13 @@ crossCuttingTests = testGroup "End-to-end FFI"
         (abs (actual - expected) < 0.05)
 
 type PtrCFloat = Ptr CFloat
+
+runtimeGraphBuilderCapacity :: RuntimeGraph -> Int
+runtimeGraphBuilderCapacity = length . rgNodes
+
+templateGraphBuilderCapacity :: TemplateGraph -> Int
+templateGraphBuilderCapacity =
+  sum . map (length . rgNodes . tplGraph) . tgTemplates
 
 ------------------------------------------------------------
 -- Step C (f): fused render equivalence cases + helper

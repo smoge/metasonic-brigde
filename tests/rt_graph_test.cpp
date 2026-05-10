@@ -8705,6 +8705,39 @@ TEST_CASE("hot-swap migration: missing new slot does not inherit lifecycle") {
     rt_graph_destroy(g);
 }
 
+TEST_CASE("hot-swap migration: available old slot does not overwrite new active slot") {
+    constexpr int kBlock = 256;
+    auto *g = rt_graph_create(4, kBlock);
+    auto *builder = rt_graph_create(4, kBlock);
+    REQUIRE(g != nullptr);
+    REQUIRE(builder != nullptr);
+
+    build_env_out_graph(g, 1.0);
+    build_env_out_graph(builder, 1.0);
+
+    rt_graph_instance_remove(g, 0);
+    REQUIRE(rt_graph_instance_status(g, 0) == -1);
+    REQUIRE(rt_graph_instance_status(builder, 0) == 0);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(g, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+
+    REQUIRE(rt_graph_publish_swap(g, swap) == 1);
+    rt_graph_process(g, kBlock);
+
+    CHECK(rt_graph_instance_status(g, 0) == 0);
+    CHECK(rt_graph_instance_alive(g, 0) == 1);
+
+    auto *retired = rt_graph_collect_retired_swap(g);
+    REQUIRE(retired == swap);
+    CHECK(rt_graph_swap_migration_lifecycle_copy_count(retired) == 0);
+    CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 0);
+    CHECK(rt_graph_swap_migration_state_copy_count(retired) == 0);
+    rt_graph_cancel_swap(g, retired);
+    rt_graph_destroy(g);
+}
+
 TEST_CASE("hot-swap migration: oscillator state survives payload install") {
     auto build = [](RTGraph *g, int osc_kind) {
         rt_graph_add_node(g, 0, osc_kind);

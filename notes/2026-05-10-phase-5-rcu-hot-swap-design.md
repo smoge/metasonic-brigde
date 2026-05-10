@@ -143,12 +143,17 @@ What the substrate provides:
 Phase 5.3.A/B wraps the C ownership protocol in
 `MetaSonic.Bridge.FFI`:
 
-- `hotSwapRuntimeGraph(target, maxFrames, rg)` and
-  `hotSwapRuntimeGraphFused(target, maxFrames, rg)` build a temporary
-  offline `RTGraph`, load the compiled `RuntimeGraph` into it, move its
-  world into an `RTGraphSwap`, and publish that swap to the target.
+- `hotSwapRuntimeGraph(target, capacity, maxFrames, rg)` and
+  `hotSwapRuntimeGraphFused(target, capacity, maxFrames, rg)` build a
+  temporary offline `RTGraph`, load the compiled `RuntimeGraph` into it,
+  move its world into an `RTGraphSwap`, and publish that swap to the
+  target.
 - `hotSwapTemplateGraph` and `hotSwapTemplateGraphFused` do the same
   for `TemplateGraph`.
+- `capacity` is the explicit builder pre-allocation hint passed to
+  `withRTGraph`; the helper does not infer capacity from graph shape or
+  node count. Producers should use the same sizing policy they used for
+  the live target.
 - If publish fails, the helper cancels the prepared swap before
   returning `False`. If publish succeeds, ownership moves to the C++
   runtime and the helper returns `True`.
@@ -165,6 +170,10 @@ Phase 5.3.A/B wraps the C ownership protocol in
   publish, publish the prepared world, wait for install, collect stats,
   and return a result that distinguishes rejected publish from install
   timeout.
+- The waited helpers are v1 single-producer/single-collector helpers.
+  Their generation-before-publish check is attribution-safe only when no
+  other producer can install a swap between the generation snapshot and
+  this helper's publish.
 
 The plain 5.3.A helpers intentionally do not wait for installation.
 Offline tests drive one `rt_graph_process` block after publish;

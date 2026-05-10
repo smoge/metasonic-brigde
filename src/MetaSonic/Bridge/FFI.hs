@@ -939,6 +939,20 @@ producer boilerplate:
     realtime commands" protocol. They poll the install-generation
     counter rather than blocking inside C++.
 
+The helper @capacity@ argument is the same advisory pre-allocation
+hint accepted by 'withRTGraph'. It is deliberately explicit: graph
+shape is not an instance-capacity contract, and producers should size
+the offline builder using the same policy they used for the live
+target.
+
+The waited helpers assume the v1 producer model: one hot-swap producer
+and one collector per target. They capture @swap_generation@ before
+publish and then wait for it to advance, so a concurrent producer could
+make the wait observe and collect the other producer's swap. The
+@HotSwapInstalledButRetiredMissing@ result is defensive for future
+multi-collector code; under the single-producer/single-collector model
+it should not occur.
+
 The 5.3.A hotSwap* helpers do not block waiting for installation.
 Offline callers drive one rt_graph_process block; realtime callers let
 the audio callback advance and poll collection from the producer side.
@@ -978,42 +992,36 @@ prepareSwapWith loader capacity maxFrames target payload =
       then pure Nothing
       else pure (Just swap)
 
-runtimeGraphCapacity :: RuntimeGraph -> Int
-runtimeGraphCapacity = length . rgNodes
-
-templateGraphCapacity :: TemplateGraph -> Int
-templateGraphCapacity =
-  sum . map (length . rgNodes . tplGraph) . tgTemplates
-
 -- | Build @rg@ in an offline runtime graph and publish it as the
 -- target's next world. Returns 'True' when publish succeeds. On
 -- 'False', no swap remains owned by the caller.
 --
+-- @capacity@ is the advisory builder capacity passed to
+-- 'withRTGraph'; callers should use the same sizing policy as the live
+-- target rather than relying on node count as an implicit proxy.
+--
 -- The caller must later call 'collectRetiredSwapStats' after a block
 -- boundary has installed the swap; otherwise the C++ one-deep retire
 -- slot remains occupied and the next publish will fail.
-hotSwapRuntimeGraph :: Ptr RTGraph -> Int -> RuntimeGraph -> IO Bool
-hotSwapRuntimeGraph target maxFrames rg =
-  hotSwapWith loadRuntimeGraph
-    (runtimeGraphCapacity rg) maxFrames target rg
+hotSwapRuntimeGraph :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO Bool
+hotSwapRuntimeGraph target capacity maxFrames rg =
+  hotSwapWith loadRuntimeGraph capacity maxFrames target rg
 
 -- | Fused-aware sibling of 'hotSwapRuntimeGraph'.
-hotSwapRuntimeGraphFused :: Ptr RTGraph -> Int -> RuntimeGraph -> IO Bool
-hotSwapRuntimeGraphFused target maxFrames rg =
-  hotSwapWith loadRuntimeGraphFused
-    (runtimeGraphCapacity rg) maxFrames target rg
+hotSwapRuntimeGraphFused :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO Bool
+hotSwapRuntimeGraphFused target capacity maxFrames rg =
+  hotSwapWith loadRuntimeGraphFused capacity maxFrames target rg
 
 -- | Multi-template sibling of 'hotSwapRuntimeGraph'.
-hotSwapTemplateGraph :: Ptr RTGraph -> Int -> TemplateGraph -> IO Bool
-hotSwapTemplateGraph target maxFrames tg =
-  hotSwapWith loadTemplateGraph
-    (templateGraphCapacity tg) maxFrames target tg
+hotSwapTemplateGraph :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO Bool
+hotSwapTemplateGraph target capacity maxFrames tg =
+  hotSwapWith loadTemplateGraph capacity maxFrames target tg
 
 -- | Fused-aware multi-template sibling of 'hotSwapTemplateGraph'.
-hotSwapTemplateGraphFused :: Ptr RTGraph -> Int -> TemplateGraph -> IO Bool
-hotSwapTemplateGraphFused target maxFrames tg =
-  hotSwapWith loadTemplateGraphFused
-    (templateGraphCapacity tg) maxFrames target tg
+hotSwapTemplateGraphFused
+  :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO Bool
+hotSwapTemplateGraphFused target capacity maxFrames tg =
+  hotSwapWith loadTemplateGraphFused capacity maxFrames target tg
 
 -- | Collect and dispose one retired swap, returning the migration
 -- counters recorded by the install that consumed it. Returns
@@ -1024,6 +1032,9 @@ collectRetiredSwapStats target = do
   if swap == nullPtr
     then pure Nothing
     else do
+      -- The collected swap has already passed through the audio
+      -- thread's retired slot. Install is complete and these counters
+      -- are frozen before the producer can observe the pointer.
       committed <- c_rt_graph_swap_migration_committed_count swap
       skipped <- c_rt_graph_swap_migration_skipped_count swap
       instances <- c_rt_graph_swap_migration_instance_copy_count swap
@@ -1063,15 +1074,16 @@ waitForSwapGeneration target priorGeneration timeoutMs = do
           pure (maybe False id result)
 
 hotSwapAndWaitWith
-  :: (Ptr RTGraph -> Int -> a -> IO Bool)
+  :: (Ptr RTGraph -> Int -> Int -> a -> IO Bool)
   -> Ptr RTGraph
+  -> Int
   -> Int
   -> Int
   -> a
   -> IO HotSwapWaitResult
-hotSwapAndWaitWith publish target maxFrames timeoutMs payload = do
+hotSwapAndWaitWith publish target capacity maxFrames timeoutMs payload = do
   before <- c_rt_graph_test_swap_generation target
-  published <- publish target maxFrames payload
+  published <- publish target capacity maxFrames payload
   if not published
     then pure HotSwapPublishRejected
     else do
@@ -1088,25 +1100,29 @@ hotSwapAndWaitWith publish target maxFrames timeoutMs payload = do
 -- installs it, collect migration stats, and dispose the retired old
 -- world. The timeout is in milliseconds; negative waits indefinitely.
 hotSwapRuntimeGraphAndWait
-  :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO HotSwapWaitResult
+  :: Ptr RTGraph -> Int -> Int -> Int -> RuntimeGraph
+  -> IO HotSwapWaitResult
 hotSwapRuntimeGraphAndWait =
   hotSwapAndWaitWith hotSwapRuntimeGraph
 
 -- | Fused-aware sibling of 'hotSwapRuntimeGraphAndWait'.
 hotSwapRuntimeGraphFusedAndWait
-  :: Ptr RTGraph -> Int -> Int -> RuntimeGraph -> IO HotSwapWaitResult
+  :: Ptr RTGraph -> Int -> Int -> Int -> RuntimeGraph
+  -> IO HotSwapWaitResult
 hotSwapRuntimeGraphFusedAndWait =
   hotSwapAndWaitWith hotSwapRuntimeGraphFused
 
 -- | Multi-template sibling of 'hotSwapRuntimeGraphAndWait'.
 hotSwapTemplateGraphAndWait
-  :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO HotSwapWaitResult
+  :: Ptr RTGraph -> Int -> Int -> Int -> TemplateGraph
+  -> IO HotSwapWaitResult
 hotSwapTemplateGraphAndWait =
   hotSwapAndWaitWith hotSwapTemplateGraph
 
 -- | Fused-aware multi-template sibling of 'hotSwapTemplateGraphAndWait'.
 hotSwapTemplateGraphFusedAndWait
-  :: Ptr RTGraph -> Int -> Int -> TemplateGraph -> IO HotSwapWaitResult
+  :: Ptr RTGraph -> Int -> Int -> Int -> TemplateGraph
+  -> IO HotSwapWaitResult
 hotSwapTemplateGraphFusedAndWait =
   hotSwapAndWaitWith hotSwapTemplateGraphFused
 

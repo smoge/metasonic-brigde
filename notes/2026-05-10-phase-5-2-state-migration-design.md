@@ -283,6 +283,10 @@ source/destination relation. 5.2.C extends the same slot match to the
 slot state plus lifecycle fields (`block_lifecycle_active`,
 `block_state_at_start`, `silent_blocks`, `block_sink_peak`) and richer
 live-voice survival tests.
+`block_sink_peak` is carried as part of the current slot lifecycle
+snapshot so release/drain decisions continue across the install; normal
+block accounting updates it on subsequent blocks, and callers should not
+treat it as a cross-world peak-meter history guarantee.
 
 This deliberately does not solve the problem of "this voice should
 survive, but its slot moved." That is a higher-level allocator
@@ -293,6 +297,8 @@ What v1 does on a slot mismatch:
 - Old slot Active + no new slot at same index → audible cut on
   install. (Equivalent to today's stop/rebuild silence, but only for
   that one voice rather than the whole graph.)
+- Old slot Available + new slot Active → no migration; the new slot
+  stays Active with the lifecycle state prepared by the offline builder.
 - Old slot Active + new slot Available → no migration; new slot
   stays Available; voice cut.
 - Old slot Active + new slot Active, same template → migrate
