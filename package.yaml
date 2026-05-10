@@ -85,6 +85,7 @@ executables:
     main: Main.hs
     source-dirs: app
     other-modules:
+      - MetaSonic.App.CorpusSurvey
       - MetaSonic.App.Demos
       - MetaSonic.App.Survey
       - MetaSonic.App.SwapBench

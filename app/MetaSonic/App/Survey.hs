@@ -3,6 +3,13 @@ module MetaSonic.App.Survey
   , runFusionSurvey
   , surveyShapeProbes
   , surveyEnsembleCorpus
+    -- * Phase 6.A.3 corpus survey
+  , CorpusGraphSummary (..)
+  , surveyCorpusGraph
+  , SinkShape (..)
+  , shapeHasKernel
+  , renderShape
+  , renderProducer
   ) where
 
 import           Data.Either               (partitionEithers)
@@ -508,6 +515,35 @@ surveySynthGraph d t g = do
 surveyTag :: String -> Maybe String -> String
 surveyTag d Nothing  = "demo=" <> d
 surveyTag d (Just t) = "demo=" <> d <> " template=" <> t
+
+-- | Phase 6.A.3: the corpus-relevant slice of 'SurveyRow'. The
+-- full row carries scheduling, rate, and edge-rate metadata that
+-- the corpus survey does not consume; exposing the slim shape
+-- keeps the public surface minimal.
+data CorpusGraphSummary = CorpusGraphSummary
+  { csNodes        :: !Int
+  , csRegions      :: !Int
+  , csFusedRegions :: !Int
+  , csKernels      :: ![(RegionKernel, Int)]
+  , csShapes       :: ![(SinkShape, Bool)]
+  , csOppProducers :: ![NodeKind]
+  } deriving (Eq, Show)
+
+-- | Phase 6.A.3 corpus-survey entry: compile a 'SynthGraph' and
+-- project the result to the corpus-relevant fields. Reuses
+-- 'surveySynthGraph' so the §4.B / §4.D logic stays single-source.
+surveyCorpusGraph
+  :: String -> Maybe String -> SynthGraph -> Either String CorpusGraphSummary
+surveyCorpusGraph d t g = do
+  row <- surveySynthGraph d t g
+  Right CorpusGraphSummary
+    { csNodes        = srNodes row
+    , csRegions      = srRegions row
+    , csFusedRegions = srFusedRegions row
+    , csKernels      = srKernels row
+    , csShapes       = srShapes row
+    , csOppProducers = srOppProducers row
+    }
 
 -- | Compile every (demo, template) pair, returning one
 -- 'Either String SurveyRow' per pair so the driver can split

@@ -21,6 +21,12 @@ module MetaSonic.Pattern.Corpus
   , polyphonicStabEvents
   , hotSwapEditEvents
   , layeredEnsembleEvents
+    -- * Per-row template inputs (for Phase 6.A.3 corpus survey)
+  , droneVibratoTemplates
+  , arpeggioSendReturnTemplates
+  , polyphonicStabTemplates
+  , hotSwapEditTemplates
+  , layeredEnsembleTemplates
     -- * Verification-gate reference range
   , corpusRange
   ) where
@@ -47,9 +53,12 @@ corpusRange = SampleRange (SamplePos 0) (SamplePos 192000)
 -- Sine carrier with 5 Hz vibrato, LPF, scalar output gain, hardware
 -- output. One long voice, periodic LPF-cutoff sweeps.
 
+droneVibratoTemplates :: [(String, SynthGraph)]
+droneVibratoTemplates = [("drone", droneVibratoGraph)]
+
 droneVibrato :: Pattern
 droneVibrato = Pattern
-  { patternTemplates = mustCompile [("drone", droneVibratoGraph)]
+  { patternTemplates = mustCompile droneVibratoTemplates
   , patternEvents    = staticEvents droneVibratoEvents
   }
 
@@ -87,13 +96,16 @@ droneVibratoEvents =
 -- Fx template:    busIn 5 → LPF → scalar Gain → Out 0.
 -- Two-note arpeggio plus one long-lived fx voice.
 
+arpeggioSendReturnTemplates :: [(String, SynthGraph)]
+arpeggioSendReturnTemplates =
+  [ ("voice", arpVoiceGraph)
+  , ("fx",    arpFxGraph)
+  ]
+
 arpeggioSendReturn :: Pattern
 arpeggioSendReturn = Pattern
-  { patternTemplates = mustCompile
-      [ ("voice", arpVoiceGraph)
-      , ("fx",    arpFxGraph)
-      ]
-  , patternEvents = staticEvents arpeggioSendReturnEvents
+  { patternTemplates = mustCompile arpeggioSendReturnTemplates
+  , patternEvents    = staticEvents arpeggioSendReturnEvents
   }
 
 arpVoiceGraph :: SynthGraph
@@ -145,9 +157,12 @@ arpeggioSendReturnEvents =
 -- Gain blocks RNoiseLpfGainOut per §4.B; the chain falls back to
 -- per-node dispatch (the row's design-note hypothesis).
 
+polyphonicStabTemplates :: [(String, SynthGraph)]
+polyphonicStabTemplates = [("stab", stabGraph)]
+
 polyphonicStab :: Pattern
 polyphonicStab = Pattern
-  { patternTemplates = mustCompile [("stab", stabGraph)]
+  { patternTemplates = mustCompile polyphonicStabTemplates
   , patternEvents    = staticEvents polyphonicStabEvents
   }
 
@@ -188,9 +203,12 @@ polyphonicStabEvents =
 -- migration keys so §5.2 state migration preserves oscillator
 -- phase across the swap.
 
+hotSwapEditTemplates :: [(String, SynthGraph)]
+hotSwapEditTemplates = [("drone", droneEditInitial)]
+
 hotSwapEdit :: Pattern
 hotSwapEdit = Pattern
-  { patternTemplates = mustCompile [("drone", droneEditInitial)]
+  { patternTemplates = mustCompile hotSwapEditTemplates
   , patternEvents    = staticEvents hotSwapEditEvents
   }
 
@@ -227,14 +245,17 @@ hotSwapEditEvents =
 -- per-node dispatch; the fx tail is a structural RBusInLpfGainOut
 -- candidate (scalar Gain).
 
+layeredEnsembleTemplates :: [(String, SynthGraph)]
+layeredEnsembleTemplates =
+  [ ("bass", bassGraph)
+  , ("pad",  padGraph)
+  , ("fx",   ensembleFxGraph)
+  ]
+
 layeredEnsemble :: Pattern
 layeredEnsemble = Pattern
-  { patternTemplates = mustCompile
-      [ ("bass", bassGraph)
-      , ("pad",  padGraph)
-      , ("fx",   ensembleFxGraph)
-      ]
-  , patternEvents = staticEvents layeredEnsembleEvents
+  { patternTemplates = mustCompile layeredEnsembleTemplates
+  , patternEvents    = staticEvents layeredEnsembleEvents
   }
 
 bassGraph :: SynthGraph

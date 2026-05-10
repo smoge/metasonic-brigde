@@ -80,6 +80,7 @@ library
 executable metasonic-bridge
   main-is: Main.hs
   other-modules:
+      MetaSonic.App.CorpusSurvey
       MetaSonic.App.Demos
       MetaSonic.App.Survey
       MetaSonic.App.SwapBench

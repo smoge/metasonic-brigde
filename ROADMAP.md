@@ -980,16 +980,30 @@ generations, and natural-music graph families that incidentally cover
 fusion / parallelism / hot-swap shapes. Corpus design is not on the
 audio thread.
 
-#### 6.A.3 Verification before "musical" surface
+#### [x] 6.A.3 Verification before "musical" surface
 
-First tests assert deterministic event expansion (same pattern → same
-events), generated graph shape (corpus-shape regression pin), and
-recognition by existing surveys / benches in the (b) sense above (do
-parked rows in the §4 ranked tables move, does the §4.D opportunity
-count grow, do `--worker-bench` rows cross the synthetic envelope, do
-pattern-driven `--swap-bench` runs surface friction the fixed corpus
-cannot). Live scheduling polish, ergonomic API, and concert-grade
-event timing all stay out of 6.A.
+Three layers of verification:
+
+- **Deterministic event expansion.** Pinned in 6.A.2 tests; each
+  row's `expandPattern row corpusRange` is byte-identical to an
+  inline expected list.
+- **Generated graph shape.** Pinned in 6.A.2 tests; each row's
+  compiled `TemplateGraph` is asserted against its §4.B kernel
+  hypothesis.
+- **Survey recognition (layer (b)).** Lands as the `--corpus-survey`
+  subcommand ([MetaSonic.App.CorpusSurvey](app/MetaSonic/App/CorpusSurvey.hs)).
+  Runs the five corpus rows through the §4 survey machinery and
+  reports per-row kernel coverage, corpus-wide kernel totals,
+  claimed / missed sink shapes, and §4.D edge-rate opportunity
+  contribution. The baseline run is recorded in
+  [notes/2026-05-10-phase-6a3-corpus-survey-baseline.md](notes/2026-05-10-phase-6a3-corpus-survey-baseline.md);
+  future runs compare against it.
+
+Live scheduling polish, ergonomic API, and concert-grade event
+timing all stay out of 6.A. Piping the corpus through
+`--worker-bench` and a pattern-driven `--swap-bench` is a future
+6.A.3 extension if the §4.E / §5 signals warrant it; the current
+`--corpus-survey` does not perform those measurements.
 
 ### Phase 6.B — OSC Control Surface
 

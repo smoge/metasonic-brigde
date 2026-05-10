@@ -13,6 +13,7 @@ import           Foreign.Ptr                (Ptr)
 import           System.Environment         (getArgs, getProgName)
 import           System.Exit                (die)
 
+import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
 import           MetaSonic.App.Demos
 import           MetaSonic.App.Survey       (printFusionSummary,
                                              runFusionSurvey)
@@ -51,6 +52,13 @@ data RunMode
     -- benchmark of the Haskell hot-swap helper path against a fixed
     -- corpus of rows (unchanged, tagged osc, tagged biquad, lifecycle-
     -- only, fused, template). Targets are ignored.
+  | CorpusSurvey
+    -- ^ Non-audio reporting mode (--corpus-survey). Phase 6.A.3
+    -- layer-(b) verification: runs the pattern corpus
+    -- (MetaSonic.Pattern.Corpus) through the §4 survey machinery
+    -- and prints per-row kernel coverage, corpus-wide totals,
+    -- claimed / missed sink shapes, and §4.D edge-rate
+    -- opportunity contribution. Targets are ignored.
   deriving (Eq, Show)
 
 data Options = Options
@@ -92,6 +100,8 @@ parseArgs = go defaultOptions
       go opts { optMode = WorkerBench } xs
     go opts ("--swap-bench" : xs) =
       go opts { optMode = SwapBench } xs
+    go opts ("--corpus-survey" : xs) =
+      go opts { optMode = CorpusSurvey } xs
     go opts (x : xs)
       | "--" `prefixOf` x = Left ("Unknown option: " <> x)
       | otherwise         = go opts { optTargets = optTargets opts <> [x] } xs
@@ -123,6 +133,7 @@ usage prog = unlines
   , "  " <> prog <> " --fusion-survey [DEMO ...]"
   , "  " <> prog <> " --worker-bench [DEMO ...]"
   , "  " <> prog <> " --swap-bench"
+  , "  " <> prog <> " --corpus-survey"
   , ""
   , "If no demo names are given, all demos are run."
   , ""
@@ -161,6 +172,15 @@ usage prog = unlines
   , "                   CSV row per case with publish/install timing"
   , "                   and migration counters. No audio, no TUI; demo"
   , "                   targets are ignored."
+  , "  --corpus-survey  Phase 6.A.3 layer-(b) verification: runs the"
+  , "                   five pattern corpus rows (drone-with-vibrato,"
+  , "                   arpeggio-send-return, polyphonic-stab,"
+  , "                   hot-swap-edit, layered-ensemble) through the"
+  , "                   §4 survey machinery and prints per-row kernel"
+  , "                   coverage, corpus-wide kernel totals, claimed /"
+  , "                   missed sink shapes, and §4.D edge-rate"
+  , "                   opportunity contribution. No audio, no TUI;"
+  , "                   demo targets are ignored."
   , ""
   , "Availavle demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
@@ -226,6 +246,9 @@ main = do
     SwapBench -> do
       putStrLn "Benchmarking Haskell hot-swap helper path."
       runSwapBench
+    CorpusSurvey -> do
+      putStrLn "Surveying the Phase 6.A pattern corpus for §4 signal."
+      runCorpusSurvey
     AudioOnly      -> runDemos "Running selected demos."
     InspectThenRun -> runDemos "Inspecting selected demos before audio."
     InspectOnly    -> runDemos "Inspecting selected demos without audio."
@@ -240,7 +263,8 @@ runDemo opts demo
   -- The single guard covers all three body-specific runners.
   | optMode opts == FusionSurvey
     || optMode opts == WorkerBench
-    || optMode opts == SwapBench =
+    || optMode opts == SwapBench
+    || optMode opts == CorpusSurvey =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
