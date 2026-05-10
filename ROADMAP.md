@@ -400,19 +400,15 @@ opportunity headline. The empirical signal is small (4 sample-rate
 producer nodes across 4 distinct kinds in the surveyed corpus). A
 runtime block-rate execution path is parked until that signal grows.
 
-What's in progress: §4.E (region-level parallelism — independent
-regions / templates on separate threads). The schedule metadata,
-global schedule, deterministic reduction substrate, test-gated worker
-Free-band dispatch, synthetic bench, Haskell-loaded worker bench, and
-first corpus-evolution probes are now in place. The current turn-on
-decision is negative: worker dispatch remains test/bench gated because
-the only Haskell-loaded rows that actually enter worker dispatch are
-targeted probes and still lose. The next decision is narrower: either
-add less-synthetic corpus shapes with enough work to make worker
-dispatch plausible, or investigate region-level dispatch inside one
-`FreeLayer` step. §4.D's descriptive metadata remains in place and
-feeds future scheduling decisions; the block-rate execution path stays
-parked until the per-port survey signal grows.
+§4.E is frozen as a default-off runtime substrate. The schedule
+metadata, global schedule, deterministic reduction substrate,
+test-gated Free-band worker dispatch, C1d region-item dispatch,
+synthetic bench, and Haskell-loaded worker bench are now in place. The
+current turn-on decision is negative: no representative workload
+justifies enabling worker dispatch by default. §4.D's descriptive
+metadata remains in place and feeds future scheduling decisions; the
+block-rate execution path stays parked until the per-port survey signal
+grows.
 
 What's deferred indefinitely: whole-region kernel codegen.
 Hand-written DSP bodies plus narrow helpers (`SinkAccumulator`,
@@ -907,7 +903,7 @@ Note: [producer identity note](notes/2026-05-10-phase-5-4-producer-identity-afte
 
 ### 5.4.C Producer-side mapping helpers — optional
 
- producer-side mapping helpers for resolving post-install node /
+Producer-side mapping helpers for resolving post-install node /
 control coordinates from migration keys, and a small set of
 name-stable bus helpers. Defer until a real caller hits the friction;
 Haskell-side `RuntimeGraph` knowledge is sufficient for v1 producers.
