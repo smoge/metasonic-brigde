@@ -45,6 +45,8 @@ import           Test.Tasty.QuickCheck     as QC
 
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI      (RTGraph,
+                                            SwapMigrationStats (..),
+                                            c_rt_graph_test_swap_generation,
                                             c_rt_graph_ensure_bus,
                                             c_rt_graph_instance_alive,
                                             c_rt_graph_instance_count,
@@ -77,6 +79,8 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_test_template_schedule_step_region,
                                             instanceStatusLive,
                                             instanceStatusReleasing,
+                                            collectRetiredSwapStats,
+                                            hotSwapRuntimeGraph,
                                             loadRuntimeGraph,
                                             loadRuntimeGraphFused,
                                             loadTemplateGraph,
@@ -4647,6 +4651,91 @@ crossCuttingTests = testGroup "End-to-end FFI"
       assertBool
         ("expected bit-equivalent samples, max diff = " <> show maxDiff)
         (maxDiff < 1e-5)
+
+  , testCase "hotSwapRuntimeGraph publishes, installs, and collects migration stats" $ do
+      let nframes = 256
+          graph = runSynth $ do
+            o <- tagged "voice-osc" (sinOsc 220.0 0.0)
+            out 0 o
+          compileOrFail g =
+            case lowerGraph g >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+
+      oldRt <- compileOrFail graph
+      newRt <- compileOrFail graph
+
+      withRTGraph (length (rgNodes oldRt)) nframes $ \handle -> do
+        loadRuntimeGraph handle oldRt
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        before <- c_rt_graph_test_swap_generation handle
+        before @?= 0
+
+        published <- hotSwapRuntimeGraph handle nframes newRt
+        published @?= True
+
+        -- The helper publishes only; installation still waits for a
+        -- block boundary, so there is nothing to collect yet.
+        early <- collectRetiredSwapStats handle
+        early @?= Nothing
+
+        c_rt_graph_process handle (fromIntegral nframes)
+        after <- c_rt_graph_test_swap_generation handle
+        after @?= 1
+
+        stats <- collectRetiredSwapStats handle
+        stats @?= Just SwapMigrationStats
+          { smsCommittedCount = 1
+          , smsSkippedCount = 1
+          , smsInstanceCopyCount = 1
+          , smsStateCopyCount = 1
+          , smsLifecycleCopyCount = 1
+          }
+
+        none <- collectRetiredSwapStats handle
+        none @?= Nothing
+
+  , testCase "hotSwapRuntimeGraph failed publish disposes the prepared swap" $ do
+      let nframes = 256
+          graph = runSynth $ do
+            o <- tagged "voice-osc" (sinOsc 330.0 0.0)
+            out 0 o
+          compileOrFail g =
+            case lowerGraph g >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+
+      rt <- compileOrFail graph
+
+      withRTGraph (length (rgNodes rt)) nframes $ \handle -> do
+        loadRuntimeGraph handle rt
+
+        first <- hotSwapRuntimeGraph handle nframes rt
+        first @?= True
+        c_rt_graph_process handle (fromIntegral nframes)
+
+        -- Retired slot is still occupied, so publish must fail. The
+        -- helper must cancel the rejected prepared swap; otherwise the
+        -- next publish after collection would be contaminated by the
+        -- failed attempt.
+        blocked <- hotSwapRuntimeGraph handle nframes rt
+        blocked @?= False
+
+        firstStats <- collectRetiredSwapStats handle
+        assertBool "expected first retired swap stats"
+          (case firstStats of
+             Just _  -> True
+             Nothing -> False)
+
+        second <- hotSwapRuntimeGraph handle nframes rt
+        second @?= True
+        c_rt_graph_process handle (fromIntegral nframes)
+        secondStats <- collectRetiredSwapStats handle
+        assertBool "expected second retired swap stats"
+          (case secondStats of
+             Just _  -> True
+             Nothing -> False)
 
   , -- Step C (c) guard: feeding a fused graph through the unfused
     -- 'loadRuntimeGraph' must fail fast with the documented error,

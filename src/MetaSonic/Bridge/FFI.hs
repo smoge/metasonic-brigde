@@ -15,6 +15,8 @@
 module MetaSonic.Bridge.FFI
   ( -- * Opaque handle
     RTGraph
+  , RTGraphSwap
+  , SwapMigrationStats (..)
   , -- * Lifecycle
     withRTGraph
   , -- * Loading a compiled graph (single-template, legacy)
@@ -23,6 +25,12 @@ module MetaSonic.Bridge.FFI
   , -- * Loading a compiled template graph (multi-template, §2.D.3)
     loadTemplateGraph
   , loadTemplateGraphFused
+  , -- * Phase 5.3.A hot-swap producer helpers
+    hotSwapRuntimeGraph
+  , hotSwapRuntimeGraphFused
+  , hotSwapTemplateGraph
+  , hotSwapTemplateGraphFused
+  , collectRetiredSwapStats
   , -- * Realtime audio lifecycle
     startAudio
   , waitAudioStarted
@@ -64,6 +72,20 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_start_audio
   , c_rt_graph_wait_started
   , c_rt_graph_stop_audio
+  , -- * Phase 5.1/5.2 low-level hot-swap ABI
+    c_rt_graph_prepare_swap
+  , c_rt_graph_prepare_swap_from_graph
+  , c_rt_graph_cancel_swap
+  , c_rt_graph_publish_swap
+  , c_rt_graph_collect_retired_swap
+  , c_rt_graph_test_swap_generation
+  , c_rt_graph_test_swap_pending
+  , c_rt_graph_test_swap_retired_pending
+  , c_rt_graph_swap_migration_committed_count
+  , c_rt_graph_swap_migration_skipped_count
+  , c_rt_graph_swap_migration_instance_copy_count
+  , c_rt_graph_swap_migration_state_copy_count
+  , c_rt_graph_swap_migration_lifecycle_copy_count
   , -- * Multi-template low-level (re-exported for tests)
     c_rt_graph_template_add
   , c_rt_graph_template_count
@@ -226,6 +248,8 @@ live stream:
   * rt_graph_start_audio
   * rt_graph_wait_started
   * rt_graph_stop_audio
+  * rt_graph_prepare_swap_from_graph
+  * rt_graph_cancel_swap
 
 A subtle but important consequence of the new realtime path is that
 rt_graph_clear and rt_graph_destroy are no longer obviously "cheap":
@@ -265,9 +289,12 @@ set as control defaults in pass 1.
 
 One more consequence of the realtime engine: loadRuntimeGraph begins
 with rt_graph_clear, and rt_graph_clear is allowed to stop a currently
-running audio stream. So hot reloading is a "stop, clear, rebuild"
-operation from the runtime's point of view. If the caller wants audio
-again after reloading, it must call startAudio once loading completes.
+running audio stream. So loadRuntimeGraph is a "stop, clear, rebuild"
+operation from the runtime's point of view. Callers that need the
+block-boundary hot-swap protocol should use the Phase 5.3 helper
+family (hotSwapRuntimeGraph, hotSwapTemplateGraph, and fused
+siblings), which builds a separate offline world and publishes it
+through rt_graph_prepare_swap_from_graph / rt_graph_publish_swap.
 -}
 
 -- | Opaque handle to the C++ runtime graph. The Haskell side never
@@ -275,6 +302,22 @@ again after reloading, it must call startAudio once loading completes.
 --
 -- See Note [FFI boundary design].
 data RTGraph
+
+-- | Opaque handle to a prepared or retired C++ runtime world swap.
+-- The Haskell side never inspects it directly; public helpers either
+-- publish it or collect/cancel it through the C ABI.
+data RTGraphSwap
+
+-- | Phase 5.2 migration counters observed on a collected swap just
+-- before the Haskell helper disposes it. Counts are representative of
+-- the audio-thread install that consumed the swap.
+data SwapMigrationStats = SwapMigrationStats
+  { smsCommittedCount      :: !Int
+  , smsSkippedCount        :: !Int
+  , smsInstanceCopyCount   :: !Int
+  , smsStateCopyCount      :: !Int
+  , smsLifecycleCopyCount  :: !Int
+  } deriving (Eq, Show)
 
 -- Foreign imports.
 -- See Note [Why ccall, not capi].
@@ -350,6 +393,57 @@ foreign import ccall safe "rt_graph_wait_started"
 
 foreign import ccall safe "rt_graph_stop_audio"
   c_rt_graph_stop_audio :: Ptr RTGraph -> IO ()
+
+-- | Allocate an empty next-world swap for the target. Low-level ABI:
+-- callers own the returned pointer until cancel or successful publish.
+foreign import ccall safe "rt_graph_prepare_swap"
+  c_rt_graph_prepare_swap :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
+
+-- | Move an offline builder graph's swappable world into a prepared
+-- swap for the target. Potentially walks graph metadata and allocates
+-- the migration plan, so this import is safe.
+foreign import ccall safe "rt_graph_prepare_swap_from_graph"
+  c_rt_graph_prepare_swap_from_graph
+    :: Ptr RTGraph -> Ptr RTGraph -> IO (Ptr RTGraphSwap)
+
+-- | Dispose an unpublished or collected swap off-audio.
+foreign import ccall safe "rt_graph_cancel_swap"
+  c_rt_graph_cancel_swap :: Ptr RTGraph -> Ptr RTGraphSwap -> IO ()
+
+-- | Publish a prepared swap to be installed at the next block
+-- boundary. Returns 1 on success, 0 if the target already has a swap
+-- pending/installing/retired.
+foreign import ccall unsafe "rt_graph_publish_swap"
+  c_rt_graph_publish_swap :: Ptr RTGraph -> Ptr RTGraphSwap -> IO CInt
+
+-- | Collect an installed retired swap, if any. Returned pointer must
+-- be disposed with c_rt_graph_cancel_swap.
+foreign import ccall unsafe "rt_graph_collect_retired_swap"
+  c_rt_graph_collect_retired_swap :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
+
+foreign import ccall unsafe "rt_graph_test_swap_generation"
+  c_rt_graph_test_swap_generation :: Ptr RTGraph -> IO CInt
+
+foreign import ccall unsafe "rt_graph_test_swap_pending"
+  c_rt_graph_test_swap_pending :: Ptr RTGraph -> IO CInt
+
+foreign import ccall unsafe "rt_graph_test_swap_retired_pending"
+  c_rt_graph_test_swap_retired_pending :: Ptr RTGraph -> IO CInt
+
+foreign import ccall unsafe "rt_graph_swap_migration_committed_count"
+  c_rt_graph_swap_migration_committed_count :: Ptr RTGraphSwap -> IO CInt
+
+foreign import ccall unsafe "rt_graph_swap_migration_skipped_count"
+  c_rt_graph_swap_migration_skipped_count :: Ptr RTGraphSwap -> IO CInt
+
+foreign import ccall unsafe "rt_graph_swap_migration_instance_copy_count"
+  c_rt_graph_swap_migration_instance_copy_count :: Ptr RTGraphSwap -> IO CInt
+
+foreign import ccall unsafe "rt_graph_swap_migration_state_copy_count"
+  c_rt_graph_swap_migration_state_copy_count :: Ptr RTGraphSwap -> IO CInt
+
+foreign import ccall unsafe "rt_graph_swap_migration_lifecycle_copy_count"
+  c_rt_graph_swap_migration_lifecycle_copy_count :: Ptr RTGraphSwap -> IO CInt
 
 -- | Pure switch dispatch on the C++ side: no allocation, no blocking,
 -- no graph state needed. 'unsafe' is correct.
@@ -803,6 +897,124 @@ withRTGraph capacity maxFrames =
   bracket
     (c_rt_graph_create (fromIntegral capacity) (fromIntegral maxFrames))
     c_rt_graph_destroy
+
+{- Note [Phase 5.3 hot-swap helpers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The low-level Phase 5.1 ABI deliberately exposes the full ownership
+protocol: build an offline graph, prepare a swap, publish it, wait for
+the audio thread to install it, collect the retired swap, then dispose
+it. That is the right C contract, but it is too easy for Haskell
+callers to leak a rejected swap or forget the retire-slot collection.
+
+The 5.3.A helpers below keep the same semantics while packaging the
+producer boilerplate:
+
+  * hotSwap* builds the next world in a temporary RTGraph by reusing
+    the existing loaders. The target graph is not cleared and audio is
+    not stopped.
+  * A successful publish transfers ownership of the swap to the C++
+    runtime and returns True. A failed publish cancels the prepared
+    swap before returning False.
+  * collectRetiredSwapStats is the reap point after an audio block has
+    installed the swap. It snapshots the Phase 5.2 counters, disposes
+    the retired swap, and returns Nothing when no retired swap exists.
+
+These helpers do not block waiting for installation. Offline callers
+drive one rt_graph_process block; realtime callers let the audio
+callback advance and poll collection from the producer side.
+-}
+
+hotSwapWith
+  :: (Ptr RTGraph -> a -> IO ())
+  -> Int
+  -> Int
+  -> Ptr RTGraph
+  -> a
+  -> IO Bool
+hotSwapWith loader capacity maxFrames target payload = do
+  maybeSwap <- prepareSwapWith loader capacity maxFrames target payload
+  case maybeSwap of
+    Nothing -> pure False
+    Just swap -> do
+      ok <- c_rt_graph_publish_swap target swap
+      if ok == 0
+        then c_rt_graph_cancel_swap target swap >> pure False
+        else pure True
+
+prepareSwapWith
+  :: (Ptr RTGraph -> a -> IO ())
+  -> Int
+  -> Int
+  -> Ptr RTGraph
+  -> a
+  -> IO (Maybe (Ptr RTGraphSwap))
+prepareSwapWith loader capacity maxFrames target payload =
+  withRTGraph capacity maxFrames $ \builder -> do
+    loader builder payload
+    swap <- c_rt_graph_prepare_swap_from_graph target builder
+    if swap == nullPtr
+      then pure Nothing
+      else pure (Just swap)
+
+runtimeGraphCapacity :: RuntimeGraph -> Int
+runtimeGraphCapacity = length . rgNodes
+
+templateGraphCapacity :: TemplateGraph -> Int
+templateGraphCapacity =
+  sum . map (length . rgNodes . tplGraph) . tgTemplates
+
+-- | Build @rg@ in an offline runtime graph and publish it as the
+-- target's next world. Returns 'True' when publish succeeds. On
+-- 'False', no swap remains owned by the caller.
+--
+-- The caller must later call 'collectRetiredSwapStats' after a block
+-- boundary has installed the swap; otherwise the C++ one-deep retire
+-- slot remains occupied and the next publish will fail.
+hotSwapRuntimeGraph :: Ptr RTGraph -> Int -> RuntimeGraph -> IO Bool
+hotSwapRuntimeGraph target maxFrames rg =
+  hotSwapWith loadRuntimeGraph
+    (runtimeGraphCapacity rg) maxFrames target rg
+
+-- | Fused-aware sibling of 'hotSwapRuntimeGraph'.
+hotSwapRuntimeGraphFused :: Ptr RTGraph -> Int -> RuntimeGraph -> IO Bool
+hotSwapRuntimeGraphFused target maxFrames rg =
+  hotSwapWith loadRuntimeGraphFused
+    (runtimeGraphCapacity rg) maxFrames target rg
+
+-- | Multi-template sibling of 'hotSwapRuntimeGraph'.
+hotSwapTemplateGraph :: Ptr RTGraph -> Int -> TemplateGraph -> IO Bool
+hotSwapTemplateGraph target maxFrames tg =
+  hotSwapWith loadTemplateGraph
+    (templateGraphCapacity tg) maxFrames target tg
+
+-- | Fused-aware multi-template sibling of 'hotSwapTemplateGraph'.
+hotSwapTemplateGraphFused :: Ptr RTGraph -> Int -> TemplateGraph -> IO Bool
+hotSwapTemplateGraphFused target maxFrames tg =
+  hotSwapWith loadTemplateGraphFused
+    (templateGraphCapacity tg) maxFrames target tg
+
+-- | Collect and dispose one retired swap, returning the migration
+-- counters recorded by the install that consumed it. Returns
+-- 'Nothing' when no installed swap is waiting to be collected.
+collectRetiredSwapStats :: Ptr RTGraph -> IO (Maybe SwapMigrationStats)
+collectRetiredSwapStats target = do
+  swap <- c_rt_graph_collect_retired_swap target
+  if swap == nullPtr
+    then pure Nothing
+    else do
+      committed <- c_rt_graph_swap_migration_committed_count swap
+      skipped <- c_rt_graph_swap_migration_skipped_count swap
+      instances <- c_rt_graph_swap_migration_instance_copy_count swap
+      states <- c_rt_graph_swap_migration_state_copy_count swap
+      lifecycles <- c_rt_graph_swap_migration_lifecycle_copy_count swap
+      c_rt_graph_cancel_swap target swap
+      pure $ Just SwapMigrationStats
+        { smsCommittedCount = fromIntegral committed
+        , smsSkippedCount = fromIntegral skipped
+        , smsInstanceCopyCount = fromIntegral instances
+        , smsStateCopyCount = fromIntegral states
+        , smsLifecycleCopyCount = fromIntegral lifecycles
+        }
 
 {- Note [Marshaling newtypes to C]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

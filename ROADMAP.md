@@ -757,6 +757,22 @@ tags plus slot-index instance identity:
 - Env, Delay, and Smooth DSP state remain default-init until a later
   prewarm/custom-state slice makes them allocation-free to migrate.
 
+### 5.3 Producer ergonomics
+
+**5.3.A done.** The Haskell FFI now exposes the swap protocol without
+forcing callers to manually juggle every ownership edge:
+
+- `hotSwapRuntimeGraph` / `hotSwapRuntimeGraphFused` build a next
+  single-template world in an offline runtime handle and publish it to a
+  live target without calling `rt_graph_clear`.
+- `hotSwapTemplateGraph` / `hotSwapTemplateGraphFused` provide the same
+  helper for template ensembles.
+- `collectRetiredSwapStats` reaps the installed retired swap, returns
+  the Phase 5.2 migration counters, and disposes the old world off-audio.
+- Failed publish cancels the prepared swap before returning, so callers
+  do not leak a next-world payload when the target already has a swap in
+  flight or a retired swap waiting.
+
 Edit a graph in the Haskell DSL, recompile, and hear the change without
 restarting audio.
 

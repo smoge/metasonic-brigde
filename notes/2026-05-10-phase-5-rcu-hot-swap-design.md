@@ -1,16 +1,17 @@
 # Phase 5 — RCU Hot-Swap Protocol
 
 Date: 2026-05-10
-Status: Phase 5.1.A/B implemented. State migration explicitly deferred.
+Status: Phase 5.1.A/B, 5.2.A/B/C, and 5.3.A implemented.
 
 This note pins the protocol for swapping a running MetaSonic graph
-without a stop/start cycle. It records what the runtime does today,
-what the target swap shape is, what crosses the audio-thread boundary
-and what does not, and what state migration would have to commit to —
-*after* the substrate is pinned. Phase 5.1.A first stood up the
-publish / install / retire dance with an empty payload; Phase 5.1.B
-moves the swappable runtime world into `RTGraphState` and makes
-`RTGraphSwap` carry a real next-world payload.
+without a stop/start cycle. It records what the runtime did before the
+swap substrate, what the target swap shape is, what crosses the
+audio-thread boundary and what does not, and what state migration had
+to commit to. Phase 5.1.A first stood up the publish / install / retire
+dance with an empty payload; Phase 5.1.B moves the swappable runtime
+world into `RTGraphState` and makes `RTGraphSwap` carry a real
+next-world payload. Phase 5.2 adds caller-tagged state migration, and
+Phase 5.3.A wraps the protocol for Haskell producers.
 
 ## 1. Today: stop / rebuild semantics
 
@@ -44,18 +45,19 @@ Concrete consequences:
   callers obey it; tests run offline; the realtime control queue
   (Phase A.2) is the *only* sanctioned mutation path while audio is live.
 
-State migration today is whatever the caller does explicitly: read
-controls / phases out of the old graph before clear, write them into
-the new one after. The runtime does not help.
+The stop/rebuild path still does not migrate state. State migration is
+provided by the hot-swap path described below; `rt_graph_clear` remains
+a destructive reset.
 
 ## 2. Target: block-boundary swap
 
 The goal is RCU-style: build a complete *next world* off-audio, hand it
 to the runtime, have the audio thread atomically install it at the top
 of the next `process_graph` block, and free the old world off-audio.
-Audio never stops; the swap is heard as one block of state-reset
-discontinuity at most (envelopes restart, oscillator phases reset,
-filter memory zeros), and zero discontinuity once state migration lands.
+Audio never stops; the swap is heard as one block of discontinuity only
+for state that the current migration policy deliberately leaves
+default-initialized. Caller-tagged controls, copy-safe DSP state, and
+slot lifecycle metadata are migrated by Phase 5.2.
 
 Three timing constraints together pin the protocol:
 
@@ -135,6 +137,28 @@ What the substrate provides:
 - `rt_graph_test_swap_generation(g) -> int`: atomic number of installs
   the audio thread has performed. Pinned by tests and usable by the
   producer as a pollable "installed" signal.
+
+## 4.1 Haskell producer helper landing
+
+Phase 5.3.A wraps the C ownership protocol in `MetaSonic.Bridge.FFI`:
+
+- `hotSwapRuntimeGraph(target, maxFrames, rg)` and
+  `hotSwapRuntimeGraphFused(target, maxFrames, rg)` build a temporary
+  offline `RTGraph`, load the compiled `RuntimeGraph` into it, move its
+  world into an `RTGraphSwap`, and publish that swap to the target.
+- `hotSwapTemplateGraph` and `hotSwapTemplateGraphFused` do the same
+  for `TemplateGraph`.
+- If publish fails, the helper cancels the prepared swap before
+  returning `False`. If publish succeeds, ownership moves to the C++
+  runtime and the helper returns `True`.
+- `collectRetiredSwapStats(target)` is the Haskell reap helper: it
+  collects the installed retired swap if present, snapshots the Phase
+  5.2 migration counters, disposes the old world off-audio, and returns
+  `Nothing` when no retired swap is waiting.
+
+The helpers intentionally do not wait for installation. Offline tests
+drive one `rt_graph_process` block after publish; realtime callers let
+the callback advance and poll collection from the producer side.
 
 ## 5. Realtime control queue across a swap
 
