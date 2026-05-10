@@ -1,7 +1,3 @@
-{-# LANGUAGE DeriveAnyClass     #-}
-{-# LANGUAGE DeriveGeneric      #-}
-{-# LANGUAGE DerivingStrategies #-}
-
 -- |
 -- Module      : MetaSonic.Pattern.Corpus
 -- Description : Phase 6.A.2 — five named pattern rows.
@@ -54,7 +50,7 @@ corpusRange = SampleRange (SamplePos 0) (SamplePos 192000)
 droneVibrato :: Pattern
 droneVibrato = Pattern
   { patternTemplates = mustCompile [("drone", droneVibratoGraph)]
-  , patternEvents    = const droneVibratoEvents
+  , patternEvents    = staticEvents droneVibratoEvents
   }
 
 droneVibratoGraph :: SynthGraph
@@ -97,7 +93,7 @@ arpeggioSendReturn = Pattern
       [ ("voice", arpVoiceGraph)
       , ("fx",    arpFxGraph)
       ]
-  , patternEvents = const arpeggioSendReturnEvents
+  , patternEvents = staticEvents arpeggioSendReturnEvents
   }
 
 arpVoiceGraph :: SynthGraph
@@ -152,7 +148,7 @@ arpeggioSendReturnEvents =
 polyphonicStab :: Pattern
 polyphonicStab = Pattern
   { patternTemplates = mustCompile [("stab", stabGraph)]
-  , patternEvents    = const polyphonicStabEvents
+  , patternEvents    = staticEvents polyphonicStabEvents
   }
 
 stabGraph :: SynthGraph
@@ -195,7 +191,7 @@ polyphonicStabEvents =
 hotSwapEdit :: Pattern
 hotSwapEdit = Pattern
   { patternTemplates = mustCompile [("drone", droneEditInitial)]
-  , patternEvents    = const hotSwapEditEvents
+  , patternEvents    = staticEvents hotSwapEditEvents
   }
 
 droneEditInitial :: SynthGraph
@@ -238,7 +234,7 @@ layeredEnsemble = Pattern
       , ("pad",  padGraph)
       , ("fx",   ensembleFxGraph)
       ]
-  , patternEvents = const layeredEnsembleEvents
+  , patternEvents = staticEvents layeredEnsembleEvents
   }
 
 bassGraph :: SynthGraph

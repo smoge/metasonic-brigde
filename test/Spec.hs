@@ -9034,6 +9034,47 @@ patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
           checkDriverFeasibility layeredEnsemble    layeredEnsembleEvents    @?= []
       ]
 
+  , testGroup "range-aware patternEvents"
+      [ testCase "empty range yields no events" $
+          expandPattern droneVibrato
+            (SampleRange (SamplePos 0) (SamplePos 0))
+          @?= []
+
+      , testCase "range entirely after all events yields no events" $
+          expandPattern droneVibrato
+            (SampleRange (SamplePos 200000) (SamplePos 300000))
+          @?= []
+
+      , testCase "subrange [90000, 100000) isolates the 96000 control write" $
+          expandPattern droneVibrato
+            (SampleRange (SamplePos 90000) (SamplePos 100000))
+          @?=
+            [ ( SamplePos 96000
+              , PEControlWrite (VoiceKey "v0")
+                  (ControlTag (MigrationKey "lpf") 0) 800.0
+              )
+            ]
+
+      , testCase
+          "patternEvents itself respects the range (no expandPattern clamp)"
+          $ do
+            let r = SampleRange (SamplePos 90000) (SamplePos 100000)
+            patternEvents droneVibrato r @?=
+              [ ( SamplePos 96000
+                , PEControlWrite (VoiceKey "v0")
+                    (ControlTag (MigrationKey "lpf") 0) 800.0
+                )
+              ]
+
+      , testCase
+          "polyphonicStab subrange [10000, 30000) captures all 8 voice-offs"
+          $ do
+            let r = SampleRange (SamplePos 10000) (SamplePos 30000)
+                evs = expandPattern polyphonicStab r
+            length evs @?= 8
+            all (\(SamplePos t, _) -> t == 24000) evs @?= True
+      ]
+
   , testGroup "driver-stub negative cases"
       [ testCase "out-of-range ctSlot reports InvalidControlSlot" $ do
           -- droneVibrato's "lpf" node has 2 controls (freq + q);

@@ -304,10 +304,14 @@ sine carrier exercises the safe path explicitly.
 
 Two distinct voice templates — `bass` (saw → LPF → envelope-shaped
 gain → `BusOut 5`) and `pad` (paired detuned sines → envelope-shaped
-gain → `BusOut 5`) — running concurrently. Each is polyphonic with 3
-voices over its own rhythmic grid (interleaved `PEVoiceOn` /
-`PEVoiceOff` per voice family). Both route through a shared FX
-template (`BusIn 5 → LPF → scalar Gain → Out 0`).
+gain → `BusOut 5`) — running concurrently. The v1 corpus row plays
+them lightly: `pad` sustains one long voice for the pattern's full
+duration, `bass` plays two sequential notes (no overlap within the
+bass family; bass and pad overlap for the first half of the
+pattern). Both route through a shared FX template
+(`BusIn 5 → LPF → scalar Gain → Out 0`) which runs as one long-lived
+voice. A "3 voices per family" version is straightforward to lift
+later once the verification gate has more polish.
 
 *Why it's music.* Bass + pad through a shared bus is the smallest
 arrangement that sounds like a piece rather than a test signal.
@@ -374,10 +378,17 @@ When 6.A.2 implementation lands, the minimum surface is:
 
 - `src/MetaSonic/Pattern.hs` — `Pattern` record, `PatternEvent`
   ADT, symbolic identifier types (`TemplateName`, `VoiceKey`,
-  `ControlTag`, `SwapLabel`), and `expandPattern :: Pattern ->
-  SampleRange -> [(SamplePos, PatternEvent)]` (this is
-  `patternEvents` with light validation: non-decreasing `SamplePos`
-  ordering, well-formed `VoiceKey` lifecycle within the range).
+  `ControlTag`, `SwapLabel`), `expandPattern :: Pattern ->
+  SampleRange -> [(SamplePos, PatternEvent)]` (defensively clamps
+  the result of `patternEvents` to `[srStart, srEnd)` — it is a
+  safety net, not validation), and `staticEvents ::
+  [(SamplePos, PatternEvent)] -> SampleRange -> [(SamplePos,
+  PatternEvent)]` (the canonical static-pattern realization of
+  the strict contract reading: a row built with `staticEvents
+  fullList` already restricts its output to the requested range).
+  Validation — `SamplePos` ordering, `VoiceKey` lifecycle,
+  template / node / slot resolution, hot-swap continuity — lives
+  in `checkDriverFeasibility`, not in `expandPattern`.
 - `src/MetaSonic/Pattern/Corpus.hs` — the five corpus rows as
   named top-level values. Each row's `SynthGraph` uses the existing
   `tagged` mechanism (§5.2) on every node the row's `ControlTag`

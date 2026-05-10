@@ -32,6 +32,7 @@ module MetaSonic.Pattern
     -- * Pattern
   , Pattern (..)
   , expandPattern
+  , staticEvents
   ) where
 
 import           Control.DeepSeq            (NFData)
@@ -141,12 +142,28 @@ data Pattern = Pattern
   , patternEvents    :: SampleRange -> [(SamplePos, PatternEvent)]
   }
 
--- | Expand a pattern over a sample range. Calls 'patternEvents'
--- and clamps the result to @[srStart, srEnd)@. The contract
--- requires 'patternEvents' to return events already sorted by
--- 'SamplePos'; 'expandPattern' does not re-sort, so a misordered
--- pattern is caught by the determinism / lifecycle property tests
--- rather than silently corrected here.
+-- | Defensively clamp the result of 'patternEvents' to @[srStart,
+-- srEnd)@. The contract requires each pattern's 'patternEvents' to
+-- already restrict its output to events inside the requested range
+-- (see 'staticEvents' for the canonical static-pattern realization);
+-- the clamp here is a safety net so a buggy row that ignores the
+-- range cannot silently mislead a downstream driver. No other
+-- validation: 'SamplePos' ordering and 'VoiceKey' lifecycle
+-- invariants are checked by the driver-stub validator in tests, not
+-- here.
 expandPattern :: Pattern -> SampleRange -> [(SamplePos, PatternEvent)]
 expandPattern p r =
   filter (sampleRangeContains r . fst) (patternEvents p r)
+
+-- | Canonical 'patternEvents' implementation for static patterns:
+-- the full event list is fixed at construction time, and the
+-- emitter returns only the entries whose 'SamplePos' falls inside
+-- the requested range. Realizes the strict reading of the contract
+-- (@patternEvents r@ returns events inside @r@), so a driver that
+-- calls 'patternEvents' directly each audio block sees only the
+-- events that block needs.
+staticEvents
+  :: [(SamplePos, PatternEvent)]
+  -> SampleRange
+  -> [(SamplePos, PatternEvent)]
+staticEvents events r = filter (sampleRangeContains r . fst) events
