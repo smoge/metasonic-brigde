@@ -13,8 +13,11 @@ This companion note settles two things 6.A.1 explicitly punted to
 
 - The `Pattern` *contract* — what a pattern is, what it produces,
   what determinism guarantees it carries.
-- The *corpus list* — five named rows, each defensible as music
-  rather than as a gate probe.
+- The *corpus list* — the original five named rows, each defensible
+  as music rather than as a gate probe. Later phases may add rows
+  when new compiler/runtime surface needs real corpus signal; those
+  additions should preserve the same standard rather than mutate the
+  original evidence.
 
 The actual module API (constructors, combinators, helpers) is
 implementation territory, not contract territory. This note fixes
@@ -389,8 +392,9 @@ When 6.A.2 implementation lands, the minimum surface is:
   Validation — `SamplePos` ordering, `VoiceKey` lifecycle,
   template / node / slot resolution, hot-swap continuity — lives
   in `checkDriverFeasibility`, not in `expandPattern`.
-- `src/MetaSonic/Pattern/Corpus.hs` — the five corpus rows as
-  named top-level values. Each row's `SynthGraph` uses the existing
+- `src/MetaSonic/Pattern/Corpus.hs` — the original five corpus rows
+  as named top-level values, with later additive rows allowed when a
+  subsequent phase needs corpus signal. Each row's `SynthGraph` uses the existing
   `tagged` mechanism (§5.2) on every node the row's `ControlTag`
   events reference; this is what makes `(NodeTag, ControlSlot) ->
   NodeIndex` resolution well-defined when the driver eventually
@@ -424,7 +428,7 @@ When 6.A.2 implementation lands, the minimum surface is:
       `UnknownVoiceForWrite`.
     - **Non-decreasing `SamplePos`.**
 
-    Positive cases prove the five corpus rows are feasible.
+    Positive cases prove the corpus rows are feasible.
     Negative cases (an out-of-range `ctSlot`, an unknown
     `NodeTag`, a hot-swap that orphans an open voice) prove the
     validator rejects malformed patterns and binds the issue ADT

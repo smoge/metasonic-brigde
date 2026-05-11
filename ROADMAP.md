@@ -992,12 +992,14 @@ Three layers of verification:
   hypothesis.
 - **Survey recognition (layer (b)).** Lands as the `--corpus-survey`
   subcommand ([MetaSonic.App.CorpusSurvey](app/MetaSonic/App/CorpusSurvey.hs)).
-  Runs the five corpus rows through the §4 survey machinery and
+  Runs the corpus rows through the §4 survey machinery and
   reports per-row kernel coverage, corpus-wide kernel totals,
   claimed / missed sink shapes, and §4.D edge-rate opportunity
   contribution. The baseline run is recorded in
   [notes/2026-05-10-phase-6a3-corpus-survey-baseline.md](notes/2026-05-10-phase-6a3-corpus-survey-baseline.md);
-  future runs compare against it.
+  future runs compare against it. A follow-up `spectral-freeze-pad`
+  row connects the pattern corpus to §6.D's first spectral kind
+  without changing the pattern-driver contract.
 
 Live scheduling polish, ergonomic API, and concert-grade event
 timing all stay out of 6.A. Piping the corpus through

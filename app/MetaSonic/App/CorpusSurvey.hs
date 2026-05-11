@@ -3,7 +3,7 @@
 -- Description : Phase 6.A.3 — Pattern corpus layer-(b) survey.
 --
 -- A descriptive reporting subcommand (@--corpus-survey@) that
--- runs the five pattern corpus rows through the existing
+-- runs the pattern corpus rows through the existing
 -- 'MetaSonic.App.Survey' analysis pipeline and prints a focused
 -- report: per-row kernel coverage, corpus-wide kernel totals,
 -- claimed / missed sink shapes, and §4.D edge-rate opportunity
@@ -61,6 +61,8 @@ corpusCatalog =
       [("edit-cutoff", Corpus.hotSwapEditAfterTemplates)]
   , CorpusCatalogEntry "layered-ensemble"
       Corpus.layeredEnsembleTemplates    []
+  , CorpusCatalogEntry "spectral-freeze-pad"
+      Corpus.spectralFreezePadTemplates   []
   ]
 
 -- | A single survey iteration unit. The 'fpVariant' field labels

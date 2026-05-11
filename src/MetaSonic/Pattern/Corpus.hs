@@ -1,6 +1,6 @@
 -- |
 -- Module      : MetaSonic.Pattern.Corpus
--- Description : Phase 6.A.2 — five named pattern rows.
+-- Description : Phase 6.A.2 — named pattern rows.
 --
 -- Each row is defensible as a musical idea independent of which
 -- §4 / §5 gates it incidentally exercises. See [Phase 6.A.2
@@ -9,18 +9,20 @@
 -- for the contract and per-row hypotheses.
 
 module MetaSonic.Pattern.Corpus
-  ( -- * Five corpus rows
+  ( -- * Corpus rows
     droneVibrato
   , arpeggioSendReturn
   , polyphonicStab
   , hotSwapEdit
   , layeredEnsemble
+  , spectralFreezePad
     -- * Static event lists (exposed for tests and inspection)
   , droneVibratoEvents
   , arpeggioSendReturnEvents
   , polyphonicStabEvents
   , hotSwapEditEvents
   , layeredEnsembleEvents
+  , spectralFreezePadEvents
     -- * Per-row template inputs (for Phase 6.A.3 corpus survey)
   , droneVibratoTemplates
   , arpeggioSendReturnTemplates
@@ -28,6 +30,7 @@ module MetaSonic.Pattern.Corpus
   , hotSwapEditTemplates
   , hotSwapEditAfterTemplates
   , layeredEnsembleTemplates
+  , spectralFreezePadTemplates
     -- * Verification-gate reference range
   , corpusRange
   ) where
@@ -331,3 +334,44 @@ layeredEnsembleEvents =
   , (SamplePos 190000, PEVoiceOff (VoiceKey "p0"))
   , (SamplePos 190000, PEVoiceOff (VoiceKey "fx0"))
   ]
+
+----------------------------------------------------------------------
+-- Row 6: spectral-freeze-pad
+--
+-- Sine drone → SpectralFreeze → scalar Gain → Out 0.
+-- A long voice toggles the hop-latched freeze flag on and off so the
+-- corpus exercises §6.D's first spectral kind through the pattern
+-- contract without requiring a runtime pattern driver.
+
+spectralFreezePadTemplates :: [(String, SynthGraph)]
+spectralFreezePadTemplates = [("texture", spectralFreezePadGraph)]
+
+spectralFreezePad :: Pattern
+spectralFreezePad = Pattern
+  { patternTemplates = mustCompile spectralFreezePadTemplates
+  , patternEvents    = staticEvents spectralFreezePadEvents
+  }
+
+spectralFreezePadGraph :: SynthGraph
+spectralFreezePadGraph = runSynth $ do
+  carrier <- tagged "carrier" (sinOsc (Param 110.0) (Param 0.0))
+  frozen  <- tagged "freeze"  (spectralFreeze carrier (Param 0.0))
+  shaped  <- tagged "outgain" (gain frozen (Param 0.35))
+  out 0 shaped
+
+spectralFreezePadEvents :: [(SamplePos, PatternEvent)]
+spectralFreezePadEvents =
+  [ (SamplePos 0,
+       PEVoiceOn (TemplateName "texture") (VoiceKey "sf0")
+         [ (ControlTag (MigrationKey "carrier") 0, 110.0)
+         , (freezeFlagTag,                         0.0)
+         , (ControlTag (MigrationKey "outgain") 0, 0.35)
+         ])
+  , (SamplePos 48000,
+       PEControlWrite (VoiceKey "sf0") freezeFlagTag 1.0)
+  , (SamplePos 144000,
+       PEControlWrite (VoiceKey "sf0") freezeFlagTag 0.0)
+  , (SamplePos 190000, PEVoiceOff (VoiceKey "sf0"))
+  ]
+  where
+    freezeFlagTag = ControlTag (MigrationKey "freeze") 1

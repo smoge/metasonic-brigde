@@ -9187,6 +9187,8 @@ patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
           expandPattern hotSwapEdit corpusRange @?= hotSwapEditEvents
       , testCase "layeredEnsemble" $
           expandPattern layeredEnsemble corpusRange @?= layeredEnsembleEvents
+      , testCase "spectralFreezePad" $
+          expandPattern spectralFreezePad corpusRange @?= spectralFreezePadEvents
       ]
 
   , testGroup "corpus shape pins"
@@ -9249,6 +9251,34 @@ patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
             ("expected RBusInLpfGainOut in ensemble fx kernels: "
              <> show fxKernels)
             (RBusInLpfGainOut `elem` fxKernels)
+
+      , testCase "spectralFreezePad: template carries KSpectralFreeze Barrier" $ do
+          let tg = patternTemplates spectralFreezePad
+              names = map tplName (tgTemplates tg)
+          names @?= ["texture"]
+          case tgTemplates tg of
+            [tpl] -> do
+              let rg = tplGraph tpl
+                  kinds = map rnKind (rgNodes rg)
+                  segments = segmentByBarrier rg
+                  freezeInBarrier =
+                    any (\seg -> case seg of
+                      Barrier r ->
+                        any (\ix ->
+                          any (\n -> rnIndex n == ix
+                                    && rnKind n == KSpectralFreeze)
+                              (rgNodes rg))
+                            (rrNodes r)
+                      FreeSegment _ -> False)
+                        segments
+              assertBool
+                ("expected KSpectralFreeze in row kinds: " <> show kinds)
+                (KSpectralFreeze `elem` kinds)
+              assertBool
+                ("expected spectral region Barrier; segments = "
+                 <> show (length segments))
+                freezeInBarrier
+            _ -> assertFailure "expected exactly one texture template"
       ]
 
   , testGroup "driver-stub feasibility"
@@ -9262,6 +9292,8 @@ patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
           checkDriverFeasibility hotSwapEdit        hotSwapEditEvents        @?= []
       , testCase "layeredEnsemble"    $
           checkDriverFeasibility layeredEnsemble    layeredEnsembleEvents    @?= []
+      , testCase "spectralFreezePad"  $
+          checkDriverFeasibility spectralFreezePad  spectralFreezePadEvents  @?= []
       ]
 
   , testGroup "range-aware patternEvents"
