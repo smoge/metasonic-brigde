@@ -11535,4 +11535,142 @@ spectralFreezeSkeletonTests =
       assertBool
         "spectral region must never appear inside a FreeSegment"
         (not freezeInFree)
+
+  -- ----------------------------------------------------------
+  -- §6.D slice 3: freeze gate
+  --
+  -- Slice 3 wires the freeze_flag input into the kernel. At
+  -- each hop boundary the kernel hop-latches the flag and
+  -- selects between pass-through (analyze + persist + IFFT)
+  -- and freeze (skip analysis, reconstruct from stored
+  -- Hermitian half + IFFT). The two counters diverge in
+  -- freeze mode (analysis stops; resynthesis continues).
+  -- ----------------------------------------------------------
+
+  , testCase "freeze halts analysis but continues resynthesis" $ do
+      -- Render 8N frames with freeze_flag stuck at 1 from
+      -- the start (Param 1.0). The first hop fires at
+      -- samples_in = N; since freeze_valid is false (no
+      -- analysis ever ran), the kernel emits silence
+      -- through IFFT. analysis_count stays at 0; the
+      -- resynthesis counter ticks once per hop.
+      let n       = 1024 :: Int
+          hop     = 256  :: Int
+          totalF  = 8 * n
+          nframes = totalF
+          graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 1.0)  -- freeze=on from start
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        analysis <- c_rt_graph_test_spectral_analysis_count    rt
+        resynth  <- c_rt_graph_test_spectral_resynthesis_count rt
+        let expectedResynth = fromIntegral
+              ((totalF - n) `div` hop + 1) :: CLLong
+        analysis @?= 0
+        resynth  @?= expectedResynth
+
+  , testCase "freeze mode sustains the frozen content after the flag turns on" $ do
+      -- Build the freeze transition inside the runtime:
+      -- block 1 (4N frames) runs in pass-through, recording
+      -- the spectrum of a steady sine. Then we drive freeze
+      -- by directly setting the kernel's freeze_default to
+      -- 1.0 via c_rt_graph_instance_set_control on slot 1
+      -- (the freeze_in default), feed Param 0.0 (silence)
+      -- as the signal, and render another 2N frames. The
+      -- frozen sine must continue at non-trivial amplitude
+      -- even though the input has gone silent.
+      let n       = 1024 :: Int
+          frames1 = 4 * n
+          frames2 = 2 * n
+          graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            -- Wire the freeze_in to a constant; we'll
+            -- override the instance's controls[1] later.
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph (totalNodes + 8) (max frames1 frames2) $ \rt -> do
+        loadTemplateGraph rt tg
+        -- Block 1: pass-through, prime the frozen_spectrum.
+        c_rt_graph_process rt (fromIntegral frames1)
+        analysis1 <- c_rt_graph_test_spectral_analysis_count    rt
+        assertBool
+          ("block 1 must record some analyses; got "
+           <> show analysis1)
+          (analysis1 > 0)
+        -- Block 2: turn the freeze flag on. The
+        -- spectralFreeze node is index 1 in this graph
+        -- (sinOsc=0, spectralFreeze=1, out=2). Its
+        -- controls[1] is the freeze_default. Bumping it to
+        -- 1.0 makes resolve_input return the default at
+        -- hop boundaries (the wired Param 0.0 only set the
+        -- node's controls[1] at construction; we now flip
+        -- it live).
+        c_rt_graph_instance_set_control rt 0 1 1 1.0
+        c_rt_graph_process rt (fromIntegral frames2)
+        analysis2 <- c_rt_graph_test_spectral_analysis_count    rt
+        -- analysis_count must not advance during freeze.
+        analysis2 @?= analysis1
+        -- Read the freeze-block's output and assert the
+        -- frozen sine survives.
+        allocaBytes (frames2 * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral frames2) (castPtr bp)
+          rendered <- peekArray frames2 (bp :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+              peak = maximum (map abs rcvs)
+          assertBool
+            ("frozen output must keep producing the recorded "
+             <> "sine after the input goes silent; peak = "
+             <> show peak)
+            (peak > 0.1)
+
+  , testCase "unfreeze recovery: analysis resumes after the flag drops" $ do
+      -- Three blocks: pass-through, freeze, then unfreeze.
+      -- Each phase verifies its own counter contract:
+      -- block 1 advances analysis, block 2 freezes it,
+      -- block 3 advances analysis again.
+      let n       = 1024 :: Int
+          phase   = 4 * n
+          nframes = phase
+          graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph (totalNodes + 8) nframes $ \rt -> do
+        loadTemplateGraph rt tg
+
+        c_rt_graph_process rt (fromIntegral phase)
+        a1 <- c_rt_graph_test_spectral_analysis_count rt
+
+        c_rt_graph_instance_set_control rt 0 1 1 1.0   -- freeze on
+        c_rt_graph_process rt (fromIntegral phase)
+        a2 <- c_rt_graph_test_spectral_analysis_count rt
+        a2 @?= a1                                       -- analysis paused
+
+        c_rt_graph_instance_set_control rt 0 1 1 0.0   -- freeze off
+        c_rt_graph_process rt (fromIntegral phase)
+        a3 <- c_rt_graph_test_spectral_analysis_count rt
+        assertBool
+          ("analysis must resume after unfreeze; "
+           <> "a1=" <> show a1 <> " a2=" <> show a2
+           <> " a3=" <> show a3)
+          (a3 > a2)
   ]

@@ -5059,10 +5059,14 @@ static void process_spectral_freeze(
 
   const auto sig_in =
       resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-  const double sig_default = node.controls[0];
+  const auto freeze_in =
+      resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const double sig_default    = node.controls[0];
+  const double freeze_default = node.controls[1];
 
-  constexpr int kN   = kSpectralFreezeN;
-  constexpr int kHop = kSpectralFreezeHop;
+  constexpr int kN     = kSpectralFreezeN;
+  constexpr int kHop   = kSpectralFreezeHop;
+  constexpr int kBins  = kN / 2 + 1;  // unique real-FFT bins
   const HannWindow &win = hann_window();
   const float scale = static_cast<float>(spectral_resynthesis_scale());
 
@@ -5096,36 +5100,91 @@ static void process_spectral_freeze(
                             && st->samples_in >= kN;
     if (!hop_boundary) continue;
 
-    // ---- Analysis-hop pass ----
+    // ---- Hop-boundary processing ----
     //
-    // Read N samples ending at input_write_head (the most
-    // recent N samples), window them, FFT, IFFT, window
-    // again, scale, and add into output_ring starting
-    // N - hop samples ahead of output_read_head so the new
-    // contribution overlaps the existing ring content.
-
-    // The analysis frame starts at (input_write_head - N + N) % N = input_write_head.
-    // q::fft is in-place on interleaved real/imag; build the
-    // complex input from the windowed real frame.
+    // Pass-through path: window + FFT the most recent N
+    // samples, persist the resulting spectrum to
+    // frozen_spectrum (bins 0..N/2 only — the upper half is
+    // conjugate-symmetric for real input), then IFFT and
+    // overlap-add the synthesis frame into the output ring.
+    //
+    // Freeze path: skip the analysis FFT. Reconstruct the
+    // full spectrum from the stored Hermitian half, IFFT,
+    // and overlap-add. The analysis_count stays put while
+    // resynthesis_count keeps ticking — the counters
+    // diverge in freeze mode.
+    //
+    // Read freeze_flag once at the hop boundary (Q-1
+    // settled: PortSampleAccurate at the port, but the
+    // kernel hop-latches internally). Use the input sample
+    // at fi when the hop fires; fall back to the default
+    // when nothing is wired.
     {
-      auto &spec = st->spectrum_work;
-      const int start = st->input_write_head;  // read starts here, wraps around
-      for (int i = 0; i < kN; ++i) {
-        const int src_idx = (start + i) % kN;
-        const float sample =
-            st->input_ring[static_cast<std::size_t>(src_idx)];
-        const float w =
-            win.data[static_cast<std::size_t>(i)];
-        spec[static_cast<std::size_t>(2 * i)]     = sample * w;
-        spec[static_cast<std::size_t>(2 * i + 1)] = 0.0f;
-      }
-      cycfi::q::fft<static_cast<std::size_t>(kN)>(spec.data());
-      ++analysis_ticks;
+      const double freeze_raw =
+          freeze_in.empty() ? freeze_default
+                            : static_cast<double>(freeze_in[fi]);
+      const bool freezing =
+          std::isfinite(freeze_raw) && freeze_raw >= 0.5;
 
-      // Slice 2: pass-through. Slice 3 will branch here on
-      // the freeze gate. The frozen_spectrum array exists
-      // and is value-initialized; populating it is slice 3's
-      // job.
+      auto &spec = st->spectrum_work;
+
+      if (!freezing) {
+        // Analysis: window + FFT the most recent N samples.
+        const int start = st->input_write_head;
+        for (int i = 0; i < kN; ++i) {
+          const int src_idx = (start + i) % kN;
+          const float sample =
+              st->input_ring[static_cast<std::size_t>(src_idx)];
+          const float w =
+              win.data[static_cast<std::size_t>(i)];
+          spec[static_cast<std::size_t>(2 * i)]     = sample * w;
+          spec[static_cast<std::size_t>(2 * i + 1)] = 0.0f;
+        }
+        cycfi::q::fft<static_cast<std::size_t>(kN)>(spec.data());
+        ++analysis_ticks;
+
+        // Persist bins 0..N/2 (kBins entries) for later
+        // freeze playback. The N/2+1..N-1 bins are
+        // reconstructed by conjugation from bins 1..N/2-1
+        // for real-input FFTs.
+        for (int k = 0; k < kBins; ++k) {
+          st->frozen_spectrum[static_cast<std::size_t>(2 * k)] =
+              spec[static_cast<std::size_t>(2 * k)];
+          st->frozen_spectrum[static_cast<std::size_t>(2 * k + 1)] =
+              spec[static_cast<std::size_t>(2 * k + 1)];
+        }
+        st->frozen_valid = true;
+      } else {
+        // Freeze path. Skip analysis; reconstruct the full
+        // spectrum from the stored Hermitian half. If
+        // frozen_valid is false (freeze flag was on before
+        // any analysis hop ever fired), emit silence — the
+        // spectrum is zero, and zero through IFFT is zero.
+        if (!st->frozen_valid) {
+          // spec is whatever was left from a prior pass;
+          // zero it so the IFFT below emits silence into
+          // the output ring.
+          std::fill(spec.begin(), spec.end(), 0.0f);
+        } else {
+          // Copy bins 0..N/2 from frozen_spectrum into
+          // spec, then reconstruct bins N/2+1..N-1 by
+          // conjugation.
+          for (int k = 0; k < kBins; ++k) {
+            spec[static_cast<std::size_t>(2 * k)] =
+                st->frozen_spectrum[static_cast<std::size_t>(2 * k)];
+            spec[static_cast<std::size_t>(2 * k + 1)] =
+                st->frozen_spectrum[static_cast<std::size_t>(2 * k + 1)];
+          }
+          for (int k = kBins; k < kN; ++k) {
+            // bin k mirrors bin N-k with conjugated imag part.
+            const int mirror = kN - k;
+            spec[static_cast<std::size_t>(2 * k)] =
+                spec[static_cast<std::size_t>(2 * mirror)];
+            spec[static_cast<std::size_t>(2 * k + 1)] =
+                -spec[static_cast<std::size_t>(2 * mirror + 1)];
+          }
+        }
+      }
 
       cycfi::q::ifft<static_cast<std::size_t>(kN)>(spec.data());
       ++resynth_ticks;
