@@ -63,10 +63,13 @@ This note is also bounded by what 6.D is *not* doing first:
 - Audio-thread STFT with overlap-add resynthesis. Fixed
   parameters: N=1024 samples, hop=256 (75% overlap),
   Hann window, mono float32.
-- Two operating modes selected per-block by `freeze_flag`:
+- Two operating modes selected by `freeze_flag` (the kernel
+  internally samples the flag at hop boundaries; the port
+  itself stays `PortSampleAccurate`, see §2.4 / Q-1):
   - **pass-through** (`freeze_flag < 0.5`): output is the input
-    delayed by N samples. Verifies the analysis/synthesis
-    plumbing is invertible to within numerical noise.
+    delayed by N samples in steady state. Verifies the
+    analysis/synthesis plumbing is invertible to within
+    numerical noise.
   - **freeze** (`freeze_flag >= 0.5`): the last-completed
     window's magnitude/phase is held; resynthesis continues
     from the frozen spectrum, no new input is consumed for
@@ -74,9 +77,10 @@ This note is also bounded by what 6.D is *not* doing first:
 - `inferEff (SpectralFreeze _ _) = [Pure]`. The kind owns its
   own ring buffers; nothing crosses an instance boundary.
 - A **declared latency** of N samples, surfaced via a new
-  `kindLatency :: NodeKind -> Int` (or
-  `ksLatencyFrames :: KindSpec -> Int`) accessor. The Haskell
-  side records it; no pass consumes it yet.
+  `kindLatency :: NodeKind -> Maybe Int` accessor. `Nothing`
+  means "no inherent latency"; `Just k` means "output port 0
+  is the input delayed by k samples in steady state". The
+  Haskell side records it; no pass consumes it yet.
 
 ### Out of scope (do **not** open in this design)
 
@@ -179,11 +183,25 @@ all overlapping windows have contributed.
 
 Three places this matters:
 
-1. **Test surface.** An impulse fed in at frame 0 must emerge
-   at frame N (within numerical noise) in pass-through mode.
-   Frames 0..N-1 of the output are the COLA pre-roll;
-   asserting they are below an epsilon is one of the slice 2
-   correctness tests.
+1. **Test surface.** Steady-state latency is provable in two
+   independent shapes:
+   - **Pre-roll silence:** frames `0..N-1` of the output
+     are below numerical noise on any non-pathological
+     input. No complete overlap windows have been summed,
+     so output is by construction zero.
+   - **Warmed-up impulse:** the kernel is fed silence for
+     at least `2N` frames (enough to flush the analysis
+     ring through one full COLA cycle), an impulse is
+     injected at frame `2N`, and the impulse must emerge at
+     frame `3N` in the output — that is, the injection
+     position plus the declared N-sample latency. Injecting
+     at frame 0 instead would make the impulse land on the
+     edge of the very first analysis window, where Hann
+     weighting is zero and pre-roll has no overlapping
+     contribution, so the impulse would be attenuated by
+     alignment rather than by latency. Warming up
+     decouples the latency assertion from startup
+     transients; it is the actual test slice 2 ships.
 2. **Documentation.** `KSpectralFreeze` advertises its latency
    as N (= 1024) samples through a new
    `kindLatency :: NodeKind -> Maybe Int` query. `Nothing`
@@ -212,15 +230,38 @@ unfreeze is still there (the kernel never stops *filling* the
 input ring, only stops *consuming* it) so the freeze release
 is a one-hop transient, not a discontinuity.
 
-Open question Q-1 (§9): whether `freeze_flag` is read once per
-hop boundary (cheap, but loses sub-hop responsiveness) or once
-per sample with hysteresis (expensive, but matches the
-`PortSampleAccurate` policy of every other gate-style flag).
-Default for v1: **once per hop**, classified as
-`PortBlockLatched` since the hop is the block boundary
-internal to the kind. If a use case forces sub-hop
-responsiveness it becomes a knob; the conservative default is
-the simpler kernel.
+Open question Q-1 (§9): how often the kernel actually
+*reads* `freeze_flag`. The kernel internally latches the flag
+at hop boundaries — once per hop is enough, since analysis
+runs on hop boundaries — but **the port metadata stays
+`PortSampleAccurate` for v1**. The two are independent:
+
+- `PortConsumptionRate` is a *fusion-survey hint* about
+  destination-side reads, defined in
+  [Types.hs:548–580](../src/MetaSonic/Types.hs#L548-L580).
+  Its three non-default classifications (`PortBlockLatched`,
+  `PortInitOnly`, `PortIgnored`) refer to specific runtime
+  behaviors: `PortBlockLatched` in particular means "read only
+  at sample 0 of each host audio block"
+  ([Types.hs:591–597](../src/MetaSonic/Types.hs#L591-L597)).
+  A *hop* is not a host block — hop boundaries land at
+  arbitrary positions inside a block, depending on the
+  monotonic sample counter mod hop. Classifying
+  `freeze_flag` as `PortBlockLatched` would mis-describe the
+  read pattern to every survey consumer.
+- The right long-term move is a new
+  `PortHopLatched` / `PortWindowLatched` policy that
+  fusion-survey can interpret correctly. v1 doesn't ship it:
+  the only consumer of the metadata today is the survey, and
+  the survey overcounting one block-rate opportunity is the
+  *conservative* error direction (a sample-accurate port can
+  never silently downgrade a block-rate decision).
+- For v1: port 1 is `PortSampleAccurate` so the metadata
+  matches the C ABI contract (the kernel may read the
+  per-sample `freeze_flag` buffer), and the kernel
+  *internally* hop-latches by reading `freeze_flag[hop_start]`
+  once per analysis hop. Hop-aware hysteresis can be added
+  later under a real use case without renaming the port.
 
 ## 3. ResourceFootprint interaction
 
@@ -306,13 +347,13 @@ Per `CLAUDE.md`'s checklist for a new kind:
 | # | File                         | Edit                                                          |
 |---|------------------------------|---------------------------------------------------------------|
 | 1 | `Types.hs`                   | `KSpectralFreeze` constructor on `NodeKind`                   |
-| 2 | `Types.hs`                   | `kindSpec` row: tag 22, SampleRate, audio arity 2, ctl arity 3, label `"spectralFreeze"` |
+| 2 | `Types.hs`                   | `kindSpec` row: `KindSpec 22 SampleRate 2 2 "spectralFreeze"` — tag 22, SampleRate, audio arity 2 (signal, freeze_flag), control arity 2 (defaults for the same two inputs, per the `UGenView` contract in [Source.hs:1167](../src/MetaSonic/Bridge/Source.hs#L1167)) |
 | 3 | `Bridge/Source.hs`           | `UGen` constructor `SpectralFreeze !Connection !Connection`    |
-| 4 | `Bridge/Source.hs`           | `ugenView` row: audio inputs `[sig_in, freeze_in]`, control defaults `[connDefault sig_in, connDefault freeze_in]` |
+| 4 | `Bridge/Source.hs`           | `ugenView` row: audio inputs `[sig_in, freeze_in]`, control defaults `[connDefault sig_in, connDefault freeze_in]` — both lengths 2, matching `ksAudioArity` and `ksControlArity` |
 | 5 | `Bridge/Source.hs`           | builder `spectralFreeze :: Connection -> Connection -> SynthM Connection` |
 | 6 | `Bridge/Source.hs`           | `inferEff (SpectralFreeze _ _) = [Pure]` — needed because the constructor takes no resource id, so the default fall-through would apply; written out for explicitness |
 | 7 | `Types.hs` (new accessor)    | `kindLatency :: NodeKind -> Maybe Int` returning `Just 1024` for `KSpectralFreeze`, `Nothing` for everything else |
-| 8 | `Types.hs` (`portInfo`)      | port 0 → `PortInfo PortSampleAccurate "signal_in"`, port 1 → `PortInfo PortBlockLatched "freeze_flag"` (block-latched per §2.4 / Q-1) |
+| 8 | `Types.hs` (`portInfo`)      | port 0 → `PortInfo PortSampleAccurate "signal_in"`, port 1 → `PortInfo PortSampleAccurate "freeze_flag"` — both sample-accurate at the C ABI; the kernel internally hop-latches `freeze_flag`. See §2.4 / Q-1 for why this is not `PortBlockLatched`. |
 
 C++ side (`tinysynth/rt_graph.cpp`):
 
@@ -338,8 +379,11 @@ struct SpectralFreezeState {
 };
 ```
 
-- `configure_spec` row for `KSpectralFreeze`: 3 default controls
-  (placeholder zeros), 2 input refs.
+- `configure_spec` row for `KSpectralFreeze`: 2 default
+  controls (one per audio input — signal default, freeze
+  default), 2 input refs. Matches Haskell's `ksControlArity =
+  2` so the per-spec defaults vector ships across the FFI at
+  the right size.
 - `init_node_state` row: zero-initialize the arrays.
 - `process_spectral_freeze` kernel: see §2.2 for the four-step
   outline.
@@ -371,16 +415,35 @@ Tests (in `recordBufMonoSkeletonTests` style, new
 
 1. `inferEff produces Pure` — pins effect classification.
 2. `kindSpec / portInfo / kindLatency agree on shape` —
-   tag 22, latency 1024, port 0 PortSampleAccurate, port 1
-   PortBlockLatched.
-3. `pass-through delays an impulse by exactly N samples` —
-   feed an impulse at frame 0, render N + N frames, expect
-   amplitude ≥ 0.99 at frame N within numerical noise.
-4. `pass-through is silent during pre-roll` — frames 0..N-1
-   of the output are all < 1e-3 in magnitude.
-5. `pass-through reconstructs a sine wave` — feed a 440 Hz
-   sine, skip the first N frames, expect peak abs ≈ 1.0 and
-   the right number of zero crossings.
+   `ksTag = 22`, `ksRate = SampleRate`, `ksAudioArity = 2`,
+   `ksControlArity = 2`, `ksLabel = "spectralFreeze"`,
+   `kindLatency KSpectralFreeze = Just 1024`, both
+   `portInfo` rows `PortSampleAccurate` (see §2.4 / Q-1 for
+   why the freeze flag is sample-accurate at the port even
+   though the kernel hop-latches it internally).
+3. `pre-roll is silent` — frames `0..N-1` of the output are
+   all below 1e-3 in magnitude on any non-pathological input
+   (no overlapping windows have completed yet).
+4. `warmed-up impulse emerges N samples later` — feed
+   silence for `2N` frames (priming the analysis ring with
+   one full window before the impulse), inject an impulse
+   at frame `2N`, render `4N` frames total. The impulse
+   must appear at frame `3N` (= injection frame + N
+   samples of pipeline latency) within numerical noise.
+   A frame-0 injection is *not* used: with causal startup
+   and a Hann window, frame 0 lands on a window edge with
+   no overlapping pre-roll contributions, so the impulse is
+   attenuated by alignment rather than by latency. Warming
+   up first decouples the latency assertion from startup
+   transients. Counter-confirmed: `analysis_count` and
+   `resynthesis_count` advance by the steady-state hop math
+   over the rendered window.
+5. `pass-through reconstructs a sine wave (steady state)` —
+   feed a 440 Hz sine for `4N` frames, skip the first `2N`
+   (startup transient + one COLA-complete window), assert
+   the remaining window has peak abs ≈ 1.0 within
+   numerical noise and the expected number of zero
+   crossings.
 6. `freeze halts analysis but continues resynthesis` —
    freeze the flag at frame F, feed silence after frame F,
    expect the output past frame F + N to keep producing the
@@ -408,11 +471,11 @@ no-intentionally-red-CI rule as §6.C.4 follow-up
 
 Haskell side:
 
-- `KSpectralFreeze` in `NodeKind`, `kindSpec` row (tag 22,
-  SampleRate, audio arity 2, ctl arity 3, label
-  `"spectralFreeze"`).
-- `kindLatency` accessor added with `KSpectralFreeze -> Just
-  1024`, all other kinds returning `Nothing`.
+- `KSpectralFreeze` in `NodeKind`, `kindSpec` row
+  (`KindSpec 22 SampleRate 2 2 "spectralFreeze"`).
+- `kindLatency :: NodeKind -> Maybe Int` accessor added
+  with `KSpectralFreeze -> Just 1024`, all other kinds
+  returning `Nothing`.
 - `UGen` constructor `SpectralFreeze`, `ugenView` row,
   `inferEff` case, `dependencies` case, `portInfo` row.
 - `spectralFreeze` DSL builder, exported.
@@ -491,12 +554,18 @@ update).
 
 ## 9. Open questions / Q-deferrals
 
-Q-1. **`freeze_flag` consumption policy.** `PortBlockLatched`
-at the hop boundary (default in §2.4) vs. `PortSampleAccurate`
-within each hop. Default: hop-latched, kept consistent with
-the kernel's hop-granular work. If a use case forces sub-hop
-responsiveness, lift to sample-accurate with a hysteresis
-band.
+Q-1. **`freeze_flag` consumption policy** (settled for v1).
+The kernel internally reads `freeze_flag` once per analysis
+hop. The C-ABI port metadata is `PortSampleAccurate` because
+that's the only existing classification that honestly
+describes "the kernel may read every sample of the input
+buffer" — `PortBlockLatched` specifically refers to host
+audio blocks (sample 0 of `nframes`), not hop boundaries,
+and overloading it would silently mis-describe the read
+pattern to fusion-survey consumers. A future
+`PortHopLatched` / `PortWindowLatched` classification can
+replace this once survey consumers learn the new contract;
+v1 stays on the conservative existing axis.
 
 Q-2. **Window choice.** Hann is default for v1. Other COLA
 windows (Hamming, Blackman) buy specific spectral leakage
