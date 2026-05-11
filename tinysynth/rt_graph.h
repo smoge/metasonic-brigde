@@ -739,6 +739,11 @@ int rt_graph_kind_supported(int node_kind);
 // audio thread never resolves plugin names.
 int rt_graph_plugin_count(void);
 int rt_graph_plugin_find(const char *name);
+const char *rt_graph_plugin_name(int plugin_id);
+int rt_graph_plugin_audio_in_count(int plugin_id);
+int rt_graph_plugin_audio_out_count(int plugin_id);
+int rt_graph_plugin_latency_samples(int plugin_id);
+int rt_graph_plugin_state_size_bytes(int plugin_id);
 
 // [T:read-only] Phase §4.E.2.B0 test surface: the count of canonical
 // writer slots reserved during the most recent rt_graph_process call.

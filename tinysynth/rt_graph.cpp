@@ -9567,6 +9567,31 @@ int rt_graph_plugin_find(const char *name) {
   return metasonic::plugin_find(name);
 }
 
+const char *rt_graph_plugin_name(int plugin_id) {
+  const auto *spec = metasonic::plugin_at(plugin_id);
+  return spec != nullptr ? spec->name : nullptr;
+}
+
+int rt_graph_plugin_audio_in_count(int plugin_id) {
+  const auto *spec = metasonic::plugin_at(plugin_id);
+  return spec != nullptr ? spec->audio_in_count : -1;
+}
+
+int rt_graph_plugin_audio_out_count(int plugin_id) {
+  const auto *spec = metasonic::plugin_at(plugin_id);
+  return spec != nullptr ? spec->audio_out_count : -1;
+}
+
+int rt_graph_plugin_latency_samples(int plugin_id) {
+  const auto *spec = metasonic::plugin_at(plugin_id);
+  return spec != nullptr ? spec->latency_samples : -1;
+}
+
+int rt_graph_plugin_state_size_bytes(int plugin_id) {
+  const auto *spec = metasonic::plugin_at(plugin_id);
+  return spec != nullptr ? spec->state_size_bytes : -1;
+}
+
 // Phase §6.C.3a/b: producer-side buffer pool. The audio thread
 // reads through `samples.data()` / `samples.size()` on each
 // PlayBufMono kernel call after an acquire-load of `slot.state`.

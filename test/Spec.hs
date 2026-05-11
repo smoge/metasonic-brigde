@@ -50,6 +50,7 @@ import           Test.Tasty.QuickCheck     as QC
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI      (RTGraph,
                                             HotSwapWaitResult (..),
+                                            PluginRegistryEntry (..),
                                             SwapMigrationStats (..),
                                             c_rt_graph_realtime_set_control,
                                             c_rt_graph_test_swap_generation,
@@ -104,6 +105,7 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             loadRuntimeGraphFused,
                                             loadTemplateGraph,
                                             loadTemplateGraphFused,
+                                            pluginRegistryEntries,
                                             withRTGraph)
 import           MetaSonic.Bridge.Buffer   (BufferIssue (..), allocBuffer,
                                             clearBuffer,
@@ -191,6 +193,22 @@ staticPluginSkeletonTests =
         @?= Just (PortInfo PortSampleAccurate "in1")
       portInfo KStaticPlugin (PortIndex 2) @?= Nothing
       kindLatency KStaticPlugin @?= Nothing
+
+  , testCase "runtime plugin registry exposes Identity metadata" $ do
+      entries <- pluginRegistryEntries
+      let identityRows =
+            filter ((== "identity") . pluginEntryName) entries
+      case identityRows of
+        [row] -> do
+          pluginEntryId row @?= 0
+          pluginEntryAudioInputs row @?= 2
+          pluginEntryAudioOutputs row @?= 1
+          pluginEntryLatencySamples row @?= 0
+          pluginEntryStateBytes row @?= 0
+        _ ->
+          assertFailure $
+            "expected exactly one identity plugin row, got: "
+            <> show identityRows
 
   , testCase "ugenView lowers identityPlugin to frozen plugin_id control" $ do
       let view = ugenView

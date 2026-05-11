@@ -2,6 +2,7 @@ set shell := ["bash", "-cu"]
 
 cpp_build_dir := "build-cpp"
 cpp_exe := "rt_graph_smoke"
+cpp_live_test_regex := "start_audio.*stop_audio|audio start/stop cycle|clear during a running audio stream|rebuild after clear with active stream|destroy after start_audio"
 
 default:
     just --list
@@ -23,6 +24,9 @@ metasonic-help:
 
 midi-list:
     stack exec -- metasonic-bridge --midi-list
+
+plugin-list:
+    stack exec -- metasonic-bridge --plugin-list
 
 midi-poly:
     stack exec -- metasonic-bridge midi-poly
@@ -56,6 +60,17 @@ cpp-run: cpp-build
 
 cpp-test: cpp-build
     ctest --test-dir {{cpp_build_dir}} --output-on-failure
+
+cpp-test-offline: cpp-build
+    ctest --test-dir {{cpp_build_dir}} --output-on-failure -E "{{cpp_live_test_regex}}"
+
+cpp-test-live: cpp-build
+    ctest --test-dir {{cpp_build_dir}} --output-on-failure -R "{{cpp_live_test_regex}}"
+
+check-offline:
+    git diff --check
+    just stack-test
+    just cpp-test-offline
 
 # §4.B kernel microbench. Configures and builds in a separate
 # RelWithDebInfo tree so the numbers aren't dominated by

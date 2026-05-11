@@ -74,6 +74,10 @@ data RunMode
     -- ^ Non-audio reporting mode (--midi-list). Enumerates the
     -- current Q / PortMIDI device table and exits. The printed ids
     -- are the values accepted by --midi-device.
+  | PluginList
+    -- ^ Non-audio reporting mode (--plugin-list). Enumerates the
+    -- build-linked static plugin registry that KStaticPlugin resolves
+    -- against on the producer side.
   deriving (Eq, Show)
 
 data Options = Options
@@ -125,6 +129,8 @@ parseArgs = go defaultOptions
       go opts { optMode = CorpusSurvey } xs
     go opts ("--midi-list" : xs) =
       go opts { optMode = MidiList } xs
+    go opts ("--plugin-list" : xs) =
+      go opts { optMode = PluginList } xs
     go opts ("--midi-device" : s : xs) =
       case parseMidiDeviceIndex s of
         Just ix -> go opts { optMidiDevice = Just ix } xs
@@ -192,6 +198,7 @@ usage prog = unlines
   , "  " <> prog <> " --swap-bench"
   , "  " <> prog <> " --corpus-survey"
   , "  " <> prog <> " --midi-list"
+  , "  " <> prog <> " --plugin-list"
   , "  " <> prog <> " --osc-listen [PORT]"
   , ""
   , "If no demo names are given, all demos are run."
@@ -246,6 +253,8 @@ usage prog = unlines
   , "  --midi-device N  Select PortMIDI device id N for the midi-poly"
   , "                   demo. Use --midi-list to discover ids. Ignored"
   , "                   by non-MIDI demos."
+  , "  --plugin-list    Print the build-linked static plugin registry"
+  , "                   used by KStaticPlugin and exit. No audio, no TUI."
   , "  --osc-listen [PORT]"
   , "                   Phase 6.B.4 thin wrapper over"
   , "                   MetaSonic.OSC.Listen.withOscListener. Loads a"
@@ -328,6 +337,8 @@ main = do
       runOscListen (optOscPort opts)
     MidiList ->
       printMidiDevices
+    PluginList ->
+      printPlugins
     AudioOnly      -> runDemos "Running selected demos."
     InspectThenRun -> runDemos "Inspecting selected demos before audio."
     InspectOnly    -> runDemos "Inspecting selected demos without audio."
@@ -355,6 +366,23 @@ printMidiDevices = do
       putStrLn ""
       putStrLn "Use an input-capable id with: --midi-device N midi-poly"
 
+printPlugins :: IO ()
+printPlugins = do
+  entries <- pluginRegistryEntries
+  case entries of
+    [] ->
+      putStrLn "No static plugins registered."
+    _ -> do
+      putStrLn "Static plugins:"
+      forM_ entries $ \p ->
+        putStrLn $
+          "  id=" <> show (pluginEntryId p)
+          <> "  name=\"" <> pluginEntryName p <> "\""
+          <> "  audio_inputs=" <> show (pluginEntryAudioInputs p)
+          <> "  audio_outputs=" <> show (pluginEntryAudioOutputs p)
+          <> "  latency_samples=" <> show (pluginEntryLatencySamples p)
+          <> "  state_bytes=" <> show (pluginEntryStateBytes p)
+
 -- Top-level dispatch: route a Demo to its body-specific runner. See
 -- Note [Demo body: single-graph vs multi-template].
 runDemo :: Options -> Demo -> IO ()
@@ -368,7 +396,8 @@ runDemo opts demo
     || optMode opts == SwapBench
     || optMode opts == CorpusSurvey
     || optMode opts == OscListen
-    || optMode opts == MidiList =
+    || optMode opts == MidiList
+    || optMode opts == PluginList =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -430,6 +459,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: OscListen should be handled by main, never reach here"
     MidiList ->
       error "runSingleDemo: MidiList should be handled by main, never reach here"
+    PluginList ->
+      error "runSingleDemo: PluginList should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare

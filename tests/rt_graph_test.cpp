@@ -22,6 +22,7 @@
 #include <limits>
 #include <numbers>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -101,6 +102,20 @@ TEST_CASE("static plugin registry exposes identity") {
     CHECK(rt_graph_plugin_find("identity") == 0);
     CHECK(rt_graph_plugin_find("missing") == -1);
     CHECK(rt_graph_plugin_find(nullptr) == -1);
+
+    const char *name = rt_graph_plugin_name(0);
+    REQUIRE(name != nullptr);
+    CHECK(std::string(name) == "identity");
+    CHECK(rt_graph_plugin_audio_in_count(0) == 2);
+    CHECK(rt_graph_plugin_audio_out_count(0) == 1);
+    CHECK(rt_graph_plugin_latency_samples(0) == 0);
+    CHECK(rt_graph_plugin_state_size_bytes(0) == 0);
+
+    CHECK(rt_graph_plugin_name(-1) == nullptr);
+    CHECK(rt_graph_plugin_audio_in_count(-1) == -1);
+    CHECK(rt_graph_plugin_audio_out_count(-1) == -1);
+    CHECK(rt_graph_plugin_latency_samples(-1) == -1);
+    CHECK(rt_graph_plugin_state_size_bytes(-1) == -1);
 }
 
 // ----------------------------------------------------------------

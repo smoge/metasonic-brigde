@@ -46,6 +46,16 @@ module MetaSonic.Bridge.FFI
   , waitAudioStarted
   , stopAudio
   , -- * Introspection
+    PluginRegistryEntry (..)
+  , pluginRegistryEntries
+  , c_rt_graph_plugin_count
+  , c_rt_graph_plugin_find
+  , c_rt_graph_plugin_name
+  , c_rt_graph_plugin_audio_in_count
+  , c_rt_graph_plugin_audio_out_count
+  , c_rt_graph_plugin_latency_samples
+  , c_rt_graph_plugin_state_size_bytes
+  , -- * Kind/kernel support probes
     c_rt_graph_kind_supported
   , c_rt_graph_region_kernel_supported
   , -- * §4.E.2.B test surface (off by default; tests opt in)
@@ -150,10 +160,10 @@ module MetaSonic.Bridge.FFI
 import           Control.Concurrent        (threadDelay)
 import           Control.Exception          (bracket)
 import qualified Control.Monad              as M (void)
-import           Control.Monad              (forM_, unless, when)
+import           Control.Monad              (forM, forM_, unless, when)
 import qualified Data.Set                  as S
 import           Foreign
-import           Foreign.C.String          (CString, withCAStringLen)
+import           Foreign.C.String          (CString, peekCString, withCAStringLen)
 import           Foreign.C.Types
 import           System.Timeout             (timeout)
 
@@ -386,6 +396,20 @@ data HotSwapWaitResult
     -- single-producer/single-collector model this should not occur.
   deriving (Eq, Show)
 
+-- | One row from the build-linked static plugin registry.
+--
+-- This is read-only producer-side metadata. Runtime nodes still
+-- receive only the integer plugin id; the audio thread never resolves
+-- names through the registry.
+data PluginRegistryEntry = PluginRegistryEntry
+  { pluginEntryId             :: !Int
+  , pluginEntryName           :: !String
+  , pluginEntryAudioInputs    :: !Int
+  , pluginEntryAudioOutputs   :: !Int
+  , pluginEntryLatencySamples :: !Int
+  , pluginEntryStateBytes     :: !Int
+  } deriving (Eq, Show)
+
 -- Foreign imports.
 -- See Note [Why ccall, not capi].
 -- See Note [Mixed foreign call safety].
@@ -593,6 +617,30 @@ foreign import ccall unsafe "rt_graph_swap_migration_lifecycle_copy_count"
 -- no graph state needed. 'unsafe' is correct.
 foreign import ccall unsafe "rt_graph_kind_supported"
   c_rt_graph_kind_supported :: CInt -> IO CInt
+
+-- | Static plugin registry size. Pure read-only metadata, but IO
+-- because the registry is owned by the linked C++ runtime.
+foreign import ccall unsafe "rt_graph_plugin_count"
+  c_rt_graph_plugin_count :: IO CInt
+
+-- | Static plugin name lookup. Returns -1 on null / unknown names.
+foreign import ccall unsafe "rt_graph_plugin_find"
+  c_rt_graph_plugin_find :: CString -> IO CInt
+
+foreign import ccall unsafe "rt_graph_plugin_name"
+  c_rt_graph_plugin_name :: CInt -> IO CString
+
+foreign import ccall unsafe "rt_graph_plugin_audio_in_count"
+  c_rt_graph_plugin_audio_in_count :: CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_plugin_audio_out_count"
+  c_rt_graph_plugin_audio_out_count :: CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_plugin_latency_samples"
+  c_rt_graph_plugin_latency_samples :: CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_plugin_state_size_bytes"
+  c_rt_graph_plugin_state_size_bytes :: CInt -> IO CInt
 
 -- | §4.E.2.B test surface: toggle reduction-capture mode for the next
 -- 'c_rt_graph_process' call. When non-zero, sink writes route into
@@ -1080,6 +1128,29 @@ foreign import ccall unsafe "rt_graph_test_spectral_resynthesis_count"
 -- Use c_rt_graph_read_bus and, if you need a liveness check, gate
 -- the call yourself with c_rt_graph_instance_alive or
 -- c_rt_graph_instance_status.)
+
+-- | Snapshot the build-linked static plugin registry into Haskell
+-- values suitable for reporting and contract tests.
+pluginRegistryEntries :: IO [PluginRegistryEntry]
+pluginRegistryEntries = do
+  n <- c_rt_graph_plugin_count
+  forM [0 .. fromIntegral n - 1] $ \i -> do
+    cName <- c_rt_graph_plugin_name (fromIntegral i)
+    name <- if cName == nullPtr
+              then pure "<invalid>"
+              else peekCString cName
+    inCount <- c_rt_graph_plugin_audio_in_count (fromIntegral i)
+    outCount <- c_rt_graph_plugin_audio_out_count (fromIntegral i)
+    latency <- c_rt_graph_plugin_latency_samples (fromIntegral i)
+    stateBytes <- c_rt_graph_plugin_state_size_bytes (fromIntegral i)
+    pure PluginRegistryEntry
+      { pluginEntryId             = i
+      , pluginEntryName           = name
+      , pluginEntryAudioInputs    = fromIntegral inCount
+      , pluginEntryAudioOutputs   = fromIntegral outCount
+      , pluginEntryLatencySamples = fromIntegral latency
+      , pluginEntryStateBytes     = fromIntegral stateBytes
+      }
 
 -- | Allocate a C++ runtime graph, run an action with it, and
 -- guarantee cleanup via bracket.
