@@ -306,52 +306,80 @@ becomes a precedence edge; the intra-graph E_r rule in
 
 ## 7. Implementation slicing
 
-Three commits, in order:
+Three commits, in order. **No commit intentionally leaves
+`stack test` red** — slice 1 lands the Haskell surface *plus*
+the minimal C++ tag/state/skeleton needed to keep the
+tag-agreement and `kind_supported` properties green. Slice 2
+then fills in the real kernel body. Slice 3 adds end-to-end
+tests. This departs from the 6.C.3a precedent that landed
+Haskell first with a known-red tag test in between — that
+pattern is useful as a tripwire but it forces every reviewer
+to read a red CI and decide whether the red is expected, which
+is friction we can avoid here.
 
-### Slice 1 — Haskell surface + effect pins
+### Slice 1 — Haskell surface + minimal C++ skeleton
 
-- Add `KRecordBufMono` to `NodeKind`, `kindSpec` row,
-  `inferEff` case, `dependencies` case, `portInfo` row, and the
-  `UGen` constructor.
-- Add the `recordBufMono` DSL builder.
-- Extend `Bridge.Validate.busEdges` to also pair
-  `BufWrite` with `BufRead` on the same buffer id (intra-graph
-  E_r at the buffer scope). Same shape as the existing pairing,
-  same exclusion of `BufReadDelayed`.
-- Add the `bufWrite` case to `runtimeNodeResourceFootprint` so
-  intra-template region precedence picks up the writer too.
-- `compileTemplateGraph`'s slice 4 check fires automatically
+Haskell side:
+
+- `KRecordBufMono` in `NodeKind`, `kindSpec` row, `inferEff`
+  case, `dependencies` case, `portInfo` row, `UGen`
+  constructor.
+- `recordBufMono` DSL builder.
+- Extend `Bridge.Validate.busEdges` to also pair `BufWrite`
+  with `BufRead` on the same buffer id (intra-graph E_r at
+  the buffer scope). Same shape as the existing pairing, same
+  exclusion of `BufReadDelayed`.
+- Add the `BufWrite` case to `runtimeNodeResourceFootprint`
+  so intra-template region precedence picks up the writer too.
+- `compileTemplateGraph`'s slice-4 check fires automatically
   when two templates use `recordBufMono` on the same buffer.
 
-Stop point: tag-agreement test fails (no C++ side yet) — that's
-the §6.C.3a precedent and the right place to land first.
+C++ side, just enough to keep the tag/agreement test green:
 
-### Slice 2 — C++ runtime kernel
-
-- `KRecordBufMono = 21` in the `NodeKind` enum, `kind_from_tag`
-  entry, `configure_spec` row (4-wide controls vector matching
-  Haskell's `kindSpec`).
+- `NodeKind::KRecordBufMono = 21`, `kind_from_tag` row,
+  `configure_spec` row matching Haskell's `KindSpec 21
+  SampleRate 2 3 "recordBufMono"`.
 - `RecordBufMonoState { int buffer_id; long long write_head; }`
-  — `write_head` is `long long` to leave headroom; bounded
-  against `samples.size()` per sample.
-- `init_node_state` case: resolve `controls[0]` to
-  `buffer_id` via the same `lround + range-check + -1
-  sentinel` idiom as `KPlayBufMono`. `write_head = 0` at reset.
+  added to the `NodeState` variant, `init_node_state` resolves
+  `controls[0]` once at reset.
+- Stub `process_record_buf_mono` kernel that emits zero on the
+  pass-through output and ticks `buffer_invalid_write_count`
+  unconditionally — same pattern as the §6.C.3a stub before
+  the real kernel landed.
+- Two new counters (`buffer_write_count`,
+  `buffer_invalid_write_count`) on `RTGraph`, plus the
+  `rt_graph_test_buffer_write_count` /
+  `_invalid_write_count` accessors.
+
+After slice 1: every existing test still passes; the
+tag-agreement / `kind_supported` / `portInfo` / `ugenView`
+arity properties all extend through `KRecordBufMono` because
+both sides agree. An end-to-end record-then-playback test
+does **not** exist yet — that's slice 3's job — but no test
+is intentionally red.
+
+### Slice 2 — Real `process_record_buf_mono` kernel
+
+Replaces slice 1's zero-output stub with the actual write path:
+
 - `process_record_buf_mono` kernel: acquire-load `slot.state`,
   invalid path on anything except `Allocated`, write
   `signal_in[fi]` into `samples[write_head]`, increment
   `write_head`, loop back to 0 when wrapping past
   `samples.size()` if `loop_flag >= 0.5` else stop writing
   (invalid path) at end. Mirror the read kernel's structure
-  one-for-one.
-- Two new counter accessors (`rt_graph_test_buffer_write_count`,
-  `rt_graph_test_buffer_invalid_write_count`) on `RTGraph`.
+  one-for-one. Pass-through output is `signal_in[fi]`
+  unconditionally.
 - Add the `regionHasBufferWriter` predicate and consult it in
   `process_schedule_band_serial` — a region with a writer
   never lands in a parallel band (conservative).
 
-Stop point: tag-agreement test passes, no end-to-end tests
-exist yet.
+Slice 2 stays test-green by either keeping the stub coverage
+tests from slice 1 valid (stub asserts the invalid path; real
+kernel still hits the invalid path on unallocated slots), or by
+adding a single end-to-end "write one block, read it back"
+test inline if the stub's tests no longer apply. Goal: never
+intentionally red.
 
 ### Slice 3 — tests
 

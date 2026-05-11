@@ -13,7 +13,8 @@
 --   * 'inputSourceIndex' / 'fusedInputSource' — uniform source-of-
 --     input projections covering 'RFrom' and the three 'FusedInput'
 --     shapes.
---   * 'regionBusPrecedence' — bus-only edge subgraph.
+--   * 'regionBusPrecedence' — bus-only edge subgraph (diagnostics).
+--   * 'regionResourcePrecedence' — bus + buffer union (§6.C.4).
 --   * 'regionStructuralPrecedence' — cross-region port-edge subgraph.
   --   * 'regionDependencies' — the union view consumed by scheduler
   --     planning and metadata generation.
@@ -36,6 +37,7 @@ module MetaSonic.Bridge.Compile.Dependencies
   , fusedInputSource
     -- * Dependency views
   , regionBusPrecedence
+  , regionResourcePrecedence
   , regionStructuralPrecedence
   , regionDependencies
     -- * Barrier predicate (§4.E.1c)
@@ -163,10 +165,15 @@ dependency graph: which regions must execute before which others.
 
 That graph has two independent edge sources:
 
-  * Bus dataflow ('regionBusPrecedence'): A precedes B iff
-    @bfWrites(A) ∩ bfReads(B) ≠ ∅@. Delayed reads do not
-    contribute, matching the intra-graph E_r rule and the
-    inter-template precedence rule.
+  * Resource dataflow ('regionResourcePrecedence', §6.C.4): A
+    precedes B iff A's resource writes intersect B's resource
+    live-reads, on EITHER buses or buffers. Bus and buffer ids
+    live in disjoint namespaces, so the two intersections are
+    checked separately. Delayed reads do not contribute,
+    matching the intra-graph E_r rule and the inter-template
+    precedence rule. ('regionBusPrecedence' is the bus-only
+    sibling — kept for diagnostics that want to see the bus
+    subgraph alone.)
 
   * Structural cross-region ports ('regionStructuralPrecedence'):
     A precedes B iff some node in B has a 'RuntimeInput' whose
@@ -177,8 +184,8 @@ That graph has two independent edge sources:
     region plus a trailing 'RNodeLoop' region containing
     @[Add, Out]@. The trailing region reads the gain's
     materialized output buffer (a port edge), but no bus is
-    involved, so 'regionBusPrecedence' would say there is no
-    edge. Treating bus precedence alone as the dependency graph
+    involved, so 'regionResourcePrecedence' would say there is
+    no edge. Treating resource precedence alone as the dependency graph
     would let a parallel scheduler run the two regions
     concurrently, which is wrong.
 
@@ -248,22 +255,14 @@ regionBusPrecedence rg = M.fromList
       [ rrIndex other
       | other <- regions
       , rrIndex other /= rrIndex r
-        -- §6.C.4 slice 3: union bus + buffer edges. Buffer ids
-        -- live in a disjoint namespace from bus ids, so checking
-        -- the two intersections separately keeps the rule shape
-        -- identical to the pre-§6.C.4 bus-only form. Writer
-        -- kinds for buffers don't exist in v1 — the buffer
-        -- disjunct is always False in current corpora — which
-        -- is what keeps bus-only region precedence bit-identical
-        -- across the §6.C.4 slices.
-      , let aFP = rrFootprint other
-            bFP = rrFootprint r
+        -- Bus-only edges: the name says so and a few diagnostic
+        -- tests rely on that. The bus + buffer union lives in
+        -- 'regionResourcePrecedence' below; 'regionDependencies'
+        -- consumes that one to get full edge coverage.
       , not (S.null
-              (bfWrites (rfBuses aFP) `S.intersection`
-               bfReads  (rfBuses bFP)))
-        || not (S.null
-              (bfBufWrites (rfBuffers aFP) `S.intersection`
-               bfBufReads  (rfBuffers bFP)))
+              (bfWrites (rfBuses (rrFootprint other))
+                `S.intersection`
+               bfReads  (rfBuses (rrFootprint r))))
       ])
   | r <- regions
   ]
@@ -309,16 +308,48 @@ regionStructuralPrecedence rg =
         ]
   in M.fromList [(rrIndex r, depsFor r) | r <- regions]
 
--- | Full region dependency graph: the union of bus-dataflow and
--- structural-port edges. This is the view the scheduler planner
--- (§4.E.2) consumes for any "must precede" decision. See Note [Region
--- dependency contract] for why both edge classes matter, and Note
--- [Region barrier policy] for how a scheduler combines this with
--- 'regionHasLiveBus' to handle dynamic bus controls safely.
+-- | §6.C.4: bus + buffer resource precedence at the region scope.
+-- A precedes B iff A writes some resource (bus or buffer) that B
+-- reads live. Bus and buffer ids live in disjoint namespaces, so
+-- the two intersections are checked separately and never collide.
+--
+-- The bus-only sibling 'regionBusPrecedence' is kept for
+-- diagnostic callers that want to see the bus-edge subgraph alone;
+-- 'regionDependencies' goes through this function so the full
+-- "must precede" view picks up writer kinds as soon as one
+-- lands (today: zero writer kinds, so the buffer half is empty
+-- on every corpus).
+regionResourcePrecedence :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
+regionResourcePrecedence rg = M.fromList
+  [ (rrIndex r, S.fromList
+      [ rrIndex other
+      | other <- regions
+      , rrIndex other /= rrIndex r
+      , let aFP = rrFootprint other
+            bFP = rrFootprint r
+      , not (S.null
+              (bfWrites (rfBuses aFP) `S.intersection`
+               bfReads  (rfBuses bFP)))
+        || not (S.null
+              (bfBufWrites (rfBuffers aFP) `S.intersection`
+               bfBufReads  (rfBuffers bFP)))
+      ])
+  | r <- regions
+  ]
+  where
+    regions = rgRuntimeRegions rg
+
+-- | Full region dependency graph: the union of resource-dataflow
+-- (bus + buffer) and structural-port edges. This is the view the
+-- scheduler planner (§4.E.2) consumes for any "must precede"
+-- decision. See Note [Region dependency contract] for why both
+-- edge classes matter, and Note [Region barrier policy] for how
+-- a scheduler combines this with 'regionHasLiveBus' to handle
+-- dynamic bus controls safely.
 regionDependencies :: RuntimeGraph -> M.Map RegionIndex (S.Set RegionIndex)
 regionDependencies rg =
   M.unionWith S.union
-    (regionBusPrecedence rg)
+    (regionResourcePrecedence rg)
     (regionStructuralPrecedence rg)
 
 {- Note [Region barrier policy]

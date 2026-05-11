@@ -1108,6 +1108,53 @@ unitTests = testGroup "Unit tests"
                      { rfBuffers = emptyBufferFootprint
                          { bfBufWrites = S.singleton 5 } }
           checkNoSharedBufferWriters [tBus, tBuf] @?= Right ()
+
+      -- §6.C.4 extractor pin. The synthetic-footprint tests above
+      -- exercise the precedence rule against hand-built
+      -- ResourceFootprints; this one closes the loop by checking
+      -- that a real playBufMono SynthGraph actually populates
+      -- bfBufReads through the resourceFootprint and the
+      -- runtimeNodeResourceFootprint extractors. Without this pin,
+      -- a future change that breaks the BufRead path in inferEff
+      -- or in the runtime-node extractor would fail silently
+      -- (every precedence test currently uses synthetic footprints).
+
+      , testCase "resourceFootprint: playBufMono populates bfBufReads from inferEff" $ do
+          let g = runSynth $ do
+                s <- playBufMono (Buffer 7) (Param 1.0) (Param 0) (Param 0)
+                out 0 s
+              ir = case lowerGraph g of
+                     Right ir' -> ir'
+                     Left err  -> error err
+              fp = resourceFootprint ir
+          bfBufWrites       (rfBuffers fp) @?= S.empty
+          bfBufReads        (rfBuffers fp) @?= S.singleton 7
+          bfBufDelayedReads (rfBuffers fp) @?= S.empty
+          -- The bus half still records the Out 0 write.
+          bfWrites (rfBuses fp) @?= S.singleton 0
+
+      , testCase "runtimeNodeResourceFootprint: KPlayBufMono carries bfBufReads from controls[0]" $ do
+          -- After compileTemplateGraph, every region's
+          -- rrFootprint should contain the buffer id resolved
+          -- from rnControls[0] on each KPlayBufMono node. This
+          -- proves the post-IR extractor agrees with the
+          -- pre-IR resourceFootprint above.
+          let g = runSynth $ do
+                s <- playBufMono (Buffer 7) (Param 1.0) (Param 0) (Param 0)
+                out 0 s
+          tg <- case compileTemplateGraph [("reader", g)] of
+                  Right t  -> pure t
+                  Left err -> assertFailure err >> error "unreachable"
+          let tpl = head (tgTemplates tg)
+              regions = rgRuntimeRegions (tplGraph tpl)
+              bufReads =
+                S.unions
+                  [ bfBufReads (rfBuffers (rrFootprint r))
+                  | r <- regions ]
+          bufReads @?= S.singleton 7
+          -- And the template-level aggregate sees the same id.
+          bfBufReads (rfBuffers (tplFootprint tpl))
+            @?= S.singleton 7
       ]
 
   , -- Rate propagation: 'inferRate' returns each kind's *floor*; the

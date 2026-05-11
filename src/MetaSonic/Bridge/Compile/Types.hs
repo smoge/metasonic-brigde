@@ -650,8 +650,9 @@ The same shape applies at three nested scopes:
     'GraphIR' (used by 'compileTemplateGraph' to derive the
     inter-template precedence DAG).
   * One region: aggregate over the region's member 'RuntimeNode's
-    (used by 'regionBusPrecedence' / 'regionDependencies' for
-    intra-template region ordering — §4.E.1 / §4.E.1b).
+    (used by 'regionResourcePrecedence' / 'regionDependencies'
+    for intra-template region ordering — §4.E.1 / §4.E.1b — and
+    by the bus-only diagnostic sibling 'regionBusPrecedence').
   * One node: trivially derived from 'rnKind' + 'rnControls[0]'.
 
 Reusing the type at every scope keeps the precedence rule
