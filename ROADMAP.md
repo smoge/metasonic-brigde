@@ -102,9 +102,13 @@ Parked / deferred:
       today. No further §4.E implementation work until a real workload
       demands it.
 
-  - Whole-region kernel codegen. Deferred indefinitely. Hand-written
-      DSP bodies plus narrow helpers (`SinkAccumulator`,
-      `drive_oscillator`) are the working approach.
+  - Whole-region generated fusion. No generated-runtime path is active
+      today. Hand-written DSP bodies plus narrow helpers
+      (`SinkAccumulator`, `drive_oscillator`) remain the working
+      approach for Phase 4-era kernels. Phase 7 reframes general
+      fusion as an evidence-gated compiler backend: cost lab first,
+      then fusion IR / planner / executor only where measurements
+      justify it.
 
   - Filtered/stateful kernel expansion. Gated behind survey
       recurrence + benchmark evidence (§4.B.x). Tri/Pulse/Add filtered
@@ -410,10 +414,12 @@ metadata remains in place and feeds future scheduling decisions; the
 block-rate execution path stays parked until the per-port survey signal
 grows.
 
-What's deferred indefinitely: whole-region kernel codegen.
+What's no longer part of Phase 4: whole-region generated fusion.
 Hand-written DSP bodies plus narrow helpers (`SinkAccumulator`,
-`drive_oscillator`) are the working approach; codegen waits until that
-becomes a real maintenance problem, which it is not today.
+`drive_oscillator`) remain the working approach for the current kernel
+set. Any move from hand-written region kernels to compiler-generated
+fusion now belongs to Phase 7, and starts with measured cost-model
+evidence rather than runtime codegen.
 
 ### [x] 4.A Region formation
 
@@ -421,8 +427,8 @@ becomes a real maintenance problem, which it is not today.
 runtime graph; `RuntimeRegion` carries the dense member list, region
 rate, and inter-region dependency edges. The runtime ships the region
 overlay across the FFI and `process_instance` dispatches on it. Future
-work (§4.E) consumes this overlay; codegen does not (see Phase 4
-introduction).
+work (§4.E) consumes this overlay. Generated fusion does not consume it
+yet; Phase 7 owns that future path.
 
 ### [x] 4.B Q inside region kernels
 
@@ -1476,6 +1482,137 @@ Design / implementation note:
 
 State snapshot at the 6.A–6.D boundary:
 - [Phase 6.A–6.D state snapshot](notes/2026-05-11-state-snapshot-phase-6-complete.md).
+
+---
+
+## Phase 7 — Compiler-Generated Fusion and Cost Model
+
+Phase 7 is the follow-up to Phase 4's fusion substrate. Phase 4 made
+regions real, added hand-written region kernels, proved scalar
+`RFused` chain rewrites, and established the corpus -> survey -> bench
+-> equivalence discipline. Phase 7 asks a different question: when can
+the Haskell compiler generate fused execution programs for arbitrary
+legal regions, and when is doing so measurably worth it?
+
+This phase is deliberately evidence-first. It should not start by
+adding a clever runtime backend. The first slice is tooling that can
+generate graph families, benchmark paired execution variants, prove
+equivalence where possible, and produce a cost model that the future
+fusion planner can consume.
+
+Design notes:
+- [Phase 7 generated-fusion plan](notes/2026-05-11-phase-7-generated-fusion-plan.md)
+  — describes the missing pieces: first-class fusion IR, legality
+  model, profitability model, runtime program ABI, survey diagnostics,
+  and staged generated-executor rollout.
+- [Phase 7.A fusion cost lab design](notes/2026-05-11-phase-7a-fusion-cost-lab-design.md)
+  — scopes the first tool: parametric graph generation, paired
+  benchmarks, equivalence gates, feature extraction, JSONL/CSV output,
+  and explainable cost-model summaries.
+
+### Phase 7.A — Fusion Cost Lab
+
+Build an offline, non-audio measurement tool beside `--fusion-survey`,
+`--worker-bench`, `--swap-bench`, and `--corpus-survey`.
+
+Initial command shape:
+
+```text
+metasonic-bridge --fusion-cost-lab
+```
+
+The tool should combine three inputs:
+
+1. real corpus rows from demos, pattern corpus, and survey ensembles;
+2. parametric generated families such as sink-terminal chains,
+   return tails, fanout near-misses, and block-latched modulation;
+3. random/fuzz graphs for legality and equivalence stress.
+
+For each row it should compile and time paired variants:
+
+- stripped node-loop baseline;
+- normal hand-written region-kernel path;
+- `RFused` path;
+- future generated-fusion path once it exists.
+
+Rows should be machine-readable first (JSONL or CSV), with fields for
+graph features, runtime variant, block size, voice count, node/region
+counts, resource footprint, declared latency, equivalence status,
+counter summary, median ns/sample, spread, and speedup against the
+node-loop baseline.
+
+Goal: produce measured rules such as "sink-terminal 3+ node chains are
+profitable" or "buffer-terminal filter chains are borderline" instead
+of treating fusion as a theoretical optimization.
+
+### Phase 7.B — Fusion Legality and Capability Metadata
+
+Add compiler-visible metadata that classifies each `NodeKind` for
+fusion planning:
+
+- pure sample operation;
+- stateful sample operation;
+- sink terminal;
+- resource reader/writer;
+- latency-bearing node;
+- hard barrier.
+
+The output is not a runtime change. It is the legality vocabulary the
+planner and cost lab share.
+
+### Phase 7.C — FusionProgram IR and Survey-Only Planner
+
+Introduce a first-class Haskell representation for generated fused
+programs. The initial planner should build and pretty-print candidate
+programs, then report why each candidate is accepted or rejected.
+
+No C++ executor is required in this slice. The important output is
+diagnostic: candidate shape, member nodes, effects, latency footprint,
+estimated benefit, and rejection reason.
+
+### Phase 7.D — Runtime Program ABI and Tiny Executor
+
+Only after the cost lab and survey-only planner exist, add a runtime
+program table and a tiny executor for a safe subset:
+
+- scalar read;
+- input read;
+- add;
+- multiply;
+- sink write.
+
+This intentionally overlaps with `RFused`; the overlap gives a
+low-risk equivalence target before stateful source/filter programs are
+attempted.
+
+### Phase 7.E — Generated Equivalents of Current Kernel Shapes
+
+Teach the planner/executor to generate programs equivalent to the
+current hand-written sink-terminal kernel families, then compare all
+three paths:
+
+- stripped node-loop baseline;
+- hand-written region kernel;
+- generated fusion program.
+
+The hand-written kernels stay as references and may remain fast paths
+where they beat the generated executor.
+
+### Phase 7.F — Profitability Gate and Turn-On Decision
+
+Generated fusion should become default behavior only when the planner
+can explain both legality and measured benefit. The decision should be
+driven by the cost lab and real corpus signal, not by the existence of
+a backend.
+
+Possible planner decisions:
+
+- fuse;
+- do not fuse;
+- illegal;
+- needs benchmark data.
+
+Until this gate exists, generated fusion remains opt-in.
 
 ---
 
