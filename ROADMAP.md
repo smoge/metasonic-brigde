@@ -1085,7 +1085,7 @@ slot, and runs the listener until Enter. OSC drops are logged
 to stderr. Same demo graph as the §6.B.3 end-to-end test so
 the CLI exercises the verified path.
 
-### Phase 6.C — Buffer I/O Design Pass
+### Phase 6.C — Buffer I/O (active)
 
 Buffer I/O is where resource identity becomes real: large sample data,
 shared references, mutation / recording, ownership across hot-swap,
@@ -1093,6 +1093,23 @@ allocation rules. Deserves its own design note before any
 implementation. Couples to Phase 6.E (most plugin formats want
 sample-buffer access), so 6.E may force a 6.C revision rather than
 only consume it as-is.
+
+#### 6.C.1 Design note (current task)
+
+Bounds 6.C before any contract or code. v1 surface is a
+producer-allocated `Buffer` resource with an integer ID
+(allocated in `IO` outside `SynthM`), audio-thread-readable
+through a new `KPlayBufMono` kind. Settled choices:
+mono-per-ID, `float32`, fixed-cap pool, linear interpolation,
+two-step allocate + load. `Eff`'s existing `BufRead` /
+`BufWrite` constructors get wired to the new kind via
+`inferEff`. `busFootprint`-driven template precedence remains
+bus-only in v1 — correct for read-only buffers; extending to
+buffers is a 6.C.4 concern, gated on a real `BufWrite` UGen.
+6.C.3 is split into 6.C.3a (read path) and 6.C.3b (live-safe
+retire/free).
+
+Note: [Phase 6.C buffer I/O design](notes/2026-05-10-phase-6c-buffer-io-design.md).
 
 ### Phase 6.D — Spectral Processing
 
