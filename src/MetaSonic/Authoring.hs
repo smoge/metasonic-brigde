@@ -84,9 +84,8 @@ import           MetaSonic.Bridge.Source
 ------------------------------------------------------------
 
 -- | A single-channel audio shape. Wrapping an existing
--- 'Connection' adds no nodes: 'Mono' is purely a phantom-typed
--- handle so authoring helpers know how many channels they are
--- looking at.
+-- 'Connection' adds no nodes: 'Mono' is a typed authoring handle
+-- so helpers know how many channels they are looking at.
 newtype Mono = Mono Connection
   deriving (Eq, Show)
 
@@ -160,7 +159,10 @@ mapChannels f (Channels cs) = Channels <$> mapM f cs
 -- Mismatched channel counts are an error — callers must broadcast
 -- explicitly via 'duplicate' or 'channels' rather than relying on
 -- implicit replication. (See §7.2 of the design note: silent
--- broadcasting can hide mistakes.)
+-- broadcasting can hide mistakes.) 'SynthM' is currently a pure
+-- 'State' builder without a validation/error channel, so this stays
+-- an immediate authoring-time failure until Phase 8 grows a proper
+-- diagnostic surface.
 zipChannelsWith
   :: (Connection -> Connection -> SynthM Connection)
   -> Channels -> Channels -> SynthM Channels
@@ -173,8 +175,9 @@ zipChannelsWith f (Channels xs) (Channels ys)
 -- | Sum a multi-channel shape into a single mono channel. The
 -- summation is a left fold of 'add' calls, emitting (N-1) Add
 -- nodes for N channels. Empty 'Channels' lowers to the literal
--- constant 0.0 — explicit so callers can decide whether to
--- forbid it upstream.
+-- constant 0.0 ('Param 0.0'), not an allocated audio-producing
+-- node. It can still feed lifted helpers because primitive inputs
+-- accept ordinary 'Connection' values.
 sumChannels :: Channels -> SynthM Mono
 sumChannels (Channels []) = pure (Mono (Param 0.0))
 sumChannels (Channels (c0 : rest)) = do

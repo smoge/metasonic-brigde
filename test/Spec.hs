@@ -402,6 +402,24 @@ authoringDslTests =
             pure ()
       length (nodesByKind g KAdd) @?= 0
 
+  , testCase "sumChannels on empty Channels can feed lifted mono helpers" $ do
+      let g = runSynth $ do
+            z <- Auth.sumChannels (Auth.channels [])
+            y <- Auth.gainM z (Param 0.5)
+            Auth.outMono 0 y
+      length (nodesByKind g KAdd) @?= 0
+      length (nodesByKind g KGain) @?= 1
+      case lowerGraph g >>= compileRuntimeGraph of
+        Left err -> assertFailure $
+          "expected empty channel sum to compile through gainM, got: " <> err
+        Right rg -> do
+          length (rgNodes rg) @?= 2
+          case [rnInputs n | n <- rgNodes rg, rnKind n == KGain] of
+            [[RConst 0.0, RConst 0.5]] -> pure ()
+            other -> assertFailure $
+              "expected Gain fed by literal zero and scalar gain, got: "
+              <> show other
+
   , testCase "addS emits two Add nodes (one per channel)" $ do
       let g = runSynth $ do
             la <- sinOsc 440.0 0.0
