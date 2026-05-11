@@ -34,6 +34,7 @@ library
       MetaSonic.Bridge.MidiDemo
       MetaSonic.OSC.Wire
       MetaSonic.OSC.Dispatch
+      MetaSonic.OSC.Dispatch.Internal
       MetaSonic.Pattern
       MetaSonic.Pattern.Corpus
       MetaSonic.Visualize.Trace

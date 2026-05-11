@@ -98,8 +98,9 @@ import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Bridge.Validate
-import qualified MetaSonic.OSC.Dispatch    as OSC
-import qualified MetaSonic.OSC.Wire        as OSC
+import qualified MetaSonic.OSC.Dispatch          as OSC
+import qualified MetaSonic.OSC.Dispatch.Internal as OSCI
+import qualified MetaSonic.OSC.Wire              as OSC
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
 import           MetaSonic.Types
@@ -9415,7 +9416,7 @@ identifierProfileTests = testGroup "OSC-safe identifier profile"
       -- segments before the lookup runs. The registered-but-
       -- unreachable voice is documentation of the design
       -- property, not a separate gate.
-      let rs = OSC.registerVoiceUnchecked
+      let rs = OSCI.registerVoiceUnchecked
                  (OBSC.pack "bad name") 1 (OBSC.pack "fx")
                  (OSC.emptyResolveState (patternTemplates arpeggioSendReturn))
           msg = OSC.OscMessage (OBSC.pack "/bad/lpf/0")
