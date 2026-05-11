@@ -442,6 +442,39 @@ authoringDslTests =
               "expected Gain fed by literal zero and scalar gain, got: "
               <> show other
 
+  , testCase "mixN emits N-1 Add nodes" $ do
+      let g = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sawOsc 220.0 0.0
+            c <- triOsc 330.0 0.0
+            _ <- Auth.mixN [Auth.mono a, Auth.mono b, Auth.mono c]
+            pure ()
+      length (nodesByKind g KAdd) @?= 2
+
+  , testCase "pan2 center lowers to equal-power stereo gains" $ do
+      let g = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            p <- Auth.pan2 (Auth.mono s) 0.0
+            Auth.stereoOut 2 p
+          gainAmounts =
+            [ amount
+            | spec <- nodesByKind g KGain
+            , Gain _ (Param amount) <- [nsUgen spec]
+            ]
+          outBuses =
+            sort
+              [ bus
+              | spec <- nodesByKind g KOut
+              , Out bus _ <- [nsUgen spec]
+              ]
+          center = sqrt 0.5
+      length gainAmounts @?= 2
+      forM_ gainAmounts $ \amount ->
+        assertBool
+          ("expected center pan gain " <> show center <> ", got " <> show amount)
+          (abs (amount - center) < 1e-12)
+      outBuses @?= [2, 3]
+
   , testCase "addS emits two Add nodes (one per channel)" $ do
       let g = runSynth $ do
             la <- sinOsc 440.0 0.0

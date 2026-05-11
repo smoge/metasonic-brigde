@@ -8,7 +8,7 @@
 -- "MetaSonic.Bridge.Source" already provides, and validation / rate
 -- inference / region formation / FFI loading still own correctness.
 --
--- Slice 1 deliberately keeps the surface tiny and explicit:
+-- The authoring surface deliberately stays tiny and explicit:
 --
 --   * Three channel-collection types — 'Mono', 'Stereo', and
 --     'Channels' — that wrap one, two, or many primitive
@@ -22,8 +22,12 @@
 --   * Lifted gain / add / output helpers that expand channel-wise
 --     to the existing primitive builders.
 --
--- Out of slice 1: 'pan2' / 'balance' / 'mixN' / 'send' / 'returnBus'
--- (Phase 8.D), ensemble builders that lower to
+--   * First routing/mix helpers ('mixN', constant equal-power
+--     'pan2', and 'stereoOut') that remain transparent wrappers over
+--     primitive Add/Gain/Out nodes.
+--
+-- Out of the current slice: 'balance' / 'spread' / 'send' /
+-- 'returnBus' (Phase 8.D), ensemble builders that lower to
 -- @[(String, SynthGraph)]@ (Phase 8.E), named-control authoring
 -- objects (Phase 8.F), an inspector that surfaces authoring
 -- metadata alongside the primitive graph (Phase 8.G).
@@ -56,6 +60,8 @@ module MetaSonic.Authoring
   , mapChannels
   , zipChannelsWith
   , sumChannels
+  , mixN
+  , pan2
 
     -- * Lifted UGen primitives
   , gainM
@@ -71,6 +77,7 @@ module MetaSonic.Authoring
     -- * Outputs
   , outMono
   , outStereo
+  , stereoOut
   , outChannels
   ) where
 
@@ -185,6 +192,23 @@ sumChannels (Channels (c0 : rest)) = do
   total <- foldM' go c0 rest
   pure (Mono total)
 
+-- | Mix a list of mono signals down to one mono signal. Empty input
+-- follows 'sumChannels': it lowers to literal 0.0 and emits no Add
+-- node.
+mixN :: [Mono] -> SynthM Mono
+mixN monos =
+  sumChannels (Channels (map monoConnection monos))
+
+-- | Constant equal-power pan from mono to stereo. @pan = -1@ is hard
+-- left, @0@ is center, and @1@ is hard right. Values outside the
+-- range are clamped. This helper emits two ordinary Gain nodes.
+pan2 :: Mono -> Double -> SynthM Stereo
+pan2 (Mono c) pan = do
+  let p = clamp (-1.0) 1.0 pan
+      l = sqrt (0.5 * (1.0 - p))
+      r = sqrt (0.5 * (1.0 + p))
+  Stereo <$> gain c (Param l) <*> gain c (Param r)
+
 -- | Strict left fold in 'SynthM' — local helper, intentionally
 -- not exported.
 foldM' :: Monad m => (a -> b -> m a) -> a -> [b] -> m a
@@ -192,6 +216,9 @@ foldM' _ z []       = pure z
 foldM' f z (x : xs) = do
   z' <- f z x
   foldM' f z' xs
+
+clamp :: Ord a => a -> a -> a -> a
+clamp lo hi = max lo . min hi
 
 ------------------------------------------------------------
 -- Lifted UGen primitives
@@ -250,6 +277,11 @@ outStereo :: Int -> Stereo -> SynthM ()
 outStereo bus (Stereo l r) = do
   out bus       l
   out (bus + 1) r
+
+-- | Alias for 'outStereo' using the noun-first name from the Phase
+-- 8.D routing plan.
+stereoOut :: Int -> Stereo -> SynthM ()
+stereoOut = outStereo
 
 -- | Multi-channel output: channel @i@ lands on @bus + i@. Emits
 -- one 'Out' node per channel in left-to-right order.

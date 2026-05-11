@@ -1788,17 +1788,21 @@ The first implementation should cover only the common musical surface:
 gain, add, LPF/HPF/BPF/Notch, delay where safe, and output routing.
 More exotic nodes can wait until the shape is needed.
 
-### Phase 8.D — Mixing, Panning, and Routing Helpers
+### Phase 8.D — Mixing, Panning, and Routing Helpers (partial)
 
 Add authoring-level operations that remove routine boilerplate:
 
-- `pan2`;
+- `pan2` (landed, constant equal-power pan);
 - `balance`;
-- `mixN`;
+- `mixN` (landed, list-of-mono mixdown);
 - `spread`;
 - `send`;
 - `returnBus`;
-- `stereoOut`.
+- `stereoOut` (landed as the noun-first `outStereo` alias).
+
+The first helper slice also rewrote the `stereo-saw` demo to use
+`pan2`, `addS`, `gainS`, and `stereoOut`, with lowering tests pinning
+the primitive Gain/Add/Out graph shape.
 
 The important design point is bus visibility. Helpers may allocate or
 thread bus identifiers, but the lowered graph must still expose the
