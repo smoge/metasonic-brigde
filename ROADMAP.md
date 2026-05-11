@@ -1073,8 +1073,17 @@ bus-0 peak amplitude changed from ~0.5 to ~0.1. Proves the
 full receive → parse → dispatch → realtime queue → render
 path without external OSC tooling or audio hardware.
 
-The `--osc-listen` CLI subcommand is the next slice (a thin
-`app/MetaSonic/App/Osc.hs` wrapper over `withOscListener`).
+#### [x] 6.B.4 `--osc-listen` CLI wrapper
+
+[app/MetaSonic/App/Osc.hs](app/MetaSonic/App/Osc.hs) exposes
+`runOscListen :: Int -> IO ()` and is wired as
+`--osc-listen [PORT]` (default 7000) in [Main.hs](app/Main.hs).
+Loads a built-in demo graph
+(`SinOsc 440 Hz → tagged "outgain" Gain → Out 0`), starts
+realtime audio, registers voice `v0` against the auto-spawned
+slot, and runs the listener until Enter. OSC drops are logged
+to stderr. Same demo graph as the §6.B.3 end-to-end test so
+the CLI exercises the verified path.
 
 ### Phase 6.C — Buffer I/O Design Pass
 

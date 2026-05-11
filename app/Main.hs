@@ -6,7 +6,7 @@ module Main where
 import           Control.DeepSeq            (force)
 import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
-import           Data.Char                  (toLower)
+import           Data.Char                  (isDigit, toLower)
 import           Data.List                  (find, intercalate)
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
@@ -15,6 +15,7 @@ import           System.Exit                (die)
 
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
 import           MetaSonic.App.Demos
+import           MetaSonic.App.Osc          (runOscListen)
 import           MetaSonic.App.Survey       (printFusionSummary,
                                              runFusionSurvey)
 import           MetaSonic.App.SwapBench    (runSwapBench)
@@ -59,6 +60,13 @@ data RunMode
     -- and prints per-row kernel coverage, corpus-wide totals,
     -- claimed / missed sink shapes, and §4.D edge-rate
     -- opportunity contribution. Targets are ignored.
+  | OscListen
+    -- ^ Phase 6.B.4 audio + OSC mode (--osc-listen [PORT]).
+    -- Loads a built-in demo graph, starts realtime audio, and
+    -- runs MetaSonic.OSC.Listen.withOscListener on the
+    -- configured UDP port. Send /v0/outgain/0 ,f <amount>
+    -- packets to control the output gain in real time. Demo
+    -- targets are ignored.
   deriving (Eq, Show)
 
 data Options = Options
@@ -70,6 +78,8 @@ data Options = Options
     -- produced 'RuntimeGraph'. Default False — Step C is opt-in
     -- in normal demo use until benchmarking warrants flipping the
     -- default. The MIDI-poly demo is unaffected for now.
+  , optOscPort :: Int
+    -- ^ UDP port for --osc-listen. Default 7000.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
@@ -77,6 +87,7 @@ defaultOptions = Options
   { optMode    = AudioOnly
   , optTargets = []
   , optFused   = False
+  , optOscPort = 7000
   }
 
 parseArgs :: [String] -> Either String Options
@@ -102,12 +113,26 @@ parseArgs = go defaultOptions
       go opts { optMode = SwapBench } xs
     go opts ("--corpus-survey" : xs) =
       go opts { optMode = CorpusSurvey } xs
+    go opts ("--osc-listen" : xs) =
+      let (port, rest) = takeOscPort xs
+      in go opts { optMode = OscListen, optOscPort = port } rest
     go opts (x : xs)
       | "--" `prefixOf` x = Left ("Unknown option: " <> x)
       | otherwise         = go opts { optTargets = optTargets opts <> [x] } xs
 
     prefixOf :: String -> String -> Bool
     prefixOf p s = take (length p) s == p
+
+    -- Consume an optional positional integer port after
+    -- --osc-listen. Falls back to the default in optOscPort if
+    -- the next token does not look like a port number.
+    takeOscPort :: [String] -> (Int, [String])
+    takeOscPort (s : rest)
+      | all isDigit s
+      , not (null s)
+      , let n = read s :: Int
+      , n > 0 && n < 65536 = (n, rest)
+    takeOscPort xs = (optOscPort defaultOptions, xs)
 
 resolveTargets :: [String] -> Either String [Demo]
 resolveTargets [] = Right demoTable
@@ -134,6 +159,7 @@ usage prog = unlines
   , "  " <> prog <> " --worker-bench [DEMO ...]"
   , "  " <> prog <> " --swap-bench"
   , "  " <> prog <> " --corpus-survey"
+  , "  " <> prog <> " --osc-listen [PORT]"
   , ""
   , "If no demo names are given, all demos are run."
   , ""
@@ -181,6 +207,16 @@ usage prog = unlines
   , "                   missed sink shapes, and §4.D edge-rate"
   , "                   opportunity contribution. No audio, no TUI;"
   , "                   demo targets are ignored."
+  , "  --osc-listen [PORT]"
+  , "                   Phase 6.B.4 thin wrapper over"
+  , "                   MetaSonic.OSC.Listen.withOscListener. Loads a"
+  , "                   built-in demo graph"
+  , "                   (SinOsc -> tagged \"outgain\" Gain -> Out 0),"
+  , "                   starts realtime audio, and binds a UDP listener"
+  , "                   on PORT (default 7000). Send OSC packets of the"
+  , "                   form /v0/outgain/0 ,f <amount> to control the"
+  , "                   gain. Press Enter to stop. Demo targets are"
+  , "                   ignored."
   , ""
   , "Availavle demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
@@ -249,6 +285,8 @@ main = do
     CorpusSurvey -> do
       putStrLn "Surveying the Phase 6.A pattern corpus for §4 signal."
       runCorpusSurvey
+    OscListen ->
+      runOscListen (optOscPort opts)
     AudioOnly      -> runDemos "Running selected demos."
     InspectThenRun -> runDemos "Inspecting selected demos before audio."
     InspectOnly    -> runDemos "Inspecting selected demos without audio."
@@ -264,7 +302,8 @@ runDemo opts demo
   | optMode opts == FusionSurvey
     || optMode opts == WorkerBench
     || optMode opts == SwapBench
-    || optMode opts == CorpusSurvey =
+    || optMode opts == CorpusSurvey
+    || optMode opts == OscListen =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g

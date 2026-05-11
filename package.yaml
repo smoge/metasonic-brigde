@@ -93,6 +93,7 @@ executables:
     other-modules:
       - MetaSonic.App.CorpusSurvey
       - MetaSonic.App.Demos
+      - MetaSonic.App.Osc
       - MetaSonic.App.Survey
       - MetaSonic.App.SwapBench
       - MetaSonic.App.WorkerBench
