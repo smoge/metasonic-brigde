@@ -79,6 +79,7 @@ module MetaSonic.Bridge.FFI
   , -- * Low-level (re-exported for tests / experimentation)
     c_rt_graph_process
   , c_rt_graph_read_bus
+  , c_rt_graph_clear
   , c_rt_graph_start_audio
   , c_rt_graph_wait_started
   , c_rt_graph_stop_audio

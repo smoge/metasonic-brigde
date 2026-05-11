@@ -61,6 +61,7 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_instance_status,
                                             c_rt_graph_kind_supported,
                                             c_rt_graph_region_kernel_supported,
+                                            c_rt_graph_clear,
                                             c_rt_graph_process,
                                             c_rt_graph_read_bus,
                                             c_rt_graph_template_count,
@@ -9869,9 +9870,10 @@ playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
             sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
 
       withRTGraph totalNodes nframes $ \rt -> do
-        -- loadTemplateGraph internally clears RTGraphState (same as
-        -- bus pool ensure-after-load), so allocate the buffer after
-        -- the template load and before the first process call.
+        -- §6.C.3b: buffer pool is now keyed off the RTGraph handle,
+        -- so alloc-before-loadTemplateGraph also works. The
+        -- ordering here is historical — kept because the
+        -- surrounding test already reads cleaner this way.
         loadTemplateGraph rt tg
         buf <- allocBuffer rt nframes
         loadBuffer rt buf table
@@ -10096,6 +10098,104 @@ playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
         invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
         readCount    @?= fromIntegral (2 * nframes)
         invalidCount @?= 0
+
+  , -- §6.C.3b slice 1: the buffer pool is keyed off the RTGraph
+    -- handle, not RTGraphState, so a c_rt_graph_clear must leave
+    -- the allocated buffers (and the per-handle counters)
+    -- intact. Regression test against a future change that puts
+    -- the pool back on RTGraphState.
+    testCase "buffer pool survives c_rt_graph_clear" $
+      withRTGraph 16 256 $ \rt -> do
+        buf <- allocBuffer rt 8
+        loadBuffer rt buf [1, 2, 3, 4, 5, 6, 7, 8]
+
+        c_rt_graph_clear rt
+
+        -- The allocated slot is still in use, so a fresh alloc
+        -- must return ID 1 (not reuse 0). A pool wipe would
+        -- return ID 0 here.
+        buf2 <- allocBuffer rt 8
+        bufferId buf2 @?= 1
+        -- And the original slot's samples are still loaded; if
+        -- the pool had been wiped, loadBuffer against `buf`
+        -- (ID 0) would now throw BiUnknownBufferId.
+        loadBuffer rt buf [9, 10, 11, 12, 13, 14, 15, 16]
+
+  , -- §6.C.3b slice 1: hot-swap survival. Build a graph that
+    -- references Buffer 0, load + render one block, run a full
+    -- prepare_swap_from_graph + publish_swap + install cycle
+    -- (which moves the old RTGraphState into the retire slot),
+    -- render again with the SAME buffer ID still resolving to
+    -- the SAME samples. A regression that put the pool back on
+    -- RTGraphState would either crash on the second render
+    -- (slot 0 unallocated in the new world) or emit silence
+    -- (invalid-read path).
+    testCase "buffer pool survives prepare_swap / publish_swap" $ do
+      let nframes = 64
+          sizeOfF :: Int
+          sizeOfF = 4
+          fill = replicate nframes (4.25 :: Float)
+          graphRef = runSynth $ do
+            s <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 1.0)
+            out 0 s
+
+      tg <- case compileTemplateGraph [("default", graphRef)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let capacity = templateGraphBuilderCapacity tg + 4
+
+      withRTGraph capacity nframes $ \rt -> do
+        buf <- allocBuffer rt nframes
+        bufferId buf @?= 0
+        loadBuffer rt buf fill
+
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+
+        let readBlock = allocaBytes (nframes * sizeOfF) $ \bp -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bp)
+              rendered <- peekArray nframes (bp :: PtrCFloat)
+              pure (map (\(CFloat x) -> x) rendered)
+
+        block1 <- readBlock
+        assertBool
+          ("pre-swap block should render the fill (4.25); got "
+           <> show (take 4 block1))
+          (all (\x -> abs (x - 4.25) < 1.0e-5) block1)
+
+        -- Run a full swap cycle through the public Haskell helper:
+        -- prepare from the same template (the buffer reference
+        -- carries across as a normal control[0] = 0 setup), publish,
+        -- and let process_graph install on the next block.
+        published <- hotSwapTemplateGraph rt capacity nframes tg
+        published @?= True
+        c_rt_graph_process rt (fromIntegral nframes)
+        gen <- c_rt_graph_test_swap_generation rt
+        gen @?= 1
+
+        -- Render once more — the new world's PlayBufMono kernel
+        -- should resolve buffer 0 and read the SAME samples.
+        block2 <- readBlock
+        assertBool
+          ("post-swap block must still render the fill (4.25) — "
+           <> "buffer pool was retired with old RTGraphState; got "
+           <> show (take 4 block2))
+          (all (\x -> abs (x - 4.25) < 1.0e-5) block2)
+
+        -- Counter-confirm: two blocks × nframes valid reads
+        -- accumulate across the swap. The new RTGraphState gets a
+        -- fresh playhead (instance reset on install), but the
+        -- handle-scoped counters do NOT reset — the same way the
+        -- buffer pool itself does not reset.
+        readCount    <- c_rt_graph_test_buffer_read_count         rt
+        invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
+        readCount    @?= fromIntegral (2 * nframes)
+        invalidCount @?= 0
+
+        _ <- collectRetiredSwapStats rt
+        pure ()
   ]
 
 -- | Test helper: render `nframes` of a `playBufMono` graph over a

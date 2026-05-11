@@ -2202,16 +2202,12 @@ struct RTGraphState {
   std::vector<RegionLayerWorkItem> region_layer_work_items;
   std::vector<GlobalScheduleBand> global_schedule_bands;
 
-  // Phase §6.C.3a: mono buffer pool + per-block read counters. The
-  // pool is producer-allocated through rt_graph_buffer_alloc /
-  // _load_f32 / _clear; the kernel reads through `samples.data()`
-  // unconditionally. The two counters are diagnostic-only
-  // (rt_graph_test_buffer_read_count /
-  // rt_graph_test_buffer_invalid_read_count) — they tick per sample,
-  // so they're long long to leave headroom for multi-block tests.
-  std::array<BufferSlot, kMaxBuffers> buffers{};
-  long long buffer_read_count = 0;
-  long long buffer_invalid_read_count = 0;
+  // Phase §6.C.3b: the buffer pool + per-block read counters used
+  // to live here, but a producer-published rt_graph_publish_swap
+  // moves the old RTGraphState into the retire slot wholesale, so
+  // anything that should "survive graph replacement" cannot live
+  // on the world. They now live on RTGraph alongside `audio`,
+  // `control_queue`, and the other handle-owned resources.
 };
 
 enum class MigrationSkipReason : int {
@@ -2367,6 +2363,26 @@ struct RTGraph {
   std::atomic<RTGraphSwap *> retired_swap{nullptr};
   std::atomic<bool> swap_in_flight{false};
   std::atomic<int> swap_generation_observed{0};
+
+  // Phase §6.C.3b: handle-owned buffer pool + per-block read
+  // counters. Previously these lived on RTGraphState, but a
+  // rt_graph_publish_swap moves the old state into the retire slot
+  // wholesale, which would silently invalidate every buffer ID a
+  // producer allocated before the swap. The pool is keyed off the
+  // RTGraph handle so it survives prepare_swap / publish_swap. The
+  // kernel reaches them through `g.buffers[...]` instead of
+  // `world(g).buffers[...]`.
+  //
+  // The two counters are diagnostic-only
+  // (rt_graph_test_buffer_read_count /
+  // rt_graph_test_buffer_invalid_read_count) — they tick per
+  // sample, so they're long long to leave headroom for multi-block
+  // tests. Reset cadence is handle-lifetime: a rt_graph_clear no
+  // longer resets them (intentional — the pool also survives
+  // clear, so the counters surviving matches).
+  std::array<BufferSlot, kMaxBuffers> buffers{};
+  long long buffer_read_count = 0;
+  long long buffer_invalid_read_count = 0;
 };
 
 namespace {
@@ -4403,8 +4419,14 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
 
 /* Note [Buffer pool]
 ~~~~~~~~~~~~~~~~~~~~~
-Phase §6.C.3a. The runtime carries a fixed-size pool of mono float32
-buffers on RTGraphState (`buffers`, sized kMaxBuffers = 64). The
+Phase §6.C.3a / 3b. The runtime carries a fixed-size pool of mono
+float32 buffers on the RTGraph handle (`buffers`, sized
+kMaxBuffers = 64). The pool moved out of RTGraphState in §6.C.3b
+because a rt_graph_publish_swap moves the old RTGraphState into
+the retire slot wholesale — making buffer IDs swap-scoped would
+silently invalidate every buffer a producer allocated before the
+swap. Keying off the handle means buffers survive
+prepare_swap / publish_swap as well as rt_graph_clear. The
 producer mutates the pool through three C entry points:
 
   * rt_graph_buffer_alloc      — find an unused slot, size its
@@ -4459,7 +4481,7 @@ static void process_play_buf_mono(
   assert(st && "PlayBufMono node has non-PlayBufMono state");
   if (!st) {
     std::fill(out.begin(), out.end(), 0.0f);
-    world(g).buffer_invalid_read_count +=
+    g.buffer_invalid_read_count +=
         static_cast<long long>(nframes);
     return;
   }
@@ -4479,7 +4501,7 @@ static void process_play_buf_mono(
   const BufferSlot *slot = nullptr;
   if (bid_in_range) {
     const auto &candidate =
-        world(g).buffers[static_cast<std::size_t>(bid)];
+        g.buffers[static_cast<std::size_t>(bid)];
     if (candidate.allocated && !candidate.samples.empty()) {
       slot = &candidate;
     }
@@ -4487,7 +4509,7 @@ static void process_play_buf_mono(
 
   if (slot == nullptr) {
     std::fill(out.begin(), out.end(), 0.0f);
-    world(g).buffer_invalid_read_count +=
+    g.buffer_invalid_read_count +=
         static_cast<long long>(nframes);
     return;
   }
@@ -4564,8 +4586,8 @@ static void process_play_buf_mono(
   }
 
   st->playhead_pos = pos;
-  world(g).buffer_read_count         += valid_samples;
-  world(g).buffer_invalid_read_count += invalid_samples;
+  g.buffer_read_count         += valid_samples;
+  g.buffer_invalid_read_count += invalid_samples;
 }
 
 /* Note [Execution order]
@@ -8750,7 +8772,7 @@ int rt_graph_kind_supported(int node_kind) {
 int rt_graph_buffer_alloc(RTGraph *g, int frames) {
   if (g == nullptr) return -1;
   if (frames < 0) return -1;
-  auto &buffers = world(*g).buffers;
+  auto &buffers = g->buffers;
   for (int id = 0; id < static_cast<int>(buffers.size()); ++id) {
     auto &slot = buffers[static_cast<std::size_t>(id)];
     if (slot.allocated) continue;
@@ -8768,7 +8790,7 @@ int rt_graph_buffer_load_f32(
   if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
   if (frame_count < 0) return -1;
   if (frame_count > 0 && samples == nullptr) return -1;
-  auto &slot = world(*g).buffers[static_cast<std::size_t>(buffer_id)];
+  auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
   if (!slot.allocated) return -1;
   if (static_cast<std::size_t>(frame_count) > slot.samples.size()) {
     return -2;
@@ -8786,7 +8808,7 @@ int rt_graph_buffer_load_f32(
 int rt_graph_buffer_clear(RTGraph *g, int buffer_id) {
   if (g == nullptr) return -1;
   if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
-  auto &slot = world(*g).buffers[static_cast<std::size_t>(buffer_id)];
+  auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
   if (!slot.allocated) return -1;
   slot.allocated = false;
   // Sample storage capacity is intentionally preserved so a
@@ -8799,12 +8821,12 @@ int rt_graph_buffer_clear(RTGraph *g, int buffer_id) {
 
 long long rt_graph_test_buffer_read_count(const RTGraph *g) {
   if (g == nullptr) return 0;
-  return world(*g).buffer_read_count;
+  return g->buffer_read_count;
 }
 
 long long rt_graph_test_buffer_invalid_read_count(const RTGraph *g) {
   if (g == nullptr) return 0;
-  return world(*g).buffer_invalid_read_count;
+  return g->buffer_invalid_read_count;
 }
 
 // Set one control slot on instance 0. Mutates the *instance*, not
