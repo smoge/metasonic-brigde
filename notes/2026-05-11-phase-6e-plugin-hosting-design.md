@@ -47,7 +47,12 @@ buffer pool.
 ### In scope (this design)
 
 - **One new `NodeKind`: `KStaticPlugin`.** Tag `23` (one past
-  `KSpectralFreeze = 22`).
+  `KSpectralFreeze = 22`). The first implementation is deliberately
+  fixed to the `Identity` reference profile: two audio inputs, one
+  audio output, one frozen host metadata control (`plugin_id`), zero
+  plugin parameters, zero declared latency, and `[Pure]` effects.
+  This avoids pretending the current kind-level compiler metadata can
+  already express per-plugin arity / latency / resource effects.
 - **Static-library plugin shim, not LV2 / VST / CLAP.** A
   plugin in 6.E is a C struct linked into the runtime at
   build time: a vtable of audio-callback function pointers
@@ -57,10 +62,10 @@ buffer pool.
   hosting contract* without committing to any specific
   third-party plugin API.
 - **DSL builder**
-  `staticPlugin :: PluginRef -> [Connection] -> SynthM Connection`
-  — a registered plugin reference plus an audio-input list.
-  Returns a single audio output connection. Multi-output
-  plugins are deferred to a later kind.
+  `staticPlugin :: PluginRef -> Connection -> Connection -> SynthM Connection`
+  — a registered plugin reference plus exactly two audio inputs.
+  Returns a single audio output connection. Multi-output and
+  variable-arity plugins are deferred to a later metadata design.
 - **One reference plugin: `Identity`.** A two-input / one-
   output adder shipped in `tinysynth/plugins/identity.cpp`
   whose body is literally `out[i] = in0[i] + in1[i]`. Its
@@ -69,14 +74,14 @@ buffer pool.
   configure, init, process, teardown) without any DSP value
   of its own. The first non-trivial plugin is a separate
   follow-up.
-- `inferEff (StaticPlugin _ _) = [Pure]`. A v1 static plugin
-  declares no shared resource interaction. Plugins that read
-  or write buses / buffers are a follow-up that lifts that
-  declaration to a per-instance effect (see §3).
-- Compile-time rejection of unregistered plugin refs (a
-  graph that names a plugin not present in the host's
-  registry fails compilation, the same way an unwired audio
-  input does).
+- `inferEff (StaticPlugin _ _ _) = [Pure]`. The fixed v1 static
+  plugin declares no shared resource interaction. Plugins that read
+  or write buses / buffers are a later node-specific metadata design
+  (see §3), not a hidden extension of this first kind.
+- Rejection of unregistered plugin refs happens through a pure
+  Haskell catalog for the fixed v1 set. The runtime registry still
+  has a C ABI lookup, but the compiler does not call C FFI while
+  building `TemplateGraph`.
 
 ### Out of scope (do **not** open in this design)
 
@@ -99,10 +104,11 @@ buffer pool.
 - **Plugin-owned UI / GUI.** Plugins are headless. A
   `tinysynth-ui` series is independent and parked until the
   resource and threading contracts are settled.
-- **Per-instance plugin parameters via OSC.** Plugins
-  expose parameters via `controls[]` exactly like every
-  other kind. The §6.B OSC dispatch surface already covers
-  control updates; no new ABI is needed.
+- **Per-instance plugin parameters via OSC.** The fixed `Identity`
+  slice has no plugin parameters; `controls[0]` is reserved for the
+  frozen `plugin_id`. Later plugin-specific parameters can use normal
+  control slots and the §6.B OSC dispatch surface, but that requires a
+  separate parameter-layout decision.
 - **Custom error vocabulary.** Plugins return `int` status
   codes: 0 = OK, non-zero = abort the kernel (emit silence
   for the rest of the block, increment an
@@ -113,11 +119,9 @@ buffer pool.
   routing MIDI to a plugin needs the MIDI-in surface 6.E
   doesn't decide.
 - **Audio-rate parameter modulation across the plugin
-  boundary.** Plugin parameters in v1 are read once per
-  block via a `set_parameter(int param_id, double value)`
-  callback at the *start* of `process`. Sample-accurate
-  parameter automation is a follow-up that needs a different
-  callback shape.
+  boundary.** There are no plugin parameters in the fixed `Identity`
+  slice. Block-rate and sample-accurate parameter automation are both
+  follow-ups that need an explicit callback/control-layout shape.
 
 ## 2. The real questions hosting introduces
 
@@ -159,11 +163,10 @@ struct PluginSpec {
   int         state_size_bytes;
   int         audio_in_count;
   int         audio_out_count;   // v1: always 1
-  int         control_count;     // host-managed parameter slots
+  int         latency_samples;   // v1 Identity: 0
 
   // Lifecycle callbacks. All non-realtime except 'process'.
   void (*init)(void *state, int sample_rate, int max_frames);
-  void (*set_parameter)(void *state, int param_id, double value);
   void (*reset)(void *state);
 
   // Audio callback. Realtime, non-blocking. Returns 0 on
@@ -172,8 +175,7 @@ struct PluginSpec {
   int  (*process)(void *state,
                   int nframes,
                   const float * const *inputs,   // audio_in_count
-                  float       * const *outputs,  // audio_out_count
-                  const double *parameters);     // control_count
+                  float       * const *outputs); // audio_out_count
 };
 ```
 
@@ -182,8 +184,7 @@ mechanically in v1):
 
 - `process` is realtime, non-blocking, allocation-free, no
   syscalls, no I/O.
-- `init` / `set_parameter` / `reset` are called from the
-  producer thread.
+- `init` / `reset` are called from the producer thread.
 - `state` is per-instance; the host zero-initializes it
   before the first `init` call.
 - `process` may not call back into the host (no synchronous
@@ -205,7 +206,8 @@ adds two read-only entries:
 `KStaticPlugin` carries a `plugin_id` control slot
 (`controls[0]`, frozen at instance reset — same §6.C.2
 contract as `PlayBufMono.buffer_id`) so the audio thread
-never resolves names.
+never resolves names. That slot is host metadata, not a plugin
+parameter.
 
 The Haskell side ships a `PluginRef` newtype:
 
@@ -213,10 +215,11 @@ The Haskell side ships a `PluginRef` newtype:
 newtype PluginRef = PluginRef { pluginName :: String }
 ```
 
-`compileTemplateGraph` resolves it once via
-`c_rt_graph_plugin_find` during loading; an unknown name
-fails compile with the same diagnostic shape as a missing
-buffer.
+The Haskell side resolves it through a small pure catalog for the
+fixed v1 set. An unknown name fails before FFI loading with the same
+diagnostic posture as other invalid source shapes. The C ABI lookup
+exists to cross-check the runtime registry and to support later
+runtime-facing tools; it is not called by pure compile functions.
 
 ### 2.4 Threading and lifecycle
 
@@ -231,12 +234,13 @@ buffer.
   callback. The host loops over the plugin's audio inputs,
   passes them as `const float * const *inputs`, and the
   plugin writes into `outputs[0]` for the block.
-- **Parameter updates** (producer thread or audio thread
-  via the §A.2 realtime control queue):
-  `set_parameter` is called between blocks. The audio
-  thread never calls `set_parameter` synchronously;
-  parameter mutations go through the existing realtime
-  queue that already routes `c_rt_graph_realtime_set_control`.
+- **Parameter updates**:
+  none in the fixed `Identity` slice. Later parameter-bearing
+  plugins must choose whether parameters are read directly from
+  `controls[]` in `process`, or whether a callback such as
+  `set_parameter` is required. The existing realtime control queue is
+  drained on the audio thread, so any callback invoked from that path
+  must be explicitly RT-safe.
 - **Tear-down** (producer thread): plugin state is
   destroyed implicitly when the instance is freed.
   Plugins do not own resources that outlive the instance
@@ -246,11 +250,11 @@ buffer.
 ### 2.5 Latency contract
 
 Plugins that buffer samples (e.g., a future FFT plugin)
-must advertise their pipeline latency. `PluginSpec` gains
-an optional `int latency_samples` field; non-zero values
-are surfaced via `kindLatency`-equivalent host-side
-metadata so the §6.D latency footprint includes them. The
-reference `Identity` plugin reports zero.
+must advertise their pipeline latency, but the current compiler
+surface is kind-level: `kindLatency :: NodeKind -> Maybe Int`.
+The fixed `KStaticPlugin` / `Identity` kind therefore reports no
+inherent latency. Per-plugin latency is a follow-up that requires a
+node-specific metadata path rather than another `kindLatency` row.
 
 Skew reporting (`inputLatencySkews`) already handles
 multi-input nodes; plugins inherit it without extra work.
@@ -261,37 +265,37 @@ multi-input nodes; plugins inherit it without extra work.
 shared-resource reads or writes. The same lever the §6.D
 spectral kind used to keep the resource model unchanged.
 
-Plugins that *do* read or write buses / buffers in a future
-series declare the effects per-instance via a new
-`PluginSpec.declared_effects` field that the host translates
-to `Eff` annotations at compile time. The host enforces:
+Plugins that *do* read or write buses / buffers in a future series
+need a node-specific effect metadata path. The existing effect and
+writer predicates are currently kind-level or constructor-field-level:
+`inferEff` sees a `UGen`, while `isBufferWriterKind` sees only a
+`NodeKind`. A single variable-behavior `KStaticPlugin` cannot safely
+claim "sometimes `BufWrite`" through those APIs without a real metadata
+extension.
 
-- A plugin that declares `BufWrite n` inherits the §6.C.5
-  single-writer-single-instance contract automatically (the
-  existing polyphony clamp keys on `kindLatency`-style
-  predicates; extend `isBufferWriterKind` to recognize the
-  plugin kind).
-- A plugin that declares `BusWrite` / `BusRead` participates
-  in the §4.E live-bus barrier rule unchanged.
-- A plugin that declares neither stays `[Pure]`.
+The v1 `Identity` plugin therefore pins only the pure path:
 
-This is the contract surface the v1 design pins. The
-implementation of the per-instance effect declaration lands
-in a follow-up; the v1 `Identity` plugin proves the
-plumbing without exercising it.
+- `inferEff (StaticPlugin _ _ _) = [Pure]`.
+- No bus or buffer precedence edges are introduced.
+- Plugin regions are normal `FreeSegment` candidates, not `Barrier`s.
+
+Future resource-declaring plugins must first add explicit per-node
+metadata to `ResourceFootprint` / region formation, then inherit the
+§6.C.4 / §6.C.5 rules through that metadata. That follow-up is not part
+of the first implementation slice.
 
 ## 4. Why this kind first
 
 `Identity` is the smallest reference plugin that:
 
-- Exercises the full protocol (register, find, init,
-  set_parameter, reset, process).
+- Exercises the fixed v1 protocol (register, find, init, reset,
+  process).
 - Has a non-trivial signature (two inputs, one output)
   that catches single-port mis-wiring.
 - Has a trivially testable kernel: `out[i] = in0[i] +
   in1[i]` — easy to assert bit-exactly.
-- Reports `latency_samples = 0`, exercising the
-  zero-latency path of the latency surface.
+- Reports `latency_samples = 0`, matching the fixed kind-level
+  zero-latency path.
 
 The first useful plugin (probably a simple
 delay-with-feedback or a soft-clipper) is a separate
@@ -306,20 +310,21 @@ Same checklist as every other new kind:
 | # | File                                | Edit                                                                  |
 |---|-------------------------------------|-----------------------------------------------------------------------|
 | 1 | `Types.hs`                          | `KStaticPlugin` constructor on `NodeKind`                             |
-| 2 | `Types.hs`                          | `kindSpec` row: `KindSpec 23 SampleRate 2 1 "staticPlugin"` (the `Identity` arity; later plugin kinds vary) |
-| 3 | `Bridge/Source.hs`                  | `UGen` constructor `StaticPlugin !PluginRef ![Connection]`            |
-| 4 | `Bridge/Source.hs`                  | `ugenView` row produced per-plugin from the registered `PluginSpec`'s arities |
-| 5 | `Bridge/Source.hs`                  | builder `staticPlugin :: PluginRef -> [Connection] -> SynthM Connection` |
-| 6 | `Bridge/Source.hs`                  | `inferEff (StaticPlugin ref _) = pluginEffects ref` (today: `[Pure]` for `Identity`; future-proofed for declared effects) |
-| 7 | `Types.hs` (`portInfo`)             | port info derived from the resolved `PluginSpec`'s `audio_in_count`, all `PortSampleAccurate` in v1 |
+| 2 | `Types.hs`                          | `kindSpec` row: `KindSpec 23 SampleRate 2 1 "staticPlugin"` (`controls[0] = plugin_id`) |
+| 3 | `Bridge/Source.hs`                  | `PluginRef` plus `UGen` constructor `StaticPlugin !PluginRef !Connection !Connection` |
+| 4 | `Bridge/Source.hs`                  | fixed `ugenView` row: two audio inputs, one frozen plugin-id control |
+| 5 | `Bridge/Source.hs`                  | builder `staticPlugin :: PluginRef -> Connection -> Connection -> SynthM Connection` |
+| 6 | `Bridge/Source.hs`                  | `inferEff (StaticPlugin _ _ _) = [Pure]` |
+| 7 | `Types.hs` (`portInfo`)             | fixed two sample-accurate audio input ports |
 
 C++ side (`tinysynth/rt_graph.cpp` + new
 `tinysynth/rt_graph_plugins.{cpp,h}` + plugin TUs):
 
 - `NodeKind::StaticPlugin = 23`, `kind_from_tag` row.
 - `StaticPluginState` on the `NodeState` variant.
-- `configure_spec` row pulls arities from the `PluginSpec`
-  registry; `init_node_state` calls the plugin's `init`.
+- `configure_spec` uses the fixed Identity-shape arity from
+  `KindSpec`; `init_node_state` freezes `controls[0]` as `plugin_id`
+  and calls the plugin's `init`.
 - `process_static_plugin` in `rt_graph.cpp` dispatches via
   the registry: looks up `PluginSpec` by `plugin_id`,
   resolves audio inputs, calls `process`. On non-zero return
@@ -349,7 +354,7 @@ Test group `staticPluginSkeletonTests`:
 1. `inferEff produces Pure for Identity`.
 2. `kindSpec / portInfo agree with the registered Identity
    spec` — tag 23, audio arity 2, control arity 1, label
-   `staticPlugin`.
+   `staticPlugin`; the single control is frozen `plugin_id`.
 3. `staticPlugin compiles + dispatches a single block` —
    build a graph with `Identity` summing two `Param` sources,
    render one block, assert output equals sum.
@@ -363,15 +368,11 @@ Test group `staticPluginSkeletonTests`:
 7. `Identity bit-exact against a hand-rolled Haskell sum` —
    pick a deterministic input pattern, render, compare to
    `zipWith (+)`.
-8. `set_parameter is honored between blocks` — render once
-   with `gain = 1.0`, then `c_rt_graph_realtime_set_control`
-   to bump gain to 2.0, render again, assert the output
-   doubled.
-9. `latency_samples is surfaced via the latency footprint` —
-   register a plugin with `latency_samples = 64`,
-   `declaredLatencyFootprint` reports it. (Reference
-   `Identity` reports zero; this test uses a second stub
-   plugin.)
+8. `plugin_id is frozen at instance reset` — a live write to
+   control slot 0 does not retarget the instance to a different
+   plugin id.
+9. `Identity does not appear in declaredLatencyFootprint` —
+   the fixed v1 plugin kind has zero inherent latency.
 10. `plugin region is not a Barrier by default` — plugins
     inherit normal scheduling unless they declare bus/buffer
     effects. The schedule classifies a v1 `[Pure]` plugin
@@ -391,7 +392,9 @@ no-intentionally-red-CI rule.
 - `PluginSpec` struct, `register_plugin`, registry array,
   `rt_graph_plugin_count` / `_find` C ABI.
 - `KStaticPlugin` (tag 23) in `NodeKind` / `kindSpec`,
-  `PluginRef` newtype, `StaticPlugin` UGen + builder.
+  `PluginRef` newtype, `StaticPlugin` UGen + builder. Fixed
+  Identity-shape only: two inputs, one output, `controls[0] =
+  plugin_id`, no plugin parameters.
 - C++ skeleton `process_static_plugin` that emits silence
   and ticks no counters; `StaticPluginState` on the variant.
 - Slice-1 tests: registry lookup, kindSpec shape, kind
@@ -406,17 +409,18 @@ no-intentionally-red-CI rule.
 - `plugin_call_count` / `invalid_plugin_call_count`
   counters + accessors.
 - Slice-2 tests: Identity bit-exact, counter math,
-  set_parameter, invalid-return silence.
+  invalid-return silence, frozen plugin-id behavior.
 
-### Slice 3 — Latency surface + ResourceFootprint hook
+### Slice 3 — Parked metadata follow-up note / hook decision
 
-- `PluginSpec.latency_samples` plumbed into the latency
-  footprint (no compensation, exactly like §6.D).
-- Stub for `PluginSpec.declared_effects` on the C side
-  (descriptive only in v1).
-- Slice-3 tests: latency surfacing, Barrier classification
-  follows declared effects (zero today, but the predicate
-  hook is in place).
+- Record the next metadata decision after the fixed Identity host is
+  working: whether per-plugin latency/effects/arity become a
+  node-specific Haskell metadata table, separate plugin-specific
+  `NodeKind`s, or a larger `RuntimeNode` extension.
+- No variable latency/effects plumbing lands in the fixed Identity
+  series.
+- Slice-3 tests: Identity does not appear in the declared-latency
+  footprint, and its region is not a `Barrier`.
 
 After slice 3: `Identity` is shipped, the contract is
 exercised, and the next plugin (probably a real
@@ -433,13 +437,14 @@ delay-with-feedback) becomes mechanical to add.
 - **Multichannel plugins.** Single output per kind in v1;
   multichannel needs the same multi-output decision §6.C
   deferred.
-- **Plugin-owned shared resources.** Plugins declare effects
-  via the `ResourceFootprint` axis they already inherit;
-  no new resource type in 6.E.
+- **Plugin-owned shared resources.** The fixed `Identity` slice
+  declares `[Pure]`. Resource-declaring plugins need a later
+  node-specific metadata path before they can participate in
+  `ResourceFootprint`.
 - **MIDI-in plugins.** §6.B MIDI dispatch is a separate
   surface.
-- **Sample-accurate parameter modulation across the plugin
-  boundary.** Block-rate only in v1.
+- **Plugin parameter modulation across the plugin boundary.** No
+  plugin parameters in the fixed `Identity` slice.
 
 ## 9. Open questions / Q-deferrals
 
@@ -452,14 +457,13 @@ plus a host-side allocation pool sized once at registration.
 v1 picks the simple constant; the constant grows if a real
 plugin needs more.
 
-Q-2. **`set_parameter` semantics around hot-swap.** If a
-producer hot-swaps the graph while plugin parameters are in
-flight, the new instance gets the spec's default
-parameters. Migration is *not* supported in v1
-(`node_kind_supports_state_migration KStaticPlugin = false`,
-same as `KSpectralFreeze`). Adding migration requires per-
-plugin opt-in via `PluginSpec.supports_state_migration` and
-a `migrate_state` callback.
+Q-2. **Plugin parameter semantics around hot-swap.** The fixed
+`Identity` slice has no plugin parameters. A later parameter-bearing
+plugin needs an explicit rule for defaults, queued writes during
+hot-swap, and migration. Migration is *not* supported in v1
+(`node_kind_supports_state_migration KStaticPlugin = false`, same as
+`KSpectralFreeze`). Adding migration requires per-plugin opt-in via
+`PluginSpec.supports_state_migration` and a `migrate_state` callback.
 
 Q-3. **Plugin errors as scheduler signals.** v1 treats a
 non-zero `process` return as "emit silence for the block."
@@ -467,17 +471,17 @@ It does *not* deactivate the instance. If a use case asks
 for "fail-then-release," the host adds a separate kill-on-N-
 errors policy.
 
-Q-4. **Audio-rate parameter modulation.** Some plugins
-benefit from sample-accurate parameter input (filter cutoff,
-envelope amount). The v1 `set_parameter` block-rate path
-covers the common case; sample-accurate modulation adds a
-parallel `audio_in[]` array of parameter signals that the
-plugin reads per-sample. Defer until a real plugin asks.
+Q-4. **Parameter layout and modulation.** Some plugins benefit from
+block-rate or sample-accurate parameter input (filter cutoff,
+envelope amount). The fixed `Identity` slice has no parameter slots.
+A later parameter-bearing plugin must decide whether parameters are
+ordinary `controls[]`, audio inputs, or a separate callback surface.
+Defer until a real plugin asks.
 
-Q-5. **Plugin ordering across templates.** A `[Pure]`
-plugin has no inter-template ordering edges. A plugin that
-declares bus/buffer effects inherits the §6.C.4 union
-unchanged. Same precedence rules; no new machinery.
+Q-5. **Plugin ordering across templates.** A `[Pure]` plugin has no
+inter-template ordering edges. A plugin that declares bus/buffer
+effects first needs the node-specific metadata path described in §3;
+only then can it inherit the §6.C.4 union.
 
 Q-6. **Stability of plugin names across builds.** Plugin
 names are the only string identifier the runtime accepts.
@@ -497,8 +501,8 @@ After slice 3 (~10 new Haskell tests):
   (`rt_graph_plugin_count` / `_find`) plus the two counter
   accessors. No new producer-side entry points for plugin
   registration (it's static / build-time).
-- DSL surface added: `PluginRef` newtype, `staticPlugin`
-  builder.
+- DSL surface added: `PluginRef` newtype, fixed-arity `staticPlugin`
+  builder for the Identity profile.
 
 The plumbing this design pins is the host-side contract.
 The first useful plugin lands in a follow-up; the second

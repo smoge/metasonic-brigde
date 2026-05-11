@@ -1462,18 +1462,16 @@ Coupling to 6.C is real (sample-buffer access) and may force 6.C and
 
 Design note (no runtime code yet):
 - [Phase 6.E plugin-hosting design](notes/2026-05-11-phase-6e-plugin-hosting-design.md)
-  — bounds the first kind (`KStaticPlugin`, tag 23; build-time
-  registry, no LV2/VST/CLAP, no dynamic loading), pins plugin
-  state ownership on the existing `NodeState` variant, declares
-  block-rate parameter updates via the existing realtime control
-  queue, and inherits §6.C.5 / §6.D / `ResourceFootprint`
-  contracts unchanged for `[Pure]` plugins. Latency surfaces
-  through the existing §6.D footprint; effects-declaring plugins
-  re-use the §6.C.4 / §6.C.5 buffer-writer rules. Slicing: plugin
-  registry + skeleton → `Identity` reference plugin → latency +
-  effects hook. Six Q-deferrals (max-state size, hot-swap
-  migration, error-as-scheduler-signal, audio-rate parameter
-  modulation, cross-template ordering, name stability).
+  — bounds the first kind (`KStaticPlugin`, tag 23) as a fixed
+  `Identity`-profile static shim: two audio inputs, one audio output,
+  one frozen `plugin_id` metadata control, zero plugin parameters,
+  zero declared latency, and `[Pure]` effects. It deliberately does
+  not claim per-plugin arity / latency / resource effects on the
+  current kind-level metadata model. Slicing: plugin registry +
+  skeleton → real `Identity` reference plugin + counters → parked
+  metadata follow-up decision. Q-deferrals cover max-state size,
+  hot-swap migration, error-as-scheduler-signal, parameter layout /
+  modulation, cross-template ordering, and name stability.
 
 State snapshot at the 6.A–6.D boundary:
 - [Phase 6.A–6.D state snapshot](notes/2026-05-11-state-snapshot-phase-6-complete.md).

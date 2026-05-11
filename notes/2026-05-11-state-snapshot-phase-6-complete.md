@@ -56,10 +56,11 @@ walks, including `spectral-freeze-pad` and the §6.B OSC patterns.
 ### 6.B — OSC (closed)
 
 `MetaSonic.OSC.{Wire, Dispatch, Listen}` covers the wire format,
-inbound dispatch, and a UDP listener; smoke-test demos are wired
-through `--external-midi` / `--external-osc` (commit `7f949e0`).
-Full end-to-end tests at every layer (`oscWireAndDispatchTests`,
-`oscListenerTests`, `oscEndToEndTests`).
+inbound dispatch, and a UDP listener. External-control smoke helpers
+are wired through `--osc-listen`, `--midi-list`, `--midi-device`,
+`midi-poly`, and the matching `just` recipes (commit `7f949e0`).
+Full end-to-end tests cover the OSC path at every layer
+(`oscWireAndDispatchTests`, `oscListenerTests`, `oscEndToEndTests`).
 
 ### 6.C — Buffer I/O (closed through §6.C.5 follow-up)
 
