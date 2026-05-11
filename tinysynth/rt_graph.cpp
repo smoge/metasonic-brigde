@@ -10,6 +10,7 @@
 // them in compile-decreed template order every block.
 
 #include "rt_graph.h"
+
 #include "rt_graph_plugins.h"
 
 #include <q/fft/fft.hpp>
@@ -103,8 +104,7 @@ default), so a non-finite spike never aliases into a different
 musical meaning than "no parameter writeable here right now."
 */
 
-template <typename T>
-static inline T sanitize_finite(T v, T fallback) noexcept {
+template <typename T> static inline T sanitize_finite(T v, T fallback) noexcept {
   return std::isfinite(v) ? v : fallback;
 }
 
@@ -114,19 +114,19 @@ static inline T sanitize_finite_clamp(T v, T lo, T hi, T fallback) noexcept {
 }
 
 // Domain bounds. Centralized so a future policy change touches one place.
-constexpr double kFreqFallbackHz   = 440.0;
-constexpr double kQMin             = 0.05;
-constexpr double kQMax             = 100.0;
-constexpr double kQFallback        = 0.707;
-constexpr double kEnvTimeMin       = 0.0001;   // 0.1 ms
-constexpr double kEnvTimeMax       = 60.0;     // 1 minute
-constexpr double kEnvTimeFallback  = 0.01;     // 10 ms
-constexpr double kEnvSustainMin    = 0.0;
-constexpr double kEnvSustainMax    = 1.0;
+constexpr double kFreqFallbackHz = 440.0;
+constexpr double kQMin = 0.05;
+constexpr double kQMax = 100.0;
+constexpr double kQFallback = 0.707;
+constexpr double kEnvTimeMin = 0.0001;    // 0.1 ms
+constexpr double kEnvTimeMax = 60.0;      // 1 minute
+constexpr double kEnvTimeFallback = 0.01; // 10 ms
+constexpr double kEnvSustainMin = 0.0;
+constexpr double kEnvSustainMax = 1.0;
 constexpr double kEnvSustainFallback = 0.0;
-constexpr double kDelayTimeMin     = 0.0;      // 0 = read freshly-pushed sample
-constexpr double kDelayMaxTimeMin  = 0.0001;   // ring buffer needs >=1 sample
-constexpr double kDelayMaxTimeMax  = 60.0;
+constexpr double kDelayTimeMin = 0.0;       // 0 = read freshly-pushed sample
+constexpr double kDelayMaxTimeMin = 0.0001; // ring buffer needs >=1 sample
+constexpr double kDelayMaxTimeMax = 60.0;
 constexpr double kDelayMaxFallback = 0.2;
 
 // §2.E: release-then-free silence detection.
@@ -140,7 +140,7 @@ constexpr double kDelayMaxFallback = 0.2;
 // envelope tails after the released level reaches the threshold.
 // See Note [§2.E: release-then-free instance lifecycle].
 constexpr float kReleaseSilenceThreshold = 1e-4f;
-constexpr int   kReleaseSilenceBlocks    = 8;
+constexpr int kReleaseSilenceBlocks = 8;
 
 // Lifecycle state of a pool slot. After A.1 the instance pool is a
 // std::vector<GraphInstance> of caller-declared size, not a vector of
@@ -183,10 +183,10 @@ constexpr int   kReleaseSilenceBlocks    = 8;
 // See Note [§2.E: release-then-free instance lifecycle], Note [Pool
 // model], and Note [A.2: realtime control queue].
 enum class SlotState : int {
-  Available = -1,  // free; reusable by any spawn path
-  Active    = 0,   // running, gate-on / sustaining (was Live)
-  Releasing = 1,   // release requested, awaiting silence
-  Reserved  = 2,   // CAS-claimed by producer; preparation in progress, audio thread skips
+  Available = -1, // free; reusable by any spawn path
+  Active = 0,     // running, gate-on / sustaining (was Live)
+  Releasing = 1,  // release requested, awaiting silence
+  Reserved = 2,   // CAS-claimed by producer; preparation in progress, audio thread skips
 };
 
 // Wrapper that exposes a SlotState surface but stores the underlying
@@ -227,17 +227,18 @@ struct AtomicSlotState {
   // compare_exchange_strong) directly, which uses release ordering by
   // default and makes the synchronization point visible at the call
   // site rather than hidden inside an assignment.
-  explicit AtomicSlotState(SlotState s) noexcept
-      : value(static_cast<int>(s)) {}
+  explicit AtomicSlotState(SlotState s) noexcept : value(static_cast<int>(s)) {}
 
   AtomicSlotState(const AtomicSlotState &o) noexcept {
-    value.store(static_cast<int>(o.load(std::memory_order_relaxed)),
-                std::memory_order_relaxed);
+    value.store(
+        static_cast<int>(o.load(std::memory_order_relaxed)), std::memory_order_relaxed
+    );
   }
 
   AtomicSlotState(AtomicSlotState &&o) noexcept {
-    value.store(static_cast<int>(o.load(std::memory_order_relaxed)),
-                std::memory_order_relaxed);
+    value.store(
+        static_cast<int>(o.load(std::memory_order_relaxed)), std::memory_order_relaxed
+    );
   }
 
   AtomicSlotState &operator=(const AtomicSlotState &o) noexcept {
@@ -258,13 +259,18 @@ struct AtomicSlotState {
     value.store(static_cast<int>(s), order);
   }
 
-  bool compare_exchange_strong(SlotState &expected, SlotState desired,
-                                std::memory_order success_order,
-                                std::memory_order failure_order) noexcept {
+  bool compare_exchange_strong(
+      SlotState &expected,
+      SlotState desired,
+      std::memory_order success_order,
+      std::memory_order failure_order
+  ) noexcept {
     int expected_int = static_cast<int>(expected);
     const bool ok = value.compare_exchange_strong(
-        expected_int, static_cast<int>(desired), success_order, failure_order);
-    if (!ok) expected = static_cast<SlotState>(expected_int);
+        expected_int, static_cast<int>(desired), success_order, failure_order
+    );
+    if (!ok)
+      expected = static_cast<SlotState>(expected_int);
     return ok;
   }
 };
@@ -373,25 +379,25 @@ NodeKind must align with the integer tags emitted by the compiler.
 */
 
 enum class NodeKind : int {
-  SinOsc       = 1,
-  Out          = 2,
-  Gain         = 3,
-  SawOsc       = 5,
-  NoiseGen     = 6,
-  LPF          = 7,
-  Add          = 8,
-  Env          = 9,
-  BusOut       = 10,
-  BusIn        = 11,
+  SinOsc = 1,
+  Out = 2,
+  Gain = 3,
+  SawOsc = 5,
+  NoiseGen = 6,
+  LPF = 7,
+  Add = 8,
+  Env = 9,
+  BusOut = 10,
+  BusIn = 11,
   BusInDelayed = 12,
-  Delay        = 13,
-  Smooth       = 14,
-  PulseOsc     = 15,
-  TriOsc       = 16,
-  HPF          = 17,
-  BPF          = 18,
-  Notch        = 19,
-  PlayBufMono  = 20,
+  Delay = 13,
+  Smooth = 14,
+  PulseOsc = 15,
+  TriOsc = 16,
+  HPF = 17,
+  BPF = 18,
+  Notch = 19,
+  PlayBufMono = 20,
   RecordBufMono = 21,
   SpectralFreeze = 22,
   StaticPlugin = 23,
@@ -413,32 +419,54 @@ enum class NodeKind : int {
 // Both rt_graph_add_node and rt_graph_kind_supported go through this,
 // so the C ABI's "is this tag known" answer cannot drift from the
 // dispatch table.
-[[nodiscard]] constexpr std::optional<NodeKind>
-kind_from_tag(int node_kind) noexcept {
+[[nodiscard]] constexpr std::optional<NodeKind> kind_from_tag(int node_kind) noexcept {
   switch (node_kind) {
-  case 1:  return NodeKind::SinOsc;
-  case 2:  return NodeKind::Out;
-  case 3:  return NodeKind::Gain;
-  case 5:  return NodeKind::SawOsc;
-  case 6:  return NodeKind::NoiseGen;
-  case 7:  return NodeKind::LPF;
-  case 8:  return NodeKind::Add;
-  case 9:  return NodeKind::Env;
-  case 10: return NodeKind::BusOut;
-  case 11: return NodeKind::BusIn;
-  case 12: return NodeKind::BusInDelayed;
-  case 13: return NodeKind::Delay;
-  case 14: return NodeKind::Smooth;
-  case 15: return NodeKind::PulseOsc;
-  case 16: return NodeKind::TriOsc;
-  case 17: return NodeKind::HPF;
-  case 18: return NodeKind::BPF;
-  case 19: return NodeKind::Notch;
-  case 20: return NodeKind::PlayBufMono;
-  case 21: return NodeKind::RecordBufMono;
-  case 22: return NodeKind::SpectralFreeze;
-  case 23: return NodeKind::StaticPlugin;
-  default: return std::nullopt;
+  case 1:
+    return NodeKind::SinOsc;
+  case 2:
+    return NodeKind::Out;
+  case 3:
+    return NodeKind::Gain;
+  case 5:
+    return NodeKind::SawOsc;
+  case 6:
+    return NodeKind::NoiseGen;
+  case 7:
+    return NodeKind::LPF;
+  case 8:
+    return NodeKind::Add;
+  case 9:
+    return NodeKind::Env;
+  case 10:
+    return NodeKind::BusOut;
+  case 11:
+    return NodeKind::BusIn;
+  case 12:
+    return NodeKind::BusInDelayed;
+  case 13:
+    return NodeKind::Delay;
+  case 14:
+    return NodeKind::Smooth;
+  case 15:
+    return NodeKind::PulseOsc;
+  case 16:
+    return NodeKind::TriOsc;
+  case 17:
+    return NodeKind::HPF;
+  case 18:
+    return NodeKind::BPF;
+  case 19:
+    return NodeKind::Notch;
+  case 20:
+    return NodeKind::PlayBufMono;
+  case 21:
+    return NodeKind::RecordBufMono;
+  case 22:
+    return NodeKind::SpectralFreeze;
+  case 23:
+    return NodeKind::StaticPlugin;
+  default:
+    return std::nullopt;
   }
 }
 
@@ -534,8 +562,8 @@ struct OscState {
 // memoization; -1.0 forces reconfigure on the first sample.
 struct PulseOscState {
   q::phase_iterator phase_iter;
-  q::pulse_osc      osc{0.5f};
-  double            last_width = -1.0;
+  q::pulse_osc osc{0.5f};
+  double last_width = -1.0;
 };
 
 struct NoiseGenState {
@@ -637,7 +665,7 @@ belongs to.
 struct DelayState {
   std::optional<q::delay> line;
   double last_max_time = -1.0;
-  float  last_sps      = -1.0f;
+  float last_sps = -1.0f;
 };
 
 /* Note [Per-node smooth state]
@@ -656,7 +684,7 @@ let the smoother track normally.
 struct SmoothState {
   std::optional<q::dynamic_smoother> smoother;
   double last_base_freq = -1.0;
-  float  last_sps       = -1.0f;
+  float last_sps = -1.0f;
 };
 
 /* Note [Per-node PlayBufMono state]
@@ -695,7 +723,7 @@ template precedence in §6.C.3a (read-only).
 constexpr int kMaxBuffers = 64;
 
 struct PlayBufMonoState {
-  int    buffer_id    = -1;
+  int buffer_id = -1;
   double playhead_pos = 0.0;
 };
 
@@ -721,7 +749,7 @@ otherwise the kernel stops writing past the end and takes the
 invalid-write path (samples vector contents stay intact).
 */
 struct RecordBufMonoState {
-  int       buffer_id  = -1;
+  int buffer_id = -1;
   long long write_head = 0;
 };
 
@@ -815,20 +843,20 @@ initialized before main(), so the audio thread never pays
 the table-build cost.
 */
 struct SpectralFreezeState {
-  static constexpr int kN        = 1024;
-  static constexpr int kHop      = 256;
-  static constexpr int kOverlaps = kN / kHop;   // 4
+  static constexpr int kN = 1024;
+  static constexpr int kHop = 256;
+  static constexpr int kOverlaps = kN / kHop; // 4
 
   // Pre-zeroed at configure_node; reset never reallocates.
-  std::array<float, kN>               input_ring{};
-  std::array<float, kN + kHop>        output_ring{};
-  std::array<float, 2 * kN>           spectrum_work{};   // FFT scratch
+  std::array<float, kN> input_ring{};
+  std::array<float, kN + kHop> output_ring{};
+  std::array<float, 2 * kN> spectrum_work{};             // FFT scratch
   std::array<float, 2 * (kN / 2 + 1)> frozen_spectrum{}; // last analysis hop
-  int       input_write_head = 0;
-  int       output_read_head = 0;
-  long long samples_in       = 0;  // monotonic; hop boundaries at samples_in % kHop == 0
-  long long samples_out      = 0;
-  bool      frozen_valid     = false;
+  int input_write_head = 0;
+  int output_read_head = 0;
+  long long samples_in = 0; // monotonic; hop boundaries at samples_in % kHop == 0
+  long long samples_out = 0;
+  bool frozen_valid = false;
 };
 
 struct StaticPluginState {
@@ -838,12 +866,22 @@ struct StaticPluginState {
 
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
-using NodeState =
-    std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState,
-                 DelayState, SmoothState, PulseOscState,
-                 HPFState, BPFState, NotchState,
-                 PlayBufMonoState, RecordBufMonoState,
-                 SpectralFreezeState, StaticPluginState>;
+using NodeState = std::variant<
+    std::monostate,
+    OscState,
+    NoiseGenState,
+    LPFState,
+    EnvState,
+    DelayState,
+    SmoothState,
+    PulseOscState,
+    HPFState,
+    BPFState,
+    NotchState,
+    PlayBufMonoState,
+    RecordBufMonoState,
+    SpectralFreezeState,
+    StaticPluginState>;
 
 constexpr int kMigrationKeyMaxBytes = 16;
 
@@ -851,26 +889,25 @@ struct MigrationKey {
   std::array<char, kMigrationKeyMaxBytes> bytes{};
   int length = 0;
 
-  [[nodiscard]] bool present() const noexcept {
-    return length > 0;
-  }
+  [[nodiscard]] bool present() const noexcept { return length > 0; }
 };
 
 [[nodiscard]] static bool
 migration_key_equals(const MigrationKey &a, const MigrationKey &b) noexcept {
-  if (a.length != b.length) return false;
-  if (a.length <= 0) return false;
-  return std::memcmp(a.bytes.data(), b.bytes.data(),
-                     static_cast<std::size_t>(a.length)) == 0;
+  if (a.length != b.length)
+    return false;
+  if (a.length <= 0)
+    return false;
+  return std::memcmp(
+             a.bytes.data(), b.bytes.data(), static_cast<std::size_t>(a.length)
+         ) == 0;
 }
 
 [[nodiscard]] static bool
-migration_key_equals_raw(
-    const MigrationKey &a, const char *key, int key_len
-) noexcept {
-  if (!key || key_len <= 0 || a.length != key_len) return false;
-  return std::memcmp(a.bytes.data(), key,
-                     static_cast<std::size_t>(key_len)) == 0;
+migration_key_equals_raw(const MigrationKey &a, const char *key, int key_len) noexcept {
+  if (!key || key_len <= 0 || a.length != key_len)
+    return false;
+  return std::memcmp(a.bytes.data(), key, static_cast<std::size_t>(key_len)) == 0;
 }
 
 /* Note [Spec/state split: NodeSpec vs NodeInstanceState]
@@ -1022,29 +1059,29 @@ template_id is stable.
 // 'RegionKernel' data constructors; integer values are part of
 // the C ABI and pinned by 'rt_graph_region_kernel_supported'.
 enum class RegionKernel : int {
-  NodeLoop        = 0,  // dispatch each member node individually
-  SawLpfGain      = 1,  // fused per-sample SawOsc -> LPF -> Gain
-                        // (buffer-terminal: gain output materialized)
-  SinGainOut      = 2,  // fused per-sample SinOsc -> Gain -> Out
-                        // (sink-terminal: bus accumulate + sink-peak)
-  SawLpfGainOut   = 3,  // fused per-sample SawOsc -> LPF -> Gain -> Out
-                        // (4-node sink-terminal)
-  SawGainOut      = 4,  // fused per-sample SawOsc -> Gain -> Out
-                        // (3-node sink-terminal; SinGainOut counterpart)
-  NoiseGainOut    = 5,  // fused per-sample NoiseGen -> Gain -> Out
-                        // (3-node sink-terminal; PRNG-state class —
-                        //  no freq port, no phase iterator)
-  BusInLpfGainOut = 6,  // fused per-sample BusIn -> LPF -> Gain -> Out
-                        // (4-node sink-terminal; first non-oscillator
-                        //  producer kernel — reads output_buses[busin_bus]
-                        //  inline instead of stepping a phase iterator)
-  NoiseLpfGainOut = 7   // fused per-sample NoiseGen -> LPF -> Gain -> Out
-                        // (4-node sink-terminal; noise counterpart of
-                        //  SawLpfGainOut — pulls samples from a
-                        //  q::white_noise_gen PRNG instead of a phase
-                        //  iterator. PRNG-cadence parity with the
-                        //  per-node baseline pinned by
-                        //  fusedEquivalenceCases.)
+  NodeLoop = 0,        // dispatch each member node individually
+  SawLpfGain = 1,      // fused per-sample SawOsc -> LPF -> Gain
+                       // (buffer-terminal: gain output materialized)
+  SinGainOut = 2,      // fused per-sample SinOsc -> Gain -> Out
+                       // (sink-terminal: bus accumulate + sink-peak)
+  SawLpfGainOut = 3,   // fused per-sample SawOsc -> LPF -> Gain -> Out
+                       // (4-node sink-terminal)
+  SawGainOut = 4,      // fused per-sample SawOsc -> Gain -> Out
+                       // (3-node sink-terminal; SinGainOut counterpart)
+  NoiseGainOut = 5,    // fused per-sample NoiseGen -> Gain -> Out
+                       // (3-node sink-terminal; PRNG-state class —
+                       //  no freq port, no phase iterator)
+  BusInLpfGainOut = 6, // fused per-sample BusIn -> LPF -> Gain -> Out
+                       // (4-node sink-terminal; first non-oscillator
+                       //  producer kernel — reads output_buses[busin_bus]
+                       //  inline instead of stepping a phase iterator)
+  NoiseLpfGainOut = 7  // fused per-sample NoiseGen -> LPF -> Gain -> Out
+                       // (4-node sink-terminal; noise counterpart of
+                       //  SawLpfGainOut — pulls samples from a
+                       //  q::white_noise_gen PRNG instead of a phase
+                       //  iterator. PRNG-cadence parity with the
+                       //  per-node baseline pinned by
+                       //  fusedEquivalenceCases.)
 };
 
 // Validate an int from the C ABI. Returns nullopt on an unknown
@@ -1054,15 +1091,24 @@ enum class RegionKernel : int {
 [[nodiscard]] static std::optional<RegionKernel>
 region_kernel_from_tag(int kind) noexcept {
   switch (kind) {
-  case 0: return RegionKernel::NodeLoop;
-  case 1: return RegionKernel::SawLpfGain;
-  case 2: return RegionKernel::SinGainOut;
-  case 3: return RegionKernel::SawLpfGainOut;
-  case 4: return RegionKernel::SawGainOut;
-  case 5: return RegionKernel::NoiseGainOut;
-  case 6: return RegionKernel::BusInLpfGainOut;
-  case 7: return RegionKernel::NoiseLpfGainOut;
-  default: return std::nullopt;
+  case 0:
+    return RegionKernel::NodeLoop;
+  case 1:
+    return RegionKernel::SawLpfGain;
+  case 2:
+    return RegionKernel::SinGainOut;
+  case 3:
+    return RegionKernel::SawLpfGainOut;
+  case 4:
+    return RegionKernel::SawGainOut;
+  case 5:
+    return RegionKernel::NoiseGainOut;
+  case 6:
+    return RegionKernel::BusInLpfGainOut;
+  case 7:
+    return RegionKernel::NoiseLpfGainOut;
+  default:
+    return std::nullopt;
   }
 }
 
@@ -1091,7 +1137,7 @@ region_kernel_from_tag(int kind) noexcept {
 // a stale or misshapen registration silently degrades rather than
 // silencing the region.
 struct RegionSpec {
-  int rate       = 0;
+  int rate = 0;
   int first_node = 0;
   int node_count = 0;
   RegionKernel kernel = RegionKernel::NodeLoop;
@@ -1162,9 +1208,9 @@ struct ScheduleStepSpec {
 // schedule registration is construction-only), the build
 // reflects current metadata rather than a snapshot.
 struct GlobalScheduleEntry {
-  int template_id   = 0;
+  int template_id = 0;
   int instance_slot = 0;
-  int step_index    = 0;
+  int step_index = 0;
   int first_writer_slot = 0;
   int writer_slot_count = 0;
   // Phase §4.E.2.C1d-b: contiguous slice of RTGraph::region_layer_work_items
@@ -1174,8 +1220,8 @@ struct GlobalScheduleEntry {
   // schedule_step_regions. -1 / 0 when the entry produced no items
   // (malformed / out-of-range step metadata) and the C1d-b path falls
   // back to a no-op for that entry.
-  int first_work_item   = -1;
-  int work_item_count   = 0;
+  int first_work_item = -1;
+  int work_item_count = 0;
 };
 
 // Phase §4.E.2.C1d: descriptive work item for a single scheduled
@@ -1401,7 +1447,7 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
   case NodeKind::Env:
     // [gate_default, attack_s, decay_s, sustain_lin, release_s]
     spec.default_controls = {0.0, 0.01, 0.05, 0.5, 0.1};
-    spec.input_refs.resize(1);            // [gate_in]
+    spec.input_refs.resize(1); // [gate_in]
     break;
 
   case NodeKind::BusOut:
@@ -1431,8 +1477,8 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     // audio inputs: [signal, delay_time]. One output (configured at
     // init_node_state time). State is the q::delay instance,
     // allocated lazily once we know the active sample rate.
-    spec.default_controls = {0.2, 0.0};   // [max_time_s, delay_time_s]
-    spec.input_refs.resize(2);            // [signal_in, time_in]
+    spec.default_controls = {0.2, 0.0}; // [max_time_s, delay_time_s]
+    spec.input_refs.resize(2);          // [signal_in, time_in]
     break;
 
   case NodeKind::Smooth:
@@ -1442,8 +1488,8 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     // when the audio input is unconnected. One audio input
     // (signal_in) and one output. State is allocated lazily on
     // first process() so we can hand it the active sample rate.
-    spec.default_controls = {20.0, 0.0};  // [base_freq_hz, target_default]
-    spec.input_refs.resize(1);            // [signal_in]
+    spec.default_controls = {20.0, 0.0}; // [base_freq_hz, target_default]
+    spec.input_refs.resize(1);           // [signal_in]
     break;
 
   case NodeKind::PulseOsc:
@@ -1454,7 +1500,7 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     // kernel reads it at the first sample after a reset and then
     // ignores port 1 for the rest of the block.
     spec.default_controls = {0.0, 0.0, 0.5};
-    spec.input_refs.resize(3);            // [freq_in, phase_in, width_in]
+    spec.input_refs.resize(3); // [freq_in, phase_in, width_in]
     break;
 
   case NodeKind::TriOsc:
@@ -1470,7 +1516,7 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     // Biquad family — same I/O shape as LPF: 3 audio inputs
     // [signal, cutoff, q]; 2 controls [cutoff_default, q_default].
     spec.default_controls = {1000.0, 0.707};
-    spec.input_refs.resize(3);            // [signal_in, freq_in, q_in]
+    spec.input_refs.resize(3); // [signal_in, freq_in, q_in]
     break;
 
   case NodeKind::PlayBufMono:
@@ -1544,7 +1590,8 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
 //   * node.state: a single variant assignment per kind. Each state
 //     struct's default constructor is non-allocating (lazy-constructed
 //     q kernels live behind std::optional).
-static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int max_frames) {
+static void
+init_node_state(NodeInstanceState &node, const NodeSpec &spec, int max_frames) {
   std::size_t target_outputs = 0;
 
   switch (spec.kind) {
@@ -1618,9 +1665,9 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
         bid = static_cast<int>(bid_l);
       }
     }
-    double start =
-        spec.default_controls.size() > 2 ? spec.default_controls[2] : 0.0;
-    if (!std::isfinite(start) || start < 0.0) start = 0.0;
+    double start = spec.default_controls.size() > 2 ? spec.default_controls[2] : 0.0;
+    if (!std::isfinite(start) || start < 0.0)
+      start = 0.0;
     target_outputs = 1;
     node.state = PlayBufMonoState{bid, start};
     break;
@@ -1837,17 +1884,17 @@ static_assert(
 
 struct ControlCommand {
   enum class Kind : int {
-    Activate   = 0,
-    Release    = 1,
-    Remove     = 2,
+    Activate = 0,
+    Release = 1,
+    Remove = 2,
     SetControl = 3,
   };
-  Kind   kind        = Kind::Activate;
-  int    slot_id     = -1;
+  Kind kind = Kind::Activate;
+  int slot_id = -1;
   // SetControl only — left unused for the other kinds.
-  int    node_idx    = 0;
-  int    control_idx = 0;
-  double value       = 0.0;
+  int node_idx = 0;
+  int control_idx = 0;
+  double value = 0.0;
 };
 
 struct ControlQueue {
@@ -2161,8 +2208,8 @@ naturally.
 */
 struct ContributionStorage {
   int max_writer_slots = 0;
-  std::vector<float>    samples;     // size = max_writer_slots * max_frames
-  std::vector<int>      target;      // size = max_writer_slots, default -1
+  std::vector<float> samples;            // size = max_writer_slots * max_frames
+  std::vector<int> target;               // size = max_writer_slots, default -1
   std::vector<std::uint64_t> used_words; // size = ceil_div(max_writer_slots, 64)
 
   // Grow-only. Sizes the three parallel vectors for at least
@@ -2171,7 +2218,8 @@ struct ContributionStorage {
   // the high-water mark holds so a slot reserved earlier in the
   // block (under a higher cap) cannot land out-of-range later.
   void resize_for(int slot_count, int max_frames) {
-    if (slot_count <= max_writer_slots) return;
+    if (slot_count <= max_writer_slots)
+      return;
     const std::size_t s = static_cast<std::size_t>(slot_count);
     const std::size_t f = static_cast<std::size_t>(max_frames);
     samples.resize(s * f, 0.0f);
@@ -2239,9 +2287,7 @@ struct ScheduleWorkerPool {
   std::atomic<void *> current_work_user{nullptr};
   std::vector<std::thread> workers;
 
-  ~ScheduleWorkerPool() {
-    stop_workers();
-  }
+  ~ScheduleWorkerPool() { stop_workers(); }
 
   ScheduleWorkerPool() = default;
   ScheduleWorkerPool(const ScheduleWorkerPool &) = delete;
@@ -2258,8 +2304,7 @@ struct ScheduleWorkerPool {
     for (int i = 0; i < next_background_workers; ++i) {
       workers.emplace_back([this, i]() noexcept { worker_loop(i + 1); });
     }
-    background_workers.store(
-        next_background_workers, std::memory_order_release);
+    background_workers.store(next_background_workers, std::memory_order_release);
   }
 
   void stop_workers() noexcept {
@@ -2294,7 +2339,8 @@ struct ScheduleWorkerPool {
   // on the current band's background lanes because later bands may read
   // state produced by this band.
   void run_parallel(WorkFn fn, void *user) noexcept {
-    if (!fn) return;
+    if (!fn)
+      return;
 
     const int active_background_workers =
         background_workers.load(std::memory_order_acquire);
@@ -2313,8 +2359,8 @@ struct ScheduleWorkerPool {
     }
 
     int join_spins = 0;
-    while (completed_workers.load(std::memory_order_acquire)
-           < active_background_workers) {
+    while (completed_workers.load(std::memory_order_acquire) <
+           active_background_workers) {
       audio_join_pause(join_spins);
       join_spins = std::min(join_spins + 1, 4096);
     }
@@ -2409,8 +2455,8 @@ private:
 // boundary since the retire).
 enum class BufferSlotState : int {
   Unallocated = 0,
-  Allocated   = 1,
-  Retired     = 2,
+  Allocated = 1,
+  Retired = 2,
 };
 
 // Phase §6.C.3a/b: mono float32 buffer pool slot. Each slot carries
@@ -2660,6 +2706,22 @@ struct RTGraph {
   long long spectral_analysis_count = 0;
   long long spectral_resynthesis_count = 0;
 
+  // Phase §6.E slice 2: static-plugin dispatch counters.
+  // Same handle-lifetime contract as the buffer / spectral
+  // counters. plugin_call_count ticks once per process_static_plugin
+  // dispatch that resolves to a registered plugin (i.e. one tick
+  // per audio-thread call into spec->process, regardless of return).
+  // invalid_plugin_call_count ticks once per dispatch where the
+  // plugin's process callback returned non-zero, signalling the
+  // host to emit silence for the rest of the block. A skeleton
+  // call (unresolved plugin_id, missing spec, or null process
+  // callback) emits silence without ticking either counter, on
+  // the assumption that an unresolved plugin is a graph-build
+  // error caught earlier on the Haskell side and never reached
+  // in well-formed graphs.
+  long long plugin_call_count = 0;
+  long long invalid_plugin_call_count = 0;
+
   // Phase §6.C.3b slice 2: monotonic block counter the audio
   // thread ticks at the top of every process_graph call.
   // rt_graph_buffer_retire snapshots this value at retire time;
@@ -2688,10 +2750,10 @@ namespace {
   return s == SlotState::Active || s == SlotState::Releasing;
 }
 
-[[nodiscard]] static int find_node_by_migration_key(
-    const MetaDef &def, const MigrationKey &key
-) noexcept {
-  if (!key.present()) return -1;
+[[nodiscard]] static int
+find_node_by_migration_key(const MetaDef &def, const MigrationKey &key) noexcept {
+  if (!key.present())
+    return -1;
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
     if (migration_key_equals(def.nodes[i].migration_key, key)) {
       return static_cast<int>(i);
@@ -2701,16 +2763,12 @@ namespace {
 }
 
 static void record_migration_skip(
-    RTGraphSwap &swap,
-    MigrationSkipReason reason,
-    int template_id,
-    int node_index
+    RTGraphSwap &swap, MigrationSkipReason reason, int template_id, int node_index
 ) {
   swap.migration_skips.push_back(MigrationSkip{reason, template_id, node_index});
 }
 
-[[nodiscard]] static bool
-node_kind_supports_state_migration(NodeKind kind) noexcept {
+[[nodiscard]] static bool node_kind_supports_state_migration(NodeKind kind) noexcept {
   switch (kind) {
   case NodeKind::Env:
   case NodeKind::Delay:
@@ -2765,22 +2823,19 @@ node_kind_supports_state_migration(NodeKind kind) noexcept {
   return false;
 }
 
-static void build_migration_plan(
-    const RTGraphState &old_state,
-    RTGraphSwap &swap
-) {
+static void build_migration_plan(const RTGraphState &old_state, RTGraphSwap &swap) {
   swap.migration_copies.clear();
   swap.migration_skips.clear();
   swap.migration_instance_copy_count = 0;
   swap.migration_state_copy_count = 0;
   swap.migration_lifecycle_copy_count = 0;
-  if (!swap.state) return;
+  if (!swap.state)
+    return;
 
   const RTGraphState &new_state = *swap.state;
   for (std::size_t tid = 0; tid < new_state.defs.size(); ++tid) {
     const MetaDef &new_def = new_state.defs[tid];
-    const MetaDef *old_def =
-        tid < old_state.defs.size() ? &old_state.defs[tid] : nullptr;
+    const MetaDef *old_def = tid < old_state.defs.size() ? &old_state.defs[tid] : nullptr;
 
     for (std::size_t ni = 0; ni < new_def.nodes.size(); ++ni) {
       const NodeSpec &new_spec = new_def.nodes[ni];
@@ -2789,13 +2844,15 @@ static void build_migration_plan(
 
       if (!new_spec.migration_key.present()) {
         record_migration_skip(
-            swap, MigrationSkipReason::MissingTag, template_id, node_index);
+            swap, MigrationSkipReason::MissingTag, template_id, node_index
+        );
         continue;
       }
 
       if (!old_def) {
         record_migration_skip(
-            swap, MigrationSkipReason::KeyNotFound, template_id, node_index);
+            swap, MigrationSkipReason::KeyNotFound, template_id, node_index
+        );
         continue;
       }
 
@@ -2803,30 +2860,34 @@ static void build_migration_plan(
           find_node_by_migration_key(*old_def, new_spec.migration_key);
       if (old_node_index < 0) {
         record_migration_skip(
-            swap, MigrationSkipReason::KeyNotFound, template_id, node_index);
+            swap, MigrationSkipReason::KeyNotFound, template_id, node_index
+        );
         continue;
       }
 
-      const NodeSpec &old_spec =
-          old_def->nodes[static_cast<std::size_t>(old_node_index)];
+      const NodeSpec &old_spec = old_def->nodes[static_cast<std::size_t>(old_node_index)];
       if (old_spec.kind != new_spec.kind) {
         record_migration_skip(
-            swap, MigrationSkipReason::KindMismatch, template_id, node_index);
+            swap, MigrationSkipReason::KindMismatch, template_id, node_index
+        );
         continue;
       }
       if (old_spec.default_controls.size() != new_spec.default_controls.size()) {
         record_migration_skip(
-            swap, MigrationSkipReason::ArityMismatch, template_id, node_index);
+            swap, MigrationSkipReason::ArityMismatch, template_id, node_index
+        );
         continue;
       }
       if (!node_kind_supports_state_migration(new_spec.kind)) {
         record_migration_skip(
-            swap, MigrationSkipReason::StateUnsupported, template_id, node_index);
+            swap, MigrationSkipReason::StateUnsupported, template_id, node_index
+        );
         continue;
       }
 
       swap.migration_copies.push_back(
-          MigrationCopy{template_id, old_node_index, node_index, new_spec.kind});
+          MigrationCopy{template_id, old_node_index, node_index, new_spec.kind}
+      );
     }
   }
 }
@@ -2838,9 +2899,7 @@ enum class StateMigrationResult {
 };
 
 [[nodiscard]] static StateMigrationResult copy_supported_dsp_state(
-    NodeKind kind,
-    const NodeInstanceState &old_node,
-    NodeInstanceState &new_node
+    NodeKind kind, const NodeInstanceState &old_node, NodeInstanceState &new_node
 ) noexcept {
   switch (kind) {
   case NodeKind::SinOsc:
@@ -2848,7 +2907,8 @@ enum class StateMigrationResult {
   case NodeKind::TriOsc: {
     const auto *src = std::get_if<OscState>(&old_node.state);
     auto *dst = std::get_if<OscState>(&new_node.state);
-    if (!src || !dst) return StateMigrationResult::Unsupported;
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
     dst->phase_iter = src->phase_iter;
     return StateMigrationResult::Copied;
   }
@@ -2856,7 +2916,8 @@ enum class StateMigrationResult {
   case NodeKind::PulseOsc: {
     const auto *src = std::get_if<PulseOscState>(&old_node.state);
     auto *dst = std::get_if<PulseOscState>(&new_node.state);
-    if (!src || !dst) return StateMigrationResult::Unsupported;
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
     dst->phase_iter = src->phase_iter;
     dst->osc = src->osc;
     dst->last_width = src->last_width;
@@ -2866,7 +2927,8 @@ enum class StateMigrationResult {
   case NodeKind::NoiseGen: {
     const auto *src = std::get_if<NoiseGenState>(&old_node.state);
     auto *dst = std::get_if<NoiseGenState>(&new_node.state);
-    if (!src || !dst) return StateMigrationResult::Unsupported;
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
     dst->noise = src->noise;
     return StateMigrationResult::Copied;
   }
@@ -2874,7 +2936,8 @@ enum class StateMigrationResult {
   case NodeKind::LPF: {
     const auto *src = std::get_if<LPFState>(&old_node.state);
     auto *dst = std::get_if<LPFState>(&new_node.state);
-    if (!src || !dst) return StateMigrationResult::Unsupported;
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
     dst->filter = src->filter;
     dst->last_freq = src->last_freq;
     dst->last_q = src->last_q;
@@ -2884,7 +2947,8 @@ enum class StateMigrationResult {
   case NodeKind::HPF: {
     const auto *src = std::get_if<HPFState>(&old_node.state);
     auto *dst = std::get_if<HPFState>(&new_node.state);
-    if (!src || !dst) return StateMigrationResult::Unsupported;
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
     dst->filter = src->filter;
     dst->last_freq = src->last_freq;
     dst->last_q = src->last_q;
@@ -2894,7 +2958,8 @@ enum class StateMigrationResult {
   case NodeKind::BPF: {
     const auto *src = std::get_if<BPFState>(&old_node.state);
     auto *dst = std::get_if<BPFState>(&new_node.state);
-    if (!src || !dst) return StateMigrationResult::Unsupported;
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
     dst->filter = src->filter;
     dst->last_freq = src->last_freq;
     dst->last_q = src->last_q;
@@ -2904,7 +2969,8 @@ enum class StateMigrationResult {
   case NodeKind::Notch: {
     const auto *src = std::get_if<NotchState>(&old_node.state);
     auto *dst = std::get_if<NotchState>(&new_node.state);
-    if (!src || !dst) return StateMigrationResult::Unsupported;
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
     dst->filter = src->filter;
     dst->last_freq = src->last_freq;
     dst->last_q = src->last_q;
@@ -2938,9 +3004,7 @@ struct MigrationApplyCounts {
 };
 
 static void copy_instance_lifecycle(
-    SlotState old_slot_state,
-    const GraphInstance &old_inst,
-    GraphInstance &new_inst
+    SlotState old_slot_state, const GraphInstance &old_inst, GraphInstance &new_inst
 ) noexcept {
   new_inst.state.store(old_slot_state);
   new_inst.silent_blocks = old_inst.silent_blocks;
@@ -2964,8 +3028,8 @@ static MigrationApplyCounts apply_migration(
 
     const SlotState old_slot_state = old_inst.state.load();
     const SlotState new_slot_state = new_inst.state.load();
-    if (!slot_is_migration_live(old_slot_state)
-        || !slot_is_migration_live(new_slot_state)) {
+    if (!slot_is_migration_live(old_slot_state) ||
+        !slot_is_migration_live(new_slot_state)) {
       continue;
     }
     if (old_inst.template_id != new_inst.template_id) {
@@ -2976,12 +3040,11 @@ static MigrationApplyCounts apply_migration(
     ++counts.lifecycle_copies;
 
     for (const MigrationCopy &copy : copies) {
-      if (copy.template_id != old_inst.template_id) continue;
+      if (copy.template_id != old_inst.template_id)
+        continue;
 
-      const std::size_t old_idx =
-          static_cast<std::size_t>(copy.old_node_index);
-      const std::size_t new_idx =
-          static_cast<std::size_t>(copy.new_node_index);
+      const std::size_t old_idx = static_cast<std::size_t>(copy.old_node_index);
+      const std::size_t new_idx = static_cast<std::size_t>(copy.new_node_index);
       if (old_idx >= old_inst.nodes.size() || new_idx >= new_inst.nodes.size()) {
         continue;
       }
@@ -2995,9 +3058,9 @@ static MigrationApplyCounts apply_migration(
       std::copy(old_controls.begin(), old_controls.end(), new_controls.begin());
       ++counts.control_vector_copies;
 
-      if (copy_supported_dsp_state(copy.kind, old_inst.nodes[old_idx],
-                                   new_inst.nodes[new_idx])
-          == StateMigrationResult::Copied) {
+      if (copy_supported_dsp_state(
+              copy.kind, old_inst.nodes[old_idx], new_inst.nodes[new_idx]
+          ) == StateMigrationResult::Copied) {
         ++counts.state_copies;
       }
     }
@@ -3008,19 +3071,22 @@ static MigrationApplyCounts apply_migration(
 
 // Lookup a template's MetaDef by id. Returns nullptr for negative /
 // out-of-range ids.
-[[nodiscard]] static MetaDef *
-template_at(RTGraph &g, int template_id) noexcept {
-  if (template_id < 0) return nullptr;
+[[nodiscard]] static MetaDef *template_at(RTGraph &g, int template_id) noexcept {
+  if (template_id < 0)
+    return nullptr;
   const std::size_t idx = static_cast<std::size_t>(template_id);
-  if (idx >= world(g).defs.size()) return nullptr;
+  if (idx >= world(g).defs.size())
+    return nullptr;
   return &world(g).defs[idx];
 }
 
 [[nodiscard]] static const MetaDef *
 template_at(const RTGraph &g, int template_id) noexcept {
-  if (template_id < 0) return nullptr;
+  if (template_id < 0)
+    return nullptr;
   const std::size_t idx = static_cast<std::size_t>(template_id);
-  if (idx >= world(g).defs.size()) return nullptr;
+  if (idx >= world(g).defs.size())
+    return nullptr;
   return &world(g).defs[idx];
 }
 
@@ -3029,21 +3095,26 @@ template_at(const RTGraph &g, int template_id) noexcept {
 // Available; the GraphInstance object still exists in the vector and
 // retains its node-state allocations for the next reuse, but it is
 // not part of the audio schedule.
-[[nodiscard]] static GraphInstance *
-instance_at(RTGraph &g, int instance_id) noexcept {
-  if (instance_id < 0) return nullptr;
+[[nodiscard]] static GraphInstance *instance_at(RTGraph &g, int instance_id) noexcept {
+  if (instance_id < 0)
+    return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= world(g).instances.size()) return nullptr;
-  if (world(g).instances[idx].state.load() == SlotState::Available) return nullptr;
+  if (idx >= world(g).instances.size())
+    return nullptr;
+  if (world(g).instances[idx].state.load() == SlotState::Available)
+    return nullptr;
   return &world(g).instances[idx];
 }
 
 [[nodiscard]] static const GraphInstance *
 instance_at(const RTGraph &g, int instance_id) noexcept {
-  if (instance_id < 0) return nullptr;
+  if (instance_id < 0)
+    return nullptr;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= world(g).instances.size()) return nullptr;
-  if (world(g).instances[idx].state.load() == SlotState::Available) return nullptr;
+  if (idx >= world(g).instances.size())
+    return nullptr;
+  if (world(g).instances[idx].state.load() == SlotState::Available)
+    return nullptr;
   return &world(g).instances[idx];
 }
 
@@ -3110,10 +3181,12 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
         return {};
       }
       const std::size_t src_index = to_size(fr.source_node);
-      if (src_index >= inst.nodes.size()) return {};
+      if (src_index >= inst.nodes.size())
+        return {};
       const NodeInstanceState &src = inst.nodes[src_index];
       const std::size_t src_port = to_size(fr.source_port);
-      if (src_port >= src.outputs.size()) return {};
+      if (src_port >= src.outputs.size())
+        return {};
       if (src.outputs[src_port].size() < static_cast<std::size_t>(nframes)) {
         return {};
       }
@@ -3131,12 +3204,15 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
       // single bad ref must not leave a partial materialization
       // visible to the consumer.
       for (const auto &step : fr.steps) {
-        if (!valid(step.node) || !valid(step.control)) return {};
+        if (!valid(step.node) || !valid(step.control))
+          return {};
         const std::size_t scale_idx = to_size(step.node);
-        if (scale_idx >= inst.nodes.size()) return {};
+        if (scale_idx >= inst.nodes.size())
+          return {};
         const NodeInstanceState &scale_or_bias = inst.nodes[scale_idx];
         const std::size_t cidx = to_size(step.control);
-        if (cidx >= scale_or_bias.controls.size()) return {};
+        if (cidx >= scale_or_bias.controls.size())
+          return {};
       }
 
       // Materialise: scratch = src, then apply each step in
@@ -3157,26 +3233,25 @@ instance_at(const RTGraph &g, int instance_id) noexcept {
         const NodeInstanceState &n = inst.nodes[to_size(step.node)];
         const double raw = n.controls[to_size(step.control)];
         switch (step.kind) {
-          case FusedAffineStep::Kind::Scale: {
-            const float k = sanitize_finite(static_cast<float>(raw), 1.0f);
-            for (int i = 0; i < nframes; ++i) {
-              const std::size_t fi = static_cast<std::size_t>(i);
-              scratch[fi] *= k;
-            }
-            break;
+        case FusedAffineStep::Kind::Scale: {
+          const float k = sanitize_finite(static_cast<float>(raw), 1.0f);
+          for (int i = 0; i < nframes; ++i) {
+            const std::size_t fi = static_cast<std::size_t>(i);
+            scratch[fi] *= k;
           }
-          case FusedAffineStep::Kind::Bias: {
-            const float b = sanitize_finite(static_cast<float>(raw), 0.0f);
-            for (int i = 0; i < nframes; ++i) {
-              const std::size_t fi = static_cast<std::size_t>(i);
-              scratch[fi] += b;
-            }
-            break;
+          break;
+        }
+        case FusedAffineStep::Kind::Bias: {
+          const float b = sanitize_finite(static_cast<float>(raw), 0.0f);
+          for (int i = 0; i < nframes; ++i) {
+            const std::size_t fi = static_cast<std::size_t>(i);
+            scratch[fi] += b;
           }
+          break;
+        }
         }
       }
-      return std::span<const float>(scratch.data(),
-                                    static_cast<std::size_t>(nframes));
+      return std::span<const float>(scratch.data(), static_cast<std::size_t>(nframes));
     }
   }
 
@@ -3236,8 +3311,10 @@ static void ensure_node_slot(RTGraph &g, int template_id, NodeIndex node_index) 
     // inst.nodes; growing the vector behind the producer's back
     // would race their writes.
     const SlotState s = inst.state.load();
-    if (s != SlotState::Active && s != SlotState::Releasing) continue;
-    if (inst.template_id != template_id) continue;
+    if (s != SlotState::Active && s != SlotState::Releasing)
+      continue;
+    if (inst.template_id != template_id)
+      continue;
     if (inst.nodes.size() <= idx) {
       inst.nodes.resize(idx + 1);
     }
@@ -3317,10 +3394,10 @@ static void ensure_output_bus_count(Server &server, std::size_t count, int max_f
 occupied_instances_for_template(const RTGraph &g, int tid) noexcept {
   int n = 0;
   for (const auto &inst : world(g).instances) {
-    if (inst.template_id != tid) continue;
+    if (inst.template_id != tid)
+      continue;
     const SlotState s = inst.state.load();
-    if (s == SlotState::Active || s == SlotState::Releasing
-        || s == SlotState::Reserved) {
+    if (s == SlotState::Active || s == SlotState::Releasing || s == SlotState::Reserved) {
       ++n;
     }
   }
@@ -3335,15 +3412,15 @@ occupied_instances_for_template(const RTGraph &g, int tid) noexcept {
 // count drains naturally. Combined with grow-only resize_for, this
 // makes a once-allocated slot index safe for the lifetime of any
 // in-flight block.
-[[nodiscard]] static int
-required_contribution_slots(const RTGraph &g) noexcept {
+[[nodiscard]] static int required_contribution_slots(const RTGraph &g) noexcept {
   int total = 0;
   for (std::size_t tid = 0; tid < world(g).defs.size(); ++tid) {
     const int sinks = sink_writer_count(world(g).defs[tid]);
-    if (sinks == 0) continue;
+    if (sinks == 0)
+      continue;
     const int poly = world(g).defs[tid].polyphony;
-    const int occ  = occupied_instances_for_template(g, static_cast<int>(tid));
-    const int per  = poly > occ ? poly : occ;
+    const int occ = occupied_instances_for_template(g, static_cast<int>(tid));
+    const int per = poly > occ ? poly : occ;
     total += per * sinks;
   }
   return total;
@@ -3371,17 +3448,16 @@ static void ensure_contribution_capacity(RTGraph &g) {
 // max(polyphony, occupied) rather than plain polyphony. Templates
 // with no schedule_steps contribute nothing — that's the
 // observational "no metadata, no schedule" fallback.
-[[nodiscard]] static int
-required_global_schedule_entries(const RTGraph &g) noexcept {
+[[nodiscard]] static int required_global_schedule_entries(const RTGraph &g) noexcept {
   int total = 0;
   for (std::size_t tid = 0; tid < world(g).defs.size(); ++tid) {
     const auto &def = world(g).defs[tid];
     const int steps = static_cast<int>(def.schedule_steps.size());
-    if (steps == 0) continue;
+    if (steps == 0)
+      continue;
     const int poly = def.polyphony;
-    const int occ  = occupied_instances_for_template(
-                        g, static_cast<int>(tid));
-    const int per  = poly > occ ? poly : occ;
+    const int occ = occupied_instances_for_template(g, static_cast<int>(tid));
+    const int per = poly > occ ? poly : occ;
     total += per * steps;
   }
   return total;
@@ -3418,12 +3494,12 @@ static void ensure_global_schedule_capacity(RTGraph &g) {
 // Construction validates ScheduleStepSpec slices; this helper is
 // still defensive so a malformed debug path cannot ask reserve() for
 // a negative / nonsensical size.
-[[nodiscard]] static int
-required_region_layer_work_items(const RTGraph &g) noexcept {
+[[nodiscard]] static int required_region_layer_work_items(const RTGraph &g) noexcept {
   int total = 0;
   for (std::size_t tid = 0; tid < world(g).defs.size(); ++tid) {
     const MetaDef &def = world(g).defs[tid];
-    if (def.schedule_steps.empty()) continue;
+    if (def.schedule_steps.empty())
+      continue;
 
     int items_per_instance = 0;
     for (const ScheduleStepSpec &step : def.schedule_steps) {
@@ -3431,11 +3507,11 @@ required_region_layer_work_items(const RTGraph &g) noexcept {
         items_per_instance += step.item_count;
       }
     }
-    if (items_per_instance == 0) continue;
+    if (items_per_instance == 0)
+      continue;
 
     const int poly = def.polyphony;
-    const int occ = occupied_instances_for_template(
-        g, static_cast<int>(tid));
+    const int occ = occupied_instances_for_template(g, static_cast<int>(tid));
     const int per = poly > occ ? poly : occ;
     total += per * items_per_instance;
   }
@@ -3521,8 +3597,9 @@ to port 1 has no effect today; phase modulation (PM) needs a separate
 runtime path that adds to _phase per sample.
 */
 
-static void process_sinosc(const RTGraph &g, GraphInstance &inst,
-                           std::size_t node_idx, int nframes) noexcept {
+static void process_sinosc(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3572,8 +3649,9 @@ is set once per block from the control default.
 Phase port (port 1) is initial-only, same as SinOsc.
 */
 
-static void process_sawosc(const RTGraph &g, GraphInstance &inst,
-                           std::size_t node_idx, int nframes) noexcept {
+static void process_sawosc(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3628,11 +3706,12 @@ static inline float sanitize_pulse_width(float w) noexcept {
   return sanitize_finite_clamp(w, 0.0f, 1.0f, 0.5f);
 }
 
-static void process_pulse_osc(const RTGraph &g, GraphInstance &inst,
-                              std::size_t node_idx, int nframes) noexcept {
+static void process_pulse_osc(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
-  const auto freq_in  = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
   const auto width_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
 
   auto *st = std::get_if<PulseOscState>(&node.state);
@@ -3698,8 +3777,9 @@ correction.
 No controls or inputs.
 */
 
-static void process_noisegen(const RTGraph &, GraphInstance &inst,
-                             std::size_t node_idx, int nframes) noexcept {
+static void process_noisegen(
+    const RTGraph &, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   auto *noisegen = std::get_if<NoiseGenState>(&node.state);
@@ -3728,8 +3808,9 @@ discontinuity beyond the filter's own transient.
 If the signal input is unconnected, output is silence.
 */
 
-static void process_lpf(const RTGraph &g, GraphInstance &inst,
-                        std::size_t node_idx, int nframes) noexcept {
+static void process_lpf(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3749,10 +3830,16 @@ static void process_lpf(const RTGraph &g, GraphInstance &inst,
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double freq = sanitize_finite_clamp(
       !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double q_val = sanitize_finite_clamp(
       !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
-      kQMin, kQMax, kQFallback);
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *lpf = std::get_if<LPFState>(&node.state);
   assert(lpf && "LPF node has non-LPF state");
@@ -3762,9 +3849,7 @@ static void process_lpf(const RTGraph &g, GraphInstance &inst,
   }
 
   if (freq != lpf->last_freq || q_val != lpf->last_q) {
-    lpf->filter.config(
-        q::frequency{freq}, g.sample_rate, q_val
-    );
+    lpf->filter.config(q::frequency{freq}, g.sample_rate, q_val);
     lpf->last_freq = freq;
     lpf->last_q = q_val;
   }
@@ -3796,8 +3881,9 @@ within-block filter sweeps would need a sample-accurate biquad update
 path.
 */
 
-static void process_hpf(const RTGraph &g, GraphInstance &inst,
-                        std::size_t node_idx, int nframes) noexcept {
+static void process_hpf(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3806,16 +3892,22 @@ static void process_hpf(const RTGraph &g, GraphInstance &inst,
     return;
   }
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+  const auto q_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
   // Sanitize freq + q -- see process_lpf comment + Note
   // [Pathological-input sanitation].
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double freq = sanitize_finite_clamp(
       !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double q_val = sanitize_finite_clamp(
       !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
-      kQMin, kQMax, kQFallback);
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *st = std::get_if<HPFState>(&node.state);
   assert(st && "HPF node has non-HPF state");
@@ -3826,7 +3918,7 @@ static void process_hpf(const RTGraph &g, GraphInstance &inst,
   if (freq != st->last_freq || q_val != st->last_q) {
     st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
     st->last_freq = freq;
-    st->last_q    = q_val;
+    st->last_q = q_val;
   }
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
@@ -3834,8 +3926,9 @@ static void process_hpf(const RTGraph &g, GraphInstance &inst,
   }
 }
 
-static void process_bpf(const RTGraph &g, GraphInstance &inst,
-                        std::size_t node_idx, int nframes) noexcept {
+static void process_bpf(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3844,16 +3937,22 @@ static void process_bpf(const RTGraph &g, GraphInstance &inst,
     return;
   }
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+  const auto q_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
   // Sanitize freq + q -- see process_lpf comment + Note
   // [Pathological-input sanitation].
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double freq = sanitize_finite_clamp(
       !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double q_val = sanitize_finite_clamp(
       !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
-      kQMin, kQMax, kQFallback);
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *st = std::get_if<BPFState>(&node.state);
   assert(st && "BPF node has non-BPF state");
@@ -3864,7 +3963,7 @@ static void process_bpf(const RTGraph &g, GraphInstance &inst,
   if (freq != st->last_freq || q_val != st->last_q) {
     st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
     st->last_freq = freq;
-    st->last_q    = q_val;
+    st->last_q = q_val;
   }
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
@@ -3872,8 +3971,9 @@ static void process_bpf(const RTGraph &g, GraphInstance &inst,
   }
 }
 
-static void process_notch(const RTGraph &g, GraphInstance &inst,
-                          std::size_t node_idx, int nframes) noexcept {
+static void process_notch(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3882,16 +3982,22 @@ static void process_notch(const RTGraph &g, GraphInstance &inst,
     return;
   }
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const auto q_in    = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+  const auto q_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
   // Sanitize freq + q -- see process_lpf comment + Note
   // [Pathological-input sanitation].
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double freq = sanitize_finite_clamp(
       !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double q_val = sanitize_finite_clamp(
       !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
-      kQMin, kQMax, kQFallback);
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *st = std::get_if<NotchState>(&node.state);
   assert(st && "Notch node has non-Notch state");
@@ -3902,7 +4008,7 @@ static void process_notch(const RTGraph &g, GraphInstance &inst,
   if (freq != st->last_freq || q_val != st->last_q) {
     st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
     st->last_freq = freq;
-    st->last_q    = q_val;
+    st->last_q = q_val;
   }
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
@@ -3918,8 +4024,9 @@ waveshape. q::triangle is a free constant of triangle_osc. Phase
 port (port 1) is initial-only, same convention as SinOsc/SawOsc.
 */
 
-static void process_triosc(const RTGraph &g, GraphInstance &inst,
-                           std::size_t node_idx, int nframes) noexcept {
+static void process_triosc(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3958,8 +4065,9 @@ back to the scalar control default for the whole block.
 If the signal input (port 0) is unconnected, output is silence.
 */
 
-static void process_gain(const RTGraph &g, GraphInstance &inst,
-                         std::size_t node_idx, int nframes) noexcept {
+static void process_gain(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -3981,8 +4089,7 @@ static void process_gain(const RTGraph &g, GraphInstance &inst,
     // write to controls[0] doesn't multiply the input into NaN — the
     // result would propagate into every downstream consumer (filters,
     // smoothers) and poison their IIR state. Fallback 1.0 = unity.
-    const float amount = sanitize_finite(
-        static_cast<float>(node.controls[0]), 1.0f);
+    const float amount = sanitize_finite(static_cast<float>(node.controls[0]), 1.0f);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       out[fi] = sig_in[fi] * amount;
@@ -4003,8 +4110,9 @@ the canonical bias use case (turning a bipolar modulator into a
 modulated frequency or amplitude).
 */
 
-static void process_add(const RTGraph &g, GraphInstance &inst,
-                        std::size_t node_idx, int nframes) noexcept {
+static void process_add(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto a_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -4012,10 +4120,8 @@ static void process_add(const RTGraph &g, GraphInstance &inst,
 
   // Sanitize control defaults so a NaN write to either control
   // doesn't add a NaN bias into the audio path. Fallback 0.0 = no bias.
-  const float a_const = sanitize_finite(
-      static_cast<float>(node.controls[0]), 0.0f);
-  const float b_const = sanitize_finite(
-      static_cast<float>(node.controls[1]), 0.0f);
+  const float a_const = sanitize_finite(static_cast<float>(node.controls[0]), 0.0f);
+  const float b_const = sanitize_finite(static_cast<float>(node.controls[1]), 0.0f);
 
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
@@ -4041,8 +4147,9 @@ The envelope_gen is constructed lazily on first call, against the runtime's
 current sample rate — kDefaultSampleRate is a placeholder that may be wrong
 once realtime audio opens with a different rate.
 */
-static void process_env(const RTGraph &g, GraphInstance &inst,
-                        std::size_t node_idx, int nframes) noexcept {
+static void process_env(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
@@ -4059,14 +4166,15 @@ static void process_env(const RTGraph &g, GraphInstance &inst,
   // unstable ramp slopes that propagate NaN through the envelope's
   // segment outputs. Clamp to a musically sensible range with a
   // safe fallback. See Note [Pathological-input sanitation].
-  const double a_sec = sanitize_finite_clamp(
-      node.controls[1], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
-  const double d_sec = sanitize_finite_clamp(
-      node.controls[2], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
+  const double a_sec =
+      sanitize_finite_clamp(node.controls[1], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
+  const double d_sec =
+      sanitize_finite_clamp(node.controls[2], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
   const double s_lin = sanitize_finite_clamp(
-      node.controls[3], kEnvSustainMin, kEnvSustainMax, kEnvSustainFallback);
-  const double r_sec = sanitize_finite_clamp(
-      node.controls[4], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
+      node.controls[3], kEnvSustainMin, kEnvSustainMax, kEnvSustainFallback
+  );
+  const double r_sec =
+      sanitize_finite_clamp(node.controls[4], kEnvTimeMin, kEnvTimeMax, kEnvTimeFallback);
 
   // (Re)build the envelope_gen against the active sample rate on first
   // call or after a sample-rate change.
@@ -4133,11 +4241,11 @@ That contract is why the reservation lives at the dispatch site in
 process_instance / dispatch_node, not inside SinkAccumulator::open.
 */
 enum class BusWriteMode {
-  Direct,    // default: kernels write into server.output_buses
-  Reduction, // kernels write into contributions[writer_slot]; the
-             // per-step fold copies used slots back into
-             // server.output_buses at deterministic joins so live
-             // BusIn semantics match Direct mode block-for-block.
+  Direct,            // default: kernels write into server.output_buses
+  Reduction,         // kernels write into contributions[writer_slot]; the
+                     // per-step fold copies used slots back into
+                     // server.output_buses at deterministic joins so live
+                     // BusIn semantics match Direct mode block-for-block.
   ReductionDeferred, // same private slot target as Reduction, but
                      // used by C1c Free-band worker dispatch: workers
                      // do not fold immediately and do not update the
@@ -4154,9 +4262,7 @@ struct BusWriteContext {
   // Reserve one canonical writer slot at a dispatch boundary. The
   // returned index is monotonically increasing across the block and
   // becomes the writer-slot identity in the canonical ordering of §3.
-  [[nodiscard]] int reserve_writer_slot() noexcept {
-    return next_writer_slot++;
-  }
+  [[nodiscard]] int reserve_writer_slot() noexcept { return next_writer_slot++; }
 };
 
 struct BlockExecutionContext {
@@ -4202,15 +4308,11 @@ canonical-writer-slot model that motivates this rule.
 */
 struct BusWriteTarget {
   float *samples = nullptr;
-  int    resolved_bus = -1;
+  int resolved_bus = -1;
 
-  [[nodiscard]] bool valid() const noexcept {
-    return samples != nullptr;
-  }
+  [[nodiscard]] bool valid() const noexcept { return samples != nullptr; }
 
-  inline void add(std::size_t fi, float s) noexcept {
-    samples[fi] += s;
-  }
+  inline void add(std::size_t fi, float s) noexcept { samples[fi] += s; }
 };
 
 // Validate the bus index in the double domain BEFORE casting to int.
@@ -4220,8 +4322,7 @@ struct BusWriteTarget {
 [[nodiscard]] static std::optional<int>
 resolve_output_bus_index(const Server &server, double bus_control) noexcept {
   const double bus_lim = static_cast<double>(server.output_buses.size());
-  if (!std::isfinite(bus_control) || bus_control < 0.0
-      || bus_control >= bus_lim) {
+  if (!std::isfinite(bus_control) || bus_control < 0.0 || bus_control >= bus_lim) {
     return std::nullopt;
   }
   return static_cast<int>(bus_control);
@@ -4235,8 +4336,8 @@ open_direct_bus_write_target(Server &server, double bus_control) noexcept {
   }
 
   return BusWriteTarget{
-    server.output_buses[static_cast<std::size_t>(*bus)].data(),
-    *bus,
+      server.output_buses[static_cast<std::size_t>(*bus)].data(),
+      *bus,
   };
 }
 
@@ -4257,10 +4358,9 @@ open_direct_bus_write_target(Server &server, double bus_control) noexcept {
 // nframes (rather than max_frames) keeps the cost proportional to
 // the work the kernel will do; bytes past nframes inside the slot
 // retain whatever was there but are never read this block.
-[[nodiscard]] static BusWriteTarget
-open_reduction_bus_write_target(RTGraph &g, double bus_control,
-                                 int writer_slot, int nframes,
-                                 bool record_used_bit) noexcept {
+[[nodiscard]] static BusWriteTarget open_reduction_bus_write_target(
+    RTGraph &g, double bus_control, int writer_slot, int nframes, bool record_used_bit
+) noexcept {
   assert(writer_slot >= 0);
   auto &storage = world(g).contribution_storage;
   assert(writer_slot < storage.max_writer_slots);
@@ -4288,8 +4388,8 @@ open_reduction_bus_write_target(RTGraph &g, double bus_control,
   }
 
   return BusWriteTarget{
-    &storage.samples[ws * mf],
-    *bus,
+      &storage.samples[ws * mf],
+      *bus,
   };
 }
 
@@ -4298,30 +4398,28 @@ open_reduction_bus_write_target(RTGraph &g, double bus_control,
 // process_graph; the kernel does not need to know which target
 // shape it got back, just that 'add' accumulates into the right
 // place.
-[[nodiscard]] static BusWriteTarget
-open_bus_write_target(RTGraph &g, BusWriteMode mode,
-                      double bus_control, int writer_slot,
-                      int nframes) noexcept {
-  if (mode == BusWriteMode::Reduction
-      || mode == BusWriteMode::ReductionDeferred) {
-    return open_reduction_bus_write_target(g, bus_control,
-                                            writer_slot, nframes,
-                                            mode == BusWriteMode::Reduction);
+[[nodiscard]] static BusWriteTarget open_bus_write_target(
+    RTGraph &g, BusWriteMode mode, double bus_control, int writer_slot, int nframes
+) noexcept {
+  if (mode == BusWriteMode::Reduction || mode == BusWriteMode::ReductionDeferred) {
+    return open_reduction_bus_write_target(
+        g, bus_control, writer_slot, nframes, mode == BusWriteMode::Reduction
+    );
   }
   return open_direct_bus_write_target(world(g).server, bus_control);
 }
 
 [[nodiscard]] static bool
-contribution_slot_used(
-    const ContributionStorage &storage, int writer_slot
-) noexcept {
-  if (writer_slot < 0 || writer_slot >= storage.max_writer_slots) return false;
+contribution_slot_used(const ContributionStorage &storage, int writer_slot) noexcept {
+  if (writer_slot < 0 || writer_slot >= storage.max_writer_slots)
+    return false;
   const std::size_t ws = static_cast<std::size_t>(writer_slot);
   // Serial Reduction sets both target[ws] and used_words. Parallel
   // ReductionDeferred intentionally skips used_words to avoid races when
   // two workers own slots in the same 64-bit word, so target[ws] >= 0 is
   // the authoritative validity predicate for deferred folds.
-  if (storage.target[ws] >= 0) return true;
+  if (storage.target[ws] >= 0)
+    return true;
   const std::size_t word = ws / 64;
   const std::uint64_t bit = std::uint64_t{1} << (ws % 64);
   return (storage.used_words[word] & bit) != 0;
@@ -4332,9 +4430,8 @@ contribution_slot_used(
 // fold happens before any later live BusIn can observe the bus. The
 // inner order is writer-slot ascending, which is the canonical serial
 // executor order captured by B0's slot assignment.
-static void fold_contribution_slots(
-    RTGraph &g, int first_slot, int end_slot, int nframes
-) noexcept {
+static void
+fold_contribution_slots(RTGraph &g, int first_slot, int end_slot, int nframes) noexcept {
   auto &storage = world(g).contribution_storage;
   assert(first_slot >= 0);
   assert(end_slot >= first_slot);
@@ -4343,13 +4440,16 @@ static void fold_contribution_slots(
   const std::size_t mf = static_cast<std::size_t>(g.max_frames);
   const std::size_t nf = static_cast<std::size_t>(nframes);
   for (int ws_i = first_slot; ws_i < end_slot; ++ws_i) {
-    if (!contribution_slot_used(storage, ws_i)) continue;
+    if (!contribution_slot_used(storage, ws_i))
+      continue;
 
     const std::size_t ws = static_cast<std::size_t>(ws_i);
     const int bus = storage.target[ws];
-    if (bus < 0) continue;
+    if (bus < 0)
+      continue;
     const std::size_t bus_idx = static_cast<std::size_t>(bus);
-    if (bus_idx >= world(g).server.output_buses.size()) continue;
+    if (bus_idx >= world(g).server.output_buses.size())
+      continue;
 
     float *dst = world(g).server.output_buses[bus_idx].data();
     const float *src = &storage.samples[ws * mf];
@@ -4362,8 +4462,10 @@ static void fold_contribution_slots(
 static inline void fold_recent_writer_slot_if_needed(
     RTGraph &g, const BlockExecutionContext &ctx, int writer_slot, int nframes
 ) noexcept {
-  if (ctx.bus_writes.mode != BusWriteMode::Reduction) return;
-  if (!ctx.bus_writes.fold_after_each_sink) return;
+  if (ctx.bus_writes.mode != BusWriteMode::Reduction)
+    return;
+  if (!ctx.bus_writes.fold_after_each_sink)
+    return;
   fold_contribution_slots(g, writer_slot, writer_slot + 1, nframes);
 }
 
@@ -4396,9 +4498,14 @@ instance-iteration × per-instance topo-order).
 If the input is unconnected or the bus index is invalid, the node
 contributes nothing. Multiple writers to the same bus sum.
 */
-static void process_out(RTGraph &g, GraphInstance &inst,
-                        std::size_t node_idx, int nframes,
-                        int writer_slot, BusWriteMode mode) noexcept {
+static void process_out(
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t node_idx,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode
+) noexcept {
   // writer_slot is reserved at the dispatch site (dispatch_node's
   // Out/BusOut branches) and threaded in here. Direct mode does not
   // consult it; Reduction mode uses it to select the contribution
@@ -4411,8 +4518,7 @@ static void process_out(RTGraph &g, GraphInstance &inst,
   if (in.empty())
     return;
 
-  auto target = open_bus_write_target(g, mode, node.controls[0],
-                                       writer_slot, nframes);
+  auto target = open_bus_write_target(g, mode, node.controls[0], writer_slot, nframes);
   if (!target.valid())
     return;
 
@@ -4428,7 +4534,8 @@ static void process_out(RTGraph &g, GraphInstance &inst,
     const float s = in[fi];
     target.add(fi, s);
     const float a = std::fabs(s);
-    if (a > peak) peak = a;
+    if (a > peak)
+      peak = a;
   }
   inst.block_sink_peak = peak;
 }
@@ -4456,8 +4563,9 @@ bus that no node wrote in this block is well-defined:
 clear_output_buses zeroed the bus at the start of the block, so BusIn
 gets zero.
 */
-static void process_busin(const RTGraph &g, GraphInstance &inst,
-                          std::size_t node_idx, int nframes) noexcept {
+static void process_busin(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
@@ -4512,8 +4620,7 @@ one-block latency.
 See Note [Bus pool double-buffering].
 */
 static void process_busin_delayed(
-    const RTGraph &g, GraphInstance &inst,
-    std::size_t node_idx, int nframes
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
 ) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
@@ -4567,8 +4674,9 @@ rate change (which is extraordinarily rare).
 
 See Note [Per-node delay state] for the state struct.
 */
-static void process_delay(const RTGraph &g, GraphInstance &inst,
-                          std::size_t node_idx, int nframes) noexcept {
+static void process_delay(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -4591,7 +4699,8 @@ static void process_delay(const RTGraph &g, GraphInstance &inst,
   // negative value would crash the allocation. See
   // Note [Pathological-input sanitation].
   const double max_time = sanitize_finite_clamp(
-      node.controls[0], kDelayMaxTimeMin, kDelayMaxTimeMax, kDelayMaxFallback);
+      node.controls[0], kDelayMaxTimeMin, kDelayMaxTimeMax, kDelayMaxFallback
+  );
 
   // (Re)build the ring buffer on first call or after a sample-rate /
   // max-time change. q::delay's constructor sizes the buffer to
@@ -4616,16 +4725,13 @@ static void process_delay(const RTGraph &g, GraphInstance &inst,
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       const float t_in = sanitize_finite(time_in[fi], 0.0f);
-      const float t_samples = std::clamp(
-        t_in * g.sample_rate, 0.0f, max_idx);
+      const float t_samples = std::clamp(t_in * g.sample_rate, 0.0f, max_idx);
       out[fi] = (*st->line)(sig_in[fi], t_samples);
     }
   } else {
     // Constant delay time from the control default.
-    const float t_in = sanitize_finite(
-        static_cast<float>(node.controls[1]), 0.0f);
-    const float t_samples = std::clamp(
-      t_in * g.sample_rate, 0.0f, max_idx);
+    const float t_in = sanitize_finite(static_cast<float>(node.controls[1]), 0.0f);
+    const float t_samples = std::clamp(t_in * g.sample_rate, 0.0f, max_idx);
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       out[fi] = (*st->line)(sig_in[fi], t_samples);
@@ -4655,8 +4761,9 @@ Stateful (the IIR carries low1/low2 history across blocks). The
 state is per-instance with no shared resource, so Eff is Pure and
 rate is SampleRate. See Note [Per-node smooth state].
 */
-static void process_smooth(const RTGraph &g, GraphInstance &inst,
-                           std::size_t node_idx, int nframes) noexcept {
+static void process_smooth(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
   const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
@@ -4685,10 +4792,9 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
   constexpr double kMinBaseFreqHz = 0.001;
   const double raw_base = node.controls[0];
   const double max_base = 0.49 * static_cast<double>(g.sample_rate);
-  const double base_hz =
-      std::isfinite(raw_base)
-          ? std::clamp(raw_base, kMinBaseFreqHz, max_base)
-          : kMinBaseFreqHz;
+  const double base_hz = std::isfinite(raw_base)
+                             ? std::clamp(raw_base, kMinBaseFreqHz, max_base)
+                             : kMinBaseFreqHz;
   // Sanitize the target *before* it reaches the smoother. q's
   // dynamic_smoother runs `low1 += g * (input - low1)` per sample;
   // a single NaN target poisons low1 / low2 forever and the smoother
@@ -4696,8 +4802,7 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
   // a later block. Fallback 0.0 keeps the IIR state finite. (This is
   // the strictly worse failure mode the audit flagged: cross-block
   // state poisoning, not just one bad block of output.)
-  const float target = sanitize_finite(
-      static_cast<float>(node.controls[1]), 0.0f);
+  const float target = sanitize_finite(static_cast<float>(node.controls[1]), 0.0f);
 
   // Lazy construction on first call or after a sample-rate change.
   // Seed the IIR state to the first input sample so the smoother
@@ -4705,8 +4810,8 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
   if (!st->smoother || st->last_sps != g.sample_rate) {
     st->smoother.emplace(q::frequency{base_hz}, g.sample_rate);
     const float seed = sig_in.empty() ? target : sig_in[0];
-    *st->smoother    = seed;
-    st->last_sps       = g.sample_rate;
+    *st->smoother = seed;
+    st->last_sps = g.sample_rate;
     st->last_base_freq = base_hz;
   } else if (base_hz != st->last_base_freq) {
     st->smoother->base_frequency(q::frequency{base_hz}, g.sample_rate);
@@ -4804,8 +4909,8 @@ and the corresponding ResourceFootprint precedence layer.
 // consumed once from controls[2] at instance reset via
 // init_node_state.
 static void process_play_buf_mono(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t node_idx, int nframes) noexcept {
+    RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
@@ -4813,8 +4918,7 @@ static void process_play_buf_mono(
   assert(st && "PlayBufMono node has non-PlayBufMono state");
   if (!st) {
     std::fill(out.begin(), out.end(), 0.0f);
-    g.buffer_invalid_read_count +=
-        static_cast<long long>(nframes);
+    g.buffer_invalid_read_count += static_cast<long long>(nframes);
     return;
   }
 
@@ -4832,35 +4936,31 @@ static void process_play_buf_mono(
   // "invalid ID, take the fast zero path."
   const BufferSlot *slot = nullptr;
   if (bid_in_range) {
-    const auto &candidate =
-        g.buffers[static_cast<std::size_t>(bid)];
+    const auto &candidate = g.buffers[static_cast<std::size_t>(bid)];
     // Acquire-load synchronizes-with the release-store in
     // rt_graph_buffer_retire / _alloc so a kernel that sees
     // Allocated reads a coherent samples vector. Retired and
     // Unallocated both fall through to the invalid-read path.
-    if (candidate.state.load(std::memory_order_acquire)
-          == BufferSlotState::Allocated
-        && !candidate.samples.empty()) {
+    if (candidate.state.load(std::memory_order_acquire) == BufferSlotState::Allocated &&
+        !candidate.samples.empty()) {
       slot = &candidate;
     }
   }
 
   if (slot == nullptr) {
     std::fill(out.begin(), out.end(), 0.0f);
-    g.buffer_invalid_read_count +=
-        static_cast<long long>(nframes);
+    g.buffer_invalid_read_count += static_cast<long long>(nframes);
     return;
   }
 
   const auto rate_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
   const auto loop_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
 
-  const double rate_default      = node.controls[1];
-  const double start_frame       = node.controls[2];
-  const double loop_default      = node.controls[3];
+  const double rate_default = node.controls[1];
+  const double start_frame = node.controls[2];
+  const double loop_default = node.controls[3];
 
-  const double frame_count_d =
-      static_cast<double>(slot->samples.size());
+  const double frame_count_d = static_cast<double>(slot->samples.size());
   // q::delay-style read: read floor(pos) and floor(pos)+1, blend
   // by the fractional part. Wrap to the start_frame when looping
   // past the last frame; one-shot mode goes silent.
@@ -4869,7 +4969,8 @@ static void process_play_buf_mono(
   // Sanitize the seeded playhead: a producer-set start_frame >=
   // frame_count is treated as "one frame past the buffer" so the
   // first sample emits zero rather than out-of-bounds-reads.
-  if (!std::isfinite(pos) || pos < 0.0) pos = 0.0;
+  if (!std::isfinite(pos) || pos < 0.0)
+    pos = 0.0;
 
   long long valid_samples = 0;
   long long invalid_samples = 0;
@@ -4878,17 +4979,14 @@ static void process_play_buf_mono(
     const std::size_t fi = static_cast<std::size_t>(i);
 
     const double rate_raw =
-        rate_in.empty() ? rate_default
-                        : static_cast<double>(rate_in[fi]);
+        rate_in.empty() ? rate_default : static_cast<double>(rate_in[fi]);
     // Negative rate is reserved for future reverse playback; 6.C.3a
     // clamps to zero. NaN / non-finite values fall through to 0 too
     // so the playhead never poisons itself.
-    const double rate =
-        (std::isfinite(rate_raw) && rate_raw > 0.0) ? rate_raw : 0.0;
+    const double rate = (std::isfinite(rate_raw) && rate_raw > 0.0) ? rate_raw : 0.0;
 
     const double loop_raw =
-        loop_in.empty() ? loop_default
-                        : static_cast<double>(loop_in[fi]);
+        loop_in.empty() ? loop_default : static_cast<double>(loop_in[fi]);
     const bool looping = std::isfinite(loop_raw) && loop_raw >= 0.5;
 
     // Compute the read result before advancing so a playhead at
@@ -4897,9 +4995,9 @@ static void process_play_buf_mono(
     if (pos >= frame_count_d) {
       if (looping) {
         double seed =
-            std::isfinite(start_frame) && start_frame >= 0.0
-                ? start_frame : 0.0;
-        if (seed >= frame_count_d) seed = 0.0;
+            std::isfinite(start_frame) && start_frame >= 0.0 ? start_frame : 0.0;
+        if (seed >= frame_count_d)
+          seed = 0.0;
         pos = seed;
       } else {
         out[fi] = 0.0f;
@@ -4910,10 +5008,8 @@ static void process_play_buf_mono(
     }
 
     const double floor_pos = std::floor(pos);
-    const std::size_t idx0 =
-        static_cast<std::size_t>(floor_pos);
-    const std::size_t idx1 =
-        (idx0 + 1 < slot->samples.size()) ? idx0 + 1 : idx0;
+    const std::size_t idx0 = static_cast<std::size_t>(floor_pos);
+    const std::size_t idx1 = (idx0 + 1 < slot->samples.size()) ? idx0 + 1 : idx0;
     const float s0 = samples[idx0];
     const float s1 = samples[idx1];
     const float frac = static_cast<float>(pos - floor_pos);
@@ -4924,7 +5020,7 @@ static void process_play_buf_mono(
   }
 
   st->playhead_pos = pos;
-  g.buffer_read_count         += valid_samples;
+  g.buffer_read_count += valid_samples;
   g.buffer_invalid_read_count += invalid_samples;
 }
 
@@ -4946,8 +5042,8 @@ static void process_play_buf_mono(
 // advanced past the snapshot, which only happens at a
 // process_graph block boundary.
 static void process_record_buf_mono(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t node_idx, int nframes) noexcept {
+    RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
@@ -4955,16 +5051,13 @@ static void process_record_buf_mono(
   assert(st && "RecordBufMono node has non-RecordBufMono state");
   if (!st) {
     std::fill(out.begin(), out.end(), 0.0f);
-    g.buffer_invalid_write_count +=
-        static_cast<long long>(nframes);
+    g.buffer_invalid_write_count += static_cast<long long>(nframes);
     return;
   }
 
-  const auto sig_in =
-      resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-  const auto loop_in =
-      resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const double sig_default  = node.controls[1];
+  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const auto loop_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const double sig_default = node.controls[1];
   const double loop_default = node.controls[2];
 
   // §6.C.2 contract: buffer_id is frozen at instance reset.
@@ -4979,17 +5072,15 @@ static void process_record_buf_mono(
   float *samples = nullptr;
   std::size_t samples_size = 0;
   if (bid_in_range) {
-    auto &candidate =
-        g.buffers[static_cast<std::size_t>(bid)];
-    if (candidate.state.load(std::memory_order_acquire)
-          == BufferSlotState::Allocated
-        && !candidate.samples.empty()) {
-      samples      = candidate.samples.data();
+    auto &candidate = g.buffers[static_cast<std::size_t>(bid)];
+    if (candidate.state.load(std::memory_order_acquire) == BufferSlotState::Allocated &&
+        !candidate.samples.empty()) {
+      samples = candidate.samples.data();
       samples_size = candidate.samples.size();
     }
   }
 
-  long long valid_samples   = 0;
+  long long valid_samples = 0;
   long long invalid_samples = 0;
 
   for (int i = 0; i < nframes; ++i) {
@@ -4998,10 +5089,7 @@ static void process_record_buf_mono(
     // Pass-through is unconditional: producer-visible monitor
     // signal does not depend on whether the buffer is
     // writable.
-    const float sig =
-        sig_in.empty()
-          ? static_cast<float>(sig_default)
-          : sig_in[fi];
+    const float sig = sig_in.empty() ? static_cast<float>(sig_default) : sig_in[fi];
     out[fi] = sig;
 
     if (samples == nullptr) {
@@ -5010,15 +5098,13 @@ static void process_record_buf_mono(
     }
 
     const double loop_raw =
-        loop_in.empty() ? loop_default
-                        : static_cast<double>(loop_in[fi]);
+        loop_in.empty() ? loop_default : static_cast<double>(loop_in[fi]);
     const bool looping = std::isfinite(loop_raw) && loop_raw >= 0.5;
 
     // Boundary check before write so a head sitting exactly at
     // frame_count either wraps (looping) or goes invalid
     // (one-shot) on this sample, not the next.
-    if (st->write_head < 0
-        || static_cast<std::size_t>(st->write_head) >= samples_size) {
+    if (st->write_head < 0 || static_cast<std::size_t>(st->write_head) >= samples_size) {
       if (looping) {
         st->write_head = 0;
       } else {
@@ -5032,7 +5118,7 @@ static void process_record_buf_mono(
     ++valid_samples;
   }
 
-  g.buffer_write_count         += valid_samples;
+  g.buffer_write_count += valid_samples;
   g.buffer_invalid_write_count += invalid_samples;
 }
 
@@ -5073,7 +5159,7 @@ static void process_record_buf_mono(
 // hop`. We precompute it once at construction.
 namespace {
 
-constexpr int kSpectralFreezeN   = SpectralFreezeState::kN;
+constexpr int kSpectralFreezeN = SpectralFreezeState::kN;
 constexpr int kSpectralFreezeHop = SpectralFreezeState::kHop;
 
 // Hann window of length N, computed at static-init time.
@@ -5096,8 +5182,7 @@ struct HannWindow {
   HannWindow() {
     constexpr double pi = 3.14159265358979323846;
     for (int i = 0; i < kSpectralFreezeN; ++i) {
-      const double w =
-          0.5 * (1.0 - std::cos(2.0 * pi * i / (kSpectralFreezeN - 1)));
+      const double w = 0.5 * (1.0 - std::cos(2.0 * pi * i / (kSpectralFreezeN - 1)));
       data[static_cast<std::size_t>(i)] = static_cast<float>(w);
       sum_of_squares += w * w;
     }
@@ -5136,10 +5221,8 @@ const double kSpectralResynthesisScale =
 } // namespace
 
 static void process_spectral_freeze(
-    RTGraph &g,
-    GraphInstance &inst,
-    std::size_t node_idx,
-    int nframes) noexcept {
+    RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
   auto &node = inst.nodes[node_idx];
   auto out = output_span(node, PortIndex{0}, nframes);
 
@@ -5150,16 +5233,14 @@ static void process_spectral_freeze(
     return;
   }
 
-  const auto sig_in =
-      resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-  const auto freeze_in =
-      resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const double sig_default    = node.controls[0];
+  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const auto freeze_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const double sig_default = node.controls[0];
   const double freeze_default = node.controls[1];
 
-  constexpr int kN     = kSpectralFreezeN;
-  constexpr int kHop   = kSpectralFreezeHop;
-  constexpr int kBins  = kN / 2 + 1;  // unique real-FFT bins
+  constexpr int kN = kSpectralFreezeN;
+  constexpr int kHop = kSpectralFreezeHop;
+  constexpr int kBins = kN / 2 + 1; // unique real-FFT bins
   // kHannWindow / kSpectralResynthesisScale are namespace-scope
   // constants initialized before the audio callback can invoke
   // this kernel, so the audio thread never pays the table-build
@@ -5168,16 +5249,13 @@ static void process_spectral_freeze(
   const float scale = static_cast<float>(kSpectralResynthesisScale);
 
   long long analysis_ticks = 0;
-  long long resynth_ticks  = 0;
+  long long resynth_ticks = 0;
 
   for (int fi = 0; fi < nframes; ++fi) {
-    const float in_sample =
-        sig_in.empty() ? static_cast<float>(sig_default)
-                       : sig_in[fi];
+    const float in_sample = sig_in.empty() ? static_cast<float>(sig_default) : sig_in[fi];
 
     // 1. Write into input ring.
-    st->input_ring[static_cast<std::size_t>(st->input_write_head)] =
-        in_sample;
+    st->input_ring[static_cast<std::size_t>(st->input_write_head)] = in_sample;
     st->input_write_head = (st->input_write_head + 1) % kN;
 
     // 2. Read from output ring, then zero the slot (so the
@@ -5193,9 +5271,9 @@ static void process_spectral_freeze(
     ++st->samples_in;
     ++st->samples_out;
 
-    const bool hop_boundary = (st->samples_in % kHop) == 0
-                            && st->samples_in >= kN;
-    if (!hop_boundary) continue;
+    const bool hop_boundary = (st->samples_in % kHop) == 0 && st->samples_in >= kN;
+    if (!hop_boundary)
+      continue;
 
     // ---- Hop-boundary processing ----
     //
@@ -5218,10 +5296,8 @@ static void process_spectral_freeze(
     // when nothing is wired.
     {
       const double freeze_raw =
-          freeze_in.empty() ? freeze_default
-                            : static_cast<double>(freeze_in[fi]);
-      const bool freezing =
-          std::isfinite(freeze_raw) && freeze_raw >= 0.5;
+          freeze_in.empty() ? freeze_default : static_cast<double>(freeze_in[fi]);
+      const bool freezing = std::isfinite(freeze_raw) && freeze_raw >= 0.5;
 
       auto &spec = st->spectrum_work;
 
@@ -5230,11 +5306,9 @@ static void process_spectral_freeze(
         const int start = st->input_write_head;
         for (int i = 0; i < kN; ++i) {
           const int src_idx = (start + i) % kN;
-          const float sample =
-              st->input_ring[static_cast<std::size_t>(src_idx)];
-          const float w =
-              win.data[static_cast<std::size_t>(i)];
-          spec[static_cast<std::size_t>(2 * i)]     = sample * w;
+          const float sample = st->input_ring[static_cast<std::size_t>(src_idx)];
+          const float w = win.data[static_cast<std::size_t>(i)];
+          spec[static_cast<std::size_t>(2 * i)] = sample * w;
           spec[static_cast<std::size_t>(2 * i + 1)] = 0.0f;
         }
         cycfi::q::fft<static_cast<std::size_t>(kN)>(spec.data());
@@ -5301,35 +5375,73 @@ static void process_spectral_freeze(
       const int add_start = st->output_read_head;
       for (int i = 0; i < kN; ++i) {
         const int dst = (add_start + i) % kN;
-        const float w =
-            win.data[static_cast<std::size_t>(i)];
-        const float reconstructed =
-            spec[static_cast<std::size_t>(2 * i)];  // real part
-        st->output_ring[static_cast<std::size_t>(dst)] +=
-            reconstructed * w * scale;
+        const float w = win.data[static_cast<std::size_t>(i)];
+        const float reconstructed = spec[static_cast<std::size_t>(2 * i)]; // real part
+        st->output_ring[static_cast<std::size_t>(dst)] += reconstructed * w * scale;
       }
     }
   }
 
-  g.spectral_analysis_count    += analysis_ticks;
+  g.spectral_analysis_count += analysis_ticks;
   g.spectral_resynthesis_count += resynth_ticks;
 }
 
 static void process_static_plugin(
-    RTGraph &,
-    GraphInstance &inst,
-    std::size_t i,
-    int nframes
+    RTGraph &g, GraphInstance &inst, std::size_t i, int nframes
 ) noexcept {
   auto &node = inst.nodes[i];
   auto out = output_span(node, PortIndex{0}, nframes);
-  if (out.empty()) return;
+  if (out.empty())
+    return;
 
-  // §6.E slice 1 is a host skeleton: it validates shape, freezes the
-  // plugin id at instance reset, and produces deterministic silence.
-  // Slice 2 replaces this body with registry dispatch into the
-  // Identity plugin and introduces call/error counters.
-  std::fill(out.begin(), out.end(), 0.0f);
+  // §6.E slice 2: dispatch into the registered plugin's process callback. The
+  // host owns shape validation and counter ticks; the plugin owns the
+  // per-sample DSP.
+  //
+  // Skeleton fallback: an unresolved plugin_id (no spec frozen at
+  // configure_node, missing process callback, or shape that doesn't match the
+  // kind's fixed Identity profile) emits silence without ticking either
+  // counter. Validation rejects unknown plugin names on the Haskell side, so
+  // the fallback is a defensive last line — a counter tick here would be
+  // misleading because no plugin call was attempted.
+  auto *st = std::get_if<StaticPluginState>(&node.state);
+  if (st == nullptr || st->spec == nullptr || st->spec->process == nullptr ||
+      st->spec->audio_in_count != 2 || st->spec->audio_out_count != 1) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  // Resolve the two audio inputs. The fixed Identity profile pins exactly two
+  // PortSampleAccurate audio inputs at ports 0 and 1. An empty span means
+  // "input unwired"; we pass nullptr so the plugin can treat the missing
+  // channel as zero (Identity does exactly that). Control slot 0 is the frozen
+  // plugin_id metadata and is not a plugin parameter.
+  const auto in0 = resolve_input(g, inst, i, PortIndex{0}, nframes);
+  const auto in1 = resolve_input(g, inst, i, PortIndex{1}, nframes);
+
+  const float *inputs[2] = {
+      in0.empty() ? nullptr : in0.data(),
+      in1.empty() ? nullptr : in1.data(),
+  };
+  float *outputs[1] = {out.data()};
+
+  // The plugin state pointer is null for v1 Identity (state_size_bytes = 0).
+  // Stateful plugins will plumb a per-instance state buffer through
+  // StaticPluginState in a later slice; for now, the contract is "process never
+  // reads through a null state when the spec declared zero state bytes."
+  const int rc = st->spec->process(
+      /*state=*/nullptr, nframes, inputs, outputs
+  );
+
+  ++g.plugin_call_count;
+
+  if (rc != 0) {
+    // §2.2 design contract: non-zero return means "abort this block for this
+    // kernel." Emit silence and tick the diagnostic counter. The instance is
+    // not deactivated; later policy (kill-on-N-errors) is the Q-3 follow-up.
+    ++g.invalid_plugin_call_count;
+    std::fill(out.begin(), out.end(), 0.0f);
+  }
 }
 
 /* Note [Execution order]
@@ -5410,8 +5522,8 @@ attempt to be a unified region kernel runner.
 // read-modify-write of inst.block_sink_peak, with the same
 // silent-no-op behavior on an invalid bus.
 struct SinkAccumulator {
-  BusWriteTarget target;  // invalid when the bus index was invalid
-  float peak;             // running max(|sample|) for this block
+  BusWriteTarget target; // invalid when the bus index was invalid
+  float peak;            // running max(|sample|) for this block
 
   // Validate the bus index and snapshot the per-instance running
   // peak. process_instance reset block_sink_peak to 0 before this
@@ -5423,13 +5535,16 @@ struct SinkAccumulator {
   // routing for the per-frame add path. nframes is forwarded so
   // the reduction opener can zero exactly the active range of the
   // slot's frame buffer for this block.
-  static SinkAccumulator open(RTGraph &g, GraphInstance &inst,
-                              double bus_control,
-                              int writer_slot, int nframes,
-                              BusWriteMode mode) noexcept {
+  static SinkAccumulator open(
+      RTGraph &g,
+      GraphInstance &inst,
+      double bus_control,
+      int writer_slot,
+      int nframes,
+      BusWriteMode mode
+  ) noexcept {
     assert(writer_slot >= 0);
-    auto target = open_bus_write_target(g, mode, bus_control,
-                                         writer_slot, nframes);
+    auto target = open_bus_write_target(g, mode, bus_control, writer_slot, nframes);
     if (!target.valid()) {
       return SinkAccumulator{target, 0.0f};
     }
@@ -5442,7 +5557,8 @@ struct SinkAccumulator {
     if (target.valid()) {
       target.add(fi, s);
       const float a = std::fabs(s);
-      if (a > peak) peak = a;
+      if (a > peak)
+        peak = a;
     }
   }
 
@@ -5450,7 +5566,8 @@ struct SinkAccumulator {
   // invalid bus so the rejected-bus path cannot stomp a peak that
   // a sibling kernel had already recorded.
   inline void flush_to(GraphInstance &inst) const noexcept {
-    if (target.valid()) inst.block_sink_peak = peak;
+    if (target.valid())
+      inst.block_sink_peak = peak;
   }
 };
 
@@ -5482,8 +5599,7 @@ static inline void drive_oscillator(
   if (!freq_in.empty()) {
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
-      const double freq = sanitize_finite(
-          static_cast<double>(freq_in[fi]), 0.0);
+      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
       osc.phase_iter.set(q::frequency{freq}, g.sample_rate);
       const float sample = wave_fn(osc.phase_iter++);
       body(fi, sample);
@@ -5535,38 +5651,42 @@ region tag was committed), the dispatch site falls back to per-node
 iteration. Silent degradation is preferred to silencing.
 */
 static void process_region_saw_lpf_gain(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t saw_idx, std::size_t lpf_idx, std::size_t gain_idx,
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t saw_idx,
+    std::size_t lpf_idx,
+    std::size_t gain_idx,
     int nframes
 ) noexcept {
-  auto &saw_node  = inst.nodes[saw_idx];
-  auto &lpf_node  = inst.nodes[lpf_idx];
+  auto &saw_node = inst.nodes[saw_idx];
+  auto &lpf_node = inst.nodes[lpf_idx];
   auto &gain_node = inst.nodes[gain_idx];
 
   auto out = output_span(gain_node, PortIndex{0}, nframes);
 
   // Saw freq input. May be RFrom (audio-rate FM) or unwired
   // (constant from controls[0]). Mirrors process_sawosc.
-  const auto saw_freq_in =
-      resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
+  const auto saw_freq_in = resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
 
   // LPF freq + q inputs. Block-rate latch at sample 0, mirroring
   // process_lpf so reconfigure-on-change semantics agree across
   // fused / unfused paths.
-  const auto lpf_freq_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
-  const auto lpf_q_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+  const auto lpf_freq_in = resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in = resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
 
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double lpf_freq = sanitize_finite_clamp(
-      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
-                           : lpf_node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0]) : lpf_node.controls[0],
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double lpf_q = sanitize_finite_clamp(
-      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
-                        : lpf_node.controls[1],
-      kQMin, kQMax, kQFallback);
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0]) : lpf_node.controls[1],
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *osc = std::get_if<OscState>(&saw_node.state);
   auto *lpf = std::get_if<LPFState>(&lpf_node.state);
@@ -5578,22 +5698,28 @@ static void process_region_saw_lpf_gain(
   if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
     lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
     lpf->last_freq = lpf_freq;
-    lpf->last_q    = lpf_q;
+    lpf->last_q = lpf_q;
   }
 
-  const float gain_amount = sanitize_finite(
-      static_cast<float>(gain_node.controls[0]), 1.0f);
+  const float gain_amount =
+      sanitize_finite(static_cast<float>(gain_node.controls[0]), 1.0f);
 
   // Buffer-terminal: write each per-sample product to the gain's
   // output buffer for sibling regions to read. drive_oscillator
   // handles the audio-rate vs block-rate freq branch and the
   // phase-iterator advance; the body inlines the LPF + gain step.
-  drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
-                   nframes, q::saw,
-    [&](std::size_t fi, float saw_sample) noexcept {
-      const float lpf_sample = lpf->filter(saw_sample);
-      out[fi] = lpf_sample * gain_amount;
-    });
+  drive_oscillator(
+      g,
+      *osc,
+      saw_freq_in,
+      saw_node.controls[0],
+      nframes,
+      q::saw,
+      [&](std::size_t fi, float saw_sample) noexcept {
+        const float lpf_sample = lpf->filter(saw_sample);
+        out[fi] = lpf_sample * gain_amount;
+      }
+  );
 }
 
 /* Note [Region kernel: SinGainOut]
@@ -5644,9 +5770,14 @@ per-node iteration. Same silent-degradation discipline as
 SawLpfGain.
 */
 static void process_region_sin_gain_out(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t sin_idx, std::size_t gain_idx, std::size_t out_idx,
-    int nframes, int writer_slot, BusWriteMode mode
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t sin_idx,
+    std::size_t gain_idx,
+    std::size_t out_idx,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode
 ) noexcept {
   // Writer slot is reserved at the dispatch boundary unconditionally
   // (process_instance, before this call). Asserting here so an
@@ -5655,14 +5786,13 @@ static void process_region_sin_gain_out(
   // is Reduction.
   assert(writer_slot >= 0);
 
-  auto &sin_node  = inst.nodes[sin_idx];
+  auto &sin_node = inst.nodes[sin_idx];
   auto &gain_node = inst.nodes[gain_idx];
-  auto &out_node  = inst.nodes[out_idx];
+  auto &out_node = inst.nodes[out_idx];
 
   // Sin freq input. May be RFrom (audio-rate FM) or unwired
   // (constant from controls[0]). Mirrors process_sinosc.
-  const auto sin_freq_in =
-      resolve_input(g, inst, sin_idx, PortIndex{0}, nframes);
+  const auto sin_freq_in = resolve_input(g, inst, sin_idx, PortIndex{0}, nframes);
 
   auto *osc = std::get_if<OscState>(&sin_node.state);
   if (!osc) {
@@ -5676,20 +5806,26 @@ static void process_region_sin_gain_out(
   // Sanitize the gain control once per block. Audio-rate gain is
   // disallowed at the Haskell match level, so this scalar value
   // is the only path to compute the per-sample product.
-  const float gain_amount = sanitize_finite(
-      static_cast<float>(gain_node.controls[0]), 1.0f);
+  const float gain_amount =
+      sanitize_finite(static_cast<float>(gain_node.controls[0]), 1.0f);
 
   // Sink-terminal: open the bus accumulator (validates the Out
   // node's bus index in the double domain, snapshots the
   // running peak), drive the sin osc, push each per-sample
   // product, then flush the running peak back to the instance.
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
-                                    writer_slot, nframes, mode);
-  drive_oscillator(g, *osc, sin_freq_in, sin_node.controls[0],
-                   nframes, q::sin,
-    [&](std::size_t fi, float sin_sample) noexcept {
-      sink.push(fi, sin_sample * gain_amount);
-    });
+  auto sink =
+      SinkAccumulator::open(g, inst, out_node.controls[0], writer_slot, nframes, mode);
+  drive_oscillator(
+      g,
+      *osc,
+      sin_freq_in,
+      sin_node.controls[0],
+      nframes,
+      q::sin,
+      [&](std::size_t fi, float sin_sample) noexcept {
+        sink.push(fi, sin_sample * gain_amount);
+      }
+  );
   sink.flush_to(inst);
 }
 
@@ -5714,18 +5850,22 @@ per-node iteration. Same silent-degradation discipline as the
 other §4.B kernels.
 */
 static void process_region_saw_gain_out(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t saw_idx, std::size_t gain_idx, std::size_t out_idx,
-    int nframes, int writer_slot, BusWriteMode mode
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t saw_idx,
+    std::size_t gain_idx,
+    std::size_t out_idx,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode
 ) noexcept {
   assert(writer_slot >= 0);
 
-  auto &saw_node  = inst.nodes[saw_idx];
+  auto &saw_node = inst.nodes[saw_idx];
   auto &gain_node = inst.nodes[gain_idx];
-  auto &out_node  = inst.nodes[out_idx];
+  auto &out_node = inst.nodes[out_idx];
 
-  const auto saw_freq_in =
-      resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
+  const auto saw_freq_in = resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
 
   auto *osc = std::get_if<OscState>(&saw_node.state);
   if (!osc) {
@@ -5735,16 +5875,22 @@ static void process_region_saw_gain_out(
     return;
   }
 
-  const float gain_amount = sanitize_finite(
-      static_cast<float>(gain_node.controls[0]), 1.0f);
+  const float gain_amount =
+      sanitize_finite(static_cast<float>(gain_node.controls[0]), 1.0f);
 
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
-                                    writer_slot, nframes, mode);
-  drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
-                   nframes, q::saw,
-    [&](std::size_t fi, float saw_sample) noexcept {
-      sink.push(fi, saw_sample * gain_amount);
-    });
+  auto sink =
+      SinkAccumulator::open(g, inst, out_node.controls[0], writer_slot, nframes, mode);
+  drive_oscillator(
+      g,
+      *osc,
+      saw_freq_in,
+      saw_node.controls[0],
+      nframes,
+      q::saw,
+      [&](std::size_t fi, float saw_sample) noexcept {
+        sink.push(fi, saw_sample * gain_amount);
+      }
+  );
   sink.flush_to(inst);
 }
 
@@ -5781,15 +5927,20 @@ per-node iteration. Same silent-degradation discipline as the
 other §4.B kernels.
 */
 static void process_region_noise_gain_out(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t noise_idx, std::size_t gain_idx, std::size_t out_idx,
-    int nframes, int writer_slot, BusWriteMode mode
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t noise_idx,
+    std::size_t gain_idx,
+    std::size_t out_idx,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode
 ) noexcept {
   assert(writer_slot >= 0);
 
   auto &noise_node = inst.nodes[noise_idx];
-  auto &gain_node  = inst.nodes[gain_idx];
-  auto &out_node   = inst.nodes[out_idx];
+  auto &gain_node = inst.nodes[gain_idx];
+  auto &out_node = inst.nodes[out_idx];
 
   auto *noisegen = std::get_if<NoiseGenState>(&noise_node.state);
   if (!noisegen) {
@@ -5798,11 +5949,11 @@ static void process_region_noise_gain_out(
     return;
   }
 
-  const float gain_amount = sanitize_finite(
-      static_cast<float>(gain_node.controls[0]), 1.0f);
+  const float gain_amount =
+      sanitize_finite(static_cast<float>(gain_node.controls[0]), 1.0f);
 
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
-                                    writer_slot, nframes, mode);
+  auto sink =
+      SinkAccumulator::open(g, inst, out_node.controls[0], writer_slot, nframes, mode);
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
     // Mirror process_noisegen exactly: pull one PRNG sample,
@@ -5852,35 +6003,41 @@ iteration — silent degradation discipline shared with the other
 kernels.
 */
 static void process_region_saw_lpf_gain_out(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t saw_idx, std::size_t lpf_idx,
-    std::size_t gain_idx, std::size_t out_idx,
-    int nframes, int writer_slot, BusWriteMode mode
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t saw_idx,
+    std::size_t lpf_idx,
+    std::size_t gain_idx,
+    std::size_t out_idx,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode
 ) noexcept {
   assert(writer_slot >= 0);
 
-  auto &saw_node  = inst.nodes[saw_idx];
-  auto &lpf_node  = inst.nodes[lpf_idx];
+  auto &saw_node = inst.nodes[saw_idx];
+  auto &lpf_node = inst.nodes[lpf_idx];
   auto &gain_node = inst.nodes[gain_idx];
-  auto &out_node  = inst.nodes[out_idx];
+  auto &out_node = inst.nodes[out_idx];
 
   // Saw freq, LPF freq/q — same resolution as the 3-node kernel.
-  const auto saw_freq_in =
-      resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
-  const auto lpf_freq_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
-  const auto lpf_q_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+  const auto saw_freq_in = resolve_input(g, inst, saw_idx, PortIndex{0}, nframes);
+  const auto lpf_freq_in = resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in = resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
 
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double lpf_freq = sanitize_finite_clamp(
-      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
-                           : lpf_node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0]) : lpf_node.controls[0],
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double lpf_q = sanitize_finite_clamp(
-      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
-                        : lpf_node.controls[1],
-      kQMin, kQMax, kQFallback);
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0]) : lpf_node.controls[1],
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *osc = std::get_if<OscState>(&saw_node.state);
   auto *lpf = std::get_if<LPFState>(&lpf_node.state);
@@ -5893,25 +6050,31 @@ static void process_region_saw_lpf_gain_out(
   if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
     lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
     lpf->last_freq = lpf_freq;
-    lpf->last_q    = lpf_q;
+    lpf->last_q = lpf_q;
   }
 
-  const float gain_amount = sanitize_finite(
-      static_cast<float>(gain_node.controls[0]), 1.0f);
+  const float gain_amount =
+      sanitize_finite(static_cast<float>(gain_node.controls[0]), 1.0f);
 
   // Sink-terminal: open the bus accumulator, drive the saw osc,
   // run the LPF + gain step inline (the LPF state stays
   // hand-written; the freq/q latch above is filter-specific
   // setup that intentionally doesn't live in the helpers), and
   // flush the running peak back to the instance.
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
-                                    writer_slot, nframes, mode);
-  drive_oscillator(g, *osc, saw_freq_in, saw_node.controls[0],
-                   nframes, q::saw,
-    [&](std::size_t fi, float saw_sample) noexcept {
-      const float lpf_sample = lpf->filter(saw_sample);
-      sink.push(fi, lpf_sample * gain_amount);
-    });
+  auto sink =
+      SinkAccumulator::open(g, inst, out_node.controls[0], writer_slot, nframes, mode);
+  drive_oscillator(
+      g,
+      *osc,
+      saw_freq_in,
+      saw_node.controls[0],
+      nframes,
+      q::saw,
+      [&](std::size_t fi, float saw_sample) noexcept {
+        const float lpf_sample = lpf->filter(saw_sample);
+        sink.push(fi, lpf_sample * gain_amount);
+      }
+  );
   sink.flush_to(inst);
 }
 
@@ -5959,17 +6122,22 @@ use BusInDelayed at the source level — the BusInDelayed → LPF →
 Gain → sink shape would be a separate kernel (no candidate today).
 */
 static void process_region_busin_lpf_gain_out(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t busin_idx, std::size_t lpf_idx,
-    std::size_t gain_idx, std::size_t out_idx,
-    int nframes, int writer_slot, BusWriteMode mode
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t busin_idx,
+    std::size_t lpf_idx,
+    std::size_t gain_idx,
+    std::size_t out_idx,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode
 ) noexcept {
   assert(writer_slot >= 0);
 
   auto &busin_node = inst.nodes[busin_idx];
-  auto &lpf_node   = inst.nodes[lpf_idx];
-  auto &gain_node  = inst.nodes[gain_idx];
-  auto &out_node   = inst.nodes[out_idx];
+  auto &lpf_node = inst.nodes[lpf_idx];
+  auto &gain_node = inst.nodes[gain_idx];
+  auto &out_node = inst.nodes[out_idx];
 
   // Source bus resolution. An invalid 'busin.bus' must NOT
   // short-circuit the kernel: process_busin's contract on an
@@ -5988,35 +6156,33 @@ static void process_region_busin_lpf_gain_out(
   // The compiler hoists the branch past the loop body either
   // way; written as two loops here for reading-order obviousness.
   const double busin_bus_d = busin_node.controls[0];
-  const double busin_bus_lim =
-      static_cast<double>(world(g).server.output_buses.size());
+  const double busin_bus_lim = static_cast<double>(world(g).server.output_buses.size());
   const float *src_data = nullptr;
-  if (std::isfinite(busin_bus_d)
-      && busin_bus_d >= 0.0
-      && busin_bus_d < busin_bus_lim) {
+  if (std::isfinite(busin_bus_d) && busin_bus_d >= 0.0 && busin_bus_d < busin_bus_lim) {
     const int busin_bus = static_cast<int>(busin_bus_d);
-    src_data =
-        world(g).server.output_buses[static_cast<std::size_t>(busin_bus)].data();
+    src_data = world(g).server.output_buses[static_cast<std::size_t>(busin_bus)].data();
   }
 
   // LPF freq/q resolution + block-rate latch. Identical to
   // RSawLpfGainOut — the LPF state machine doesn't care what feeds
   // its signal port, just that freq/q reach the right q::lowpass
   // configure call.
-  const auto lpf_freq_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
-  const auto lpf_q_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+  const auto lpf_freq_in = resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in = resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
 
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double lpf_freq = sanitize_finite_clamp(
-      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
-                           : lpf_node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0]) : lpf_node.controls[0],
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double lpf_q = sanitize_finite_clamp(
-      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
-                        : lpf_node.controls[1],
-      kQMin, kQMax, kQFallback);
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0]) : lpf_node.controls[1],
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *lpf = std::get_if<LPFState>(&lpf_node.state);
   if (!lpf) {
@@ -6029,11 +6195,11 @@ static void process_region_busin_lpf_gain_out(
   if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
     lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
     lpf->last_freq = lpf_freq;
-    lpf->last_q    = lpf_q;
+    lpf->last_q = lpf_q;
   }
 
-  const float gain_amount = sanitize_finite(
-      static_cast<float>(gain_node.controls[0]), 1.0f);
+  const float gain_amount =
+      sanitize_finite(static_cast<float>(gain_node.controls[0]), 1.0f);
 
   // Sink-terminal accumulate. No 'drive_oscillator' here — there's
   // no oscillator to drive; the source is a bus read. Two loops to
@@ -6042,8 +6208,8 @@ static void process_region_busin_lpf_gain_out(
   // sample into the SinkAccumulator (so 'block_sink_peak' tracks
   // the LPF's transient response on a fresh-state filter just as
   // process_lpf + process_out would have).
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
-                                    writer_slot, nframes, mode);
+  auto sink =
+      SinkAccumulator::open(g, inst, out_node.controls[0], writer_slot, nframes, mode);
   if (src_data != nullptr) {
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
@@ -6106,17 +6272,22 @@ itself imposes (sink writes go through SinkAccumulator into
 output_buses[bus]).
 */
 static void process_region_noise_lpf_gain_out(
-    RTGraph &g, GraphInstance &inst,
-    std::size_t noise_idx, std::size_t lpf_idx,
-    std::size_t gain_idx, std::size_t out_idx,
-    int nframes, int writer_slot, BusWriteMode mode
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t noise_idx,
+    std::size_t lpf_idx,
+    std::size_t gain_idx,
+    std::size_t out_idx,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode
 ) noexcept {
   assert(writer_slot >= 0);
 
   auto &noise_node = inst.nodes[noise_idx];
-  auto &lpf_node   = inst.nodes[lpf_idx];
-  auto &gain_node  = inst.nodes[gain_idx];
-  auto &out_node   = inst.nodes[out_idx];
+  auto &lpf_node = inst.nodes[lpf_idx];
+  auto &gain_node = inst.nodes[gain_idx];
+  auto &out_node = inst.nodes[out_idx];
 
   // PRNG state. Mirrors RNoiseGainOut: silent no-op on a missing
   // generator (no PRNG to pull, can't produce samples). Sink-bus
@@ -6132,20 +6303,22 @@ static void process_region_noise_lpf_gain_out(
   // RSawLpfGainOut and RBusInLpfGainOut — the LPF state machine
   // doesn't care what feeds its signal port, just that freq/q
   // reach the right q::lowpass configure call.
-  const auto lpf_freq_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
-  const auto lpf_q_in =
-      resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
+  const auto lpf_freq_in = resolve_input(g, inst, lpf_idx, PortIndex{1}, nframes);
+  const auto lpf_q_in = resolve_input(g, inst, lpf_idx, PortIndex{2}, nframes);
 
   const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
   const double lpf_freq = sanitize_finite_clamp(
-      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0])
-                           : lpf_node.controls[0],
-      0.0, max_freq, kFreqFallbackHz);
+      !lpf_freq_in.empty() ? static_cast<double>(lpf_freq_in[0]) : lpf_node.controls[0],
+      0.0,
+      max_freq,
+      kFreqFallbackHz
+  );
   const double lpf_q = sanitize_finite_clamp(
-      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0])
-                        : lpf_node.controls[1],
-      kQMin, kQMax, kQFallback);
+      !lpf_q_in.empty() ? static_cast<double>(lpf_q_in[0]) : lpf_node.controls[1],
+      kQMin,
+      kQMax,
+      kQFallback
+  );
 
   auto *lpf = std::get_if<LPFState>(&lpf_node.state);
   if (!lpf) {
@@ -6155,17 +6328,17 @@ static void process_region_noise_lpf_gain_out(
   if (lpf_freq != lpf->last_freq || lpf_q != lpf->last_q) {
     lpf->filter.config(q::frequency{lpf_freq}, g.sample_rate, lpf_q);
     lpf->last_freq = lpf_freq;
-    lpf->last_q    = lpf_q;
+    lpf->last_q = lpf_q;
   }
 
-  const float gain_amount = sanitize_finite(
-      static_cast<float>(gain_node.controls[0]), 1.0f);
+  const float gain_amount =
+      sanitize_finite(static_cast<float>(gain_node.controls[0]), 1.0f);
 
   // Sink-terminal accumulate. PRNG pull + recenter per sample,
   // identical to process_noisegen, then through the LPF + scalar
   // gain before SinkAccumulator handles bus + block_sink_peak.
-  auto sink = SinkAccumulator::open(g, inst, out_node.controls[0],
-                                    writer_slot, nframes, mode);
+  auto sink =
+      SinkAccumulator::open(g, inst, out_node.controls[0], writer_slot, nframes, mode);
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
     const float noise_sample = noisegen->noise() - 1.0f;
@@ -6197,9 +6370,7 @@ static void process_region_noise_lpf_gain_out(
 //   * else flip to Releasing and reset silent_blocks.
 //
 // No allocation. Safe to call from the audio thread.
-static void apply_instance_release(
-    RTGraph &g, GraphInstance &inst
-) noexcept {
+static void apply_instance_release(RTGraph &g, GraphInstance &inst) noexcept {
   const MetaDef *def = template_at(g, inst.template_id);
   if (!def) {
     // Defensive: template gone — nothing sensible to do but free.
@@ -6240,30 +6411,31 @@ static void apply_instance_release(
 //
 // No allocation. Safe to call from the audio thread.
 static void apply_instance_set_control(
-    RTGraph &g, GraphInstance &inst,
-    int node_index, int control_index, double value
+    RTGraph &g, GraphInstance &inst, int node_index, int control_index, double value
 ) noexcept {
   const MetaDef *def = template_at(g, inst.template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
   const NodeIndex ni{node_index};
   const ControlIndex ci{control_index};
-  if (!valid(ni) || !valid(ci)) return;
+  if (!valid(ni) || !valid(ci))
+    return;
 
   const std::size_t nidx = to_size(ni);
-  if (nidx >= def->nodes.size() || nidx >= inst.nodes.size()) return;
+  if (nidx >= def->nodes.size() || nidx >= inst.nodes.size())
+    return;
 
   const NodeSpec &spec = def->nodes[nidx];
   NodeInstanceState &node = inst.nodes[nidx];
   const std::size_t cidx = to_size(ci);
-  if (cidx >= node.controls.size()) return;
+  if (cidx >= node.controls.size())
+    return;
 
   node.controls[cidx] = value;
 
-  if (cidx == 1 && (spec.kind == NodeKind::SinOsc
-                    || spec.kind == NodeKind::SawOsc
-                    || spec.kind == NodeKind::PulseOsc
-                    || spec.kind == NodeKind::TriOsc)) {
+  if (cidx == 1 && (spec.kind == NodeKind::SinOsc || spec.kind == NodeKind::SawOsc ||
+                    spec.kind == NodeKind::PulseOsc || spec.kind == NodeKind::TriOsc)) {
     set_osc_initial_phase(node, value);
   }
 }
@@ -6297,14 +6469,13 @@ static void apply_instance_set_control(
 // Forward declaration: the helper itself lives next to make_instance
 // so its semantics sit alongside the other instance-init paths, but
 // prepare_reserved_slot needs to call it from earlier in the file.
-static void ensure_fused_scratch(
-    GraphInstance &inst, int slot_count, int max_frames);
+static void ensure_fused_scratch(GraphInstance &inst, int slot_count, int max_frames);
 
 static void prepare_reserved_slot(
     RTGraph &g, GraphInstance &slot, const MetaDef &def, int template_id
 ) {
-  slot.template_id    = template_id;
-  slot.silent_blocks  = 0;
+  slot.template_id = template_id;
+  slot.silent_blocks = 0;
   slot.block_sink_peak = 0.0f;
   slot.nodes.resize(def.nodes.size());
   for (std::size_t i = 0; i < def.nodes.size(); ++i) {
@@ -6331,7 +6502,8 @@ static bool enqueue_command(ControlQueue &q, const ControlCommand &cmd) noexcept
   // release-store at the bottom of drain_control_queue, so we see
   // freed slots once the audio thread has consumed them.
   const std::uint32_t r = q.read_idx.load(std::memory_order_acquire);
-  if (w - r >= kControlQueueCapacity) return false;
+  if (w - r >= kControlQueueCapacity)
+    return false;
   q.ring[w % kControlQueueCapacity] = cmd;
   // Release publish. After this store, the audio drain's acquire-
   // load on write_idx will see ring[w%cap] AND every write the
@@ -6353,57 +6525,61 @@ static bool enqueue_command(ControlQueue &q, const ControlCommand &cmd) noexcept
 // the audio path.
 
 static void apply_control_command(RTGraph &g, const ControlCommand &cmd) noexcept {
-  if (cmd.slot_id < 0) return;
+  if (cmd.slot_id < 0)
+    return;
   const std::size_t idx = static_cast<std::size_t>(cmd.slot_id);
-  if (idx >= world(g).instances.size()) return;
+  if (idx >= world(g).instances.size())
+    return;
   GraphInstance &inst = world(g).instances[idx];
 
   switch (cmd.kind) {
-    case ControlCommand::Kind::Activate: {
-      // Guarded Reserved → Active. CAS so we don't blindly publish
-      // a slot whose state isn't what the producer thought it was
-      // (caller bug, external race, or producer cancellation
-      // between enqueue and drain). The release-success ordering
-      // makes the slot's prepared contents visible to subsequent
-      // process_graph block iterations via their state.load(acquire).
-      // (The queue's own release/acquire pair already published the
-      // contents to *this* drain — see Note [A.2: realtime control
-      // queue].)
-      SlotState expected = SlotState::Reserved;
-      (void) inst.state.compare_exchange_strong(
-          expected, SlotState::Active,
-          std::memory_order_release,
-          std::memory_order_relaxed);
+  case ControlCommand::Kind::Activate: {
+    // Guarded Reserved → Active. CAS so we don't blindly publish
+    // a slot whose state isn't what the producer thought it was
+    // (caller bug, external race, or producer cancellation
+    // between enqueue and drain). The release-success ordering
+    // makes the slot's prepared contents visible to subsequent
+    // process_graph block iterations via their state.load(acquire).
+    // (The queue's own release/acquire pair already published the
+    // contents to *this* drain — see Note [A.2: realtime control
+    // queue].)
+    SlotState expected = SlotState::Reserved;
+    (void)inst.state.compare_exchange_strong(
+        expected, SlotState::Active, std::memory_order_release, std::memory_order_relaxed
+    );
+    break;
+  }
+  case ControlCommand::Kind::Release: {
+    // Drain-path Release acts only on Active. Reserved is the
+    // producer's private state; Releasing is already in flight;
+    // Available is a no-op.
+    const SlotState s = inst.state.load();
+    if (s != SlotState::Active)
       break;
-    }
-    case ControlCommand::Kind::Release: {
-      // Drain-path Release acts only on Active. Reserved is the
-      // producer's private state; Releasing is already in flight;
-      // Available is a no-op.
-      const SlotState s = inst.state.load();
-      if (s != SlotState::Active) break;
-      apply_instance_release(g, inst);
+    apply_instance_release(g, inst);
+    break;
+  }
+  case ControlCommand::Kind::Remove: {
+    // Drain-path Remove acts on Active or Releasing. Hard-free
+    // a Reserved slot would yank the producer's claim; refuse.
+    const SlotState s = inst.state.load();
+    if (s != SlotState::Active && s != SlotState::Releasing)
       break;
-    }
-    case ControlCommand::Kind::Remove: {
-      // Drain-path Remove acts on Active or Releasing. Hard-free
-      // a Reserved slot would yank the producer's claim; refuse.
-      const SlotState s = inst.state.load();
-      if (s != SlotState::Active && s != SlotState::Releasing) break;
-      inst.state.store(SlotState::Available);
+    inst.state.store(SlotState::Available);
+    break;
+  }
+  case ControlCommand::Kind::SetControl: {
+    // Drain-path SetControl acts only on slots already in the
+    // audio schedule (Active or Releasing). Reserved slots
+    // receive their initial controls from the producer's pre-
+    // enqueue path (direct write to the producer-owned slot),
+    // not from the queue. Available is a no-op.
+    const SlotState s = inst.state.load();
+    if (s != SlotState::Active && s != SlotState::Releasing)
       break;
-    }
-    case ControlCommand::Kind::SetControl: {
-      // Drain-path SetControl acts only on slots already in the
-      // audio schedule (Active or Releasing). Reserved slots
-      // receive their initial controls from the producer's pre-
-      // enqueue path (direct write to the producer-owned slot),
-      // not from the queue. Available is a no-op.
-      const SlotState s = inst.state.load();
-      if (s != SlotState::Active && s != SlotState::Releasing) break;
-      apply_instance_set_control(g, inst, cmd.node_idx, cmd.control_idx, cmd.value);
-      break;
-    }
+    apply_instance_set_control(g, inst, cmd.node_idx, cmd.control_idx, cmd.value);
+    break;
+  }
   }
 }
 
@@ -6441,8 +6617,12 @@ static void drain_control_queue(RTGraph &g) noexcept {
 // process_instance loop so the region-iterating and flat-fallback
 // paths share one switch statement. See Note [Region fallback].
 static inline void dispatch_node(
-    RTGraph &g, GraphInstance &inst, std::size_t i, int nframes,
-    const NodeSpec &spec, BlockExecutionContext &ctx
+    RTGraph &g,
+    GraphInstance &inst,
+    std::size_t i,
+    int nframes,
+    const NodeSpec &spec,
+    BlockExecutionContext &ctx
 ) noexcept {
   switch (spec.kind) {
   case NodeKind::SinOsc:
@@ -6536,9 +6716,8 @@ static inline void begin_instance_block(GraphInstance &inst) noexcept {
   inst.block_sink_peak = 0.0f;
 }
 
-static inline void finish_instance_block(
-    GraphInstance &inst, SlotState state_at_block_start
-) noexcept {
+static inline void
+finish_instance_block(GraphInstance &inst, SlotState state_at_block_start) noexcept {
   // §2.E: if the slot is Releasing, drive the silence counter from
   // the peak that sink kernels recorded into block_sink_peak. Once
   // the counter crosses kReleaseSilenceBlocks, transition the slot
@@ -6564,7 +6743,8 @@ static void begin_global_schedule_instance_blocks(RTGraph &g) noexcept {
     inst.block_state_at_start = SlotState::Available;
 
     const SlotState s = inst.state.load();
-    if (!is_audio_scheduled_state(s)) continue;
+    if (!is_audio_scheduled_state(s))
+      continue;
 
     inst.block_lifecycle_active = true;
     inst.block_state_at_start = s;
@@ -6574,7 +6754,8 @@ static void begin_global_schedule_instance_blocks(RTGraph &g) noexcept {
 
 static void finish_global_schedule_instance_blocks(RTGraph &g) noexcept {
   for (GraphInstance &inst : world(g).instances) {
-    if (!inst.block_lifecycle_active) continue;
+    if (!inst.block_lifecycle_active)
+      continue;
 
     finish_instance_block(inst, inst.block_state_at_start);
     inst.block_lifecycle_active = false;
@@ -6583,8 +6764,12 @@ static void finish_global_schedule_instance_blocks(RTGraph &g) noexcept {
 }
 
 static void process_region(
-    RTGraph &g, const MetaDef &def, GraphInstance &inst,
-    const RegionSpec &r, int nframes, BlockExecutionContext &ctx
+    RTGraph &g,
+    const MetaDef &def,
+    GraphInstance &inst,
+    const RegionSpec &r,
+    int nframes,
+    BlockExecutionContext &ctx
 ) noexcept {
   const std::size_t node_count = std::min(def.nodes.size(), inst.nodes.size());
   const std::size_t first = static_cast<std::size_t>(r.first_node);
@@ -6595,102 +6780,125 @@ static void process_region(
   // to per-node iteration so a stale or misshapen tag silently
   // degrades rather than silencing the region.
   bool fused = false;
-  if (r.kernel == RegionKernel::SawLpfGain
-      && r.node_count == 3
-      && first + 3 <= node_count
-      && def.nodes[first    ].kind == NodeKind::SawOsc
-      && def.nodes[first + 1].kind == NodeKind::LPF
-      && def.nodes[first + 2].kind == NodeKind::Gain) {
-    process_region_saw_lpf_gain(g, inst, first, first + 1, first + 2,
-                                nframes);
+  if (r.kernel == RegionKernel::SawLpfGain && r.node_count == 3 &&
+      first + 3 <= node_count && def.nodes[first].kind == NodeKind::SawOsc &&
+      def.nodes[first + 1].kind == NodeKind::LPF &&
+      def.nodes[first + 2].kind == NodeKind::Gain) {
+    process_region_saw_lpf_gain(g, inst, first, first + 1, first + 2, nframes);
     fused = true;
-  } else if (r.kernel == RegionKernel::SinGainOut
-      && r.node_count == 3
-      && first + 3 <= node_count
-      && def.nodes[first    ].kind == NodeKind::SinOsc
-      && def.nodes[first + 1].kind == NodeKind::Gain
-      && is_sink_terminal(def.nodes[first + 2].kind)) {
+  } else if (
+      r.kernel == RegionKernel::SinGainOut && r.node_count == 3 &&
+      first + 3 <= node_count && def.nodes[first].kind == NodeKind::SinOsc &&
+      def.nodes[first + 1].kind == NodeKind::Gain &&
+      is_sink_terminal(def.nodes[first + 2].kind)
+  ) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    process_region_sin_gain_out(g, inst, first, first + 1, first + 2,
-                                nframes, writer_slot, ctx.bus_writes.mode);
+    process_region_sin_gain_out(
+        g, inst, first, first + 1, first + 2, nframes, writer_slot, ctx.bus_writes.mode
+    );
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     fused = true;
-  } else if (r.kernel == RegionKernel::SawLpfGainOut
-      && r.node_count == 4
-      && first + 4 <= node_count
-      && def.nodes[first    ].kind == NodeKind::SawOsc
-      && def.nodes[first + 1].kind == NodeKind::LPF
-      && def.nodes[first + 2].kind == NodeKind::Gain
-      && is_sink_terminal(def.nodes[first + 3].kind)) {
+  } else if (
+      r.kernel == RegionKernel::SawLpfGainOut && r.node_count == 4 &&
+      first + 4 <= node_count && def.nodes[first].kind == NodeKind::SawOsc &&
+      def.nodes[first + 1].kind == NodeKind::LPF &&
+      def.nodes[first + 2].kind == NodeKind::Gain &&
+      is_sink_terminal(def.nodes[first + 3].kind)
+  ) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    process_region_saw_lpf_gain_out(g, inst,
-                                    first, first + 1,
-                                    first + 2, first + 3,
-                                    nframes, writer_slot, ctx.bus_writes.mode);
+    process_region_saw_lpf_gain_out(
+        g,
+        inst,
+        first,
+        first + 1,
+        first + 2,
+        first + 3,
+        nframes,
+        writer_slot,
+        ctx.bus_writes.mode
+    );
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     fused = true;
-  } else if (r.kernel == RegionKernel::SawGainOut
-      && r.node_count == 3
-      && first + 3 <= node_count
-      && def.nodes[first    ].kind == NodeKind::SawOsc
-      && def.nodes[first + 1].kind == NodeKind::Gain
-      && is_sink_terminal(def.nodes[first + 2].kind)) {
+  } else if (
+      r.kernel == RegionKernel::SawGainOut && r.node_count == 3 &&
+      first + 3 <= node_count && def.nodes[first].kind == NodeKind::SawOsc &&
+      def.nodes[first + 1].kind == NodeKind::Gain &&
+      is_sink_terminal(def.nodes[first + 2].kind)
+  ) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    process_region_saw_gain_out(g, inst, first, first + 1, first + 2,
-                                nframes, writer_slot, ctx.bus_writes.mode);
+    process_region_saw_gain_out(
+        g, inst, first, first + 1, first + 2, nframes, writer_slot, ctx.bus_writes.mode
+    );
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     fused = true;
-  } else if (r.kernel == RegionKernel::NoiseGainOut
-      && r.node_count == 3
-      && first + 3 <= node_count
-      && def.nodes[first    ].kind == NodeKind::NoiseGen
-      && def.nodes[first + 1].kind == NodeKind::Gain
-      && is_sink_terminal(def.nodes[first + 2].kind)) {
+  } else if (
+      r.kernel == RegionKernel::NoiseGainOut && r.node_count == 3 &&
+      first + 3 <= node_count && def.nodes[first].kind == NodeKind::NoiseGen &&
+      def.nodes[first + 1].kind == NodeKind::Gain &&
+      is_sink_terminal(def.nodes[first + 2].kind)
+  ) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    process_region_noise_gain_out(g, inst, first, first + 1, first + 2,
-                                  nframes, writer_slot, ctx.bus_writes.mode);
+    process_region_noise_gain_out(
+        g, inst, first, first + 1, first + 2, nframes, writer_slot, ctx.bus_writes.mode
+    );
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     fused = true;
-  } else if (r.kernel == RegionKernel::BusInLpfGainOut
-      && r.node_count == 4
-      && first + 4 <= node_count
-      && def.nodes[first    ].kind == NodeKind::BusIn
-      && def.nodes[first + 1].kind == NodeKind::LPF
-      && def.nodes[first + 2].kind == NodeKind::Gain
-      && is_sink_terminal(def.nodes[first + 3].kind)) {
+  } else if (
+      r.kernel == RegionKernel::BusInLpfGainOut && r.node_count == 4 &&
+      first + 4 <= node_count && def.nodes[first].kind == NodeKind::BusIn &&
+      def.nodes[first + 1].kind == NodeKind::LPF &&
+      def.nodes[first + 2].kind == NodeKind::Gain &&
+      is_sink_terminal(def.nodes[first + 3].kind)
+  ) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    process_region_busin_lpf_gain_out(g, inst,
-                                      first, first + 1,
-                                      first + 2, first + 3,
-                                      nframes, writer_slot, ctx.bus_writes.mode);
+    process_region_busin_lpf_gain_out(
+        g,
+        inst,
+        first,
+        first + 1,
+        first + 2,
+        first + 3,
+        nframes,
+        writer_slot,
+        ctx.bus_writes.mode
+    );
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     fused = true;
-  } else if (r.kernel == RegionKernel::NoiseLpfGainOut
-      && r.node_count == 4
-      && first + 4 <= node_count
-      && def.nodes[first    ].kind == NodeKind::NoiseGen
-      && def.nodes[first + 1].kind == NodeKind::LPF
-      && def.nodes[first + 2].kind == NodeKind::Gain
-      && is_sink_terminal(def.nodes[first + 3].kind)) {
+  } else if (
+      r.kernel == RegionKernel::NoiseLpfGainOut && r.node_count == 4 &&
+      first + 4 <= node_count && def.nodes[first].kind == NodeKind::NoiseGen &&
+      def.nodes[first + 1].kind == NodeKind::LPF &&
+      def.nodes[first + 2].kind == NodeKind::Gain &&
+      is_sink_terminal(def.nodes[first + 3].kind)
+  ) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    process_region_noise_lpf_gain_out(g, inst,
-                                      first, first + 1,
-                                      first + 2, first + 3,
-                                      nframes, writer_slot, ctx.bus_writes.mode);
+    process_region_noise_lpf_gain_out(
+        g,
+        inst,
+        first,
+        first + 1,
+        first + 2,
+        first + 3,
+        nframes,
+        writer_slot,
+        ctx.bus_writes.mode
+    );
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     fused = true;
   }
 
   if (!fused) {
     for (std::size_t i = first; i < end_excl; ++i) {
-      if (def.nodes[i].elided) continue;
+      if (def.nodes[i].elided)
+        continue;
       dispatch_node(g, inst, i, nframes, def.nodes[i], ctx);
     }
   }
 }
 
-static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
-                              BlockExecutionContext &ctx) noexcept {
+static void process_instance(
+    RTGraph &g, GraphInstance &inst, int nframes, BlockExecutionContext &ctx
+) noexcept {
   // Look up the spec via inst.template_id. If the template is gone
   // (shouldn't happen — we never shrink world(g).defs while instances are
   // live — but be defensive), skip the instance.
@@ -6710,7 +6918,8 @@ static void process_instance(RTGraph &g, GraphInstance &inst, int nframes,
   // into a fused consumer input. See FusedAffineRef.
   if (def->regions.empty()) {
     for (std::size_t i = 0; i < node_count; ++i) {
-      if (def->nodes[i].elided) continue;
+      if (def->nodes[i].elided)
+        continue;
       dispatch_node(g, inst, i, nframes, def->nodes[i], ctx);
     }
     return;
@@ -6810,18 +7019,18 @@ BusInDelayed to break the cross-instance dependency.
 // mutation that can grow the bound) keeps world(g).global_schedule's
 // capacity at or above max-block size; clear() preserves that
 // capacity, and every push_back below lands inside it.
-static int region_sink_writer_count(
-    const MetaDef &def, const RegionSpec &r
-) noexcept {
+static int region_sink_writer_count(const MetaDef &def, const RegionSpec &r) noexcept {
   // Writer-slot sizing is node-spec based. Today's fused sink kernels are
   // one-sink-terminal regions and reserve exactly one slot; if a future
   // fused kernel contains multiple sink terminals, its reservation code
   // must grow to match this count rather than relying on the old 1-slot
   // fused-kernel assumption.
-  if (r.first_node < 0 || r.node_count <= 0) return 0;
+  if (r.first_node < 0 || r.node_count <= 0)
+    return 0;
   const std::size_t node_count = def.nodes.size();
   const std::size_t first = static_cast<std::size_t>(r.first_node);
-  if (first >= node_count) return 0;
+  if (first >= node_count)
+    return 0;
   const std::size_t end_excl =
       std::min(node_count, first + static_cast<std::size_t>(r.node_count));
 
@@ -6834,25 +7043,28 @@ static int region_sink_writer_count(
   return count;
 }
 
-static int schedule_step_sink_writer_count(
-    const MetaDef &def, std::size_t step_index
-) noexcept {
-  if (step_index >= def.schedule_steps.size()) return 0;
+static int
+schedule_step_sink_writer_count(const MetaDef &def, std::size_t step_index) noexcept {
+  if (step_index >= def.schedule_steps.size())
+    return 0;
   const ScheduleStepSpec &step = def.schedule_steps[step_index];
-  if (step.first_item < 0 || step.item_count <= 0) return 0;
+  if (step.first_item < 0 || step.item_count <= 0)
+    return 0;
   const std::size_t first_item = static_cast<std::size_t>(step.first_item);
   const std::size_t item_count = static_cast<std::size_t>(step.item_count);
-  if (first_item > def.schedule_step_regions.size()
-      || item_count > def.schedule_step_regions.size() - first_item) {
+  if (first_item > def.schedule_step_regions.size() ||
+      item_count > def.schedule_step_regions.size() - first_item) {
     return 0;
   }
 
   int count = 0;
   for (std::size_t i = 0; i < item_count; ++i) {
     const int region_ordinal = def.schedule_step_regions[first_item + i];
-    if (region_ordinal < 0) continue;
+    if (region_ordinal < 0)
+      continue;
     const std::size_t region_pos = static_cast<std::size_t>(region_ordinal);
-    if (region_pos >= def.regions.size()) continue;
+    if (region_pos >= def.regions.size())
+      continue;
     count += region_sink_writer_count(def, def.regions[region_pos]);
   }
   return count;
@@ -6864,25 +7076,25 @@ static void build_global_schedule(RTGraph &g) noexcept {
   const std::size_t template_count = world(g).defs.size();
   for (std::size_t tid = 0; tid < template_count; ++tid) {
     const MetaDef &def = world(g).defs[tid];
-    if (def.schedule_steps.empty()) continue;
-    const int tid_i  = static_cast<int>(tid);
+    if (def.schedule_steps.empty())
+      continue;
+    const int tid_i = static_cast<int>(tid);
     const std::size_t step_count = def.schedule_steps.size();
     for (std::size_t slot = 0; slot < world(g).instances.size(); ++slot) {
       const GraphInstance &inst = world(g).instances[slot];
       const SlotState s = inst.state.load();
-      if (s != SlotState::Active && s != SlotState::Releasing) continue;
-      if (inst.template_id != tid_i) continue;
+      if (s != SlotState::Active && s != SlotState::Releasing)
+        continue;
+      if (inst.template_id != tid_i)
+        continue;
       const int slot_i = static_cast<int>(slot);
       for (std::size_t step = 0; step < step_count; ++step) {
         const int writer_count = schedule_step_sink_writer_count(def, step);
         world(g).global_schedule.push_back(
             GlobalScheduleEntry{
-              tid_i,
-              slot_i,
-              static_cast<int>(step),
-              next_writer_slot,
-              writer_count
-            });
+                tid_i, slot_i, static_cast<int>(step), next_writer_slot, writer_count
+            }
+        );
         next_writer_slot += writer_count;
       }
     }
@@ -6901,52 +7113,56 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
 
   const int entry_count = static_cast<int>(world(g).global_schedule.size());
   for (int entry_index = 0; entry_index < entry_count; ++entry_index) {
-    auto &entry =
-        world(g).global_schedule[static_cast<std::size_t>(entry_index)];
+    auto &entry = world(g).global_schedule[static_cast<std::size_t>(entry_index)];
     entry.first_work_item = -1;
     entry.work_item_count = 0;
-    if (entry.template_id < 0 || entry.step_index < 0) continue;
+    if (entry.template_id < 0 || entry.step_index < 0)
+      continue;
     const std::size_t tid = static_cast<std::size_t>(entry.template_id);
-    if (tid >= world(g).defs.size()) continue;
+    if (tid >= world(g).defs.size())
+      continue;
     const MetaDef &def = world(g).defs[tid];
 
     const std::size_t step_pos = static_cast<std::size_t>(entry.step_index);
-    if (step_pos >= def.schedule_steps.size()) continue;
+    if (step_pos >= def.schedule_steps.size())
+      continue;
     const ScheduleStepSpec &step = def.schedule_steps[step_pos];
-    if (step.first_item < 0 || step.item_count <= 0) continue;
+    if (step.first_item < 0 || step.item_count <= 0)
+      continue;
     const std::size_t first_item = static_cast<std::size_t>(step.first_item);
     const std::size_t item_count = static_cast<std::size_t>(step.item_count);
-    if (first_item > def.schedule_step_regions.size()
-        || item_count > def.schedule_step_regions.size() - first_item) {
+    if (first_item > def.schedule_step_regions.size() ||
+        item_count > def.schedule_step_regions.size() - first_item) {
       continue;
     }
 
-    const int items_begin =
-        static_cast<int>(world(g).region_layer_work_items.size());
+    const int items_begin = static_cast<int>(world(g).region_layer_work_items.size());
 
     int next_writer_slot = entry.first_writer_slot;
     bool has_sink_writer = false;
     int emitted_items = 0;
     for (std::size_t item = 0; item < item_count; ++item) {
       const int region_ordinal = def.schedule_step_regions[first_item + item];
-      if (region_ordinal < 0) continue;
+      if (region_ordinal < 0)
+        continue;
       const std::size_t region_pos = static_cast<std::size_t>(region_ordinal);
-      if (region_pos >= def.regions.size()) continue;
+      if (region_pos >= def.regions.size())
+        continue;
 
-      const int writer_count =
-          region_sink_writer_count(def, def.regions[region_pos]);
+      const int writer_count = region_sink_writer_count(def, def.regions[region_pos]);
       has_sink_writer = has_sink_writer || writer_count > 0;
       world(g).region_layer_work_items.push_back(
           RegionLayerWorkItem{
-            entry_index,
-            entry.template_id,
-            entry.instance_slot,
-            entry.step_index,
-            static_cast<int>(item),
-            region_ordinal,
-            next_writer_slot,
-            writer_count
-          });
+              entry_index,
+              entry.template_id,
+              entry.instance_slot,
+              entry.step_index,
+              static_cast<int>(item),
+              region_ordinal,
+              next_writer_slot,
+              writer_count
+          }
+      );
       next_writer_slot += writer_count;
       ++emitted_items;
     }
@@ -6968,15 +7184,16 @@ static void build_region_layer_work_items(RTGraph &g) noexcept {
 }
 
 static const ScheduleStepSpec *
-schedule_step_for_entry(
-    const RTGraph &g, const GlobalScheduleEntry &entry
-) noexcept {
-  if (entry.template_id < 0 || entry.step_index < 0) return nullptr;
+schedule_step_for_entry(const RTGraph &g, const GlobalScheduleEntry &entry) noexcept {
+  if (entry.template_id < 0 || entry.step_index < 0)
+    return nullptr;
   const std::size_t tid = static_cast<std::size_t>(entry.template_id);
-  if (tid >= world(g).defs.size()) return nullptr;
+  if (tid >= world(g).defs.size())
+    return nullptr;
   const auto &steps = world(g).defs[tid].schedule_steps;
   const std::size_t step = static_cast<std::size_t>(entry.step_index);
-  if (step >= steps.size()) return nullptr;
+  if (step >= steps.size())
+    return nullptr;
   return &steps[step];
 }
 
@@ -6988,14 +7205,14 @@ static bool global_schedule_entry_is_free(
 }
 
 static bool free_entry_conflicts_with_band(
-    const RTGraph &g, const GlobalScheduleEntry &entry,
-    int first_entry, int entry_count
+    const RTGraph &g, const GlobalScheduleEntry &entry, int first_entry, int entry_count
 ) noexcept {
-  if (entry_count <= 0) return false;
+  if (entry_count <= 0)
+    return false;
   const std::size_t first = static_cast<std::size_t>(first_entry);
   const std::size_t count = static_cast<std::size_t>(entry_count);
-  if (first > world(g).global_schedule.size()
-      || count > world(g).global_schedule.size() - first) {
+  if (first > world(g).global_schedule.size() ||
+      count > world(g).global_schedule.size() - first) {
     return true;
   }
 
@@ -7006,7 +7223,8 @@ static bool free_entry_conflicts_with_band(
     // in one instance are layer-ordered; grouping them would require
     // the dependency graph at runtime, which C0d deliberately does not
     // ship yet.
-    if (member.instance_slot == entry.instance_slot) return true;
+    if (member.instance_slot == entry.instance_slot)
+      return true;
   }
   return false;
 }
@@ -7034,10 +7252,11 @@ static void build_global_schedule_bands(RTGraph &g) noexcept {
   int free_count = 0;
 
   auto flush_free = [&]() noexcept {
-    if (free_count <= 0) return;
+    if (free_count <= 0)
+      return;
     world(g).global_schedule_bands.push_back(
-        GlobalScheduleBand{GlobalScheduleBandKind::Free,
-                           free_start, free_count});
+        GlobalScheduleBand{GlobalScheduleBandKind::Free, free_start, free_count}
+    );
     free_start = -1;
     free_count = 0;
   };
@@ -7049,13 +7268,13 @@ static void build_global_schedule_bands(RTGraph &g) noexcept {
     if (!global_schedule_entry_is_free(g, entry)) {
       flush_free();
       world(g).global_schedule_bands.push_back(
-          GlobalScheduleBand{GlobalScheduleBandKind::Barrier, i, 1});
+          GlobalScheduleBand{GlobalScheduleBandKind::Barrier, i, 1}
+      );
       continue;
     }
 
-    if (free_count > 0
-        && free_entry_conflicts_with_band(g, entry,
-                                          free_start, free_count)) {
+    if (free_count > 0 &&
+        free_entry_conflicts_with_band(g, entry, free_start, free_count)) {
       flush_free();
     }
 
@@ -7076,7 +7295,8 @@ static void build_global_schedule_bands(RTGraph &g) noexcept {
 static bool global_schedule_covers_audio_schedule(const RTGraph &g) noexcept {
   for (const GraphInstance &inst : world(g).instances) {
     const SlotState s = inst.state.load();
-    if (s != SlotState::Active && s != SlotState::Releasing) continue;
+    if (s != SlotState::Active && s != SlotState::Releasing)
+      continue;
     const MetaDef *def = template_at(g, inst.template_id);
     if (!def || def->schedule_steps.empty()) {
       return false;
@@ -7086,31 +7306,40 @@ static bool global_schedule_covers_audio_schedule(const RTGraph &g) noexcept {
 }
 
 static void process_schedule_step(
-    RTGraph &g, const MetaDef &def, GraphInstance &inst,
-    int step_index, int nframes, BlockExecutionContext &ctx
+    RTGraph &g,
+    const MetaDef &def,
+    GraphInstance &inst,
+    int step_index,
+    int nframes,
+    BlockExecutionContext &ctx
 ) noexcept {
   // Defensive only: rt_graph_template_add_schedule_step validates the
   // step bounds, item slice, and region ordinals before committing
   // metadata. Keep the executor silent if a future ABI path corrupts or
   // stales the schedule metadata.
-  if (step_index < 0) return;
+  if (step_index < 0)
+    return;
   const std::size_t step_pos = static_cast<std::size_t>(step_index);
-  if (step_pos >= def.schedule_steps.size()) return;
+  if (step_pos >= def.schedule_steps.size())
+    return;
 
   const ScheduleStepSpec &step = def.schedule_steps[step_pos];
-  if (step.first_item < 0 || step.item_count <= 0) return;
+  if (step.first_item < 0 || step.item_count <= 0)
+    return;
   const std::size_t first_item = static_cast<std::size_t>(step.first_item);
   const std::size_t item_count = static_cast<std::size_t>(step.item_count);
-  if (first_item > def.schedule_step_regions.size()
-      || item_count > def.schedule_step_regions.size() - first_item) {
+  if (first_item > def.schedule_step_regions.size() ||
+      item_count > def.schedule_step_regions.size() - first_item) {
     return;
   }
 
   for (std::size_t i = 0; i < item_count; ++i) {
     const int region_ordinal = def.schedule_step_regions[first_item + i];
-    if (region_ordinal < 0) continue;
+    if (region_ordinal < 0)
+      continue;
     const std::size_t region_pos = static_cast<std::size_t>(region_ordinal);
-    if (region_pos >= def.regions.size()) continue;
+    if (region_pos >= def.regions.size())
+      continue;
     process_region(g, def, inst, def.regions[region_pos], nframes, ctx);
   }
 }
@@ -7127,53 +7356,55 @@ struct ScheduleEntryExecutionContext {
     // begin_global_schedule_instance_blocks /
     // finish_global_schedule_instance_blocks, so this context is safe
     // to duplicate per worker in C1c.
-    if (entry.instance_slot < 0) return;
+    if (entry.instance_slot < 0)
+      return;
     const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
-    if (slot >= world(g).instances.size()) return;
+    if (slot >= world(g).instances.size())
+      return;
 
     GraphInstance &inst = world(g).instances[slot];
     const SlotState s = inst.state.load();
-    if (!is_audio_scheduled_state(s)) return;
-    if (inst.template_id != entry.template_id) return;
+    if (!is_audio_scheduled_state(s))
+      return;
+    if (inst.template_id != entry.template_id)
+      return;
 
     const MetaDef *def = template_at(g, entry.template_id);
-    if (!def) return;
+    if (!def)
+      return;
 
-    process_schedule_step(g, *def, inst, entry.step_index,
-                          nframes, block_ctx);
+    process_schedule_step(g, *def, inst, entry.step_index, nframes, block_ctx);
   }
 };
 
-static bool band_range_valid(
-    const RTGraph &g, const GlobalScheduleBand &band
-) noexcept {
-  if (band.first_entry < 0 || band.entry_count <= 0) return false;
+static bool band_range_valid(const RTGraph &g, const GlobalScheduleBand &band) noexcept {
+  if (band.first_entry < 0 || band.entry_count <= 0)
+    return false;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
-  return first <= world(g).global_schedule.size()
-      && count <= world(g).global_schedule.size() - first;
+  return first <= world(g).global_schedule.size() &&
+         count <= world(g).global_schedule.size() - first;
 }
 
-static int band_first_writer_slot(
-    const RTGraph &g, const GlobalScheduleBand &band
-) noexcept {
-  if (!band_range_valid(g, band)) return 0;
+static int
+band_first_writer_slot(const RTGraph &g, const GlobalScheduleBand &band) noexcept {
+  if (!band_range_valid(g, band))
+    return 0;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   return world(g).global_schedule[first].first_writer_slot;
 }
 
-static int band_end_writer_slot(
-    const RTGraph &g, const GlobalScheduleBand &band
-) noexcept {
-  if (!band_range_valid(g, band)) return 0;
+static int
+band_end_writer_slot(const RTGraph &g, const GlobalScheduleBand &band) noexcept {
+  if (!band_range_valid(g, band))
+    return 0;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
 
   int end_slot = world(g).global_schedule[first].first_writer_slot;
   for (std::size_t i = 0; i < count; ++i) {
     const GlobalScheduleEntry &entry = world(g).global_schedule[first + i];
-    end_slot = std::max(
-        end_slot, entry.first_writer_slot + entry.writer_slot_count);
+    end_slot = std::max(end_slot, entry.first_writer_slot + entry.writer_slot_count);
   }
   return end_slot;
 }
@@ -7187,7 +7418,8 @@ static bool schedule_band_has_sink_writers(
 static bool schedule_band_has_duplicate_instances(
     const RTGraph &g, const GlobalScheduleBand &band
 ) noexcept {
-  if (!band_range_valid(g, band)) return true;
+  if (!band_range_valid(g, band))
+    return true;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
   for (std::size_t i = 0; i < count; ++i) {
@@ -7216,40 +7448,45 @@ static bool schedule_band_has_duplicate_instances(
 // only ticks when global-schedule execution is enabled and a Free band
 // stays on the audio thread.
 static void process_entry_via_work_items(
-    RTGraph &g, const GlobalScheduleEntry &entry,
-    int nframes, BlockExecutionContext &block_ctx
+    RTGraph &g,
+    const GlobalScheduleEntry &entry,
+    int nframes,
+    BlockExecutionContext &block_ctx
 ) noexcept {
-  if (entry.instance_slot < 0) return;
+  if (entry.instance_slot < 0)
+    return;
   const std::size_t slot = static_cast<std::size_t>(entry.instance_slot);
-  if (slot >= world(g).instances.size()) return;
+  if (slot >= world(g).instances.size())
+    return;
 
   GraphInstance &inst = world(g).instances[slot];
   const SlotState s = inst.state.load();
-  if (!is_audio_scheduled_state(s)) return;
-  if (inst.template_id != entry.template_id) return;
+  if (!is_audio_scheduled_state(s))
+    return;
+  if (inst.template_id != entry.template_id)
+    return;
 
   const MetaDef *def = template_at(g, entry.template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
-  if (entry.first_work_item < 0 || entry.work_item_count <= 0) return;
-  const std::size_t first =
-      static_cast<std::size_t>(entry.first_work_item);
-  const std::size_t count =
-      static_cast<std::size_t>(entry.work_item_count);
-  if (first > world(g).region_layer_work_items.size()
-      || count > world(g).region_layer_work_items.size() - first) {
+  if (entry.first_work_item < 0 || entry.work_item_count <= 0)
+    return;
+  const std::size_t first = static_cast<std::size_t>(entry.first_work_item);
+  const std::size_t count = static_cast<std::size_t>(entry.work_item_count);
+  if (first > world(g).region_layer_work_items.size() ||
+      count > world(g).region_layer_work_items.size() - first) {
     return;
   }
 
   for (std::size_t i = 0; i < count; ++i) {
-    const RegionLayerWorkItem &item =
-        world(g).region_layer_work_items[first + i];
-    if (item.region_ordinal < 0) continue;
-    const std::size_t region_pos =
-        static_cast<std::size_t>(item.region_ordinal);
-    if (region_pos >= def->regions.size()) continue;
-    process_region(g, *def, inst, def->regions[region_pos],
-                   nframes, block_ctx);
+    const RegionLayerWorkItem &item = world(g).region_layer_work_items[first + i];
+    if (item.region_ordinal < 0)
+      continue;
+    const std::size_t region_pos = static_cast<std::size_t>(item.region_ordinal);
+    if (region_pos >= def->regions.size())
+      continue;
+    process_region(g, *def, inst, def->regions[region_pos], nframes, block_ctx);
     ++g.last_c1d_serial_region_item_execution_count;
   }
 }
@@ -7267,42 +7504,49 @@ struct ParallelEntryRegionItemDispatch {
   std::atomic<int> next_offset{0};
 };
 
-static void process_parallel_entry_region_item_worker(
-    void *user, int /*worker_id*/) noexcept {
+static void
+process_parallel_entry_region_item_worker(void *user, int /*worker_id*/) noexcept {
   auto &dispatch = *static_cast<ParallelEntryRegionItemDispatch *>(user);
   while (true) {
-    const int offset = dispatch.next_offset.fetch_add(
-        1, std::memory_order_relaxed);
-    if (offset >= dispatch.work_item_count) return;
+    const int offset = dispatch.next_offset.fetch_add(1, std::memory_order_relaxed);
+    if (offset >= dispatch.work_item_count)
+      return;
 
     const int item_index = dispatch.first_work_item + offset;
-    if (item_index < 0) continue;
+    if (item_index < 0)
+      continue;
     const std::size_t i = static_cast<std::size_t>(item_index);
-    if (i >= world(dispatch.g).region_layer_work_items.size()) continue;
+    if (i >= world(dispatch.g).region_layer_work_items.size())
+      continue;
 
-    const RegionLayerWorkItem &item =
-        world(dispatch.g).region_layer_work_items[i];
-    if (item.instance_slot < 0) continue;
-    const std::size_t slot =
-        static_cast<std::size_t>(item.instance_slot);
-    if (slot >= world(dispatch.g).instances.size()) continue;
+    const RegionLayerWorkItem &item = world(dispatch.g).region_layer_work_items[i];
+    if (item.instance_slot < 0)
+      continue;
+    const std::size_t slot = static_cast<std::size_t>(item.instance_slot);
+    if (slot >= world(dispatch.g).instances.size())
+      continue;
 
     GraphInstance &inst = world(dispatch.g).instances[slot];
     const SlotState s = inst.state.load();
-    if (!is_audio_scheduled_state(s)) continue;
-    if (inst.template_id != item.template_id) continue;
+    if (!is_audio_scheduled_state(s))
+      continue;
+    if (inst.template_id != item.template_id)
+      continue;
 
     const MetaDef *def = template_at(dispatch.g, item.template_id);
-    if (!def) continue;
+    if (!def)
+      continue;
 
-    if (item.region_ordinal < 0) continue;
-    const std::size_t region_pos =
-        static_cast<std::size_t>(item.region_ordinal);
-    if (region_pos >= def->regions.size()) continue;
+    if (item.region_ordinal < 0)
+      continue;
+    const std::size_t region_pos = static_cast<std::size_t>(item.region_ordinal);
+    if (region_pos >= def->regions.size())
+      continue;
 
     BlockExecutionContext local_ctx;
-    process_region(dispatch.g, *def, inst, def->regions[region_pos],
-                   dispatch.nframes, local_ctx);
+    process_region(
+        dispatch.g, *def, inst, def->regions[region_pos], dispatch.nframes, local_ctx
+    );
   }
 }
 
@@ -7314,21 +7558,23 @@ static void process_parallel_entry_region_item_worker(
 static bool entry_is_c1d_parallel_candidate(
     const RTGraph &g, const GlobalScheduleEntry &entry
 ) noexcept {
-  if (g.worker_pool.logical_size() <= 1) return false;
-  if (entry.work_item_count <= 1) return false;
-  if (entry.first_work_item < 0) return false;
+  if (g.worker_pool.logical_size() <= 1)
+    return false;
+  if (entry.work_item_count <= 1)
+    return false;
+  if (entry.first_work_item < 0)
+    return false;
 
-  const std::size_t first =
-      static_cast<std::size_t>(entry.first_work_item);
-  const std::size_t count =
-      static_cast<std::size_t>(entry.work_item_count);
-  if (first > world(g).region_layer_work_items.size()
-      || count > world(g).region_layer_work_items.size() - first) {
+  const std::size_t first = static_cast<std::size_t>(entry.first_work_item);
+  const std::size_t count = static_cast<std::size_t>(entry.work_item_count);
+  if (first > world(g).region_layer_work_items.size() ||
+      count > world(g).region_layer_work_items.size() - first) {
     return false;
   }
 
   const ScheduleStepSpec *step = schedule_step_for_entry(g, entry);
-  if (!step || step->kind != ScheduleStepKind::FreeLayer) return false;
+  if (!step || step->kind != ScheduleStepKind::FreeLayer)
+    return false;
 
   // Sink-free: every work item must contribute zero canonical writer
   // slots. C1d-c never carries a sink writer through worker dispatch
@@ -7345,10 +7591,7 @@ static void dispatch_c1d_parallel_entry(
     RTGraph &g, const GlobalScheduleEntry &entry, int nframes
 ) noexcept {
   ParallelEntryRegionItemDispatch dispatch{
-    g,
-    entry.first_work_item,
-    entry.work_item_count,
-    nframes
+      g, entry.first_work_item, entry.work_item_count, nframes
   };
   ++g.last_c1d_parallel_entry_count;
   // Count region items queued through the worker pool. Eligibility and
@@ -7359,19 +7602,17 @@ static void dispatch_c1d_parallel_entry(
   // Hard join: run_parallel returns only after every worker has
   // observed its claim past the end of work_item_count. No later band
   // can read the regions' node output buffers until then.
-  g.worker_pool.run_parallel(
-      process_parallel_entry_region_item_worker, &dispatch);
+  g.worker_pool.run_parallel(process_parallel_entry_region_item_worker, &dispatch);
 }
 
 static void process_schedule_band_serial(
-    RTGraph &g,
-    const GlobalScheduleBand &band,
-    ScheduleEntryExecutionContext &worker_ctx
+    RTGraph &g, const GlobalScheduleBand &band, ScheduleEntryExecutionContext &worker_ctx
 ) noexcept {
   // Defensive only: build_global_schedule_bands emits valid,
   // contiguous slices over world(g).global_schedule. Keep the executor
   // silent if a future ABI/debug path corrupts the band metadata.
-  if (!band_range_valid(g, band)) return;
+  if (!band_range_valid(g, band))
+    return;
   const std::size_t first = static_cast<std::size_t>(band.first_entry);
   const std::size_t count = static_cast<std::size_t>(band.entry_count);
 
@@ -7396,8 +7637,7 @@ static void process_schedule_band_serial(
       if (entry_is_c1d_parallel_candidate(g, entry)) {
         dispatch_c1d_parallel_entry(g, entry, worker_ctx.nframes);
       } else {
-        process_entry_via_work_items(g, entry, worker_ctx.nframes,
-                                     worker_ctx.block_ctx);
+        process_entry_via_work_items(g, entry, worker_ctx.nframes, worker_ctx.block_ctx);
       }
     }
     return;
@@ -7420,45 +7660,45 @@ struct ParallelBandDispatch {
 static void process_parallel_band_worker(void *user, int /*worker_id*/) noexcept {
   auto &dispatch = *static_cast<ParallelBandDispatch *>(user);
   while (true) {
-    const int offset = dispatch.next_entry_offset.fetch_add(
-        1, std::memory_order_relaxed);
+    const int offset = dispatch.next_entry_offset.fetch_add(1, std::memory_order_relaxed);
     if (offset >= dispatch.band.entry_count) {
       return;
     }
 
     const int entry_index = dispatch.band.first_entry + offset;
-    if (entry_index < 0) continue;
+    if (entry_index < 0)
+      continue;
     const std::size_t i = static_cast<std::size_t>(entry_index);
-    if (i >= world(dispatch.g).global_schedule.size()) continue;
+    if (i >= world(dispatch.g).global_schedule.size())
+      continue;
 
     const GlobalScheduleEntry &entry = world(dispatch.g).global_schedule[i];
     BlockExecutionContext local_ctx;
-    local_ctx.bus_writes.mode = dispatch.defer_reduction_folds
-        ? BusWriteMode::ReductionDeferred
-        : dispatch.mode;
+    local_ctx.bus_writes.mode =
+        dispatch.defer_reduction_folds ? BusWriteMode::ReductionDeferred : dispatch.mode;
     local_ctx.bus_writes.next_writer_slot = entry.first_writer_slot;
-    local_ctx.bus_writes.fold_after_each_sink =
-        !dispatch.defer_reduction_folds;
+    local_ctx.bus_writes.fold_after_each_sink = !dispatch.defer_reduction_folds;
 
     ScheduleEntryExecutionContext local_entry_ctx{
-      dispatch.g,
-      dispatch.nframes,
-      local_ctx
+        dispatch.g, dispatch.nframes, local_ctx
     };
     local_entry_ctx.process_entry(entry);
   }
 }
 
 static bool should_parallelize_schedule_band(
-    const RTGraph &g,
-    const GlobalScheduleBand &band,
-    const BlockExecutionContext &ctx
+    const RTGraph &g, const GlobalScheduleBand &band, const BlockExecutionContext &ctx
 ) noexcept {
-  if (band.kind != GlobalScheduleBandKind::Free) return false;
-  if (!band_range_valid(g, band)) return false;
-  if (band.entry_count <= 1) return false;
-  if (g.worker_pool.logical_size() <= 1) return false;
-  if (schedule_band_has_duplicate_instances(g, band)) return false;
+  if (band.kind != GlobalScheduleBandKind::Free)
+    return false;
+  if (!band_range_valid(g, band))
+    return false;
+  if (band.entry_count <= 1)
+    return false;
+  if (g.worker_pool.logical_size() <= 1)
+    return false;
+  if (schedule_band_has_duplicate_instances(g, band))
+    return false;
 
   const bool has_sinks = schedule_band_has_sink_writers(g, band);
   if (has_sinks && ctx.bus_writes.mode != BusWriteMode::Reduction) {
@@ -7474,14 +7714,13 @@ static void process_schedule_band(
     ScheduleEntryExecutionContext &serial_ctx,
     BlockExecutionContext &block_ctx
 ) noexcept {
-  if (!band_range_valid(g, band)) return;
+  if (!band_range_valid(g, band))
+    return;
 
   const bool has_sinks = schedule_band_has_sink_writers(g, band);
   if (!should_parallelize_schedule_band(g, band, block_ctx)) {
-    if (band.kind == GlobalScheduleBandKind::Free
-        && band.entry_count > 1
-        && has_sinks
-        && block_ctx.bus_writes.mode == BusWriteMode::Direct) {
+    if (band.kind == GlobalScheduleBandKind::Free && band.entry_count > 1 && has_sinks &&
+        block_ctx.bus_writes.mode == BusWriteMode::Direct) {
       ++g.last_serialized_free_band_count;
     }
     process_schedule_band_serial(g, band, serial_ctx);
@@ -7494,11 +7733,11 @@ static void process_schedule_band(
       std::max(block_ctx.bus_writes.next_writer_slot, end_slot);
 
   ParallelBandDispatch dispatch{
-    g,
-    band,
-    serial_ctx.nframes,
-    block_ctx.bus_writes.mode,
-    has_sinks && block_ctx.bus_writes.mode == BusWriteMode::Reduction,
+      g,
+      band,
+      serial_ctx.nframes,
+      block_ctx.bus_writes.mode,
+      has_sinks && block_ctx.bus_writes.mode == BusWriteMode::Reduction,
   };
 
   ++g.last_parallel_band_count;
@@ -7527,14 +7766,13 @@ static void process_global_schedule_bands(
     process_schedule_band(g, band, worker_ctx, ctx);
   }
   finish_global_schedule_instance_blocks(g);
-  ctx.bus_writes.next_writer_slot =
-      std::max(ctx.bus_writes.next_writer_slot,
-               world(g).global_schedule_writer_slot_count);
+  ctx.bus_writes.next_writer_slot = std::max(
+      ctx.bus_writes.next_writer_slot, world(g).global_schedule_writer_slot_count
+  );
 }
 
-static void process_legacy_schedule(
-    RTGraph &g, int nframes, BlockExecutionContext &ctx
-) noexcept {
+static void
+process_legacy_schedule(RTGraph &g, int nframes, BlockExecutionContext &ctx) noexcept {
   // Iterate templates in registration order. The Haskell side picks
   // registration order to match the topological sort over template
   // precedence, so this loop respects all bus-induced ordering
@@ -7552,8 +7790,10 @@ static void process_legacy_schedule(
       // already been published into the schedule. Snapshot once; the
       // §2.E silence-window branch reuses the snapshot.
       const SlotState s = inst.state.load();
-      if (!is_audio_scheduled_state(s)) continue;
-      if (inst.template_id != tid_i) continue;
+      if (!is_audio_scheduled_state(s))
+        continue;
+      if (inst.template_id != tid_i)
+        continue;
       process_instance(g, inst, nframes, ctx);
       finish_instance_block(inst, s);
     }
@@ -7610,16 +7850,13 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
   // holds swap_in_flight true until collection, so an unreaped retired
   // payload cannot be overwritten by a second install.
   if (pending_install) {
-    const MigrationApplyCounts migration_counts =
-        apply_migration(
-            *g.active, *pending_install->state,
-            pending_install->migration_copies);
+    const MigrationApplyCounts migration_counts = apply_migration(
+        *g.active, *pending_install->state, pending_install->migration_copies
+    );
     pending_install->migration_instance_copy_count =
         migration_counts.control_vector_copies;
-    pending_install->migration_state_copy_count =
-        migration_counts.state_copies;
-    pending_install->migration_lifecycle_copy_count =
-        migration_counts.lifecycle_copies;
+    pending_install->migration_state_copy_count = migration_counts.state_copies;
+    pending_install->migration_lifecycle_copy_count = migration_counts.lifecycle_copies;
     pending_install->retired_state = std::move(g.active);
     g.active = std::move(pending_install->state);
     g.retired_swap.store(pending_install, std::memory_order_release);
@@ -7668,12 +7905,10 @@ static void process_graph(RTGraph &g, int nframes) noexcept {
     ctx.bus_writes.mode = BusWriteMode::Reduction;
     auto &storage = world(g).contribution_storage;
     std::fill(storage.target.begin(), storage.target.end(), -1);
-    std::fill(storage.used_words.begin(), storage.used_words.end(),
-              std::uint64_t{0});
+    std::fill(storage.used_words.begin(), storage.used_words.end(), std::uint64_t{0});
   }
 
-  if (g.execute_global_schedule
-      && global_schedule_covers_audio_schedule(g)) {
+  if (g.execute_global_schedule && global_schedule_covers_audio_schedule(g)) {
     process_global_schedule_bands(g, nframes, ctx);
   } else {
     process_legacy_schedule(g, nframes, ctx);
@@ -7872,9 +8107,7 @@ open_audio_stream(RTGraph &g, int requested_output_channels, int requested_devic
 // this on a reused Available slot would leave fused_scratch short
 // of the template's slot count, and resolve_input would silently
 // return empty spans for any slot beyond the previous size.
-static void ensure_fused_scratch(
-    GraphInstance &inst, int slot_count, int max_frames
-) {
+static void ensure_fused_scratch(GraphInstance &inst, int slot_count, int max_frames) {
   const auto frames = static_cast<std::size_t>(max_frames);
   const std::size_t target = static_cast<std::size_t>(std::max(0, slot_count));
   if (inst.fused_scratch.size() < target) {
@@ -7902,8 +8135,7 @@ static GraphInstance make_instance(const MetaDef &def, int template_id, int max_
   return inst;
 }
 
-static std::unique_ptr<RTGraphState>
-make_default_state(int capacity, int max_frames) {
+static std::unique_ptr<RTGraphState> make_default_state(int capacity, int max_frames) {
   auto next = std::make_unique<RTGraphState>();
 
   MetaDef def;
@@ -7973,12 +8205,12 @@ static void reset_to_default_state(RTGraph &g) {
   // [T:realtime-producer] which by §1's contract is only safe to
   // call while audio is running). Free any unreaped pending /
   // retired swaps so a clear-then-destroy sequence does not leak.
-  if (RTGraphSwap *pending = g.pending_swap.exchange(
-          nullptr, std::memory_order_relaxed)) {
+  if (RTGraphSwap *pending =
+          g.pending_swap.exchange(nullptr, std::memory_order_relaxed)) {
     delete pending;
   }
-  if (RTGraphSwap *retired = g.retired_swap.exchange(
-          nullptr, std::memory_order_relaxed)) {
+  if (RTGraphSwap *retired =
+          g.retired_swap.exchange(nullptr, std::memory_order_relaxed)) {
     delete retired;
   }
   g.swap_in_flight.store(false, std::memory_order_relaxed);
@@ -8133,12 +8365,12 @@ void rt_graph_destroy(RTGraph *g) {
   // Free any unreaped swap so destroying a graph mid-protocol does not
   // leak. Mirrors the reset_to_default_state path; matters here for
   // callers that destroy without first calling rt_graph_clear.
-  if (RTGraphSwap *pending = g->pending_swap.exchange(
-          nullptr, std::memory_order_relaxed)) {
+  if (RTGraphSwap *pending =
+          g->pending_swap.exchange(nullptr, std::memory_order_relaxed)) {
     delete pending;
   }
-  if (RTGraphSwap *retired = g->retired_swap.exchange(
-          nullptr, std::memory_order_relaxed)) {
+  if (RTGraphSwap *retired =
+          g->retired_swap.exchange(nullptr, std::memory_order_relaxed)) {
     delete retired;
   }
   delete g;
@@ -8182,7 +8414,8 @@ void rt_graph_clear(RTGraph *g) {
 // precedence DAG, so this single ordering invariant captures both
 // the user's intent and the scheduler's guarantee.
 int rt_graph_template_add(RTGraph *g) {
-  if (!g) return -1;
+  if (!g)
+    return -1;
 
   MetaDef def;
   def.max_frames = g->max_frames;
@@ -8220,7 +8453,8 @@ int rt_graph_template_add(RTGraph *g) {
 // path (Haskell loaders, direct C tests, future producers).
 static bool def_has_buffer_writer(const MetaDef &def) {
   for (const auto &node : def.nodes) {
-    if (node.kind == NodeKind::RecordBufMono) return true;
+    if (node.kind == NodeKind::RecordBufMono)
+      return true;
   }
   return false;
 }
@@ -8247,11 +8481,14 @@ static bool def_has_buffer_writer(const MetaDef &def) {
 // See Note [Pool model] for how the cap interacts with the
 // std::vector<GraphInstance> pool model.
 void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony) {
-  if (!g) return;
+  if (!g)
+    return;
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
   int clamped = polyphony < 1 ? 1 : polyphony;
-  if (clamped > 1 && def_has_buffer_writer(*def)) clamped = 1;
+  if (clamped > 1 && def_has_buffer_writer(*def))
+    clamped = 1;
   def->polyphony = clamped;
 
   // ensure_contribution_capacity is grow-only and uses
@@ -8267,7 +8504,8 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
 
 // Number of registered templates. Iterate 0..count-1 to enumerate.
 int rt_graph_template_count(RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).defs.size());
 }
 
@@ -8276,94 +8514,114 @@ int rt_graph_template_count(RTGraph *g) {
 // ----------------------------------------------------------------
 
 int rt_graph_test_last_writer_slot_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->last_block_writer_slot_count;
 }
 
 int rt_graph_test_contribution_slot_capacity(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return world(*g).contribution_storage.max_writer_slots;
 }
 
 int rt_graph_test_contribution_sample_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).contribution_storage.samples.size());
 }
 
 int rt_graph_test_contribution_target_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).contribution_storage.target.size());
 }
 
 int rt_graph_test_contribution_used_word_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).contribution_storage.used_words.size());
 }
 
 void rt_graph_test_set_reduction_capture(RTGraph *g, int on) {
-  if (!g) return;
+  if (!g)
+    return;
   g->capture_reduction_mode = (on != 0);
 }
 
 void rt_graph_test_set_global_schedule_execution(RTGraph *g, int on) {
-  if (!g) return;
+  if (!g)
+    return;
   g->execute_global_schedule = (on != 0);
 }
 
 void rt_graph_test_set_worker_pool_size(RTGraph *g, int worker_count) {
-  if (!g) return;
+  if (!g)
+    return;
   g->worker_pool.set_size(worker_count);
 }
 
 int rt_graph_test_worker_pool_size(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->worker_pool.logical_size();
 }
 
 int rt_graph_test_worker_thread_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->worker_pool.background_thread_count();
 }
 
 int rt_graph_test_last_parallel_band_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->last_parallel_band_count;
 }
 
 int rt_graph_test_last_parallel_entry_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->last_parallel_entry_count;
 }
 
 int rt_graph_test_last_serialized_free_band_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->last_serialized_free_band_count;
 }
 
 int rt_graph_test_contribution_slot_target(const RTGraph *g, int ws) {
-  if (!g) return -1;
+  if (!g)
+    return -1;
   const auto &storage = world(*g).contribution_storage;
-  if (ws < 0 || ws >= storage.max_writer_slots) return -1;
+  if (ws < 0 || ws >= storage.max_writer_slots)
+    return -1;
   return storage.target[static_cast<std::size_t>(ws)];
 }
 
 int rt_graph_test_contribution_slot_used(const RTGraph *g, int ws) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   const auto &storage = world(*g).contribution_storage;
-  if (ws < 0 || ws >= storage.max_writer_slots) return 0;
+  if (ws < 0 || ws >= storage.max_writer_slots)
+    return 0;
   return contribution_slot_used(storage, ws) ? 1 : 0;
 }
 
-int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
-                                         int nframes, float *out) {
-  if (!g || !out) return -1;
+int rt_graph_test_read_contribution_slot(
+    const RTGraph *g, int ws, int nframes, float *out
+) {
+  if (!g || !out)
+    return -1;
   const auto &storage = world(*g).contribution_storage;
-  if (ws < 0 || ws >= storage.max_writer_slots) return -1;
-  if (nframes < 0 || nframes > g->max_frames) return -1;
-  const std::size_t base = static_cast<std::size_t>(ws)
-                           * static_cast<std::size_t>(g->max_frames);
-  std::copy_n(&storage.samples[base],
-              static_cast<std::size_t>(nframes), out);
+  if (ws < 0 || ws >= storage.max_writer_slots)
+    return -1;
+  if (nframes < 0 || nframes > g->max_frames)
+    return -1;
+  const std::size_t base =
+      static_cast<std::size_t>(ws) * static_cast<std::size_t>(g->max_frames);
+  std::copy_n(&storage.samples[base], static_cast<std::size_t>(nframes), out);
   return 0;
 }
 
@@ -8371,35 +8629,41 @@ int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
 // step_index, then read the vector entry" shape; mismatches return
 // safe sentinels (0 for counts, -1 for per-step accessors) without
 // raising or aborting.
-int rt_graph_test_template_schedule_step_count(
-    const RTGraph *g, int template_id
-) {
-  if (!g) return 0;
-  if (template_id < 0) return 0;
+int rt_graph_test_template_schedule_step_count(const RTGraph *g, int template_id) {
+  if (!g)
+    return 0;
+  if (template_id < 0)
+    return 0;
   const std::size_t tid = static_cast<std::size_t>(template_id);
-  if (tid >= world(*g).defs.size()) return 0;
+  if (tid >= world(*g).defs.size())
+    return 0;
   return static_cast<int>(world(*g).defs[tid].schedule_steps.size());
 }
 
 namespace {
 const ScheduleStepSpec *
 schedule_step_at(const RTGraph *g, int template_id, int step_index) {
-  if (!g) return nullptr;
-  if (template_id < 0 || step_index < 0) return nullptr;
+  if (!g)
+    return nullptr;
+  if (template_id < 0 || step_index < 0)
+    return nullptr;
   const std::size_t tid = static_cast<std::size_t>(template_id);
-  if (tid >= world(*g).defs.size()) return nullptr;
+  if (tid >= world(*g).defs.size())
+    return nullptr;
   const auto &steps = world(*g).defs[tid].schedule_steps;
   const std::size_t sidx = static_cast<std::size_t>(step_index);
-  if (sidx >= steps.size()) return nullptr;
+  if (sidx >= steps.size())
+    return nullptr;
   return &steps[sidx];
 }
-}  // namespace
+} // namespace
 
 int rt_graph_test_template_schedule_step_kind(
     const RTGraph *g, int template_id, int step_index
 ) {
   const auto *spec = schedule_step_at(g, template_id, step_index);
-  if (!spec) return -1;
+  if (!spec)
+    return -1;
   return static_cast<int>(spec->kind);
 }
 
@@ -8407,7 +8671,8 @@ int rt_graph_test_template_schedule_step_item_count(
     const RTGraph *g, int template_id, int step_index
 ) {
   const auto *spec = schedule_step_at(g, template_id, step_index);
-  if (!spec) return -1;
+  if (!spec)
+    return -1;
   return spec->item_count;
 }
 
@@ -8421,13 +8686,16 @@ int rt_graph_test_template_schedule_step_region(
     const RTGraph *g, int template_id, int step_index, int item_index
 ) {
   const auto *spec = schedule_step_at(g, template_id, step_index);
-  if (!spec) return -1;
-  if (item_index < 0 || item_index >= spec->item_count) return -1;
+  if (!spec)
+    return -1;
+  if (item_index < 0 || item_index >= spec->item_count)
+    return -1;
   const std::size_t tid = static_cast<std::size_t>(template_id);
   const auto &items = world(*g).defs[tid].schedule_step_regions;
-  const std::size_t pos = static_cast<std::size_t>(spec->first_item)
-                          + static_cast<std::size_t>(item_index);
-  if (pos >= items.size()) return -1;
+  const std::size_t pos =
+      static_cast<std::size_t>(spec->first_item) + static_cast<std::size_t>(item_index);
+  if (pos >= items.size())
+    return -1;
   return items[pos];
 }
 
@@ -8437,38 +8705,35 @@ int rt_graph_test_template_schedule_step_region(
 // schedule for the most recent block. After rt_graph_clear (or
 // before any block has run), the vector is empty.
 int rt_graph_test_global_schedule_entry_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).global_schedule.size());
 }
 
 namespace {
-const GlobalScheduleEntry *
-global_schedule_entry_at(const RTGraph *g, int entry_index) {
-  if (!g) return nullptr;
-  if (entry_index < 0) return nullptr;
+const GlobalScheduleEntry *global_schedule_entry_at(const RTGraph *g, int entry_index) {
+  if (!g)
+    return nullptr;
+  if (entry_index < 0)
+    return nullptr;
   const std::size_t i = static_cast<std::size_t>(entry_index);
-  if (i >= world(*g).global_schedule.size()) return nullptr;
+  if (i >= world(*g).global_schedule.size())
+    return nullptr;
   return &world(*g).global_schedule[i];
 }
-}  // namespace
+} // namespace
 
-int rt_graph_test_global_schedule_entry_template(
-    const RTGraph *g, int entry_index
-) {
+int rt_graph_test_global_schedule_entry_template(const RTGraph *g, int entry_index) {
   const auto *e = global_schedule_entry_at(g, entry_index);
   return e ? e->template_id : -1;
 }
 
-int rt_graph_test_global_schedule_entry_instance(
-    const RTGraph *g, int entry_index
-) {
+int rt_graph_test_global_schedule_entry_instance(const RTGraph *g, int entry_index) {
   const auto *e = global_schedule_entry_at(g, entry_index);
   return e ? e->instance_slot : -1;
 }
 
-int rt_graph_test_global_schedule_entry_step(
-    const RTGraph *g, int entry_index
-) {
+int rt_graph_test_global_schedule_entry_step(const RTGraph *g, int entry_index) {
   const auto *e = global_schedule_entry_at(g, entry_index);
   return e ? e->step_index : -1;
 }
@@ -8479,101 +8744,90 @@ int rt_graph_test_global_schedule_entry_step(
 // accessors and the per-template step metadata through the C0a
 // accessors.
 int rt_graph_test_global_schedule_band_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).global_schedule_bands.size());
 }
 
 namespace {
-const GlobalScheduleBand *
-global_schedule_band_at(const RTGraph *g, int band_index) {
-  if (!g) return nullptr;
-  if (band_index < 0) return nullptr;
+const GlobalScheduleBand *global_schedule_band_at(const RTGraph *g, int band_index) {
+  if (!g)
+    return nullptr;
+  if (band_index < 0)
+    return nullptr;
   const std::size_t i = static_cast<std::size_t>(band_index);
-  if (i >= world(*g).global_schedule_bands.size()) return nullptr;
+  if (i >= world(*g).global_schedule_bands.size())
+    return nullptr;
   return &world(*g).global_schedule_bands[i];
 }
-}  // namespace
+} // namespace
 
-int rt_graph_test_global_schedule_band_kind(
-    const RTGraph *g, int band_index
-) {
+int rt_graph_test_global_schedule_band_kind(const RTGraph *g, int band_index) {
   const auto *b = global_schedule_band_at(g, band_index);
   return b ? static_cast<int>(b->kind) : -1;
 }
 
-int rt_graph_test_global_schedule_band_first_entry(
-    const RTGraph *g, int band_index
-) {
+int rt_graph_test_global_schedule_band_first_entry(const RTGraph *g, int band_index) {
   const auto *b = global_schedule_band_at(g, band_index);
   return b ? b->first_entry : -1;
 }
 
-int rt_graph_test_global_schedule_band_entry_count(
-    const RTGraph *g, int band_index
-) {
+int rt_graph_test_global_schedule_band_entry_count(const RTGraph *g, int band_index) {
   const auto *b = global_schedule_band_at(g, band_index);
   return b ? b->entry_count : -1;
 }
 
 int rt_graph_test_region_layer_work_item_count(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).region_layer_work_items.size());
 }
 
 int rt_graph_test_region_layer_work_item_capacity(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return static_cast<int>(world(*g).region_layer_work_items.capacity());
 }
 
 namespace {
-const RegionLayerWorkItem *
-region_layer_work_item_at(const RTGraph *g, int item_index) {
-  if (!g) return nullptr;
-  if (item_index < 0) return nullptr;
+const RegionLayerWorkItem *region_layer_work_item_at(const RTGraph *g, int item_index) {
+  if (!g)
+    return nullptr;
+  if (item_index < 0)
+    return nullptr;
   const std::size_t i = static_cast<std::size_t>(item_index);
-  if (i >= world(*g).region_layer_work_items.size()) return nullptr;
+  if (i >= world(*g).region_layer_work_items.size())
+    return nullptr;
   return &world(*g).region_layer_work_items[i];
 }
-}  // namespace
+} // namespace
 
-int rt_graph_test_region_layer_work_item_entry(
-    const RTGraph *g, int item_index
-) {
+int rt_graph_test_region_layer_work_item_entry(const RTGraph *g, int item_index) {
   const auto *item = region_layer_work_item_at(g, item_index);
   return item ? item->global_entry_index : -1;
 }
 
-int rt_graph_test_region_layer_work_item_template(
-    const RTGraph *g, int item_index
-) {
+int rt_graph_test_region_layer_work_item_template(const RTGraph *g, int item_index) {
   const auto *item = region_layer_work_item_at(g, item_index);
   return item ? item->template_id : -1;
 }
 
-int rt_graph_test_region_layer_work_item_instance(
-    const RTGraph *g, int item_index
-) {
+int rt_graph_test_region_layer_work_item_instance(const RTGraph *g, int item_index) {
   const auto *item = region_layer_work_item_at(g, item_index);
   return item ? item->instance_slot : -1;
 }
 
-int rt_graph_test_region_layer_work_item_step(
-    const RTGraph *g, int item_index
-) {
+int rt_graph_test_region_layer_work_item_step(const RTGraph *g, int item_index) {
   const auto *item = region_layer_work_item_at(g, item_index);
   return item ? item->step_index : -1;
 }
 
-int rt_graph_test_region_layer_work_item_item(
-    const RTGraph *g, int item_index
-) {
+int rt_graph_test_region_layer_work_item_item(const RTGraph *g, int item_index) {
   const auto *item = region_layer_work_item_at(g, item_index);
   return item ? item->item_index : -1;
 }
 
-int rt_graph_test_region_layer_work_item_region(
-    const RTGraph *g, int item_index
-) {
+int rt_graph_test_region_layer_work_item_region(const RTGraph *g, int item_index) {
   const auto *item = region_layer_work_item_at(g, item_index);
   return item ? item->region_ordinal : -1;
 }
@@ -8604,8 +8858,7 @@ int rt_graph_test_last_c1d_serialized_sink_entry_count(const RTGraph *g) {
   return g ? g->last_c1d_serialized_sink_entry_count : 0;
 }
 
-int rt_graph_test_last_c1d_serial_region_item_execution_count(
-    const RTGraph *g) {
+int rt_graph_test_last_c1d_serial_region_item_execution_count(const RTGraph *g) {
   return g ? g->last_c1d_serial_region_item_execution_count : 0;
 }
 
@@ -8622,7 +8875,8 @@ int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g) {
 // ----------------------------------------------------------------
 
 RTGraphSwap *rt_graph_prepare_swap(RTGraph *g) {
-  if (!g) return nullptr;
+  if (!g)
+    return nullptr;
   auto *swap = new RTGraphSwap{};
   swap->state = make_default_state(g->capacity, g->max_frames);
   return swap;
@@ -8637,30 +8891,34 @@ RTGraphSwap *rt_graph_prepare_swap(RTGraph *g) {
 // not checked because a renumber that happens before any voice is
 // active is not observable through migration anyway.
 [[nodiscard]] static bool template_identity_precondition_ok(
-    const RTGraphState &old_state,
-    const RTGraphState &new_state
+    const RTGraphState &old_state, const RTGraphState &new_state
 ) noexcept {
   for (const GraphInstance &inst : old_state.instances) {
     const SlotState slot = inst.state.load(std::memory_order_acquire);
-    if (slot != SlotState::Active && slot != SlotState::Releasing) continue;
+    if (slot != SlotState::Active && slot != SlotState::Releasing)
+      continue;
     const int tid = inst.template_id;
-    if (tid < 0) continue;
+    if (tid < 0)
+      continue;
     const std::size_t utid = static_cast<std::size_t>(tid);
     if (utid >= old_state.defs.size() || utid >= new_state.defs.size()) {
       continue;
     }
     const MigrationKey &old_id = old_state.defs[utid].identity;
     const MigrationKey &new_id = new_state.defs[utid].identity;
-    if (!old_id.present() || !new_id.present()) continue;
-    if (!migration_key_equals(old_id, new_id)) return false;
+    if (!old_id.present() || !new_id.present())
+      continue;
+    if (!migration_key_equals(old_id, new_id))
+      return false;
   }
   return true;
 }
 
-RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
-                                              RTGraph *source) {
-  if (!target || !source || target == source) return nullptr;
-  if (target->max_frames != source->max_frames) return nullptr;
+RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target, RTGraph *source) {
+  if (!target || !source || target == source)
+    return nullptr;
+  if (target->max_frames != source->max_frames)
+    return nullptr;
   if (target->pending_swap.load(std::memory_order_acquire) != nullptr) {
     return nullptr;
   }
@@ -8690,17 +8948,15 @@ RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
   return swap;
 }
 
-void rt_graph_cancel_swap(RTGraph * /*g*/, RTGraphSwap *swap) {
-  delete swap;
-}
+void rt_graph_cancel_swap(RTGraph * /*g*/, RTGraphSwap *swap) { delete swap; }
 
 int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap) {
-  if (!g || !swap || !swap->state) return 0;
+  if (!g || !swap || !swap->state)
+    return 0;
   bool idle = false;
   if (!g->swap_in_flight.compare_exchange_strong(
-          idle, true,
-          std::memory_order_acq_rel,
-          std::memory_order_relaxed)) {
+          idle, true, std::memory_order_acq_rel, std::memory_order_relaxed
+      )) {
     return 0;
   }
   // CAS the pending slot from null → swap. A failure means a
@@ -8710,9 +8966,8 @@ int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap) {
   // thread's acquire-load in process_graph.
   RTGraphSwap *expected = nullptr;
   if (!g->pending_swap.compare_exchange_strong(
-          expected, swap,
-          std::memory_order_release,
-          std::memory_order_relaxed)) {
+          expected, swap, std::memory_order_release, std::memory_order_relaxed
+      )) {
     g->swap_in_flight.store(false, std::memory_order_release);
     return 0;
   }
@@ -8720,11 +8975,11 @@ int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap) {
 }
 
 RTGraphSwap *rt_graph_collect_retired_swap(RTGraph *g) {
-  if (!g) return nullptr;
+  if (!g)
+    return nullptr;
   // Acquire so the retired state moved into the swap by the audio
   // thread is visible before the producer disposes it.
-  RTGraphSwap *retired =
-      g->retired_swap.exchange(nullptr, std::memory_order_acquire);
+  RTGraphSwap *retired = g->retired_swap.exchange(nullptr, std::memory_order_acquire);
   if (retired) {
     g->swap_in_flight.store(false, std::memory_order_release);
   }
@@ -8736,12 +8991,14 @@ int rt_graph_test_swap_generation(const RTGraph *g) {
 }
 
 int rt_graph_test_swap_pending(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->pending_swap.load(std::memory_order_acquire) != nullptr ? 1 : 0;
 }
 
 int rt_graph_test_swap_retired_pending(const RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   return g->retired_swap.load(std::memory_order_acquire) != nullptr ? 1 : 0;
 }
 
@@ -8752,60 +9009,70 @@ int rt_graph_test_retired_swap_control_value(
     int control_index,
     double *out_value
 ) {
-  if (!swap || !swap->retired_state || !out_value) return 0;
-  if (instance_id < 0 || node_index < 0 || control_index < 0) return 0;
+  if (!swap || !swap->retired_state || !out_value)
+    return 0;
+  if (instance_id < 0 || node_index < 0 || control_index < 0)
+    return 0;
 
   const auto &instances = swap->retired_state->instances;
   const std::size_t inst_idx = static_cast<std::size_t>(instance_id);
-  if (inst_idx >= instances.size()) return 0;
+  if (inst_idx >= instances.size())
+    return 0;
 
   const GraphInstance &inst = instances[inst_idx];
   const SlotState s = inst.state.load();
-  if (s == SlotState::Available) return 0;
+  if (s == SlotState::Available)
+    return 0;
 
   const std::size_t node_idx = static_cast<std::size_t>(node_index);
-  if (node_idx >= inst.nodes.size()) return 0;
+  if (node_idx >= inst.nodes.size())
+    return 0;
 
   const auto &controls = inst.nodes[node_idx].controls;
   const std::size_t control_idx = static_cast<std::size_t>(control_index);
-  if (control_idx >= controls.size()) return 0;
+  if (control_idx >= controls.size())
+    return 0;
 
   *out_value = controls[control_idx];
   return 1;
 }
 
 int rt_graph_swap_migration_committed_count(const RTGraphSwap *swap) {
-  if (!swap) return 0;
+  if (!swap)
+    return 0;
   return static_cast<int>(swap->migration_copies.size());
 }
 
 int rt_graph_swap_migration_skipped_count(const RTGraphSwap *swap) {
-  if (!swap) return 0;
+  if (!swap)
+    return 0;
   return static_cast<int>(swap->migration_skips.size());
 }
 
 int rt_graph_swap_migration_instance_copy_count(const RTGraphSwap *swap) {
-  if (!swap) return 0;
+  if (!swap)
+    return 0;
   return swap->migration_instance_copy_count;
 }
 
 int rt_graph_swap_migration_state_copy_count(const RTGraphSwap *swap) {
-  if (!swap) return 0;
+  if (!swap)
+    return 0;
   return swap->migration_state_copy_count;
 }
 
 int rt_graph_swap_migration_lifecycle_copy_count(const RTGraphSwap *swap) {
-  if (!swap) return 0;
+  if (!swap)
+    return 0;
   return swap->migration_lifecycle_copy_count;
 }
 
-int rt_graph_swap_migration_skipped_reason(
-    const RTGraphSwap *swap,
-    int skip_index
-) {
-  if (!swap || skip_index < 0) return -1;
+int rt_graph_swap_migration_skipped_reason(const RTGraphSwap *swap, int skip_index) {
+  if (!swap || skip_index < 0)
+    return -1;
   const std::size_t idx = static_cast<std::size_t>(skip_index);
-  if (idx >= swap->migration_skips.size()) return -1;
+  if (idx >= swap->migration_skips.size())
+    return -1;
   return static_cast<int>(swap->migration_skips[idx].reason);
 }
 
@@ -8819,8 +9086,11 @@ int rt_graph_swap_migration_skipped_reason(
 // final layout — every live instance of this template ends up with a
 // state slot for the new node. Instances of *other* templates are
 // untouched.
-void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int node_kind) {
-  if (!g) return;
+void rt_graph_template_add_node(
+    RTGraph *g, int template_id, int node_index, int node_kind
+) {
+  if (!g)
+    return;
 
   const auto maybe_kind = kind_from_tag(node_kind);
   if (!maybe_kind) {
@@ -8859,12 +9129,11 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
     // writes. (In practice no producer runs during construction,
     // but defense in depth makes the rule legible.)
     const SlotState s = inst.state.load();
-    if (s != SlotState::Active && s != SlotState::Releasing) continue;
-    if (inst.template_id != template_id) continue;
-    init_node_state(
-        inst.nodes[to_size(idx)],
-        def->nodes[to_size(idx)],
-        g->max_frames);
+    if (s != SlotState::Active && s != SlotState::Releasing)
+      continue;
+    if (inst.template_id != template_id)
+      continue;
+    init_node_state(inst.nodes[to_size(idx)], def->nodes[to_size(idx)], g->max_frames);
   }
 
   // Out nodes imply at least one runtime output bus exists, on the
@@ -8882,28 +9151,31 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
 }
 
 int rt_graph_template_set_node_migration_key(
-    RTGraph *g,
-    int template_id,
-    int node_index,
-    const char *key,
-    int key_len
+    RTGraph *g, int template_id, int node_index, const char *key, int key_len
 ) {
-  if (!g || !key) return 0;
-  if (key_len <= 0 || key_len > kMigrationKeyMaxBytes) return 0;
+  if (!g || !key)
+    return 0;
+  if (key_len <= 0 || key_len > kMigrationKeyMaxBytes)
+    return 0;
   for (int i = 0; i < key_len; ++i) {
-    if (key[i] == '\0') return 0;
+    if (key[i] == '\0')
+      return 0;
   }
 
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return 0;
+  if (!def)
+    return 0;
 
   const NodeIndex idx{node_index};
-  if (!valid(idx)) return 0;
+  if (!valid(idx))
+    return 0;
   const std::size_t node_idx = to_size(idx);
-  if (node_idx >= def->nodes.size()) return 0;
+  if (node_idx >= def->nodes.size())
+    return 0;
 
   for (std::size_t i = 0; i < def->nodes.size(); ++i) {
-    if (i == node_idx) continue;
+    if (i == node_idx)
+      continue;
     if (migration_key_equals_raw(def->nodes[i].migration_key, key, key_len)) {
       return 0;
     }
@@ -8917,19 +9189,20 @@ int rt_graph_template_set_node_migration_key(
 }
 
 int rt_graph_template_set_identity(
-    RTGraph *g,
-    int template_id,
-    const char *key,
-    int key_len
+    RTGraph *g, int template_id, const char *key, int key_len
 ) {
-  if (!g || !key) return 0;
-  if (key_len <= 0 || key_len > kMigrationKeyMaxBytes) return 0;
+  if (!g || !key)
+    return 0;
+  if (key_len <= 0 || key_len > kMigrationKeyMaxBytes)
+    return 0;
   for (int i = 0; i < key_len; ++i) {
-    if (key[i] == '\0') return 0;
+    if (key[i] == '\0')
+      return 0;
   }
 
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return 0;
+  if (!def)
+    return 0;
 
   MigrationKey next{};
   next.length = key_len;
@@ -8952,21 +9225,26 @@ int rt_graph_template_set_identity(
 void rt_graph_template_set_default(
     RTGraph *g, int template_id, int node_index, int control_index, double value
 ) {
-  if (!g) return;
+  if (!g)
+    return;
 
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
   const NodeIndex ni{node_index};
   const ControlIndex ci{control_index};
-  if (!valid(ni) || !valid(ci)) return;
+  if (!valid(ni) || !valid(ci))
+    return;
 
   const std::size_t nidx = to_size(ni);
-  if (nidx >= def->nodes.size()) return;
+  if (nidx >= def->nodes.size())
+    return;
 
   NodeSpec &spec = def->nodes[nidx];
   const std::size_t cidx = to_size(ci);
-  if (cidx >= spec.default_controls.size()) return;
+  if (cidx >= spec.default_controls.size())
+    return;
 
   spec.default_controls[cidx] = value;
   // Bus-pool sizing is no longer a side effect of writing this
@@ -8984,13 +9262,14 @@ void rt_graph_template_set_default(
 // (cross-template signal flow goes through the bus pool, not direct
 // port wiring); this function does not validate that.
 void rt_graph_template_connect(
-    RTGraph *g, int template_id,
-    int src_index, int src_port, int dst_index, int dst_port
+    RTGraph *g, int template_id, int src_index, int src_port, int dst_index, int dst_port
 ) {
-  if (!g) return;
+  if (!g)
+    return;
 
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
   const NodeIndex src{src_index};
   const PortIndex sp{src_port};
@@ -9057,8 +9336,7 @@ without Haskell. There is no plan to remove it.
 // node covered exactly once, contiguous, in scheduled execution order);
 // the C ABI does not duplicate that check. See Note [Region fallback].
 void rt_graph_template_add_region(
-    RTGraph *g, int template_id,
-    int rate, int first_node, int node_count
+    RTGraph *g, int template_id, int rate, int first_node, int node_count
 ) {
   // The kernel-aware entry takes a kernel_kind in addition to rate /
   // first_node / node_count. Existing callers (Haskell pre-§4.B
@@ -9067,8 +9345,8 @@ void rt_graph_template_add_region(
   // path; that preserves their bit-identical render against the
   // pre-§4.B world.
   rt_graph_template_add_region_kernel(
-      g, template_id, /*kernel_kind=*/0,
-      rate, first_node, node_count);
+      g, template_id, /*kernel_kind=*/0, rate, first_node, node_count
+  );
 }
 
 // Phase 4.B: kernel-aware region registration. Same precondition
@@ -9078,16 +9356,17 @@ void rt_graph_template_add_region(
 // no-op so a stale Haskell sender against an older runtime can't
 // silently silence the region.
 void rt_graph_template_add_region_kernel(
-    RTGraph *g, int template_id,
-    int kernel_kind,
-    int rate, int first_node, int node_count
+    RTGraph *g, int template_id, int kernel_kind, int rate, int first_node, int node_count
 ) {
-  if (!g) return;
+  if (!g)
+    return;
 
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
-  if (first_node < 0 || node_count <= 0) return;
+  if (first_node < 0 || node_count <= 0)
+    return;
   const std::size_t first = static_cast<std::size_t>(first_node);
   const std::size_t count = static_cast<std::size_t>(node_count);
   if (first >= def->nodes.size() || count > def->nodes.size() - first) {
@@ -9095,10 +9374,10 @@ void rt_graph_template_add_region_kernel(
   }
 
   const auto kernel = region_kernel_from_tag(kernel_kind);
-  if (!kernel.has_value()) return;
+  if (!kernel.has_value())
+    return;
 
-  def->regions.push_back(
-      RegionSpec{rate, first_node, node_count, *kernel});
+  def->regions.push_back(RegionSpec{rate, first_node, node_count, *kernel});
 }
 
 // Phase 4.B introspection: pinned by the Haskell-side 'kernelTag'
@@ -9133,23 +9412,29 @@ int rt_graph_region_kernel_supported(int kernel_kind) {
 // pushes never happen: the function checks every ordinal before
 // committing anything to schedule_step_regions.
 void rt_graph_template_add_schedule_step(
-    RTGraph *g, int template_id,
-    int kind,
-    int item_count,
-    const int *region_ordinals
+    RTGraph *g, int template_id, int kind, int item_count, const int *region_ordinals
 ) {
-  if (!g) return;
+  if (!g)
+    return;
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
-  if (item_count <= 0) return;
-  if (!region_ordinals) return;
+  if (item_count <= 0)
+    return;
+  if (!region_ordinals)
+    return;
 
   ScheduleStepKind step_kind;
   switch (kind) {
-    case 0: step_kind = ScheduleStepKind::Barrier;   break;
-    case 1: step_kind = ScheduleStepKind::FreeLayer; break;
-    default: return;
+  case 0:
+    step_kind = ScheduleStepKind::Barrier;
+    break;
+  case 1:
+    step_kind = ScheduleStepKind::FreeLayer;
+    break;
+  default:
+    return;
   }
 
   // Barriers are single pinned regions by definition (Haskell's
@@ -9170,13 +9455,11 @@ void rt_graph_template_add_schedule_step(
     }
   }
 
-  const int first_item =
-      static_cast<int>(def->schedule_step_regions.size());
+  const int first_item = static_cast<int>(def->schedule_step_regions.size());
   for (int i = 0; i < item_count; ++i) {
     def->schedule_step_regions.push_back(region_ordinals[i]);
   }
-  def->schedule_steps.push_back(
-      ScheduleStepSpec{step_kind, first_item, item_count});
+  def->schedule_steps.push_back(ScheduleStepSpec{step_kind, first_item, item_count});
 
   // C0b: schedule_steps just grew by one, so the per-block global
   // schedule's high-water bound grows by max(polyphony, occupied)
@@ -9193,15 +9476,17 @@ void rt_graph_template_add_schedule_step(
 // instance keeps its NodeInstanceState slot, so control writes
 // targeting node_index continue to land on the same controls vector
 // that resolve_input reads at fused-input materialization time.
-void rt_graph_template_set_node_elided(
-    RTGraph *g, int template_id, int node_index
-) {
-  if (!g) return;
+void rt_graph_template_set_node_elided(RTGraph *g, int template_id, int node_index) {
+  if (!g)
+    return;
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
-  if (node_index < 0) return;
+  if (!def)
+    return;
+  if (node_index < 0)
+    return;
   const std::size_t idx = static_cast<std::size_t>(node_index);
-  if (idx >= def->nodes.size()) return;
+  if (idx >= def->nodes.size())
+    return;
   def->nodes[idx].elided = true;
 }
 
@@ -9214,26 +9499,30 @@ void rt_graph_template_set_node_elided(
 // (dst_node, dst_port) overwrite the previous fused override; the
 // older slot stays allocated but unused.
 void rt_graph_template_connect_fused_scale_input(
-    RTGraph *g, int template_id,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
-    int scale_node, int scale_control_index
+    RTGraph *g,
+    int template_id,
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
+    int scale_node,
+    int scale_control_index
 ) {
-  if (!g) return;
+  if (!g)
+    return;
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
   // Validate every index in the template's spec frame.
-  if (dst_node   < 0 || dst_port   < 0 ||
-      src_node   < 0 || src_port   < 0 ||
-      scale_node < 0 || scale_control_index < 0) {
+  if (dst_node < 0 || dst_port < 0 || src_node < 0 || src_port < 0 || scale_node < 0 ||
+      scale_control_index < 0) {
     return;
   }
   const std::size_t didx = static_cast<std::size_t>(dst_node);
   const std::size_t sidx = static_cast<std::size_t>(src_node);
   const std::size_t scidx = static_cast<std::size_t>(scale_node);
-  if (didx >= def->nodes.size() ||
-      sidx >= def->nodes.size() ||
+  if (didx >= def->nodes.size() || sidx >= def->nodes.size() ||
       scidx >= def->nodes.size()) {
     return;
   }
@@ -9254,16 +9543,15 @@ void rt_graph_template_connect_fused_scale_input(
   // (the override takes precedence over the original input_refs);
   // failing fast keeps construction-time bugs visible instead of
   // surfacing as muted audio.
-  const NodeSpec &src_spec   = def->nodes[sidx];
+  const NodeSpec &src_spec = def->nodes[sidx];
   const NodeSpec &scale_spec = def->nodes[scidx];
   // All non-sink kinds produce exactly one output port (port 0);
   // sinks (Out / BusOut) produce zero. See init_node_state.
   const int src_output_count =
-      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut)
-          ? 0 : 1;
-  if (src_port >= src_output_count) return;
-  if (scale_control_index >=
-      static_cast<int>(scale_spec.default_controls.size())) {
+      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut) ? 0 : 1;
+  if (src_port >= src_output_count)
+    return;
+  if (scale_control_index >= static_cast<int>(scale_spec.default_controls.size())) {
     return;
   }
 
@@ -9273,12 +9561,15 @@ void rt_graph_template_connect_fused_scale_input(
   const int slot = def->fused_input_count++;
 
   FusedAffineRef ref;
-  ref.source_node  = NodeIndex{src_node};
-  ref.source_port  = PortIndex{src_port};
-  ref.steps.push_back(FusedAffineStep{
-      FusedAffineStep::Kind::Scale,
-      NodeIndex{scale_node},
-      ControlIndex{scale_control_index}});
+  ref.source_node = NodeIndex{src_node};
+  ref.source_port = PortIndex{src_port};
+  ref.steps.push_back(
+      FusedAffineStep{
+          FusedAffineStep::Kind::Scale,
+          NodeIndex{scale_node},
+          ControlIndex{scale_control_index}
+      }
+  );
   ref.scratch_slot = slot;
   dst_spec.fused_inputs[dport] = std::move(ref);
 
@@ -9288,8 +9579,10 @@ void rt_graph_template_connect_fused_scale_input(
   // parallel-growth contract; uses the shared ensure_fused_scratch
   // helper so reuse paths and growth paths agree exactly.
   for (auto &inst : world(*g).instances) {
-    if (inst.template_id != template_id) continue;
-    if (inst.state.load() == SlotState::Available) continue;
+    if (inst.template_id != template_id)
+      continue;
+    if (inst.state.load() == SlotState::Available)
+      continue;
     ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
   }
 }
@@ -9302,22 +9595,28 @@ void rt_graph_template_connect_fused_scale_input(
 // chain length; per-block resolver folds the chain into the slot in
 // source-to-sink order. See FusedAffineRef::steps and resolve_input.
 void rt_graph_template_connect_fused_scale_chain_input(
-    RTGraph *g, int template_id,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
+    RTGraph *g,
+    int template_id,
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
     int scale_count,
     const int *scale_nodes,
     const int *scale_controls
 ) {
-  if (!g) return;
+  if (!g)
+    return;
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
-  if (scale_count <= 0) return;
-  if (!scale_nodes || !scale_controls) return;
+  if (scale_count <= 0)
+    return;
+  if (!scale_nodes || !scale_controls)
+    return;
 
-  if (dst_node < 0 || dst_port < 0 ||
-      src_node < 0 || src_port < 0) {
+  if (dst_node < 0 || dst_port < 0 || src_node < 0 || src_port < 0) {
     return;
   }
   const std::size_t didx = static_cast<std::size_t>(dst_node);
@@ -9328,16 +9627,17 @@ void rt_graph_template_connect_fused_scale_chain_input(
 
   NodeSpec &dst_spec = def->nodes[didx];
   const std::size_t dport = static_cast<std::size_t>(dst_port);
-  if (dport >= dst_spec.fused_inputs.size()) return;
+  if (dport >= dst_spec.fused_inputs.size())
+    return;
 
   // Validate src_port against source kind's output arity. Mirrors
   // the single-scale path so chain-mode rejects the same invalid
   // shapes (Out / BusOut as a source, etc.).
   const NodeSpec &src_spec = def->nodes[sidx];
   const int src_output_count =
-      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut)
-          ? 0 : 1;
-  if (src_port >= src_output_count) return;
+      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut) ? 0 : 1;
+  if (src_port >= src_output_count)
+    return;
 
   // Pre-validate every scale ref. A bad mid-chain entry must
   // abort the whole call, otherwise we'd claim the scratch slot
@@ -9346,31 +9646,39 @@ void rt_graph_template_connect_fused_scale_chain_input(
   for (int k = 0; k < scale_count; ++k) {
     const int sn = scale_nodes[k];
     const int sc = scale_controls[k];
-    if (sn < 0 || sc < 0) return;
+    if (sn < 0 || sc < 0)
+      return;
     const std::size_t snidx = static_cast<std::size_t>(sn);
-    if (snidx >= def->nodes.size()) return;
+    if (snidx >= def->nodes.size())
+      return;
     const NodeSpec &scale_spec = def->nodes[snidx];
-    if (sc >= static_cast<int>(scale_spec.default_controls.size())) return;
+    if (sc >= static_cast<int>(scale_spec.default_controls.size()))
+      return;
   }
 
   const int slot = def->fused_input_count++;
 
   FusedAffineRef ref;
-  ref.source_node  = NodeIndex{src_node};
-  ref.source_port  = PortIndex{src_port};
+  ref.source_node = NodeIndex{src_node};
+  ref.source_port = PortIndex{src_port};
   ref.steps.reserve(static_cast<std::size_t>(scale_count));
   for (int k = 0; k < scale_count; ++k) {
-    ref.steps.push_back(FusedAffineStep{
-        FusedAffineStep::Kind::Scale,
-        NodeIndex{scale_nodes[k]},
-        ControlIndex{scale_controls[k]}});
+    ref.steps.push_back(
+        FusedAffineStep{
+            FusedAffineStep::Kind::Scale,
+            NodeIndex{scale_nodes[k]},
+            ControlIndex{scale_controls[k]}
+        }
+    );
   }
   ref.scratch_slot = slot;
   dst_spec.fused_inputs[dport] = std::move(ref);
 
   for (auto &inst : world(*g).instances) {
-    if (inst.template_id != template_id) continue;
-    if (inst.state.load() == SlotState::Available) continue;
+    if (inst.template_id != template_id)
+      continue;
+    if (inst.state.load() == SlotState::Available)
+      continue;
     ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
   }
 }
@@ -9391,23 +9699,29 @@ void rt_graph_template_connect_fused_scale_chain_input(
 // bad mid-chain entry never inflates fused_input_count past what
 // is actually wired. One slot per fused input regardless of length.
 void rt_graph_template_connect_fused_affine_input(
-    RTGraph *g, int template_id,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
+    RTGraph *g,
+    int template_id,
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
     int step_count,
     const int *step_kinds,
     const int *step_nodes,
     const int *step_controls
 ) {
-  if (!g) return;
+  if (!g)
+    return;
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return;
+  if (!def)
+    return;
 
-  if (step_count <= 0) return;
-  if (!step_kinds || !step_nodes || !step_controls) return;
+  if (step_count <= 0)
+    return;
+  if (!step_kinds || !step_nodes || !step_controls)
+    return;
 
-  if (dst_node < 0 || dst_port < 0 ||
-      src_node < 0 || src_port < 0) {
+  if (dst_node < 0 || dst_port < 0 || src_node < 0 || src_port < 0) {
     return;
   }
   const std::size_t didx = static_cast<std::size_t>(dst_node);
@@ -9418,27 +9732,32 @@ void rt_graph_template_connect_fused_affine_input(
 
   NodeSpec &dst_spec = def->nodes[didx];
   const std::size_t dport = static_cast<std::size_t>(dst_port);
-  if (dport >= dst_spec.fused_inputs.size()) return;
+  if (dport >= dst_spec.fused_inputs.size())
+    return;
 
   const NodeSpec &src_spec = def->nodes[sidx];
   const int src_output_count =
-      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut)
-          ? 0 : 1;
-  if (src_port >= src_output_count) return;
+      (src_spec.kind == NodeKind::Out || src_spec.kind == NodeKind::BusOut) ? 0 : 1;
+  if (src_port >= src_output_count)
+    return;
 
   // Pre-validate every step. Step kinds are restricted to the two
   // declared ABI tags; a value outside that range is a contract
   // violation and bails out before we claim a slot.
   for (int k = 0; k < step_count; ++k) {
     const int kind = step_kinds[k];
-    const int sn   = step_nodes[k];
-    const int sc   = step_controls[k];
-    if (kind != 0 && kind != 1) return;
-    if (sn < 0 || sc < 0) return;
+    const int sn = step_nodes[k];
+    const int sc = step_controls[k];
+    if (kind != 0 && kind != 1)
+      return;
+    if (sn < 0 || sc < 0)
+      return;
     const std::size_t snidx = static_cast<std::size_t>(sn);
-    if (snidx >= def->nodes.size()) return;
+    if (snidx >= def->nodes.size())
+      return;
     const NodeSpec &spec = def->nodes[snidx];
-    if (sc >= static_cast<int>(spec.default_controls.size())) return;
+    if (sc >= static_cast<int>(spec.default_controls.size()))
+      return;
   }
 
   const int slot = def->fused_input_count++;
@@ -9448,18 +9767,23 @@ void rt_graph_template_connect_fused_affine_input(
   ref.source_port = PortIndex{src_port};
   ref.steps.reserve(static_cast<std::size_t>(step_count));
   for (int k = 0; k < step_count; ++k) {
-    ref.steps.push_back(FusedAffineStep{
-        step_kinds[k] == 0 ? FusedAffineStep::Kind::Scale
-                           : FusedAffineStep::Kind::Bias,
-        NodeIndex{step_nodes[k]},
-        ControlIndex{step_controls[k]}});
+    ref.steps.push_back(
+        FusedAffineStep{
+            step_kinds[k] == 0 ? FusedAffineStep::Kind::Scale
+                               : FusedAffineStep::Kind::Bias,
+            NodeIndex{step_nodes[k]},
+            ControlIndex{step_controls[k]}
+        }
+    );
   }
   ref.scratch_slot = slot;
   dst_spec.fused_inputs[dport] = std::move(ref);
 
   for (auto &inst : world(*g).instances) {
-    if (inst.template_id != template_id) continue;
-    if (inst.state.load() == SlotState::Available) continue;
+    if (inst.template_id != template_id)
+      continue;
+    if (inst.state.load() == SlotState::Available)
+      continue;
     ensure_fused_scratch(inst, def->fused_input_count, def->max_frames);
   }
 }
@@ -9487,25 +9811,29 @@ void rt_graph_template_connect_fused_affine_input(
 // of the RTGraph (the dead slot is reused after rt_graph_instance_-
 // remove or after the §2.E auto-free path), but never concurrently.
 int rt_graph_template_instance_add(RTGraph *g, int template_id) {
-  if (!g) return -1;
+  if (!g)
+    return -1;
 
   const MetaDef *def = template_at(*g, template_id);
-  if (!def) return -1;
+  if (!def)
+    return -1;
 
   // Count live slots (Active + Releasing) assigned to this template
   // and remember the first Available slot we see, so the cap check
   // and the slot scan share one pass over world(g).instances.
   int live_count = 0;
-  std::size_t free_slot = world(*g).instances.size();  // sentinel: no slot found
+  std::size_t free_slot = world(*g).instances.size(); // sentinel: no slot found
   for (std::size_t i = 0; i < world(*g).instances.size(); ++i) {
     auto &s = world(*g).instances[i];
     if (s.state.load() == SlotState::Available) {
-      if (free_slot == world(*g).instances.size()) free_slot = i;
+      if (free_slot == world(*g).instances.size())
+        free_slot = i;
     } else if (s.template_id == template_id) {
       ++live_count;
     }
   }
-  if (live_count >= def->polyphony) return -1;
+  if (live_count >= def->polyphony)
+    return -1;
 
   if (free_slot < world(*g).instances.size()) {
     // Reuse: preserve the GraphInstance's vector capacity, just
@@ -9559,13 +9887,9 @@ int rt_graph_kind_supported(int node_kind) {
   return kind_from_tag(node_kind).has_value() ? 1 : 0;
 }
 
-int rt_graph_plugin_count(void) {
-  return metasonic::plugin_count();
-}
+int rt_graph_plugin_count(void) { return metasonic::plugin_count(); }
 
-int rt_graph_plugin_find(const char *name) {
-  return metasonic::plugin_find(name);
-}
+int rt_graph_plugin_find(const char *name) { return metasonic::plugin_find(name); }
 
 const char *rt_graph_plugin_name(int plugin_id) {
   const auto *spec = metasonic::plugin_at(plugin_id);
@@ -9604,8 +9928,10 @@ int rt_graph_plugin_state_size_bytes(int plugin_id) {
 // advanced past the snapshot retire stamped on it. See
 // Note [Buffer pool] above for the slot state machine.
 int rt_graph_buffer_alloc(RTGraph *g, int frames) {
-  if (g == nullptr) return -1;
-  if (frames < 0) return -1;
+  if (g == nullptr)
+    return -1;
+  if (frames < 0)
+    return -1;
   auto &buffers = g->buffers;
   for (int id = 0; id < static_cast<int>(buffers.size()); ++id) {
     auto &slot = buffers[static_cast<std::size_t>(id)];
@@ -9615,14 +9941,13 @@ int rt_graph_buffer_alloc(RTGraph *g, int frames) {
     // can't accidentally hand out a slot whose storage might
     // still be observed by a captured pointer on the audio
     // thread.
-    if (slot.state.load(std::memory_order_relaxed)
-          != BufferSlotState::Unallocated) continue;
+    if (slot.state.load(std::memory_order_relaxed) != BufferSlotState::Unallocated)
+      continue;
     slot.samples.assign(static_cast<std::size_t>(frames), 0.0f);
     // Release-store pairs with the kernel's acquire-load so a
     // kernel that sees Allocated reads the samples vector
     // contents that the assign() above just published.
-    slot.state.store(BufferSlotState::Allocated,
-                     std::memory_order_release);
+    slot.state.store(BufferSlotState::Allocated, std::memory_order_release);
     return id;
   }
   return -1;
@@ -9631,13 +9956,17 @@ int rt_graph_buffer_alloc(RTGraph *g, int frames) {
 int rt_graph_buffer_load_f32(
     RTGraph *g, int buffer_id, const float *samples, int frame_count
 ) {
-  if (g == nullptr) return -1;
-  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
-  if (frame_count < 0) return -1;
-  if (frame_count > 0 && samples == nullptr) return -1;
+  if (g == nullptr)
+    return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers)
+    return -1;
+  if (frame_count < 0)
+    return -1;
+  if (frame_count > 0 && samples == nullptr)
+    return -1;
   auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
-  if (slot.state.load(std::memory_order_relaxed)
-        != BufferSlotState::Allocated) return -1;
+  if (slot.state.load(std::memory_order_relaxed) != BufferSlotState::Allocated)
+    return -1;
   if (static_cast<std::size_t>(frame_count) > slot.samples.size()) {
     return -2;
   }
@@ -9646,22 +9975,24 @@ int rt_graph_buffer_load_f32(
   // on a null pointer is technically UB. Skipping std::copy here is
   // also a no-op when samples != nullptr (the bus pool's load path
   // matches this idiom).
-  if (frame_count == 0) return 0;
+  if (frame_count == 0)
+    return 0;
   std::copy(samples, samples + frame_count, slot.samples.begin());
   return frame_count;
 }
 
 int rt_graph_buffer_clear(RTGraph *g, int buffer_id) {
-  if (g == nullptr) return -1;
-  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
+  if (g == nullptr)
+    return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers)
+    return -1;
   auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
   // clearBuffer is the stopped-audio-only fast path: it requires
   // Allocated (not Retired). A retired slot must go through
   // collect_retired before it can be cleared or reused.
-  if (slot.state.load(std::memory_order_relaxed)
-        != BufferSlotState::Allocated) return -1;
-  slot.state.store(BufferSlotState::Unallocated,
-                   std::memory_order_relaxed);
+  if (slot.state.load(std::memory_order_relaxed) != BufferSlotState::Allocated)
+    return -1;
+  slot.state.store(BufferSlotState::Unallocated, std::memory_order_relaxed);
   // Sample storage capacity is intentionally preserved so a
   // subsequent rt_graph_buffer_alloc of the same size is
   // allocation-free in steady state.
@@ -9681,11 +10012,13 @@ int rt_graph_buffer_clear(RTGraph *g, int buffer_id) {
 // Returns 0 on success, -1 if buffer_id is out of range or the
 // slot is not currently Allocated.
 int rt_graph_buffer_retire(RTGraph *g, int buffer_id) {
-  if (g == nullptr) return -1;
-  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
+  if (g == nullptr)
+    return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers)
+    return -1;
   auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
-  if (slot.state.load(std::memory_order_relaxed)
-        != BufferSlotState::Allocated) return -1;
+  if (slot.state.load(std::memory_order_relaxed) != BufferSlotState::Allocated)
+    return -1;
   // Snapshot the audio thread's current block counter so collect
   // can compare against later increments. Acquire is enough
   // here: any block already running has already incremented
@@ -9695,8 +10028,7 @@ int rt_graph_buffer_retire(RTGraph *g, int buffer_id) {
       g->buffer_retire_generation.load(std::memory_order_acquire);
   // Release pairs with the kernel's acquire-load: a kernel that
   // sees Retired sees the snapshot already written.
-  slot.state.store(BufferSlotState::Retired,
-                   std::memory_order_release);
+  slot.state.store(BufferSlotState::Retired, std::memory_order_release);
   return 0;
 }
 
@@ -9713,41 +10045,45 @@ int rt_graph_buffer_retire(RTGraph *g, int buffer_id) {
 // a pre-retire pointer might still be in flight (the producer
 // should call rt_graph_process at least once more and retry).
 int rt_graph_buffer_collect_retired(RTGraph *g, int buffer_id) {
-  if (g == nullptr) return -1;
-  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
+  if (g == nullptr)
+    return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers)
+    return -1;
   auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
-  if (slot.state.load(std::memory_order_relaxed)
-        != BufferSlotState::Retired) return -1;
-  const long long current =
-      g->buffer_retire_generation.load(std::memory_order_acquire);
+  if (slot.state.load(std::memory_order_relaxed) != BufferSlotState::Retired)
+    return -1;
+  const long long current = g->buffer_retire_generation.load(std::memory_order_acquire);
   if (current <= slot.retire_generation_snapshot) {
     // The audio thread has not crossed a block boundary since
     // retire — wait one block and try again.
     return -2;
   }
   // Safe to reclaim. Storage stays in place for the next alloc.
-  slot.state.store(BufferSlotState::Unallocated,
-                   std::memory_order_relaxed);
+  slot.state.store(BufferSlotState::Unallocated, std::memory_order_relaxed);
   return 0;
 }
 
 long long rt_graph_test_buffer_read_count(const RTGraph *g) {
-  if (g == nullptr) return 0;
+  if (g == nullptr)
+    return 0;
   return g->buffer_read_count;
 }
 
 long long rt_graph_test_buffer_invalid_read_count(const RTGraph *g) {
-  if (g == nullptr) return 0;
+  if (g == nullptr)
+    return 0;
   return g->buffer_invalid_read_count;
 }
 
 long long rt_graph_test_buffer_write_count(const RTGraph *g) {
-  if (g == nullptr) return 0;
+  if (g == nullptr)
+    return 0;
   return g->buffer_write_count;
 }
 
 long long rt_graph_test_buffer_invalid_write_count(const RTGraph *g) {
-  if (g == nullptr) return 0;
+  if (g == nullptr)
+    return 0;
   return g->buffer_invalid_write_count;
 }
 
@@ -9755,13 +10091,31 @@ long long rt_graph_test_buffer_invalid_write_count(const RTGraph *g) {
 // for counter-confirmed validation. Each ticks by exactly
 // one per FFT / IFFT call.
 long long rt_graph_test_spectral_analysis_count(const RTGraph *g) {
-  if (g == nullptr) return 0;
+  if (g == nullptr)
+    return 0;
   return g->spectral_analysis_count;
 }
 
 long long rt_graph_test_spectral_resynthesis_count(const RTGraph *g) {
-  if (g == nullptr) return 0;
+  if (g == nullptr)
+    return 0;
   return g->spectral_resynthesis_count;
+}
+
+// §6.E slice 2: static-plugin dispatch counters. plugin_call_count
+// ticks once per audio-thread call into a registered plugin's
+// process callback; invalid_plugin_call_count ticks once per
+// non-zero return from that call.
+long long rt_graph_test_plugin_call_count(const RTGraph *g) {
+  if (g == nullptr)
+    return 0;
+  return g->plugin_call_count;
+}
+
+long long rt_graph_test_invalid_plugin_call_count(const RTGraph *g) {
+  if (g == nullptr)
+    return 0;
+  return g->invalid_plugin_call_count;
 }
 
 // Set one control slot on instance 0. Mutates the *instance*, not
@@ -9778,9 +10132,7 @@ void rt_graph_connect(
   rt_graph_template_connect(g, 0, src_index, src_port, dst_index, dst_port);
 }
 
-void rt_graph_add_region(
-    RTGraph *g, int rate, int first_node, int node_count
-) {
+void rt_graph_add_region(RTGraph *g, int rate, int first_node, int node_count) {
   rt_graph_template_add_region(g, 0, rate, first_node, node_count);
 }
 
@@ -9790,13 +10142,16 @@ void rt_graph_set_node_elided(RTGraph *g, int node_index) {
 
 void rt_graph_connect_fused_scale_input(
     RTGraph *g,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
-    int scale_node, int scale_control_index
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
+    int scale_node,
+    int scale_control_index
 ) {
   rt_graph_template_connect_fused_scale_input(
-      g, 0, dst_node, dst_port, src_node, src_port,
-      scale_node, scale_control_index);
+      g, 0, dst_node, dst_port, src_node, src_port, scale_node, scale_control_index
+  );
 }
 
 // Render one block offline; processes every live instance of every
@@ -9863,7 +10218,8 @@ to this pattern when the implicit growth was removed.
 */
 
 void rt_graph_ensure_bus(RTGraph *g, int bus_index) {
-  if (!g || bus_index < 0) return;
+  if (!g || bus_index < 0)
+    return;
   const auto bus = static_cast<std::size_t>(bus_index);
   ensure_output_bus_count(world(*g).server, bus + 1, g->max_frames);
 }
@@ -9883,8 +10239,7 @@ int rt_graph_read_bus(RTGraph *g, int bus_index, int nframes, float *out) {
   }
 
   const auto &src = world(*g).server.output_buses[bus];
-  const std::size_t to_copy =
-      std::min(static_cast<std::size_t>(nframes), src.size());
+  const std::size_t to_copy = std::min(static_cast<std::size_t>(nframes), src.size());
   std::copy_n(src.begin(), to_copy, out);
   return static_cast<int>(to_copy);
 }
@@ -9962,15 +10317,16 @@ void rt_graph_stop_audio(RTGraph *g) {
 // 0" shorthand kept for back-compat with §2.B-era callers)
 // ----------------------------------------------------------------
 
-int rt_graph_instance_add(RTGraph *g) {
-  return rt_graph_template_instance_add(g, 0);
-}
+int rt_graph_instance_add(RTGraph *g) { return rt_graph_template_instance_add(g, 0); }
 
 void rt_graph_instance_remove(RTGraph *g, int instance_id) {
-  if (!g) return;
-  if (instance_id < 0) return;
+  if (!g)
+    return;
+  if (instance_id < 0)
+    return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= world(*g).instances.size()) return;
+  if (idx >= world(*g).instances.size())
+    return;
   // Gate to Active / Releasing only. Hard-freeing an Available slot
   // is a silent no-op (the slot is already free); hard-freeing a
   // Reserved slot would yank a producer's claim out from under it,
@@ -9978,7 +10334,8 @@ void rt_graph_instance_remove(RTGraph *g, int instance_id) {
   // only legitimate owner of a Reserved slot's lifecycle. See
   // Note [Pool model] and the SlotState comment.
   const SlotState s = world(*g).instances[idx].state.load();
-  if (s != SlotState::Active && s != SlotState::Releasing) return;
+  if (s != SlotState::Active && s != SlotState::Releasing)
+    return;
   // Flip to Available; preserve the GraphInstance object and its
   // node-state vector capacity for the next reuse. No allocation,
   // no destruction.
@@ -10052,10 +10409,13 @@ per-instance override on the GraphInstance, set at release time
 */
 
 void rt_graph_instance_release(RTGraph *g, int instance_id) {
-  if (!g) return;
-  if (instance_id < 0) return;
+  if (!g)
+    return;
+  if (instance_id < 0)
+    return;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= world(*g).instances.size()) return;
+  if (idx >= world(*g).instances.size())
+    return;
   // Gate to Active / Releasing only. Releasing an Available slot is
   // a no-op (nothing to release). Releasing a Reserved slot would
   // flip it to Releasing and publish it into the audio schedule
@@ -10065,7 +10425,8 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
   // Reserved slot's lifecycle; external callers must wait until the
   // queued Activate publishes it before they can ask for release.
   const SlotState pre_state = world(*g).instances[idx].state.load();
-  if (pre_state != SlotState::Active && pre_state != SlotState::Releasing) return;
+  if (pre_state != SlotState::Active && pre_state != SlotState::Releasing)
+    return;
 
   // The body lives in apply_instance_release so the queued-drain
   // path (apply_control_command::Release) shares the gate-off and
@@ -10074,23 +10435,29 @@ void rt_graph_instance_release(RTGraph *g, int instance_id) {
 }
 
 int rt_graph_instance_status(RTGraph *g, int instance_id) {
-  if (!g) return -1;
-  if (instance_id < 0) return -1;
+  if (!g)
+    return -1;
+  if (instance_id < 0)
+    return -1;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= world(*g).instances.size()) return -1;
+  if (idx >= world(*g).instances.size())
+    return -1;
   // Active and Releasing have ABI-stable integer values (0 and 1);
   // Available and Reserved both surface as -1 to external callers.
   // Reserved is the producer's claim and is not visible through this
   // entry — a caller that did not perform the reservation has no
   // business observing it as "live". See SlotState comment.
   const SlotState s = world(*g).instances[idx].state.load();
-  if (s == SlotState::Active)    return 0;
-  if (s == SlotState::Releasing) return 1;
+  if (s == SlotState::Active)
+    return 0;
+  if (s == SlotState::Releasing)
+    return 1;
   return -1;
 }
 
 int rt_graph_instance_count(RTGraph *g) {
-  if (!g) return 0;
+  if (!g)
+    return 0;
   // After A.1 this is the slot-pool size, not a high-water-mark of
   // ever-used indices. The pool grows during construction up to the
   // sum of per-template polyphony caps; once stable, instance_count
@@ -10099,10 +10466,13 @@ int rt_graph_instance_count(RTGraph *g) {
 }
 
 int rt_graph_instance_alive(RTGraph *g, int instance_id) {
-  if (!g) return 0;
-  if (instance_id < 0) return 0;
+  if (!g)
+    return 0;
+  if (instance_id < 0)
+    return 0;
   const std::size_t idx = static_cast<std::size_t>(instance_id);
-  if (idx >= world(*g).instances.size()) return 0;
+  if (idx >= world(*g).instances.size())
+    return 0;
   // Alive iff the slot is part of the audio schedule. Reserved slots
   // (claimed by a producer but not yet activated) are not yet
   // schedulable, so they read as not alive — same as Available. See
@@ -10114,12 +10484,14 @@ int rt_graph_instance_alive(RTGraph *g, int instance_id) {
 void rt_graph_instance_set_control(
     RTGraph *g, int instance_id, int node_index, int control_index, double value
 ) {
-  if (!g) return;
+  if (!g)
+    return;
   // instance_at returns a live or Reserved slot; both are writable
   // from the producer's prep / control path. (Available slots are
   // rejected.) See apply_instance_set_control for the gated body.
   GraphInstance *inst = instance_at(*g, instance_id);
-  if (!inst) return;
+  if (!inst)
+    return;
   apply_instance_set_control(*g, *inst, node_index, control_index, value);
   // Bus-pool sizing is no longer a side effect of writing this
   // control — see rt_graph_ensure_bus and Note [Explicit bus-pool
@@ -10172,9 +10544,11 @@ void rt_graph_instance_set_control(
 // rt_graph_instance_set_control on the Reserved slot, and finally
 // publish it into the audio schedule via rt_graph_realtime_activate.
 int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
-  if (!g) return -1;
+  if (!g)
+    return -1;
   const MetaDef *def = template_at(*g, template_id);
-  if (!def) return -1;
+  if (!def)
+    return -1;
 
   // Single-pass scan: count Active+Releasing+Reserved instances of
   // this template (cap check) and remember the first Available slot.
@@ -10183,17 +10557,20 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
   // Active→Available — both increase the Available count, never
   // decrease it). We can therefore CAS without retries.
   int live_count = 0;
-  std::size_t free_slot = world(*g).instances.size();  // sentinel
+  std::size_t free_slot = world(*g).instances.size(); // sentinel
   for (std::size_t i = 0; i < world(*g).instances.size(); ++i) {
     const SlotState s = world(*g).instances[i].state.load();
     if (s == SlotState::Available) {
-      if (free_slot == world(*g).instances.size()) free_slot = i;
+      if (free_slot == world(*g).instances.size())
+        free_slot = i;
     } else if (world(*g).instances[i].template_id == template_id) {
-      ++live_count;  // Active, Releasing, or Reserved for this template
+      ++live_count; // Active, Releasing, or Reserved for this template
     }
   }
-  if (live_count >= def->polyphony) return -1;
-  if (free_slot >= world(*g).instances.size()) return -1;  // pool not pre-warmed
+  if (live_count >= def->polyphony)
+    return -1;
+  if (free_slot >= world(*g).instances.size())
+    return -1; // pool not pre-warmed
 
   // CAS Available → Reserved. Acquire on success synchronizes-with
   // the audio thread's release-store that flipped this slot to
@@ -10203,9 +10580,11 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
   // contract being violated and silently return -1.
   SlotState expected = SlotState::Available;
   if (!world(*g).instances[free_slot].state.compare_exchange_strong(
-          expected, SlotState::Reserved,
+          expected,
+          SlotState::Reserved,
           std::memory_order_acquire,
-          std::memory_order_relaxed)) {
+          std::memory_order_relaxed
+      )) {
     return -1;
   }
 
@@ -10220,7 +10599,9 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
   try {
     prepare_reserved_slot(*g, world(*g).instances[free_slot], *def, template_id);
   } catch (...) {
-    world(*g).instances[free_slot].state.store(SlotState::Available, std::memory_order_release);
+    world(*g).instances[free_slot].state.store(
+        SlotState::Available, std::memory_order_release
+    );
     return -1;
   }
   return static_cast<int>(free_slot);
@@ -10233,19 +10614,21 @@ int rt_graph_realtime_reserve(RTGraph *g, int template_id) {
 // fails. Release on success so a subsequent reserve sees the slot
 // in a clean state.
 void rt_graph_realtime_cancel(RTGraph *g, int slot_id) {
-  if (!g) return;
-  if (slot_id < 0) return;
+  if (!g)
+    return;
+  if (slot_id < 0)
+    return;
   const std::size_t idx = static_cast<std::size_t>(slot_id);
-  if (idx >= world(*g).instances.size()) return;
+  if (idx >= world(*g).instances.size())
+    return;
   SlotState expected = SlotState::Reserved;
   // Failure is silent — Available means already canceled, Active
   // means the queue already activated us, Releasing means the
   // queue activated then released. None of these are recoverable
   // by cancel; the producer must handle that path differently.
-  (void) world(*g).instances[idx].state.compare_exchange_strong(
-      expected, SlotState::Available,
-      std::memory_order_release,
-      std::memory_order_relaxed);
+  (void)world(*g).instances[idx].state.compare_exchange_strong(
+      expected, SlotState::Available, std::memory_order_release, std::memory_order_relaxed
+  );
 }
 
 // Enqueue Activate(slot_id) for the audio thread to publish at the
@@ -10255,10 +10638,12 @@ void rt_graph_realtime_cancel(RTGraph *g, int slot_id) {
 // thread. Returns 1 on success, 0 if the queue is full — on full
 // queue the producer should rt_graph_realtime_cancel the slot.
 int rt_graph_realtime_activate(RTGraph *g, int slot_id) {
-  if (!g) return 0;
-  if (slot_id < 0) return 0;
+  if (!g)
+    return 0;
+  if (slot_id < 0)
+    return 0;
   ControlCommand cmd;
-  cmd.kind    = ControlCommand::Kind::Activate;
+  cmd.kind = ControlCommand::Kind::Activate;
   cmd.slot_id = slot_id;
   return enqueue_command(g->control_queue, cmd) ? 1 : 0;
 }
@@ -10267,10 +10652,12 @@ int rt_graph_realtime_activate(RTGraph *g, int slot_id) {
 // Reserved is producer-private and Releasing is already in flight.
 // Returns 1/0 as for activate.
 int rt_graph_realtime_release(RTGraph *g, int slot_id) {
-  if (!g) return 0;
-  if (slot_id < 0) return 0;
+  if (!g)
+    return 0;
+  if (slot_id < 0)
+    return 0;
   ControlCommand cmd;
-  cmd.kind    = ControlCommand::Kind::Release;
+  cmd.kind = ControlCommand::Kind::Release;
   cmd.slot_id = slot_id;
   return enqueue_command(g->control_queue, cmd) ? 1 : 0;
 }
@@ -10280,10 +10667,12 @@ int rt_graph_realtime_release(RTGraph *g, int slot_id) {
 // producer-private (the producer should cancel rather than enqueue
 // remove on its own reservation). Returns 1/0 as for activate.
 int rt_graph_realtime_remove(RTGraph *g, int slot_id) {
-  if (!g) return 0;
-  if (slot_id < 0) return 0;
+  if (!g)
+    return 0;
+  if (slot_id < 0)
+    return 0;
   ControlCommand cmd;
-  cmd.kind    = ControlCommand::Kind::Remove;
+  cmd.kind = ControlCommand::Kind::Remove;
   cmd.slot_id = slot_id;
   return enqueue_command(g->control_queue, cmd) ? 1 : 0;
 }
@@ -10296,14 +10685,16 @@ int rt_graph_realtime_remove(RTGraph *g, int slot_id) {
 int rt_graph_realtime_set_control(
     RTGraph *g, int slot_id, int node_index, int control_index, double value
 ) {
-  if (!g) return 0;
-  if (slot_id < 0) return 0;
+  if (!g)
+    return 0;
+  if (slot_id < 0)
+    return 0;
   ControlCommand cmd;
-  cmd.kind        = ControlCommand::Kind::SetControl;
-  cmd.slot_id     = slot_id;
-  cmd.node_idx    = node_index;
+  cmd.kind = ControlCommand::Kind::SetControl;
+  cmd.slot_id = slot_id;
+  cmd.node_idx = node_index;
   cmd.control_idx = control_index;
-  cmd.value       = value;
+  cmd.value = value;
   return enqueue_command(g->control_queue, cmd) ? 1 : 0;
 }
 

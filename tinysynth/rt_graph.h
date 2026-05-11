@@ -727,6 +727,25 @@ long long rt_graph_test_spectral_analysis_count(const RTGraph *g);
 // spectral kernel has run, or if g is null.
 long long rt_graph_test_spectral_resynthesis_count(const RTGraph *g);
 
+// [T:read-only] Phase §6.E slice 2 test surface: total number of
+// audio-thread dispatches into a registered static plugin's
+// process callback since g was created. Increments once per
+// process_static_plugin call that resolved to a valid spec,
+// regardless of the plugin's return code. A skeleton dispatch
+// (unresolved plugin_id, missing spec, or shape mismatch) does
+// not tick this counter — those cases emit silence and are
+// expected to be caught by Haskell-side validation. Returns
+// 0 if no plugin kernel has run, or if g is null.
+long long rt_graph_test_plugin_call_count(const RTGraph *g);
+
+// [T:read-only] Phase §6.E slice 2 test surface: total number of
+// static-plugin dispatches where the plugin's process callback
+// returned non-zero. Each non-zero return makes the host emit
+// silence for the rest of the block. Strict subset of
+// rt_graph_test_plugin_call_count. Returns 0 if no plugin
+// kernel has run, or if g is null.
+long long rt_graph_test_invalid_plugin_call_count(const RTGraph *g);
+
 // [T:read-only] Pure introspection: returns 1 if node_kind names a kind
 // this runtime knows how to construct (i.e. it has a case in
 // rt_graph_add_node), 0 otherwise. Intended for contract tests that

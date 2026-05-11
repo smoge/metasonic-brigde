@@ -55,6 +55,7 @@ library:
     - MetaSonic.OSC.Listen
     - MetaSonic.Pattern
     - MetaSonic.Pattern.Corpus
+    - MetaSonic.Authoring
     - MetaSonic.Visualize.Trace
     - MetaSonic.Visualize.TUI
 
@@ -97,6 +98,7 @@ executables:
     other-modules:
       - MetaSonic.App.CorpusSurvey
       - MetaSonic.App.Demos
+      - MetaSonic.App.FusionCostLab
       - MetaSonic.App.Osc
       - MetaSonic.App.Survey
       - MetaSonic.App.SwapBench

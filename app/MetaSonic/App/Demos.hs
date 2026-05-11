@@ -23,6 +23,7 @@ module MetaSonic.App.Demos
 
 import           Data.Word                 (Word8)
 
+import qualified MetaSonic.Authoring       as Auth
 import           MetaSonic.Bridge.Source
 
 simpleGraph :: SynthGraph
@@ -83,6 +84,20 @@ detunedSawGraph = runSynth $ do
   g2   <- gain osc2 0.3
   out 0 g1
   out 0 g2                     -- second out accumulates onto same bus
+
+-- Stereo detuned-saw patch authored through MetaSonic.Authoring.
+-- Same DSP shape as 'detunedSawGraph' (two slightly-offset saws),
+-- but spread across two output channels instead of summed onto
+-- bus 0. The point is that the authoring layer's 'Stereo' + 'gainS'
+-- + 'outStereo' helpers express the per-channel pattern once, lower
+-- to two of every node, and stay transparent to the existing
+-- compiler / inspector tools.
+authoringStereoSawGraph :: SynthGraph
+authoringStereoSawGraph = runSynth $ do
+  l <- sawOsc 220.0 0.0
+  r <- sawOsc 220.5 0.5
+  stereoSig <- Auth.gainS (Auth.stereo l r) (Param 0.3)
+  Auth.outStereo 0 stereoSig
 
 -- Ring modulation: 440 Hz carrier multiplied sample-by-sample by a 7 Hz
 -- modulator. Both signals are bipolar, so this is genuine ring mod
@@ -311,6 +326,9 @@ demoTable =
          (SingleGraph filteredSawGraph)
   , Demo "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"
          (SingleGraph detunedSawGraph)
+  , Demo "stereo-saw"
+         "Stereo detuned saws via MetaSonic.Authoring (Phase 8.A)"
+         (SingleGraph authoringStereoSawGraph)
   , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"
          (SingleGraph ringModGraph)
   , Demo "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)"

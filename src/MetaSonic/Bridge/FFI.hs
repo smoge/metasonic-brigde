@@ -152,6 +152,9 @@ module MetaSonic.Bridge.FFI
   , -- * §6.D spectral counters
     c_rt_graph_test_spectral_analysis_count
   , c_rt_graph_test_spectral_resynthesis_count
+  , -- * §6.E plugin dispatch counters
+    c_rt_graph_test_plugin_call_count
+  , c_rt_graph_test_invalid_plugin_call_count
   , -- * §2.E lifecycle status values (mirroring rt_graph.h's InstanceStatus)
     instanceStatusLive
   , instanceStatusReleasing
@@ -1119,6 +1122,14 @@ foreign import ccall unsafe "rt_graph_test_spectral_analysis_count"
 
 foreign import ccall unsafe "rt_graph_test_spectral_resynthesis_count"
   c_rt_graph_test_spectral_resynthesis_count
+    :: Ptr RTGraph -> IO CLLong
+
+foreign import ccall unsafe "rt_graph_test_plugin_call_count"
+  c_rt_graph_test_plugin_call_count
+    :: Ptr RTGraph -> IO CLLong
+
+foreign import ccall unsafe "rt_graph_test_invalid_plugin_call_count"
+  c_rt_graph_test_invalid_plugin_call_count
     :: Ptr RTGraph -> IO CLLong
 
 -- (c_rt_graph_instance_read_bus was removed in the post-§2.E ABI

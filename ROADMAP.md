@@ -934,12 +934,16 @@ Haskell-side `RuntimeGraph` knowledge is sufficient for v1 producers.
 
 ## Phase 6 — Extended DSP and Ecosystem
 
-Phase 6 collects five formerly-bundled workstreams as named
-sub-phases. Only 6.A is active; the rest are described but not
-started. Ordering reflects two project rules: cheapest unblocker for
-the parked §4 corpus signals first, and items whose design needs its
-own pass before code go after items whose surface is already
-analogous to something shipped.
+Phase 6 collects five formerly-bundled workstreams as named sub-phases. 6.A
+through 6.D are closed (pattern producer + OSC control surface + buffer I/O +
+first spectral kind). 6.E (plugin hosting) is the open final boundary test:
+slice 1 landed the `KStaticPlugin` surface and the silence skeleton, slice 2
+turns on real `Identity` dispatch with `plugin_call_count` /
+`invalid_plugin_call_count` counters, and slice 3 records the parked metadata
+follow-up decision. Ordering reflects two project rules: cheapest unblocker for
+the parked §4 corpus signals first, and items whose design needs its own pass
+before code go after items whose surface is already analogous to something
+shipped.
 
 ### Phase 6.A — Sequencing / Pattern Layer (active)
 
@@ -1473,12 +1477,68 @@ Design / implementation note:
   one frozen `plugin_id` metadata control, zero plugin parameters,
   zero declared latency, and `[Pure]` effects. It deliberately does
   not claim per-plugin arity / latency / resource effects on the
-  current kind-level metadata model. Slice 1 adds the registry,
-  Haskell/C++ kind surface, and deterministic silence skeleton; the
-  next slice turns on real `Identity` dispatch + counters → parked
-  metadata follow-up decision. Q-deferrals cover max-state size,
-  hot-swap migration, error-as-scheduler-signal, parameter layout /
+  current kind-level metadata model. Slice 1 added the registry,
+  Haskell/C++ kind surface, and the deterministic silence skeleton.
+  Slice 2 (current) turns on real `Identity` dispatch through the
+  `PluginSpec::process` vtable, plus `plugin_call_count` and
+  `invalid_plugin_call_count` audio-thread counters with C ABI test
+  accessors (`rt_graph_test_plugin_call_count` /
+  `rt_graph_test_invalid_plugin_call_count`); the Haskell side's
+  `staticPluginSkeletonTests` now asserts non-silent output, per-block
+  counter math, and bit-identical samples against a hand-rolled
+  `add` graph. Q-deferrals cover max-state size, hot-swap
+  migration, error-as-scheduler-signal, parameter layout /
   modulation, cross-template ordering, and name stability.
+
+### Phase 6.E.3 — Plugin metadata follow-up decision (pending)
+
+Slice 3 is a decision artifact, not new runtime code. With real
+`Identity` dispatch landed, the next plugin kind cannot reuse the
+fixed-`Identity` shortcut: per-plugin arity, declared latency, and
+resource effects (`BusRead` / `BusWrite` / `BufRead` / `BufWrite`)
+all need to flow into the existing compiler-side machinery —
+`kindSpec`, `kindLatency`, `inferEff`, `ResourceFootprint`, and
+template precedence — without breaking the kind-level
+table-shaped sites that adding-a-new-kind currently touches.
+
+The decision is between three shapes; the slice's job is to pick
+one and write the contract note before any second plugin lands:
+
+- **Per-plugin metadata table on the Haskell side.** Keep
+  `KStaticPlugin` as the only plugin `NodeKind`; add a
+  Haskell-side catalog that pairs each registered `PluginRef`
+  with arity / latency / resource declarations and feeds those
+  into `inferEff` / `kindLatency` / `ResourceFootprint` lookups.
+  Pro: one kind, one C++ dispatch path, no `NodeKind` growth.
+  Con: `kindSpec` / `kindLatency` / port-info code paths grow a
+  ref-keyed branch, and `inferEff` becomes per-`UGen` data-
+  dependent rather than per-kind.
+
+- **One `NodeKind` per plugin profile.** Add `KDelayPlugin` /
+  `KFilterPlugin` / etc. as the second / third plugin kinds.
+  Pro: every existing kind-level table-shaped site keeps its
+  current shape; arity, latency, and effects stay derivable from
+  `kindSpec`-style rows. Con: every new plugin profile costs the
+  6-site checklist plus a C++ dispatch case, and the static-vs-
+  ABI plugin distinction blurs.
+
+- **Larger `RuntimeNode` metadata extension.** Pull arity /
+  latency / effects off `NodeKind` and onto a node-level
+  `RuntimeNode` annotation that the compiler computes once and
+  ships across the FFI. Pro: dissolves the per-kind /
+  per-`PluginRef` split entirely; the same machinery serves
+  generated-fusion programs (§7) and authoring-DSL ensembles
+  (§8). Con: largest scope, touches the IR and the C ABI, and
+  re-shapes survey / inspector code that currently keys on
+  `NodeKind`.
+
+Slice 3 deliverable is the decision note, not the
+implementation. Until a real second plugin (probably a small
+stateful one such as a one-tap delay) demands it, the question
+stays parked. Out-of-scope for slice 3 specifically: LV2 / VST3
+/ CLAP adapter kinds, dynamic loading / plugin discovery,
+plugin-owned UI, MIDI-in plugins, and any new C ABI surface.
+Those reopen only after the metadata shape is settled.
 
 State snapshot at the 6.A–6.D boundary:
 - [Phase 6.A–6.D state snapshot](notes/2026-05-11-state-snapshot-phase-6-complete.md).

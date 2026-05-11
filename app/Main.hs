@@ -15,6 +15,10 @@ import           System.Exit                (die)
 
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
 import           MetaSonic.App.Demos
+import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
+                                              OutputFormat (..),
+                                              runFusionCostLab)
+import qualified MetaSonic.App.FusionCostLab as FCL
 import           MetaSonic.App.Osc          (runOscListen)
 import           MetaSonic.OSC.Listen       (parseListenerPort)
 import           MetaSonic.App.Survey       (printFusionSummary,
@@ -78,6 +82,14 @@ data RunMode
     -- ^ Non-audio reporting mode (--plugin-list). Enumerates the
     -- build-linked static plugin registry that KStaticPlugin resolves
     -- against on the producer side.
+  | FusionCostLab
+    -- ^ Non-audio reporting mode (--fusion-cost-lab). Phase 7.A
+    -- tooling: generates a fixed bank of parametric graph families,
+    -- compiles each through stripped-node-loop / region-kernel /
+    -- RFused variants, times them, checks bit-equivalence against
+    -- the baseline, and prints one machine-readable row per
+    -- (family, member, variant). Use --summary to switch from
+    -- JSONL to a human-readable table.
   deriving (Eq, Show)
 
 data Options = Options
@@ -93,6 +105,10 @@ data Options = Options
     -- ^ UDP port for --osc-listen. Default 7000.
   , optMidiDevice :: Maybe Int
     -- ^ Optional PortMIDI device id for midi-poly.
+  , optFCLSummary :: Bool
+    -- ^ When True, --fusion-cost-lab prints a per-row table
+    -- instead of JSONL. Toggled by --summary alongside
+    -- --fusion-cost-lab.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
@@ -102,6 +118,7 @@ defaultOptions = Options
   , optFused   = False
   , optOscPort = 7000
   , optMidiDevice = Nothing
+  , optFCLSummary = False
   }
 
 parseArgs :: [String] -> Either String Options
@@ -127,6 +144,10 @@ parseArgs = go defaultOptions
       go opts { optMode = SwapBench } xs
     go opts ("--corpus-survey" : xs) =
       go opts { optMode = CorpusSurvey } xs
+    go opts ("--fusion-cost-lab" : xs) =
+      go opts { optMode = FusionCostLab } xs
+    go opts ("--summary" : xs) =
+      go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
       go opts { optMode = MidiList } xs
     go opts ("--plugin-list" : xs) =
@@ -197,6 +218,7 @@ usage prog = unlines
   , "  " <> prog <> " --worker-bench [DEMO ...]"
   , "  " <> prog <> " --swap-bench"
   , "  " <> prog <> " --corpus-survey"
+  , "  " <> prog <> " --fusion-cost-lab [--summary]"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --plugin-list"
   , "  " <> prog <> " --osc-listen [PORT]"
@@ -248,6 +270,18 @@ usage prog = unlines
   , "                   missed sink shapes, and §4.D edge-rate"
   , "                   opportunity contribution. No audio, no TUI;"
   , "                   demo targets are ignored."
+  , "  --fusion-cost-lab"
+  , "                   Phase 7.A fusion cost lab. Generates a fixed bank"
+  , "                   of parametric graph families (sink-chain,"
+  , "                   return-tail, fanout), compiles each member through"
+  , "                   stripped-node-loop / region-kernel / RFused"
+  , "                   variants, times them, and checks bit-equivalence"
+  , "                   against the baseline. Output is JSONL (one row per"
+  , "                   variant) by default; pair with --summary for a"
+  , "                   human-readable table. No audio, no TUI; demo"
+  , "                   targets are ignored."
+  , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
+  , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
   , "                   with inputs can be passed to --midi-device."
   , "  --midi-device N  Select PortMIDI device id N for the midi-poly"
@@ -333,6 +367,14 @@ main = do
     CorpusSurvey -> do
       putStrLn "Surveying the Phase 6.A pattern corpus for §4 signal."
       runCorpusSurvey
+    FusionCostLab -> do
+      let fcoOpts = FusionCostLabOptions
+            { fcoFormat = if optFCLSummary opts
+                            then FormatSummary
+                            else FormatJSONL
+            , fcoFamilies = fcoFamilies FCL.defaultOptions
+            }
+      runFusionCostLab fcoOpts
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -395,6 +437,7 @@ runDemo opts demo
     || optMode opts == WorkerBench
     || optMode opts == SwapBench
     || optMode opts == CorpusSurvey
+    || optMode opts == FusionCostLab
     || optMode opts == OscListen
     || optMode opts == MidiList
     || optMode opts == PluginList =
@@ -455,6 +498,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: SwapBench should be handled by main, never reach here"
     CorpusSurvey ->
       error "runSingleDemo: CorpusSurvey should be handled by main, never reach here"
+    FusionCostLab ->
+      error "runSingleDemo: FusionCostLab should be handled by main, never reach here"
     OscListen ->
       error "runSingleDemo: OscListen should be handled by main, never reach here"
     MidiList ->

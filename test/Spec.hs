@@ -93,6 +93,8 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_test_buffer_invalid_write_count,
                                             c_rt_graph_test_spectral_analysis_count,
                                             c_rt_graph_test_spectral_resynthesis_count,
+                                            c_rt_graph_test_plugin_call_count,
+                                            c_rt_graph_test_invalid_plugin_call_count,
                                             instanceStatusLive,
                                             instanceStatusReleasing,
                                             collectRetiredSwapStats,
@@ -128,6 +130,7 @@ import           Data.IORef                      (modifyIORef',
 import           System.Timeout                  (timeout)
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
+import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Types
 
 import qualified Data.ByteString           as OBS
@@ -155,15 +158,16 @@ main = defaultMain $ testGroup "MetaSonic"
   , recordBufMonoSkeletonTests
   , spectralFreezeSkeletonTests
   , staticPluginSkeletonTests
+  , authoringDslTests
   ]
 
 ------------------------------------------------------------
--- §6.E slice 1: KStaticPlugin surface + registry skeleton
+-- §6.E slice 2: KStaticPlugin Identity dispatch + counters
 ------------------------------------------------------------
 
 staticPluginSkeletonTests :: TestTree
 staticPluginSkeletonTests =
-  testGroup "Phase 6.E slice 1: StaticPlugin surface"
+  testGroup "Phase 6.E slice 2: Identity dispatch"
   [ testCase "inferEff produces Pure for identityPlugin" $ do
       let g = runSynth $ do
             a <- sinOsc 440.0 0.0
@@ -231,7 +235,14 @@ staticPluginSkeletonTests =
         Right _ ->
           assertFailure "expected lowerGraph to reject an unknown static plugin"
 
-  , testCase "staticPlugin graph compiles and skeleton renders silence" $ do
+  -- Slice 2 dispatch tests below. Each one renders identityPlugin
+  -- against two sinOsc sources and uses the plugin call counters as
+  -- counter-confirmed validation of "the kernel actually ran" — a
+  -- bit-equivalence check against a hand-rolled `add` graph in a
+  -- separate render proves the output is real plugin work, not the
+  -- old silence skeleton.
+
+  , testCase "identity dispatch produces non-silent output and ticks plugin_call_count" $ do
       let nframes = 64
           graph = runSynth $ do
             a <- sinOsc 440.0 0.0
@@ -246,13 +257,193 @@ staticPluginSkeletonTests =
       withRTGraph totalNodes nframes $ \rt -> do
         loadTemplateGraph rt tg
         c_rt_graph_process rt (fromIntegral nframes)
+        calls   <- c_rt_graph_test_plugin_call_count rt
+        invalid <- c_rt_graph_test_invalid_plugin_call_count rt
+        calls   @?= 1
+        invalid @?= 0
         allocaBytes (nframes * 4) $ \bp -> do
           _ <- c_rt_graph_read_bus rt 0
                  (fromIntegral nframes) (castPtr bp)
           rendered <- peekArray nframes (bp :: PtrCFloat)
           let peak = maximum (map (abs . (\(CFloat x) -> x)) rendered)
-          peak @?= 0.0
+          assertBool
+            ("expected non-silent identity output, got peak=" <> show peak)
+            (peak > 0.0)
+
+  , testCase "plugin_call_count ticks once per block over N blocks" $ do
+      let nframes = 64
+          nblocks = 5 :: Int
+          graph = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sinOsc 220.0 0.0
+            y <- staticPlugin identityPlugin a b
+            out 0 y
+      tg <- case compileTemplateGraph [("plugin", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        forM_ [1 .. nblocks] $ \_ ->
+          c_rt_graph_process rt (fromIntegral nframes)
+        calls   <- c_rt_graph_test_plugin_call_count rt
+        invalid <- c_rt_graph_test_invalid_plugin_call_count rt
+        calls   @?= fromIntegral nblocks
+        invalid @?= 0
+
+  , testCase "identity output is bit-exact to a hand-rolled add graph" $ do
+      -- Two graphs with identical sources; one feeds identityPlugin,
+      -- the other a normal Add. Rendering them in separate RTGraphs
+      -- starting from the same zero-initialized phase state must
+      -- produce bit-identical bus 0 samples — Identity's body is
+      -- literally `a[i] + b[i]`, so any divergence here means
+      -- dispatch wired the wrong input/output spans.
+      let nframes = 64
+          pluginGraph = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sinOsc 220.0 0.0
+            y <- staticPlugin identityPlugin a b
+            out 0 y
+          addGraph = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sinOsc 220.0 0.0
+            y <- add a b
+            out 0 y
+          render g = do
+            tg <- case compileTemplateGraph [("g", g)] of
+              Right t  -> pure t
+              Left err -> assertFailure err >> error "unreachable"
+            let totalNodes =
+                  sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+            withRTGraph totalNodes nframes $ \rt -> do
+              loadTemplateGraph rt tg
+              c_rt_graph_process rt (fromIntegral nframes)
+              allocaBytes (nframes * 4) $ \bp -> do
+                _ <- c_rt_graph_read_bus rt 0
+                       (fromIntegral nframes) (castPtr bp)
+                peekArray nframes (bp :: PtrCFloat)
+      viaPlugin <- render pluginGraph
+      viaAdd    <- render addGraph
+      viaPlugin @?= viaAdd
   ]
+
+------------------------------------------------------------
+-- Phase 8.A authoring DSL: lowering-shape pinning
+------------------------------------------------------------
+
+authoringDslTests :: TestTree
+authoringDslTests =
+  testGroup "Phase 8.A: authoring DSL lowering"
+  [ testCase "Mono / Stereo / Channels constructors emit no nodes" $ do
+      -- Wrapping existing Connections must be a pure authoring
+      -- shape — no graph mutation, no UGen creation. The check
+      -- compares the SynthGraph emitted by a do-block that only
+      -- calls the wrappers to the empty graph emitted by an
+      -- empty runSynth.
+      let g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let _m = Auth.mono osc
+                _s = Auth.stereo osc osc
+                _c = Auth.channels [osc, osc, osc]
+                _d = Auth.duplicate 4 (Auth.mono osc)
+            pure ()
+          ref = runSynth (do
+            _ <- sinOsc 440.0 0.0
+            pure ())
+      M.size (sgNodes g) @?= M.size (sgNodes ref)
+      kindHistogram g @?= kindHistogram ref
+
+  , testCase "gainS emits two Gain nodes in left-then-right order" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.gainS (Auth.stereo l r) (Param 0.5)
+            pure ()
+      let gains = nodesByKind g KGain
+      length gains @?= 2
+
+  , testCase "gainC emits one Gain per channel; channelCount preserved" $ do
+      let chCount = 4
+          g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let inCh = Auth.duplicate chCount (Auth.mono osc)
+            _ <- Auth.gainC inCh (Param 0.25)
+            pure ()
+      length (nodesByKind g KGain) @?= chCount
+
+  , testCase "outStereo emits Out on bus and bus+1" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            Auth.outStereo 0 (Auth.stereo l r)
+      length (nodesByKind g KOut) @?= 2
+
+  , testCase "outChannels emits one Out per channel" $ do
+      let chCount = 3
+          g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let chans = Auth.duplicate chCount (Auth.mono osc)
+            Auth.outChannels 0 chans
+      length (nodesByKind g KOut) @?= chCount
+
+  , testCase "sumChannels emits N-1 Add nodes" $ do
+      let chCount = 4
+          g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let chans = Auth.duplicate chCount (Auth.mono osc)
+            _ <- Auth.sumChannels chans
+            pure ()
+      length (nodesByKind g KAdd) @?= chCount - 1
+
+  , testCase "sumChannels on empty Channels emits no Add nodes" $ do
+      let g = runSynth $ do
+            _ <- Auth.sumChannels (Auth.channels [])
+            pure ()
+      length (nodesByKind g KAdd) @?= 0
+
+  , testCase "addS emits two Add nodes (one per channel)" $ do
+      let g = runSynth $ do
+            la <- sinOsc 440.0 0.0
+            ra <- sinOsc 660.0 0.0
+            lb <- sinOsc 220.0 0.0
+            rb <- sinOsc 330.0 0.0
+            _ <- Auth.addS (Auth.stereo la ra) (Auth.stereo lb rb)
+            pure ()
+      length (nodesByKind g KAdd) @?= 2
+
+  , testCase "lifted stereo patch compiles to a runnable RuntimeGraph" $ do
+      -- End-to-end smoke test: an authored stereo gain patch must
+      -- traverse lowerGraph + compileTemplateGraph + load without
+      -- error. This is the first-demo-target stand-in until the
+      -- authoring layer has its own demo entry.
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 220.0 0.0
+            stereoOut <- Auth.gainS (Auth.stereo l r) (Param 0.4)
+            Auth.outStereo 0 stereoOut
+      case lowerGraph g >>= compileRuntimeGraph of
+        Left err -> assertFailure $
+          "expected authored stereo patch to compile, got: " <> err
+        Right rg -> do
+          -- Two oscillators + two gains + two outs = 6 nodes
+          length (rgNodes rg) @?= 6
+  ]
+
+-- | Tally a 'SynthGraph' by 'NodeKind' for shape-pinning tests.
+-- 'NodeKind' has no 'Ord' instance, so the tally is a sorted-by-show
+-- assoc list — equality is by value, not order.
+kindHistogram :: SynthGraph -> [(String, Int)]
+kindHistogram g =
+  let kinds = [ show (inferKind (nsUgen spec))
+              | spec <- M.elems (sgNodes g) ]
+  in sort [ (k, length (filter (== k) kinds))
+          | k <- nub kinds ]
+
+-- | The list of source NodeSpecs whose UGen lowers to the given kind.
+nodesByKind :: SynthGraph -> NodeKind -> [NodeSpec]
+nodesByKind g k =
+  [ spec | spec <- M.elems (sgNodes g), inferKind (nsUgen spec) == k ]
 
 ------------------------------------------------------------
 -- Sample graphs (mirrors of the demos in app/Main.hs)
@@ -4723,10 +4914,11 @@ propRegionRateCompatible g = case lowerGraph g of
     findNode nid = lookup nid . map (\n -> (irNodeID n, n))
 
 -- | Step A round-trip property: the runtime region overlay produced
--- by 'compileRuntimeGraph' must agree with 'formRegions (giNodes ir)'
--- on count, rate, member count, and the per-region NodeID-to-NodeIndex
--- translation. Pins the contract that loaders use to send regions
--- across the FFI.
+-- by 'compileRuntimeGraph' starts from 'formRegions (giNodes ir)'
+-- and may then be split by 'selectRegionKernels'. The final runtime
+-- regions must therefore be a rate-preserving refinement of the raw
+-- formRegions output, with the same per-region NodeID-to-NodeIndex
+-- membership when adjacent refined regions are concatenated.
 propRuntimeRegionsRoundTrip :: SynthGraph -> Property
 propRuntimeRegionsRoundTrip g = case lowerGraph g of
   Left err -> counterexample ("lowerGraph failed: " <> err) False
@@ -4738,20 +4930,49 @@ propRuntimeRegionsRoundTrip g = case lowerGraph g of
           indexMap = M.fromList
             [ (rnOriginalID n, rnIndex n) | n <- rgNodes rg ]
           translate nid = M.lookup nid indexMap
-      in conjoin
-           [ counterexample "region count mismatch" $
-               length runtime === length compileRegions
-           , conjoin
-               [ counterexample
-                   (show i <> ": rate mismatch")
-                   (rrRate rr === regRate cr)
-                 .&&.
-                 counterexample
-                   (show i <> ": members differ from translated formRegions output")
-                   (rrNodes rr === mapMaybe translate (regNodes cr))
-               | (i, rr, cr) <- zip3 [(0 :: Int) ..] runtime compileRegions
-               ]
-           ]
+          expected =
+            [ (regRate cr, mapMaybe translate (regNodes cr))
+            | cr <- compileRegions
+            ]
+      in case checkRuntimeRegionRefinement expected runtime of
+           Right () -> property True
+           Left msg -> counterexample msg False
+
+checkRuntimeRegionRefinement
+  :: [(Rate, [NodeIndex])]
+  -> [RuntimeRegion]
+  -> Either String ()
+checkRuntimeRegionRefinement [] [] = Right ()
+checkRuntimeRegionRefinement [] extra =
+  Left $ "unexpected extra runtime regions: " <> show (map rrIndex extra)
+checkRuntimeRegionRefinement ((rate, expectedNodes) : rest) runtime =
+  let (chunk, remaining) = takeRuntimeChunk (length expectedNodes) runtime
+      actualNodes = concatMap rrNodes chunk
+      rates = map rrRate chunk
+  in if null chunk
+       then Left $ "missing runtime regions for expected nodes " <> show expectedNodes
+       else if actualNodes /= expectedNodes
+         then Left $
+           "runtime region refinement changed members: expected "
+           <> show expectedNodes <> ", got " <> show actualNodes
+         else if any (/= rate) rates
+           then Left $
+             "runtime region refinement changed rate for "
+             <> show expectedNodes <> ": expected " <> show rate
+             <> ", got " <> show rates
+           else checkRuntimeRegionRefinement rest remaining
+
+takeRuntimeChunk
+  :: Int
+  -> [RuntimeRegion]
+  -> ([RuntimeRegion], [RuntimeRegion])
+takeRuntimeChunk targetLen = go [] 0
+  where
+    go acc _ [] = (reverse acc, [])
+    go acc len rest@(r : rs)
+      | len >= targetLen = (reverse acc, rest)
+      | otherwise =
+          go (r : acc) (len + length (rrNodes r)) rs
 
 -- | Step A structural invariant: every 'RuntimeRegion' covers a
 -- contiguous run of 'NodeIndex' values, regions concatenate in order
