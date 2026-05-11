@@ -6,7 +6,7 @@ module Main where
 import           Control.DeepSeq            (force)
 import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
-import           Data.Char                  (toLower)
+import           Data.Char                  (isDigit, toLower)
 import           Data.List                  (find, intercalate)
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
@@ -25,8 +25,10 @@ import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.MidiDemo  (CCMapping (..),
+                                             MidiDeviceInfo (..),
                                              PitchBendBinding (..),
-                                             VoiceMapping (..), withMidiDemo)
+                                             VoiceMapping (..),
+                                             midiDeviceList, withMidiDemo)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Types            (NodeIndex (..))
@@ -68,6 +70,10 @@ data RunMode
     -- configured UDP port. Send /v0/outgain/0 ,f <amount>
     -- packets to control the output gain in real time. Demo
     -- targets are ignored.
+  | MidiList
+    -- ^ Non-audio reporting mode (--midi-list). Enumerates the
+    -- current Q / PortMIDI device table and exits. The printed ids
+    -- are the values accepted by --midi-device.
   deriving (Eq, Show)
 
 data Options = Options
@@ -81,6 +87,8 @@ data Options = Options
     -- default. The MIDI-poly demo is unaffected for now.
   , optOscPort :: Int
     -- ^ UDP port for --osc-listen. Default 7000.
+  , optMidiDevice :: Maybe Int
+    -- ^ Optional PortMIDI device id for midi-poly.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
@@ -89,6 +97,7 @@ defaultOptions = Options
   , optTargets = []
   , optFused   = False
   , optOscPort = 7000
+  , optMidiDevice = Nothing
   }
 
 parseArgs :: [String] -> Either String Options
@@ -114,6 +123,16 @@ parseArgs = go defaultOptions
       go opts { optMode = SwapBench } xs
     go opts ("--corpus-survey" : xs) =
       go opts { optMode = CorpusSurvey } xs
+    go opts ("--midi-list" : xs) =
+      go opts { optMode = MidiList } xs
+    go opts ("--midi-device" : s : xs) =
+      case parseMidiDeviceIndex s of
+        Just ix -> go opts { optMidiDevice = Just ix } xs
+        Nothing -> Left $
+          "Invalid device for --midi-device: " <> s
+          <> " (expected non-negative integer)"
+    go _ ("--midi-device" : []) =
+      Left "Missing value for --midi-device"
     go opts ("--osc-listen" : xs) = case takeOscPort xs of
       Left err           -> Left err
       Right (port, rest) ->
@@ -124,6 +143,13 @@ parseArgs = go defaultOptions
 
     prefixOf :: String -> String -> Bool
     prefixOf p s = take (length p) s == p
+
+    parseMidiDeviceIndex :: String -> Maybe Int
+    parseMidiDeviceIndex s
+      | not (null s)
+      , all isDigit s
+      , length s <= 9 = Just (read s)
+      | otherwise     = Nothing
 
     -- Consume an optional positional integer port after
     -- --osc-listen. The next token, if present and not a flag,
@@ -165,6 +191,7 @@ usage prog = unlines
   , "  " <> prog <> " --worker-bench [DEMO ...]"
   , "  " <> prog <> " --swap-bench"
   , "  " <> prog <> " --corpus-survey"
+  , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --osc-listen [PORT]"
   , ""
   , "If no demo names are given, all demos are run."
@@ -214,6 +241,11 @@ usage prog = unlines
   , "                   missed sink shapes, and §4.D edge-rate"
   , "                   opportunity contribution. No audio, no TUI;"
   , "                   demo targets are ignored."
+  , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
+  , "                   with inputs can be passed to --midi-device."
+  , "  --midi-device N  Select PortMIDI device id N for the midi-poly"
+  , "                   demo. Use --midi-list to discover ids. Ignored"
+  , "                   by non-MIDI demos."
   , "  --osc-listen [PORT]"
   , "                   Phase 6.B.4 thin wrapper over"
   , "                   MetaSonic.OSC.Listen.withOscListener. Loads a"
@@ -294,9 +326,34 @@ main = do
       runCorpusSurvey
     OscListen ->
       runOscListen (optOscPort opts)
+    MidiList ->
+      printMidiDevices
     AudioOnly      -> runDemos "Running selected demos."
     InspectThenRun -> runDemos "Inspecting selected demos before audio."
     InspectOnly    -> runDemos "Inspecting selected demos without audio."
+
+printMidiDevices :: IO ()
+printMidiDevices = do
+  result <- midiDeviceList
+  case result of
+    Left err -> die err
+    Right [] -> do
+      putStrLn "No MIDI devices reported by Q / PortMIDI."
+      putStrLn "On Linux, check that ALSA sequencer support is available."
+    Right devices -> do
+      putStrLn "MIDI devices reported by Q / PortMIDI:"
+      forM_ devices $ \d -> do
+        let usable = if midiDeviceInputs d > 0
+                       then "input"
+                       else "no input"
+        putStrLn $
+          "  id=" <> show (midiDeviceId d)
+          <> "  inputs=" <> show (midiDeviceInputs d)
+          <> "  outputs=" <> show (midiDeviceOutputs d)
+          <> "  " <> usable
+          <> "  name=\"" <> midiDeviceName d <> "\""
+      putStrLn ""
+      putStrLn "Use an input-capable id with: --midi-device N midi-poly"
 
 -- Top-level dispatch: route a Demo to its body-specific runner. See
 -- Note [Demo body: single-graph vs multi-template].
@@ -310,7 +367,8 @@ runDemo opts demo
     || optMode opts == WorkerBench
     || optMode opts == SwapBench
     || optMode opts == CorpusSurvey
-    || optMode opts == OscListen =
+    || optMode opts == OscListen
+    || optMode opts == MidiList =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -366,6 +424,12 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: WorkerBench should be handled by main, never reach here"
     SwapBench ->
       error "runSingleDemo: SwapBench should be handled by main, never reach here"
+    CorpusSurvey ->
+      error "runSingleDemo: CorpusSurvey should be handled by main, never reach here"
+    OscListen ->
+      error "runSingleDemo: OscListen should be handled by main, never reach here"
+    MidiList ->
+      error "runSingleDemo: MidiList should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare
@@ -494,7 +558,7 @@ runMidiPolyDemo opts demo poly build = do
               putStrLn ""
             Right (vm, ccs, mpb) ->
               runMidiPolyAudio (length (rgNodes (tplGraph tpl)))
-                               poly tg vm ccs mpb
+                               poly (optMidiDevice opts) tg vm ccs mpb
           _ -> do
             putStrLn $ "  Internal error: midi-poly compiled to "
                     <> show (length (tgTemplates tg))
@@ -579,12 +643,13 @@ resolveBindings rg b autoCCs = do
 runMidiPolyAudio
   :: Int                       -- ^ runtime capacity hint
   -> Int                       -- ^ polyphony
+  -> Maybe Int                 -- ^ PortMIDI device id
   -> TemplateGraph
   -> VoiceMapping
   -> [CCMapping]
   -> Maybe PitchBendBinding
   -> IO ()
-runMidiPolyAudio capacity poly tg vm ccs mpb =
+runMidiPolyAudio capacity poly midiDevice tg vm ccs mpb =
   withRTGraph capacity demoMaxFrames $ \rt -> do
     loadTemplateGraph rt tg
 
@@ -601,9 +666,11 @@ runMidiPolyAudio capacity poly tg vm ccs mpb =
 
     putStrLn $ "  Polyphony=" <> show poly
             <> ", template_id=" <> show cTid
+            <> ", MIDI device="
+            <> maybe "default (0)" show midiDevice
             <> "; opening MIDI session..."
 
-    withMidiDemo rt 0 poly Nothing vm ccs mpb 0xFFFF $ \mh ->
+    withMidiDemo rt 0 poly midiDevice vm ccs mpb 0xFFFF $ \mh ->
       case mh of
         Nothing -> do
           putStrLn $ "  Failed to open MIDI session "

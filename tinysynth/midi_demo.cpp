@@ -15,9 +15,13 @@
 #include <q_io/midi_stream.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <limits>
 #include <new>
 #include <optional>
+#include <string>
 #include <thread>
 
 namespace {
@@ -57,6 +61,20 @@ constexpr auto kWorkerSleep = std::chrono::milliseconds(1);
 // process() consumes at most one per call; bursting up to 16 keeps
 // us from falling behind on rapid pitch-bend / CC streams.
 constexpr int kEventsPerPass = 16;
+
+int clamp_size_to_int(std::size_t n) noexcept {
+  constexpr auto kMax = static_cast<std::size_t>(
+      std::numeric_limits<int>::max());
+  return n > kMax ? std::numeric_limits<int>::max() : static_cast<int>(n);
+}
+
+void copy_device_name(char *dst, const std::string &src) noexcept {
+  if (!dst) return;
+  const auto n = std::min(src.size(),
+                          static_cast<std::size_t>(RT_MIDI_DEVICE_NAME_MAX - 1));
+  std::memcpy(dst, src.data(), n);
+  dst[n] = '\0';
+}
 
 } // namespace
 
@@ -149,6 +167,30 @@ struct rt_midi_demo {
 };
 
 extern "C" {
+
+int rt_midi_device_list(rt_midi_device_info *out, int max_devices) {
+  if (max_devices < 0) return -1;
+
+  try {
+    const auto devices = cycfi::q::midi_device::list();
+    const int total = clamp_size_to_int(devices.size());
+
+    if (out && max_devices > 0) {
+      const int n = std::min(total, max_devices);
+      for (int i = 0; i < n; ++i) {
+        const auto &d = devices[static_cast<std::size_t>(i)];
+        out[i].id = clamp_size_to_int(d.id());
+        out[i].num_inputs = clamp_size_to_int(d.num_inputs());
+        out[i].num_outputs = clamp_size_to_int(d.num_outputs());
+        copy_device_name(out[i].name, d.name());
+      }
+    }
+
+    return total;
+  } catch (...) {
+    return -1;
+  }
+}
 
 rt_midi_demo *
 rt_midi_demo_open(RTGraph                            *graph,

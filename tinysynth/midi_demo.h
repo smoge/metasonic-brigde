@@ -53,6 +53,8 @@
 
 #include <cstdint>
 
+#define RT_MIDI_DEVICE_NAME_MAX 256
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -101,6 +103,25 @@ struct rt_midi_pitch_bend_binding {
   int   control_index;
   float semitone_range;  // 2.0f matches typical controller default
 };
+
+// Snapshot row for q::midi_device::list(). `name` is always
+// NUL-terminated, truncated if the backend reports a longer string.
+// Use rt_midi_device_list(nullptr, 0) to get the current device
+// count, then call again with an array of that many rows.
+struct rt_midi_device_info {
+  int  id;
+  int  num_inputs;
+  int  num_outputs;
+  char name[RT_MIDI_DEVICE_NAME_MAX];
+};
+
+// Enumerate current MIDI devices through Q / PortMIDI.
+//
+// Returns the total number of devices on success, whether or not
+// `out` has enough capacity to receive all rows. Copies at most
+// `max_devices` rows when `out` is non-null. Returns -1 if
+// enumeration throws or if `max_devices` is negative.
+int rt_midi_device_list(rt_midi_device_info *out, int max_devices);
 
 // Open a live MIDI session over `graph`. Spawns a worker thread that
 // runs `stream.process(proc); proc.tick();` in a loop with a small

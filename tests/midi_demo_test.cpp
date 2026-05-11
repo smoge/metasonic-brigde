@@ -15,6 +15,7 @@
 #include "midi_demo.h"
 #include "rt_graph.h"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -121,6 +122,38 @@ TEST_CASE("rt_midi_demo: null inputs reject open and surface -1 on accessors") {
     CHECK(rt_midi_demo_pitch_bend_count(nullptr)  == -1);
     CHECK(rt_midi_demo_has_device(nullptr)        == -1);
     rt_midi_demo_close(nullptr);  // must not crash
+}
+
+TEST_CASE("rt_midi_device_list: enumeration ABI is safe without MIDI hardware") {
+    CHECK(rt_midi_device_list(nullptr, -1) == -1);
+
+    const int count = rt_midi_device_list(nullptr, 0);
+    REQUIRE(count >= 0);
+
+    rt_midi_device_info first{};
+    const int one_count = rt_midi_device_list(&first, 1);
+    CHECK(one_count >= 0);
+    if (one_count > 0) {
+        CHECK(first.id >= 0);
+        CHECK(first.num_inputs >= 0);
+        CHECK(first.num_outputs >= 0);
+        CHECK(first.name[RT_MIDI_DEVICE_NAME_MAX - 1] == '\0');
+    }
+
+    if (count > 0) {
+        std::vector<rt_midi_device_info> rows(static_cast<std::size_t>(count));
+        const int count2 = rt_midi_device_list(rows.data(), count);
+        REQUIRE(count2 >= 0);
+
+        const int copied = std::min(count, count2);
+        for (int i = 0; i < copied; ++i) {
+            CHECK(rows[static_cast<std::size_t>(i)].id >= 0);
+            CHECK(rows[static_cast<std::size_t>(i)].num_inputs >= 0);
+            CHECK(rows[static_cast<std::size_t>(i)].num_outputs >= 0);
+            CHECK(rows[static_cast<std::size_t>(i)].name[RT_MIDI_DEVICE_NAME_MAX - 1]
+                  == '\0');
+        }
+    }
 }
 
 TEST_CASE("rt_midi_demo: CC mappings + pitch-bend binding are accepted at open") {

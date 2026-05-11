@@ -21,6 +21,21 @@ metasonic-inspect-only name="":
 metasonic-help:
     stack exec -- metasonic-bridge --help
 
+midi-list:
+    stack exec -- metasonic-bridge --midi-list
+
+midi-poly:
+    stack exec -- metasonic-bridge midi-poly
+
+midi-poly-device device:
+    stack exec -- metasonic-bridge --midi-device {{device}} midi-poly
+
+osc-listen port="7000":
+    stack exec -- metasonic-bridge --osc-listen {{port}}
+
+osc-send value port="7000" host="127.0.0.1":
+    python3 tools/send_osc.py --host {{host}} --port {{port}} --value {{value}}
+
 stack-test:
     stack test
 

@@ -36,9 +36,12 @@ module MetaSonic.Bridge.MidiDemo
   ( -- * Opaque handle
     MidiDemo
     -- * Bindings (Haskell-side mirrors of the C structs in midi_demo.h)
+  , MidiDeviceInfo (..)
   , VoiceMapping (..)
   , CCMapping (..)
   , PitchBendBinding (..)
+    -- * Device enumeration
+  , midiDeviceList
     -- * Lifecycle
   , openMidiDemo
   , closeMidiDemo
@@ -53,11 +56,13 @@ module MetaSonic.Bridge.MidiDemo
 
 import           Control.Exception          (bracket)
 import           Data.Word                  (Word16, Word8)
+import           Foreign.C.String           (peekCString)
 import           Foreign.C.Types            (CInt (..), CFloat (..),
-                                             CUChar (..), CUShort (..))
-import           Foreign.Marshal.Array      (withArrayLen)
+                                             CChar, CUChar (..), CUShort (..))
+import           Foreign.Marshal.Array      (allocaArray, peekArray,
+                                             withArrayLen)
 import           Foreign.Marshal.Utils      (with)
-import           Foreign.Ptr                (Ptr, nullPtr)
+import           Foreign.Ptr                (Ptr, castPtr, nullPtr, plusPtr)
 import           Foreign.Storable           (Storable (..))
 
 import           MetaSonic.Bridge.FFI       (RTGraph)
@@ -70,6 +75,15 @@ newtype MidiDemo = MidiDemo (Ptr CMidiDemo)
 
 -- Phantom for the C-side @rt_midi_demo@ struct; kept abstract.
 data CMidiDemo
+
+-- | One row from the current PortMIDI device table. Device ids are
+-- the values accepted by 'openMidiDemo' / @--midi-device@.
+data MidiDeviceInfo = MidiDeviceInfo
+  { midiDeviceId      :: !Int
+  , midiDeviceName    :: !String
+  , midiDeviceInputs  :: !Int
+  , midiDeviceOutputs :: !Int
+  } deriving (Eq, Show)
 
 -- | Routing for note-on events. The voice map callback writes
 -- frequency to @(vmFreqNode, vmFreqCtl)@, gate=1.0 to @(vmGateNode,
@@ -184,6 +198,30 @@ instance Storable CPitchBendBinding where
     pokeByteOff p 4 c
     pokeByteOff p 8 r
 
+data CMidiDeviceInfo = CMidiDeviceInfo
+  { cMidiDeviceId      :: !CInt
+  , cMidiDeviceInputs  :: !CInt
+  , cMidiDeviceOutputs :: !CInt
+  , cMidiDeviceName    :: !String
+  }
+
+instance Storable CMidiDeviceInfo where
+  sizeOf    _ = 268
+  alignment _ = 4
+  peek p = do
+    devId   <- peekByteOff p 0
+    inputs  <- peekByteOff p 4
+    outputs <- peekByteOff p 8
+    name    <- peekCString (castPtr (p `plusPtr` 12) :: Ptr CChar)
+    pure CMidiDeviceInfo
+      { cMidiDeviceId      = devId
+      , cMidiDeviceInputs  = inputs
+      , cMidiDeviceOutputs = outputs
+      , cMidiDeviceName    = name
+      }
+  poke _ _ =
+    error "CMidiDeviceInfo is read-only on the Haskell side"
+
 -- ---------------------------------------------------------------------------
 -- Marshalling from Haskell-facing records to C-mirror records.
 -- ---------------------------------------------------------------------------
@@ -261,6 +299,36 @@ foreign import ccall unsafe "rt_midi_demo_pitch_bend_count"
 
 foreign import ccall unsafe "rt_midi_demo_has_device"
   c_rt_midi_demo_has_device :: Ptr CMidiDemo -> IO CInt
+
+foreign import ccall safe "rt_midi_device_list"
+  c_rt_midi_device_list :: Ptr CMidiDeviceInfo -> CInt -> IO CInt
+
+-- ---------------------------------------------------------------------------
+-- Device enumeration
+-- ---------------------------------------------------------------------------
+
+midiDeviceList :: IO (Either String [MidiDeviceInfo])
+midiDeviceList = do
+  n0 <- c_rt_midi_device_list nullPtr 0
+  if n0 < 0
+    then pure (Left "MIDI device enumeration failed")
+    else if n0 == 0
+      then pure (Right [])
+      else allocaArray (fromIntegral n0) $ \p -> do
+        n1 <- c_rt_midi_device_list p n0
+        if n1 < 0
+          then pure (Left "MIDI device enumeration failed")
+          else do
+            rows <- peekArray (fromIntegral (min n0 n1)) p
+            pure (Right (map fromCMidiDeviceInfo rows))
+  where
+    fromCMidiDeviceInfo :: CMidiDeviceInfo -> MidiDeviceInfo
+    fromCMidiDeviceInfo c = MidiDeviceInfo
+      { midiDeviceId      = fromIntegral (cMidiDeviceId c)
+      , midiDeviceName    = cMidiDeviceName c
+      , midiDeviceInputs  = fromIntegral (cMidiDeviceInputs c)
+      , midiDeviceOutputs = fromIntegral (cMidiDeviceOutputs c)
+      }
 
 -- ---------------------------------------------------------------------------
 -- Public lifecycle
