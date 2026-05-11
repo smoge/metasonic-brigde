@@ -1614,9 +1614,11 @@ Rows are machine-readable first: JSONL by default, with a `--summary`
 table for human inspection. Slice 1 emits graph family/member,
 runtime variant, node/region/kernel/RFused counts, exact-equivalence
 status, ns/sample, and speedup against a stripped node-loop baseline.
-Open follow-up fields are resource footprint, declared latency,
-consumer/fanout shape, counter summary, spread, corpus rows, and
-snapshot-checker invariants.
+The follow-up feature slice added a small demo/pattern corpus family
+plus resource-footprint, declared-latency, and consumer/fanout columns.
+Open follow-up fields are counter summary, spread, random/fuzz rows,
+survey/cost-lab snapshot-checker invariants, and the future
+generated-fusion variant.
 
 Goal: produce measured rules such as "sink-terminal 3+ node chains are
 profitable" or "buffer-terminal filter chains are borderline" instead

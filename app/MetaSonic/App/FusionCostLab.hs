@@ -6,25 +6,24 @@
 -- Description : Phase 7.A fusion cost lab — first slice
 --
 -- The fusion cost lab is offline tooling that builds a small bank of
--- parametric graph families, compiles each family member through three
--- runtime variants (stripped node-loop baseline, hand-written region
--- kernels, RFused), measures per-sample timing for each variant, and
--- emits one machine-readable row per (family, member, variant) tuple.
+-- parametric and corpus-derived graph families, compiles each family
+-- member through three runtime variants (stripped node-loop baseline,
+-- hand-written region kernels, RFused), measures per-sample timing
+-- for each variant, and emits one machine-readable row per (family,
+-- member, variant) tuple.
 --
 -- The deliberate scope of slice 1:
 --
---   * Three deterministic families ('FamilySinkChain', 'FamilyReturnTail',
---     'FamilyFanout') keyed by a small integer 'familyIndex'. The
---     families are sized to exercise the shapes the §4.B kernel set
---     actually claims, plus one shape that intentionally falls outside
---     ('FamilyFanout' breaks single-use internal edges).
+--   * Four deterministic families. Three are closed-form generated
+--     families ('FamilySinkChain', 'FamilyReturnTail',
+--     'FamilyFanout'); one is a small real-corpus slice
+--     ('FamilyCorpus') pulled from demos and pattern rows.
 --
 --   * Feature extraction reads compiler facts off the produced
---     'RuntimeGraph' — node count, region count, fused-kernel mix,
---     and the §4.D-style sink-terminal flag — without re-deriving
---     them. Slice 2 will add resource footprints / declared latency /
---     consumer counts once a downstream consumer (cost model) needs
---     them.
+--     'RuntimeGraph' — node/region count, fused-kernel mix, RFused
+--     inputs, resource-footprint counts, declared-latency counts, and
+--     consumer/fanout shape — without re-deriving them from source
+--     syntax.
 --
 --   * Equivalence is the cheap version: render N blocks per variant,
 --     read every bus written by a KOut / KBusOut node, compare
@@ -76,6 +75,7 @@ module MetaSonic.App.FusionCostLab
 
 import           Control.Monad              (forM, forM_, replicateM_)
 import           Data.List                  (intercalate, sort)
+import qualified Data.Set                   as S
 import           Foreign                    (allocaArray, castPtr, peekArray)
 import           Foreign.C.Types            (CFloat (..))
 import           Foreign.Ptr                (Ptr)
@@ -86,8 +86,10 @@ import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR        (lowerGraph)
 import           MetaSonic.Bridge.Source
+import qualified MetaSonic.App.Demos        as Demos
+import qualified MetaSonic.Pattern.Corpus   as Corpus
 
-import           MetaSonic.Types            (NodeKind (..))
+import           MetaSonic.Types            (NodeKind (..), kindLatency)
 
 
 ------------------------------------------------------------
@@ -119,12 +121,18 @@ data GraphFamily
     -- every variant. It bounds the lab's expected speedup at 1.0×
     -- and acts as a regression target if a future kernel relaxes
     -- the single-consumer gate.
+  | FamilyCorpus
+    -- ^ A small real-corpus slice from demos and Phase 6.A pattern
+    -- rows. These rows keep the lab connected to musical shapes while
+    -- still using single 'SynthGraph' members, so the current
+    -- equivalence harness can compare variants directly.
   deriving stock (Eq, Show, Bounded, Enum)
 
 familyName :: GraphFamily -> String
 familyName FamilySinkChain  = "sink-chain"
 familyName FamilyReturnTail = "return-tail"
 familyName FamilyFanout     = "fanout"
+familyName FamilyCorpus     = "corpus"
 
 -- | One member of a family. The string label is the row's stable
 -- identity in JSONL output — keep it short and shell-grep-friendly.
@@ -142,6 +150,21 @@ familyMembers FamilyReturnTail =
   ]
 familyMembers FamilyFanout =
   [ FamilyMember "sin-fanout-two-out"  fanoutTwoOut
+  ]
+familyMembers FamilyCorpus =
+     [ FamilyMember "demo/chain"        Demos.chainGraph
+     , FamilyMember "demo/fm"           Demos.fmGraph
+     , FamilyMember "demo/ringmod"      Demos.ringModGraph
+     , FamilyMember "demo/saw-lpf"      Demos.filteredSawGraph
+     ]
+  ++ templateMembers "pattern/drone-vibrato" Corpus.droneVibratoTemplates
+  ++ templateMembers "pattern/hotswap-initial" Corpus.hotSwapEditTemplates
+  ++ templateMembers "pattern/spectral-freeze" Corpus.spectralFreezePadTemplates
+
+templateMembers :: String -> [(String, SynthGraph)] -> [FamilyMember]
+templateMembers prefix entries =
+  [ FamilyMember (prefix <> "/" <> name) graph
+  | (name, graph) <- entries
   ]
 
 ------------------------------------------------------------
@@ -234,42 +257,89 @@ variantName VarNodeLoop     = "node-loop"
 variantName VarRegionKernel = "region-kernel"
 variantName VarRFused       = "rfused"
 
--- | The compiler facts we record per graph. Slice 1 keeps the set
--- small — adding fields cheaply is the point, but the row schema
--- is stable in JSONL and a downstream cost-model consumer will
--- start keying off these. Resource footprints, declared latency,
--- and consumer-count detail land in slice 2.
+-- | The compiler facts we record per graph. The row schema stays
+-- deliberately small enough to inspect in JSONL, but it now includes
+-- the compiler facts the next cost-model pass needs: resource
+-- footprint, declared latency, and consumer-count shape.
 data FusionCaseFeatures = FusionCaseFeatures
-  { fcfNodeCount    :: !Int
-  , fcfRegionCount  :: !Int
-  , fcfKernelClaims :: !Int
+  { fcfNodeCount        :: !Int
+  , fcfRegionCount      :: !Int
+  , fcfKernelClaims     :: !Int
     -- ^ How many regions resolved to a non-NodeLoop kernel.
-  , fcfRFusedCount  :: !Int
+  , fcfRFusedCount      :: !Int
     -- ^ How many regions report 'RFused' membership.
-  , fcfSinkCount    :: !Int
+  , fcfSinkCount        :: !Int
     -- ^ Count of 'KOut' / 'KBusOut' nodes — proxy for the
     -- sink-terminal opportunity surface §4.D scans for.
+  , fcfBusWrites        :: !Int
+  , fcfBusReads         :: !Int
+  , fcfBusDelayedReads  :: !Int
+  , fcfBufferReads      :: !Int
+  , fcfBufferWrites     :: !Int
+  , fcfLatencyNodes     :: !Int
+  , fcfMaxLatency       :: !Int
+  , fcfFanoutNodes      :: !Int
+  , fcfMaxConsumerCount :: !Int
   } deriving (Eq, Show)
 
 extractFeatures :: RuntimeGraph -> FusionCaseFeatures
 extractFeatures rg =
-  let nodes    = rgNodes rg
-      regions  = rgRuntimeRegions rg
-      kernels  = length [ r | r <- regions, rrKernel r /= RNodeLoop ]
-      rfused   = length [ () | n <- nodes
-                             , any isRFused (rnInputs n) ]
-      sinks    = length [ () | n <- nodes
-                             , rnKind n == KOut || rnKind n == KBusOut ]
+  let nodes      = rgNodes rg
+      regions    = rgRuntimeRegions rg
+      kernels    = length [ r | r <- regions, rrKernel r /= RNodeLoop ]
+      rfused     = length [ () | n <- nodes
+                               , any isRFused (rnInputs n) ]
+      sinks      = length [ () | n <- nodes
+                               , rnKind n == KOut || rnKind n == KBusOut ]
+      resources  = foldr mergeResource emptyResourceFootprint
+                         (map rrFootprint regions)
+      busFp      = rfBuses resources
+      bufFp      = rfBuffers resources
+      latencies  = [ lat | n <- nodes, Just lat <- [kindLatency (rnKind n)] ]
+      consumers  = map rnConsumerCount nodes
+      fanouts    = length [ () | n <- nodes, rnConsumerCount n > 1 ]
   in FusionCaseFeatures
-       { fcfNodeCount    = length nodes
-       , fcfRegionCount  = length regions
-       , fcfKernelClaims = kernels
-       , fcfRFusedCount  = rfused
-       , fcfSinkCount    = sinks
+       { fcfNodeCount        = length nodes
+       , fcfRegionCount      = length regions
+       , fcfKernelClaims     = kernels
+       , fcfRFusedCount      = rfused
+       , fcfSinkCount        = sinks
+       , fcfBusWrites        = S.size (bfWrites busFp)
+       , fcfBusReads         = S.size (bfReads busFp)
+       , fcfBusDelayedReads  = S.size (bfDelayedReads busFp)
+       , fcfBufferReads      = S.size (bfBufReads bufFp)
+       , fcfBufferWrites     = S.size (bfBufWrites bufFp)
+       , fcfLatencyNodes     = length latencies
+       , fcfMaxLatency       = maximumOrZero latencies
+       , fcfFanoutNodes      = fanouts
+       , fcfMaxConsumerCount = maximumOrZero consumers
        }
   where
     isRFused (RFused _) = True
     isRFused _          = False
+
+    maximumOrZero [] = 0
+    maximumOrZero xs = maximum xs
+
+    mergeResource a b =
+      ResourceFootprint
+        { rfBuses   = mergeBus (rfBuses a) (rfBuses b)
+        , rfBuffers = mergeBuffer (rfBuffers a) (rfBuffers b)
+        }
+
+    mergeBus a b =
+      BusFootprint
+        { bfWrites       = bfWrites a       `S.union` bfWrites b
+        , bfReads        = bfReads a        `S.union` bfReads b
+        , bfDelayedReads = bfDelayedReads a `S.union` bfDelayedReads b
+        }
+
+    mergeBuffer a b =
+      BufferFootprint
+        { bfBufWrites       = bfBufWrites a       `S.union` bfBufWrites b
+        , bfBufReads        = bfBufReads a        `S.union` bfBufReads b
+        , bfBufDelayedReads = bfBufDelayedReads a `S.union` bfBufDelayedReads b
+        }
 
 ------------------------------------------------------------
 -- Compile / load plumbing for variants
@@ -606,6 +676,15 @@ featuresJSON f =
        , "\"kernel_claims\":"   <> show (fcfKernelClaims f)
        , "\"rfused_consumers\":"<> show (fcfRFusedCount f)
        , "\"sinks\":"           <> show (fcfSinkCount f)
+       , "\"bus_writes\":"      <> show (fcfBusWrites f)
+       , "\"bus_reads\":"       <> show (fcfBusReads f)
+       , "\"bus_delayed_reads\":" <> show (fcfBusDelayedReads f)
+       , "\"buffer_reads\":"    <> show (fcfBufferReads f)
+       , "\"buffer_writes\":"   <> show (fcfBufferWrites f)
+       , "\"latency_nodes\":"   <> show (fcfLatencyNodes f)
+       , "\"max_latency\":"     <> show (fcfMaxLatency f)
+       , "\"fanout_nodes\":"    <> show (fcfFanoutNodes f)
+       , "\"max_consumers\":"   <> show (fcfMaxConsumerCount f)
        ]
   <> "}"
 
@@ -647,3 +726,10 @@ renderSummary rows = do
       <> " regions=" <> show (fcfRegionCount f)
       <> " kernels=" <> show (fcfKernelClaims f)
       <> " rfused=" <> show (fcfRFusedCount f)
+      <> " fanout=" <> show (fcfFanoutNodes f)
+      <> " maxc=" <> show (fcfMaxConsumerCount f)
+      <> " busW/R=" <> show (fcfBusWrites f)
+      <> "/" <> show (fcfBusReads f)
+      <> " bufW/R=" <> show (fcfBufferWrites f)
+      <> "/" <> show (fcfBufferReads f)
+      <> " lat=" <> show (fcfMaxLatency f)
