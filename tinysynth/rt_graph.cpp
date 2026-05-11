@@ -4992,8 +4992,19 @@ namespace {
 constexpr int kSpectralFreezeN   = SpectralFreezeState::kN;
 constexpr int kSpectralFreezeHop = SpectralFreezeState::kHop;
 
-// Hann window of length N, computed once at static-init time.
+// Hann window of length N, computed at static-init time.
 // Value at index i is 0.5 * (1 - cos(2π i / (N - 1))).
+//
+// Made a namespace-scope constant (kHannWindow below) rather than
+// a function-local static so the audio thread cannot be the first
+// caller. A function-local static would pay the C++ thread-safe
+// init guard plus 1024 std::cos calls on its first invocation; on
+// a cold-start graph the first invocation is on the audio
+// thread, which is exactly where we don't want it. Namespace-
+// scope const-objects are zero-initialized at load time and
+// dynamically initialized before main() returns (and, on every
+// platform we care about, before any thread spawns), so any
+// later thread observes the table already built.
 struct HannWindow {
   std::array<float, kSpectralFreezeN> data{};
   double sum_of_squares = 0.0;
@@ -5009,10 +5020,7 @@ struct HannWindow {
   }
 };
 
-const HannWindow &hann_window() {
-  static const HannWindow w;
-  return w;
-}
+const HannWindow kHannWindow{};
 
 // WOLA normalization scale: with Hann applied on both analysis
 // and resynthesis sides and hop = N/4 (75% overlap), the
@@ -5035,10 +5043,11 @@ const HannWindow &hann_window() {
 // 256 → scale ≈ 2/3 ≈ 0.667. Verified empirically: a 440 Hz
 // sine fed through pass-through reaches unity peak in steady
 // state with this scale.
-double spectral_resynthesis_scale() {
-  const HannWindow &w = hann_window();
-  return static_cast<double>(kSpectralFreezeHop) / w.sum_of_squares;
-}
+//
+// Like kHannWindow, computed at namespace-scope init so the
+// audio thread never pays the floating-point divide.
+const double kSpectralResynthesisScale =
+    static_cast<double>(kSpectralFreezeHop) / kHannWindow.sum_of_squares;
 
 } // namespace
 
@@ -5067,8 +5076,12 @@ static void process_spectral_freeze(
   constexpr int kN     = kSpectralFreezeN;
   constexpr int kHop   = kSpectralFreezeHop;
   constexpr int kBins  = kN / 2 + 1;  // unique real-FFT bins
-  const HannWindow &win = hann_window();
-  const float scale = static_cast<float>(spectral_resynthesis_scale());
+  // kHannWindow / kSpectralResynthesisScale are namespace-scope
+  // constants initialized before main() returns — the audio
+  // thread never pays the table-build cost or the local-static
+  // thread-safe init guard.
+  const HannWindow &win = kHannWindow;
+  const float scale = static_cast<float>(kSpectralResynthesisScale);
 
   long long analysis_ticks = 0;
   long long resynth_ticks  = 0;
