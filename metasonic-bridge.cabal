@@ -40,6 +40,7 @@ library
       MetaSonic.OSC.Listen
       MetaSonic.Pattern
       MetaSonic.Pattern.Corpus
+      MetaSonic.Authoring
       MetaSonic.Visualize.Trace
       MetaSonic.Visualize.TUI
   other-modules:
@@ -58,6 +59,8 @@ library
       vendor/infra/include
   cxx-sources:
       tinysynth/rt_graph.cpp
+      tinysynth/rt_graph_plugins.cpp
+      tinysynth/plugins/identity.cpp
       tinysynth/voice_allocator.cpp
       tinysynth/midi_voice_processor.cpp
       tinysynth/midi_demo.cpp
@@ -90,6 +93,7 @@ executable metasonic-bridge
   other-modules:
       MetaSonic.App.CorpusSurvey
       MetaSonic.App.Demos
+      MetaSonic.App.FusionCostLab
       MetaSonic.App.Osc
       MetaSonic.App.Survey
       MetaSonic.App.SwapBench

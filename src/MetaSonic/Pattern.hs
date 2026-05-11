@@ -10,8 +10,8 @@
 -- pre-compiled initial 'TemplateGraph' a driver loads at pattern
 -- start. The pattern never names runtime instance slots, swap
 -- generations, or other identifiers the audio thread assigns; a
--- driver layer (not shipped in 6.A.2) translates symbolic events
--- into the realtime ABI surface.
+-- driver layer (not shipped in 6.A.2) translates symbolic events into
+-- the realtime ABI surface.
 --
 -- See [Phase 6.A pattern design](../../../notes/2026-05-10-phase-6a-pattern-design.md)
 -- and [Phase 6.A.2 contract and corpus](../../../notes/2026-05-10-phase-6a2-pattern-corpus-design.md).
@@ -49,16 +49,16 @@ newtype TemplateName = TemplateName { unTemplateName :: String }
 
 -- | Pattern-local stable voice identity. Two events sharing a
 -- 'VoiceKey' refer to the same logical voice across 'PEVoiceOn',
--- 'PEVoiceOff', and 'PEControlWrite'. The driver assigns runtime
--- slot identity; the pattern only emits keys.
+-- 'PEVoiceOff', and 'PEControlWrite'. The driver assigns runtime slot
+-- identity; the pattern only emits keys.
 newtype VoiceKey = VoiceKey { unVoiceKey :: String }
   deriving stock    (Eq, Ord, Show, Generic)
   deriving anyclass (NFData)
 
 -- | Symbolic @(NodeTag, ControlSlot)@ target. The 'NodeTag' reuses
 -- the §5.2 'MigrationKey' shape so a producer that already marks
--- nodes for state migration gets pattern-level control targeting
--- for free.
+-- nodes for state migration gets pattern-level control targeting for
+-- free.
 data ControlTag = ControlTag
   { ctNodeTag :: !MigrationKey
   , ctSlot    :: !Int
@@ -76,9 +76,9 @@ newtype SwapLabel = SwapLabel { unSwapLabel :: String }
 type Value = Double
 
 -- | Pattern-time as a discrete sample position relative to the
--- pattern's zero. The v1 driver delivers events at block
--- boundaries; sub-block precision is contract-permitted but
--- unused by the v1 verification gate.
+-- pattern's zero. The v1 driver delivers events at block boundaries;
+-- sub-block precision is contract-permitted but unused by the v1
+-- verification gate.
 newtype SamplePos = SamplePos { unSamplePos :: Int }
   deriving stock    (Eq, Ord, Show, Generic)
   deriving anyclass (NFData)
