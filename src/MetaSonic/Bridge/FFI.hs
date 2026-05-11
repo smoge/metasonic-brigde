@@ -494,10 +494,30 @@ setTemplateIdentityBytes g cTid name (Just bytes) =
 -- declined to pin. Clamping cap=1 closes that gap; lifting it is a
 -- §6.C.5+ feature gated on a real mixdown/ordering primitive.
 --
+-- The C++ runtime also enforces the same invariant on the public
+-- C ABI (see Note [§6.C.5 single-writer-single-instance invariant]
+-- in rt_graph.cpp): rt_graph_template_add_node clamps the cap when
+-- a writer kind is added, and rt_graph_template_set_polyphony
+-- refuses to raise it past 1 once a writer is present. The Haskell
+-- clamp is the *declarative* expression of the rule at the compiler
+-- boundary; the runtime backstop catches any direct-ABI caller that
+-- never goes through these loaders.
+--
 -- Non-writer templates are left at their default cap.
 clampWriterPolyphony :: Ptr RTGraph -> CInt -> Template -> IO ()
 clampWriterPolyphony g cTid tpl =
   unless (S.null (bfBufWrites (rfBuffers (tplFootprint tpl)))) $
+    c_rt_graph_template_set_polyphony g cTid 1
+
+-- | §6.C.5 follow-up: 'clampWriterPolyphony' for single-template
+-- loaders, which never build a 'Template' / 'ResourceFootprint' and
+-- only have a 'RuntimeGraph' in hand. Same rule, different access
+-- path: look at the dense node list directly. Today
+-- 'KRecordBufMono' is the only buffer writer; the helper is
+-- centralised so adding another writer kind is one edit.
+clampWriterPolyphonyRG :: Ptr RTGraph -> CInt -> RuntimeGraph -> IO ()
+clampWriterPolyphonyRG g cTid rg =
+  when (any (\n -> rnKind n == KRecordBufMono) (rgNodes rg)) $
     c_rt_graph_template_set_polyphony g cTid 1
 
 foreign import ccall unsafe "rt_graph_connect"
@@ -1491,6 +1511,10 @@ loadRuntimeGraph g rg = do
     Right ss -> pure ss
     Left err -> fail $ "loadRuntimeGraph: " <> err
   c_rt_graph_clear g
+  -- §6.C.5: writer templates are monophonic at the loader boundary.
+  -- The Haskell clamp is declarative; the runtime in rt_graph.cpp
+  -- holds the same invariant against direct-C-ABI callers.
+  clampWriterPolyphonyRG g 0 rg
   -- Pass 0: size the shared bus pool to cover every bus this graph
   -- references. Construction-only; must run before audio starts.
   -- See Note [Explicit bus-pool sizing] in rt_graph.cpp.
@@ -1603,6 +1627,8 @@ loadRuntimeGraphFused g rg = do
     Right ss -> pure ss
     Left err -> fail $ "loadRuntimeGraphFused: " <> err
   c_rt_graph_clear g
+  -- §6.C.5: same writer-monophonic clamp as the unfused loader.
+  clampWriterPolyphonyRG g 0 rg
   mapM_ ensureBusForNode (rgNodes rg)
   mapM_ addNode (rgNodes rg)
   -- Pass 2: regular RFrom wiring. RFused / RConst are no-ops here;

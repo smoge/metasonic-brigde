@@ -11159,4 +11159,71 @@ recordBufMonoSkeletonTests =
         Left err -> assertFailure $
           "writer + reader on same buffer must lower cleanly; got: "
           <> err
+
+  , -- §6.C.5 follow-up: loadRuntimeGraph (single-template
+    -- loader, used by the legacy ABI and by app/Main.hs's demo
+    -- helpers) must clamp writer-template polyphony to 1 the
+    -- same way the multi-template loader does. The runtime
+    -- backstop in rt_graph.cpp catches direct-C-ABI callers;
+    -- this test pins the Haskell loader's declarative clamp.
+    testCase "loadRuntimeGraph clamps a writer graph's polyphony" $ do
+      let writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 0.0)
+            pure ()
+
+      rg <- case lowerGraph writerGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rg) + 8) 64 $ \rt -> do
+        _ <- allocBuffer rt 64
+        loadRuntimeGraph rt rg
+
+        -- Auto-spawn took slot 0; second spawn must hit the cap.
+        extra <- c_rt_graph_template_instance_add rt 0
+        extra @?= (-1)
+
+  , -- §6.C.5 follow-up: loadRuntimeGraphFused mirrors the
+    -- unfused loader. Even though the demo graph here has no
+    -- RFused inputs, the loader must still apply the clamp on
+    -- the same writer-presence rule.
+    testCase "loadRuntimeGraphFused clamps a writer graph's polyphony" $ do
+      let writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 0.0)
+            pure ()
+
+      rg <- case lowerGraph writerGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rg) + 8) 64 $ \rt -> do
+        _ <- allocBuffer rt 64
+        loadRuntimeGraphFused rt rg
+
+        extra <- c_rt_graph_template_instance_add rt 0
+        extra @?= (-1)
+
+  , -- §6.C.5 follow-up: a non-writer graph loaded via
+    -- loadRuntimeGraph must keep its default polyphony (8) —
+    -- the clamp is gated on the writer-presence check.
+    testCase "loadRuntimeGraph leaves non-writer polyphony untouched" $ do
+      let readerGraph = runSynth $ do
+            s <- sinOsc (Param 440.0) (Param 0.0)
+            out 0 s
+
+      rg <- case lowerGraph readerGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      withRTGraph (length (rgNodes rg) + 32) 64 $ \rt -> do
+        loadRuntimeGraph rt rg
+        -- Slot 0 is auto-spawned; spawning three more must
+        -- succeed under the default cap of 8.
+        s1 <- c_rt_graph_template_instance_add rt 0
+        s2 <- c_rt_graph_template_instance_add rt 0
+        s3 <- c_rt_graph_template_instance_add rt 0
+        assertBool
+          ("expected three additional non-writer instances; got "
+           <> show [s1, s2, s3])
+          (all (>= 0) [s1, s2, s3])
   ]
