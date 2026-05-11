@@ -1040,6 +1040,74 @@ unitTests = testGroup "Unit tests"
             @?= Just (S.fromList [TemplateID 0, TemplateID 1])
           M.lookup (TemplateID 0) prec @?= Just S.empty
           M.lookup (TemplateID 1) prec @?= Just S.empty
+
+      -- §6.C.4 slice 4: reject same-buffer BufWrite across
+      -- templates. Tests exercise checkNoSharedBufferWriters
+      -- directly (no BufWrite UGen exists yet — the writer kind
+      -- lands in the §6.C.4 follow-up).
+
+      , testCase "checkNoSharedBufferWriters: distinct writers on distinct buffers is OK" $ do
+          let dummyRG = RuntimeGraph [] []
+              tA = Template (TemplateID 0) "A" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufWrites = S.singleton 0 } }
+              tB = Template (TemplateID 1) "B" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufWrites = S.singleton 1 } }
+          checkNoSharedBufferWriters [tA, tB] @?= Right ()
+
+      , testCase "checkNoSharedBufferWriters: BufWrite + BufRead on the same buffer is OK" $ do
+          let dummyRG = RuntimeGraph [] []
+              tWriter = Template (TemplateID 0) "writer" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufWrites = S.singleton 3 } }
+              tReader = Template (TemplateID 1) "reader" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufReads = S.singleton 3 } }
+          checkNoSharedBufferWriters [tWriter, tReader] @?= Right ()
+
+      , testCase "checkNoSharedBufferWriters: two writers on the same buffer is rejected" $ do
+          let dummyRG = RuntimeGraph [] []
+              tA = Template (TemplateID 0) "first" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufWrites = S.singleton 2 } }
+              tB = Template (TemplateID 1) "second" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufWrites = S.singleton 2 } }
+          case checkNoSharedBufferWriters [tA, tB] of
+            Right () -> assertFailure
+              "expected same-buffer BufWrite conflict to be rejected"
+            Left err -> do
+              assertBool
+                ("diagnostic must name buffer 2; got: " <> err)
+                ("buffer 2" `isInfixOf` err)
+              assertBool
+                ("diagnostic must mention 'first'; got: " <> err)
+                ("first"   `isInfixOf` err)
+              assertBool
+                ("diagnostic must mention 'second'; got: " <> err)
+                ("second"  `isInfixOf` err)
+
+      , testCase "checkNoSharedBufferWriters: bus 5 / buffer 5 are not aliased" $ do
+          -- Regression guard for the disjoint-id-space property:
+          -- two templates writing BUS 5 and BUFFER 5 respectively
+          -- must not be flagged as a buffer-write conflict.
+          let dummyRG = RuntimeGraph [] []
+              tBus = Template (TemplateID 0) "bus_writer" dummyRG
+                   emptyResourceFootprint
+                     { rfBuses = emptyFootprint
+                         { bfWrites = S.singleton 5 } }
+              tBuf = Template (TemplateID 1) "buf_writer" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufWrites = S.singleton 5 } }
+          checkNoSharedBufferWriters [tBus, tBuf] @?= Right ()
       ]
 
   , -- Rate propagation: 'inferRate' returns each kind's *floor*; the

@@ -46,6 +46,7 @@ module MetaSonic.Bridge.Templates
   , -- * §6.C.4 precedence rule (exposed for tests)
     computePrecedence
   , templatePrecedes
+  , checkNoSharedBufferWriters
   , -- * Template-level schedule stats (§4.E.2c read-only view)
     TemplateScheduleStats (..)
   , templateScheduleStats
@@ -259,6 +260,12 @@ compileTemplateGraph entries = do
   -- Stage 2: name uniqueness.
   checkUniqueNames templates
 
+  -- Stage 2.5 (§6.C.4 slice 4): reject same-buffer BufWrite /
+  -- BufWrite across templates. v1 does not pin a deterministic
+  -- ordering for two writers on the same buffer — see the 6.C.4
+  -- design note for the rationale.
+  checkNoSharedBufferWriters templates
+
   -- Stage 3: precedence DAG.
   let !precedence = computePrecedence templates
 
@@ -302,6 +309,7 @@ compileTemplateGraphFused
 compileTemplateGraphFused entries = do
   templates <- mapM compileOneFused (zip [0..] entries)
   checkUniqueNames templates
+  checkNoSharedBufferWriters templates
   let !precedence = computePrecedence templates
   ordered <- topoSortTemplates templates precedence
   pure TemplateGraph
@@ -334,6 +342,44 @@ checkUniqueNames ts =
        []  -> Right ()
        ns  -> Left $ "duplicate template name(s): "
                   <> intercalate ", " (map show ns)
+
+-- | §6.C.4 slice 4: reject same-buffer @BufWrite@ from two or
+-- more templates in the same 'TemplateGraph'. v1 does not pin
+-- a deterministic ordering for two writers on the same buffer;
+-- the design note records the rationale (input order is
+-- implicit-and-observable, tagged order is a feature in search
+-- of a use case, and the producer can already express the
+-- ordering through a bus or split into separate buffers).
+--
+-- Reports every offending buffer id with the names of the
+-- templates that contest it, in registration order, so the
+-- diagnostic is actionable. A single template that writes the
+-- same buffer twice (theoretically possible if a future writer
+-- UGen is dropped twice into the same graph) is fine — the
+-- check is across templates, not within a single template.
+checkNoSharedBufferWriters :: [Template] -> Either String ()
+checkNoSharedBufferWriters ts =
+  let writers :: M.Map Int [String]
+      writers = M.fromListWith (++)
+        [ (bufId, [tplName t])
+        | t <- ts
+        , bufId <- S.toList (bfBufWrites (rfBuffers (tplFootprint t)))
+        ]
+      conflicts =
+        [ (bufId, reverse names)
+        | (bufId, names) <- M.toAscList writers
+        , length names > 1
+        ]
+  in case conflicts of
+       []   -> Right ()
+       _    -> Left $
+         "same-buffer BufWrite from multiple templates is "
+         <> "rejected in v1 (§6.C.4): "
+         <> intercalate "; "
+              [ "buffer " <> show bufId
+                <> " written by " <> intercalate ", " (map show names)
+              | (bufId, names) <- conflicts
+              ]
 
 -- | Build the reader-keyed precedence map: for each template @b@, the
 -- set of templates @a@ such that @a@'s writes intersect @b@'s live
