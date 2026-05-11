@@ -84,8 +84,8 @@ sub-phase.
   Live recording (`RecordBuf` / `BufWr`) introduces
   reader-writer race questions, sample-accuracy questions
   about when the write completes, producer-side coordination
-  questions, AND a precedence-extension question (see L-7
-  below); defer until the read path is solid.
+  questions, AND a precedence-extension question (see
+  decision 6 below); defer until the read path is solid.
 - **Not a delay-line replacement.** `KDelay` already owns a
   per-node `q::delay` ring buffer (see
   [src/MetaSonic/Bridge/Source.hs:861-882](../src/MetaSonic/Bridge/Source.hs)

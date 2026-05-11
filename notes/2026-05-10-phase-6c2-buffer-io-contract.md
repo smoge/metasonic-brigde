@@ -66,35 +66,59 @@ S-6 unloaded/freed ID emits zeros + invalid-read counter.
 
 ## Haskell surface
 
-### `MetaSonic.Bridge.Buffer` (new module)
+The pure identity type and the IO wrapper live in **separate
+modules** to keep the import graph acyclic — see
+[FFI.hs](../src/MetaSonic/Bridge/FFI.hs)'s existing
+`MetaSonic.Bridge.Source` import.
+
+### `MetaSonic.Types` (existing module, additions)
+
+```haskell
+-- Added alongside the existing NodeID / NodeIndex / Eff
+-- vocabulary. Pure data; no IO, no FFI.
+newtype Buffer = Buffer { bufferId :: Int }
+  deriving stock    (Eq, Ord, Show, Generic)
+  deriving anyclass (NFData)
+```
+
+The DSL imports `Buffer` from `MetaSonic.Types`. `Source.hs`
+puts `Buffer` inside the `PlayBufMono` `UGen` constructor;
+that does not introduce any new dependency since
+`MetaSonic.Types` is already an upstream of `Source.hs`.
+
+### `MetaSonic.Bridge.Buffer` (new module — IO wrapper only)
 
 ```haskell
 module MetaSonic.Bridge.Buffer
-  ( -- * Identity
-    Buffer
-  , bufferId          -- :: Buffer -> Int
-
-    -- * Allocation / load / clear (producer-side IO)
-  , allocBuffer       -- :: Ptr RTGraph -> Int -> IO Buffer
-  , loadBuffer        -- :: Ptr RTGraph -> Buffer
-                      --   -> VS.Vector Float -> IO ()
-  , clearBuffer       -- :: Ptr RTGraph -> Buffer -> IO ()
-                      --   (stopped-audio-only; 6.C.3a)
-
+  ( -- * Allocation / load / clear (producer-side IO)
+    allocBuffer    -- :: Ptr RTGraph -> Int -> IO Buffer
+  , loadBuffer     -- :: Ptr RTGraph -> Buffer -> [Float] -> IO ()
+  , clearBuffer    -- :: Ptr RTGraph -> Buffer -> IO ()
+                   --   (stopped-audio-only; 6.C.3a)
     -- * Errors
   , BufferIssue (..)
   ) where
+
+import           Control.Exception     (Exception, throwIO)
+import           Foreign.Marshal.Array (withArray)
+import           MetaSonic.Bridge.FFI  (RTGraph)
+import           MetaSonic.Types       (Buffer (..))
 ```
 
-```haskell
-newtype Buffer = Buffer { bufferId :: Int }
-  deriving stock (Eq, Ord, Show)
-```
+The new module imports `MetaSonic.Bridge.FFI` for `RTGraph`
+and the raw C entry points; it sits **downstream** of FFI in
+the import graph. `Source.hs` continues to import only
+`MetaSonic.Types` (for `Buffer`), so the proposed split
+breaks no existing module-graph constraint.
 
-`Buffer` is opaque to the DSL but its integer identity is
-exposed (the `bufferId` accessor) because the `playBuf`
-builder needs the raw integer to fill the `buffer_id`
-control slot.
+`loadBuffer` takes a plain `[Float]` and marshals it on the
+fly with `Foreign.Marshal.Array.withArray`. This avoids
+introducing a `vector` dependency for one call site — the
+test corpus uses 256-sample tables where the cost of going
+through a list is negligible. If a future caller needs to
+load multi-MB sample data, switching to a `ForeignPtr Float`
+or adding `vector` to [package.yaml](../package.yaml) is a
+one-line change to this module.
 
 ### `MetaSonic.Bridge.Source` additions
 
@@ -179,6 +203,39 @@ dependencies (PlayBufMono _ r s lp) = deps [r, s, lp]
 
 (`Audio` connections among `r` / `s` / `lp` contribute
 structural edges; `Param` literals do not.)
+
+### `portInfo` row (required for totality)
+
+The `portInfo` totality property in
+[test/Spec.hs](../test/Spec.hs) iterates
+`[minBound..maxBound]` over `NodeKind` and asserts that every
+declared audio input has a `Just` entry. With audio arity 3,
+`KPlayBufMono` needs three rows:
+
+```haskell
+KPlayBufMono -> case i of
+  0 -> Just (PortInfo PortSampleAccurate "rate")
+  1 -> Just (PortInfo PortIgnored        "start_frame")
+  2 -> Just (PortInfo PortSampleAccurate "loop_flag")
+  _ -> Nothing
+```
+
+- **`rate`** is read every sample (the playhead advances by
+  `rate` per frame), so `PortSampleAccurate`.
+- **`start_frame`** is read once at instance reset via
+  `rnControls[2]` and never resolved in the audio loop. An
+  `RFrom` wired into port 1 would be silently dropped —
+  the exact precedent set by oscillator `phase`. Marked
+  `PortIgnored` so the §4.D.2 survey excludes it from
+  opportunity counts and the §4.B/§4.D code paths handle
+  it consistently with the oscillator family.
+- **`loop_flag`** is checked at the playback-position
+  boundary every sample (live toggling on / off must work),
+  so `PortSampleAccurate`.
+
+This pattern mirrors `KPulseOsc` (port 1 = `phase`,
+`PortIgnored`) and validates against the existing pinned-
+classification test set without needing a new pinned row.
 
 ## C ABI (additions to `tinysynth/rt_graph.h`)
 
@@ -279,15 +336,18 @@ data BufferIssue
   | BiFrameCountExceedsBuffer !Int !Int
                        -- requested, capacity
   deriving stock    (Eq, Show, Generic)
-  deriving anyclass (NFData)
+  deriving anyclass (NFData, Exception)
 ```
 
-`allocBuffer` / `loadBuffer` / `clearBuffer` throw
-`BufferIssue` via `Control.Exception.throwIO` on failure
-(matching the existing FFI helpers' `IO` style — see
-e.g. how `loadTemplateGraph` reacts to a non-zero RC). No
-`Either` shaping at the FFI layer; the producer is expected
-to wrap calls in a higher-level layer if it needs that.
+The `Exception` instance comes via `deriving anyclass` —
+`BufferIssue` already has `Show`, which is the only
+superclass `Exception` requires. `allocBuffer` /
+`loadBuffer` / `clearBuffer` throw `BufferIssue` via
+`Control.Exception.throwIO` on failure (matching the
+existing FFI helpers' `IO` style — see e.g. how
+`loadTemplateGraph` reacts to a non-zero RC). No `Either`
+shaping at the FFI layer; the producer is expected to wrap
+calls in a higher-level layer if it needs that.
 
 ## Cross-checks (existing test properties cover these)
 
@@ -314,46 +374,76 @@ both must continue to pass.
 
 ## Implementation order for 6.C.3a
 
-1. Add `BufferSlot` storage to the C++ `RTGraph` (header +
-   .cpp) and the read/invalid-read counters. Make
-   `rt_graph_kind_supported(20) == 1` after wiring
-   `KPlayBufMono` into `kind_from_tag`. No process_graph
-   change yet — fail fast if a graph tries to use the new
-   kind.
-2. Add `rt_graph_buffer_alloc` / `_load_f32` / `_clear`.
-   Standalone C++ test: alloc, load, read back via a debug
-   accessor (or skip — only Haskell tests need to verify).
-3. Add `KPlayBufMono` to `NodeKind`, `kindSpec` row, `UGen`
-   `PlayBufMono` constructor, `ugenView` / `inferEff` /
-   `dependencies` cases, `playBufMono` builder.
-4. Add the C++ `process_play_buf_mono` kernel and wire it
-   into `process_graph` + `configure_node` +
-   `rt_graph_add_node`. Read counter ticks on each valid
-   sample; invalid-read counter ticks on each sample where
-   `buffer_id` doesn't resolve.
-5. Add the Haskell FFI bindings (`MetaSonic.Bridge.FFI`) for
-   the four new C entry points + the two counters.
-6. Add `MetaSonic.Bridge.Buffer` (the new module) with
-   `Buffer`, `allocBuffer`, `loadBuffer`, `clearBuffer`,
-   `BufferIssue`.
-7. Add the end-to-end test in `test/Spec.hs`: alloc a
-   buffer, load a sine table of 256 frames, build a graph
-   `playBufMono buf (Param 1.0) (Param 0) (Param 1) → out 0`,
-   render one block, assert the bus-0 output matches the
-   loaded samples to within linear-interpolation tolerance.
-   Counter-confirm via `rt_graph_test_buffer_read_count > 0`.
-8. Add the invalid-ID test: build a graph with a
-   `PlayBufMono` whose `Buffer` references a never-allocated
-   ID (e.g. by constructing `Buffer 99` directly via a
-   test-only constructor, or by clearing the buffer before
-   render). Assert bus-0 is all zeros AND
-   `rt_graph_test_buffer_invalid_read_count > 0`.
-9. Update `package.yaml` (`exposed-modules`) + `CMakeLists.txt`
-   (no new files, but the .cpp / .h changes need a rebuild).
-10. Update `ROADMAP.md` to mark 6.C.2 done and 6.C.3a as the
-    current task. Commit.
+Revised after review: type surface lands first so the
+existing tag-agreement / `kind_supported` / `ugenView`
+arity / `portInfo` totality tests act as a tripwire when the
+C++ side has not caught up.
 
-Step ordering is deliberate: get the data-plane storage and
-counters in **before** the kernel, so a regression at step 4
-fails loud (counter mismatch) instead of silent (correct
-output for the wrong reason).
+1. **Haskell type surface first.** Add `Buffer` newtype to
+   `MetaSonic.Types`; add `KPlayBufMono` to `NodeKind`;
+   `kindSpec` row; `PlayBufMono` `UGen` constructor;
+   `ugenView` / `inferEff` / `dependencies` / `portInfo`
+   cases; `playBufMono` builder in `Source.hs`. Expect
+   `kind_supported` / tag-agreement tests to fail until step
+   2 lands — useful as a cross-check that the C++ side did
+   not silently drift.
+2. **C++ kind skeleton.** `NodeKind::PlayBufMono = 20`,
+   `kind_from_tag` row, `configure_spec` audio-input refs
+   and controls (4: `buffer_id`, `rate`, `start_frame`,
+   `loop_flag`), `NodeState` field for `playhead_pos`, and
+   a stub `process_play_buf_mono` that emits zeros and
+   increments the invalid-read counter unconditionally.
+   After this step the tag-agreement test passes; the E2E
+   test does not.
+3. **Buffer pool ABI.** `MAX_BUFFERS = 64` constant,
+   `BufferSlot { std::vector<float> samples; bool
+   allocated; }` on `RTGraph`, the three producer entry
+   points (`alloc`, `load_f32`, `clear`) and the two test
+   counters (`rt_graph_test_buffer_read_count`,
+   `rt_graph_test_buffer_invalid_read_count`). No kernel
+   change yet.
+4. **Haskell FFI + IO wrapper.** Low-level
+   `c_rt_graph_buffer_*` imports in
+   `MetaSonic.Bridge.FFI`; new module
+   `MetaSonic.Bridge.Buffer` with `allocBuffer`,
+   `loadBuffer`, `clearBuffer`, `BufferIssue`. Marshal
+   `[Float]` via `Foreign.Marshal.Array.withArray`. Add
+   `MetaSonic.Bridge.Buffer` to `package.yaml`
+   `exposed-modules`.
+5. **Actual kernel body** in `process_play_buf_mono`:
+   resolve buffer ID from control 0; initialise
+   `playhead_pos` from `start_frame` at instance reset
+   (`configure_node`); clamp negative `rate` to 0;
+   linear-interpolate samples; loop to `start_frame` when
+   `loop_flag >= 0.5` else go silent past the last frame;
+   emit zero + invalid-counter on unresolved IDs;
+   valid-counter per valid sample.
+6. **Tests in this order:**
+   - **a.** Tag support / `kind_supported` round-trip
+     (automatic via the existing iteration).
+   - **b.** `ugenView` arity totality (automatic).
+   - **c.** `portInfo` totality (automatic — the test
+     iterates `[minBound..maxBound]`).
+   - **d.** FFI wrapper unit tests: alloc returns ID 0;
+     alloc twice returns IDs 0, 1; alloc past 64 raises
+     `BiPoolFull`; load with too many frames raises
+     `BiFrameCountExceedsBuffer`; load against an unknown
+     ID raises `BiUnknownBufferId`.
+   - **e.** End-to-end: load a 256-frame sine table, build
+     `playBufMono buf (Param 1.0) (Param 0) (Param 0) → out 0`,
+     render one block, compare bus-0 output to the loaded
+     samples within linear-interpolation tolerance;
+     counter-confirm `rt_graph_test_buffer_read_count > 0`.
+   - **f.** Invalid-ID render: build a graph that references
+     an unallocated `Buffer 99`, render, assert bus-0 is
+     all zeros AND
+     `rt_graph_test_buffer_invalid_read_count > 0`.
+   - **g.** Clear-then-render: alloc + load + clear, then
+     render, same invalid-ID assertions.
+7. Update `ROADMAP.md`: mark 6.C.2 done and 6.C.3a as
+   shipped. Commit.
+
+Step ordering is deliberate: get the type / ABI surface in
+**before** the kernel body, so a regression at step 5 fails
+loud (counter mismatch on a fresh test) instead of silent
+(correct output for the wrong reason).
