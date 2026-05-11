@@ -32,6 +32,10 @@ import           MetaSonic.App.Survey          (CorpusGraphSummary (..),
                                                 surveyEnsembleCorpus,
                                                 surveyShapeProbes)
 import           MetaSonic.Bridge.Compile      (DeclaredNodeLatency (..))
+import           MetaSonic.Bridge.Planner      (FusionCandidate (..),
+                                                RejectionReason (..),
+                                                Verdict (..), isAccepted,
+                                                isRejected)
 import           MetaSonic.Types               (KindCapability (..),
                                                 NodeKind (..),
                                                 kindCapabilities)
@@ -54,6 +58,7 @@ runSnapshotCheck = do
       checks =  costLabChecks costRows
              <> surveyChecks survey
              <> capabilityChecks survey
+             <> plannerChecks survey
 
   putStrLn "Phase 7 survey/cost-lab snapshot checks"
   putStrLn ""
@@ -322,6 +327,105 @@ lookupCap c = maybe 0 id . lookup c
 renderCapCounts :: [(KindCapability, Int)] -> String
 renderCapCounts xs =
   intercalate "," [show c <> "=" <> show n | (c, n) <- xs]
+
+-- §7.C planner verdict invariants on the snapshot corpus.
+-- Pinned counts are intentionally specific: candidate/accepted/
+-- rejected totals plus per-rejection-reason counts. Drift means
+-- either the corpus changed, a planner rule changed, or
+-- 'kindCapabilities' moved a kind to a different bucket. All three
+-- deserve an explicit acknowledgement, so the counts are pinned
+-- and treated as a snapshot.
+plannerChecks :: SurveySnapshots -> [SnapshotCheck]
+plannerChecks snapshots =
+  [ check "planner total candidate count is stable"
+      (totalCandidates == expectedTotal)
+      ("expected=" <> show expectedTotal
+       <> "; actual=" <> show totalCandidates)
+
+  , check "planner accepted/rejected split is stable"
+      (acceptedCount == expectedAccepted
+        && rejectedCount == expectedRejected)
+      ("expected accepted=" <> show expectedAccepted
+       <> " rejected=" <> show expectedRejected
+       <> "; actual accepted=" <> show acceptedCount
+       <> " rejected=" <> show rejectedCount)
+
+  , check "planner per-rejection-reason counts are stable"
+      (rejectionCounts == expectedRejectionCounts)
+      ("expected=" <> renderReasonCounts expectedRejectionCounts
+       <> "; actual=" <> renderReasonCounts rejectionCounts)
+
+  , check "planner accepts at least one §4.B-matched candidate"
+      (matchedCount > 0)
+      ("matched=" <> show matchedCount)
+  ]
+  where
+    allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
+    verdicts =
+      [ v
+      | (_, Right row) <- allRows
+      , v <- csPlannerVerdicts row
+      ]
+
+    totalCandidates = length verdicts
+    acceptedCount   = length (filter isAccepted verdicts)
+    rejectedCount   = length (filter isRejected verdicts)
+    matchedCount    =
+      length [ ()
+             | Accepted c <- verdicts
+             , Just _ <- [fcMatchedShape c]
+             ]
+
+    rejectionCounts :: [(String, Int)]
+    rejectionCounts =
+      let reasons = [r | Rejected _ r <- verdicts]
+          tags    = map reasonTagName reasons
+      in [ (tag, length (filter (== tag) tags))
+         | tag <- expectedReasonOrder
+         , tag `elem` tags
+         ]
+
+    -- Pinned snapshot. Bump these intentionally when a planner
+    -- rule or the corpus changes; a silent shift means the
+    -- planner output drifted.
+    expectedTotal      = 193
+    expectedAccepted   = 163
+    expectedRejected   = 30
+    expectedRejectionCounts :: [(String, Int)]
+    expectedRejectionCounts =
+      [ ("ReasonStatefulInterior", 13)
+      , ("ReasonFanoutEscape",     13)
+      , ("ReasonResourceMidChain",  2)
+      , ("ReasonLatencyMidChain",   2)
+      ]
+
+    -- Display order for rejection reasons; matches
+    -- 'printRejectionSummary' in 'MetaSonic.App.Survey'.
+    expectedReasonOrder =
+      [ "ReasonStatefulInterior"
+      , "ReasonFanoutEscape"
+      , "ReasonResourceMidChain"
+      , "ReasonLatencyMidChain"
+      , "ReasonHardBarrier"
+      , "ReasonTooShort"
+      , "ReasonNoTerminalSink"
+      , "ReasonCrossesRegion"
+      ]
+
+reasonTagName :: RejectionReason -> String
+reasonTagName r = case r of
+  ReasonHardBarrier{}      -> "ReasonHardBarrier"
+  ReasonLatencyMidChain{}  -> "ReasonLatencyMidChain"
+  ReasonResourceMidChain{} -> "ReasonResourceMidChain"
+  ReasonStatefulInterior{} -> "ReasonStatefulInterior"
+  ReasonFanoutEscape{}     -> "ReasonFanoutEscape"
+  ReasonTooShort{}         -> "ReasonTooShort"
+  ReasonNoTerminalSink     -> "ReasonNoTerminalSink"
+  ReasonCrossesRegion{}    -> "ReasonCrossesRegion"
+
+renderReasonCounts :: [(String, Int)] -> String
+renderReasonCounts xs =
+  intercalate "," [tag <> "=" <> show n | (tag, n) <- xs]
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =

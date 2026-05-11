@@ -624,6 +624,11 @@ data CorpusGraphSummary = CorpusGraphSummary
     -- ^ §7.B per-kind node count. Carried through 'CorpusGraphSummary'
     -- so '--snapshot-check' can aggregate the corpus's
     -- capability footprint without re-compiling each graph.
+  , csPlannerVerdicts :: ![Verdict]
+    -- ^ §7.C planner verdicts. Carried through so
+    -- '--snapshot-check' can pin per-reason rejection counts and
+    -- per-matched-shape acceptance counts without re-running the
+    -- planner.
   } deriving (Eq, Show)
 
 -- | Phase 6.A.3 corpus-survey entry: compile a 'SynthGraph' and
@@ -643,6 +648,7 @@ surveyCorpusGraph d t g = do
     , csDeclaredLatency = srDeclaredLatency row
     , csLatencySkews    = srLatencySkews row
     , csKindTally       = srKindTally row
+    , csPlannerVerdicts = srPlannerVerdicts row
     }
 
 -- | Compile every (demo, template) pair, returning one
