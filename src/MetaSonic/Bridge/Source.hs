@@ -25,6 +25,9 @@ module MetaSonic.Bridge.Source
   , migrationKeyUtf8Bytes
   , migrationKeyUtf8ByteLength
   , PluginRef (..)
+  , StaticPluginInfo (..)
+  , staticPluginCatalog
+  , staticPluginInfo
   , identityPlugin
   , staticPluginId
   , UGen (..)
@@ -190,6 +193,23 @@ newtype PluginRef = PluginRef
   } deriving stock    (Eq, Ord, Show, Generic)
     deriving anyclass (NFData)
 
+-- | Compiler-visible metadata for one build-linked static plugin.
+--
+-- §6.E.3 deliberately keeps this table on the Haskell side: the
+-- runtime still receives only the frozen @plugin_id@ control, while
+-- validation, effect analysis, and future latency/resource reporting
+-- can become plugin-specific without growing the C ABI.
+data StaticPluginInfo = StaticPluginInfo
+  { spiRef            :: !PluginRef
+  , spiPluginId       :: !Int
+  , spiAudioInputs    :: !Int
+  , spiAudioOutputs   :: !Int
+  , spiLatencySamples :: !Int
+  , spiEffects        :: ![Eff]
+  , spiLabel          :: !String
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
 -- | The first fixed static plugin profile: two audio inputs, one
 -- audio output, no plugin parameters, no inherent latency.
 identityPlugin :: PluginRef
@@ -200,10 +220,29 @@ identityPlugin = PluginRef "identity"
 -- The C++ registry exposes the same index through
 -- @rt_graph_plugin_find@ for runtime-side cross-checks, but the pure
 -- compiler path does not call FFI during validation.
+staticPluginCatalog :: [StaticPluginInfo]
+staticPluginCatalog =
+  [ StaticPluginInfo
+      { spiRef            = identityPlugin
+      , spiPluginId       = 0
+      , spiAudioInputs    = 2
+      , spiAudioOutputs   = 1
+      , spiLatencySamples = 0
+      , spiEffects        = [Pure]
+      , spiLabel          = "identity"
+      }
+  ]
+
+-- | Look up compiler-visible metadata for a static plugin.
+staticPluginInfo :: PluginRef -> Maybe StaticPluginInfo
+staticPluginInfo ref =
+  case [ info | info <- staticPluginCatalog, spiRef info == ref ] of
+    [info] -> Just info
+    _      -> Nothing
+
+-- | Frozen integer plugin id shipped to the runtime.
 staticPluginId :: PluginRef -> Maybe Int
-staticPluginId = \case
-  PluginRef "identity" -> Just 0
-  _                    -> Nothing
+staticPluginId = fmap spiPluginId . staticPluginInfo
 
 
 {- Note [Num/Fractional Connection]
@@ -1344,7 +1383,8 @@ ugenView = \case
   StaticPlugin ref in0 in1 ->
     UGenView KStaticPlugin
              [in0, in1]
-             [ maybe (-1.0) fromIntegral (staticPluginId ref)
+             [ maybe (-1.0) (fromIntegral . spiPluginId)
+                     (staticPluginInfo ref)
              ]
 
 
@@ -1454,7 +1494,8 @@ inferEff (RecordBufMono buf _ _)    = [BufWrite (bufferId buf)]
 -- spectrum-stream kind that needs a real Eff axis is forced to add
 -- its own row rather than silently falling through.
 inferEff (SpectralFreeze _ _)       = [Pure]
-inferEff (StaticPlugin _ _ _)       = [Pure]
+inferEff (StaticPlugin ref _ _)     =
+  maybe [Pure] spiEffects (staticPluginInfo ref)
 inferEff _                          = [Pure]
 
 

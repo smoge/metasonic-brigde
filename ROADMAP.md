@@ -1539,8 +1539,15 @@ Three shapes were considered:
   `NodeKind`.
 
 The decision-note deliverable is done; the immediate follow-up is the
-small Haskell catalog scaffold for the existing `identity` row. Until
-a real second plugin (probably a small stateful one such as a one-tap
+small Haskell catalog scaffold for the existing `identity` row.
+
+Follow-up scaffold: `MetaSonic.Bridge.Source` now exposes
+`StaticPluginInfo`, `staticPluginCatalog`, and `staticPluginInfo`.
+The lone `identity` row carries plugin id 0, arity 2 -> 1, zero
+declared latency, and `[Pure]` effects; `staticPluginId`, validation,
+`ugenView`, and `inferEff` route through that table.
+
+Until a real second plugin (probably a small stateful one such as a one-tap
 delay) demands it, broader plugin-host work stays parked. Out-of-scope
 for 6.E.3 specifically: LV2 / VST3 / CLAP adapter kinds, dynamic
 loading / plugin discovery, plugin-owned UI, MIDI-in plugins, and any

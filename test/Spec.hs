@@ -185,6 +185,24 @@ staticPluginSkeletonTests =
             ]
       pluginEffs @?= [Pure]
 
+  , testCase "Haskell plugin metadata catalog exposes Identity row" $ do
+      staticPluginCatalog @?=
+        [ StaticPluginInfo
+            { spiRef            = identityPlugin
+            , spiPluginId       = 0
+            , spiAudioInputs    = 2
+            , spiAudioOutputs   = 1
+            , spiLatencySamples = 0
+            , spiEffects        = [Pure]
+            , spiLabel          = "identity"
+            }
+        ]
+      staticPluginInfo identityPlugin
+        @?= listToMaybe staticPluginCatalog
+      staticPluginId identityPlugin @?= Just 0
+      staticPluginInfo (PluginRef "missing") @?= Nothing
+      staticPluginId (PluginRef "missing") @?= Nothing
+
   , testCase "kindSpec / portInfo / kindLatency agree on fixed Identity shape" $ do
       ksTag          (kindSpec KStaticPlugin) @?= 23
       ksRate         (kindSpec KStaticPlugin) @?= SampleRate
@@ -204,11 +222,15 @@ staticPluginSkeletonTests =
             filter ((== "identity") . pluginEntryName) entries
       case identityRows of
         [row] -> do
-          pluginEntryId row @?= 0
-          pluginEntryAudioInputs row @?= 2
-          pluginEntryAudioOutputs row @?= 1
-          pluginEntryLatencySamples row @?= 0
-          pluginEntryStateBytes row @?= 0
+          case staticPluginInfo identityPlugin of
+            Just meta -> do
+              pluginEntryId row @?= spiPluginId meta
+              pluginEntryAudioInputs row @?= spiAudioInputs meta
+              pluginEntryAudioOutputs row @?= spiAudioOutputs meta
+              pluginEntryLatencySamples row @?= spiLatencySamples meta
+              pluginEntryStateBytes row @?= 0
+            Nothing ->
+              assertFailure "missing Haskell identity plugin metadata row"
         _ ->
           assertFailure $
             "expected exactly one identity plugin row, got: "
