@@ -16,6 +16,7 @@ import           Data.Either               (partitionEithers)
 import           Data.List                 (intercalate, isPrefixOf, nub, sort,
                                              sortOn)
 import qualified Data.Map.Strict           as M
+import           Foreign.C.Types           (CInt)
 import           System.Exit               (die)
 
 import           MetaSonic.App.Demos
@@ -25,7 +26,8 @@ import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Types            (NodeIndex (..), NodeKind (..),
                                              PortConsumptionRate (..),
-                                             PortIndex (..), Rate (..))
+                                             PortIndex (..), Rate (..),
+                                             kindTag)
 
 printFusionSummary :: String -> RuntimeGraph -> IO ()
 printFusionSummary label rg = do
@@ -648,7 +650,20 @@ surveyEnsembleCorpusScheduleRows =
 surveyShapeProbes :: [(String, SynthGraph)]
 surveyShapeProbes =
   -- ── shape/: kernel-shape probes (single chains) ───────────────
-  [ ( "shape/sin-gain-out"
+  [ ( "shape/spectral-freeze-tail"
+    , runSynth $ do
+        -- §6.D follow-up: surface KSpectralFreeze in the
+        -- fusion-survey corpus so the declared-latency view
+        -- has something to render. Same passthrough wiring
+        -- the slice-1 / slice-2 tests use — a sine into
+        -- the spectral kind, freeze flag held at 0, output
+        -- to bus 0. The latency footprint reports
+        -- KSpectralFreeze @ 1024 samples; no skew (only
+        -- one dynamic input).
+        s <- sinOsc 220.0 0.0
+        f <- spectralFreeze s (Param 0.0)
+        out 0 f )                            -- §6.D latency footprint
+  , ( "shape/sin-gain-out"
     , runSynth $ do
         s <- sinOsc 220.0 0.0
         a <- gain s 0.4
@@ -1436,6 +1451,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printEdgeRateDistribution allRows
   putStrLn ""
+  printDeclaredLatency allRows
+  putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
   case allErrs of
@@ -2036,6 +2053,91 @@ renderEdgeRateRow (sr, pp, b) =
   , show (length (erbProducerKinds b))
   , maybe "" id (erbExample b)
   ]
+
+-- | §6.D descriptive latency surface. Aggregates the per-row
+-- 'srDeclaredLatency' / 'srLatencySkews' captured by
+-- 'compileForSurvey' into a single corpus-wide view.
+--
+-- Two sub-tables: which 'NodeKind's contribute inherent
+-- pipeline latency (and how many node instances of each), and
+-- which nodes combine inputs that arrive at different
+-- cumulative latencies (uncompensated skew — the diagnostic
+-- that would justify a future compensation pass).
+--
+-- '--corpus-survey' already renders this view per-row in
+-- 'MetaSonic.App.CorpusSurvey.printLatencyFootprint';
+-- '--fusion-survey' aggregates across the surveyed corpus so
+-- the headline number matches the rest of the §6.D follow-up
+-- decision evidence.
+printDeclaredLatency :: [SurveyRow] -> IO ()
+printDeclaredLatency rows = do
+  putStrLn "─── Declared-latency footprint (§6.D, kindLatency-bearing nodes) ───"
+  let entries =
+        [ (srDemo r, srTemplate r, d)
+        | r <- rows
+        , d <- srDeclaredLatency r
+        ]
+      -- 'NodeKind' has no 'Ord' instance, so we key the
+      -- aggregation by 'kindTag' (a 'CInt') and carry the
+      -- original kind in the value tuple for display.
+      perKind :: M.Map CInt (NodeKind, Int, Int, String, Maybe String)
+      perKind = M.fromListWith mergeKindEntry
+        [ ( kindTag (dnlKind d)
+          , (dnlKind d, dnlLatency d, 1, demo, tmpl)
+          )
+        | (demo, tmpl, d) <- entries
+        ]
+      mergeKindEntry (k, lat, c1, demo1, tmpl1) (_, _, c2, _, _) =
+        (k, lat, c1 + c2, demo1, tmpl1)
+      skews = [ s | r <- rows, s <- srLatencySkews r ]
+  if null entries
+    then putStrLn "  (no nodes declare inherent latency in the surveyed graphs)"
+    else do
+      putStrLn $ formatLatencyRow
+        [ "kind", "latency-samples", "nodes", "example"
+        ]
+      let perKindRows =
+            [ formatLatencyRow
+                [ show k
+                , show lat
+                , show count
+                , demo <> maybe "" ("/" <>) tmpl
+                ]
+            | (_tag, (k, lat, count, demo, tmpl))
+                <- M.toAscList perKind
+            ]
+      mapM_ putStrLn perKindRows
+      let totalNodes = sum [c | (_, _, c, _, _) <- M.elems perKind]
+          totalKinds = M.size perKind
+      putStrLn ""
+      putStrLn $ "  totals: nodes=" <> show totalNodes
+              <> "  kinds=" <> show totalKinds
+      putStrLn $ "  uncompensated skew: "
+              <> show (length skews) <> " node(s)"
+      if null skews
+        then putStrLn
+          "  (compensation parked per the §6.D follow-up decision)"
+        else mapM_
+          (\s -> putStrLn $ "    "
+                         <> show (lsKind s)
+                         <> "@" <> showNodeIndex (lsNode s)
+                         <> " min=" <> show (lsMinLatency s)
+                         <> " max=" <> show (lsMaxLatency s))
+          skews
+
+latencyColumnWidths :: [Int]
+latencyColumnWidths = [16, 15, 6, 32]
+
+formatLatencyRow :: [String] -> String
+formatLatencyRow cols =
+  intercalate "  " (zipWith pad latencyColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+showNodeIndex :: NodeIndex -> String
+showNodeIndex (NodeIndex i) = show i
 
 edgeRateColumnWidths :: [Int]
 edgeRateColumnWidths = [13, 19, 6, 15, 32]

@@ -1437,7 +1437,12 @@ Open follow-up queue:
    compensation stays parked because the real corpus reports declared
    latency but no uncompensated skew; see
    [Phase 6.D latency follow-up decision](notes/2026-05-11-phase-6d-latency-followup-decision.md).
-5. Keep block-rate promotion, spectrum-stream types, multichannel
+5. [x] Surface the declared-latency footprint in `--fusion-survey`
+   output (parity with `--corpus-survey`'s per-row view), plus a
+   `shape/spectral-freeze-tail` shape probe so the corpus-wide
+   aggregate has a non-empty number to report. Mirrors the
+   `--fusion-survey` `printEdgeRateDistribution` section.
+6. Keep block-rate promotion, spectrum-stream types, multichannel
    STFT, variable N / hop, and plugin hosting parked until the
    smaller spectral and latency slices make their requirements
    concrete.
