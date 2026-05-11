@@ -708,6 +708,25 @@ long long rt_graph_test_buffer_write_count(const RTGraph *g);
 // yet, or if g is null.
 long long rt_graph_test_buffer_invalid_write_count(const RTGraph *g);
 
+// [T:read-only] Phase §6.D slice 2 test surface: number of
+// analysis FFT calls performed by KSpectralFreeze kernels
+// since g was created. Each tick corresponds to exactly one
+// FFT pass at an analysis-hop boundary; counter-confirmed
+// tests can derive expected counts from
+// floor((samples_in_so_far) / hop). Returns 0 if no
+// spectral kernel has run, or if g is null.
+long long rt_graph_test_spectral_analysis_count(const RTGraph *g);
+
+// [T:read-only] Phase §6.D slice 2 test surface: number of
+// resynthesis IFFT calls performed by KSpectralFreeze
+// kernels since g was created. Mirrors the analysis
+// counter: one tick per IFFT call. In pass-through mode the
+// analysis and resynthesis counts advance in lockstep; in
+// freeze mode (slice 3) the analysis counter stops while
+// the resynthesis counter keeps ticking. Returns 0 if no
+// spectral kernel has run, or if g is null.
+long long rt_graph_test_spectral_resynthesis_count(const RTGraph *g);
+
 // [T:read-only] Pure introspection: returns 1 if node_kind names a kind
 // this runtime knows how to construct (i.e. it has a case in
 // rt_graph_add_node), 0 otherwise. Intended for contract tests that

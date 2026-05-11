@@ -73,6 +73,7 @@ import           MetaSonic.Bridge.Compile.Dependencies
                    ( regionDependencies
                    , regionHasLiveBus
                    , regionHasBufferWriter
+                   , regionHasSpectral
                    )
 import           MetaSonic.Bridge.Compile.Types
                    ( BusFootprint (..)
@@ -144,12 +145,21 @@ segmentByBarrier rg = go [] (rgRuntimeRegions rg)
     go acc []     = flushAcc acc
     go acc (r:rs)
         -- §4.E.1c live-bus barrier OR §6.C.4 follow-up
-        -- conservative buffer-writer barrier. A region with a
+        -- conservative buffer-writer barrier OR §6.D slice 2
+        -- conservative spectral barrier. A region with a
         -- KRecordBufMono kernel never lands in a parallel band
         -- because the writer's samples.data() mutation could
-        -- race a concurrent reader's load on the same slot.
-        -- See 'regionHasBufferWriter' for the rationale.
-      | regionHasLiveBus rg r || regionHasBufferWriter rg r =
+        -- race a concurrent reader's load on the same slot. A
+        -- region with a KSpectralFreeze kernel never lands in
+        -- a parallel band either: STFT kernels do bursty FFT
+        -- work at hop boundaries (zero, one, or two transforms
+        -- per block depending on alignment) which is the
+        -- wrong shape for the §4.E equal-work assumption. See
+        -- 'regionHasBufferWriter' / 'regionHasSpectral' for
+        -- the rationale.
+      | regionHasLiveBus       rg r
+     || regionHasBufferWriter  rg r
+     || regionHasSpectral      rg r =
           flushAcc acc ++ Barrier r : go [] rs
       | otherwise             =
           go (r : acc) rs

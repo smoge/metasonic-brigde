@@ -11,6 +11,7 @@
 
 #include "rt_graph.h"
 
+#include <q/fft/fft.hpp>
 #include <q/fx/biquad.hpp>
 #include <q/fx/delay.hpp>
 #include <q/fx/lowpass.hpp>
@@ -2571,6 +2572,16 @@ struct RTGraph {
   long long buffer_write_count = 0;
   long long buffer_invalid_write_count = 0;
 
+  // Phase §6.D slice 2: spectral STFT counters. Mirror the
+  // buffer counters' contract: long long, handle-lifetime
+  // (rt_graph_clear does not reset them), audio-thread
+  // exclusive writers. Each is incremented by exactly one
+  // per FFT / IFFT call from process_spectral_freeze, so
+  // counter-confirmed tests can assert "this many analysis
+  // hops fired" without reading every output sample.
+  long long spectral_analysis_count = 0;
+  long long spectral_resynthesis_count = 0;
+
   // Phase §6.C.3b slice 2: monotonic block counter the audio
   // thread ticks at the top of every process_graph call.
   // rt_graph_buffer_retire snapshots this value at retire time;
@@ -4940,26 +4951,99 @@ static void process_record_buf_mono(
   g.buffer_invalid_write_count += invalid_samples;
 }
 
-// §6.D slice 1: spectral freeze kernel skeleton.
+// §6.D slice 2 spectral freeze kernel: real overlap-add STFT
+// in pass-through mode.
 //
-// This is the minimal body that lets process_instance dispatch
-// through SpectralFreeze without crashing. The kind is loaded,
-// instances spawn, audio renders — but no analysis or
-// resynthesis happens, and the output is silence on every
-// sample. The real STFT body lands in slice 2; freeze gating
-// lands in slice 3.
+// Pipeline per sample (fi = 0..nframes-1):
 //
-// Why ship the stub now rather than leaving the dispatch arm
-// unhandled: the §6.C.4-follow-up precedent (commit 39539bb)
-// established that a kind's Haskell surface should land
-// together with a C++ skeleton that keeps every existing
-// test green. Slice-1 tests assert the Haskell-side
-// kindSpec / portInfo / kindLatency / inferEff shape; a
-// missing C++ dispatch arm would either crash via the
-// default assert(false) or skip the kernel through an
-// unhandled-case warning. The stub closes that loop.
+//   1. Write signal_in[fi] into input_ring[input_write_head]
+//      and advance input_write_head modulo N.
+//   2. Read output_ring[output_read_head] into output[fi] and
+//      zero the slot we just consumed (overlap-add adds future
+//      contributions into the same slot, so leaving residual
+//      data would re-emit it).
+//   3. Increment samples_in / samples_out. If samples_in is a
+//      multiple of hop AND samples_in >= N (we have a full
+//      analysis frame), run one analysis-hop pass: copy the
+//      input ring through the Hann window into spectrum_work,
+//      FFT in place, then IFFT (slice 2 is pass-through —
+//      slice 3 will wire in freeze gating between FFT and
+//      IFFT). Window-multiply the IFFT output and add into
+//      output_ring at output_write_head ahead of
+//      output_read_head by N - hop samples.
+//
+// Steady-state latency: N samples. Pre-roll (samples_out < N)
+// is silent by construction because output_ring is zero-
+// initialized and no IFFT contributions have been added yet.
+//
+// Counters: each analysis-hop pass increments
+// spectral_analysis_count and spectral_resynthesis_count by
+// exactly one. Slice 3's freeze gate suspends only the
+// analysis half, so the two counters separate in freeze mode.
+//
+// WOLA normalization (Q-3 in the design note): q::fft is
+// unnormalized forward / 1/N inverse. With a Hann window and
+// 75% overlap (hop = N/4), the standard COLA sum-of-squared-
+// windows per output sample is N/8 / (2/3)^-1... in practice
+// the unity-pass-through gain is `1 / windowSumOfSquares *
+// hop`. We precompute it once at construction.
+namespace {
+
+constexpr int kSpectralFreezeN   = SpectralFreezeState::kN;
+constexpr int kSpectralFreezeHop = SpectralFreezeState::kHop;
+
+// Hann window of length N, computed once at static-init time.
+// Value at index i is 0.5 * (1 - cos(2π i / (N - 1))).
+struct HannWindow {
+  std::array<float, kSpectralFreezeN> data{};
+  double sum_of_squares = 0.0;
+
+  HannWindow() {
+    constexpr double pi = 3.14159265358979323846;
+    for (int i = 0; i < kSpectralFreezeN; ++i) {
+      const double w =
+          0.5 * (1.0 - std::cos(2.0 * pi * i / (kSpectralFreezeN - 1)));
+      data[static_cast<std::size_t>(i)] = static_cast<float>(w);
+      sum_of_squares += w * w;
+    }
+  }
+};
+
+const HannWindow &hann_window() {
+  static const HannWindow w;
+  return w;
+}
+
+// WOLA normalization scale: with Hann applied on both analysis
+// and resynthesis sides and hop = N/4 (75% overlap), the
+// steady-state per-output-sample gain through the FFT/IFFT
+// roundtrip is sum_k w²[n - k*hop] — the per-sample sum of
+// windowed-squared contributions across all overlapping
+// windows. For Hann with hop = N/4 that sum is exactly
+// sum_of_squares / (N / hop) = sum_of_squares * hop / N
+// = 4 * (3/8) = 3/2, independent of n. (The cosine terms in
+// the Hann² expansion cancel across the 4 evenly-spaced
+// shifts at hop = N/4.)
+//
+// To recover unity pass-through gain we therefore divide by
+// that sum, which is mathematically:
+//
+//   scale = N / (sum_of_squares * (N / hop))
+//         = hop / sum_of_squares
+//
+// For Hann length N=1024: sum_of_squares ≈ 3N/8 = 384, hop =
+// 256 → scale ≈ 2/3 ≈ 0.667. Verified empirically: a 440 Hz
+// sine fed through pass-through reaches unity peak in steady
+// state with this scale.
+double spectral_resynthesis_scale() {
+  const HannWindow &w = hann_window();
+  return static_cast<double>(kSpectralFreezeHop) / w.sum_of_squares;
+}
+
+} // namespace
+
 static void process_spectral_freeze(
-    [[maybe_unused]] RTGraph &g,
+    RTGraph &g,
     GraphInstance &inst,
     std::size_t node_idx,
     int nframes) noexcept {
@@ -4968,12 +5052,111 @@ static void process_spectral_freeze(
 
   auto *st = std::get_if<SpectralFreezeState>(&node.state);
   assert(st && "SpectralFreeze node has non-SpectralFreeze state");
-  (void)st;
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
 
-  // Slice-1 stub: silence on the audio output, no counter
-  // ticks, no state mutation. Slice-2 replaces this body with
-  // the real overlap-add STFT.
-  std::fill(out.begin(), out.end(), 0.0f);
+  const auto sig_in =
+      resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const double sig_default = node.controls[0];
+
+  constexpr int kN   = kSpectralFreezeN;
+  constexpr int kHop = kSpectralFreezeHop;
+  const HannWindow &win = hann_window();
+  const float scale = static_cast<float>(spectral_resynthesis_scale());
+
+  long long analysis_ticks = 0;
+  long long resynth_ticks  = 0;
+
+  for (int fi = 0; fi < nframes; ++fi) {
+    const float in_sample =
+        sig_in.empty() ? static_cast<float>(sig_default)
+                       : sig_in[fi];
+
+    // 1. Write into input ring.
+    st->input_ring[static_cast<std::size_t>(st->input_write_head)] =
+        in_sample;
+    st->input_write_head = (st->input_write_head + 1) % kN;
+
+    // 2. Read from output ring, then zero the slot (so the
+    //    next IFFT pass that lands here starts from 0).
+    const int read_idx = st->output_read_head;
+    out[static_cast<std::size_t>(fi)] =
+        st->output_ring[static_cast<std::size_t>(read_idx)];
+    st->output_ring[static_cast<std::size_t>(read_idx)] = 0.0f;
+    st->output_read_head = (st->output_read_head + 1) % kN;
+
+    // 3. Tick sample counters and decide whether this is an
+    //    analysis hop boundary.
+    ++st->samples_in;
+    ++st->samples_out;
+
+    const bool hop_boundary = (st->samples_in % kHop) == 0
+                            && st->samples_in >= kN;
+    if (!hop_boundary) continue;
+
+    // ---- Analysis-hop pass ----
+    //
+    // Read N samples ending at input_write_head (the most
+    // recent N samples), window them, FFT, IFFT, window
+    // again, scale, and add into output_ring starting
+    // N - hop samples ahead of output_read_head so the new
+    // contribution overlaps the existing ring content.
+
+    // The analysis frame starts at (input_write_head - N + N) % N = input_write_head.
+    // q::fft is in-place on interleaved real/imag; build the
+    // complex input from the windowed real frame.
+    {
+      auto &spec = st->spectrum_work;
+      const int start = st->input_write_head;  // read starts here, wraps around
+      for (int i = 0; i < kN; ++i) {
+        const int src_idx = (start + i) % kN;
+        const float sample =
+            st->input_ring[static_cast<std::size_t>(src_idx)];
+        const float w =
+            win.data[static_cast<std::size_t>(i)];
+        spec[static_cast<std::size_t>(2 * i)]     = sample * w;
+        spec[static_cast<std::size_t>(2 * i + 1)] = 0.0f;
+      }
+      cycfi::q::fft<static_cast<std::size_t>(kN)>(spec.data());
+      ++analysis_ticks;
+
+      // Slice 2: pass-through. Slice 3 will branch here on
+      // the freeze gate. The frozen_spectrum array exists
+      // and is value-initialized; populating it is slice 3's
+      // job.
+
+      cycfi::q::ifft<static_cast<std::size_t>(kN)>(spec.data());
+      ++resynth_ticks;
+
+      // Overlap-add into output_ring starting at the current
+      // output_read_head. The synthesis frame's relative
+      // offset 0 lands at the next output sample to be
+      // emitted, so input sample at offset j of the analysis
+      // window becomes output sample (analysis_time + j),
+      // i.e. exactly N samples after it was input. With
+      // 75% overlap the same input sample is reconstructed
+      // by 4 overlapping windows, all of which target the
+      // same output position thanks to the matched
+      // window/hop arithmetic — that's the COLA invariant.
+      // Steady-state latency: N samples, matching the
+      // kindLatency declaration on the Haskell side.
+      const int add_start = st->output_read_head;
+      for (int i = 0; i < kN; ++i) {
+        const int dst = (add_start + i) % kN;
+        const float w =
+            win.data[static_cast<std::size_t>(i)];
+        const float reconstructed =
+            spec[static_cast<std::size_t>(2 * i)];  // real part
+        st->output_ring[static_cast<std::size_t>(dst)] +=
+            reconstructed * w * scale;
+      }
+    }
+  }
+
+  g.spectral_analysis_count    += analysis_ticks;
+  g.spectral_resynthesis_count += resynth_ticks;
 }
 
 /* Note [Execution order]
@@ -9357,6 +9540,19 @@ long long rt_graph_test_buffer_write_count(const RTGraph *g) {
 long long rt_graph_test_buffer_invalid_write_count(const RTGraph *g) {
   if (g == nullptr) return 0;
   return g->buffer_invalid_write_count;
+}
+
+// §6.D slice 2: spectral analysis / resynthesis counters
+// for counter-confirmed validation. Each ticks by exactly
+// one per FFT / IFFT call.
+long long rt_graph_test_spectral_analysis_count(const RTGraph *g) {
+  if (g == nullptr) return 0;
+  return g->spectral_analysis_count;
+}
+
+long long rt_graph_test_spectral_resynthesis_count(const RTGraph *g) {
+  if (g == nullptr) return 0;
+  return g->spectral_resynthesis_count;
 }
 
 // Set one control slot on instance 0. Mutates the *instance*, not

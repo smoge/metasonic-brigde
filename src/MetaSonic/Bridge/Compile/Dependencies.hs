@@ -46,6 +46,8 @@ module MetaSonic.Bridge.Compile.Dependencies
     -- * §6.C.4 follow-up writer barrier
   , isBufferWriterKind
   , regionHasBufferWriter
+  , isSpectralKind
+  , regionHasSpectral
   ) where
 
 import qualified Data.Map.Strict as M
@@ -481,3 +483,37 @@ regionHasBufferWriter rg r =
 isBufferWriterKind :: NodeKind -> Bool
 isBufferWriterKind KRecordBufMono = True
 isBufferWriterKind _              = False
+
+-- | §6.D slice 2: whether a 'NodeKind' is a spectral processor.
+-- Spectral kernels do bursty FFT / IFFT work at hop boundaries
+-- (zero, one, or two transforms per block depending on hop
+-- alignment with the host block boundary), which is not a fit
+-- for the per-sample equal-work assumptions of the §4.E
+-- parallel-band dispatch path. The conservative policy: any
+-- region containing a spectral kind is a Barrier, exactly the
+-- same shape as 'regionHasBufferWriter'.
+--
+-- Today only 'KSpectralFreeze' qualifies; future spectral
+-- kinds get added here.
+isSpectralKind :: NodeKind -> Bool
+isSpectralKind KSpectralFreeze = True
+isSpectralKind _               = False
+
+-- | §6.D slice 2: whether a region contains any spectral
+-- processor kernel. Same shape as 'regionHasBufferWriter' /
+-- 'regionHasLiveBus' — consults 'rnKind', not the footprint,
+-- because spectral kinds carry no resource footprint anyway
+-- (their windowing state is per-instance, see §3 of the 6.D
+-- design note).
+--
+-- Used by 'Bridge.Compile.Schedule.regionsToSegments' to
+-- classify regions: any region the predicate matches becomes
+-- a 'Barrier', preventing the spectral kernel from running in
+-- a parallel band.
+regionHasSpectral :: RuntimeGraph -> RuntimeRegion -> Bool
+regionHasSpectral rg r =
+  let nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
+      memberIsSpectral ix = case M.lookup ix nodeMap of
+        Just n  -> isSpectralKind (rnKind n)
+        Nothing -> False
+  in any memberIsSpectral (rrNodes r)

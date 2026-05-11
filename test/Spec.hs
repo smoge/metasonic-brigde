@@ -37,7 +37,8 @@ import           Data.Maybe                (isJust, isNothing, listToMaybe,
                                             mapMaybe)
 import           Data.Ord                  (comparing)
 import           Data.Word                 (Word8)
-import           Foreign.C.Types           (CDouble (..), CFloat (..), CInt)
+import           Foreign.C.Types           (CDouble (..), CFloat (..),
+                                            CInt, CLLong)
 import           Foreign.Marshal.Alloc     (allocaBytes)
 import           Foreign.Marshal.Array     (peekArray)
 import           Foreign.Ptr               (Ptr, castPtr)
@@ -89,6 +90,8 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_test_buffer_invalid_read_count,
                                             c_rt_graph_test_buffer_write_count,
                                             c_rt_graph_test_buffer_invalid_write_count,
+                                            c_rt_graph_test_spectral_analysis_count,
+                                            c_rt_graph_test_spectral_resynthesis_count,
                                             instanceStatusLive,
                                             instanceStatusReleasing,
                                             collectRetiredSwapStats,
@@ -11304,11 +11307,10 @@ spectralFreezeSkeletonTests =
       length (uvControls view) @?= 2
 
   , testCase "spectralFreeze graph compiles and renders without crashing" $ do
-      -- Stub kernel emits silence; the test pins only that
-      -- the kind is wired end-to-end (loader, dispatch,
-      -- output port) and a process_graph call returns
-      -- normally. Bus output magnitude is not asserted — that
-      -- belongs to slice 2.
+      -- Stub-era smoke test, retained for the slice-1
+      -- invariant: the kind loads, dispatches, and a
+      -- process_graph call returns normally. Slice 2 adds
+      -- the kernel-correctness assertions below.
       let nframes = 64
           graph = runSynth $ do
             src    <- sinOsc 440.0 0.0
@@ -11322,4 +11324,215 @@ spectralFreezeSkeletonTests =
       withRTGraph totalNodes nframes $ \rt -> do
         loadTemplateGraph rt tg
         c_rt_graph_process rt (fromIntegral nframes)
+
+  -- ----------------------------------------------------------
+  -- §6.D slice 2: real STFT pass-through, counters, Barrier
+  --
+  -- All tests below run with N=1024 / hop=256 — the constants
+  -- baked into 'SpectralFreezeState'. If those constants change
+  -- the test expectations have to follow.
+  -- ----------------------------------------------------------
+
+  , testCase "pre-roll is silent below numerical noise" $ do
+      -- Frames 0..N-1 of the output are zero by construction:
+      -- no analysis hops have fired yet (the first hop boundary
+      -- is at samples_in == N), so the output ring is the
+      -- value-initialized zero buffer.
+      let nframes = 1024  -- exactly N
+          graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+              peak = maximum (map abs rcvs)
+          assertBool
+            ("pre-roll must be silent (peak < 1e-3); got "
+             <> show peak)
+            (peak < 1.0e-3)
+
+  , testCase "counter math: analysis and resynthesis tick on every hop in pass-through" $ do
+      -- Render exactly 4N frames. After 4*1024 samples_in
+      -- counter, the analysis condition (samples_in % hop == 0
+      -- AND samples_in >= N) fires at samples_in =
+      -- N, N+hop, N+2*hop, ..., 4N. That gives floor((4N - N)
+      -- / hop) + 1 = floor(3*1024 / 256) + 1 = 13 hops. Both
+      -- counters tick once per hop in pass-through.
+      let n       = 1024 :: Int
+          hop     = 256  :: Int
+          totalF  = 4 * n
+          nframes = totalF
+          graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        analysis  <- c_rt_graph_test_spectral_analysis_count    rt
+        resynth   <- c_rt_graph_test_spectral_resynthesis_count rt
+        let expected = fromIntegral
+              ((totalF - n) `div` hop + 1) :: CLLong
+        analysis @?= expected
+        resynth  @?= expected
+
+  , testCase "warmed-up impulse emerges N samples after injection" $ do
+      -- Feed 2N silent frames, then an impulse at frame 2N,
+      -- through spectralFreeze in pass-through mode. The
+      -- impulse must emerge ~N samples after injection — at
+      -- the response peak — proving the declared kindLatency
+      -- of 1024. Frame-0 injection is *not* used: with causal
+      -- startup the first analysis window's edge is at frame
+      -- 0 where the Hann weight is zero and no overlapping
+      -- pre-roll contributes, so an impulse there would be
+      -- attenuated by alignment rather than latency
+      -- (§2.3 of the 6.D design note).
+      --
+      -- Drive the input from playBufMono reading a 4N-frame
+      -- buffer with a single non-zero sample at frame 2N. The
+      -- buffer is the only way the DSL can express a
+      -- one-shot time-positioned signal without adding new
+      -- generators.
+      let n        = 1024 :: Int
+          totalF   = 4 * n
+          impulseF = 2 * n         -- inject at frame 2N
+          nframes  = totalF
+          graph = runSynth $ do
+            sig    <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 0)
+            frozen <- spectralFreeze sig (Param 0.0)
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt totalF
+        bufferId buf @?= 0
+        -- Build the impulse: silence everywhere, 1.0 at
+        -- frame 2N.
+        let impulseFrames =
+              [ if i == impulseF then 1.0 else 0.0
+              | i <- [0 .. totalF - 1]
+              ]
+        loadBuffer rt buf impulseFrames
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+              -- Locate the global peak position in the
+              -- output. With N-sample steady-state latency,
+              -- the impulse's energy is spread by Hann
+              -- windowing but peaks ~N samples after
+              -- injection.
+              indexed = zip [0 :: Int ..] (map abs rcvs)
+              (peakIdx, peakAmp) =
+                foldr (\p@(_, a) q@(_, b) -> if a > b then p else q)
+                      (0, 0) indexed
+              expectedPeak = impulseF + n
+              tolerance    = 16 :: Int  -- a single hop
+          assertBool
+            ("output must have non-trivial energy; peak amp = "
+             <> show peakAmp)
+            (peakAmp > 1.0e-3)
+          assertBool
+            ("impulse peak must land near frame " <> show expectedPeak
+             <> " (= injection " <> show impulseF
+             <> " + latency " <> show n <> "); observed peak at frame "
+             <> show peakIdx)
+            (abs (peakIdx - expectedPeak) <= tolerance)
+
+  , testCase "pass-through reconstructs a 440 Hz sine in steady state" $ do
+      -- Render 4N frames of a 440 Hz sine, skip the first 2N
+      -- (pre-roll + warmup), and assert the steady-state peak
+      -- amplitude is within 5% of 1.0. WOLA normalization
+      -- targets unity gain; the 5% tolerance covers the
+      -- Hann-window contribution sum that doesn't quite
+      -- reach exact COLA at hop = N/4 (the analytic value
+      -- for the chosen overlap is ~1.5 / 1.5 = 1.0, and
+      -- numerical rounding in the FFT roundtrip plus the
+      -- N-truncated window cosine series adds <1% in
+      -- practice).
+      let n       = 1024 :: Int
+          totalF  = 4 * n
+          nframes = totalF
+          graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs       = map (\(CFloat x) -> x) rendered
+              steady     = drop (2 * n) rcvs
+              steadyPeak = maximum (map abs steady)
+          assertBool
+            ("steady-state pass-through must reach unity (±5%); "
+             <> "peak = " <> show steadyPeak)
+            (steadyPeak > 0.95 && steadyPeak < 1.05)
+
+  , testCase "spectral region is a scheduler Barrier" $ do
+      -- regionHasSpectral makes any region containing a
+      -- KSpectralFreeze node a Barrier. The spectral kernel
+      -- never runs in a FreeSegment.
+      let graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+      rg <- case lowerGraph graph >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+      let segments = segmentByBarrier rg
+          regionHasFreezeKind r =
+            any (\nodeIx -> case [ rnKind n
+                                 | n <- rgNodes rg
+                                 , rnIndex n == nodeIx ] of
+                              [KSpectralFreeze] -> True
+                              _                 -> False)
+                (rrNodes r)
+          freezeInBarrier = any
+            (\seg -> case seg of
+                Barrier r     -> regionHasFreezeKind r
+                FreeSegment _ -> False)
+            segments
+          freezeInFree = any
+            (\seg -> case seg of
+                FreeSegment rs -> any regionHasFreezeKind rs
+                Barrier _      -> False)
+            segments
+      assertBool
+        ("spectral region must appear in a Barrier; segments = "
+         <> show (length segments))
+        freezeInBarrier
+      assertBool
+        "spectral region must never appear inside a FreeSegment"
+        (not freezeInFree)
   ]
