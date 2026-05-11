@@ -147,7 +147,8 @@ module MetaSonic.Bridge.FFI
 import           Control.Concurrent        (threadDelay)
 import           Control.Exception          (bracket)
 import qualified Control.Monad              as M (void)
-import           Control.Monad              (forM_, when)
+import           Control.Monad              (forM_, unless, when)
+import qualified Data.Set                  as S
 import           Foreign
 import           Foreign.C.String          (CString, withCAStringLen)
 import           Foreign.C.Types
@@ -168,7 +169,10 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              scheduledRuntimeRegions)
 import           MetaSonic.Bridge.Source    (MigrationKey (..),
                                              migrationKeyUtf8Bytes)
-import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..))
+import           MetaSonic.Bridge.Templates (BufferFootprint (..),
+                                             ResourceFootprint (..),
+                                             Template (..),
+                                             TemplateGraph (..))
 import           MetaSonic.Types
 
 
@@ -480,6 +484,21 @@ setTemplateIdentityBytes g cTid name (Just bytes) =
       fail $
         "rt_graph_template_set_identity rejected "
         <> show name <> " for template " <> show cTid
+
+-- | §6.C.5: buffer-writer templates must be monophonic. The §6.C.4
+-- check already rejects two templates writing the same buffer, but
+-- the runtime polyphony cap (default 8) would otherwise let a single
+-- writer template spawn N live instances, all frozen to the same
+-- buffer id at instance reset. Slot order would then decide the
+-- per-block winner — exactly the implicit observable ordering §6.C.4
+-- declined to pin. Clamping cap=1 closes that gap; lifting it is a
+-- §6.C.5+ feature gated on a real mixdown/ordering primitive.
+--
+-- Non-writer templates are left at their default cap.
+clampWriterPolyphony :: Ptr RTGraph -> CInt -> Template -> IO ()
+clampWriterPolyphony g cTid tpl =
+  unless (S.null (bfBufWrites (rfBuffers (tplFootprint tpl)))) $
+    c_rt_graph_template_set_polyphony g cTid 1
 
 foreign import ccall unsafe "rt_graph_connect"
   c_rt_graph_connect :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
@@ -1726,6 +1745,11 @@ loadTemplateGraph g tg = do
     -- token so swap prepare can reject reorders that would migrate
     -- live state across semantically-different templates.
     setTemplateIdentityBytes g cTid (tplName tpl) identityBytes
+    -- §6.C.5: clamp polyphony to 1 for buffer-writer templates so the
+    -- §6.C.4 cross-template uniqueness check is not bypassed at
+    -- runtime by spawning a second live instance of the same writer
+    -- against the same frozen buffer id.
+    clampWriterPolyphony g cTid tpl
     populateTemplate cTid (tplGraph tpl) scheduled steps
     -- Spawn one instance per template so the typical single-voice
     -- ensemble case works without explicit instance spawning. For
@@ -1839,6 +1863,8 @@ loadTemplateGraphFused g tg = do
     -- fused and unfused multi-template paths reject reorders the
     -- same way.
     setTemplateIdentityBytes g cTid (tplName tpl) identityBytes
+    -- §6.C.5: same writer-monophonic clamp as the non-fused loader.
+    clampWriterPolyphony g cTid tpl
     populateTemplate cTid (tplGraph tpl) scheduled steps
     M.void $ c_rt_graph_template_instance_add g cTid
   where

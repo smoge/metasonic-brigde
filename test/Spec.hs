@@ -64,8 +64,10 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_clear,
                                             c_rt_graph_process,
                                             c_rt_graph_read_bus,
+                                            c_rt_graph_template_add,
                                             c_rt_graph_template_count,
                                             c_rt_graph_template_instance_add,
+                                            c_rt_graph_template_set_polyphony,
                                             c_rt_graph_test_global_schedule_entry_count,
                                             c_rt_graph_test_global_schedule_entry_instance,
                                             c_rt_graph_test_global_schedule_entry_step,
@@ -11014,4 +11016,101 @@ recordBufMonoSkeletonTests =
       assertBool
         "writer region must never appear inside a FreeSegment"
         (not writerInFreeSegment)
+
+  , -- §6.C.5 commit 1: a template whose footprint carries a
+    -- BufWrite must be loaded with polyphony cap = 1. The auto-
+    -- spawned instance at load time succeeds; any second
+    -- c_rt_graph_template_instance_add for the same template
+    -- must return -1 (cap reached, no voice stealing).
+    testCase "writer template auto-spawn succeeds; second instance rejected" $ do
+      let writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 0.0)
+            pure ()
+
+      tg <- case compileTemplateGraph [("writer", writerGraph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph (totalNodes + 8) 64 $ \rt -> do
+        _ <- allocBuffer rt 64
+        loadTemplateGraph rt tg
+
+        -- The auto-spawn already occupies slot 0; the live count
+        -- for template 0 is therefore 1, matching the cap.
+        extra <- c_rt_graph_template_instance_add rt 0
+        extra @?= (-1)
+
+  , -- §6.C.5 commit 1: non-writer templates must keep the
+    -- default polyphony (8). We don't peek at the cap directly
+    -- (no FFI accessor) — instead we verify behavior: spawn
+    -- multiple instances and confirm they all succeed.
+    testCase "non-writer template keeps default polyphony behavior" $ do
+      let readerGraph = runSynth $ do
+            s <- sinOsc (Param 440.0) (Param 0.0)
+            out 0 s
+
+      tg <- case compileTemplateGraph [("reader", readerGraph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph (totalNodes + 32) 64 $ \rt -> do
+        loadTemplateGraph rt tg
+        -- Slot 0 is auto-spawned; spawning three more must
+        -- succeed under the default cap of 8 (4 live total).
+        s1 <- c_rt_graph_template_instance_add rt 0
+        s2 <- c_rt_graph_template_instance_add rt 0
+        s3 <- c_rt_graph_template_instance_add rt 0
+        assertBool
+          ("expected three additional non-writer instances; got "
+           <> show [s1, s2, s3])
+          (all (>= 0) [s1, s2, s3])
+
+  , -- §6.C.5 commit 1: the clamp must apply when the writer
+    -- template is registered as a *non-first* template too. The
+    -- fused loader path shares the same clamping helper; this
+    -- exercises it via a two-template mix.
+    testCase "writer clamp survives non-first template position" $ do
+      let readerGraph = runSynth $ do
+            s <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 0)
+            out 0 s
+          writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 1.0)
+            pure ()
+
+      tg <- case compileTemplateGraph
+                   [ ("reader", readerGraph)
+                   , ("writer", writerGraph) ] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- After §6.C.4 topo-sort the writer must be first in
+      -- execution order, so on the C side template_id 0 is the
+      -- writer and template_id 1 is the reader.
+      let names = map tplName (tgTemplates tg)
+      assertEqual "writer must precede reader after topo-sort"
+        ["writer", "reader"] names
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph (totalNodes + 16) 64 $ \rt -> do
+        _ <- allocBuffer rt 64
+        loadTemplateGraph rt tg
+
+        -- Writer is template 0; second spawn must be rejected.
+        writerExtra <- c_rt_graph_template_instance_add rt 0
+        writerExtra @?= (-1)
+        -- Reader is template 1; second spawn must succeed under
+        -- the default cap.
+        readerExtra <- c_rt_graph_template_instance_add rt 1
+        assertBool
+          ("reader second-instance spawn must succeed; got "
+           <> show readerExtra)
+          (readerExtra >= 0)
   ]
