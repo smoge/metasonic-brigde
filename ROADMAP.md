@@ -1616,6 +1616,159 @@ Until this gate exists, generated fusion remains opt-in.
 
 ---
 
+## Phase 8 — Authoring DSL and Composition Layer
+
+Phase 8 is the user-facing counterpart to the compiler/runtime work in
+Phases 4-7. The low-level source DSL is already expressive enough to
+build real graphs, but authors still work directly with mono
+`Connection`s, explicit repeated branches, explicit output channels,
+manual bus numbers, and hand-assembled template lists. Phase 8 should
+turn those primitives into a higher-level composition surface without
+creating a second compiler.
+
+The boundary is strict:
+
+- Phase 8 elaborates down to ordinary `SynthGraph` and
+  `TemplateGraph` values.
+- `Source`, `Templates`, `Validate`, `IR`, and `Compile` remain the
+  semantic authority.
+- All resource ordering, latency metadata, fusion decisions, state
+  migration, and runtime loading still flow through the existing
+  compiler pipeline.
+- The layer is authoring ergonomics plus structured expansion, not new
+  runtime behavior.
+
+This phase should be evaluated by whether it makes practical patches
+shorter, safer, and easier to inspect while keeping the generated graph
+fully transparent to the existing tools.
+
+Design note:
+- [Phase 8 authoring DSL design](notes/2026-05-11-phase-8-authoring-dsl-design.md)
+  — records the elaboration-only contract, first signal collection
+  types, multichannel expansion rules, routing/ensemble/control
+  follow-ups, lowering transparency requirements, and first
+  implementation series.
+
+### Phase 8.A — Authoring DSL Contract
+
+The contract note is the first artifact. It should decide:
+
+- which concepts belong in the high-level authoring layer;
+- what lowers to one primitive graph vs. multiple templates;
+- how generated node names, migration keys, controls, buffers, and
+  buses stay stable and inspectable;
+- what the layer deliberately does not own.
+
+Non-goals for the first pass:
+
+- a new parser or external language;
+- a replacement for `SynthM`;
+- type-level modeling of every rate/effect rule;
+- bypassing validation or template scheduling;
+- hidden runtime allocation.
+
+### Phase 8.B — Signal Collection Types
+
+Introduce lightweight wrappers over existing `Connection`s:
+
+```haskell
+newtype Mono = Mono Connection
+data Stereo = Stereo Connection Connection
+newtype Channels = Channels [Connection]
+```
+
+The first helper surface should be boring and explicit:
+
+- `mono`;
+- `stereo`;
+- `channels`;
+- `duplicate`;
+- `mapChannels`;
+- `zipChannelsWith`;
+- `mix`;
+- `sumChannels`.
+
+This gives the project multichannel authoring without changing the
+runtime audio buffer model.
+
+### Phase 8.C — Lifted UGen Combinators and Multichannel Expansion
+
+Add lifted versions of common primitives that expand channel-wise:
+
+- gain over mono/stereo/channel sets;
+- filter over mono/stereo/channel sets;
+- add/mix over compatible channel shapes;
+- `outStereo` / `outChannels`;
+- deterministic expansion tests that pin the generated primitive graph.
+
+The first implementation should cover only the common musical surface:
+gain, add, LPF/HPF/BPF/Notch, delay where safe, and output routing.
+More exotic nodes can wait until the shape is needed.
+
+### Phase 8.D — Mixing, Panning, and Routing Helpers
+
+Add authoring-level operations that remove routine boilerplate:
+
+- `pan2`;
+- `balance`;
+- `mixN`;
+- `spread`;
+- `send`;
+- `returnBus`;
+- `stereoOut`.
+
+The important design point is bus visibility. Helpers may allocate or
+thread bus identifiers, but the lowered graph must still expose the
+actual bus reads/writes so `BusFootprint`, template ordering, survey
+tools, and inspectors remain truthful.
+
+### Phase 8.E — Template and Ensemble Builders
+
+Provide a higher-level way to describe multi-template systems:
+
+```haskell
+ensemble $ do
+  voice "bass" ...
+  voice "pad" ...
+  fx "return" ...
+```
+
+This should lower to the existing `compileTemplateGraph` input shape,
+not replace it. The value of the layer is stable naming, less manual
+bus plumbing, and clearer intent around voice templates, shared FX,
+and return chains.
+
+### Phase 8.F — Named Controls and External Mapping
+
+Promote named controls as authoring objects rather than incidental
+nodes:
+
+- named MIDI CC controls;
+- named OSC-addressable controls;
+- range/default metadata;
+- optional smoothing policy;
+- stable post-compile lookup for runtime control binding.
+
+The existing `cc` builder and OSC control surface stay underneath.
+Phase 8 should make the control vocabulary easier to write and easier
+to inspect.
+
+### Phase 8.G — Lowering Tests, Demos, and Inspector Hooks
+
+Every high-level combinator should have tests that prove what
+primitive graph it emits. The first demo rewrite should be small but
+real: for example, a stereo detuned patch or a send/return ensemble
+that becomes substantially clearer with the new layer.
+
+Inspector and survey output should eventually be able to show both:
+
+- the authoring-level construct;
+- the generated primitive nodes/templates/buses.
+
+This prevents the authoring DSL from becoming opaque.
+
+---
+
 ## Design Principles
 
 1. **Haskell compiles, C++ executes.** All graph semantics, rate
