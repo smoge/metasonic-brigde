@@ -1266,7 +1266,41 @@ ordering machinery picks it up automatically.
 
 558 tests total (9 new since 6.C.3b).
 
-Note: [Phase 6.C.4 resource-ordering design](notes/2026-05-11-phase-6c4-resource-ordering-design.md).
+Notes:
+- [Phase 6.C.4 resource-ordering design](notes/2026-05-11-phase-6c4-resource-ordering-design.md)
+- [Minimal RecordBufMono contract](notes/2026-05-11-record-buf-mono-design.md) — design for the first audio-thread writer (next implementation series).
+
+#### 6.C.4 follow-up — minimal `RecordBufMono` (next task)
+
+First audio-thread writer kind. The 6.C.4 precedence union and
+the slice 4 same-buffer-writers diagnostic land it as a
+mechanical addition: `inferEff (RecordBufMono buf _ _) =
+[BufWrite (bufferId buf)]` and the ordering machinery picks it
+up. The work is in the kernel and the runtime's audio-thread
+write path, not the compiler.
+
+Three-commit series:
+
+1. Haskell surface: `KRecordBufMono` (tag 21), `kindSpec` /
+   `ugenView` / `inferEff` / `dependencies` / `portInfo` rows,
+   `recordBufMono` builder. Extend `Bridge.Validate.busEdges`
+   to pair `BufWrite` / `BufRead` at the intra-graph scope.
+   `runtimeNodeResourceFootprint` learns the writer case.
+2. C++ runtime: `process_record_buf_mono` kernel (sample-by-
+   sample write through `samples.data()`, acquire-load
+   `slot.state`, one-shot vs. loop branch at the end-of-buffer
+   boundary, ticks `buffer_write_count` /
+   `buffer_invalid_write_count`). `RecordBufMonoState` carries
+   the frozen `buffer_id` + write head. Conservative band
+   serialization: a region with a writer never lands in a
+   parallel band.
+3. End-to-end tests: record-then-playback, retire-during-write,
+   loop wrap, one-shot boundary, live-set_control regression,
+   cross-template same-buffer rejection.
+
+Out of scope: random-access `BufWr`, multichannel, file I/O,
+`start_frame` / `record_run` / `loop_count` controls. The
+design note (linked above) records the Q-1..Q-5 deferrals.
 
 ### Phase 6.D — Spectral Processing
 
