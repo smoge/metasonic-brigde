@@ -1429,15 +1429,22 @@ Landed initial kind:
 
 Open follow-up queue:
 
-1. Add a corpus / survey row that exercises `KSpectralFreeze`.
-2. Add a descriptive latency-footprint view over compiled graphs.
-3. Use that view to report uncompensated parallel-path latency skew.
-4. Decide from corpus evidence whether the next runtime slice is
-   latency compensation or a second spectral kind.
+1. [x] Add a corpus / survey row that exercises `KSpectralFreeze`.
+2. [x] Add a descriptive latency-footprint view over compiled graphs.
+3. [x] Use that view to report uncompensated parallel-path latency skew.
+4. [x] Decide from corpus evidence whether the next runtime slice is
+   latency compensation or a second spectral kind. Decision:
+   compensation stays parked because the real corpus reports declared
+   latency but no uncompensated skew; see
+   [Phase 6.D latency follow-up decision](notes/2026-05-11-phase-6d-latency-followup-decision.md).
 5. Keep block-rate promotion, spectrum-stream types, multichannel
    STFT, variable N / hop, and plugin hosting parked until the
    smaller spectral and latency slices make their requirements
    concrete.
+
+Next 6.D implementation direction: write a small contract note for a
+second fixed-size spectral kind (likely a frequency-domain filter
+variant such as `KSpectralLpf`) before adding runtime code.
 
 ### Phase 6.E — Plugin Hosting
 
