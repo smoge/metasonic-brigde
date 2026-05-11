@@ -10698,4 +10698,320 @@ recordBufMonoSkeletonTests =
             ("monitor output must equal signal_in (0.25); got "
              <> show (take 4 rcvs))
             (all (\x -> abs (x - 0.25) < 1.0e-5) rcvs)
+
+  , -- §6.C.4 follow-up: record-then-playback, single block,
+    -- two templates referencing the same buffer. The §6.C.4
+    -- precedence union puts the writer template before the
+    -- reader, so within one process_graph call the writer
+    -- fills the buffer and the reader reads what was just
+    -- written. Counter-confirmed both sides.
+    testCase "record-then-playback within one block" $ do
+      let nframes = 32
+          sizeOfF :: Int
+          sizeOfF = 4
+          writerGraph = runSynth $ do
+            -- recordBufMono is a sink-like writer with a
+            -- pass-through output we ignore here.
+            _ <- recordBufMono (Buffer 0) (Param 0.375) (Param 0.0)
+            pure ()
+          readerGraph = runSynth $ do
+            s <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 0)
+            out 0 s
+
+      tg <- case compileTemplateGraph
+                   [ ("writer", writerGraph)
+                   , ("reader", readerGraph) ] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- §6.C.4 precedence union: writer must precede reader.
+      let names = map tplName (tgTemplates tg)
+      assertEqual "writer must precede reader after topo-sort"
+        ["writer", "reader"] names
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt nframes
+        bufferId buf @?= 0
+        loadBuffer rt buf (replicate nframes 0.0)
+
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+
+        writeCount <- c_rt_graph_test_buffer_write_count        rt
+        readCount  <- c_rt_graph_test_buffer_read_count         rt
+        invalidW   <- c_rt_graph_test_buffer_invalid_write_count rt
+        invalidR   <- c_rt_graph_test_buffer_invalid_read_count  rt
+        writeCount @?= fromIntegral nframes
+        readCount  @?= fromIntegral nframes
+        invalidW   @?= 0
+        invalidR   @?= 0
+
+        allocaBytes (nframes * sizeOfF) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+          assertBool
+            ("reader must read back the recorded 0.375 from "
+             <> "buffer 0 (pre-load was zeros); got "
+             <> show (take 4 rcvs))
+            (all (\x -> abs (x - 0.375) < 1.0e-5) rcvs)
+
+  , -- §6.C.4 follow-up: retire-during-write. Render block 1
+    -- (writer ticks valid count), retire the buffer, render
+    -- block 2 (writer ticks invalid count, storage untouched),
+    -- collect and re-alloc, render block 3 (valid count
+    -- resumes). Mirrors the §6.C.3b retire-during-read test
+    -- exactly.
+    testCase "retire-during-write takes the invalid path; collect re-arms" $ do
+      let nframes = 32
+          -- Loop so the write head wraps within a block and the
+          -- re-allocated slot is immediately writable again. A
+          -- one-shot writer's head would be parked at the end of
+          -- the buffer after block 1, and the kernel state
+          -- survives retire / collect / re-alloc (we don't
+          -- migrate writer state — Note [Per-node RecordBufMono
+          -- state]). Looping avoids that interaction here and
+          -- keeps the test scoped to the retire semantics.
+          writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 1.0)
+            pure ()
+
+      tg <- case compileTemplateGraph [("writer", writerGraph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt nframes
+        loadBuffer rt buf (replicate nframes 0.0)
+        loadTemplateGraph rt tg
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        w1 <- c_rt_graph_test_buffer_write_count          rt
+        i1 <- c_rt_graph_test_buffer_invalid_write_count  rt
+        w1 @?= fromIntegral nframes
+        i1 @?= 0
+
+        retireBuffer rt buf
+        c_rt_graph_process rt (fromIntegral nframes)
+        w2 <- c_rt_graph_test_buffer_write_count          rt
+        i2 <- c_rt_graph_test_buffer_invalid_write_count  rt
+        -- Block 2 took the invalid path on every sample; the
+        -- write counter must not have moved.
+        w2 @?= w1
+        i2 @?= fromIntegral nframes
+
+        collectRetiredBuffer rt buf
+        buf' <- allocBuffer rt nframes
+        bufferId buf' @?= 0
+        loadBuffer rt buf' (replicate nframes 0.0)
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        w3 <- c_rt_graph_test_buffer_write_count          rt
+        i3 <- c_rt_graph_test_buffer_invalid_write_count  rt
+        -- After collect + re-alloc, the writer resumes valid
+        -- writes (the kernel instance's write_head is whatever
+        -- block 2 left it at — block 2 did not advance it).
+        -- valid-count picks up by nframes; invalid unchanged.
+        w3 @?= w2 + fromIntegral nframes
+        i3 @?= i2
+
+  , -- §6.C.4 follow-up: loop wrap. 4-frame buffer rendered for
+    -- 12 samples with loop_flag=1; the kernel must wrap the
+    -- write head and every sample is a valid write. Counter-
+    -- confirmed.
+    testCase "loop_flag=1 wraps the write head past the end" $ do
+      let nframes = 12
+          bufFrames = 4
+          writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 1.0)
+            pure ()
+
+      tg <- case compileTemplateGraph [("writer", writerGraph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt bufFrames
+        loadBuffer rt buf (replicate bufFrames 0.0)
+        loadTemplateGraph rt tg
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        w <- c_rt_graph_test_buffer_write_count          rt
+        i <- c_rt_graph_test_buffer_invalid_write_count  rt
+        w @?= fromIntegral nframes
+        i @?= 0
+
+  , -- §6.C.4 follow-up: one-shot end. Same 4-frame buffer,
+    -- 12 samples, loop_flag=0. After frame 3 the head is past
+    -- the end and every subsequent sample takes the invalid
+    -- path. Counter-confirmed: bufFrames valid writes, the
+    -- remainder invalid.
+    testCase "loop_flag=0 stops writing past the buffer end" $ do
+      let nframes = 12
+          bufFrames = 4
+          writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 0.0)
+            pure ()
+
+      tg <- case compileTemplateGraph [("writer", writerGraph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt bufFrames
+        loadBuffer rt buf (replicate bufFrames 0.0)
+        loadTemplateGraph rt tg
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        w <- c_rt_graph_test_buffer_write_count          rt
+        i <- c_rt_graph_test_buffer_invalid_write_count  rt
+        w @?= fromIntegral bufFrames
+        i @?= fromIntegral (nframes - bufFrames)
+
+  , -- §6.C.4 follow-up: live set_control on slot 0 does NOT
+    -- retarget the writer. Mirrors the §6.C.2 frozen-
+    -- buffer-id regression test on the read side.
+    testCase "live set_control on slot 0 does not retarget the writer" $ do
+      let nframes = 16
+          writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 0.0)
+            pure ()
+
+      tg <- case compileTemplateGraph [("writer", writerGraph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+          recIx =
+            case [ rnIndex n
+                 | tpl <- tgTemplates tg
+                 , n   <- rgNodes (tplGraph tpl)
+                 , rnKind n == KRecordBufMono
+                 ] of
+              [NodeIndex i] -> i
+              other         -> error $
+                "expected one RecordBufMono node, got " <> show other
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf0 <- allocBuffer rt nframes
+        buf1 <- allocBuffer rt nframes
+        bufferId buf0 @?= 0
+        bufferId buf1 @?= 1
+        loadBuffer rt buf0 (replicate nframes 0.0)
+        loadBuffer rt buf1 (replicate nframes 0.0)
+        loadTemplateGraph rt tg
+
+        -- Block 1: writer targets buffer 0 (the frozen id at
+        -- instance reset).
+        c_rt_graph_process rt (fromIntegral nframes)
+        w1 <- c_rt_graph_test_buffer_write_count rt
+        w1 @?= fromIntegral nframes
+
+        -- Live-write controls[0] = 1.0 on the writer. A kernel
+        -- that re-reads controls[0] per block would silently
+        -- start writing buffer 1 from here onward. The §6.C.2
+        -- contract pins the kernel to st->buffer_id, which is
+        -- frozen at 0.
+        c_rt_graph_instance_set_control rt 0
+          (fromIntegral recIx) 0 (CDouble 1.0)
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        w2 <- c_rt_graph_test_buffer_write_count rt
+        i2 <- c_rt_graph_test_buffer_invalid_write_count rt
+        -- Either (a) the writer kept writing buffer 0 — head
+        -- continued past the end and stopped (loop_flag=0), so
+        -- the second block's writes are all invalid; or (b) a
+        -- regression would point the writer at buffer 1 which
+        -- still has frames available, racking up nframes valid
+        -- writes. The first nframes valid writes of block 1
+        -- exactly filled buffer 0, so block 2 must be all
+        -- invalid.
+        w2 @?= w1
+        i2 @?= fromIntegral nframes
+
+  , -- §6.C.4 follow-up: same-buffer write from two templates is
+    -- rejected at compileTemplateGraph time. This is the §6.C.4
+    -- slice-4 diagnostic, now exercised end-to-end via the
+    -- DSL builder (the existing slice-4 test used hand-built
+    -- ResourceFootprints).
+    testCase "same-buffer recordBufMono across templates is rejected" $ do
+      let g1 = runSynth $ do
+            _ <- recordBufMono (Buffer 3) (Param 0.25) (Param 0.0)
+            pure ()
+          g2 = runSynth $ do
+            _ <- recordBufMono (Buffer 3) (Param 0.75) (Param 0.0)
+            pure ()
+      case compileTemplateGraph [("first", g1), ("second", g2)] of
+        Right _ -> assertFailure
+          "expected same-buffer BufWrite to be rejected end-to-end"
+        Left err -> do
+          assertBool
+            ("diagnostic must mention 'buffer 3'; got: " <> err)
+            ("buffer 3" `isInfixOf` err)
+          assertBool
+            ("diagnostic must mention 'first'; got: " <> err)
+            ("first"  `isInfixOf` err)
+          assertBool
+            ("diagnostic must mention 'second'; got: " <> err)
+            ("second" `isInfixOf` err)
+
+  , -- §6.C.4 follow-up: scheduler barrier. A region with a
+    -- writer must appear as a Barrier in segmentByBarrier's
+    -- output, never inside a FreeSegment. Conservative
+    -- serialization keeps the writer kernel from running in
+    -- parallel with anything else.
+    testCase "writer region is a scheduler Barrier, not a FreeSegment" $ do
+      let writerGraph = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 0.0)
+            pure ()
+      rg <- case lowerGraph writerGraph >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+
+      let segments = segmentByBarrier rg
+          writerInBarrier = any
+            (\seg -> case seg of
+                Barrier r ->
+                  any (\nodeIx -> case [ rnKind n
+                                       | n <- rgNodes rg
+                                       , rnIndex n == nodeIx ] of
+                                    [KRecordBufMono] -> True
+                                    _                -> False)
+                      (rrNodes r)
+                FreeSegment _ -> False)
+            segments
+          writerInFreeSegment = any
+            (\seg -> case seg of
+                FreeSegment rs ->
+                  any (\r -> any (\nodeIx ->
+                                     case [ rnKind n
+                                          | n <- rgNodes rg
+                                          , rnIndex n == nodeIx ] of
+                                       [KRecordBufMono] -> True
+                                       _                -> False)
+                                 (rrNodes r))
+                      rs
+                Barrier _ -> False)
+            segments
+      assertBool
+        ("writer region must appear in a Barrier; segments = "
+         <> show (length segments))
+        writerInBarrier
+      assertBool
+        "writer region must never appear inside a FreeSegment"
+        (not writerInFreeSegment)
   ]
