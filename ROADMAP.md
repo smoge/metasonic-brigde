@@ -1460,6 +1460,24 @@ guarantees — only become concrete once 6.A–6.D have stressed them.
 Coupling to 6.C is real (sample-buffer access) and may force 6.C and
 6.E to be co-designed even if 6.E lands later.
 
+Design note (no runtime code yet):
+- [Phase 6.E plugin-hosting design](notes/2026-05-11-phase-6e-plugin-hosting-design.md)
+  — bounds the first kind (`KStaticPlugin`, tag 23; build-time
+  registry, no LV2/VST/CLAP, no dynamic loading), pins plugin
+  state ownership on the existing `NodeState` variant, declares
+  block-rate parameter updates via the existing realtime control
+  queue, and inherits §6.C.5 / §6.D / `ResourceFootprint`
+  contracts unchanged for `[Pure]` plugins. Latency surfaces
+  through the existing §6.D footprint; effects-declaring plugins
+  re-use the §6.C.4 / §6.C.5 buffer-writer rules. Slicing: plugin
+  registry + skeleton → `Identity` reference plugin → latency +
+  effects hook. Six Q-deferrals (max-state size, hot-swap
+  migration, error-as-scheduler-signal, audio-rate parameter
+  modulation, cross-template ordering, name stability).
+
+State snapshot at the 6.A–6.D boundary:
+- [Phase 6.A–6.D state snapshot](notes/2026-05-11-state-snapshot-phase-6-complete.md).
+
 ---
 
 ## Design Principles
