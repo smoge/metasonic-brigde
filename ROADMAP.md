@@ -1094,7 +1094,7 @@ implementation. Couples to Phase 6.E (most plugin formats want
 sample-buffer access), so 6.E may force a 6.C revision rather than
 only consume it as-is.
 
-#### 6.C.1 Design note (current task)
+#### [x] 6.C.1 Design note
 
 Bounds 6.C before any contract or code. v1 surface is a
 producer-allocated `Buffer` resource with an integer ID
@@ -1110,6 +1110,26 @@ buffers is a 6.C.4 concern, gated on a real `BufWrite` UGen.
 retire/free).
 
 Note: [Phase 6.C buffer I/O design](notes/2026-05-10-phase-6c-buffer-io-design.md).
+
+#### 6.C.2 Contract (current task)
+
+Pins the v1 surface 6.C.3a implements. Haskell:
+`MetaSonic.Bridge.Buffer` exposes a `Buffer` newtype handle,
+`allocBuffer` / `loadBuffer` / `clearBuffer` (producer-side
+`IO` against an `RTGraph`), and a `BufferIssue` ADT. Source
+DSL adds `PlayBufMono` (`UGen`) and `playBufMono` (builder),
+with a `KPlayBufMono` `NodeKind` (tag 20, `KindSpec 20
+SampleRate 3 4 "playBufMono"`), control vector
+`[buffer_id, rate, start_frame, loop_flag]`, and an
+`inferEff (PlayBufMono buf _ _ _) = [BufRead (bufferId buf)]`
+case. C ABI adds `rt_graph_buffer_alloc` /
+`_load_f32` / `_clear` (the last is stopped-audio-only —
+live-safe retire/collect lands in 6.C.3b) plus
+`rt_graph_test_buffer_read_count` /
+`_invalid_read_count` test surfaces. `MAX_BUFFERS = 64`. No
+pattern / OSC coupling in v1.
+
+Note: [Phase 6.C.2 buffer I/O contract](notes/2026-05-10-phase-6c2-buffer-io-contract.md).
 
 ### Phase 6.D — Spectral Processing
 
