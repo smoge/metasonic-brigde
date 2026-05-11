@@ -76,19 +76,19 @@ namespace cycfi::q
          port_midi_init()
          {
             auto err = Pm_Initialize();
-            CYCFI_ASSERT(err == pmNoError, "Error! Failed to initialize PortAudio.");
+            CYCFI_ASSERT(err == pmNoError, "Error! Failed to initialize PortMIDI.");
          }
 
          ~port_midi_init()
          {
             auto err = Pm_Terminate();
-            CYCFI_ASSERT(err == pmNoError, "Error! Failed to terminate PortAudio.");
+            CYCFI_ASSERT(err == pmNoError, "Error! Failed to terminate PortMIDI.");
          }
       };
 
       port_midi_init const& portmidi_init()
       {
-         // This will initialize port audio on first call
+         // This will initialize PortMIDI on first call.
          static detail::port_midi_init init_;
          return init_;
       }

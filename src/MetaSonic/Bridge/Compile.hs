@@ -320,7 +320,8 @@ compileRuntimeGraphUnfused = compileRuntimeGraph
 
 -- | Compile then run the Step-C single-edge fusion rewrite.
 -- Equivalent to @'fuseRuntimeGraph' '<$>' 'compileRuntimeGraph'@.
--- Existing audio loaders use the unfused path; tests and future
--- fused-aware loaders call this entry point explicitly.
+-- The default audio path still uses the unfused compiler; tests,
+-- surveys, and explicit fused loaders call this entry point when they
+-- want the Step-C rewrite.
 compileRuntimeGraphFused :: GraphIR -> Either String RuntimeGraph
 compileRuntimeGraphFused = fmap fuseRuntimeGraph . compileRuntimeGraph

@@ -1178,15 +1178,15 @@ struct GlobalScheduleEntry {
   int work_item_count   = 0;
 };
 
-// Phase §4.E.2.C1d-a: descriptive work item for a single scheduled
+// Phase §4.E.2.C1d: descriptive work item for a single scheduled
 // region inside one GlobalScheduleEntry. C1c dispatches whole entries
-// (one ScheduleStepSpec) to workers; C1d will be able to dispatch
-// individual sink-free regions from a multi-region FreeLayer entry.
+// (one ScheduleStepSpec) to workers; C1d-b/C1d-c consume these items
+// to dispatch individual regions from a multi-region FreeLayer entry.
 //
 // Built once per block from global_schedule and MetaDef::schedule_steps.
-// The executor does not consume this vector in C1d-a; tests inspect it
-// to pin the canonical mapping and writer-slot subranges before C1d-b
-// introduces any region-level worker dispatch.
+// Tests inspect it to pin the canonical mapping and writer-slot
+// subranges; the C1d executor consumes the same slices, either
+// serially or through the worker pool depending on eligibility.
 struct RegionLayerWorkItem {
   int global_entry_index = 0;
   int template_id = 0;
@@ -1907,12 +1907,11 @@ rt_graph_start_audio and not modifying state during the realtime
 bracket. Tests run offline (no audio thread), so the question does
 not arise.
 
-The voice allocator (Phase 3.1) and Q MIDI input (Phase 3.2) will
-break the convention: they need to spawn, release, and set-control
-on instances while audio is live. A.2 introduces the mechanism
-that makes this safe — the realtime-producer entries below mediate
-mutation through an SPSC lock-free command queue drained at the
-top of every process_graph block. Construction-only and control-
+The voice allocator and live-MIDI path intentionally need to spawn,
+release, and set-control on instances while audio is live. A.2 is the
+mechanism that makes this safe: the realtime-producer entries below
+mediate mutation through an SPSC lock-free command queue drained at
+the top of every process_graph block. Construction-only and control-
 thread entries remain audio-stopped-only; the realtime-producer
 entries are the audio-running path.
 
@@ -2126,13 +2125,14 @@ and output_buses_prev corresponds to InFeedback.ar's source.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Storage for the writer-slot-keyed contribution table the design note
 in notes/2026-05-08-deterministic-bus-reduction-design.md (§5)
-specifies. B1 only allocates and sizes the storage; B2 will route
-sink writes into it and add the canonical-order reduction pass.
+specifies. B1 introduced the storage; B2/B3 route sink writes into it
+under reduction-capture mode and fold them back in canonical order.
 
 Three parallel vectors, all indexed by writer slot ws ∈ [0, max_writer_slots):
 
   * samples[ws * max_frames .. ws * max_frames + max_frames)
-      — per-slot frame buffer. Phase B2 fills this from sink kernels.
+      — per-slot frame buffer filled by sink kernels in reduction-
+        capture mode.
   * target[ws]
       — resolved bus index for slot ws; -1 means invalid / unused.
   * used_words[ws / 64] bit (1 << (ws % 64))
@@ -7011,10 +7011,10 @@ static bool free_entry_conflicts_with_band(
   return false;
 }
 
-// Phase §4.E.2.C0d/C1a: build runnable bands over the C0b global
-// schedule. C1a execution walks these bands serially. Phase C can
-// later consume the Free bands as worker dispatch groups and keep
-// Barrier bands on the audio thread.
+// Phase §4.E.2.C0d/C1: build runnable bands over the C0b global
+// schedule. Serial execution walks these bands in order; worker
+// execution can consume eligible Free bands as dispatch groups while
+// Barrier bands remain on the audio thread.
 //
 // The v1 conservative grouping rule is:
 //   * Barrier steps are singleton serial bands.
@@ -10124,8 +10124,8 @@ void rt_graph_instance_set_control(
   // Bus-pool sizing is no longer a side effect of writing this
   // control — see rt_graph_ensure_bus and Note [Explicit bus-pool
   // sizing]. The audio thread still must never grow the pool, so
-  // when this entry becomes realtime-callable in Phase 3 the value
-  // write is the only thing the queue ferries.
+  // the realtime set-control path ferries only the value write;
+  // callers must size buses ahead of time through rt_graph_ensure_bus.
 }
 
 // (rt_graph_instance_read_bus was removed in the post-§2.E ABI

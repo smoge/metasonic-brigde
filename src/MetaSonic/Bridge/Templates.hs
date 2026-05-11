@@ -180,10 +180,9 @@ busFootprint ir = foldr stepNode emptyFootprint (giNodes ir)
 -- *and* buffer fields) from a lowered 'GraphIR'. Reads only
 -- 'irEffects'. The fold is order-independent.
 --
--- In 6.C.4 only the bus half participates in the precedence
--- rule until slice 3 unions in the buffer edges; the buffer
--- half is populated but not consumed yet, which keeps
--- bus-only graphs bit-identical with slice 1 / 2.
+-- Both halves participate in the resource precedence rule. Bus-only
+-- graphs stay bit-identical to the earlier bus-only rule because the
+-- buffer footprint is empty.
 --
 -- See Note [Resource footprints, §6.C.4] in
 -- 'MetaSonic.Bridge.Compile.Types'.
@@ -437,10 +436,9 @@ computePrecedence ts = M.fromList
 -- Delayed reads (bus or buffer) do not contribute — matches the
 -- pre-§6.C.4 rule and the intra-graph E_r convention.
 --
--- Writer kinds for buffers don't exist yet (6.C.4 follow-up
--- adds RecordBufMono), so the buffer half of the disjunction is
--- always False in v1 corpora — which is what keeps bus-only
--- precedence bit-identical with slice 2.
+-- Buffer writers enter through 'RecordBufMono'. Graphs that never
+-- use buffer effects still take the same answer as the pre-§6.C.4
+-- bus-only rule because both buffer intersections are empty.
 templatePrecedes :: ResourceFootprint -> ResourceFootprint -> Bool
 templatePrecedes a b = busEdge || bufEdge
   where

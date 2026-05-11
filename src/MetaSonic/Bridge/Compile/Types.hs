@@ -692,18 +692,16 @@ emptyFootprint = BusFootprint S.empty S.empty S.empty
 It carries the buffer indices a unit of execution writes, reads
 live, and reads delayed — exactly the same shape, indexed on a
 disjoint id space. 'ResourceFootprint' is the pair, the
-superset that template- / region-level precedence will
-consume once a writer UGen exists (6.C.4 design note +
-follow-up RecordBufMono work).
+superset consumed by template- / region-level precedence. The
+same rule applies to both namespaces: live reads depend on earlier
+writes, while delayed reads deliberately do not add ordering
+constraints.
 
-In 6.C.4 slice 1 (this commit) the types are not yet
-consumed by any call site. Slice 2 pivots
-'Template.tplFootprint' and 'RuntimeRegion.rrFootprint' to
-carry 'ResourceFootprint'; slice 3 unions the bus + buffer
-edges in the inter-template precedence derivation. Bus-only
-graphs stay bit-identical because 'emptyBufferFootprint' is
-the BufferFootprint identity under union, and 'rfBuses' is a
-zero-cost projection.
+'Template.tplFootprint' and 'RuntimeRegion.rrFootprint' carry
+'ResourceFootprint'. The inter-template precedence rule unions bus
+and buffer edges, while bus-only graphs stay bit-identical because
+'emptyBufferFootprint' is the BufferFootprint identity under union
+and 'rfBuses' is a zero-cost projection.
 
 Same-buffer 'BufWrite / BufWrite' is rejected at compile time
 in v1 — see the 6.C.4 design note for the rationale and the

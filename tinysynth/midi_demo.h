@@ -3,14 +3,14 @@
 // Description : Live-MIDI demo runner (Phase 3 closing piece)
 // ================================================================
 //
-// Slice 2 of the end-to-end MIDI demo: a small C ABI that opens a
-// MIDI input stream, attaches a VoiceAllocator + MidiVoiceProcessor
-// to a loaded RTGraph, and dispatches incoming events on a producer
-// worker thread until the caller closes the session.
+// C ABI for the live-MIDI path: opens a MIDI input stream, attaches a
+// VoiceAllocator + MidiVoiceProcessor to a loaded RTGraph, and
+// dispatches incoming events on a producer worker thread until the
+// caller closes the session.
 //
 // Design intent: keep the live-MIDI plumbing entirely on the C++
-// side. Haskell compiles the synth structure and (slice 3) drives
-// open/close lifecycle plus binding manifest. Note events themselves
+// side. Haskell compiles the synth structure and drives open/close
+// lifecycle plus binding manifest. Note events themselves
 // never cross the FFI boundary — they go straight from PortMIDI →
 // q::midi_input_stream → MidiVoiceProcessor → realtime ABI.
 //

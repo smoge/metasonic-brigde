@@ -4,7 +4,7 @@
 -- Module      : MetaSonic.Bridge.MidiDemo
 -- Description : Haskell wrapper around tinysynth/midi_demo.h
 --
--- Slice 3 of the end-to-end MIDI demo. The C side
+-- Haskell wrapper for the live-MIDI path. The C side
 -- (@tinysynth/midi_demo.cpp@) owns the worker thread, the live MIDI
 -- input stream, and the producer-thread voice/CC dispatch. This
 -- module exposes its open\/close lifecycle and binding manifest to

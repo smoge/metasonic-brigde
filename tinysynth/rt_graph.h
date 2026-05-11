@@ -940,9 +940,10 @@ int rt_graph_test_global_schedule_entry_step(
 //   0 = Barrier  (one serial GlobalScheduleEntry)
 //   1 = Free     (one or more FreeLayer entries that the conservative
 //                 v1 rule would be allowed to dispatch together)
-// The C1a executor walks these bands serially; Phase C can replace the
-// Free-band loop with worker dispatch. Return -1 on
-// null g or out-of-range band_index for per-band accessors.
+// Serial execution walks these bands in order; worker execution can
+// consume eligible Free bands as dispatch groups while Barrier bands
+// remain on the audio thread. Return -1 on null g or out-of-range
+// band_index for per-band accessors.
 
 int rt_graph_test_global_schedule_band_count(const RTGraph *g);
 int rt_graph_test_global_schedule_band_kind(
