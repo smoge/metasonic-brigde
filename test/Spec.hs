@@ -11327,6 +11327,34 @@ spectralFreezeSkeletonTests =
       kindLatency KPlayBufMono    @?= Nothing
       kindLatency KRecordBufMono  @?= Nothing
 
+  , testCase "latency footprint reports SpectralFreeze and propagates downstream" $ do
+      let graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            shaped <- gain frozen (Param 0.5)
+            out 0 shaped
+      rg <- case lowerGraph graph >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+      let footprint = declaredLatencyFootprint rg
+          lats      = nodeOutputLatencies rg
+          latsFor k =
+            [ lat
+            | n <- rgNodes rg
+            , rnKind n == k
+            , Just lat <- [M.lookup (rnIndex n) lats]
+            ]
+      case footprint of
+        [DeclaredNodeLatency _ KSpectralFreeze 1024] -> pure ()
+        other ->
+          assertFailure $
+            "expected one KSpectralFreeze declared-latency row, got "
+            <> show other
+      latsFor KSpectralFreeze @?= [1024]
+      latsFor KGain           @?= [1024]
+      latsFor KOut            @?= [1024]
+      inputLatencySkews rg    @?= []
+
   , testCase "ugenView arities match kindSpec for SpectralFreeze" $ do
       -- The local check that the global property
       -- 'ugenView arities match kindSpec for every UGen'

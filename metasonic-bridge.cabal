@@ -29,6 +29,7 @@ library
       MetaSonic.Bridge.Compile.Fusion
       MetaSonic.Bridge.Compile.Schedule
       MetaSonic.Bridge.Compile.EdgeRates
+      MetaSonic.Bridge.Compile.Latency
       MetaSonic.Bridge.Templates
       MetaSonic.Bridge.Buffer
       MetaSonic.Bridge.FFI

@@ -92,6 +92,13 @@ module MetaSonic.Bridge.Compile
   , edgeRateBuckets
   , addEdgeRateBuckets
   , sampleRateOpportunityProducers
+  , -- * Declared-latency survey (§6.D)
+    DeclaredNodeLatency (..)
+  , InputLatency (..)
+  , LatencySkew (..)
+  , declaredLatencyFootprint
+  , nodeOutputLatencies
+  , inputLatencySkews
   , -- * Compilation
     compileRuntimeGraph
   , compileRuntimeGraphUnfused
@@ -120,6 +127,7 @@ import           MetaSonic.Bridge.Compile.Dependencies
 import           MetaSonic.Bridge.Compile.Fusion
 import           MetaSonic.Bridge.Compile.Schedule
 import           MetaSonic.Bridge.Compile.EdgeRates
+import           MetaSonic.Bridge.Compile.Latency
 
 -- | Look up the dense 'NodeIndex' that a given symbolic 'NodeID'
 -- compiled to. Returns 'Nothing' if the 'NodeID' isn't present in
