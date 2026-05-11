@@ -1665,17 +1665,47 @@ legality vocabulary the planner and cost lab share.
 Decision note:
 - [Phase 7.B capability metadata decision](notes/2026-05-11-phase-7b-capability-metadata-decision.md).
 
-### Phase 7.C — FusionProgram IR and Survey-Only Planner
+### Phase 7.C — FusionProgram IR and Survey-Only Planner (partial)
 
-Introduce a first-class Haskell representation for generated fused
-programs. The initial planner reads `kindCapabilities` (Phase 7.B) plus
-per-UGen `inferEff` to decide candidate legality, builds and
-pretty-prints candidate programs, then reports why each candidate is
-accepted or rejected.
+First slice landed: a Haskell-only, diagnostic-only planner in
+`MetaSonic.Bridge.Planner`. The planner walks each region, forms
+candidates as contiguous dense-order sub-sequences ending in a
+`CapSinkTerminal`, and emits a 'Verdict' per candidate — `Accepted`
+with optional `fcMatchedShape` against the existing §4.B kernel set,
+or `Rejected` with a node-level 'RejectionReason' (hard barrier,
+latency mid-chain, resource mid-chain, stateful interior off the
+allow-list, fanout escape).
 
-No C++ executor is required in this slice. The important output is
-diagnostic: candidate shape, member nodes, effects, latency footprint,
-estimated benefit, and rejection reason.
+Legality is per-node and position-aware: the source position (head
+of chain) is relaxed for `CapStatefulOp` and `CapResourceAccess` so
+the §4.B kernel set (`RSinGainOut`, `RBusInLpfGainOut`, etc.) maps
+to accepted candidates; true-interior positions stay strict. The
+chain-caps union in `--fusion-survey` is explicitly **not** used as
+the legality model — the decision note has the rule.
+
+Surface:
+
+- `--fusion-survey` gained a "Phase 7.C planner verdicts" section
+  with totals, per-rejection-reason counts (plus one example per
+  reason), and accepted candidates grouped by matched §4.B kernel
+  vs. "no-§4.B-match" (generated-eligible).
+- `--snapshot-check` pins planner total / accepted / rejected
+  counts and per-rejection-reason counts.
+- `test/Spec.hs` covers each rejection rule with a small SynthGraph
+  that should trigger exactly that reason, plus the
+  §4.B-matched-acceptance case.
+
+No `FusionProgram` opcode encoding, no C ABI, no runtime program
+table — those belong to Phase 7.D.
+
+Decision note:
+- [Phase 7.C planner decision](notes/2026-05-11-phase-7c-planner-decision.md).
+
+Open follow-ups inside 7.C: nested-candidate coalescing (a 4-node
+sink-terminal chain produces three nested candidates today),
+optional stateful-interior allow-list expansion gated on cost-lab
+evidence, and `KOut`-as-non-terminal de-prioritization in the
+rejection diagnostic.
 
 ### Phase 7.D — Runtime Program ABI and Tiny Executor
 
