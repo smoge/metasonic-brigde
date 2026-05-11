@@ -1730,6 +1730,10 @@ Design note:
   types, multichannel expansion rules, routing/ensemble/control
   follow-ups, lowering transparency requirements, and first
   implementation series.
+- [Session layer scoping gate](notes/2026-05-11-session-layer-scoping.md)
+  — records the structural pushback: session/authoring is a next
+  product direction, but session runtime implementation waits for a
+  Phase 7 planner/cost-model v1 and gets its own ownership scoping.
 
 ### [x] Phase 8.A — Authoring DSL Contract
 
@@ -1853,6 +1857,20 @@ Inspector and survey output should eventually be able to show both:
 - the generated primitive nodes/templates/buses.
 
 This prevents the authoring DSL from becoming opaque.
+
+### Session-Layer Scoping Gate (not a numbered phase yet)
+
+The session layer is the likely product direction after authoring and
+planner tooling, but it is not a small continuation of Phase 8.D.
+It crosses `RTGraph` ownership, producer fan-in, OSC resolve-state
+updates on hot-swap, MIDI/pattern coexistence, and buffer/plugin
+lifecycle reporting.
+
+Current decision: write and refine the scoping contract now, but do not
+start session runtime code until Phase 7 has capability metadata,
+survey-only planner output, and a first cost-model table. That places
+session implementation after a planner/cost-model v1, but it does not
+require waiting for a generated fusion executor to ship.
 
 ---
 
