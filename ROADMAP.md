@@ -1492,7 +1492,7 @@ Design / implementation note:
   migration, error-as-scheduler-signal, parameter layout /
   modulation, cross-template ordering, and name stability.
 
-### Phase 6.E.3 — Plugin metadata follow-up decision (pending)
+### [x] Phase 6.E.3 — Plugin metadata follow-up decision
 
 Slice 3 is a decision artifact, not new runtime code. With real
 `Identity` dispatch landed, the next plugin kind cannot reuse the
@@ -1503,10 +1503,14 @@ all need to flow into the existing compiler-side machinery —
 template precedence — without breaking the kind-level
 table-shaped sites that adding-a-new-kind currently touches.
 
-The decision is between three shapes; the slice's job is to pick
-one and write the contract note before any second plugin lands:
+Decision note:
+- [Phase 6.E.3 plugin metadata decision](notes/2026-05-11-phase-6e3-plugin-metadata-decision.md)
+  — chooses a Haskell-side per-plugin metadata table while keeping
+  `KStaticPlugin` as the only plugin `NodeKind` for now.
 
-- **Per-plugin metadata table on the Haskell side.** Keep
+Three shapes were considered:
+
+- **Chosen: per-plugin metadata table on the Haskell side.** Keep
   `KStaticPlugin` as the only plugin `NodeKind`; add a
   Haskell-side catalog that pairs each registered `PluginRef`
   with arity / latency / resource declarations and feeds those
@@ -1534,13 +1538,14 @@ one and write the contract note before any second plugin lands:
   re-shapes survey / inspector code that currently keys on
   `NodeKind`.
 
-Slice 3 deliverable is the decision note, not the
-implementation. Until a real second plugin (probably a small
-stateful one such as a one-tap delay) demands it, the question
-stays parked. Out-of-scope for slice 3 specifically: LV2 / VST3
-/ CLAP adapter kinds, dynamic loading / plugin discovery,
-plugin-owned UI, MIDI-in plugins, and any new C ABI surface.
-Those reopen only after the metadata shape is settled.
+The decision-note deliverable is done; the immediate follow-up is the
+small Haskell catalog scaffold for the existing `identity` row. Until
+a real second plugin (probably a small stateful one such as a one-tap
+delay) demands it, broader plugin-host work stays parked. Out-of-scope
+for 6.E.3 specifically: LV2 / VST3 / CLAP adapter kinds, dynamic
+loading / plugin discovery, plugin-owned UI, MIDI-in plugins, and any
+new C ABI surface. Those reopen only after the metadata shape has been
+exercised by a second static plugin.
 
 State snapshot at the 6.A–6.D boundary:
 - [Phase 6.A–6.D state snapshot](notes/2026-05-11-state-snapshot-phase-6-complete.md).
