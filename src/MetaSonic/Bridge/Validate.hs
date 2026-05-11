@@ -19,6 +19,7 @@ module MetaSonic.Bridge.Validate
     validateAndSort
   , -- * Individual passes (useful for testing)
     checkDependencies
+  , checkUniqueBufferWriters
   , topoSort
   , -- * Dependency derivation (useful for testing the scheduler)
     busEdges
@@ -26,6 +27,7 @@ module MetaSonic.Bridge.Validate
   ) where
 
 import           Data.Foldable           (foldlM)
+import           Data.List               (intercalate)
 import qualified Data.Map.Strict         as M
 import qualified Data.Set                as S
 
@@ -371,8 +373,51 @@ topoSort g = do
 validateAndSort :: SynthGraph -> Either String [NodeID]
 validateAndSort g = do
   checkDependencies g
+  checkUniqueBufferWriters g
   checkMigrationKeys g
   topoSort g
+
+-- | §6.C.5 commit 2: reject a 'SynthGraph' that contains two or
+-- more nodes carrying a 'BufWrite' on the same buffer id. The
+-- §6.C.4 cross-template check rejects the inter-template case
+-- with the same rationale: there is no implicit observable
+-- write order in v1, and pretending the input order constitutes
+-- one would invent an ordering primitive in search of a use
+-- case. A future ordering / mixdown surface (§6.C.5+) can lift
+-- this restriction once it pins the order explicitly.
+--
+-- The check fires before topological sort so the diagnostic
+-- reports the offending buffer id (and every node that contests
+-- it) instead of being hidden behind a downstream rate / topology
+-- error. 'BufRead' / 'BufReadDelayed' are unaffected: any number
+-- of readers on a buffer is fine, and a writer + reader on the
+-- same buffer composes (the §6.C.4 E_r edge pins the writer
+-- before the reader).
+checkUniqueBufferWriters :: SynthGraph -> Either String ()
+checkUniqueBufferWriters g =
+  let writers :: M.Map Int [NodeID]
+      writers = M.fromListWith (++)
+        [ (b, [nid])
+        | (nid, ns) <- M.toList (sgNodes g)
+        , BufWrite b <- inferEff (nsUgen ns)
+        ]
+      conflicts =
+        [ (b, reverse nids)
+        | (b, nids) <- M.toAscList writers
+        , length nids > 1
+        ]
+  in case conflicts of
+       [] -> Right ()
+       _  ->
+         Left $
+           "same-buffer BufWrite from multiple nodes in one "
+           <> "SynthGraph is rejected in v1 (§6.C.5): "
+           <> intercalate "; "
+                [ "buffer " <> show b
+                  <> " written by "
+                  <> intercalate ", " (map show nids)
+                | (b, nids) <- conflicts
+                ]
 
 -- | Phase 5.2 migration keys are optional, but when present they must fit
 -- the C ABI's fixed-width byte representation and be unique within this

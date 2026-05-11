@@ -11113,4 +11113,50 @@ recordBufMonoSkeletonTests =
           ("reader second-instance spawn must succeed; got "
            <> show readerExtra)
           (readerExtra >= 0)
+
+  , -- §6.C.5 commit 2: two writer nodes against the same buffer
+    -- in one SynthGraph must be rejected by validation. The
+    -- diagnostic names the offending buffer id so authors can
+    -- locate the conflict instead of chasing a downstream
+    -- topology error.
+    testCase "duplicate same-buffer writers in one graph are rejected" $ do
+      let g = runSynth $ do
+            _ <- recordBufMono (Buffer 2) (Param 0.25) (Param 0.0)
+            _ <- recordBufMono (Buffer 2) (Param 0.75) (Param 0.0)
+            pure ()
+      case lowerGraph g of
+        Right _ -> assertFailure
+          "expected duplicate BufWrite on buffer 2 to be rejected"
+        Left err ->
+          assertBool
+            ("diagnostic must mention 'buffer 2'; got: " <> err)
+            ("buffer 2" `isInfixOf` err)
+
+  , -- §6.C.5 commit 2: writers targeting *different* buffers
+    -- compose freely. The rule is per-buffer, not per-graph.
+    testCase "writers to different buffers in one graph are accepted" $ do
+      let g = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.25) (Param 0.0)
+            _ <- recordBufMono (Buffer 1) (Param 0.75) (Param 0.0)
+            pure ()
+      case lowerGraph g of
+        Right _  -> pure ()
+        Left err -> assertFailure $
+          "writers to different buffers must lower cleanly; got: "
+          <> err
+
+  , -- §6.C.5 commit 2: writer + reader on the same buffer is
+    -- the canonical compose case. The E_r edge pins the
+    -- writer before the reader; nothing about that pattern is
+    -- ambiguous.
+    testCase "writer + reader on same buffer in one graph is accepted" $ do
+      let g = runSynth $ do
+            _ <- recordBufMono (Buffer 0) (Param 0.5) (Param 0.0)
+            s <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 0)
+            out 0 s
+      case lowerGraph g of
+        Right _  -> pure ()
+        Left err -> assertFailure $
+          "writer + reader on same buffer must lower cleanly; got: "
+          <> err
   ]
