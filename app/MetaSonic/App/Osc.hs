@@ -80,10 +80,11 @@ listenDemoGraph = runSynth $ do
 -- built-in demo graph, starts realtime audio, runs the listener
 -- in the background, and blocks on Enter to stop.
 --
--- Bind address is @0.0.0.0@ (any interface). For loopback-only
--- testing, the caller can change 'lcBindHost' through the
--- library API directly — the CLI does not expose it as a flag
--- yet.
+-- Bind address is the library default, @127.0.0.1@ (loopback
+-- only). Exposing the control port on every interface should be
+-- an opt-in flag, not the default; if/when LAN control is
+-- wanted, add a @--osc-bind-host@ flag rather than dropping the
+-- default.
 runOscListen :: Int -> IO ()
 runOscListen port = do
   putStrLn "OSC listener demo."
@@ -112,9 +113,7 @@ runOscListen port = do
         Left  iss -> die $ "OSC listen demo: registerVoice: " <> show iss
     rsRef <- newIORef rs0
 
-    let cfg =
-          (OSC.defaultListenerConfig port)
-            { OSC.lcBindHost = "0.0.0.0" }
+    let cfg = OSC.defaultListenerConfig port
         hooks =
           (OSC.defaultListenerHooks rt)
             { OSC.lhOnIssue = \iss ->

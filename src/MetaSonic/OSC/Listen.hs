@@ -35,11 +35,14 @@ module MetaSonic.OSC.Listen
     -- * Bracketed listener
   , withOscListener
   , withOscListenerHooks
+    -- * CLI helpers
+  , parseListenerPort
   ) where
 
 import           Control.Concurrent             (forkIO, killThread)
 import           Control.DeepSeq                (NFData)
 import           Control.Exception              (IOException, bracket, try)
+import           Data.Char                      (isDigit)
 import           Data.IORef                     (IORef, readIORef)
 import           Foreign.C.Types                (CDouble (..))
 import           Foreign.Ptr                    (Ptr)
@@ -85,6 +88,22 @@ defaultListenerConfig port = ListenerConfig
 newtype ListenerInfo = ListenerInfo
   { liBoundPort :: Int
   } deriving stock (Eq, Show)
+
+-- | Validate a CLI-supplied UDP port. Accepts a non-empty digit
+-- string that fits in 'Int' and falls in @[1, 65535]@. Returns
+-- 'Nothing' for empty input, non-digit characters, overflow, or
+-- out-of-range numbers. Used by the @--osc-listen [PORT]@ option
+-- so a typo (@--osc-listen foo@) or out-of-range number
+-- (@--osc-listen 70000@) errors loudly instead of silently
+-- falling back to the default.
+parseListenerPort :: String -> Maybe Int
+parseListenerPort s
+  | not (null s)
+  , all isDigit s
+  , length s <= 5
+  , let n = read s :: Int
+  , n >= 1 && n <= 65535 = Just n
+  | otherwise = Nothing
 
 ----------------------------------------------------------------------
 -- Issue ADT

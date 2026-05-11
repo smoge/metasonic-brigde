@@ -6,7 +6,7 @@ module Main where
 import           Control.DeepSeq            (force)
 import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
-import           Data.Char                  (isDigit, toLower)
+import           Data.Char                  (toLower)
 import           Data.List                  (find, intercalate)
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
@@ -16,6 +16,7 @@ import           System.Exit                (die)
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
 import           MetaSonic.App.Demos
 import           MetaSonic.App.Osc          (runOscListen)
+import           MetaSonic.OSC.Listen       (parseListenerPort)
 import           MetaSonic.App.Survey       (printFusionSummary,
                                              runFusionSurvey)
 import           MetaSonic.App.SwapBench    (runSwapBench)
@@ -113,9 +114,10 @@ parseArgs = go defaultOptions
       go opts { optMode = SwapBench } xs
     go opts ("--corpus-survey" : xs) =
       go opts { optMode = CorpusSurvey } xs
-    go opts ("--osc-listen" : xs) =
-      let (port, rest) = takeOscPort xs
-      in go opts { optMode = OscListen, optOscPort = port } rest
+    go opts ("--osc-listen" : xs) = case takeOscPort xs of
+      Left err           -> Left err
+      Right (port, rest) ->
+        go opts { optMode = OscListen, optOscPort = port } rest
     go opts (x : xs)
       | "--" `prefixOf` x = Left ("Unknown option: " <> x)
       | otherwise         = go opts { optTargets = optTargets opts <> [x] } xs
@@ -124,15 +126,19 @@ parseArgs = go defaultOptions
     prefixOf p s = take (length p) s == p
 
     -- Consume an optional positional integer port after
-    -- --osc-listen. Falls back to the default in optOscPort if
-    -- the next token does not look like a port number.
-    takeOscPort :: [String] -> (Int, [String])
+    -- --osc-listen. The next token, if present and not a flag,
+    -- MUST be a valid port — silently falling back to the
+    -- default would mask typos like "--osc-listen foo" or
+    -- out-of-range numbers like "--osc-listen 70000".
+    takeOscPort :: [String] -> Either String (Int, [String])
+    takeOscPort [] = Right (optOscPort defaultOptions, [])
     takeOscPort (s : rest)
-      | all isDigit s
-      , not (null s)
-      , let n = read s :: Int
-      , n > 0 && n < 65536 = (n, rest)
-    takeOscPort xs = (optOscPort defaultOptions, xs)
+      | "--" `prefixOf` s = Right (optOscPort defaultOptions, s : rest)
+      | otherwise = case parseListenerPort s of
+          Just n  -> Right (n, rest)
+          Nothing -> Left $
+            "Invalid port for --osc-listen: " <> s
+            <> " (expected integer in [1, 65535])"
 
 resolveTargets :: [String] -> Either String [Demo]
 resolveTargets [] = Right demoTable

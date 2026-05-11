@@ -133,6 +133,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , oscWireAndDispatchTests
   , oscListenerTests
   , oscEndToEndTests
+  , oscPortParserTests
   ]
 
 ------------------------------------------------------------
@@ -9620,23 +9621,18 @@ oscEndToEndTests = testGroup "Phase 6.B.3: OSC end-to-end loopback"
                          >> error "unreachable"
         rsRef <- newIORef rs0
 
-        -- Synchronisation hook. The mock calls the real FFI
-        -- (the same call defaultListenerHooks would make) and
-        -- ALSO signals an MVar so the test knows when to
-        -- render the post-OSC block.
+        -- Synchronisation hook. Wraps the production
+        -- 'defaultListenerHooks' so we exercise the exact FFI
+        -- call the CLI uses, then signals an MVar so the test
+        -- knows when to render the post-OSC block.
         setCtrlDone <- newEmptyMVar
-        let setCtrl slotId (NodeIndex nodeIx) ctrlSlot val = do
-              r <- c_rt_graph_realtime_set_control handle
-                     (fromIntegral slotId)
-                     (fromIntegral nodeIx)
-                     (fromIntegral ctrlSlot)
-                     (CDouble val)
+        let baseHooks = OSC.defaultListenerHooks handle
+            setCtrl slotId nodeIx ctrlSlot val = do
+              ok <- OSC.lhSetControl baseHooks
+                      slotId nodeIx ctrlSlot val
               putMVar setCtrlDone ()
-              pure (r /= 0)
-            hooks = OSC.ListenerHooks
-              { OSC.lhSetControl = setCtrl
-              , OSC.lhOnIssue    = \_ -> pure ()
-              }
+              pure ok
+            hooks = baseHooks { OSC.lhSetControl = setCtrl }
 
         OSC.withOscListenerHooks hooks rsRef
           (OSC.defaultListenerConfig 0) $ \info -> do
@@ -9688,4 +9684,46 @@ oscEndToEndTests = testGroup "Phase 6.B.3: OSC end-to-end loopback"
               ("post-OSC peak (gain=0.1) should be in (0.05, 0.2), got "
                <> show changedPeak)
               (changedPeak > 0.05 && changedPeak < 0.2)
+  ]
+
+------------------------------------------------------------
+-- Phase 6.B.4: --osc-listen port parser regression tests
+--
+-- 'parseListenerPort' is the library-side validator that the
+-- '--osc-listen [PORT]' CLI option uses to reject malformed or
+-- out-of-range tokens. The CLI used to silently fall back to the
+-- default port on bad input; these tests pin the strict behaviour.
+------------------------------------------------------------
+
+oscPortParserTests :: TestTree
+oscPortParserTests = testGroup "Phase 6.B.4: --osc-listen port parser"
+  [ testCase "accepts canonical port" $
+      OSC.parseListenerPort "7000" @?= Just 7000
+
+  , testCase "accepts low end of range" $
+      OSC.parseListenerPort "1" @?= Just 1
+
+  , testCase "accepts high end of range" $
+      OSC.parseListenerPort "65535" @?= Just 65535
+
+  , testCase "rejects zero" $
+      OSC.parseListenerPort "0" @?= Nothing
+
+  , testCase "rejects out-of-range numeric" $
+      OSC.parseListenerPort "70000" @?= Nothing
+
+  , testCase "rejects six-digit overflow guard" $
+      OSC.parseListenerPort "100000" @?= Nothing
+
+  , testCase "rejects non-digit token" $
+      OSC.parseListenerPort "foo" @?= Nothing
+
+  , testCase "rejects mixed digits and letters" $
+      OSC.parseListenerPort "7000x" @?= Nothing
+
+  , testCase "rejects empty string" $
+      OSC.parseListenerPort "" @?= Nothing
+
+  , testCase "rejects negative" $
+      OSC.parseListenerPort "-7000" @?= Nothing
   ]
