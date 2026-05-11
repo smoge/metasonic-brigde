@@ -1414,17 +1414,28 @@ convolution). FFT windows are inherently block-structured, so 6.D may
 project sees. Bidirectional coupling: §4.D's executor waits on signal,
 and 6.D produces signal.
 
-Design note (no code yet):
+Landed initial kind:
 - [Phase 6.D minimal-spectral-kind design](notes/2026-05-11-phase-6d-spectral-design.md)
   — bounds the first kind (`KSpectralFreeze`, tag 22, N=1024 / hop=256,
   Hann window, freeze gate), pins per-instance window ownership,
   declares N-sample latency through a new `kindLatency` accessor,
-  parks block-rate / spectrum-stream / multichannel / latency
-  compensation for follow-up series, and lays out a three-slice
-  implementation (Haskell surface + green C++ skeleton → real STFT
-  kernel + writer-style Barrier → freeze tests). Self-contained per
-  instance: no new `Eff` axis, the kind is `[Pure]` from the
-  resource-ordering point of view.
+  and keeps the runtime resource model unchanged (`inferEff = [Pure]`).
+  The first implementation series landed the Haskell surface, real
+  overlap-add STFT kernel, spectral-region Barrier classification,
+  freeze-mode behavior, hop-boundary latch tests, and runtime-doc
+  hardening.
+
+Open follow-up queue:
+
+1. Add a corpus / survey row that exercises `KSpectralFreeze`.
+2. Add a descriptive latency-footprint view over compiled graphs.
+3. Use that view to report uncompensated parallel-path latency skew.
+4. Decide from corpus evidence whether the next runtime slice is
+   latency compensation or a second spectral kind.
+5. Keep block-rate promotion, spectrum-stream types, multichannel
+   STFT, variable N / hop, and plugin hosting parked until the
+   smaller spectral and latency slices make their requirements
+   concrete.
 
 ### Phase 6.E — Plugin Hosting
 

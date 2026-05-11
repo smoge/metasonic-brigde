@@ -1,13 +1,16 @@
 # Phase 6.D — Spectral Processing (Design)
 
 Date: 2026-05-11
-Status: design / contract preflight; no code lands here. Bounds
-the first spectral kind and the infrastructure it forces into
-existence. The first three implementation commits (slicing in
-§7) start only after this note is signed off. Mirrors the
-6.C.4 / 6.C.4-follow-up precedent: bound the new
-infrastructure, land one minimal kind that exercises it
-end-to-end, then add useful kinds in subsequent series.
+Status: landed v1 contract. This note first bounded the
+`KSpectralFreeze` slice; the initial implementation series has now
+landed the Haskell surface, real STFT kernel, Barrier classification,
+freeze behavior, hop-boundary latch hardening, and runtime-doc sync.
+The remaining value of the note is the contract and follow-up queue:
+corpus signal, descriptive latency analysis, possible compensation,
+and later spectral-family expansion. Mirrors the 6.C.4 /
+6.C.4-follow-up precedent: bound the new infrastructure, land one
+minimal kind that exercises it end-to-end, then add useful kinds in
+subsequent series.
 
 ## 0. Anchors
 
@@ -491,11 +494,12 @@ Tests (in `recordBufMonoSkeletonTests` style, new
 
 ## 7. Implementation slicing
 
-Three commits, each keeping `stack test` green. Same
-no-intentionally-red-CI rule as §6.C.4 follow-up
-(commit `39539bb` precedent).
+Landed as a three-slice implementation plus follow-up hardening.
+The original rule was: each commit keeps `stack test` green, with
+no intentionally-red CI, matching the §6.C.4 follow-up precedent
+(commit `39539bb`).
 
-### Slice 1 — Haskell surface + green C++ skeleton
+### Slice 1 — Haskell surface + green C++ skeleton (landed)
 
 Haskell side:
 
@@ -529,7 +533,7 @@ Slice-1 tests: `inferEff = [Pure]`, `kindSpec` shape,
 delay test is not added yet — there's no real kernel to
 verify. **No test is intentionally red.**
 
-### Slice 2 — Real STFT kernel + writer-style barrier
+### Slice 2 — Real STFT kernel + writer-style barrier (landed)
 
 - Replace stub with the real four-step kernel from §2.2:
   ring fills, hop-boundary analysis, hop-boundary
@@ -544,7 +548,7 @@ Slice-2 tests: pre-roll silence (#4), impulse delay (#3),
 sine reconstruction (#5), counter math in pass-through (#7),
 spectral-region Barrier (#9), latency accessor (#10).
 
-### Slice 3 — Freeze mode + freeze tests
+### Slice 3 — Freeze mode + freeze tests (landed)
 
 - Wire the `freeze_flag` into the kernel. Hop-boundary
   read of the flag selects between the "store new spectrum
@@ -553,10 +557,10 @@ spectral-region Barrier (#9), latency accessor (#10).
   (flag on).
 - Freeze on/off transition tests (#6, #8).
 
-After slice 3: total tests ≈ 580 + 10 = 590 Haskell, 308 C++
-unchanged (the new tests are Haskell-driven; the C++ doctest
-side gets no new tags beyond the slice-1 `kind_supported`
-update).
+Post-slice hardening moved Hann / WOLA table construction out of a
+function-local static, strengthened the freeze-sustain proof with a
+truly silent input after the frozen window, synchronized runtime docs,
+and added a one-frame hop-boundary latch distinguisher.
 
 ## 8. What this does NOT unblock
 
