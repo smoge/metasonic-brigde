@@ -1216,35 +1216,55 @@ generalized `ResourceFootprint`. That work opens as 6.C.4.
 
 Note: [Phase 6.C.3b lifetime design](notes/2026-05-11-phase-6c3b-lifetime-design.md).
 
-#### 6.C.4 Buffer resource ordering (next task)
+#### [x] 6.C.4 Buffer resource ordering
 
-Resource-ordering preflight for a future `BufWrite`. Today
-template precedence flows through `BusFootprint`; once a writer
-UGen exists, `BusFootprint` is too narrow. 6.C.4 widens the
-precedence surface to a `ResourceFootprint` covering both bus
-and buffer reads / writes / delayed reads, *before* any writer
-kind lands. Done in a tight series:
+Resource-ordering preflight for the writer UGen. Pre-§6.C.4
+template / region precedence flowed through `BusFootprint`; once
+a writer kind exists, `BusFootprint` is too narrow. 6.C.4
+widened the precedence surface to a `ResourceFootprint`
+covering both bus and buffer reads / writes / delayed reads
+without semantic change for bus-only corpora. Four slices:
 
-1. Add `BufferFootprint` and `ResourceFootprint` types in
-   `Compile.Types`. No call sites yet.
-2. Pivot `Template.tplFootprint` / `RuntimeRegion.rrFootprint`
-   to `ResourceFootprint`. Bus-only graphs are bit-identical.
-3. Union bus + buffer edges in the template-level precedence
-   step. New tests:
-   - `BufWrite → BufRead` on the same buffer adds the edge.
-   - Bus-only corpus precedence stays byte-identical.
-4. Reject same-buffer `BufWrite / BufWrite` in
-   `compileTemplateGraph` with a dedicated diagnostic. Stricter
-   v1 contract; producer must express ordering through a bus or
-   split into separate buffers.
+1. **[x] Add `BufferFootprint` and `ResourceFootprint`** in
+   `Compile.Types` (commit 76fac6b). Type-only; no call site
+   touches them.
+2. **[x] Pivot `Template.tplFootprint` / `RuntimeRegion.rrFootprint`
+   to `ResourceFootprint`** (commit 3fcfdee). New
+   `resourceFootprint` / `runtimeNodeResourceFootprint` /
+   `regionResourceFootprint` extractors; existing bus-only
+   consumers project through `rfBuses`. Bus-only graphs stay
+   bit-identical.
+3. **[x] Union bus + buffer edges in the precedence rule**
+   (commit 05211f6). New `templatePrecedes` consults both
+   intersections (bus-write/bus-read and buffer-write/buffer-read);
+   `regionBusPrecedence` mirrors the same union. Bus and buffer
+   id spaces are disjoint, so the two halves can never collide.
+   Tests cover `BufWrite → BufRead` on same buffer
+   (asymmetric edge), `BufWrite` on different buffer (no edge),
+   `BufRead` alone (non-ordering), and the disjoint-id-space
+   regression guard.
+4. **[x] Reject same-buffer `BufWrite / BufWrite`** (commit
+   1a363b5). New stage 2.5 in `compileTemplateGraph(Fused)`
+   (`checkNoSharedBufferWriters`) fails the compile if any
+   buffer id is written by two or more templates, naming both
+   the offending buffer and the template names.
+
+`computePrecedence`, `templatePrecedes`, and
+`checkNoSharedBufferWriters` are exported from
+`Bridge.Templates` so the rule can be exercised against
+hand-built `Template` / `ResourceFootprint` values without
+needing a writer UGen in the DSL yet.
+
+Same-buffer `BufWrite / BufWrite` lifting is reserved for
+6.C.5+ once a real use case forces a pinned ordering
+primitive.
 
 After 6.C.4, the writer UGen (`RecordBufMono`) is a separate
 follow-up that only has to pin `inferEff (RecordBufMono buf
 _ _) = [BufWrite (bufferId buf)]` and ship the kernel — the
 ordering machinery picks it up automatically.
 
-Same-buffer `BufWrite / BufWrite` lifting is reserved for
-6.C.5+ once a real use case forces a pinned ordering primitive.
+558 tests total (9 new since 6.C.3b).
 
 Note: [Phase 6.C.4 resource-ordering design](notes/2026-05-11-phase-6c4-resource-ordering-design.md).
 
