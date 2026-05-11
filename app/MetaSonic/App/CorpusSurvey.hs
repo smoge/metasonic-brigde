@@ -26,9 +26,13 @@ import           MetaSonic.App.Survey      (CorpusGraphSummary (..),
                                              renderShape,
                                              shapeHasKernel,
                                              surveyCorpusGraph)
-import           MetaSonic.Bridge.Compile  (RegionKernel)
+import           MetaSonic.Bridge.Compile  (DeclaredNodeLatency (..),
+                                             InputLatency (..),
+                                             LatencySkew (..),
+                                             RegionKernel)
 import           MetaSonic.Bridge.Source   (SynthGraph)
 import qualified MetaSonic.Pattern.Corpus  as Corpus
+import           MetaSonic.Types           (NodeIndex (..), PortIndex (..))
 
 ------------------------------------------------------------
 -- Corpus catalog
@@ -128,6 +132,8 @@ runCorpusSurvey = do
   printShapeContributions flatRows
   putStrLn ""
   printOpportunities flatRows
+  putStrLn ""
+  printLatencyFootprint flatRows
   putStrLn ""
 
   -- Mirror '--fusion-survey's precedent: print successful sections
@@ -265,3 +271,60 @@ printOpportunities rows = do
               putStrLn $ "    " <> kStr <> ": "
                       <> intercalate ", " tags)
             (M.toList perKind)
+
+------------------------------------------------------------
+-- §6.D declared latency / uncompensated skew
+------------------------------------------------------------
+
+printLatencyFootprint :: [FlatRow] -> IO ()
+printLatencyFootprint rows = do
+  putStrLn "─── §6.D declared latency / uncompensated skew ───"
+  let declared =
+        [ (frRow r <> "/" <> frTemplate r, d)
+        | r <- rows
+        , d <- csDeclaredLatency (frSummary r)
+        ]
+      skews =
+        [ (frRow r <> "/" <> frTemplate r, s)
+        | r <- rows
+        , s <- csLatencySkews (frSummary r)
+        ]
+
+  putStrLn "  Declared-latency nodes:"
+  if null declared
+    then putStrLn "    (none)"
+    else mapM_ (\(tag, d) ->
+           putStrLn $ "    " <> tag <> ": " <> renderDeclared d)
+         declared
+
+  putStrLn ""
+  putStrLn "  Uncompensated input-latency skew:"
+  if null skews
+    then putStrLn "    (none)"
+    else mapM_ (\(tag, s) ->
+           putStrLn $ "    " <> tag <> ": " <> renderSkew s)
+         skews
+
+renderDeclared :: DeclaredNodeLatency -> String
+renderDeclared d =
+  show (dnlKind d) <> "@" <> renderNodeIndex (dnlNode d)
+  <> "=" <> show (dnlLatency d) <> " samples"
+
+renderSkew :: LatencySkew -> String
+renderSkew s =
+  show (lsKind s) <> "@" <> renderNodeIndex (lsNode s)
+  <> " min=" <> show (lsMinLatency s)
+  <> " max=" <> show (lsMaxLatency s)
+  <> " inputs=[" <> intercalate ", " (map renderInput (lsInputs s)) <> "]"
+
+renderInput :: InputLatency -> String
+renderInput i =
+  "port" <> renderPortIndex (ilPort i)
+  <> "<-" <> renderNodeIndex (ilSource i)
+  <> ":" <> show (ilLatency i)
+
+renderNodeIndex :: NodeIndex -> String
+renderNodeIndex (NodeIndex i) = show i
+
+renderPortIndex :: PortIndex -> String
+renderPortIndex (PortIndex i) = show i

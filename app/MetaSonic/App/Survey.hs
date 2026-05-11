@@ -432,6 +432,13 @@ data SurveyRow = SurveyRow
     -- sample-rate to serve its sample-accurate consumer). Stored
     -- as a flat list rather than a count so cross-row
     -- aggregation can also report distinct-kind diversity.
+  , srDeclaredLatency :: ![DeclaredNodeLatency]
+    -- ^ §6.D descriptive latency footprint. Nodes whose kind
+    -- declares inherent steady-state latency.
+  , srLatencySkews :: ![LatencySkew]
+    -- ^ §6.D diagnostic for uncompensated parallel paths: nodes
+    -- with dynamic inputs arriving at different cumulative
+    -- latencies. Read-only; no scheduler pass consumes this yet.
   } deriving (Eq, Show)
 
 -- Build a SurveyRow from /two/ compiled 'RuntimeGraph's of the
@@ -494,6 +501,8 @@ surveyRuntimeGraph d t rt rtF stats workerStats =
          -- elided producers, which would silently drop the very
          -- edges the survey is meant to count.
        , srOppProducers = sampleRateOpportunityProducers rt
+       , srDeclaredLatency = declaredLatencyFootprint rt
+       , srLatencySkews    = inputLatencySkews rt
        }
 
 -- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
@@ -527,6 +536,8 @@ data CorpusGraphSummary = CorpusGraphSummary
   , csKernels      :: ![(RegionKernel, Int)]
   , csShapes       :: ![(SinkShape, Bool)]
   , csOppProducers :: ![NodeKind]
+  , csDeclaredLatency :: ![DeclaredNodeLatency]
+  , csLatencySkews :: ![LatencySkew]
   } deriving (Eq, Show)
 
 -- | Phase 6.A.3 corpus-survey entry: compile a 'SynthGraph' and
@@ -543,6 +554,8 @@ surveyCorpusGraph d t g = do
     , csKernels      = srKernels row
     , csShapes       = srShapes row
     , csOppProducers = srOppProducers row
+    , csDeclaredLatency = srDeclaredLatency row
+    , csLatencySkews    = srLatencySkews row
     }
 
 -- | Compile every (demo, template) pair, returning one

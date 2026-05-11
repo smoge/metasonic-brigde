@@ -11355,6 +11355,35 @@ spectralFreezeSkeletonTests =
       latsFor KOut            @?= [1024]
       inputLatencySkews rg    @?= []
 
+  , testCase "latency skew reports uncompensated dry/wet spectral path" $ do
+      let graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            mixed  <- add src frozen
+            out 0 mixed
+      rg <- case lowerGraph graph >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+      let skews = inputLatencySkews rg
+          lats  = nodeOutputLatencies rg
+          latsFor k =
+            [ lat
+            | n <- rgNodes rg
+            , rnKind n == k
+            , Just lat <- [M.lookup (rnIndex n) lats]
+            ]
+      case [s | s <- skews, lsKind s == KAdd] of
+        [s] -> do
+          lsMinLatency s @?= 0
+          lsMaxLatency s @?= 1024
+          sort (map ilLatency (lsInputs s)) @?= [0, 1024]
+        other ->
+          assertFailure $
+            "expected one KAdd latency-skew diagnostic, got "
+            <> show other
+      latsFor KAdd @?= [1024]
+      latsFor KOut @?= [1024]
+
   , testCase "ugenView arities match kindSpec for SpectralFreeze" $ do
       -- The local check that the global property
       -- 'ugenView arities match kindSpec for every UGen'
