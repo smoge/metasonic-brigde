@@ -762,13 +762,50 @@ two ring buffers (input ring of size N for analysis; output
 ring of size N + hop for overlap-add resynthesis) and an
 analysis-hop counter measured in samples_in.
 
-Slice-1 invariant: SpectralFreezeState exists on the
-NodeState variant and configure_spec / init_node_state
-zero-initialize it. The kernel emits zero on output port 0
-and never advances any analysis / resynthesis counters
-('spectral_analysis_count' / 'spectral_resynthesis_count'
-stay at 0). The real STFT body lands in slice 2; the freeze
-gate lands in slice 3.
+Kernel structure (process_spectral_freeze):
+
+  Every sample (unconditional):
+    1. Write signal_in[fi] into input_ring; advance head.
+    2. Read output_ring[output_read_head] into the output
+       span; zero the slot (the next IFFT contribution that
+       lands here will start from 0).
+    3. Tick samples_in / samples_out.
+
+  At analysis-hop boundaries (samples_in % hop == 0 AND
+  samples_in >= N), hop-latch freeze_flag once and branch:
+
+    - freeze_flag < 0.5: window + FFT the most recent N
+      samples, persist bins 0..N/2 into frozen_spectrum,
+      IFFT, overlap-add into output_ring at the current
+      output_read_head. Both spectral_analysis_count and
+      spectral_resynthesis_count advance.
+
+    - freeze_flag >= 0.5 and frozen_valid: reconstruct the
+      full spectrum from the stored Hermitian half, IFFT,
+      overlap-add. Only spectral_resynthesis_count advances —
+      the analysis path is skipped entirely. The input ring
+      keeps filling (step 1 is unconditional), so unfreezing
+      resumes analysis on a ring that has been tracking the
+      live input the whole time.
+
+    - freeze_flag >= 0.5 and !frozen_valid: emit silence
+      through IFFT (freeze rose before any pass-through hop
+      ever ran, so there is nothing to freeze yet). Only
+      spectral_resynthesis_count advances.
+
+The two counters diverge in freeze mode — that's the test
+contract counter-confirmed-validation depends on.
+
+Steady-state pipeline latency: N samples. Pre-roll
+(samples_out < N) is silent by construction because the
+output ring is value-initialized and no IFFT contributions
+have been added yet.
+
+WOLA normalization (kSpectralResynthesisScale =
+hop / sum_of_squares) recovers unity pass-through gain. The
+Hann table and the scale are namespace-scope constants
+initialized before main(), so the audio thread never pays
+the table-build cost.
 */
 struct SpectralFreezeState {
   static constexpr int kN        = 1024;

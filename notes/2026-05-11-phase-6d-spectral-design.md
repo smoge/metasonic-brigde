@@ -219,16 +219,44 @@ Three places this matters:
 
 ### 2.4 Frozen state semantics
 
-When `freeze_flag` crosses 0.5 → 1, the next analysis hop is
-the last one that updates `frozen_spec`. From that hop forward
-the analysis side is suspended (no input is read into the
-analysis ring); resynthesis continues to pull `frozen_spec`,
-applying a fresh window and adding into the output ring on
-each hop. When `freeze_flag` crosses 1 → 0, analysis resumes
-on the next hop; the input ring's content from before the
-unfreeze is still there (the kernel never stops *filling* the
-input ring, only stops *consuming* it) so the freeze release
-is a one-hop transient, not a discontinuity.
+The kernel reads `freeze_flag` once per analysis hop (hop-
+latching, see Q-1). The transition is described in terms of
+how each hop boundary sees the flag, not in terms of
+sample-by-sample state mutation:
+
+- **Pass-through hop** (`freeze_flag < 0.5`): window + FFT the
+  most recent N samples; persist the resulting spectrum into
+  `frozen_spectrum` (bins 0..N/2 — the Hermitian half;
+  bins above N/2 are reconstructed by conjugation at IFFT
+  time). IFFT + overlap-add into the output ring.
+
+- **Frozen hop with valid spectrum** (`freeze_flag ≥ 0.5` and
+  `frozen_valid`): skip the analysis FFT entirely; reconstruct
+  the full spectrum from the stored Hermitian half, IFFT,
+  overlap-add. `frozen_spectrum` is not modified, so every
+  subsequent frozen hop replays exactly the same spectrum.
+
+- **Frozen hop with no valid spectrum** (`freeze_flag ≥ 0.5`
+  and `!frozen_valid`): the flag rose before any pass-through
+  hop ever fired. IFFT receives a zero spectrum, output is
+  silent.
+
+The input ring is **always** filled, regardless of the flag —
+the kernel's per-sample step 1 (`input_ring[head] = sample`)
+is unconditional. The "suspended" thing is the analysis FFT,
+not the input drain. That means when `freeze_flag` crosses
+1 → 0, the analysis ring already contains the most recent N
+samples of live input; the next pass-through hop windows
+them and produces a synthesis frame from real (post-freeze)
+data. There is no input-ring catch-up or replay across the
+unfreeze transition; the kernel just resumes analyzing what
+was already being recorded throughout the freeze.
+
+In counter terms: `spectral_analysis_count` advances only on
+pass-through hops; `spectral_resynthesis_count` advances on
+every hop (including frozen ones, since IFFT always runs).
+This is the counter-confirmed split that proves "freeze
+suspends analysis only" without having to inspect the audio.
 
 Open question Q-1 (§9): how often the kernel actually
 *reads* `freeze_flag`. The kernel internally latches the flag
