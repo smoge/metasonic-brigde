@@ -114,6 +114,7 @@ import           MetaSonic.Bridge.Buffer   (BufferIssue (..), allocBuffer,
                                             collectRetiredBuffer,
                                             loadBuffer, retireBuffer)
 import           MetaSonic.Bridge.IR
+import           MetaSonic.Bridge.Planner
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Bridge.Validate
@@ -160,6 +161,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , staticPluginSkeletonTests
   , authoringDslTests
   , capabilityTableTests
+  , plannerTests
   ]
 
 ------------------------------------------------------------
@@ -583,6 +585,110 @@ representativeUGen = \case
   KRecordBufMono  -> RecordBufMono (Buffer 0) (Param 0) (Param 0)
   KSpectralFreeze -> SpectralFreeze (Param 0) (Param 0)
   KStaticPlugin   -> StaticPlugin identityPlugin (Param 0) (Param 0)
+
+------------------------------------------------------------
+-- §7.C: Survey-only fusion planner
+------------------------------------------------------------
+
+plannerTests :: TestTree
+plannerTests =
+  testGroup "Phase 7.C: survey-only fusion planner"
+  [ testCase "Sin→Gain→Out yields an accepted candidate matched to a §4.B kernel" $ do
+      let g = runSynth $ do
+            o <- sinOsc 440 0
+            y <- gain o 0.5
+            out 0 y
+          verdicts = runPlanner g
+          matched =
+            [ k
+            | Accepted c <- verdicts
+            , Just k <- [fcMatchedShape c]
+            , fcLengthNodes c == 3
+            ]
+      assertBool
+        ("expected an Accepted 3-node candidate matched to a §4.B kernel; got "
+         <> show verdicts)
+        (not (null matched))
+
+  , testCase "spectralFreeze as true-interior triggers ReasonLatencyMidChain" $ do
+      let g = runSynth $ do
+            o <- sinOsc 440 0
+            f <- spectralFreeze o 0
+            y <- gain f 0.5
+            out 0 y
+          verdicts = runPlanner g
+          rejections = [r | Rejected _ r <- verdicts]
+      assertBool
+        ("expected ReasonLatencyMidChain in rejections; got " <> show rejections)
+        (any isLatencyMid rejections)
+
+  , testCase "staticPlugin as true-interior triggers ReasonHardBarrier" $ do
+      let g = runSynth $ do
+            a <- sinOsc 440 0
+            b <- sinOsc 220 0
+            p <- staticPlugin identityPlugin a b
+            y <- gain p 0.5
+            out 0 y
+          verdicts = runPlanner g
+          rejections = [r | Rejected _ r <- verdicts]
+      assertBool
+        ("expected ReasonHardBarrier in rejections; got " <> show rejections)
+        (any isHardBarrier rejections)
+
+  , testCase "stateful non-allow-list kind (Env) as true-interior is rejected" $ do
+      -- Two oscillators feed the chain so the first SinOsc is the
+      -- source and the second SinOsc lands at true-interior; the
+      -- planner should cite that mid-chain osc, not the source.
+      let g = runSynth $ do
+            o1 <- sinOsc 440 0
+            o2 <- sinOsc 220 0
+            y  <- add o1 o2
+            z  <- gain y 0.5
+            out 0 z
+          verdicts = runPlanner g
+          rejections = [r | Rejected _ r <- verdicts]
+      assertBool
+        ("expected ReasonStatefulInterior in rejections; got "
+         <> show rejections)
+        (any isStatefulInterior rejections)
+
+  , testCase "fanout producer triggers ReasonFanoutEscape" $ do
+      -- Same osc feeds two output chains. The osc has
+      -- consumerCount=2 and shows up as a non-sink position with
+      -- fanout. (The osc is also source-stateful, but the rule
+      -- order checks HardBarrier/Latency/Resource/Stateful/Fanout
+      -- and the source is exempt from the Stateful check, so
+      -- Fanout fires.)
+      let g = runSynth $ do
+            o  <- sinOsc 440 0
+            y1 <- gain o 0.5
+            y2 <- gain o 0.3
+            out 0 y1
+            out 1 y2
+          verdicts = runPlanner g
+          rejections = [r | Rejected _ r <- verdicts]
+      assertBool
+        ("expected ReasonFanoutEscape in rejections; got "
+         <> show rejections)
+        (any isFanoutEscape rejections)
+  ]
+  where
+    runPlanner :: SynthGraph -> [Verdict]
+    runPlanner g = case lowerGraph g >>= compileRuntimeGraph of
+      Right rg -> planRuntimeGraph rg
+      Left err -> error ("expected compile success, got: " <> err)
+
+    isLatencyMid ReasonLatencyMidChain{} = True
+    isLatencyMid _                       = False
+
+    isHardBarrier ReasonHardBarrier{}   = True
+    isHardBarrier _                     = False
+
+    isStatefulInterior ReasonStatefulInterior{} = True
+    isStatefulInterior _                        = False
+
+    isFanoutEscape ReasonFanoutEscape{} = True
+    isFanoutEscape _                    = False
 
 -- | Tally a 'SynthGraph' by 'NodeKind' for shape-pinning tests.
 -- 'NodeKind' has no 'Ord' instance, so the tally is a sorted-by-show

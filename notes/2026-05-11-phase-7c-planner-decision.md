@@ -92,28 +92,50 @@ a later slice) decide whether to coalesce.
 
 ## Per-Node Legality Rules
 
-Each node in a candidate is inspected against the rules below in
-order. The first violated rule produces a node-level rejection
-reason and stops evaluation of that candidate.
+A candidate's positions are three classes:
 
-1. **No hard barrier mid-chain.** A node with `CapHardBarrier`
-   anywhere in the candidate rejects the candidate. (Today this is
-   only `KStaticPlugin`.)
-2. **No latency-bearing mid-chain.** A node with `CapLatencyBearing`
-   anywhere except as the terminal sink rejects the candidate. (The
-   terminal sink does not declare latency.)
-3. **Resource access only at the terminal sink.** A node with
-   `CapResourceAccess` that is not the candidate's last node rejects
-   the candidate. The last node is required to have both
-   `CapSinkTerminal` and `CapResourceAccess`.
-4. **Stateful interior nodes must be on a known list.** Today the
-   list is `[KLPF, KHPF, KBPF, KNotch]` and only when the candidate
-   matches a §4.B-recognizable shape (matched against the existing
-   `RegionKernel` set: `RSinGainOut`, `RSawLpfGainOut`, etc.). Other
-   stateful interior nodes (`KEnv`, `KDelay`, `KSmooth`, oscillators
-   mid-chain) reject the candidate. The list is deliberately narrow
-   at this slice; expanding it is a per-shape decision made against
-   `--fusion-cost-lab` evidence.
+- **Source** (position 0): the producer at the head of the chain.
+- **True interior** (positions 1…n-2): the nodes strictly between
+  source and sink.
+- **Terminal sink** (position n-1): always `CapSinkTerminal`.
+
+Each non-sink node is inspected in candidate order. The first
+violated rule produces a node-level rejection reason and stops
+evaluation. The position-aware split matches the §4.B kernel set
+(`RSinGainOut` has `KSinOsc` at source; `RBusInLpfGainOut` has
+`KBusIn` at source) — both are legal and the planner mirrors that.
+
+The rules are checked in this priority order, per node:
+
+1. **No hard barrier anywhere.** A node with `CapHardBarrier` at
+   any position rejects the candidate. (Today this is only
+   `KStaticPlugin`.) Position-independent: a plugin source is just
+   as opaque as a plugin mid-chain.
+2. **No latency-bearing anywhere.** A node with `CapLatencyBearing`
+   at any non-sink position rejects. (The terminal sink does not
+   declare latency today.) Position-independent: inlining across a
+   latency boundary needs explicit handling whether the boundary is
+   the producer or a mid-chain node.
+3. **Resource access only at source or terminal sink.** A node with
+   `CapResourceAccess` at a true-interior position (1…n-2) rejects.
+   The source may carry `CapResourceAccess` (e.g., `KBusIn` reading
+   a return bus), and the terminal sink always does. This is the
+   rule that distinguishes a safe `KOut` at the tail from a
+   hazardous `KBusOut` in the middle of a chain.
+4. **Stateful kinds at true-interior positions must be on a known
+   list.** A node with `CapStatefulOp` at position ≥1 (and not the
+   sink) is rejected unless its kind is on the planner's narrow
+   allow-list. The list is `[KLPF, KHPF, KBPF, KNotch]` at this
+   slice — biquads only. The **source position is exempt**: a
+   `KSinOsc`, `KSawOsc`, `KNoiseGen`, etc., as the chain's producer
+   is fine (this is what §4.B's `RSinGainOut`, `RSawGainOut`, etc.
+   already do). Adding kinds to the allow-list is a per-shape
+   decision made against `--fusion-cost-lab` evidence, not just
+   legality.
+5. **No fanout escape.** Any non-sink node (including the source)
+   with `rnConsumerCount /= 1` rejects. Duplicating a fanout
+   producer is a profitability question, not a legality question,
+   and the planner defers it.
 
 These rules are **per-node** by design: the planner cites the
 specific `NodeIndex` and `NodeKind` that caused the rejection.

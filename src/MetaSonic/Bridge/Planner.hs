@@ -29,14 +29,28 @@ module MetaSonic.Bridge.Planner
   , verdictCandidate
   , isAccepted
   , isRejected
+    -- * Planning pass
+  , planRuntimeGraph
+  , planRegion
+    -- * Allow list (exposed for tests)
+  , statefulInteriorAllowList
   ) where
 
 import           Control.DeepSeq                  (NFData)
+import           Data.List                        (find)
+import           Data.Maybe                       (fromMaybe, listToMaybe,
+                                                   mapMaybe)
 import           GHC.Generics                     (Generic)
 
 import           MetaSonic.Bridge.Compile.Types   (RegionIndex,
-                                                   RegionKernel)
-import           MetaSonic.Types                  (NodeIndex, NodeKind)
+                                                   RegionKernel (..),
+                                                   RuntimeGraph (..),
+                                                   RuntimeNode (..),
+                                                   RuntimeRegion (..))
+import           MetaSonic.Types                  (KindCapability (..),
+                                                   NodeIndex, NodeKind (..),
+                                                   kindCapabilities,
+                                                   kindLatency)
 
 -- | A contiguous, dense-order sub-sequence of nodes within a single
 -- 'RuntimeRegion' whose last member is a 'CapSinkTerminal' node.
@@ -137,3 +151,151 @@ isAccepted _            = False
 isRejected :: Verdict -> Bool
 isRejected (Rejected _ _) = True
 isRejected _              = False
+
+------------------------------------------------------------
+-- Planning pass
+------------------------------------------------------------
+
+-- | Plan every region in a runtime graph. The output is a flat
+-- list of verdicts; consumers can group by 'fcRegion' or filter by
+-- 'isAccepted' / 'isRejected'.
+planRuntimeGraph :: RuntimeGraph -> [Verdict]
+planRuntimeGraph rg =
+  concatMap (planRegion rg) (rgRuntimeRegions rg)
+
+-- | Plan a single region.
+--
+-- Candidates are formed by scanning region members in dense order.
+-- For each member that carries 'CapSinkTerminal', every contiguous
+-- sub-sequence of length ≥ 2 ending at that sink is a candidate;
+-- each candidate gets a 'Verdict'. This intentionally over-reports:
+-- a 4-node sink-terminal chain produces three nested candidates
+-- (lengths 2, 3, and 4). The cost-lab consumption pass coalesces.
+planRegion :: RuntimeGraph -> RuntimeRegion -> [Verdict]
+planRegion rg region =
+  let memberNodes = mapMaybe (`lookupNode` rg) (rrNodes region)
+      sinkPosns   =
+        [ i | (i, n) <- zip [0 ..] memberNodes, isSinkTerminal n ]
+      candidates  =
+        [ slice
+        | sinkAt  <- sinkPosns
+        , startAt <- [sinkAt - 1, sinkAt - 2 .. 0]
+        , let slice = take (sinkAt - startAt + 1) (drop startAt memberNodes)
+        , length slice >= 2
+        ]
+  in map (judgeCandidate region) candidates
+
+judgeCandidate :: RuntimeRegion -> [RuntimeNode] -> Verdict
+judgeCandidate region nodes =
+  let candidate = mkCandidate region nodes
+  in case firstViolation nodes of
+       Just r  -> Rejected candidate r
+       Nothing -> Accepted candidate
+
+mkCandidate :: RuntimeRegion -> [RuntimeNode] -> FusionCandidate
+mkCandidate region nodes =
+  FusionCandidate
+    { fcRegion       = rrIndex region
+    , fcMembers      = map rnIndex nodes
+    , fcMemberKinds  = map rnKind  nodes
+    , fcMatchedShape = matchedShape region nodes
+    , fcLengthNodes  = length nodes
+    }
+
+-- | A candidate's matched shape is the region's kernel iff the
+-- candidate's members are exactly the region's members and the
+-- kernel is a real fused kernel (not 'RNodeLoop'). A candidate that
+-- is a proper subset of a fused region's members is not "claimed"
+-- by that kernel — the kernel would have to match the candidate's
+-- exact shape to claim it.
+matchedShape :: RuntimeRegion -> [RuntimeNode] -> Maybe RegionKernel
+matchedShape region nodes
+  | rrKernel region /= RNodeLoop
+  , map rnIndex nodes == rrNodes region
+  = Just (rrKernel region)
+  | otherwise = Nothing
+
+------------------------------------------------------------
+-- Legality rule application
+------------------------------------------------------------
+
+-- | Walk the candidate in order and return the first node-level or
+-- structural violation. Position-aware: position 0 is the source
+-- (relaxed rules for stateful kinds and resource access), positions
+-- @[1..len-2]@ are true interior (strict rules), position @len-1@ is
+-- the terminal sink. See
+-- @notes/2026-05-11-phase-7c-planner-decision.md@.
+firstViolation :: [RuntimeNode] -> Maybe RejectionReason
+firstViolation nodes =
+  let len = length nodes
+  in case nodes of
+       []    -> Just ReasonNoTerminalSink
+       _     ->
+         let sink           = last nodes
+             nonSinkIndexed = zip [0 :: Int ..] (init nodes)
+         in firstJust
+              [ checkLength len
+              , if isSinkTerminal sink
+                  then Nothing
+                  else Just ReasonNoTerminalSink
+              , firstJust [ checkNonSinkAt pos n
+                          | (pos, n) <- nonSinkIndexed ]
+              ]
+
+checkLength :: Int -> Maybe RejectionReason
+checkLength n
+  | n < 2     = Just (ReasonTooShort n)
+  | otherwise = Nothing
+
+-- | Per-node legality check for a non-sink node at position @pos@.
+--
+-- Hard barriers and latency-bearing kinds are rejected regardless
+-- of position. Resource access and stateful-not-on-allow-list are
+-- only rejected at true-interior positions (@pos >= 1@) — the
+-- source (@pos == 0@) is allowed to be a stateful producer
+-- (e.g., 'KSinOsc' in @Sin → Gain → Out@) or a resource reader
+-- (e.g., 'KBusIn' in @BusIn → LPF → Gain → Out@). Fanout escape
+-- applies at every non-sink position because duplicating a fanout
+-- producer is the same profitability question at any depth.
+checkNonSinkAt :: Int -> RuntimeNode -> Maybe RejectionReason
+checkNonSinkAt pos n
+  | CapHardBarrier `elem` caps =
+      Just (ReasonHardBarrier (rnIndex n) (rnKind n))
+  | CapLatencyBearing `elem` caps =
+      Just (ReasonLatencyMidChain
+              (rnIndex n) (rnKind n)
+              (fromMaybe 0 (kindLatency (rnKind n))))
+  | pos >= 1
+  , CapResourceAccess `elem` caps =
+      Just (ReasonResourceMidChain (rnIndex n) (rnKind n))
+  | pos >= 1
+  , CapStatefulOp `elem` caps
+  , rnKind n `notElem` statefulInteriorAllowList =
+      Just (ReasonStatefulInterior (rnIndex n) (rnKind n))
+  | rnConsumerCount n /= 1 =
+      Just (ReasonFanoutEscape (rnIndex n) (rnConsumerCount n))
+  | otherwise = Nothing
+  where
+    caps = kindCapabilities (rnKind n)
+
+isSinkTerminal :: RuntimeNode -> Bool
+isSinkTerminal n =
+  CapSinkTerminal `elem` kindCapabilities (rnKind n)
+
+-- | The narrow allow-list of stateful kinds the planner accepts as
+-- interior nodes. Biquads only at this slice. Adding 'KDelay',
+-- 'KSmooth', or 'KEnv' requires '--fusion-cost-lab' evidence; the
+-- list lives here and is intentionally a separate table from
+-- 'kindCapabilities'.
+statefulInteriorAllowList :: [NodeKind]
+statefulInteriorAllowList = [KLPF, KHPF, KBPF, KNotch]
+
+------------------------------------------------------------
+-- Local helpers
+------------------------------------------------------------
+
+lookupNode :: NodeIndex -> RuntimeGraph -> Maybe RuntimeNode
+lookupNode ix rg = find (\n -> rnIndex n == ix) (rgNodes rg)
+
+firstJust :: [Maybe a] -> Maybe a
+firstJust = listToMaybe . mapMaybe id
