@@ -4418,12 +4418,13 @@ producer mutates the pool through three C entry points:
                                  retire/collect lands in §6.C.3b.
 
 The audio thread reads through `samples.data()` and `samples.size()`;
-it never resizes. PlayBufMono kernels resolve their buffer ID at the
-start of each block from controls[0] and emit zeros + tick the
-invalid-read counter if the slot is unallocated or out of range. The
-read counter ticks per valid sample. Both counters live on
-RTGraphState and are observable through the rt_graph_test_buffer_*
-test surface.
+it never resizes. PlayBufMono kernels resolve their buffer ID *once*
+at instance reset (in init_node_state, from controls[0]) and freeze
+it on PlayBufMonoState; the kernel reads st->buffer_id and emits
+zeros + ticks the invalid-read counter if the slot is unallocated or
+out of range. The read counter ticks per valid sample. Both counters
+live on RTGraphState and are observable through the
+rt_graph_test_buffer_* test surface.
 
 §6.C.3a is read-only — there is no audio-thread write path, no
 BufWrite UGen, and no precedence extension for BufRead (a BufRead
@@ -4432,15 +4433,17 @@ free; §6.C.4+ may add write kinds and the corresponding
 ResourceFootprint precedence layer.
 */
 
-// §6.C.3a kernel. Resolves the buffer ID from controls[0],
-// advances a per-instance playhead by `rate` per output sample
-// (read from controls[1] / port 0; clamped to [0, ∞)), reads
-// samples with linear interpolation, and either loops back to
-// `start_frame` (controls[2]) or goes silent past the last frame
-// based on `loop_flag` (controls[3] / port 2). Ticks
-// buffer_read_count per valid sample; ticks
-// buffer_invalid_read_count + emits zero per sample when the
-// buffer ID does not resolve or the buffer is empty.
+// §6.C.3a kernel. Reads `st->buffer_id` (frozen at instance reset
+// in init_node_state from controls[0]; deliberately not re-read
+// per block — see Note [Per-node PlayBufMono state]), advances a
+// per-instance playhead by `rate` per output sample (read from
+// controls[1] / port 0; clamped to [0, ∞)), reads samples with
+// linear interpolation, and either loops back to `start_frame`
+// (controls[2]) or goes silent past the last frame based on
+// `loop_flag` (controls[3] / port 2). Ticks buffer_read_count per
+// valid sample; ticks buffer_invalid_read_count + emits zero per
+// sample when the buffer ID does not resolve or the buffer is
+// empty.
 //
 // Note: port 1 (start_frame) is PortIgnored on the Haskell side —
 // the kernel never resolves it in the audio loop; start_frame is

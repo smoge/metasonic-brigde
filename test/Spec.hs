@@ -10011,6 +10011,91 @@ playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
           expected = replicate 8 10 :: [Float]
       in runPlayBufScenario table (-1.0) 0.0 0.0 8 expected 8 0
            "negative rate clamp"
+
+  , -- Regression test for the §6.C.2 contract: buffer_id is
+    -- consulted at instance reset, never re-read per block. Build
+    -- a graph that references Buffer 0 (filled with 7.0); load
+    -- Buffer 1 with a different constant (99.0); render once and
+    -- confirm output is 7.0; then live-write controls[0] = 1.0
+    -- through rt_graph_instance_set_control and render again. The
+    -- output must still be 7.0 — a regression that re-reads
+    -- controls[0] per block would flip to 99.0 here.
+    testCase "live set_control on slot 0 does not retarget buffer_id" $ do
+      let nframes = 64
+          sizeOfF :: Int
+          sizeOfF = 4
+          tableA = replicate nframes (7.0 :: Float)
+          tableB = replicate nframes (99.0 :: Float)
+          graph = runSynth $ do
+            -- loop=1 so the entire 64-sample render reads valid
+            -- samples; rate=1.0; start_frame=0.
+            s <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 1.0)
+            out 0 s
+
+      tg <- case compileTemplateGraph [("default", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+          playBufIx =
+            case [ rnIndex n
+                 | tpl <- tgTemplates tg
+                 , n   <- rgNodes (tplGraph tpl)
+                 , rnKind n == KPlayBufMono
+                 ] of
+              [NodeIndex i] -> i
+              other         -> error $
+                "expected one PlayBufMono node, got " <> show other
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        -- Allocate both buffers AFTER loadTemplateGraph (which
+        -- internally clears the buffer pool).
+        bufA <- allocBuffer rt nframes
+        bufB <- allocBuffer rt nframes
+        bufferId bufA @?= 0
+        bufferId bufB @?= 1
+        loadBuffer rt bufA tableA
+        loadBuffer rt bufB tableB
+
+        let readBlock = allocaBytes (nframes * sizeOfF) $ \bufPtr -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bufPtr)
+              rendered <- peekArray nframes (bufPtr :: PtrCFloat)
+              pure (map (\(CFloat x) -> x) rendered)
+
+        -- Block 1: kernel reads frozen buffer_id = 0, expects 7.0.
+        c_rt_graph_process rt (fromIntegral nframes)
+        block1 <- readBlock
+        assertBool
+          ("first block must come from buffer 0 (all 7.0); got "
+           <> show (take 4 block1) <> " ...")
+          (all (\x -> abs (x - 7.0) < 1.0e-5) block1)
+
+        -- Live-write controls[0] = 1.0 on the PlayBufMono node.
+        -- A kernel that re-reads controls[0] per block would now
+        -- play from buffer 1 (all 99.0); a kernel that respects
+        -- the §6.C.2 contract stays on buffer 0.
+        c_rt_graph_instance_set_control rt 0
+          (fromIntegral playBufIx) 0 (CDouble 1.0)
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        block2 <- readBlock
+        assertBool
+          ("second block must STILL come from buffer 0 (all 7.0) "
+           <> "after live set_control on slot 0; got "
+           <> show (take 4 block2) <> " ... "
+           <> "(a value near 99.0 means buffer_id was re-read)")
+          (all (\x -> abs (x - 7.0) < 1.0e-5) block2)
+
+        -- Counter sanity: 2 blocks × nframes valid reads, no
+        -- invalid reads. A regression that took the invalid-read
+        -- path would not pass this either.
+        readCount    <- c_rt_graph_test_buffer_read_count         rt
+        invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
+        readCount    @?= fromIntegral (2 * nframes)
+        invalidCount @?= 0
   ]
 
 -- | Test helper: render `nframes` of a `playBufMono` graph over a
