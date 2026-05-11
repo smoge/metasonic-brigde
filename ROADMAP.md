@@ -1059,14 +1059,22 @@ exit. The caller owns the runtime handle and the resolve-state
 ref; the listener only reads them and writes through the
 existing realtime queue helpers.
 
-#### 6.B.3 End-to-end verification
+#### [x] 6.B.3 End-to-end verification
 
-Loopback integration test: a Haskell OSC client (or in-process
-message generator) drives the listener against a loaded
-`TemplateGraph`. Asserts the realtime queue writes match what
-the OSC stream specified. Only after this gate holds does the
-`--osc-listen` subcommand land in `app/` as the CLI wrapper
-over the library entry point.
+Loopback integration test in `test/Spec.hs`
+(`oscEndToEndTests`): builds a tagged graph
+(`SinOsc → tagged "outgain" Gain → Out 0`), compiles to a
+`TemplateGraph`, loads it with `loadTemplateGraph`, registers
+voice key `v0` against the auto-spawned slot, starts
+`withOscListenerHooks` (real FFI + thread-synchronisation hook),
+sends a UDP packet `/v0/outgain/0 ,f 0.1`, waits for the
+listener's FFI call to complete, and asserts the rendered
+bus-0 peak amplitude changed from ~0.5 to ~0.1. Proves the
+full receive → parse → dispatch → realtime queue → render
+path without external OSC tooling or audio hardware.
+
+The `--osc-listen` CLI subcommand is the next slice (a thin
+`app/MetaSonic/App/Osc.hs` wrapper over `withOscListener`).
 
 ### Phase 6.C — Buffer I/O Design Pass
 

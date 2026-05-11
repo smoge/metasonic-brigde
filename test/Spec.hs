@@ -50,6 +50,7 @@ import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI      (RTGraph,
                                             HotSwapWaitResult (..),
                                             SwapMigrationStats (..),
+                                            c_rt_graph_realtime_set_control,
                                             c_rt_graph_test_swap_generation,
                                             c_rt_graph_ensure_bus,
                                             c_rt_graph_instance_alive,
@@ -131,6 +132,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
+  , oscEndToEndTests
   ]
 
 ------------------------------------------------------------
@@ -9563,3 +9565,127 @@ sendUdpLoopback port payload = do
                           (OSCN.addrProtocol addr)
       _    <- OSCNSB.sendTo sock payload (OSCN.addrAddress addr)
       OSCN.close sock
+
+------------------------------------------------------------
+-- Phase 6.B.3: end-to-end OSC loopback verification
+--
+-- Drives the production listener against a real loaded
+-- TemplateGraph, sends a UDP packet, and verifies the realtime
+-- queue actually applied the control write — by reading bus
+-- samples before and after and asserting the peak amplitude
+-- changed in the predicted direction.
+--
+-- The hook layer is used only for thread-synchronisation: the
+-- mock SetControlFn calls the real c_rt_graph_realtime_set_control
+-- (the same call the production listener would make) and ALSO
+-- signals an MVar so the test thread knows when to render the
+-- post-OSC block. This proves the full receive → parse →
+-- dispatch → FFI path without depending on threadDelay, and
+-- without standing up external OSC tooling or audio hardware.
+------------------------------------------------------------
+
+oscEndToEndTests :: TestTree
+oscEndToEndTests = testGroup "Phase 6.B.3: OSC end-to-end loopback"
+  [ testCase "UDP /v0/outgain/0 0.1 changes the bus-0 peak amplitude" $ do
+      let nframes  = 256
+          sizeOfF :: Int
+          sizeOfF = 4
+
+          -- A tiny tagged graph: 440 Hz sine through a scalar
+          -- gain (tagged "outgain") to hardware bus 0. Default
+          -- gain 0.5, so the rendered peak is ~0.5 before the
+          -- OSC write and ~0.1 after.
+          graph = runSynth $ do
+            o <- sinOsc 440.0 0.0
+            g <- tagged "outgain" (gain o 0.5)
+            out 0 g
+
+      tg <- case compileTemplateGraph [("default", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \handle -> do
+        loadTemplateGraph handle tg
+        -- loadTemplateGraph auto-spawns instance 0 of each
+        -- template; slot id 0 references the auto-spawn.
+
+        rs0 <-
+          case OSC.registerVoice (OBSC.pack "v0") 0 (OBSC.pack "default")
+                 (OSC.emptyResolveState tg) of
+            Right rs  -> pure rs
+            Left  iss -> assertFailure (show iss)
+                         >> error "unreachable"
+        rsRef <- newIORef rs0
+
+        -- Synchronisation hook. The mock calls the real FFI
+        -- (the same call defaultListenerHooks would make) and
+        -- ALSO signals an MVar so the test knows when to
+        -- render the post-OSC block.
+        setCtrlDone <- newEmptyMVar
+        let setCtrl slotId (NodeIndex nodeIx) ctrlSlot val = do
+              r <- c_rt_graph_realtime_set_control handle
+                     (fromIntegral slotId)
+                     (fromIntegral nodeIx)
+                     (fromIntegral ctrlSlot)
+                     (CDouble val)
+              putMVar setCtrlDone ()
+              pure (r /= 0)
+            hooks = OSC.ListenerHooks
+              { OSC.lhSetControl = setCtrl
+              , OSC.lhOnIssue    = \_ -> pure ()
+              }
+
+        OSC.withOscListenerHooks hooks rsRef
+          (OSC.defaultListenerConfig 0) $ \info -> do
+
+          -- Render an initial block at the default gain (0.5)
+          -- and capture the peak amplitude.
+          c_rt_graph_process handle (fromIntegral nframes)
+          allocaBytes (nframes * sizeOfF) $ \buf -> do
+            _ <- c_rt_graph_read_bus handle 0
+                   (fromIntegral nframes) (castPtr buf)
+            initial <- peekArray nframes (buf :: PtrCFloat)
+            let initialPeak =
+                  maximum (map (\(CFloat x) -> abs x) initial)
+            assertBool
+              ("initial peak (gain=0.5) should be > 0.4, got "
+               <> show initialPeak)
+              (initialPeak > 0.4)
+
+            -- Send the OSC packet: /v0/outgain/0 ,f 0.1
+            -- The big-endian bit pattern for 0.1f is 0x3DCCCCCD.
+            let packet = OBS.concat
+                  [ oscString (OBSC.pack "/v0/outgain/0")
+                  , oscString (OBSC.pack ",f")
+                  , OBS.pack [0x3D, 0xCC, 0xCC, 0xCD]
+                  ]
+            sendUdpLoopback (OSC.liBoundPort info) packet
+
+            -- Wait for the listener thread to receive the
+            -- packet and finish the FFI call. 1-second timeout
+            -- means a regression that breaks the listener
+            -- fails the test fast instead of hanging.
+            mDone <- timeout 1000000 (takeMVar setCtrlDone)
+            case mDone of
+              Just () -> pure ()
+              Nothing ->
+                assertFailure
+                  "listener did not call FFI within 1s"
+
+            -- Render another block. The realtime queue has
+            -- the new gain (0.1) enqueued; rt_graph_process
+            -- drains it before rendering.
+            c_rt_graph_process handle (fromIntegral nframes)
+            _ <- c_rt_graph_read_bus handle 0
+                   (fromIntegral nframes) (castPtr buf)
+            changed <- peekArray nframes (buf :: PtrCFloat)
+            let changedPeak =
+                  maximum (map (\(CFloat x) -> abs x) changed)
+            assertBool
+              ("post-OSC peak (gain=0.1) should be in (0.05, 0.2), got "
+               <> show changedPeak)
+              (changedPeak > 0.05 && changedPeak < 0.2)
+  ]
