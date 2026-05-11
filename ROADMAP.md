@@ -38,13 +38,14 @@ pluck, vibrato FM, multi-template send-return, and live-MIDI poly.
 
 Phases:
 
-- Phase 1 — node registry. Eighteen `NodeKind`s implemented:
+- Phase 1 — node registry. Twenty-two `NodeKind`s implemented:
     oscillators `SinOsc` / `SawOsc` (PolyBLEP) / `PulseOsc` /
     `TriOsc`, `NoiseGen`, biquads `LPF` / `HPF` / `BPF` / `Notch`
     (Bristow-Johnson), arithmetic `Gain` / `Add`, sinks `Out` /
     `BusOut`, `Env` (`q::adsr_envelope_gen`), `Delay`
     (`q::fractional_ring_buffer`), `Smooth` (`q::dynamic_smoother`),
-    `BusIn` / `BusInDelayed`. Per-node state unified under
+    `BusIn` / `BusInDelayed`, `PlayBufMono`, `RecordBufMono`,
+    `SpectralFreeze`, and `StaticPlugin`. Per-node state unified under
     `std::variant` with `std::get_if` dispatch. See §1 for per-kind
     status.
 
@@ -69,13 +70,14 @@ Phases:
     priority; scalar Gain/Add chain fusion via the `FAffineFrom`
     algebra (one scratch slot per fused input); IR-propagated `rnRate`
     plus per-kind/per-port `PortConsumptionRate` metadata in place.
-    `Eff` annotations are real for the bus kinds and drive both
+    `Eff` annotations are real for bus and buffer kinds and drive both
     intragraph E_r ordering and inter-template precedence.
 
 - Tooling. Brick TUI inspector (`--inspect` / `--inspect-only`),
     `--fusion-survey` for kernel coverage and rate distribution,
-    `tools/rt_graph_bench.cpp` synthetic bench, and `--worker-bench`
-    Haskell-loaded worker bench.
+    `tools/rt_graph_bench.cpp` synthetic bench, `--worker-bench`
+    Haskell-loaded worker bench, `--corpus-survey`, `--swap-bench`,
+    `--plugin-list`, and the first `--fusion-cost-lab` slice.
 
 Parked / deferred:
 
@@ -938,14 +940,14 @@ Phase 6 collects five formerly-bundled workstreams as named sub-phases. 6.A
 through 6.D are closed (pattern producer + OSC control surface + buffer I/O +
 first spectral kind). 6.E (plugin hosting) is the open final boundary test:
 slice 1 landed the `KStaticPlugin` surface and the silence skeleton, slice 2
-turns on real `Identity` dispatch with `plugin_call_count` /
+landed real `Identity` dispatch with `plugin_call_count` /
 `invalid_plugin_call_count` counters, and slice 3 records the parked metadata
 follow-up decision. Ordering reflects two project rules: cheapest unblocker for
 the parked §4 corpus signals first, and items whose design needs its own pass
 before code go after items whose surface is already analogous to something
 shipped.
 
-### Phase 6.A — Sequencing / Pattern Layer (active)
+### Phase 6.A — Sequencing / Pattern Layer (closed at contract level)
 
 A Haskell-side producer of compiled graphs and timed control / hot-swap
 events. No new C++ runtime substrate, no new DSP nodes, no audio-thread
@@ -957,7 +959,7 @@ outside the current tracked bridge tree; 6.A formalizes the
 producer-vs-runtime boundary before any prototype is promoted into
 this repo.
 
-#### 6.A.1 Design note (current task)
+#### [x] 6.A.1 Design note
 
 Settles four bounds before any code lands:
 
@@ -981,7 +983,7 @@ Settles four bounds before any code lands:
 
 Note: [Phase 6.A pattern design](notes/2026-05-10-phase-6a-pattern-design.md).
 
-#### 6.A.2 Minimal pattern corpus
+#### [x] 6.A.2 Minimal pattern corpus
 
 A small, fixed, deterministic battery — analogous to the §4 demo
 battery — covering recurring control changes, bus send/return
@@ -1017,7 +1019,7 @@ timing all stay out of 6.A. Piping the corpus through
 6.A.3 extension if the §4.E / §5 signals warrant it; the current
 `--corpus-survey` does not perform those measurements.
 
-### Phase 6.B — OSC Control Surface (active)
+### Phase 6.B — OSC Control Surface (closed at contract level)
 
 OSC is the first real external producer. Receive surface only —
 binds a configured UDP port, parses single messages, and writes
@@ -1035,7 +1037,7 @@ realtime control queue decouples the audio callback from
 producer-side jitter (events may arrive late under a GC pause,
 but the audio thread does not stall).
 
-#### 6.B.1 Design note (current task)
+#### [x] 6.B.1 Design note
 
 Bounds the architecture, scope, and address resolution model
 before code lands. Settles the Haskell-vs-C++ ownership decision,
@@ -1045,7 +1047,7 @@ implement.
 
 Note: [Phase 6.B OSC design](notes/2026-05-10-phase-6b-osc-design.md).
 
-#### 6.B.2a Wire and dispatch (pure)
+#### [x] 6.B.2a Wire and dispatch (pure)
 
 `MetaSonic.OSC.Wire` (pure parser + `OscMessage` ADT) and
 `MetaSonic.OSC.Dispatch` (pure resolver, `ResolveState`,
@@ -1061,7 +1063,7 @@ resolution against the 6.A corpus plus negative cases
 mirroring 6.A's `DriverIssue` shape (unknown voice / node tag
 / slot, identifier-profile violations).
 
-#### 6.B.2b Bracketed UDP listener
+#### [x] 6.B.2b Bracketed UDP listener
 
 `MetaSonic.OSC.Listen` (in `src/`, not `app/`, so tests can
 import it). Exposes a bracketed listener that takes a supplied
@@ -1097,7 +1099,7 @@ slot, and runs the listener until Enter. OSC drops are logged
 to stderr. Same demo graph as the §6.B.3 end-to-end test so
 the CLI exercises the verified path.
 
-### Phase 6.C — Buffer I/O (active)
+### Phase 6.C — Buffer I/O (closed through §6.C.5)
 
 Buffer I/O is where resource identity becomes real: large sample data,
 shared references, mutation / recording, ownership across hot-swap,
@@ -1479,7 +1481,7 @@ Design / implementation note:
   not claim per-plugin arity / latency / resource effects on the
   current kind-level metadata model. Slice 1 added the registry,
   Haskell/C++ kind surface, and the deterministic silence skeleton.
-  Slice 2 (current) turns on real `Identity` dispatch through the
+  Slice 2 turned on real `Identity` dispatch through the
   `PluginSpec::process` vtable, plus `plugin_call_count` and
   `invalid_plugin_call_count` audio-thread counters with C ABI test
   accessors (`rt_graph_test_plugin_call_count` /
@@ -1572,8 +1574,9 @@ Design notes:
 
 ### Phase 7.A — Fusion Cost Lab
 
-Build an offline, non-audio measurement tool beside `--fusion-survey`,
-`--worker-bench`, `--swap-bench`, and `--corpus-survey`.
+First slice landed: an offline, non-audio measurement tool beside
+`--fusion-survey`, `--worker-bench`, `--swap-bench`, and
+`--corpus-survey`.
 
 Initial command shape:
 
@@ -1595,11 +1598,13 @@ For each row it should compile and time paired variants:
 - `RFused` path;
 - future generated-fusion path once it exists.
 
-Rows should be machine-readable first (JSONL or CSV), with fields for
-graph features, runtime variant, block size, voice count, node/region
-counts, resource footprint, declared latency, equivalence status,
-counter summary, median ns/sample, spread, and speedup against the
-node-loop baseline.
+Rows are machine-readable first: JSONL by default, with a `--summary`
+table for human inspection. Slice 1 emits graph family/member,
+runtime variant, node/region/kernel/RFused counts, exact-equivalence
+status, ns/sample, and speedup against a stripped node-loop baseline.
+Open follow-up fields are resource footprint, declared latency,
+consumer/fanout shape, counter summary, spread, corpus rows, and
+snapshot-checker invariants.
 
 Goal: produce measured rules such as "sink-terminal 3+ node chains are
 profitable" or "buffer-terminal filter chains are borderline" instead
@@ -1709,9 +1714,9 @@ Design note:
   follow-ups, lowering transparency requirements, and first
   implementation series.
 
-### Phase 8.A — Authoring DSL Contract
+### [x] Phase 8.A — Authoring DSL Contract
 
-The contract note is the first artifact. It should decide:
+The contract note is landed. It decides:
 
 - which concepts belong in the high-level authoring layer;
 - what lowers to one primitive graph vs. multiple templates;
@@ -1727,9 +1732,9 @@ Non-goals for the first pass:
 - bypassing validation or template scheduling;
 - hidden runtime allocation.
 
-### Phase 8.B — Signal Collection Types
+### [x] Phase 8.B — Signal Collection Types
 
-Introduce lightweight wrappers over existing `Connection`s:
+Introduced lightweight wrappers over existing `Connection`s:
 
 ```haskell
 newtype Mono = Mono Connection
@@ -1751,9 +1756,10 @@ The first helper surface should be boring and explicit:
 This gives the project multichannel authoring without changing the
 runtime audio buffer model.
 
-### Phase 8.C — Lifted UGen Combinators and Multichannel Expansion
+### Phase 8.C — Lifted UGen Combinators and Multichannel Expansion (partial)
 
-Add lifted versions of common primitives that expand channel-wise:
+First slice added lifted versions of common primitives that expand
+channel-wise:
 
 - gain over mono/stereo/channel sets;
 - filter over mono/stereo/channel sets;
