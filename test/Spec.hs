@@ -963,6 +963,83 @@ unitTests = testGroup "Unit tests"
             Left err ->
               assertBool ("expected template name in error, got: " <> err)
                          ("naughty" `isInfixOf` err)
+
+      , -- §6.C.4 slice 3: templatePrecedes unions bus + buffer
+        -- edges. Bus and buffer ids live in disjoint namespaces,
+        -- so neither half can spuriously trip the other.
+
+        testCase "templatePrecedes: BufWrite \8594 BufRead on same buffer adds an edge" $ do
+          let writer = emptyResourceFootprint
+                { rfBuffers = emptyBufferFootprint
+                    { bfBufWrites = S.singleton 3 } }
+              reader = emptyResourceFootprint
+                { rfBuffers = emptyBufferFootprint
+                    { bfBufReads = S.singleton 3 } }
+          templatePrecedes writer reader @?= True
+          -- Asymmetric: the reader does not precede the writer.
+          templatePrecedes reader writer @?= False
+
+      , testCase "templatePrecedes: BufWrite on a different buffer does not add an edge" $ do
+          let writer = emptyResourceFootprint
+                { rfBuffers = emptyBufferFootprint
+                    { bfBufWrites = S.singleton 3 } }
+              reader = emptyResourceFootprint
+                { rfBuffers = emptyBufferFootprint
+                    { bfBufReads = S.singleton 4 } }
+          templatePrecedes writer reader @?= False
+
+      , testCase "templatePrecedes: BufRead alone is non-ordering" $ do
+          -- Two readers on the same buffer: no edge (identical
+          -- reads commute, matching the BusIn/BusIn convention).
+          let readerA = emptyResourceFootprint
+                { rfBuffers = emptyBufferFootprint
+                    { bfBufReads = S.singleton 1 } }
+              readerB = readerA
+          templatePrecedes readerA readerB @?= False
+
+      , testCase "templatePrecedes: bus 5 / buffer 5 share an int but not a namespace" $ do
+          -- A regression guard for the disjoint-id-space property:
+          -- a template writing bus 5 must not precede a template
+          -- that only reads BUFFER 5 (or vice versa).
+          let busWriter5 = emptyResourceFootprint
+                { rfBuses = emptyFootprint
+                    { bfWrites = S.singleton 5 } }
+              bufReader5 = emptyResourceFootprint
+                { rfBuffers = emptyBufferFootprint
+                    { bfBufReads = S.singleton 5 } }
+              bufWriter5 = emptyResourceFootprint
+                { rfBuffers = emptyBufferFootprint
+                    { bfBufWrites = S.singleton 5 } }
+              busReader5 = emptyResourceFootprint
+                { rfBuses = emptyFootprint
+                    { bfReads = S.singleton 5 } }
+          templatePrecedes busWriter5 bufReader5 @?= False
+          templatePrecedes bufWriter5 busReader5 @?= False
+
+      , testCase "computePrecedence: bus + buffer edges both register" $ do
+          -- Three templates: A writes bus 0, B writes buffer 7,
+          -- C reads both. computePrecedence should map C \8594 {A, B}.
+          let dummyRG = RuntimeGraph [] []
+              tA = Template (TemplateID 0) "A" dummyRG
+                   emptyResourceFootprint
+                     { rfBuses = emptyFootprint
+                         { bfWrites = S.singleton 0 } }
+              tB = Template (TemplateID 1) "B" dummyRG
+                   emptyResourceFootprint
+                     { rfBuffers = emptyBufferFootprint
+                         { bfBufWrites = S.singleton 7 } }
+              tC = Template (TemplateID 2) "C" dummyRG
+                   emptyResourceFootprint
+                     { rfBuses   = emptyFootprint
+                         { bfReads    = S.singleton 0 }
+                     , rfBuffers = emptyBufferFootprint
+                         { bfBufReads = S.singleton 7 }
+                     }
+              prec = computePrecedence [tA, tB, tC]
+          M.lookup (TemplateID 2) prec
+            @?= Just (S.fromList [TemplateID 0, TemplateID 1])
+          M.lookup (TemplateID 0) prec @?= Just S.empty
+          M.lookup (TemplateID 1) prec @?= Just S.empty
       ]
 
   , -- Rate propagation: 'inferRate' returns each kind's *floor*; the

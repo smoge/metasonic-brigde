@@ -43,6 +43,9 @@ module MetaSonic.Bridge.Templates
     TemplateGraph (..)
   , compileTemplateGraph
   , compileTemplateGraphFused
+  , -- * §6.C.4 precedence rule (exposed for tests)
+    computePrecedence
+  , templatePrecedes
   , -- * Template-level schedule stats (§4.E.2c read-only view)
     TemplateScheduleStats (..)
   , templateScheduleStats
@@ -345,16 +348,35 @@ computePrecedence ts = M.fromList
         [ tplID a
         | a <- ts
         , tplID a /= tplID b
-          -- §6.C.4 slice 2 keeps the precedence rule bus-only:
-          -- buffer edges land in slice 3.
-        , not (S.null
-                 (bfWrites (rfBuses (tplFootprint a))
-                  `S.intersection`
-                  bfReads  (rfBuses (tplFootprint b))))
+        , templatePrecedes (tplFootprint a) (tplFootprint b)
         ]
     )
   | b <- ts
   ]
+
+-- | §6.C.4 slice 3 precedence rule: A precedes B iff A writes
+-- some resource (bus or buffer) that B reads live. Bus and
+-- buffer id spaces are disjoint, so checking the two
+-- intersections separately avoids any namespace collision and
+-- keeps the rule shape identical to the pre-§6.C.4 bus-only
+-- form.
+--
+-- Delayed reads (bus or buffer) do not contribute — matches the
+-- pre-§6.C.4 rule and the intra-graph E_r convention.
+--
+-- Writer kinds for buffers don't exist yet (6.C.4 follow-up
+-- adds RecordBufMono), so the buffer half of the disjunction is
+-- always False in v1 corpora — which is what keeps bus-only
+-- precedence bit-identical with slice 2.
+templatePrecedes :: ResourceFootprint -> ResourceFootprint -> Bool
+templatePrecedes a b = busEdge || bufEdge
+  where
+    busEdge = not (S.null
+      (bfWrites (rfBuses a) `S.intersection`
+       bfReads  (rfBuses b)))
+    bufEdge = not (S.null
+      (bfBufWrites (rfBuffers a) `S.intersection`
+       bfBufReads  (rfBuffers b)))
 
 
 {- Note [Template topo-sort]

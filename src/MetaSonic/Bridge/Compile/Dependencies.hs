@@ -248,12 +248,22 @@ regionBusPrecedence rg = M.fromList
       [ rrIndex other
       | other <- regions
       , rrIndex other /= rrIndex r
-        -- §6.C.4 slice 2: precedence stays bus-only here; slice 3
-        -- unions the buffer half.
+        -- §6.C.4 slice 3: union bus + buffer edges. Buffer ids
+        -- live in a disjoint namespace from bus ids, so checking
+        -- the two intersections separately keeps the rule shape
+        -- identical to the pre-§6.C.4 bus-only form. Writer
+        -- kinds for buffers don't exist in v1 — the buffer
+        -- disjunct is always False in current corpora — which
+        -- is what keeps bus-only region precedence bit-identical
+        -- across the §6.C.4 slices.
+      , let aFP = rrFootprint other
+            bFP = rrFootprint r
       , not (S.null
-              (bfWrites (rfBuses (rrFootprint other))
-                `S.intersection`
-               bfReads  (rfBuses (rrFootprint r))))
+              (bfWrites (rfBuses aFP) `S.intersection`
+               bfReads  (rfBuses bFP)))
+        || not (S.null
+              (bfBufWrites (rfBuffers aFP) `S.intersection`
+               bfBufReads  (rfBuffers bFP)))
       ])
   | r <- regions
   ]
