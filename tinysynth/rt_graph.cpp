@@ -4988,8 +4988,8 @@ static void process_record_buf_mono(
   g.buffer_invalid_write_count += invalid_samples;
 }
 
-// §6.D slice 2 spectral freeze kernel: real overlap-add STFT
-// in pass-through mode.
+// §6.D spectral freeze kernel: overlap-add STFT with a hop-latched
+// freeze flag.
 //
 // Pipeline per sample (fi = 0..nframes-1):
 //
@@ -5001,13 +5001,12 @@ static void process_record_buf_mono(
 //      data would re-emit it).
 //   3. Increment samples_in / samples_out. If samples_in is a
 //      multiple of hop AND samples_in >= N (we have a full
-//      analysis frame), run one analysis-hop pass: copy the
-//      input ring through the Hann window into spectrum_work,
-//      FFT in place, then IFFT (slice 2 is pass-through —
-//      slice 3 will wire in freeze gating between FFT and
-//      IFFT). Window-multiply the IFFT output and add into
-//      output_ring at output_write_head ahead of
-//      output_read_head by N - hop samples.
+//      analysis frame), run one hop-boundary pass. In
+//      pass-through mode this analyzes the most recent N
+//      samples and persists their Hermitian spectrum; in
+//      freeze mode this skips analysis and reuses the frozen
+//      spectrum. Both paths IFFT, window-multiply, and
+//      overlap-add into output_ring.
 //
 // Steady-state latency: N samples. Pre-roll (samples_out < N)
 // is silent by construction because output_ring is zero-
@@ -5039,9 +5038,9 @@ constexpr int kSpectralFreezeHop = SpectralFreezeState::kHop;
 // a cold-start graph the first invocation is on the audio
 // thread, which is exactly where we don't want it. Namespace-
 // scope const-objects are zero-initialized at load time and
-// dynamically initialized before main() returns (and, on every
-// platform we care about, before any thread spawns), so any
-// later thread observes the table already built.
+// dynamically initialized before any runtime graph entrypoint
+// can start the audio callback, so the callback observes the
+// table already built.
 struct HannWindow {
   std::array<float, kSpectralFreezeN> data{};
   double sum_of_squares = 0.0;
@@ -5114,9 +5113,9 @@ static void process_spectral_freeze(
   constexpr int kHop   = kSpectralFreezeHop;
   constexpr int kBins  = kN / 2 + 1;  // unique real-FFT bins
   // kHannWindow / kSpectralResynthesisScale are namespace-scope
-  // constants initialized before main() returns — the audio
-  // thread never pays the table-build cost or the local-static
-  // thread-safe init guard.
+  // constants initialized before the audio callback can invoke
+  // this kernel, so the audio thread never pays the table-build
+  // cost or the local-static thread-safe init guard.
   const HannWindow &win = kHannWindow;
   const float scale = static_cast<float>(kSpectralResynthesisScale);
 
