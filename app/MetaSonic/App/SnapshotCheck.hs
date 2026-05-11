@@ -81,9 +81,12 @@ collectSurveySnapshots = SurveySnapshots
 
 costLabChecks :: [LabRow] -> [SnapshotCheck]
 costLabChecks rows =
-  [ check "cost-lab row count is stable"
-      (length rows == 39)
-      ("rows=" <> show (length rows))
+  [ check "cost-lab row counts are stable by family"
+      (familyCounts == expectedFamilyCounts)
+      ("expected=" <> renderCounts expectedFamilyCounts
+       <> "; actual=" <> renderCounts familyCounts
+       <> "; rows=" <> show (length rows)
+       <> "/" <> show expectedRowCount)
 
   , check "cost-lab covers the expected families"
       (familyNames == ["corpus", "fanout", "return-tail", "sink-chain"])
@@ -112,6 +115,23 @@ costLabChecks rows =
   ]
   where
     familyNames = sort (nub (map (familyName . lrFamily) rows))
+    familyCounts =
+      [ (fam, length [() | r <- rows, familyName (lrFamily r) == fam])
+      | fam <- familyNames
+      ]
+
+    expectedFamilyCounts =
+      [ ("corpus",      21)
+      , ("fanout",       3)
+      , ("return-tail",  3)
+      , ("sink-chain",  12)
+      ]
+
+    expectedRowCount =
+      sum (map snd expectedFamilyCounts)
+
+    renderCounts xs =
+      intercalate "," [fam <> ":" <> show n | (fam, n) <- xs]
 
     rowMeasured r =
       lrError r == Nothing

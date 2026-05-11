@@ -86,10 +86,10 @@ KTriOsc       16
 KHPF          17
 KBPF          18
 KNotch        19
-KPlayBufMono   20
-KRecordBufMono 21
-KSpectralFreeze  22
-KStaticPlugin  23
+KPlayBufMono    20
+KRecordBufMono  21
+KSpectralFreeze 22
+KStaticPlugin   23
 ```
 
 `test/Spec.hs` checks Haskell-side structural invariants, dense lowering,

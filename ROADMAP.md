@@ -1620,6 +1620,7 @@ plus resource-footprint, declared-latency, and consumer/fanout columns.
 A snapshot-checker slice added `--snapshot-check`, which asserts
 cost-lab row/equivalence/feature invariants and survey corpus
 compile/latency/shape invariants without comparing full text output.
+It is a dev-time invariant gate, not a golden-output contract.
 Open follow-up fields are counter summary, spread, random/fuzz rows,
 and the future generated-fusion variant.
 
