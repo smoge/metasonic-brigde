@@ -9217,3 +9217,113 @@ TEST_CASE("hot-swap substrate: null-arg paths are silent no-ops") {
     rt_graph_destroy(a);
     rt_graph_destroy(b);
 }
+
+// ----------------------------------------------------------------
+// §6.C.5 commit 1: writer-template monophony runtime backstop
+//
+// The Haskell loaders clamp writer templates declaratively, but
+// the public C ABI is reachable from C++ tests, future producers,
+// and any caller that builds graphs without going through the
+// Haskell loaders. The backstop in rt_graph_template_add_node and
+// rt_graph_template_set_polyphony makes that surface honor the
+// same single-writer-single-instance invariant.
+// ----------------------------------------------------------------
+
+TEST_CASE("§6.C.5: rt_graph_template_add_node clamps a writer template to polyphony=1") {
+    auto *g = rt_graph_create(/*capacity*/ 2, /*max_frames*/ kFrames);
+    REQUIRE(g != nullptr);
+    // A real buffer must exist so the kernel does not crash on the
+    // auto-spawn render path. The actual write path is irrelevant
+    // to this test — we only care about the polyphony clamp.
+    const int bid = rt_graph_buffer_alloc(g, kFrames);
+    CHECK(bid == 0);
+
+    // Drop a RecordBufMono (tag 21) into template 0 via the direct
+    // C ABI. The default polyphony was kDefaultPolyphony (8); the
+    // backstop must drop it to 1 in place.
+    rt_graph_template_add_node(g, 0, 0, 21);
+    rt_graph_set_control(g, 0, 0, static_cast<float>(bid));
+
+    // Template 0 already has its auto-spawned instance from
+    // rt_graph_create / clear. With cap=1 the second spawn must
+    // fail.
+    const int second = rt_graph_template_instance_add(g, 0);
+    CHECK(second == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§6.C.5: rt_graph_add_node template-0 shim picks up the same clamp") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    const int bid = rt_graph_buffer_alloc(g, kFrames);
+    CHECK(bid == 0);
+
+    // rt_graph_add_node forwards straight to template_add_node(_, 0, …).
+    // Same clamp must fire even though the caller never names
+    // template 0 explicitly.
+    rt_graph_add_node(g, 0, 21);  // RecordBufMono
+    rt_graph_set_control(g, 0, 0, static_cast<float>(bid));
+
+    CHECK(rt_graph_template_instance_add(g, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§6.C.5: set_polyphony cannot raise a writer template's cap above 1") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    const int bid = rt_graph_buffer_alloc(g, kFrames);
+    CHECK(bid == 0);
+
+    rt_graph_template_add_node(g, 0, 0, 21);  // RecordBufMono → clamps cap to 1
+    rt_graph_set_control(g, 0, 0, static_cast<float>(bid));
+
+    // Try to raise the cap back up after the writer is present.
+    // The backstop must silently keep it at 1.
+    rt_graph_template_set_polyphony(g, 0, 8);
+    CHECK(rt_graph_template_instance_add(g, 0) == -1);
+
+    rt_graph_template_set_polyphony(g, 0, 16);
+    CHECK(rt_graph_template_instance_add(g, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§6.C.5: set_polyphony=N then add_node(writer) still clamps to 1") {
+    auto *g = rt_graph_create(2, kFrames);
+    REQUIRE(g != nullptr);
+    const int bid = rt_graph_buffer_alloc(g, kFrames);
+    CHECK(bid == 0);
+
+    // Caller raises the cap before any writer node is added —
+    // legitimate, since the template is non-writer at this point.
+    rt_graph_template_set_polyphony(g, 0, 4);
+
+    // Drop the writer node. The add_node-side clamp fires and
+    // brings the cap back down to 1, even though set_polyphony
+    // accepted the higher value moments earlier.
+    rt_graph_template_add_node(g, 0, 0, 21);
+    rt_graph_set_control(g, 0, 0, static_cast<float>(bid));
+
+    CHECK(rt_graph_template_instance_add(g, 0) == -1);
+
+    rt_graph_destroy(g);
+}
+
+TEST_CASE("§6.C.5: non-writer templates keep set_polyphony's higher cap") {
+    auto *g = rt_graph_create(4, kFrames);
+    REQUIRE(g != nullptr);
+
+    // A non-writer template: just a SinOsc (tag 1). The §6.C.5
+    // clamp must not affect this path — set_polyphony(4) must
+    // stick, and the second spawn must succeed.
+    rt_graph_template_add_node(g, 0, 0, 1);
+    rt_graph_set_control(g, 0, 0, 440.0f);
+    rt_graph_template_set_polyphony(g, 0, 4);
+
+    const int second = rt_graph_template_instance_add(g, 0);
+    CHECK(second >= 0);
+
+    rt_graph_destroy(g);
+}

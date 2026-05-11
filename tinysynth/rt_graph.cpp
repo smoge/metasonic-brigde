@@ -715,6 +715,36 @@ struct RecordBufMonoState {
   long long write_head = 0;
 };
 
+/* Note [§6.C.5 single-writer-single-instance invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+v1 buffer writers are a single-writer, single-template-instance
+resource. The Haskell side rejects two `BufWrite`s on the same
+buffer at every scope (`Validate.checkUniqueBufferWriters` for
+intra-graph, `Templates.checkNoSharedBufferWriters` for cross-
+template), and the Haskell loaders clamp writer-template
+polyphony to 1 declaratively (`clampWriterPolyphony` in FFI).
+
+The C++ runtime adds a second, independent backstop on the
+public C ABI so the same invariant survives every construction
+path — Haskell loaders, direct C tests, future producers
+reaching into `rt_graph_template_add_node` /
+`rt_graph_template_set_polyphony` straight from the C side:
+
+  - `rt_graph_template_add_node`: when a RecordBufMono node is
+    dropped into a template whose polyphony > 1, the cap is
+    silently clamped to 1.
+
+  - `rt_graph_template_set_polyphony`: any attempt to raise
+    polyphony above 1 on a template that already carries a
+    RecordBufMono node is silently clamped to 1.
+
+The two-sided clamp is necessary because callers may set the
+cap and add nodes in either order. Lifting this restriction is
+a §6.C.5+ feature gated on a real ordering / mixdown primitive
+— the implicit "input declaration order" is the trap §6.C.4
+declined to pin.
+*/
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
 using NodeState =
@@ -7709,6 +7739,19 @@ int rt_graph_template_add(RTGraph *g) {
   return static_cast<int>(world(*g).defs.size() - 1);
 }
 
+// §6.C.5 commit 1: scan a template's spec for any buffer-writer
+// node. Used by both rt_graph_template_set_polyphony and
+// rt_graph_template_add_node to clamp polyphony to 1 whenever the
+// template carries a writer kind, so the §6.C.5 single-writer-
+// single-instance invariant survives every public-ABI construction
+// path (Haskell loaders, direct C tests, future producers).
+static bool def_has_buffer_writer(const MetaDef &def) {
+  for (const auto &node : def.nodes) {
+    if (node.kind == NodeKind::RecordBufMono) return true;
+  }
+  return false;
+}
+
 // Set the per-template polyphony cap (max simultaneously-live
 // instances of this template). Construction-only.
 //
@@ -7720,13 +7763,23 @@ int rt_graph_template_add(RTGraph *g) {
 // instances keep running until they release/free naturally; the cap
 // gates *future* spawns.
 //
+// §6.C.5 commit 1 backstop: if the template currently carries any
+// buffer-writer node (kind == NodeKind::RecordBufMono), the cap is
+// silently clamped to 1 regardless of the requested value. The same
+// clamp fires from rt_graph_template_add_node when a writer node is
+// added to a template that was previously non-writer. This keeps the
+// public C ABI in lockstep with the §6.C.4 / §6.C.5 invariant: at
+// most one live instance of any buffer-writer template.
+//
 // See Note [Pool model] for how the cap interacts with the
 // std::vector<GraphInstance> pool model.
 void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony) {
   if (!g) return;
   MetaDef *def = template_at(*g, template_id);
   if (!def) return;
-  def->polyphony = polyphony < 1 ? 1 : polyphony;
+  int clamped = polyphony < 1 ? 1 : polyphony;
+  if (clamped > 1 && def_has_buffer_writer(*def)) clamped = 1;
+  def->polyphony = clamped;
 
   // ensure_contribution_capacity is grow-only and uses
   // max(polyphony, occupied) per template, so lowering the cap
@@ -8315,6 +8368,16 @@ void rt_graph_template_add_node(RTGraph *g, int template_id, int node_index, int
 
   ensure_node_slot(*g, template_id, idx);
   configure_spec(def->nodes[to_size(idx)], kind);
+  // §6.C.5 commit 1 backstop: dropping a buffer-writer kind into a
+  // template forces its polyphony cap to 1. Pairs with the matching
+  // clamp in rt_graph_template_set_polyphony so the public C ABI
+  // refuses to let a writer template host more than one live
+  // instance — even when callers reach into _template_add_node
+  // directly (Haskell loaders, C++ doctests, future producers). See
+  // Note [§6.C.5 single-writer-single-instance invariant].
+  if (kind == NodeKind::RecordBufMono && def->polyphony > 1) {
+    def->polyphony = 1;
+  }
   for (auto &inst : world(*g).instances) {
     // [T:construction]: walk only the slots that already participate
     // in the audio schedule, skipping Reserved alongside Available.
