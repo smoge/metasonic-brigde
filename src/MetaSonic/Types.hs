@@ -65,6 +65,9 @@ module MetaSonic.Types
     KindSpec (..)
   , kindSpec
   , kindLatency
+  , -- * Per-kind fusion capability table (§7.B)
+    KindCapability (..)
+  , kindCapabilities
   , -- * Rate discipline
     Rate (..)
   , -- * Per-input-port consumption policy (§4.D.2)
@@ -539,6 +542,112 @@ kindLatency :: NodeKind -> Maybe Int
 kindLatency = \case
   KSpectralFreeze -> Just 1024
   _               -> Nothing
+
+
+{- Note [Per-kind capability table]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+'kindCapabilities' is the kind-level fusion legality vocabulary §7.B
+specifies. It is intentionally kept as a separate table from
+'kindSpec' for three reasons:
+
+  1. 'KindSpec' carries the ABI/arity/rate/label facts the C side
+     sees. Capabilities are planner vocabulary; mixing them would
+     conflate roles.
+
+  2. The "effects are per-UGen, not per-kind" invariant in
+     Note [Effects are per-UGen, not per-kind] in
+     'MetaSonic.Bridge.Source' is easier to keep honest with a
+     dedicated kind-level table whose purpose is explicitly per-kind.
+     'CapResourceAccess' declares only the *possibility* that the
+     kind touches a Bus/Buffer; the per-UGen 'inferEff' remains the
+     source of truth for which specific resource.
+
+  3. Adding a new planner-relevant flag does not need to touch the
+     C ABI side or the existing kindSpec/ugenView agreement tests.
+
+Flags are overlapping. A kind may belong to several flags at once
+('KOut' is both 'CapSinkTerminal' and 'CapResourceAccess'); the test
+suite enforces a few cross-table biconditionals to prevent drift:
+
+  * 'CapLatencyBearing' iff 'kindLatency k' is 'Just _'.
+  * 'CapSinkTerminal' iff @k `elem` [KOut, KBusOut]@.
+  * 'CapResourceAccess' iff a representative UGen of that kind has
+    'inferEff' that contains a non-'Pure' effect.
+
+See @notes/2026-05-11-phase-7b-capability-metadata-decision.md@.
+-}
+
+-- | Kind-level fusion legality flag.
+--
+-- See Note [Per-kind capability table] and
+-- @notes/2026-05-11-phase-7b-capability-metadata-decision.md@.
+data KindCapability
+  = CapStatelessOp
+    -- ^ Output at sample @n@ is a deterministic function of inputs
+    -- at sample @n@; no cross-sample state. Generated fusion may
+    -- inline a stateless op into a larger program.
+  | CapStatefulOp
+    -- ^ The kind carries cross-sample state (filter z^-1 history,
+    -- oscillator phase, envelope phase, smoother state, delay-line
+    -- position, buffer head, spectral analysis window). Generated
+    -- fusion may emit stateful ops as separate program instructions
+    -- but cannot collapse two stateful instances without explicit
+    -- state handling.
+  | CapSinkTerminal
+    -- ^ Terminates a chain. Output never feeds further DSP.
+  | CapResourceAccess
+    -- ^ Reads from or writes to a Bus or a Buffer. The flag declares
+    -- the possibility; per-UGen 'inferEff' declares the specific
+    -- resource.
+  | CapLatencyBearing
+    -- ^ Declares non-zero latency via 'kindLatency'. Generated
+    -- fusion cannot inline across a latency boundary without
+    -- explicit handling.
+  | CapHardBarrier
+    -- ^ Opaque to the planner. Cannot be fused into, out of, or
+    -- around. Reserved for kinds whose internal semantics the
+    -- planner does not yet have enough metadata to reason about
+    -- ('KStaticPlugin' until §6.E.3 per-plugin metadata refines it).
+  deriving stock    (Eq, Ord, Show, Generic, Enum, Bounded)
+  deriving anyclass (NFData)
+
+-- | Per-'NodeKind' fusion capability set. Overlapping flags; see
+-- Note [Per-kind capability table].
+--
+-- Open questions deferred out of §7.B (see decision note):
+--
+--   * 'KBusInDelayed' and 'KDelay' are not 'CapLatencyBearing'
+--     today because 'kindLatency' returns 'Nothing' for both. If
+--     either should become latency-bearing, extend 'kindLatency'
+--     first; the table follows automatically via the biconditional
+--     test.
+--   * 'KStaticPlugin' is uniformly 'CapHardBarrier'. Per-plugin
+--     refinement is the §6.E.3 follow-up.
+kindCapabilities :: NodeKind -> [KindCapability]
+kindCapabilities = \case
+  KSinOsc         -> [CapStatefulOp]
+  KSawOsc         -> [CapStatefulOp]
+  KPulseOsc       -> [CapStatefulOp]
+  KTriOsc         -> [CapStatefulOp]
+  KNoiseGen       -> [CapStatefulOp]
+  KLPF            -> [CapStatefulOp]
+  KHPF            -> [CapStatefulOp]
+  KBPF            -> [CapStatefulOp]
+  KNotch          -> [CapStatefulOp]
+  KEnv            -> [CapStatefulOp]
+  KDelay          -> [CapStatefulOp]
+  KSmooth         -> [CapStatefulOp]
+  KGain           -> [CapStatelessOp]
+  KAdd            -> [CapStatelessOp]
+  KOut            -> [CapSinkTerminal, CapResourceAccess]
+  KBusOut         -> [CapSinkTerminal, CapResourceAccess]
+  KBusIn          -> [CapStatelessOp,  CapResourceAccess]
+  KBusInDelayed   -> [CapStatelessOp,  CapResourceAccess]
+  KPlayBufMono    -> [CapStatefulOp,   CapResourceAccess]
+  KRecordBufMono  -> [CapStatefulOp,   CapResourceAccess]
+  KSpectralFreeze -> [CapStatefulOp,   CapLatencyBearing]
+  KStaticPlugin   -> [CapHardBarrier]
 
 
 {- Note [Rate discipline]
