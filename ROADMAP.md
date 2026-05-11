@@ -1148,8 +1148,9 @@ exception-throwing `BufferIssue` errors (revised after review:
 since capacity is not exposed across the FFI in v1; a separate
 `BiInvalidFrameCount` covers the wrapper-side check that fires
 before `fromIntegral` crosses the FFI). Fixed-cap pool of 64
-`BufferSlot`s on `RTGraphState`; counters
-(`rt_graph_test_buffer_read_count` /
+`BufferSlot`s — initially on `RTGraphState` in 6.C.3a, relocated
+to the `RTGraph` handle in 6.C.3b slice 1 so the pool survives
+hot-swap; counters (`rt_graph_test_buffer_read_count` /
 `_invalid_read_count`) tick per sample. Linear-interpolating
 `process_play_buf_mono` kernel reads from `st->buffer_id`,
 which is resolved from `controls[0]` once at instance reset

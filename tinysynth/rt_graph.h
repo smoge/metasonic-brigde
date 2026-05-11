@@ -633,16 +633,15 @@ int rt_graph_buffer_retire(RTGraph *g, int buffer_id);
 // retired buffer slot. If the audio thread has crossed at least
 // one block boundary since the matching retire (i.e. the
 // internal buffer-retire-generation counter has advanced past
-// the snapshot stamped by retire), the slot is safe to reuse —
-// every kernel call since the retire has seen state == Retired
-// and taken the invalid-read path, so no captured
-// samples.data() pointer can survive. Transitions the slot back
-// to Unallocated; storage capacity is preserved for the next
-// rt_graph_buffer_alloc. Returns 0 on success, -1 if buffer_id
-// is out of range or the slot is not currently Retired, -2 if
-// the audio thread might still hold a pre-retire pointer (the
-// producer should call rt_graph_process at least once more and
-// retry).
+// the snapshot stamped by retire), no pre-retire pointer can
+// survive — every kernel call since the retire has seen state
+// == Retired and taken the invalid-read path. Transitions the
+// slot back to Unallocated; storage capacity is preserved for
+// the next rt_graph_buffer_alloc. Returns 0 on success, -1 if
+// buffer_id is out of range or the slot is not currently
+// Retired, -2 if a pre-retire pointer might still be in flight
+// (the producer should call rt_graph_process at least once more
+// and retry).
 int rt_graph_buffer_collect_retired(RTGraph *g, int buffer_id);
 
 // [T:read-only] Phase §6.C.3a test surface: total number of

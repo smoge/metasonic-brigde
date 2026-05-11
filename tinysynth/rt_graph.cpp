@@ -2171,8 +2171,9 @@ private:
 // kernel may read) and Retired (the producer has dropped the
 // reference; the kernel takes the invalid-read path on the next
 // block). Retired slots' sample storage is preserved until a
-// successful collect proves the audio thread can no longer hold a
-// samples.data() pointer from a pre-retire block.
+// successful collect, which only succeeds once no pre-retire
+// pointer can survive (i.e. the audio thread has crossed a block
+// boundary since the retire).
 enum class BufferSlotState : int {
   Unallocated = 0,
   Allocated   = 1,
@@ -2186,9 +2187,11 @@ enum class BufferSlotState : int {
 // (alloc/load/clear are stopped-audio-only; retire/collect are
 // live-safe). `retire_generation_snapshot` records the value of
 // g.buffer_retire_generation observed at the moment of retire so
-// collect can prove "the audio thread has crossed at least one
-// block boundary since." Single-producer: retire writes the
-// snapshot, collect reads it.
+// collect can confirm that no pre-retire pointer can still be in
+// flight on the audio thread (the counter has advanced past the
+// snapshot — i.e. at least one block boundary has been crossed
+// since retire). Single-producer: retire writes the snapshot,
+// collect reads it.
 struct BufferSlot {
   std::vector<float> samples;
   std::atomic<BufferSlotState> state{BufferSlotState::Unallocated};
@@ -4483,12 +4486,9 @@ The producer mutates the pool through five C entry points:
                                  snapshot on the slot.
   * rt_graph_buffer_collect_retired — Retired -> Unallocated once
                                  g.buffer_retire_generation has
-                                 advanced past the snapshot
-                                 (proving the audio thread has
-                                 crossed a block boundary, so no
-                                 captured samples.data() pointer
-                                 from a pre-retire block can
-                                 survive). Returns -2 if still
+                                 advanced past the snapshot — at
+                                 which point no pre-retire pointer
+                                 can survive. Returns -2 if still
                                  live; producer should run one
                                  more process_graph block and
                                  retry.
@@ -4499,14 +4499,13 @@ at instance reset (in init_node_state, from controls[0]) and freeze
 it on PlayBufMonoState; the kernel reads st->buffer_id and emits
 zeros + ticks the invalid-read counter if the slot is unallocated or
 out of range. The read counter ticks per valid sample. Both counters
-live on RTGraphState and are observable through the
-rt_graph_test_buffer_* test surface.
+live on the RTGraph handle (alongside the buffer pool) and are
+observable through the rt_graph_test_buffer_* test surface.
 
-§6.C.3a is read-only — there is no audio-thread write path, no
+§6.C.3a/b are read-only — there is no audio-thread write path, no
 BufWrite UGen, and no precedence extension for BufRead (a BufRead
-alone induces no template ordering). §6.C.3b will revisit live-safe
-free; §6.C.4+ may add write kinds and the corresponding
-ResourceFootprint precedence layer.
+alone induces no template ordering). §6.C.4+ may add write kinds
+and the corresponding ResourceFootprint precedence layer.
 */
 
 // §6.C.3a kernel. Reads `st->buffer_id` (frozen at instance reset
@@ -8917,8 +8916,9 @@ int rt_graph_buffer_clear(RTGraph *g, int buffer_id) {
 // hold a samples.data() pointer captured at the top of the
 // current block — the pointer remains valid because retire
 // never resizes / frees samples. Stamps the slot with the
-// generation snapshot collect_retired needs to prove "the
-// audio thread has crossed a block boundary."
+// generation snapshot collect_retired uses to confirm no
+// pre-retire pointer can survive (i.e. the audio thread has
+// crossed at least one block boundary since this stamp).
 //
 // Returns 0 on success, -1 if buffer_id is out of range or the
 // slot is not currently Allocated.
@@ -8944,18 +8944,16 @@ int rt_graph_buffer_retire(RTGraph *g, int buffer_id) {
 
 // §6.C.3b slice 2. Live-safe collect: if the audio thread has
 // crossed at least one block boundary since retire (i.e. the
-// generation counter advanced past the snapshot), the slot is
-// safe to reuse — any captured samples.data() pointer from a
-// pre-retire block has gone out of scope, and every block
-// since has seen state == Retired and taken the invalid path.
-// Transitions the slot back to Unallocated; storage capacity is
-// preserved.
+// generation counter advanced past the snapshot), no pre-retire
+// pointer can survive — every block since has seen state ==
+// Retired and taken the invalid path, so the slot is safe to
+// reuse. Transitions the slot back to Unallocated; storage
+// capacity is preserved.
 //
 // Returns 0 on success, -1 if buffer_id is out of range or the
 // slot is not currently Retired, -2 if the slot IS retired but
-// the audio thread might still hold a pre-retire pointer (the
-// producer should call rt_graph_process at least once more and
-// retry).
+// a pre-retire pointer might still be in flight (the producer
+// should call rt_graph_process at least once more and retry).
 int rt_graph_buffer_collect_retired(RTGraph *g, int buffer_id) {
   if (g == nullptr) return -1;
   if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;

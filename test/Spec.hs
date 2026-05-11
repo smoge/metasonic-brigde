@@ -10054,8 +10054,11 @@ playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
 
       withRTGraph totalNodes nframes $ \rt -> do
         loadTemplateGraph rt tg
-        -- Allocate both buffers AFTER loadTemplateGraph (which
-        -- internally clears the buffer pool).
+        -- §6.C.3b: the buffer pool is keyed off the RTGraph
+        -- handle now, so alloc-before-load also works. Kept
+        -- post-load for readability — the surrounding test
+        -- builds the graph and the buffers in the same logical
+        -- step.
         bufA <- allocBuffer rt nframes
         bufB <- allocBuffer rt nframes
         bufferId bufA @?= 0

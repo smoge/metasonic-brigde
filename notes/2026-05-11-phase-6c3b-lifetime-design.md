@@ -1,10 +1,12 @@
 # Phase 6.C.3b — Buffer Lifetime Hardening (Design)
 
 Date: 2026-05-11
-Status: shipped (commits 6dbe75c slice 1; slice 2 in the
-follow-up commit on this branch). The contract that landed
-matches this note; Q-1..Q-5 resolutions are inlined in
-section 5 below.
+Status: shipped (commit 6dbe75c for slice 1, commit 166a667
+for slice 2). The contract that landed matches this note;
+Q-1..Q-5 resolutions are inlined in section 5 below. The
+producer-facing wrapper names are singular (`retireBuffer`,
+`collectRetiredBuffer`) and the new error vocabulary is the
+two-constructor pair `BiNotRetired` / `BiCollectStillLive`.
 
 This note follows
 [Phase 6.C.1 buffer I/O bounds](2026-05-10-phase-6c-buffer-io-design.md)
@@ -195,7 +197,7 @@ pure structural rework + one test.
 - Add `rt_graph_buffer_retire` + `rt_graph_buffer_collect_retired`
   to the C ABI; matching `c_rt_graph_buffer_*` foreign imports
   in [Bridge/FFI.hs](../src/MetaSonic/Bridge/FFI.hs); matching
-  `retireBuffer` / `collectRetiredBuffers` in
+  `retireBuffer` / `collectRetiredBuffer` in
   [Bridge/Buffer.hs](../src/MetaSonic/Bridge/Buffer.hs).
 - Add an `RTGraphState`-style generation counter for buffer
   retires so `collect` can prove "a block has run since the
@@ -211,14 +213,13 @@ pure structural rework + one test.
   distinguishable fills. Build a graph referencing `Buffer 0`.
   Render block 1 → assert the fill. Call `retireBuffer 0`.
   Render block 2 → assert zeros + invalid-read counter
-  ticks. Call `collectRetiredBuffers` → confirm `Buffer 0`
+  ticks. Call `collectRetiredBuffer` → confirm `Buffer 0`
   is now reusable. Re-`allocBuffer` → confirm we get ID 0
   back with a fresh empty fill. Counter-confirm read /
   invalid totals.
 
-Slice 2 ships two new entry points and one new error
-constructor (`BiCollectStillLive` or similar — to be
-pinned in the 6.C.3b.contract note).
+Slice 2 ships two new entry points and two new error
+constructors (`BiNotRetired`, `BiCollectStillLive`).
 
 ## 5. Q-1..Q-5 resolutions (settled during 6.C.3b slice 2)
 
