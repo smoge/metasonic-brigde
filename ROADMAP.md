@@ -1628,26 +1628,50 @@ Goal: produce measured rules such as "sink-terminal 3+ node chains are
 profitable" or "buffer-terminal filter chains are borderline" instead
 of treating fusion as a theoretical optimization.
 
-### Phase 7.B — Fusion Legality and Capability Metadata
+### [x] Phase 7.B — Fusion Legality and Capability Metadata
 
-Add compiler-visible metadata that classifies each `NodeKind` for
-fusion planning:
+Compiler-visible per-`NodeKind` metadata that classifies each kind
+for fusion planning. Six overlapping `KindCapability` flags:
 
-- pure sample operation;
-- stateful sample operation;
-- sink terminal;
-- resource reader/writer;
-- latency-bearing node;
-- hard barrier.
+- `CapStatelessOp`;
+- `CapStatefulOp`;
+- `CapSinkTerminal`;
+- `CapResourceAccess`;
+- `CapLatencyBearing`;
+- `CapHardBarrier`.
 
-The output is not a runtime change. It is the legality vocabulary the
-planner and cost lab share.
+Lives in `MetaSonic.Types` as
+`kindCapabilities :: NodeKind -> [KindCapability]`, deliberately
+separate from `kindSpec` so the "effects are per-UGen, not per-kind"
+invariant stays honest. `CapResourceAccess` declares only the
+kind-level possibility; per-UGen `inferEff` remains the single source
+of truth for which specific bus or buffer.
+
+Tooling surface:
+
+- `--fusion-survey` gained a "Kind capability footprint" section with
+  per-cap and per-kind counts.
+- The ranked missed-shape table gained a `chain-caps` column derived
+  from each `SinkShape`'s member sequence.
+- `--snapshot-check` pins corpus capability counts and asserts the
+  `CapLatencyBearing` ↔ `KSpectralFreeze` count biconditional.
+- `test/Spec.hs` pins totality, stateless/stateful exclusion, and the
+  latency / sink / resource biconditionals against `kindSpec`,
+  `kindLatency`, and `inferEff`.
+
+No runtime, C ABI, or compiler-behavior change. The output is the
+legality vocabulary the planner and cost lab share.
+
+Decision note:
+- [Phase 7.B capability metadata decision](notes/2026-05-11-phase-7b-capability-metadata-decision.md).
 
 ### Phase 7.C — FusionProgram IR and Survey-Only Planner
 
 Introduce a first-class Haskell representation for generated fused
-programs. The initial planner should build and pretty-print candidate
-programs, then report why each candidate is accepted or rejected.
+programs. The initial planner reads `kindCapabilities` (Phase 7.B) plus
+per-UGen `inferEff` to decide candidate legality, builds and
+pretty-prints candidate programs, then reports why each candidate is
+accepted or rejected.
 
 No C++ executor is required in this slice. The important output is
 diagnostic: candidate shape, member nodes, effects, latency footprint,

@@ -124,7 +124,7 @@ Out of v0:
 
 Do not promote this to a numbered phase until these artifacts exist:
 
-1. Phase 7.B capability metadata for fusion legality.
+1. [x] Phase 7.B capability metadata for fusion legality.
 2. Phase 7.C survey-only planner output.
 3. A v1 profitability/cost table from the cost lab.
 4. A command/event ADT sketch for session producer fan-in.
