@@ -58,6 +58,7 @@ module MetaSonic.Bridge.Source
   , smooth
   , playBufMono
   , recordBufMono
+  , spectralFreeze
   , tagged
   , cc
   , -- * Connection helpers
@@ -567,6 +568,24 @@ data UGen
     -- @BufWrite → BufRead@ on the same buffer automatically,
     -- and 'compileTemplateGraph' rejects same-buffer writers
     -- across templates. Rate is 'SampleRate'.
+  | SpectralFreeze !Connection !Connection
+    -- ^ Mono STFT freeze (§6.D first kind). Streams the
+    -- audio input through a fixed-window-size analysis
+    -- (N=1024, hop=256, Hann), and either resynthesizes the
+    -- running spectrum (pass-through mode, output equals the
+    -- input delayed by N samples in steady state) or holds
+    -- the last-completed window's spectrum and resynthesizes
+    -- from it indefinitely (freeze mode). Arguments in
+    -- declared order: the audio signal to analyse, and a
+    -- freeze flag (@< 0.5@ = pass-through, @>= 0.5@ =
+    -- freeze).
+    --
+    -- All windowing state is per-instance; the kind owns its
+    -- own analysis ring, output ring, and frozen spectrum
+    -- store. 'inferEff' is @[Pure]@ — spectral kinds extend
+    -- the runtime's compute capability, not its resource
+    -- model. Declared steady-state latency: N=1024 samples
+    -- ('kindLatency').
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -1060,6 +1079,42 @@ recordBufMono buf signalIn loopFlag =
   insertNodeC "recordBufMono"
     (RecordBufMono buf signalIn loopFlag)
 
+-- | Allocate a 'SpectralFreeze' node — mono STFT freeze
+-- (§6.D first spectral kind).
+--
+-- The kind streams the input signal through a fixed-window
+-- analysis (N=1024, hop=256, Hann) and either pass-throughs
+-- the resynthesized spectrum or holds the last-completed
+-- window's spectrum and resynthesizes from it indefinitely.
+-- All windowing state is per-instance; nothing crosses an
+-- instance boundary.
+--
+-- Inputs (in declared order):
+--
+--   - @signal_in@: the audio signal to analyse. Buffered
+--     into the per-instance analysis ring every sample.
+--   - @freeze_flag@: @< 0.5@ = pass-through, @>= 0.5@ =
+--     freeze. The kernel internally samples the flag once
+--     per analysis hop, but the port is 'PortSampleAccurate'
+--     because no existing 'PortConsumptionRate' classification
+--     honestly describes a hop-granular read pattern. See
+--     §2.4 / Q-1 of the 6.D design note for the reasoning.
+--
+-- Declared steady-state latency: N=1024 samples
+-- ('kindLatency'). Effect: @[Pure]@.
+--
+-- > runSynth $ do
+-- >   src    <- sinOsc 440.0 0.0
+-- >   frozen <- spectralFreeze src (Param 0.0)
+-- >   out 0 frozen
+spectralFreeze
+  :: Connection  -- ^ signal_in (the audio signal to analyse)
+  -> Connection  -- ^ freeze_flag (< 0.5 = pass-through, >= 0.5 = freeze)
+  -> SynthM Connection
+spectralFreeze signalIn freezeFlag =
+  insertNodeC "spectralFreeze"
+    (SpectralFreeze signalIn freezeFlag)
+
 -- | Declare a CC-bound smoothed control input. Allocates a 'Smooth'
 -- node fed by an initially-constant target, records the @(cc_number,
 -- smooth_node, ctl=1, min, max)@ binding in the builder state, and
@@ -1225,6 +1280,12 @@ ugenView = \case
              , connDefault sigIn
              , connDefault lp
              ]
+  SpectralFreeze sigIn fr ->
+    UGenView KSpectralFreeze
+             [sigIn, fr]
+             [ connDefault sigIn
+             , connDefault fr
+             ]
 
 
 {- Note [Per-UGen projections]
@@ -1328,6 +1389,11 @@ inferEff (BusIn        bus)         = [BusRead         bus]
 inferEff (BusInDelayed bus)         = [BusReadDelayed  bus]
 inferEff (PlayBufMono   buf _ _ _)  = [BufRead  (bufferId buf)]
 inferEff (RecordBufMono buf _ _)    = [BufWrite (bufferId buf)]
+-- §6.D: spectral kinds own their windowing state per-instance,
+-- nothing crosses a boundary. Written out explicitly so a future
+-- spectrum-stream kind that needs a real Eff axis is forced to add
+-- its own row rather than silently falling through.
+inferEff (SpectralFreeze _ _)       = [Pure]
 inferEff _                          = [Pure]
 
 
@@ -1368,6 +1434,7 @@ dependencies = \case
   Smooth _ v       -> deps [v]
   PlayBufMono   _ r s lp -> deps [r, s, lp]
   RecordBufMono _ sigIn lp -> deps [sigIn, lp]
+  SpectralFreeze sigIn fr -> deps [sigIn, fr]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

@@ -387,6 +387,7 @@ enum class NodeKind : int {
   Notch        = 19,
   PlayBufMono  = 20,
   RecordBufMono = 21,
+  SpectralFreeze = 22,
 };
 
 // Sink-terminal classifier. Both 'Out' and 'BusOut' are pure sinks
@@ -428,6 +429,7 @@ kind_from_tag(int node_kind) noexcept {
   case 19: return NodeKind::Notch;
   case 20: return NodeKind::PlayBufMono;
   case 21: return NodeKind::RecordBufMono;
+  case 22: return NodeKind::SpectralFreeze;
   default: return std::nullopt;
   }
 }
@@ -745,13 +747,53 @@ a §6.C.5+ feature gated on a real ordering / mixdown primitive
 declined to pin.
 */
 
+/* Note [Spectral kernel: per-instance window ownership]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Phase §6.D first spectral kind. Every spectral instance owns
+its own analysis ring, output ring, FFT scratch, and frozen
+spectrum store. Nothing crosses a graph-instance boundary, so
+the kind's 'Eff' is '[Pure]' and the §6.C.4 / §6.C.5 resource
+ordering machinery has nothing to do.
+
+Window: Hann, N=1024, hop=256, 4-overlap. q::fft<N, float>
+operates on interleaved real/imag in place. The kernel keeps
+two ring buffers (input ring of size N for analysis; output
+ring of size N + hop for overlap-add resynthesis) and an
+analysis-hop counter measured in samples_in.
+
+Slice-1 invariant: SpectralFreezeState exists on the
+NodeState variant and configure_spec / init_node_state
+zero-initialize it. The kernel emits zero on output port 0
+and never advances any analysis / resynthesis counters
+('spectral_analysis_count' / 'spectral_resynthesis_count'
+stay at 0). The real STFT body lands in slice 2; the freeze
+gate lands in slice 3.
+*/
+struct SpectralFreezeState {
+  static constexpr int kN        = 1024;
+  static constexpr int kHop      = 256;
+  static constexpr int kOverlaps = kN / kHop;   // 4
+
+  // Pre-zeroed at configure_node; reset never reallocates.
+  std::array<float, kN>               input_ring{};
+  std::array<float, kN + kHop>        output_ring{};
+  std::array<float, 2 * kN>           spectrum_work{};   // FFT scratch
+  std::array<float, 2 * (kN / 2 + 1)> frozen_spectrum{}; // last analysis hop
+  int       input_write_head = 0;
+  int       output_read_head = 0;
+  long long samples_in       = 0;  // monotonic; hop boundaries at samples_in % kHop == 0
+  long long samples_out      = 0;
+  bool      frozen_valid     = false;
+};
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
 using NodeState =
     std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState,
                  DelayState, SmoothState, PulseOscState,
                  HPFState, BPFState, NotchState,
-                 PlayBufMonoState, RecordBufMonoState>;
+                 PlayBufMonoState, RecordBufMonoState,
+                 SpectralFreezeState>;
 
 constexpr int kMigrationKeyMaxBytes = 16;
 
@@ -1406,6 +1448,16 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.default_controls = {-1.0, 0.0, 0.0};
     spec.input_refs.resize(2); // [signal_in, loop_flag_in]
     break;
+  case NodeKind::SpectralFreeze:
+    // Mono STFT freeze (§6.D first spectral kind). Two
+    // controls [signal_in_default, freeze_default] (one per
+    // audio input, matching Haskell's ksControlArity = 2);
+    // two audio inputs [signal_in, freeze_flag]. No
+    // resource id, no frozen control at instance reset — all
+    // windowing state is held on SpectralFreezeState.
+    spec.default_controls = {0.0, 0.0};
+    spec.input_refs.resize(2); // [signal_in, freeze_flag]
+    break;
   }
 
   // Step C (d): fused_inputs is parallel to input_refs. Sizing it
@@ -1532,6 +1584,18 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
     }
     target_outputs = 1;
     node.state = RecordBufMonoState{bid, 0};
+    break;
+  }
+
+  case NodeKind::SpectralFreeze: {
+    // §6.D first spectral kind. Per-instance window state is
+    // value-initialized (arrays of zero, heads at 0,
+    // samples_in / samples_out at 0, frozen_valid false). The
+    // arrays live on SpectralFreezeState — no allocation
+    // through std::array, so reset is allocation-free in
+    // steady state.
+    target_outputs = 1;
+    node.state = SpectralFreezeState{};
     break;
   }
 
@@ -2576,6 +2640,16 @@ node_kind_supports_state_migration(NodeKind kind) noexcept {
     // §6.C.4 follow-up does not extend state migration.
     return false;
 
+  case NodeKind::SpectralFreeze:
+    // §6.D first kind. The per-instance window state holds a
+    // ring buffer mid-window, an output overlap-add buffer
+    // mid-COLA, and a hop-aligned analysis counter. None of
+    // these survive a hot-swap meaningfully — a swap mid-
+    // window would either glitch (replay an in-flight
+    // overlap fragment) or restart silent. v1 opts out;
+    // freezing/swapping is a future series.
+    return false;
+
   case NodeKind::SinOsc:
   case NodeKind::Out:
   case NodeKind::Gain:
@@ -2755,6 +2829,7 @@ enum class StateMigrationResult {
   case NodeKind::Smooth:
   case NodeKind::PlayBufMono:
   case NodeKind::RecordBufMono:
+  case NodeKind::SpectralFreeze:
     return StateMigrationResult::Unsupported;
   }
   return StateMigrationResult::Unsupported;
@@ -4865,6 +4940,42 @@ static void process_record_buf_mono(
   g.buffer_invalid_write_count += invalid_samples;
 }
 
+// §6.D slice 1: spectral freeze kernel skeleton.
+//
+// This is the minimal body that lets process_instance dispatch
+// through SpectralFreeze without crashing. The kind is loaded,
+// instances spawn, audio renders — but no analysis or
+// resynthesis happens, and the output is silence on every
+// sample. The real STFT body lands in slice 2; freeze gating
+// lands in slice 3.
+//
+// Why ship the stub now rather than leaving the dispatch arm
+// unhandled: the §6.C.4-follow-up precedent (commit 39539bb)
+// established that a kind's Haskell surface should land
+// together with a C++ skeleton that keeps every existing
+// test green. Slice-1 tests assert the Haskell-side
+// kindSpec / portInfo / kindLatency / inferEff shape; a
+// missing C++ dispatch arm would either crash via the
+// default assert(false) or skip the kernel through an
+// unhandled-case warning. The stub closes that loop.
+static void process_spectral_freeze(
+    [[maybe_unused]] RTGraph &g,
+    GraphInstance &inst,
+    std::size_t node_idx,
+    int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+
+  auto *st = std::get_if<SpectralFreezeState>(&node.state);
+  assert(st && "SpectralFreeze node has non-SpectralFreeze state");
+  (void)st;
+
+  // Slice-1 stub: silence on the audio output, no counter
+  // ticks, no state mutation. Slice-2 replaces this body with
+  // the real overlap-add STFT.
+  std::fill(out.begin(), out.end(), 0.0f);
+}
+
 /* Note [Execution order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Inside one instance the runtime processes nodes in storage order.
@@ -6048,6 +6159,9 @@ static inline void dispatch_node(
     break;
   case NodeKind::RecordBufMono:
     process_record_buf_mono(g, inst, i, nframes);
+    break;
+  case NodeKind::SpectralFreeze:
+    process_spectral_freeze(g, inst, i, nframes);
     break;
   default:
     assert(false && "unhandled NodeKind in process_instance");

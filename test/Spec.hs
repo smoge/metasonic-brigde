@@ -148,6 +148,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , bufferPoolTests
   , playBufMonoTests
   , recordBufMonoSkeletonTests
+  , spectralFreezeSkeletonTests
   ]
 
 ------------------------------------------------------------
@@ -11226,4 +11227,99 @@ recordBufMonoSkeletonTests =
           ("expected three additional non-writer instances; got "
            <> show [s1, s2, s3])
           (all (>= 0) [s1, s2, s3])
+  ]
+
+------------------------------------------------------------
+-- §6.D slice 1: KSpectralFreeze surface + C++ skeleton
+--
+-- Slice-1 tests pin only the Haskell-side shape and the
+-- declared latency. No kernel-output assertions yet — the
+-- C++ side is a stub that emits silence. Slice 2 adds the
+-- real STFT body + pre-roll silence + warmed-up impulse +
+-- sine reconstruction; slice 3 adds the freeze gate tests.
+--
+-- Property tests in 'unitTests' iterate over every
+-- 'NodeKind' (kindTag-vs-kind_supported, ugenView arities,
+-- portInfo coverage) and therefore extend through
+-- 'KSpectralFreeze' automatically — slice 1 inherits that
+-- coverage without writing a new test.
+------------------------------------------------------------
+
+spectralFreezeSkeletonTests :: TestTree
+spectralFreezeSkeletonTests =
+  testGroup "Phase 6.D slice 1: SpectralFreeze surface"
+  [ testCase "inferEff produces Pure" $ do
+      -- §6.D: spectral kinds own their windowing state per
+      -- instance, nothing crosses a graph boundary. Pinning
+      -- this means a future spectrum-streaming kind that
+      -- needs a real Eff axis is forced to introduce it
+      -- deliberately rather than fall through the default.
+      let g = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+          ir = case lowerGraph g of
+                 Right ir' -> ir'
+                 Left err  -> error err
+          freezeEffs =
+            [ eff
+            | n   <- giNodes ir
+            , eff <- irEffects n
+            , irKind n == KSpectralFreeze
+            ]
+      freezeEffs @?= [Pure]
+
+  , testCase "kindSpec / portInfo / kindLatency agree on shape" $ do
+      ksTag          (kindSpec KSpectralFreeze) @?= 22
+      ksRate         (kindSpec KSpectralFreeze) @?= SampleRate
+      ksAudioArity   (kindSpec KSpectralFreeze) @?= 2
+      ksControlArity (kindSpec KSpectralFreeze) @?= 2
+      ksLabel        (kindSpec KSpectralFreeze) @?= "spectralFreeze"
+      portInfo KSpectralFreeze (PortIndex 0)
+        @?= Just (PortInfo PortSampleAccurate "signal_in")
+      portInfo KSpectralFreeze (PortIndex 1)
+        @?= Just (PortInfo PortSampleAccurate "freeze_flag")
+      portInfo KSpectralFreeze (PortIndex 2) @?= Nothing
+
+  , testCase "kindLatency declares N=1024 for KSpectralFreeze" $ do
+      kindLatency KSpectralFreeze @?= Just 1024
+      -- Everything else must stay Nothing — the accessor is
+      -- only meaningful on kinds that introduce inherent
+      -- pipeline latency.
+      kindLatency KSinOsc         @?= Nothing
+      kindLatency KGain           @?= Nothing
+      kindLatency KLPF            @?= Nothing
+      kindLatency KPlayBufMono    @?= Nothing
+      kindLatency KRecordBufMono  @?= Nothing
+
+  , testCase "ugenView arities match kindSpec for SpectralFreeze" $ do
+      -- The local check that the global property
+      -- 'ugenView arities match kindSpec for every UGen'
+      -- already covers — but a focused unit case here makes
+      -- intent obvious for reviewers reading slice 1 in
+      -- isolation.
+      let view = ugenView
+            (SpectralFreeze (Param 0.0) (Param 0.0))
+      length (uvInputs view)   @?= 2
+      length (uvControls view) @?= 2
+
+  , testCase "spectralFreeze graph compiles and renders without crashing" $ do
+      -- Stub kernel emits silence; the test pins only that
+      -- the kind is wired end-to-end (loader, dispatch,
+      -- output port) and a process_graph call returns
+      -- normally. Bus output magnitude is not asserted — that
+      -- belongs to slice 2.
+      let nframes = 64
+          graph = runSynth $ do
+            src    <- sinOsc 440.0 0.0
+            frozen <- spectralFreeze src (Param 0.0)
+            out 0 frozen
+      tg <- case compileTemplateGraph [("freeze", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
   ]

@@ -64,6 +64,7 @@ module MetaSonic.Types
   , -- * Per-kind metadata
     KindSpec (..)
   , kindSpec
+  , kindLatency
   , -- * Rate discipline
     Rate (..)
   , -- * Per-input-port consumption policy (§4.D.2)
@@ -279,6 +280,26 @@ data NodeKind
     -- picks up @BufWrite → BufRead@ on the same buffer
     -- automatically and rejects same-buffer writers in
     -- 'compileTemplateGraph'.
+  | KSpectralFreeze
+    -- ^ Mono float32 STFT freeze (§6.D, first spectral kind).
+    -- Streams the input through a fixed-window-size analysis
+    -- (N=1024, hop=256, Hann), and either resynthesizes the
+    -- running spectrum (pass-through mode: output equals the
+    -- input delayed by N samples in steady state) or holds
+    -- the last-completed window's spectrum and resynthesizes
+    -- from it indefinitely (freeze mode). Audio inputs in
+    -- declared order: @[signal_in, freeze_flag]@. Controls
+    -- @[signal_in_default, freeze_default]@.
+    -- @freeze_flag@ @< 0.5@ = pass-through, @>= 0.5@ = freeze.
+    -- The kernel internally samples @freeze_flag@ once per
+    -- analysis hop; the port itself is 'PortSampleAccurate'
+    -- because no existing 'PortConsumptionRate' classification
+    -- honestly describes hop-granular reads (a hop is not a
+    -- host audio block — see §2.4 / Q-1 of the 6.D design
+    -- note). 'inferEff' is @[Pure]@: the kind owns its own
+    -- per-instance ring buffers and spectrum store, nothing
+    -- crosses an instance boundary. Declared steady-state
+    -- latency: N=1024 samples (see 'kindLatency').
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -448,6 +469,14 @@ kindSpec = \case
   -- floor because the kernel writes once per output sample
   -- and the write head advances per sample.
   KRecordBufMono -> KindSpec 21 SampleRate  2 3 "recordBufMono"
+  -- Spectral freeze (§6.D first kind): per-instance STFT with
+  -- N=1024, hop=256, Hann window. 2 audio inputs
+  -- (signal_in, freeze_flag), 2 controls
+  -- [signal_in_default, freeze_default]. SampleRate floor
+  -- because output is delivered one sample per audio frame;
+  -- the hop-granular analysis/resynthesis work is internal
+  -- to the kernel.
+  KSpectralFreeze -> KindSpec 22 SampleRate  2 2 "spectralFreeze"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to
@@ -472,6 +501,30 @@ kindSpec = \case
 -- rt_graph.cpp. Verified by a contract test in Spec.hs.
 kindTag :: NodeKind -> CInt
 kindTag = ksTag . kindSpec
+
+-- | Declared steady-state pipeline latency of a kind, in samples.
+--
+-- @Nothing@ means "no inherent latency": the kind's output at frame
+-- @i@ is a function of inputs at frame @i@ (and possibly earlier
+-- frames the kind already has in private state). @Just k@ means
+-- "output port 0 at frame @i@ corresponds to the input that arrived
+-- at frame @i - k@ in steady state," typically because the kernel
+-- needs to buffer @k@ samples before producing meaningful output —
+-- e.g. an STFT analyzer with overlap-add resynthesis.
+--
+-- §6.D first consumer: 'KSpectralFreeze' returns @Just 1024@. The
+-- Haskell side records the latency; no IR / scheduler pass consumes
+-- it today (a future latency-compensation pass under §6.D.1 or
+-- later is the intended consumer). The accessor exists now so kinds
+-- that ship before that pass already declare honest values rather
+-- than placeholders.
+--
+-- See Note [§6.D latency contract] in
+-- @notes/2026-05-11-phase-6d-spectral-design.md@.
+kindLatency :: NodeKind -> Maybe Int
+kindLatency = \case
+  KSpectralFreeze -> Just 1024
+  _               -> Nothing
 
 
 {- Note [Rate discipline]
@@ -703,6 +756,22 @@ portInfo k (PortIndex i) = case k of
     -- loop_flag: checked at the write-head boundary every
     -- sample so live toggling between loop and one-shot works.
     1 -> Just (PortInfo PortSampleAccurate "loop_flag")
+    _ -> Nothing
+  KSpectralFreeze -> case i of
+    -- signal_in: every sample is buffered into the analysis
+    -- ring.
+    0 -> Just (PortInfo PortSampleAccurate "signal_in")
+    -- freeze_flag: the kernel internally samples the flag at
+    -- analysis-hop boundaries, but the port itself is
+    -- PortSampleAccurate because no existing
+    -- PortConsumptionRate classification honestly describes a
+    -- hop-granular read pattern. PortBlockLatched specifically
+    -- means "read only at sample 0 of each host audio block";
+    -- a hop boundary is not a host block boundary. See §2.4 /
+    -- Q-1 of the 6.D design note for why we don't overload
+    -- PortBlockLatched and the long-term PortHopLatched /
+    -- PortWindowLatched plan.
+    1 -> Just (PortInfo PortSampleAccurate "freeze_flag")
     _ -> Nothing
   where
     -- Oscillator family: port 0 = freq (sample-accurate FM when
