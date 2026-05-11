@@ -27,6 +27,10 @@ import           System.Exit               (die)
 import           MetaSonic.App.Demos
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.IR
+import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
+                                             RejectionReason (..),
+                                             Verdict (..), isAccepted,
+                                             isRejected, planRuntimeGraph)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Types            (KindCapability (..),
@@ -483,6 +487,11 @@ data SurveyRow = SurveyRow
     -- printed in the kind capability footprint section. Sorted by
     -- 'NodeKind' Enum order; kinds with zero occurrences are
     -- dropped.
+  , srPlannerVerdicts :: ![Verdict]
+    -- ^ §7.C survey-only fusion planner output. One 'Verdict' per
+    -- candidate; consumers aggregate per-reason rejection counts
+    -- and matched-shape acceptance counts. Read-only; the planner
+    -- does not influence runtime behavior.
   } deriving (Eq, Show)
 
 -- | Per-row tally of 'NodeKind' → count of nodes carrying that kind.
@@ -575,6 +584,7 @@ surveyRuntimeGraph d t rt rtF stats workerStats =
        , srDeclaredLatency = declaredLatencyFootprint rt
        , srLatencySkews    = inputLatencySkews rt
        , srKindTally       = kindTallyOf rt
+       , srPlannerVerdicts = planRuntimeGraph rt
        }
 
 -- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
@@ -1530,6 +1540,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printCapabilityFootprint allRows
   putStrLn ""
+  printPlannerVerdicts allRows
+  putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
   case allErrs of
@@ -2222,12 +2234,13 @@ formatLatencyRow cols =
 
 -- Two sub-sections under one header:
 --
---   1. Per-capability node counts across the corpus. A node is
---      counted once for each capability its kind carries, so the
---      column totals do not sum to the node count.
---   2. The per-kind matrix: for each 'NodeKind' that appears in the
---      corpus, its total occurrence count and its declared
---      'kindCapabilities' list.
+--   1. Per-capability node counts across every surveyed graph
+--      (demos plus the corpus). A node is counted once for each
+--      capability its kind carries, so the column totals do not
+--      sum to the node count.
+--   2. The per-kind matrix: for each 'NodeKind' that appears in
+--      any surveyed graph, its total occurrence count and its
+--      declared 'kindCapabilities' list.
 --
 -- The footprint is descriptive only. No planner decision is made
 -- from it yet; the section exists so the upcoming Phase 7.C planner
@@ -2273,6 +2286,125 @@ formatCapRow cols =
     pad w s
       | length s >= w = s
       | otherwise     = s <> replicate (w - length s) ' '
+
+--------------------------------------------------------------------------------
+-- §7.C planner verdicts
+--------------------------------------------------------------------------------
+
+-- Per-row 'srPlannerVerdicts' is aggregated across every surveyed
+-- graph and rendered as two sub-sections:
+--
+--   1. Per-rejection-reason counts plus one example per reason.
+--   2. Accepted candidates grouped by their matched §4.B kernel,
+--      with a separate "no-§4.B-match" row for generated-eligible
+--      candidates.
+--
+-- The planner over-reports by design: a 4-node sink-terminal chain
+-- yields nested 2/3/4-length candidates, all with their own
+-- verdicts. The counts here therefore exceed the per-graph node
+-- count; that is expected and the cost-lab consumption pass will
+-- coalesce.
+printPlannerVerdicts :: [SurveyRow] -> IO ()
+printPlannerVerdicts rows = do
+  putStrLn "─── Phase 7.C planner verdicts ───"
+  let verdicts = concatMap srPlannerVerdicts rows
+      accs     = filter isAccepted verdicts
+      rejs     = filter isRejected verdicts
+  putStrLn $ "  candidates=" <> show (length verdicts)
+          <> "  accepted="   <> show (length accs)
+          <> "  rejected="   <> show (length rejs)
+  if null verdicts
+    then putStrLn "  (no candidates in the surveyed graphs)"
+    else do
+      putStrLn ""
+      printRejectionSummary rejs
+      putStrLn ""
+      printAcceptedByShape accs
+
+printRejectionSummary :: [Verdict] -> IO ()
+printRejectionSummary [] =
+  putStrLn "  (no rejections)"
+printRejectionSummary rejs = do
+  putStrLn "  Top rejection reasons (count desc):"
+  let reasons   = [r | Rejected _ r <- rejs]
+      tags      = nub (map reasonTag reasons)
+      grouped   =
+        [ (tag, count, exampleStr)
+        | tag <- tags
+        , let matching = filter ((== tag) . reasonTag) reasons
+              count    = length matching
+              exampleStr = case matching of
+                (r : _) -> renderReasonExample r
+                _       -> "(none)"
+        ]
+      sorted    = sortOn (\(_, c, _) -> negate c) grouped
+  mapM_
+    (\(tag, count, ex) ->
+        putStrLn $ "    " <> padR 24 tag
+                 <> "count=" <> padR 5 (show count)
+                 <> "example=" <> ex)
+    sorted
+
+reasonTag :: RejectionReason -> String
+reasonTag r = case r of
+  ReasonHardBarrier{}      -> "ReasonHardBarrier"
+  ReasonLatencyMidChain{}  -> "ReasonLatencyMidChain"
+  ReasonResourceMidChain{} -> "ReasonResourceMidChain"
+  ReasonStatefulInterior{} -> "ReasonStatefulInterior"
+  ReasonFanoutEscape{}     -> "ReasonFanoutEscape"
+  ReasonTooShort{}         -> "ReasonTooShort"
+  ReasonNoTerminalSink     -> "ReasonNoTerminalSink"
+  ReasonCrossesRegion{}    -> "ReasonCrossesRegion"
+
+renderReasonExample :: RejectionReason -> String
+renderReasonExample r = case r of
+  ReasonHardBarrier ix k        ->
+    "node " <> show (nodeIxInt ix) <> " " <> show k
+  ReasonLatencyMidChain ix k l  ->
+    "node " <> show (nodeIxInt ix) <> " " <> show k
+            <> " (lat=" <> show l <> ")"
+  ReasonResourceMidChain ix k   ->
+    "node " <> show (nodeIxInt ix) <> " " <> show k
+  ReasonStatefulInterior ix k   ->
+    "node " <> show (nodeIxInt ix) <> " " <> show k
+  ReasonFanoutEscape ix cc      ->
+    "node " <> show (nodeIxInt ix) <> " consumers=" <> show cc
+  ReasonTooShort n              -> "len=" <> show n
+  ReasonNoTerminalSink          -> "(structural)"
+  ReasonCrossesRegion ix        -> "node " <> show (nodeIxInt ix)
+
+nodeIxInt :: NodeIndex -> Int
+nodeIxInt (NodeIndex i) = i
+
+printAcceptedByShape :: [Verdict] -> IO ()
+printAcceptedByShape accs = do
+  putStrLn "  Accepted candidates by matched shape:"
+  let cands     = [c | Accepted c <- accs]
+      kernels   = nub [k | c <- cands, Just k <- [fcMatchedShape c]]
+      perKernel =
+        [ (show k, length [c | c <- cands, fcMatchedShape c == Just k])
+        | k <- kernels
+        ]
+      noMatch   = length [() | c <- cands, fcMatchedShape c == Nothing]
+      sorted    = sortOn (negate . snd) perKernel
+  if null cands
+    then putStrLn "    (no accepted candidates)"
+    else do
+      mapM_
+        (\(label, n) ->
+            putStrLn $ "    " <> padR 18 label
+                     <> "count=" <> show n)
+        sorted
+      if noMatch > 0
+        then putStrLn $ "    " <> padR 18 "no-§4.B-match"
+                              <> "count=" <> show noMatch
+                              <> "  (generated-eligible)"
+        else pure ()
+
+padR :: Int -> String -> String
+padR w s
+  | length s >= w = s
+  | otherwise     = s <> replicate (w - length s) ' '
 
 showNodeIndex :: NodeIndex -> String
 showNodeIndex (NodeIndex i) = show i

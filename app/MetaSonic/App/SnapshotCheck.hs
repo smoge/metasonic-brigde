@@ -55,7 +55,7 @@ runSnapshotCheck = do
              <> surveyChecks survey
              <> capabilityChecks survey
 
-  putStrLn "Phase 7.A survey/cost-lab snapshot checks"
+  putStrLn "Phase 7 survey/cost-lab snapshot checks"
   putStrLn ""
   forM_ checks printCheck
 
