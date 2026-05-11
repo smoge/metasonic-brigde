@@ -466,8 +466,14 @@ Q-5. **DSL pass-through type.** The proposed signature returns
   same pool, but plugin lifecycle is an external story —
   separate phase.
 - **Same-buffer `BufWrite / BufWrite` lifting.** Still
-  rejected; 6.C.5 is the placeholder if a real use case
-  appears.
+  rejected at every scope after 6.C.5: across templates
+  (§6.C.4), inside one graph (§6.C.5 commit 2), and at
+  runtime via the polyphony=1 clamp on writer templates
+  (§6.C.5 commit 1). v1 buffer writers are a single-writer,
+  single-template-instance resource. Lifting that constraint
+  needs an explicit ordering / mixdown primitive — the
+  implicit "input declaration order" is the trap §6.C.4
+  declined to pin.
 - **File I/O, async load, multichannel.** All explicitly
   deferred in 6.C.4's bounds.
 

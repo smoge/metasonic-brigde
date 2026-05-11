@@ -1277,7 +1277,7 @@ ordering machinery picks it up automatically.
 
 Notes:
 - [Phase 6.C.4 resource-ordering design](notes/2026-05-11-phase-6c4-resource-ordering-design.md)
-- [Minimal RecordBufMono contract](notes/2026-05-11-record-buf-mono-design.md) — design for the first audio-thread writer (next implementation series).
+- [Minimal RecordBufMono contract](notes/2026-05-11-record-buf-mono-design.md) — design for the first audio-thread writer (shipped in the 6.C.4 follow-up below).
 
 #### [x] 6.C.4 follow-up — minimal `RecordBufMono`
 
@@ -1331,6 +1331,45 @@ Out of scope: random-access `BufWr`, multichannel, file I/O,
 design note records the Q-1..Q-5 deferrals.
 
 571 tests total (10 new since 6.C.4).
+
+#### [x] 6.C.5 — Writer cardinality hardening
+
+Closes the gap that §6.C.4's cross-template rule left open at
+runtime: a single writer template could still spawn N live
+instances under the default polyphony cap (8), all frozen to
+the same buffer id at instance reset, with slot order silently
+deciding the per-block winner.
+
+In v1, a buffer writer is a **single-writer, single-template-
+instance resource**. Lifting that constraint is a §6.C.5+
+feature and only makes sense once an explicit ordering /
+mixdown primitive is designed; the implicit input-order
+"ordering" §6.C.4 declined to pin would still be a problem.
+
+1. **[x] Auto-monophonic writer templates** (commit d4f8d54).
+   `loadTemplateGraph` / `loadTemplateGraphFused` inspect
+   `tplFootprint.rfBuffers.bfBufWrites`; templates whose
+   writer set is non-empty are clamped to polyphony = 1 via
+   `c_rt_graph_template_set_polyphony` before the auto-spawn.
+   Tests: writer template auto-spawn succeeds + second
+   `instance_add` returns -1; non-writer template still allows
+   multiple instances; clamp survives non-first registration
+   position.
+2. **[x] Intra-graph duplicate-writer rejection** (commit
+   22ffbe8). `validateAndSort` runs a new
+   `checkUniqueBufferWriters` pass that fails lowering with a
+   diagnostic naming the offending buffer id and contesting
+   nodes. Aligns the intra-graph case with the §6.C.4 inter-
+   template case; writer + reader on the same buffer still
+   composes through E_r. Tests: duplicate writers reject;
+   different-buffer writers compose; writer + reader composes.
+3. **[x] Docs / roadmap sync** (this commit). `rt_graph.h`'s
+   inter-template precedence comment now spells out the
+   bus+buffer rule and the §6.C.5 single-writer-single-
+   instance contract; ROADMAP no longer calls the
+   `RecordBufMono` note "next implementation series".
+
+577 tests total (6 new since the 6.C.4 follow-up).
 
 ### Phase 6.D — Spectral Processing
 

@@ -84,11 +84,25 @@ void rt_graph_clear(RTGraph *g);
 // template_id.
 //
 // The Haskell side (compileTemplateGraph) chooses registration order
-// to match a topological sort over the inter-template precedence DAG
-// (T_a precedes T_b iff bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅; BusInDelayed
-// reads do not contribute, exactly as within a single graph). Cycles
-// in that DAG are rejected at compile time. The runtime is a dumb
-// executor — it never inspects the precedence relation or reorders.
+// to match a topological sort over the inter-template precedence DAG.
+// As of §6.C.4 the rule unions buses and buffers — T_a precedes T_b
+// iff
+//
+//   (bfWrites(T_a) ∩ bfReads(T_b))                ≠ ∅   // bus
+//   ∨ (bfBufWrites(T_a) ∩ bfBufReads(T_b))         ≠ ∅   // buffer
+//
+// 'BusInDelayed' / 'BufReadDelayed' reads do not contribute on
+// either side, exactly as within a single graph. Cycles in that DAG
+// are rejected at compile time, as is a same-buffer 'BufWrite' from
+// two different templates (§6.C.4) or from two nodes in one graph
+// (§6.C.5). The runtime is a dumb executor — it never inspects the
+// precedence relation or reorders.
+//
+// §6.C.5 also clamps any template carrying a non-empty bfBufWrites
+// to polyphony=1 at load time so the same-buffer-writer uniqueness
+// invariant survives runtime instance spawning. Lifting that single-
+// writer-single-instance constraint is reserved for §6.C.5+ once a
+// real ordering / mixdown primitive lands.
 //
 // Cross-template signal flow goes through the shared Server bus pool
 // (BusOut/Out -> BusIn/BusInDelayed). The bus pool is single-buffered
