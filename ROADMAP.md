@@ -1414,6 +1414,18 @@ convolution). FFT windows are inherently block-structured, so 6.D may
 project sees. Bidirectional coupling: §4.D's executor waits on signal,
 and 6.D produces signal.
 
+Design note (no code yet):
+- [Phase 6.D minimal-spectral-kind design](notes/2026-05-11-phase-6d-spectral-design.md)
+  — bounds the first kind (`KSpectralFreeze`, tag 22, N=1024 / hop=256,
+  Hann window, freeze gate), pins per-instance window ownership,
+  declares N-sample latency through a new `kindLatency` accessor,
+  parks block-rate / spectrum-stream / multichannel / latency
+  compensation for follow-up series, and lays out a three-slice
+  implementation (Haskell surface + green C++ skeleton → real STFT
+  kernel + writer-style Barrier → freeze tests). Self-contained per
+  instance: no new `Eff` axis, the kind is `[Pure]` from the
+  resource-ordering point of view.
+
 ### Phase 6.E — Plugin Hosting
 
 Last because it imports external lifecycles, error vocabularies,
