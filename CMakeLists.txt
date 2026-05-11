@@ -7,6 +7,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(tinysynth_rt STATIC
     tinysynth/rt_graph.cpp
+    tinysynth/rt_graph_plugins.cpp
+    tinysynth/plugins/identity.cpp
     tinysynth/voice_allocator.cpp
     tinysynth/midi_voice_processor.cpp
     tinysynth/midi_demo.cpp

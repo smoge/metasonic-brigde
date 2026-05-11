@@ -85,14 +85,22 @@ TEST_CASE("kind_from_tag accepts every defined tag") {
     CHECK(rt_graph_kind_supported(20) == 1); // PlayBufMono
     CHECK(rt_graph_kind_supported(21) == 1); // RecordBufMono
     CHECK(rt_graph_kind_supported(22) == 1); // SpectralFreeze
+    CHECK(rt_graph_kind_supported(23) == 1); // StaticPlugin
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
     CHECK(rt_graph_kind_supported(4) == 0);  // intentional gap
-    CHECK(rt_graph_kind_supported(23) == 0); // first unallocated past KSpectralFreeze
+    CHECK(rt_graph_kind_supported(24) == 0); // first unallocated past StaticPlugin
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
+}
+
+TEST_CASE("static plugin registry exposes identity") {
+    CHECK(rt_graph_plugin_count() >= 1);
+    CHECK(rt_graph_plugin_find("identity") == 0);
+    CHECK(rt_graph_plugin_find("missing") == -1);
+    CHECK(rt_graph_plugin_find(nullptr) == -1);
 }
 
 // ----------------------------------------------------------------

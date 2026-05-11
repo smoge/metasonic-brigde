@@ -192,12 +192,12 @@ mechanically in v1):
 
 ### 2.3 The plugin registry
 
-A namespace-scope `std::array<PluginSpec, kMaxPlugins>` in
-`tinysynth/rt_graph_plugins.cpp`. Plugins register through a
-`REGISTER_PLUGIN(name, &spec)` macro at translation-unit
-init time. Discovery is build-time: the linked translation
-units determine the registry contents. The C ABI surface
-adds two read-only entries:
+A namespace-scope registry in `tinysynth/rt_graph_plugins.cpp`.
+The v1 built-ins are linked into the runtime and explicitly referenced
+from the registry so static-library dead-stripping cannot silently
+drop them. Discovery is build-time: the linked translation units
+determine the registry contents. The C ABI surface adds two read-only
+entries:
 
 - `int rt_graph_plugin_count();` — registered count.
 - `int rt_graph_plugin_find(const char *name);` — index by
@@ -224,9 +224,9 @@ runtime-facing tools; it is not called by pure compile functions.
 ### 2.4 Threading and lifecycle
 
 - **Construction** (producer thread):
-  `register_plugin` is called at static-init time. The
-  registry is immutable from the audio thread's point of
-  view.
+  built-in plugin specs are registered before any `plugin_at` result
+  is used by an instance. The registry is immutable from the audio
+  thread's point of view.
 - **Instance reset** (producer thread): `init` is called
   once per instance, before any audio. `state` is host-
   owned, zero-initialized, then handed to `init`.
@@ -323,13 +323,12 @@ C++ side (`tinysynth/rt_graph.cpp` + new
 - `NodeKind::StaticPlugin = 23`, `kind_from_tag` row.
 - `StaticPluginState` on the `NodeState` variant.
 - `configure_spec` uses the fixed Identity-shape arity from
-  `KindSpec`; `init_node_state` freezes `controls[0]` as `plugin_id`
-  and calls the plugin's `init`.
-- `process_static_plugin` in `rt_graph.cpp` dispatches via
-  the registry: looks up `PluginSpec` by `plugin_id`,
-  resolves audio inputs, calls `process`. On non-zero return
-  it emits silence and ticks
-  `g.invalid_plugin_call_count`.
+  `KindSpec`; `init_node_state` freezes `controls[0]` as
+  `plugin_id`.
+- Slice 1 keeps `process_static_plugin` as a deterministic silence
+  skeleton. Slice 2 replaces that body with registry dispatch:
+  resolve audio inputs, call `process`, emit silence on non-zero
+  return, and tick `g.invalid_plugin_call_count`.
 - New design Note `[Static plugin protocol]` alongside the
   state struct.
 
@@ -391,6 +390,9 @@ no-intentionally-red-CI rule.
 
 - `PluginSpec` struct, `register_plugin`, registry array,
   `rt_graph_plugin_count` / `_find` C ABI.
+- Built-in `identity` spec is linked and explicitly pulled into the
+  registry; the skeleton host does not call its `process` callback
+  yet.
 - `KStaticPlugin` (tag 23) in `NodeKind` / `kindSpec`,
   `PluginRef` newtype, `StaticPlugin` UGen + builder. Fixed
   Identity-shape only: two inputs, one output, `controls[0] =
@@ -402,8 +404,6 @@ no-intentionally-red-CI rule.
 
 ### Slice 2 — Identity reference plugin
 
-- `tinysynth/plugins/identity.cpp` with the real `process`
-  body.
 - Real `process_static_plugin` body that dispatches into
   the plugin's vtable.
 - `plugin_call_count` / `invalid_plugin_call_count`

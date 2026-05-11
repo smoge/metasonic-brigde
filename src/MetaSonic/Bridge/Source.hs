@@ -24,6 +24,9 @@ module MetaSonic.Bridge.Source
   , MigrationKey (..)
   , migrationKeyUtf8Bytes
   , migrationKeyUtf8ByteLength
+  , PluginRef (..)
+  , identityPlugin
+  , staticPluginId
   , UGen (..)
   , NodeSpec (..)
   , SynthGraph (..)
@@ -59,6 +62,7 @@ module MetaSonic.Bridge.Source
   , playBufMono
   , recordBufMono
   , spectralFreeze
+  , staticPlugin
   , tagged
   , cc
   , -- * Connection helpers
@@ -174,6 +178,32 @@ data Connection
     -- graph construction time.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
+
+-- | Symbolic reference to a statically registered plugin.
+--
+-- The fixed §6.E slice exposes only 'identityPlugin' through the
+-- builder path, but the constructor is kept visible so validation can
+-- reject unknown names deliberately instead of making "only known
+-- values are constructible" the whole contract.
+newtype PluginRef = PluginRef
+  { pluginRefName :: String
+  } deriving stock    (Eq, Ord, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | The first fixed static plugin profile: two audio inputs, one
+-- audio output, no plugin parameters, no inherent latency.
+identityPlugin :: PluginRef
+identityPlugin = PluginRef "identity"
+
+-- | Pure Haskell catalog for the fixed §6.E v1 plugin set.
+--
+-- The C++ registry exposes the same index through
+-- @rt_graph_plugin_find@ for runtime-side cross-checks, but the pure
+-- compiler path does not call FFI during validation.
+staticPluginId :: PluginRef -> Maybe Int
+staticPluginId = \case
+  PluginRef "identity" -> Just 0
+  _                    -> Nothing
 
 
 {- Note [Num/Fractional Connection]
@@ -586,6 +616,14 @@ data UGen
     -- the runtime's compute capability, not its resource
     -- model. Declared steady-state latency: N=1024 samples
     -- ('kindLatency').
+  | StaticPlugin !PluginRef !Connection !Connection
+    -- ^ Fixed-shape static plugin host (§6.E slice 1).
+    -- The first profile is 'identityPlugin': two audio
+    -- inputs, one audio output, and no plugin parameters.
+    -- The plugin reference lowers to the frozen host
+    -- metadata control @plugin_id@ in control slot 0. The
+    -- fixed v1 profile is @[Pure]@ and declares no inherent
+    -- latency.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -1115,6 +1153,23 @@ spectralFreeze signalIn freezeFlag =
   insertNodeC "spectralFreeze"
     (SpectralFreeze signalIn freezeFlag)
 
+-- | Allocate a fixed-shape 'StaticPlugin' node (§6.E slice 1).
+--
+-- The current profile is 'identityPlugin': two audio inputs, one
+-- output, no plugin parameters, no inherent latency, and @[Pure]@
+-- effects. The 'PluginRef' is compiled to a frozen @plugin_id@
+-- control slot. Unknown references are rejected by validation before
+-- lowering; the runtime never resolves plugin names on the audio
+-- thread.
+staticPlugin
+  :: PluginRef
+  -> Connection  -- ^ input 0
+  -> Connection  -- ^ input 1
+  -> SynthM Connection
+staticPlugin ref in0 in1 =
+  insertNodeC "staticPlugin"
+    (StaticPlugin ref in0 in1)
+
 -- | Declare a CC-bound smoothed control input. Allocates a 'Smooth'
 -- node fed by an initially-constant target, records the @(cc_number,
 -- smooth_node, ctl=1, min, max)@ binding in the builder state, and
@@ -1286,6 +1341,11 @@ ugenView = \case
              [ connDefault sigIn
              , connDefault fr
              ]
+  StaticPlugin ref in0 in1 ->
+    UGenView KStaticPlugin
+             [in0, in1]
+             [ maybe (-1.0) fromIntegral (staticPluginId ref)
+             ]
 
 
 {- Note [Per-UGen projections]
@@ -1394,6 +1454,7 @@ inferEff (RecordBufMono buf _ _)    = [BufWrite (bufferId buf)]
 -- spectrum-stream kind that needs a real Eff axis is forced to add
 -- its own row rather than silently falling through.
 inferEff (SpectralFreeze _ _)       = [Pure]
+inferEff (StaticPlugin _ _ _)       = [Pure]
 inferEff _                          = [Pure]
 
 
@@ -1435,6 +1496,7 @@ dependencies = \case
   PlayBufMono   _ r s lp -> deps [r, s, lp]
   RecordBufMono _ sigIn lp -> deps [sigIn, lp]
   SpectralFreeze sigIn fr -> deps [sigIn, fr]
+  StaticPlugin _ in0 in1 -> deps [in0, in1]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

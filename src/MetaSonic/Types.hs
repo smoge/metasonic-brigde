@@ -300,6 +300,15 @@ data NodeKind
     -- per-instance ring buffers and spectrum store, nothing
     -- crosses an instance boundary. Declared steady-state
     -- latency: N=1024 samples (see 'kindLatency').
+  | KStaticPlugin
+    -- ^ Fixed-shape static plugin host (§6.E slice 1).
+    -- The first profile is the build-time registered
+    -- @identity@ reference plugin: two audio inputs, one
+    -- audio output, and one frozen host-metadata control
+    -- @[plugin_id]@. There are no plugin parameters in this
+    -- v1 profile, and the kind declares no inherent latency
+    -- ('kindLatency' returns 'Nothing'). Effects remain
+    -- per-UGen; the fixed identity profile is @[Pure]@.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -477,6 +486,11 @@ kindSpec = \case
   -- the hop-granular analysis/resynthesis work is internal
   -- to the kernel.
   KSpectralFreeze -> KindSpec 22 SampleRate  2 2 "spectralFreeze"
+  -- Static plugin host (§6.E slice 1): fixed Identity profile.
+  -- Two audio inputs, one output, one frozen metadata control
+  -- [plugin_id]. SampleRate floor because the host invokes the
+  -- plugin per audio block and delivers one output sample per frame.
+  KStaticPlugin -> KindSpec 23 SampleRate 2 1 "staticPlugin"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to
@@ -772,6 +786,10 @@ portInfo k (PortIndex i) = case k of
     -- PortBlockLatched and the long-term PortHopLatched /
     -- PortWindowLatched plan.
     1 -> Just (PortInfo PortSampleAccurate "freeze_flag")
+    _ -> Nothing
+  KStaticPlugin -> case i of
+    0 -> Just (PortInfo PortSampleAccurate "in0")
+    1 -> Just (PortInfo PortSampleAccurate "in1")
     _ -> Nothing
   where
     -- Oscillator family: port 0 = freq (sample-accurate FM when

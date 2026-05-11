@@ -20,6 +20,7 @@ module MetaSonic.Bridge.Validate
   , -- * Individual passes (useful for testing)
     checkDependencies
   , checkUniqueBufferWriters
+  , checkStaticPluginRefs
   , topoSort
   , -- * Dependency derivation (useful for testing the scheduler)
     busEdges
@@ -374,8 +375,32 @@ validateAndSort :: SynthGraph -> Either String [NodeID]
 validateAndSort g = do
   checkDependencies g
   checkUniqueBufferWriters g
+  checkStaticPluginRefs g
   checkMigrationKeys g
   topoSort g
+
+-- | Reject 'StaticPlugin' nodes that name no entry in the fixed
+-- Haskell-side static plugin catalog.
+--
+-- The C++ runtime also exposes a registry, but validation stays pure:
+-- it lowers a known 'PluginRef' to a frozen integer @plugin_id@ and
+-- refuses unknown names before any FFI loading path can see them.
+checkStaticPluginRefs :: SynthGraph -> Either String ()
+checkStaticPluginRefs g =
+  mapM_ checkNode (M.elems (sgNodes g))
+  where
+    checkNode ns =
+      case nsUgen ns of
+        StaticPlugin ref _ _ ->
+          case staticPluginId ref of
+            Just _  -> Right ()
+            Nothing ->
+              Left $
+                "Unknown static plugin "
+                ++ show (pluginRefName ref)
+                ++ " at "
+                ++ show (nsID ns)
+        _ -> Right ()
 
 -- | §6.C.5 commit 2: reject a 'SynthGraph' that contains two or
 -- more nodes carrying a 'BufWrite' on the same buffer id. The

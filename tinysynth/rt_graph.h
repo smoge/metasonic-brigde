@@ -733,6 +733,13 @@ long long rt_graph_test_spectral_resynthesis_count(const RTGraph *g);
 // verify Haskell's NodeKind tags agree with this file's enum.
 int rt_graph_kind_supported(int node_kind);
 
+// [T:read-only] Static plugin registry introspection. The registry is
+// populated at process start by build-linked plugin translation units.
+// KStaticPlugin stores the returned integer id in control slot 0; the
+// audio thread never resolves plugin names.
+int rt_graph_plugin_count(void);
+int rt_graph_plugin_find(const char *name);
+
 // [T:read-only] Phase §4.E.2.B0 test surface: the count of canonical
 // writer slots reserved during the most recent rt_graph_process call.
 // Equals the total of:

@@ -1460,15 +1460,16 @@ guarantees — only become concrete once 6.A–6.D have stressed them.
 Coupling to 6.C is real (sample-buffer access) and may force 6.C and
 6.E to be co-designed even if 6.E lands later.
 
-Design note (no runtime code yet):
+Design / implementation note:
 - [Phase 6.E plugin-hosting design](notes/2026-05-11-phase-6e-plugin-hosting-design.md)
   — bounds the first kind (`KStaticPlugin`, tag 23) as a fixed
   `Identity`-profile static shim: two audio inputs, one audio output,
   one frozen `plugin_id` metadata control, zero plugin parameters,
   zero declared latency, and `[Pure]` effects. It deliberately does
   not claim per-plugin arity / latency / resource effects on the
-  current kind-level metadata model. Slicing: plugin registry +
-  skeleton → real `Identity` reference plugin + counters → parked
+  current kind-level metadata model. Slice 1 adds the registry,
+  Haskell/C++ kind surface, and deterministic silence skeleton; the
+  next slice turns on real `Identity` dispatch + counters → parked
   metadata follow-up decision. Q-deferrals cover max-state size,
   hot-swap migration, error-as-scheduler-signal, parameter layout /
   modulation, cross-template ordering, and name stability.

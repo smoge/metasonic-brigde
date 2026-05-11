@@ -152,6 +152,88 @@ main = defaultMain $ testGroup "MetaSonic"
   , playBufMonoTests
   , recordBufMonoSkeletonTests
   , spectralFreezeSkeletonTests
+  , staticPluginSkeletonTests
+  ]
+
+------------------------------------------------------------
+-- §6.E slice 1: KStaticPlugin surface + registry skeleton
+------------------------------------------------------------
+
+staticPluginSkeletonTests :: TestTree
+staticPluginSkeletonTests =
+  testGroup "Phase 6.E slice 1: StaticPlugin surface"
+  [ testCase "inferEff produces Pure for identityPlugin" $ do
+      let g = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sinOsc 220.0 0.0
+            y <- staticPlugin identityPlugin a b
+            out 0 y
+          ir = case lowerGraph g of
+                 Right ir' -> ir'
+                 Left err  -> error err
+          pluginEffs =
+            [ eff
+            | n   <- giNodes ir
+            , eff <- irEffects n
+            , irKind n == KStaticPlugin
+            ]
+      pluginEffs @?= [Pure]
+
+  , testCase "kindSpec / portInfo / kindLatency agree on fixed Identity shape" $ do
+      ksTag          (kindSpec KStaticPlugin) @?= 23
+      ksRate         (kindSpec KStaticPlugin) @?= SampleRate
+      ksAudioArity   (kindSpec KStaticPlugin) @?= 2
+      ksControlArity (kindSpec KStaticPlugin) @?= 1
+      ksLabel        (kindSpec KStaticPlugin) @?= "staticPlugin"
+      portInfo KStaticPlugin (PortIndex 0)
+        @?= Just (PortInfo PortSampleAccurate "in0")
+      portInfo KStaticPlugin (PortIndex 1)
+        @?= Just (PortInfo PortSampleAccurate "in1")
+      portInfo KStaticPlugin (PortIndex 2) @?= Nothing
+      kindLatency KStaticPlugin @?= Nothing
+
+  , testCase "ugenView lowers identityPlugin to frozen plugin_id control" $ do
+      let view = ugenView
+            (StaticPlugin identityPlugin (Param 0.25) (Param 0.75))
+      uvKind view @?= KStaticPlugin
+      uvInputs view @?= [Param 0.25, Param 0.75]
+      uvControls view @?= [0.0]
+
+  , testCase "unregistered plugin name fails validation before lowering" $ do
+      let graph = runSynth $ do
+            a <- add 1.0 2.0
+            b <- add 3.0 4.0
+            y <- staticPlugin (PluginRef "missing") a b
+            out 0 y
+      case lowerGraph graph of
+        Left err ->
+          assertBool
+            ("expected unknown plugin diagnostic, got: " <> err)
+            ("Unknown static plugin" `isInfixOf` err)
+        Right _ ->
+          assertFailure "expected lowerGraph to reject an unknown static plugin"
+
+  , testCase "staticPlugin graph compiles and skeleton renders silence" $ do
+      let nframes = 64
+          graph = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sinOsc 220.0 0.0
+            y <- staticPlugin identityPlugin a b
+            out 0 y
+      tg <- case compileTemplateGraph [("plugin", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let peak = maximum (map (abs . (\(CFloat x) -> x)) rendered)
+          peak @?= 0.0
   ]
 
 ------------------------------------------------------------
@@ -4148,6 +4230,10 @@ ugenKind = \case
   BusInDelayed{}  -> KBusInDelayed
   Delay{}         -> KDelay
   Smooth{}        -> KSmooth
+  PlayBufMono{}   -> KPlayBufMono
+  RecordBufMono{} -> KRecordBufMono
+  SpectralFreeze{} -> KSpectralFreeze
+  StaticPlugin{}  -> KStaticPlugin
 
 -- The empty graph: no nodes at all.
 emptyGraph_ :: SynthGraph

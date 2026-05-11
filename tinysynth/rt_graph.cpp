@@ -10,6 +10,7 @@
 // them in compile-decreed template order every block.
 
 #include "rt_graph.h"
+#include "rt_graph_plugins.h"
 
 #include <q/fft/fft.hpp>
 #include <q/fx/biquad.hpp>
@@ -328,6 +329,10 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KHPF          = 17           HPF          = 17
   kindTag KBPF          = 18           BPF          = 18
   kindTag KNotch        = 19           Notch        = 19
+  kindTag KPlayBufMono  = 20           PlayBufMono  = 20
+  kindTag KRecordBufMono = 21          RecordBufMono = 21
+  kindTag KSpectralFreeze = 22         SpectralFreeze = 22
+  kindTag KStaticPlugin = 23           StaticPlugin = 23
 
   Bus model: Out, BusOut, BusIn, and BusInDelayed all operate on the
   same bus pool, owned by the Server (see Note [§2.C: server-global
@@ -389,6 +394,7 @@ enum class NodeKind : int {
   PlayBufMono  = 20,
   RecordBufMono = 21,
   SpectralFreeze = 22,
+  StaticPlugin = 23,
 };
 
 // Sink-terminal classifier. Both 'Out' and 'BusOut' are pure sinks
@@ -431,6 +437,7 @@ kind_from_tag(int node_kind) noexcept {
   case 20: return NodeKind::PlayBufMono;
   case 21: return NodeKind::RecordBufMono;
   case 22: return NodeKind::SpectralFreeze;
+  case 23: return NodeKind::StaticPlugin;
   default: return std::nullopt;
   }
 }
@@ -824,6 +831,11 @@ struct SpectralFreezeState {
   bool      frozen_valid     = false;
 };
 
+struct StaticPluginState {
+  int plugin_id = -1;
+  const metasonic::PluginSpec *spec = nullptr;
+};
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
 using NodeState =
@@ -831,7 +843,7 @@ using NodeState =
                  DelayState, SmoothState, PulseOscState,
                  HPFState, BPFState, NotchState,
                  PlayBufMonoState, RecordBufMonoState,
-                 SpectralFreezeState>;
+                 SpectralFreezeState, StaticPluginState>;
 
 constexpr int kMigrationKeyMaxBytes = 16;
 
@@ -1496,6 +1508,14 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.default_controls = {0.0, 0.0};
     spec.input_refs.resize(2); // [signal_in, freeze_flag]
     break;
+
+  case NodeKind::StaticPlugin:
+    // Static plugin host (§6.E slice 1), fixed Identity shape.
+    // One frozen metadata control [plugin_id], two audio inputs,
+    // one output. No plugin parameters in the fixed v1 profile.
+    spec.default_controls = {-1.0};
+    spec.input_refs.resize(2); // [in0, in1]
+    break;
   }
 
   // Step C (d): fused_inputs is parallel to input_refs. Sizing it
@@ -1634,6 +1654,27 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
     // steady state.
     target_outputs = 1;
     node.state = SpectralFreezeState{};
+    break;
+  }
+
+  case NodeKind::StaticPlugin: {
+    // §6.E slice 1. Resolve controls[0] once at instance reset
+    // and freeze the registry pointer on state. Live writes to
+    // control slot 0 update node.controls but do not retarget
+    // this instance.
+    const double pid_raw =
+        spec.default_controls.size() > 0 ? spec.default_controls[0] : -1.0;
+    int plugin_id = -1;
+    const metasonic::PluginSpec *plugin_spec = nullptr;
+    if (std::isfinite(pid_raw)) {
+      const long pid_l = std::lround(pid_raw);
+      if (pid_l >= 0) {
+        plugin_id = static_cast<int>(pid_l);
+        plugin_spec = metasonic::plugin_at(plugin_id);
+      }
+    }
+    target_outputs = 1;
+    node.state = StaticPluginState{plugin_id, plugin_spec};
     break;
   }
 
@@ -2698,6 +2739,12 @@ node_kind_supports_state_migration(NodeKind kind) noexcept {
     // freezing/swapping is a future series.
     return false;
 
+  case NodeKind::StaticPlugin:
+    // Plugin state is opaque to the graph host. Even the fixed
+    // Identity slice freezes plugin_id at instance reset; later
+    // stateful plugins must opt into migration explicitly.
+    return false;
+
   case NodeKind::SinOsc:
   case NodeKind::Out:
   case NodeKind::Gain:
@@ -2878,6 +2925,7 @@ enum class StateMigrationResult {
   case NodeKind::PlayBufMono:
   case NodeKind::RecordBufMono:
   case NodeKind::SpectralFreeze:
+  case NodeKind::StaticPlugin:
     return StateMigrationResult::Unsupported;
   }
   return StateMigrationResult::Unsupported;
@@ -5267,6 +5315,23 @@ static void process_spectral_freeze(
   g.spectral_resynthesis_count += resynth_ticks;
 }
 
+static void process_static_plugin(
+    RTGraph &,
+    GraphInstance &inst,
+    std::size_t i,
+    int nframes
+) noexcept {
+  auto &node = inst.nodes[i];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  if (out.empty()) return;
+
+  // §6.E slice 1 is a host skeleton: it validates shape, freezes the
+  // plugin id at instance reset, and produces deterministic silence.
+  // Slice 2 replaces this body with registry dispatch into the
+  // Identity plugin and introduces call/error counters.
+  std::fill(out.begin(), out.end(), 0.0f);
+}
+
 /* Note [Execution order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Inside one instance the runtime processes nodes in storage order.
@@ -6453,6 +6518,9 @@ static inline void dispatch_node(
     break;
   case NodeKind::SpectralFreeze:
     process_spectral_freeze(g, inst, i, nframes);
+    break;
+  case NodeKind::StaticPlugin:
+    process_static_plugin(g, inst, i, nframes);
     break;
   default:
     assert(false && "unhandled NodeKind in process_instance");
@@ -9489,6 +9557,14 @@ where someone adds a NodeKind in Haskell without updating C++.
 
 int rt_graph_kind_supported(int node_kind) {
   return kind_from_tag(node_kind).has_value() ? 1 : 0;
+}
+
+int rt_graph_plugin_count(void) {
+  return metasonic::plugin_count();
+}
+
+int rt_graph_plugin_find(const char *name) {
+  return metasonic::plugin_find(name);
 }
 
 // Phase §6.C.3a/b: producer-side buffer pool. The audio thread
