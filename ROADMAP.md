@@ -1235,14 +1235,23 @@ without semantic change for bus-only corpora. Four slices:
    consumers project through `rfBuses`. Bus-only graphs stay
    bit-identical.
 3. **[x] Union bus + buffer edges in the precedence rule**
-   (commit 05211f6). New `templatePrecedes` consults both
-   intersections (bus-write/bus-read and buffer-write/buffer-read);
-   `regionBusPrecedence` mirrors the same union. Bus and buffer
-   id spaces are disjoint, so the two halves can never collide.
-   Tests cover `BufWrite → BufRead` on same buffer
-   (asymmetric edge), `BufWrite` on different buffer (no edge),
-   `BufRead` alone (non-ordering), and the disjoint-id-space
-   regression guard.
+   (commits 05211f6 + 1bd2fd4). New `templatePrecedes`
+   consults both intersections (bus-write/bus-read and
+   buffer-write/buffer-read). At the region scope the union
+   is exposed through a new `regionResourcePrecedence`;
+   `regionBusPrecedence` stays bus-only and is the
+   diagnostic projection that callers reach for when they
+   specifically want to see the bus edge subgraph alone.
+   `regionDependencies` (the scheduler's full "must precede"
+   view) is the union of `regionResourcePrecedence` and
+   `regionStructuralPrecedence`. Bus and buffer id spaces are
+   disjoint, so the two halves can never collide. Tests cover
+   `BufWrite → BufRead` on same buffer (asymmetric edge),
+   `BufWrite` on different buffer (no edge), `BufRead` alone
+   (non-ordering), the disjoint-id-space regression guard,
+   and an extractor pin that `playBufMono` actually populates
+   `bfBufReads` end-to-end through `resourceFootprint` /
+   `runtimeNodeResourceFootprint`.
 4. **[x] Reject same-buffer `BufWrite / BufWrite`** (commit
    1a363b5). New stage 2.5 in `compileTemplateGraph(Fused)`
    (`checkNoSharedBufferWriters`) fails the compile if any

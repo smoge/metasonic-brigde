@@ -7,23 +7,24 @@
 
 -- |
 -- Module      : MetaSonic.Bridge.Templates
--- Description : Inter-template ordering from bus dataflow
+-- Description : Inter-template ordering from resource dataflow
 --
 -- One pipeline stage above 'MetaSonic.Bridge.Compile'. Where
 -- 'Compile' produces a dense per-template 'RuntimeGraph', this module
 -- composes several templates into a 'TemplateGraph': an ordered list
 -- of templates plus the precedence DAG that the compiler decreed by
--- analyzing each template's bus reads/writes.
+-- analyzing each template's resource (bus + buffer) reads/writes.
 --
 -- The whole module exists to keep execution order on the Haskell side
 -- at compile time, the way intra-graph ordering already is. The
 -- runtime stays a dumb executor: it iterates templates in the order
 -- it was handed and never reorders. Users do not get SC-style live
 -- 'head'/'tail'/'before'/'after' ordering primitives — instead, they
--- write bus connectivity, and 'compileTemplateGraph' derives the
--- order from the dataflow.
+-- write bus connectivity (and, as of §6.C.4, buffer references), and
+-- 'compileTemplateGraph' derives the order from the dataflow.
 --
--- See Note [Template-level precedence from bus dataflow].
+-- See Note [Template-level precedence from bus dataflow]; the same
+-- rule generalizes to buffers via 'templatePrecedes' / §6.C.4.
 
 module MetaSonic.Bridge.Templates
   ( -- * Identifiers
@@ -72,23 +73,44 @@ dependencies: structural edges (E_s) plus resource-induced edges
 (E_r) from same-bus 'BusWrite' / 'BusRead' pairs. This module is
 that idea applied one tier up.
 
-Each template exposes a 'BusFootprint': the set of bus indices it
-writes (via 'Out' or 'BusOut'), the set it reads live (via 'BusIn'),
-and the set it reads delayed (via 'BusInDelayed'). The 'Eff' machinery
-already classifies these uniformly — see Note [Effects are per-UGen,
-not per-kind] in "MetaSonic.Bridge.Source" — so footprint extraction
-is a single fold over 'irEffects'.
+Each template exposes a 'ResourceFootprint' (§6.C.4): the set of bus
+indices it writes (via 'Out' / 'BusOut'), reads live (via 'BusIn'),
+or reads delayed (via 'BusInDelayed'), *plus* the parallel set of
+buffer indices it writes / reads-live / reads-delayed once a writer
+UGen exists. Bus-only callers can keep using 'busFootprint' as a
+projection ('rfBuses') without going through the full type. The
+'Eff' machinery already classifies bus and buffer effects uniformly
+— see Note [Effects are per-UGen, not per-kind] in
+"MetaSonic.Bridge.Source" — so footprint extraction is a single
+fold over 'irEffects'.
 
-Precedence between two templates @T_a@ and @T_b@:
+Precedence between two templates @T_a@ and @T_b@
+('templatePrecedes' below):
 
-  T_a precedes T_b   iff   bfWrites(T_a) ∩ bfReads(T_b) ≠ ∅
+  T_a precedes T_b   iff
+      bfWrites    (rfBuses    a) ∩ bfReads    (rfBuses    b) ≠ ∅
+   ∨  bfBufWrites (rfBuffers a) ∩ bfBufReads (rfBuffers b) ≠ ∅
 
-That is: if @T_b@ reads, in this block, a bus that @T_a@ writes, then
-@T_a@ must run first. This is the inter-template counterpart of E_r.
-'BusReadDelayed' deliberately does not contribute, exactly as within a
-single graph — see Note [Effect-induced edges (E_r)] in
-"MetaSonic.Bridge.Validate" — so cross-template feedback through
-'BusInDelayed' stays schedulable.
+That is: if @T_b@ reads, in this block, any resource (bus or buffer)
+that @T_a@ writes, then @T_a@ must run first. This is the
+inter-template counterpart of E_r. Bus and buffer ids live in
+disjoint namespaces, so the two intersections cannot alias.
+'BusReadDelayed' / 'BufReadDelayed' deliberately do not contribute,
+exactly as within a single graph — see Note [Effect-induced edges
+(E_r)] in "MetaSonic.Bridge.Validate" — so cross-template feedback
+through 'BusInDelayed' stays schedulable.
+
+Three concentric views consume the precedence machinery (mirrored
+at the region scope by 'regionBusPrecedence' /
+'regionResourcePrecedence' / 'regionDependencies' in
+"MetaSonic.Bridge.Compile.Dependencies"):
+
+  * 'busFootprint'  / bus-only diagnostic projection of a template.
+  * 'templatePrecedes' / 'computePrecedence' — bus + buffer union;
+    the rule the inter-template scheduler trips on.
+  * 'compileTemplateGraph' — produces the full 'TemplateGraph' with
+    the resource precedence DAG and (§6.C.4 slice 4) the
+    same-buffer-writers rejection diagnostic.
 
 A cycle in the precedence DAG is a compile error. The remedy is the
 same as within a graph: replace one of the live reads in the cycle
@@ -115,15 +137,20 @@ newtype TemplateID = TemplateID Int
 'BusFootprint' is the public bus-level interface a template exposes
 to its peers: which buses it touches, and how. The fold that builds
 it ('busFootprint') reads only 'irEffects' — never inspects node
-kinds or controls — so any future 'Eff' constructor that names a bus
-('BufRead'/'BufWrite' on a shared buffer, etc.) is one pattern-match
-away from contributing to template-level precedence.
+kinds or controls. §6.C.4 generalizes the same idea to buffers via
+'ResourceFootprint' / 'resourceFootprint' / 'templatePrecedes';
+'busFootprint' is the bus-only projection retained for callers that
+only need the bus subgraph (diagnostics, the
+'regionBusPrecedence' diagnostic at the region scope, the
+'rfBuses' field of the full footprint).
 
-The three sets are deliberately disjoint in role even though the same
-bus number can appear in more than one. A template that does 'BusOut
-5' followed by 'BusInDelayed 5' is a valid self-feedback shape and
-contributes both to 'bfWrites' and to 'bfDelayedReads' on bus 5; only
-'bfWrites' is consulted when computing precedence against peers.
+The three bus-axis sets are deliberately disjoint in role even
+though the same bus number can appear in more than one. A template
+that does 'BusOut 5' followed by 'BusInDelayed 5' is a valid
+self-feedback shape and contributes both to 'bfWrites' and to
+'bfDelayedReads' on bus 5; only 'bfWrites' is consulted when
+computing precedence against peers. The buffer-axis sets in
+'BufferFootprint' follow exactly the same rule.
 -}
 
 -- The 'BusFootprint' type and 'emptyFootprint' helper are defined in

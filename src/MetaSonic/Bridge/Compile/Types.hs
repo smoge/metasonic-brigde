@@ -769,16 +769,25 @@ data RuntimeRegion = RuntimeRegion
   , rrFootprint :: !ResourceFootprint
     -- ^ §6.C.4: resource-level interface of this region. The
     -- bus half ('rfBuses') carries the writes / live-reads /
-    -- delayed-reads that drove pre-6.C.4 region precedence;
-    -- the buffer half ('rfBuffers') is populated but not
-    -- consumed yet (slice 3 unions the edges).
+    -- delayed-reads that drove pre-§6.C.4 region precedence;
+    -- the buffer half ('rfBuffers') joins the precedence
+    -- union via 'regionResourcePrecedence'.
+    --
     -- Computed by 'attachRegionFootprints' as the final step
     -- of 'compileRuntimeGraph' so the same field survives
     -- 'selectRegionKernels' splits without going stale.
     -- §4.E.1 / §4.E.1b metadata only — does not change region
-    -- execution order today; consumed by 'regionBusPrecedence'
-    -- and (in union with structural cross-region edges)
-    -- 'regionDependencies'.
+    -- execution order today.
+    --
+    -- Three views consume this field:
+    --
+    --   * 'regionBusPrecedence' — diagnostics; bus-only.
+    --   * 'regionResourcePrecedence' — §6.C.4 bus + buffer
+    --     resource union; the precedence rule a future writer
+    --     UGen will trip.
+    --   * 'regionDependencies' — the scheduler's full view:
+    --     'regionResourcePrecedence' unioned with structural
+    --     cross-region port edges.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
