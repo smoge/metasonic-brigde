@@ -911,7 +911,7 @@ unitTests = testGroup "Unit tests"
               -- footprint where it belongs.
               let readerTpl = head [ t | t <- tgTemplates tg
                                        , tplName t == "reader" ]
-              bfDelayedReads (tplFootprint readerTpl)
+              bfDelayedReads (rfBuses (tplFootprint readerTpl))
                 @?= S.singleton 5
 
       , testCase "mutual live writes/reads form a cycle (rejected)" $ do
@@ -2542,9 +2542,9 @@ unitTests = testGroup "Unit tests"
             Right rg -> do
               case rgRuntimeRegions rg of
                 [r] -> do
-                  bfWrites       (rrFootprint r) @?= S.singleton 0
-                  bfReads        (rrFootprint r) @?= S.empty
-                  bfDelayedReads (rrFootprint r) @?= S.empty
+                  bfWrites       (rfBuses (rrFootprint r)) @?= S.singleton 0
+                  bfReads        (rfBuses (rrFootprint r)) @?= S.empty
+                  bfDelayedReads (rfBuses (rrFootprint r)) @?= S.empty
                   regionDependencies rg @?=
                     M.singleton (rrIndex r) S.empty
                 rs -> assertFailure $
@@ -2584,11 +2584,11 @@ unitTests = testGroup "Unit tests"
                                  , rrKernel r == RBusInLpfGainOut]
               case (producers, consumers) of
                 ([p], [c]) -> do
-                  bfWrites       (rrFootprint p) @?= S.singleton 5
-                  bfReads        (rrFootprint p) @?= S.empty
-                  bfWrites       (rrFootprint c) @?= S.singleton 0
-                  bfReads        (rrFootprint c) @?= S.singleton 5
-                  bfDelayedReads (rrFootprint c) @?= S.empty
+                  bfWrites       (rfBuses (rrFootprint p)) @?= S.singleton 5
+                  bfReads        (rfBuses (rrFootprint p)) @?= S.empty
+                  bfWrites       (rfBuses (rrFootprint c)) @?= S.singleton 0
+                  bfReads        (rfBuses (rrFootprint c)) @?= S.singleton 5
+                  bfDelayedReads (rfBuses (rrFootprint c)) @?= S.empty
 
                   let busPrec = regionBusPrecedence rg
                       structPrec = regionStructuralPrecedence rg
@@ -2645,10 +2645,10 @@ unitTests = testGroup "Unit tests"
                   -- Footprints: producer writes nothing (gain
                   -- materializes a buffer, not a bus); consumer
                   -- writes bus 0 via Out, reads no bus.
-                  bfWrites       (rrFootprint buf)   @?= S.empty
-                  bfReads        (rrFootprint buf)   @?= S.empty
-                  bfWrites       (rrFootprint tail_) @?= S.singleton 0
-                  bfReads        (rrFootprint tail_) @?= S.empty
+                  bfWrites       (rfBuses (rrFootprint buf))   @?= S.empty
+                  bfReads        (rfBuses (rrFootprint buf))   @?= S.empty
+                  bfWrites       (rfBuses (rrFootprint tail_)) @?= S.singleton 0
+                  bfReads        (rfBuses (rrFootprint tail_)) @?= S.empty
 
                   -- Bus view alone misses the dependency (no bus
                   -- writes / reads intersect).
@@ -2703,13 +2703,13 @@ unitTests = testGroup "Unit tests"
                   readers   = [r | r <- regions, rrKernel r == RNodeLoop]
               case (producers, readers) of
                 ([p], [r]) -> do
-                  bfWrites       (rrFootprint p) @?= S.singleton 5
-                  bfReads        (rrFootprint p) @?= S.empty
-                  bfDelayedReads (rrFootprint p) @?= S.empty
+                  bfWrites       (rfBuses (rrFootprint p)) @?= S.singleton 5
+                  bfReads        (rfBuses (rrFootprint p)) @?= S.empty
+                  bfDelayedReads (rfBuses (rrFootprint p)) @?= S.empty
 
-                  bfWrites       (rrFootprint r) @?= S.singleton 0
-                  bfReads        (rrFootprint r) @?= S.empty
-                  bfDelayedReads (rrFootprint r) @?= S.singleton 5
+                  bfWrites       (rfBuses (rrFootprint r)) @?= S.singleton 0
+                  bfReads        (rfBuses (rrFootprint r)) @?= S.empty
+                  bfDelayedReads (rfBuses (rrFootprint r)) @?= S.singleton 5
 
                   -- Headline assertion: no edge in any view.
                   let busPrec    = regionBusPrecedence rg
@@ -2746,7 +2746,7 @@ unitTests = testGroup "Unit tests"
               length [r | r <- regions, rrKernel r == RSinGainOut] @?= 2
               -- Each kernel region writes exactly one bus; the
               -- two written buses are disjoint.
-              let writes = [bfWrites (rrFootprint r) | r <- regions]
+              let writes = [bfWrites (rfBuses (rrFootprint r)) | r <- regions]
               S.unions writes @?= S.fromList [0, 1]
               -- Every dependency view is empty for every region.
               let deps = regionDependencies rg
@@ -2791,8 +2791,8 @@ unitTests = testGroup "Unit tests"
           case rgRuntimeRegions voiceRg of
             [r] -> do
               rrKernel r @?= RSinGainOut
-              bfWrites (rrFootprint r) @?= S.singleton 5
-              bfReads  (rrFootprint r) @?= S.empty
+              bfWrites (rfBuses (rrFootprint r)) @?= S.singleton 5
+              bfReads  (rfBuses (rrFootprint r)) @?= S.empty
               regionDependencies voiceRg
                 @?= M.singleton (rrIndex r) S.empty
             rs -> assertFailure $
@@ -2804,8 +2804,8 @@ unitTests = testGroup "Unit tests"
           case rgRuntimeRegions fxRg of
             [r] -> do
               rrKernel r @?= RBusInLpfGainOut
-              bfWrites (rrFootprint r) @?= S.singleton 0
-              bfReads  (rrFootprint r) @?= S.singleton 5
+              bfWrites (rfBuses (rrFootprint r)) @?= S.singleton 0
+              bfReads  (rfBuses (rrFootprint r)) @?= S.singleton 5
               regionDependencies fxRg
                 @?= M.singleton (rrIndex r) S.empty
             rs -> assertFailure $

@@ -631,7 +631,7 @@ printTemplateGraph :: TemplateGraph -> IO ()
 printTemplateGraph tg = do
   putStrLn "\n  Templates (execution order):"
   forM_ (zip [(0 :: Int) ..] (tgTemplates tg)) $ \(i, t) -> do
-    let fp = tplFootprint t
+    let fp = rfBuses (tplFootprint t)
     putStrLn $
       "    " <> show i <> ". " <> tplName t
       <> "  writes=" <> show (bfWrites fp)

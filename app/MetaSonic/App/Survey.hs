@@ -371,7 +371,7 @@ regionLayerStats rt = do
           (flRegions fl)
       rowFor layer =
         let width   = length layer
-            hasSink = any (not . null . bfWrites . rrFootprint) layer
+            hasSink = any (not . null . bfWrites . rfBuses . rrFootprint) layer
             work    = sum (map (length . rrNodes) layer)
         in if hasSink
              then emptyRegionLayerStats

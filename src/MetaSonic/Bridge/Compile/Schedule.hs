@@ -75,6 +75,7 @@ import           MetaSonic.Bridge.Compile.Dependencies
                    )
 import           MetaSonic.Bridge.Compile.Types
                    ( BusFootprint (..)
+                   , ResourceFootprint (..)
                    , RuntimeGraph (..)
                    , RuntimeRegion (..)
                    , RegionIndex (..)
@@ -551,12 +552,12 @@ sharedWriteHazards layer =
   , let writers =
           [ rrIndex r
           | r <- layer
-          , bus `S.member` bfWrites (rrFootprint r)
+          , bus `S.member` bfWrites (rfBuses (rrFootprint r))
           ]
   , length writers > 1
   ]
   where
-    allWrites = S.unions [bfWrites (rrFootprint r) | r <- layer]
+    allWrites = S.unions [bfWrites (rfBuses (rrFootprint r)) | r <- layer]
 
 maxOr0 :: [Int] -> Int
 maxOr0 [] = 0

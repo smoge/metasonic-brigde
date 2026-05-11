@@ -765,11 +765,15 @@ data RuntimeRegion = RuntimeRegion
     -- by 'formRegions'; 'selectRegionKernels' may upgrade some
     -- regions to a fused kernel after splitting the region to
     -- contain only the matched members. See 'RegionKernel'.
-  , rrFootprint :: !BusFootprint
-    -- ^ Bus-level interface of this region: writes / live-reads /
-    -- delayed-reads. Computed by 'attachRegionFootprints' as the
-    -- final step of 'compileRuntimeGraph' so the same field
-    -- survives 'selectRegionKernels' splits without going stale.
+  , rrFootprint :: !ResourceFootprint
+    -- ^ §6.C.4: resource-level interface of this region. The
+    -- bus half ('rfBuses') carries the writes / live-reads /
+    -- delayed-reads that drove pre-6.C.4 region precedence;
+    -- the buffer half ('rfBuffers') is populated but not
+    -- consumed yet (slice 3 unions the edges).
+    -- Computed by 'attachRegionFootprints' as the final step
+    -- of 'compileRuntimeGraph' so the same field survives
+    -- 'selectRegionKernels' splits without going stale.
     -- §4.E.1 / §4.E.1b metadata only — does not change region
     -- execution order today; consumed by 'regionBusPrecedence'
     -- and (in union with structural cross-region edges)

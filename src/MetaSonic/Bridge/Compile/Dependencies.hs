@@ -28,6 +28,8 @@ module MetaSonic.Bridge.Compile.Dependencies
   ( -- * Footprints
     runtimeNodeFootprint
   , regionFootprint
+  , runtimeNodeResourceFootprint
+  , regionResourceFootprint
   , attachRegionFootprints
     -- * Source-of-input projections
   , inputSourceIndex
@@ -81,7 +83,58 @@ regionFootprint nodes = foldr step emptyFootprint
   where
     step ix acc = case M.lookup ix nodes of
       Nothing -> acc
-      Just n  -> mergeFootprint (runtimeNodeFootprint n) acc
+      Just n  -> mergeBusFootprint (runtimeNodeFootprint n) acc
+
+-- | Set-union of two 'BusFootprint's. Used by 'regionFootprint'
+-- and (via composition) by 'regionResourceFootprint'.
+mergeBusFootprint :: BusFootprint -> BusFootprint -> BusFootprint
+mergeBusFootprint a b = BusFootprint
+  { bfWrites       = bfWrites       a `S.union` bfWrites       b
+  , bfReads        = bfReads        a `S.union` bfReads        b
+  , bfDelayedReads = bfDelayedReads a `S.union` bfDelayedReads b
+  }
+
+-- | §6.C.4: resource footprint of one runtime node — the bus
+-- footprint from 'runtimeNodeFootprint' plus a buffer footprint
+-- derived from the kind + 'rnControls[0]' (the buffer ID slot,
+-- where applicable). Currently only 'KPlayBufMono' contributes
+-- a 'BufRead'; writer kinds land in 6.C.4's follow-up.
+runtimeNodeResourceFootprint :: RuntimeNode -> ResourceFootprint
+runtimeNodeResourceFootprint n =
+  ResourceFootprint
+    { rfBuses   = runtimeNodeFootprint n
+    , rfBuffers = case (rnKind n, rnControls n) of
+        (KPlayBufMono, v : _) | Just b <- finiteBufferId v ->
+          emptyBufferFootprint { bfBufReads = S.singleton b }
+        _ -> emptyBufferFootprint
+    }
+  where
+    finiteBufferId :: Double -> Maybe Int
+    finiteBufferId v
+      | isNaN v || isInfinite v || v < 0 = Nothing
+      | otherwise                         = Just (truncate v)
+
+-- | §6.C.4: aggregate 'ResourceFootprint' over a region's member
+-- list. Bus half matches 'regionFootprint' exactly; buffer half
+-- unions the per-node 'rfBuffers'.
+regionResourceFootprint
+  :: M.Map NodeIndex RuntimeNode
+  -> [NodeIndex]
+  -> ResourceFootprint
+regionResourceFootprint nodes = foldr step emptyResourceFootprint
+  where
+    step ix acc = case M.lookup ix nodes of
+      Nothing -> acc
+      Just n  -> mergeResource (runtimeNodeResourceFootprint n) acc
+    mergeResource a b = ResourceFootprint
+      { rfBuses   = mergeFootprint (rfBuses a) (rfBuses b)
+      , rfBuffers = mergeBuf       (rfBuffers a) (rfBuffers b)
+      }
+    mergeBuf a b = BufferFootprint
+      { bfBufWrites       = bfBufWrites       a `S.union` bfBufWrites       b
+      , bfBufReads        = bfBufReads        a `S.union` bfBufReads        b
+      , bfBufDelayedReads = bfBufDelayedReads a `S.union` bfBufDelayedReads b
+      }
 
     mergeFootprint a b = BusFootprint
       { bfWrites       = bfWrites       a `S.union` bfWrites       b
@@ -98,7 +151,7 @@ attachRegionFootprints :: RuntimeGraph -> RuntimeGraph
 attachRegionFootprints rg =
   let nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
       decorated =
-        [ r { rrFootprint = regionFootprint nodeMap (rrNodes r) }
+        [ r { rrFootprint = regionResourceFootprint nodeMap (rrNodes r) }
         | r <- rgRuntimeRegions rg
         ]
   in rg { rgRuntimeRegions = decorated }
@@ -195,10 +248,12 @@ regionBusPrecedence rg = M.fromList
       [ rrIndex other
       | other <- regions
       , rrIndex other /= rrIndex r
+        -- §6.C.4 slice 2: precedence stays bus-only here; slice 3
+        -- unions the buffer half.
       , not (S.null
-              (bfWrites (rrFootprint other)
+              (bfWrites (rfBuses (rrFootprint other))
                 `S.intersection`
-               bfReads  (rrFootprint r)))
+               bfReads  (rfBuses (rrFootprint r))))
       ])
   | r <- regions
   ]

@@ -32,6 +32,12 @@ module MetaSonic.Bridge.Templates
     BusFootprint (..)
   , emptyFootprint
   , busFootprint
+  , -- * §6.C.4 resource footprints (bus + buffer)
+    BufferFootprint (..)
+  , emptyBufferFootprint
+  , ResourceFootprint (..)
+  , emptyResourceFootprint
+  , resourceFootprint
   , Template (..)
   , -- * Compile-decreed plan
     TemplateGraph (..)
@@ -126,7 +132,10 @@ contributes both to 'bfWrites' and to 'bfDelayedReads' on bus 5; only
 --
 -- Reads only 'irEffects'. The fold is order-independent.
 --
--- See Note [Bus footprint surface].
+-- See Note [Bus footprint surface]. §6.C.4 generalizes this to
+-- 'resourceFootprint' which also records 'BufRead' / 'BufWrite'
+-- effects; 'busFootprint' is the bus-only projection retained
+-- for callers that only need bus precedence.
 busFootprint :: GraphIR -> BusFootprint
 busFootprint ir = foldr stepNode emptyFootprint (giNodes ir)
   where
@@ -136,15 +145,43 @@ busFootprint ir = foldr stepNode emptyFootprint (giNodes ir)
     addEff (BusReadDelayed  b) fp = fp { bfDelayedReads = S.insert b (bfDelayedReads fp) }
     addEff _                   fp = fp
 
--- | A single template — one 'RuntimeGraph' plus the bus interface it
--- exposes. The 'tplName' is user-provided and used only for error
--- messages and diagnostics; uniqueness is enforced by
+-- | §6.C.4 extractor: derive the full 'ResourceFootprint' (bus
+-- *and* buffer fields) from a lowered 'GraphIR'. Reads only
+-- 'irEffects'. The fold is order-independent.
+--
+-- In 6.C.4 only the bus half participates in the precedence
+-- rule until slice 3 unions in the buffer edges; the buffer
+-- half is populated but not consumed yet, which keeps
+-- bus-only graphs bit-identical with slice 1 / 2.
+--
+-- See Note [Resource footprints, §6.C.4] in
+-- 'MetaSonic.Bridge.Compile.Types'.
+resourceFootprint :: GraphIR -> ResourceFootprint
+resourceFootprint ir = foldr stepNode emptyResourceFootprint (giNodes ir)
+  where
+    stepNode n acc = foldr addEff acc (irEffects n)
+    addEff (BusWrite        b) fp = fp
+      { rfBuses = (rfBuses fp) { bfWrites       = S.insert b (bfWrites       (rfBuses fp)) } }
+    addEff (BusRead         b) fp = fp
+      { rfBuses = (rfBuses fp) { bfReads        = S.insert b (bfReads        (rfBuses fp)) } }
+    addEff (BusReadDelayed  b) fp = fp
+      { rfBuses = (rfBuses fp) { bfDelayedReads = S.insert b (bfDelayedReads (rfBuses fp)) } }
+    addEff (BufWrite        b) fp = fp
+      { rfBuffers = (rfBuffers fp) { bfBufWrites       = S.insert b (bfBufWrites       (rfBuffers fp)) } }
+    addEff (BufRead         b) fp = fp
+      { rfBuffers = (rfBuffers fp) { bfBufReads        = S.insert b (bfBufReads        (rfBuffers fp)) } }
+    addEff Pure                fp = fp
+
+-- | A single template — one 'RuntimeGraph' plus the resource
+-- interface it exposes (buses + buffers, §6.C.4). The 'tplName'
+-- is user-provided and used only for error messages and
+-- diagnostics; uniqueness is enforced by
 -- 'compileTemplateGraph'.
 data Template = Template
   { tplID        :: !TemplateID
   , tplName      :: !String
   , tplGraph     :: !RuntimeGraph
-  , tplFootprint :: !BusFootprint
+  , tplFootprint :: !ResourceFootprint
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -234,7 +271,7 @@ compileTemplateGraph entries = do
     compileOne (i, (name, sg)) = do
       ir <- prefixError name (lowerGraph sg)
       rg <- prefixError name (compileRuntimeGraph ir)
-      let !fp = busFootprint ir
+      let !fp = resourceFootprint ir
       pure Template
         { tplID        = TemplateID i
         , tplName      = name
@@ -273,7 +310,7 @@ compileTemplateGraphFused entries = do
     compileOneFused (i, (name, sg)) = do
       ir <- prefixError name (lowerGraph sg)
       rg <- prefixError name (compileRuntimeGraphFused ir)
-      let !fp = busFootprint ir
+      let !fp = resourceFootprint ir
       pure Template
         { tplID        = TemplateID i
         , tplName      = name
@@ -308,10 +345,12 @@ computePrecedence ts = M.fromList
         [ tplID a
         | a <- ts
         , tplID a /= tplID b
+          -- §6.C.4 slice 2 keeps the precedence rule bus-only:
+          -- buffer edges land in slice 3.
         , not (S.null
-                 (bfWrites (tplFootprint a)
+                 (bfWrites (rfBuses (tplFootprint a))
                   `S.intersection`
-                  bfReads  (tplFootprint b)))
+                  bfReads  (rfBuses (tplFootprint b))))
         ]
     )
   | b <- ts
@@ -488,12 +527,12 @@ templateLayerSharedWriteHazards layer =
     , let writers =
             [ tplID t
             | t <- layer
-            , bus `S.member` bfWrites (tplFootprint t)
+            , bus `S.member` bfWrites (rfBuses (tplFootprint t))
             ]
     , length writers > 1
     ]
   where
-    allWrites = S.unions [bfWrites (tplFootprint t) | t <- layer]
+    allWrites = S.unions [bfWrites (rfBuses (tplFootprint t)) | t <- layer]
 
 maxOr0 :: [Int] -> Int
 maxOr0 [] = 0

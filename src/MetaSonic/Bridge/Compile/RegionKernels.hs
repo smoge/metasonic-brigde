@@ -187,7 +187,7 @@ selectRegionKernels rg =
                 , rrRate      = rate
                 , rrNodes     = ks
                 , rrKernel    = ker
-                , rrFootprint = emptyFootprint
+                , rrFootprint = emptyResourceFootprint
                   -- Re-derived by 'attachRegionFootprints' after
                   -- 'selectRegionKernels' finishes splitting; safe to
                   -- leave empty until then.
@@ -220,7 +220,7 @@ selectRegionKernels rg =
                         , rrRate      = rate
                         , rrNodes     = post
                         , rrKernel    = RNodeLoop
-                        , rrFootprint = emptyFootprint
+                        , rrFootprint = emptyResourceFootprint
                           -- See note on 'mkPart'.
                         }
                 in  mkPart rate pre RNodeLoop

@@ -43,6 +43,10 @@ module MetaSonic.Bridge.Compile
     -- 'MetaSonic.Bridge.Compile.Types'.
     BusFootprint (..)
   , emptyFootprint
+  , BufferFootprint (..)
+  , emptyBufferFootprint
+  , ResourceFootprint (..)
+  , emptyResourceFootprint
   , runtimeNodeFootprint
   , regionFootprint
   , attachRegionFootprints
@@ -279,7 +283,7 @@ compileRuntimeGraph ir = do
           -- 'selectRegionKernels' may upgrade some regions to a
           -- fused kernel after splitting, before the final
           -- 'RuntimeGraph' is returned.
-        , rrFootprint = emptyFootprint
+        , rrFootprint = emptyResourceFootprint
           -- Placeholder; 'attachRegionFootprints' fills this in as
           -- the final step of 'compileRuntimeGraph' so kernel splits
           -- don't leave stale aggregations behind.
