@@ -100,6 +100,7 @@ executables:
       - MetaSonic.App.Demos
       - MetaSonic.App.FusionCostLab
       - MetaSonic.App.Osc
+      - MetaSonic.App.SnapshotCheck
       - MetaSonic.App.Survey
       - MetaSonic.App.SwapBench
       - MetaSonic.App.WorkerBench

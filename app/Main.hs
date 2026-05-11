@@ -20,6 +20,7 @@ import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
                                               runFusionCostLab)
 import qualified MetaSonic.App.FusionCostLab as FCL
 import           MetaSonic.App.Osc          (runOscListen)
+import           MetaSonic.App.SnapshotCheck (runSnapshotCheck)
 import           MetaSonic.OSC.Listen       (parseListenerPort)
 import           MetaSonic.App.Survey       (printFusionSummary,
                                              runFusionSurvey)
@@ -90,6 +91,10 @@ data RunMode
     -- the baseline, and prints one machine-readable row per
     -- (family, member, variant). Use --summary to switch from
     -- JSONL to a human-readable table.
+  | SnapshotCheck
+    -- ^ Non-audio reporting mode (--snapshot-check). Runs the
+    -- Phase 7.A read-only invariants over the survey corpus and
+    -- fusion cost lab, then exits non-zero on drift.
   deriving (Eq, Show)
 
 data Options = Options
@@ -146,6 +151,8 @@ parseArgs = go defaultOptions
       go opts { optMode = CorpusSurvey } xs
     go opts ("--fusion-cost-lab" : xs) =
       go opts { optMode = FusionCostLab } xs
+    go opts ("--snapshot-check" : xs) =
+      go opts { optMode = SnapshotCheck } xs
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -219,6 +226,7 @@ usage prog = unlines
   , "  " <> prog <> " --swap-bench"
   , "  " <> prog <> " --corpus-survey"
   , "  " <> prog <> " --fusion-cost-lab [--summary]"
+  , "  " <> prog <> " --snapshot-check"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --plugin-list"
   , "  " <> prog <> " --osc-listen [PORT]"
@@ -272,14 +280,19 @@ usage prog = unlines
   , "                   demo targets are ignored."
   , "  --fusion-cost-lab"
   , "                   Phase 7.A fusion cost lab. Generates a fixed bank"
-  , "                   of parametric graph families (sink-chain,"
-  , "                   return-tail, fanout), compiles each member through"
-  , "                   stripped-node-loop / region-kernel / RFused"
-  , "                   variants, times them, and checks bit-equivalence"
-  , "                   against the baseline. Output is JSONL (one row per"
-  , "                   variant) by default; pair with --summary for a"
-  , "                   human-readable table. No audio, no TUI; demo"
-  , "                   targets are ignored."
+  , "                   of parametric and corpus graph families"
+  , "                   (sink-chain, return-tail, fanout, corpus),"
+  , "                   compiles each member through stripped-node-loop /"
+  , "                   region-kernel / RFused variants, times them, and"
+  , "                   checks bit-equivalence against the baseline. Output"
+  , "                   is JSONL (one row per variant) by default; pair"
+  , "                   with --summary for a human-readable table. No audio,"
+  , "                   no TUI; demo targets are ignored."
+  , "  --snapshot-check"
+  , "                   Phase 7.A survey/cost-lab invariant checker. Runs"
+  , "                   the cost-lab row/equivalence/feature checks and"
+  , "                   the survey corpus compile/latency/shape checks."
+  , "                   No audio, no TUI; demo targets are ignored."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
@@ -375,6 +388,8 @@ main = do
             , fcoFamilies = fcoFamilies FCL.defaultOptions
             }
       runFusionCostLab fcoOpts
+    SnapshotCheck ->
+      runSnapshotCheck
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -438,6 +453,7 @@ runDemo opts demo
     || optMode opts == SwapBench
     || optMode opts == CorpusSurvey
     || optMode opts == FusionCostLab
+    || optMode opts == SnapshotCheck
     || optMode opts == OscListen
     || optMode opts == MidiList
     || optMode opts == PluginList =
@@ -500,6 +516,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: CorpusSurvey should be handled by main, never reach here"
     FusionCostLab ->
       error "runSingleDemo: FusionCostLab should be handled by main, never reach here"
+    SnapshotCheck ->
+      error "runSingleDemo: SnapshotCheck should be handled by main, never reach here"
     OscListen ->
       error "runSingleDemo: OscListen should be handled by main, never reach here"
     MidiList ->

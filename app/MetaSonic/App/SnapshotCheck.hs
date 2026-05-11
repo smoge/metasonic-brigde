@@ -1,0 +1,256 @@
+-- |
+-- Module      : MetaSonic.App.SnapshotCheck
+-- Description : Read-only invariants for survey and cost-lab tooling.
+--
+-- This is a lightweight gate for the Phase 7.A tooling surface. It
+-- deliberately checks structural invariants over the current survey
+-- corpus and fusion cost lab instead of comparing full textual output:
+-- row counts, compile success, equivalence, feature columns, latency
+-- coverage, and known sink-shape signals.
+
+module MetaSonic.App.SnapshotCheck
+  ( runSnapshotCheck
+  ) where
+
+import           Control.Monad                 (forM_)
+import           Data.List                     (intercalate, nub, sort)
+import           System.Exit                   (die)
+
+import qualified MetaSonic.App.FusionCostLab   as FCL
+import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
+                                                FusionCaseFeatures (..),
+                                                GraphFamily (..),
+                                                LabRow (..),
+                                                Variant (..),
+                                                collectFusionCostLabRows,
+                                                familyName)
+import           MetaSonic.App.Survey          (CorpusGraphSummary (..),
+                                                SinkShape (..), renderShape,
+                                                shapeHasKernel,
+                                                surveyCorpusGraph,
+                                                surveyEnsembleCorpus,
+                                                surveyShapeProbes)
+import           MetaSonic.Bridge.Compile      (DeclaredNodeLatency (..))
+import           MetaSonic.Types               (NodeKind (..))
+
+data SnapshotCheck = SnapshotCheck
+  { scLabel  :: !String
+  , scPassed :: !Bool
+  , scDetail :: !String
+  } deriving (Eq, Show)
+
+data SurveySnapshots = SurveySnapshots
+  { ssShapeRows    :: ![(String, Either String CorpusGraphSummary)]
+  , ssEnsembleRows :: ![(String, Either String CorpusGraphSummary)]
+  } deriving (Eq, Show)
+
+runSnapshotCheck :: IO ()
+runSnapshotCheck = do
+  costRows <- collectFusionCostLabRows FCL.defaultOptions
+  let survey = collectSurveySnapshots
+      checks = costLabChecks costRows <> surveyChecks survey
+
+  putStrLn "Phase 7.A survey/cost-lab snapshot checks"
+  putStrLn ""
+  forM_ checks printCheck
+
+  let failures = [c | c <- checks, not (scPassed c)]
+  putStrLn ""
+  if null failures
+    then putStrLn $
+      "All snapshot checks passed (" <> show (length checks) <> ")."
+    else die $
+      show (length failures) <> " snapshot check(s) failed."
+
+collectSurveySnapshots :: SurveySnapshots
+collectSurveySnapshots = SurveySnapshots
+  { ssShapeRows =
+      [ (name, surveyCorpusGraph ("snapshot:" <> name) Nothing graph)
+      | (name, graph) <- surveyShapeProbes
+      ]
+  , ssEnsembleRows =
+      [ (ensembleName <> "/" <> templateName,
+         surveyCorpusGraph
+           ("snapshot:" <> ensembleName)
+           (Just templateName)
+           graph)
+      | (ensembleName, templates) <- surveyEnsembleCorpus
+      , (templateName, graph)     <- templates
+      ]
+  }
+
+costLabChecks :: [LabRow] -> [SnapshotCheck]
+costLabChecks rows =
+  [ check "cost-lab row count is stable"
+      (length rows == 39)
+      ("rows=" <> show (length rows))
+
+  , check "cost-lab covers the expected families"
+      (familyNames == ["corpus", "fanout", "return-tail", "sink-chain"])
+      ("families=" <> intercalate "," familyNames)
+
+  , check "cost-lab variants compile and measure"
+      (all rowMeasured rows)
+      ("unmeasured=" <> show (length [() | r <- rows, not (rowMeasured r)]))
+
+  , check "cost-lab variants remain bit-equivalent"
+      (all ((== EqExact) . lrEquivalence) rows)
+      ("non-exact=" <> show (length [() | r <- rows, lrEquivalence r /= EqExact]))
+
+  , check "cost-lab corpus carries declared latency coverage"
+      corpusLatency
+      ("max-latency=" <> show maxLatency)
+
+  , check "cost-lab fanout row stays a kernel near-miss"
+      fanoutNearMiss
+      ("fanout-node-loop=" <> maybe "missing" show (featuresFor "sin-fanout-two-out" VarNodeLoop)
+       <> "; fanout-region=" <> maybe "missing" show (featuresFor "sin-fanout-two-out" VarRegionKernel))
+
+  , check "cost-lab return tail records bus footprint"
+      returnTailFootprint
+      ("return-tail=" <> maybe "missing" show (featuresFor "send-busout-return" VarNodeLoop))
+  ]
+  where
+    familyNames = sort (nub (map (familyName . lrFamily) rows))
+
+    rowMeasured r =
+      lrError r == Nothing
+        && lrFeatures r /= Nothing
+        && lrNsPerSample r /= Nothing
+
+    corpusFeatures =
+      [ f
+      | r <- rows
+      , lrFamily r == FamilyCorpus
+      , Just f <- [lrFeatures r]
+      ]
+
+    maxLatency =
+      maximumOrZero (map fcfMaxLatency corpusFeatures)
+
+    corpusLatency =
+      any (\f -> fcfLatencyNodes f > 0 && fcfMaxLatency f >= 1024)
+          corpusFeatures
+
+    fanoutNearMiss =
+      case featuresFor "sin-fanout-two-out" VarRegionKernel of
+        Just f ->
+          fcfFanoutNodes f > 0
+            && fcfMaxConsumerCount f >= 2
+            && fcfKernelClaims f == 0
+        Nothing -> False
+
+    returnTailFootprint =
+      case featuresFor "send-busout-return" VarNodeLoop of
+        Just f -> fcfBusWrites f >= 2 && fcfBusReads f >= 1
+        Nothing -> False
+
+    featuresFor member variant =
+      case [f | r <- rows
+              , lrMember r == member
+              , lrVariant r == variant
+              , Just f <- [lrFeatures r]
+           ] of
+        (f : _) -> Just f
+        []      -> Nothing
+
+surveyChecks :: SurveySnapshots -> [SnapshotCheck]
+surveyChecks snapshots =
+  [ check "survey shape probes compile"
+      (null shapeErrs)
+      (compileDetail shapeErrs)
+
+  , check "survey ensemble corpus compiles"
+      (null ensembleErrs)
+      (compileDetail ensembleErrs)
+
+  , check "survey corpus size stays non-trivial"
+      (length (ssShapeRows snapshots) >= 20
+       && length (ssEnsembleRows snapshots) >= 20)
+      ("shape-rows=" <> show (length (ssShapeRows snapshots))
+       <> "; ensemble-template-rows=" <> show (length (ssEnsembleRows snapshots)))
+
+  , check "survey spectral-freeze latency stays visible"
+      spectralLatency
+      (shapeSummary "shape/spectral-freeze-tail")
+
+  , check "survey BusIn return-tail shape stays claimed"
+      busInReturnClaim
+      (shapeSummary "shape/busin-lpf-gain-out")
+
+  , check "survey missed no-kernel shapes remain visible"
+      (not (null missedNoKernel))
+      ("missed-shapes=" <> show (length (nub (map fst missedNoKernel)))
+       <> "; sources=" <> show (length (nub (map snd missedNoKernel)))
+       <> "; examples=" <> missedExamples)
+  ]
+  where
+    allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
+    shapeErrs = compileFailures (ssShapeRows snapshots)
+    ensembleErrs = compileFailures (ssEnsembleRows snapshots)
+
+    spectralLatency =
+      case lookup "shape/spectral-freeze-tail" (ssShapeRows snapshots) of
+        Just (Right row) ->
+          any isSpectralFreezeLatency (csDeclaredLatency row)
+        _ -> False
+
+    isSpectralFreezeLatency d =
+      dnlKind d == KSpectralFreeze && dnlLatency d >= 1024
+
+    busInReturnClaim =
+      case lookup "shape/busin-lpf-gain-out" (ssShapeRows snapshots) of
+        Just (Right row) ->
+          (SinkBusInLpfGain, True) `elem` csShapes row
+        _ -> False
+
+    missedNoKernel =
+      [ (shape, label)
+      | (label, Right row) <- allRows
+      , (shape, False) <- csShapes row
+      , not (shapeHasKernel shape)
+      ]
+
+    missedExamples =
+      intercalate ", "
+        (take 3 [renderShape shape <> "@" <> label
+                | (shape, label) <- missedNoKernel])
+
+    shapeSummary name =
+      case lookup name (ssShapeRows snapshots) of
+        Just (Right row) ->
+          "shapes=" <>
+            intercalate ", "
+              [ renderShape shape <> ":" <> if claimed then "claimed" else "missed"
+              | (shape, claimed) <- csShapes row
+              ]
+          <> "; latency=" <> show (csDeclaredLatency row)
+        Just (Left err) -> err
+        Nothing         -> "missing"
+
+compileFailures :: [(String, Either String a)] -> [String]
+compileFailures rows =
+  [ label <> ": " <> err
+  | (label, Left err) <- rows
+  ]
+
+compileDetail :: [String] -> String
+compileDetail [] = "ok"
+compileDetail xs =
+  intercalate "; " (take 3 xs)
+  <> if length xs > 3 then "; ..." else ""
+
+check :: String -> Bool -> String -> SnapshotCheck
+check = SnapshotCheck
+
+printCheck :: SnapshotCheck -> IO ()
+printCheck c =
+  putStrLn $
+    (if scPassed c then "[pass] " else "[fail] ")
+    <> scLabel c
+    <> " -- "
+    <> scDetail c
+
+maximumOrZero :: [Int] -> Int
+maximumOrZero [] = 0
+maximumOrZero xs = maximum xs

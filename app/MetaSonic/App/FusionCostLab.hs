@@ -57,6 +57,7 @@
 module MetaSonic.App.FusionCostLab
   ( -- * CLI entry point
     runFusionCostLab
+  , collectFusionCostLabRows
   , FusionCostLabOptions (..)
   , defaultOptions
   , OutputFormat (..)
@@ -556,10 +557,14 @@ defaultOptions = FusionCostLabOptions
 
 runFusionCostLab :: FusionCostLabOptions -> IO ()
 runFusionCostLab opts = do
-  rows <- concat <$> mapM runFamily (fcoFamilies opts)
+  rows <- collectFusionCostLabRows opts
   case fcoFormat opts of
     FormatJSONL   -> mapM_ (putStrLn . rowToJSONL) rows
     FormatSummary -> renderSummary rows
+
+collectFusionCostLabRows :: FusionCostLabOptions -> IO [LabRow]
+collectFusionCostLabRows opts =
+  concat <$> mapM runFamily (fcoFamilies opts)
 
 runFamily :: GraphFamily -> IO [LabRow]
 runFamily fam = concat <$> mapM (runMember fam) (familyMembers fam)

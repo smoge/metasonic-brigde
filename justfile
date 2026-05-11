@@ -28,6 +28,9 @@ midi-list:
 plugin-list:
     stack exec -- metasonic-bridge --plugin-list
 
+snapshot-check:
+    stack exec -- metasonic-bridge --snapshot-check
+
 midi-poly:
     stack exec -- metasonic-bridge midi-poly
 
