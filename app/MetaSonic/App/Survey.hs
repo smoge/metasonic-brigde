@@ -24,10 +24,11 @@ import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
-import           MetaSonic.Types            (NodeIndex (..), NodeKind (..),
+import           MetaSonic.Types            (KindCapability (..),
+                                             NodeIndex (..), NodeKind (..),
                                              PortConsumptionRate (..),
                                              PortIndex (..), Rate (..),
-                                             kindTag)
+                                             kindCapabilities, kindTag)
 
 printFusionSummary :: String -> RuntimeGraph -> IO ()
 printFusionSummary label rg = do
@@ -441,7 +442,39 @@ data SurveyRow = SurveyRow
     -- ^ §6.D diagnostic for uncompensated parallel paths: nodes
     -- with dynamic inputs arriving at different cumulative
     -- latencies. Read-only; no scheduler pass consumes this yet.
+  , srKindTally    :: !KindTally
+    -- ^ §7.B per-kind node counts. Read-only descriptive metadata;
+    -- printed in the kind capability footprint section. Sorted by
+    -- 'NodeKind' Enum order; kinds with zero occurrences are
+    -- dropped.
   } deriving (Eq, Show)
+
+-- | Per-row tally of 'NodeKind' → count of nodes carrying that kind.
+-- Kept as an Enum-ordered assoc list because 'NodeKind' has no 'Ord'
+-- instance. Zero-count kinds are dropped so a per-kind table doesn't
+-- show 22 rows for every graph.
+type KindTally = [(NodeKind, Int)]
+
+kindTallyOf :: RuntimeGraph -> KindTally
+kindTallyOf rt =
+  [ (k, n)
+  | k <- [minBound .. maxBound :: NodeKind]
+  , let n = length [() | node <- rgNodes rt, rnKind node == k]
+  , n > 0
+  ]
+
+emptyKindTally :: KindTally
+emptyKindTally = []
+
+mergeKindTallies :: KindTally -> KindTally -> KindTally
+mergeKindTallies a b =
+  [ (k, n)
+  | k <- [minBound .. maxBound :: NodeKind]
+  , let n = countOf k a + countOf k b
+  , n > 0
+  ]
+  where
+    countOf k = maybe 0 id . lookup k
 
 -- Build a SurveyRow from /two/ compiled 'RuntimeGraph's of the
 -- same source 'SynthGraph':
@@ -505,6 +538,7 @@ surveyRuntimeGraph d t rt rtF stats workerStats =
        , srOppProducers = sampleRateOpportunityProducers rt
        , srDeclaredLatency = declaredLatencyFootprint rt
        , srLatencySkews    = inputLatencySkews rt
+       , srKindTally       = kindTallyOf rt
        }
 
 -- | Compile a 'SynthGraph' for the survey. Returns 'Left' with a
@@ -1453,6 +1487,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printDeclaredLatency allRows
   putStrLn ""
+  printCapabilityFootprint allRows
+  putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
   case allErrs of
@@ -2131,6 +2167,64 @@ latencyColumnWidths = [16, 15, 6, 32]
 formatLatencyRow :: [String] -> String
 formatLatencyRow cols =
   intercalate "  " (zipWith pad latencyColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+--------------------------------------------------------------------------------
+-- §7.B kind capability footprint
+--------------------------------------------------------------------------------
+
+-- Two sub-sections under one header:
+--
+--   1. Per-capability node counts across the corpus. A node is
+--      counted once for each capability its kind carries, so the
+--      column totals do not sum to the node count.
+--   2. The per-kind matrix: for each 'NodeKind' that appears in the
+--      corpus, its total occurrence count and its declared
+--      'kindCapabilities' list.
+--
+-- The footprint is descriptive only. No planner decision is made
+-- from it yet; the section exists so the upcoming Phase 7.C planner
+-- has a checked input surface and so corpus capability drift fails
+-- loudly in '--snapshot-check'.
+printCapabilityFootprint :: [SurveyRow] -> IO ()
+printCapabilityFootprint rows = do
+  putStrLn "─── Kind capability footprint (§7.B, kindCapabilities) ───"
+  let aggTally = foldr mergeKindTallies emptyKindTally
+                       (map srKindTally rows)
+      caps     = [minBound .. maxBound :: KindCapability]
+      perCap   = [(cap, nodesWithCap cap aggTally) | cap <- caps]
+  if null aggTally
+    then putStrLn "  (no nodes in the surveyed graphs)"
+    else do
+      putStrLn $ formatCapRow ["capability", "nodes"]
+      mapM_ (\(c, n) -> putStrLn $ formatCapRow [show c, show n]) perCap
+      putStrLn ""
+      putStrLn "  Per-kind capability matrix:"
+      mapM_
+        (\(k, n) ->
+            putStrLn $
+              "    " <> padR 18 (show k)
+                     <> "n=" <> padR 5 (show n)
+                     <> intercalate ", "
+                          (map show (kindCapabilities k)))
+        aggTally
+  where
+    nodesWithCap cap tally =
+      sum [n | (k, n) <- tally, cap `elem` kindCapabilities k]
+
+    padR w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+capabilityColumnWidths :: [Int]
+capabilityColumnWidths = [22, 6]
+
+formatCapRow :: [String] -> String
+formatCapRow cols =
+  "  " <> intercalate "  " (zipWith pad capabilityColumnWidths cols)
   where
     pad w s
       | length s >= w = s
