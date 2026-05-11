@@ -11669,6 +11669,85 @@ spectralFreezeSkeletonTests =
              <> show peak)
             (peak > 0.1)
 
+  , testCase "hop-boundary latch: freeze_flag read happens at the hop's fi" $ do
+      -- §6.D hardening: prove the kernel hop-latches the
+      -- freeze_flag at exactly fi = hop boundary, not at
+      -- block-start, block-end, or a sample-rounded
+      -- approximation. The kernel reads
+      -- @freeze_in[fi]@ where @fi@ is the loop index at the
+      -- moment a hop fires. With N=1024 / hop=256 the first
+      -- three hops fire at fi=1023, 1279, 1535 (samples_in
+      -- crosses 1024 / 1280 / 1536). If we vary the freeze
+      -- transition by a single frame around fi=1279, the
+      -- expected analysis_count flips because the hop-1
+      -- decision flips.
+      --
+      -- Two sub-scenarios, each in its own RT graph:
+      --
+      --   transition = 1279 → freeze_in[1279] = 1 → hop 1
+      --     freezes → analysis_count = 1 (only hop 0).
+      --
+      --   transition = 1280 → freeze_in[1279] = 0 → hop 1
+      --     analyzes; hop 2 (fi=1535) reads
+      --     freeze_in[1535] = 1 → freezes →
+      --     analysis_count = 2.
+      --
+      -- The 1-frame difference between the two scenarios is
+      -- the proof: the latch lands at exactly the hop's fi,
+      -- not anywhere else.
+      let n         = 1024 :: Int
+          hop       = 256  :: Int
+          nframes   = n + 2 * hop          -- 1536: covers hops at fi=1023, 1279, 1535
+          freezeBuf transitionF =
+            [ if i >= transitionF then 1.0 else 0.0 :: Float
+            | i <- [0 .. nframes - 1]
+            ]
+          -- Two separate audio buffers: buffer 0 is the
+          -- signal_in source (silent sine — content doesn't
+          -- matter, only the freeze_flag does), buffer 1 is
+          -- the freeze_flag transition.
+          graph = runSynth $ do
+            -- A signal source for spectralFreeze. The
+            -- content doesn't change the analysis_count
+            -- assertion — we're testing the freeze gate
+            -- only. Use a sinOsc so the kernel has real
+            -- audio to analyze on pass-through hops.
+            sig <- sinOsc 440.0 0.0
+            -- The freeze_flag, driven from playBufMono on a
+            -- buffer whose values transition mid-render.
+            fl  <- playBufMono (Buffer 1) (Param 1.0) (Param 0) (Param 0)
+            frozen <- spectralFreeze sig fl
+            out 0 frozen
+
+          runWithTransition transitionF expectedAnalysis = do
+            tg <- case compileTemplateGraph
+                         [("freeze", graph)] of
+              Right t  -> pure t
+              Left err -> assertFailure err >> error "unreachable"
+            let totalNodes =
+                  sum (map (length . rgNodes . tplGraph)
+                           (tgTemplates tg))
+            withRTGraph (totalNodes + 8) nframes $ \rt -> do
+              -- Buffer 0 reserved for the signal — left
+              -- unallocated since signal_in is wired from
+              -- sinOsc, not a buffer. Buffer 1 holds the
+              -- freeze transition pattern.
+              _    <- allocBuffer rt 4  -- placeholder so buf 1 lands as id 1
+              fbuf <- allocBuffer rt nframes
+              bufferId fbuf @?= 1
+              loadBuffer rt fbuf (freezeBuf transitionF)
+              loadTemplateGraph rt tg
+              c_rt_graph_process rt (fromIntegral nframes)
+              analysis <- c_rt_graph_test_spectral_analysis_count rt
+              assertEqual
+                ("transition at fi=" <> show transitionF
+                 <> " must produce analysis_count = "
+                 <> show expectedAnalysis)
+                expectedAnalysis analysis
+
+      runWithTransition 1279 1
+      runWithTransition 1280 2
+
   , testCase "unfreeze recovery: analysis resumes after the flag drops" $ do
       -- Three blocks: pass-through, freeze, then unfreeze.
       -- Each phase verifies its own counter contract:
