@@ -9247,6 +9247,35 @@ wireTests = testGroup "wire parser"
       case OSC.parseMessage bytes of
         Left  _   -> pure ()
         Right msg -> assertFailure ("expected Left, got: " <> show msg)
+
+  , testCase "rejects trailing bytes after declared arguments" $ do
+      -- A valid /fx0/lpf/0 ,f 1500.0 message followed by 4
+      -- extra bytes the wire spec does not authorize.
+      let bytes = OBS.concat
+            [ messageBytesFx0LpfFloat
+            , OBS.pack [0x00, 0x00, 0x00, 0x00]
+            ]
+      case OSC.parseMessage bytes of
+        Left err -> assertBool ("expected trailing-byte rejection, got: " <> err)
+                               ("trailing" `isInfixOf` err)
+        Right msg -> assertFailure ("expected Left, got: " <> show msg)
+
+  , testCase "rejects non-zero bytes in OSC-string padding" $ do
+      -- '/foo' is 4 bytes + 1 NUL = 5 raw bytes; padding is
+      -- 3 bytes to reach the next 4-byte boundary. A conforming
+      -- producer fills them with NUL; we plant 0xFF in the
+      -- first padding slot and assert the parser rejects it.
+      let badAddrField =
+            OBS.pack [0x2F, 0x66, 0x6F, 0x6F, 0x00, 0xFF, 0x00, 0x00]
+          bytes = OBS.concat
+            [ badAddrField
+            , oscString (OBSC.pack ",f")
+            , floatBytes1500
+            ]
+      case OSC.parseMessage bytes of
+        Left err -> assertBool ("expected padding-zero rejection, got: " <> err)
+                               ("padding" `isInfixOf` err)
+        Right msg -> assertFailure ("expected Left, got: " <> show msg)
   ]
 
 -- ----- Dispatch against a 6.A corpus template ----------------
@@ -9254,11 +9283,15 @@ wireTests = testGroup "wire parser"
 -- Build a ResolveState that registers voice key "fx0" against
 -- the arpeggio-send-return fx template. The voice's runtime
 -- slot id is fixed at 1 (the IO layer would have this from a
--- prior rt_graph_realtime_reserve call).
+-- prior rt_graph_realtime_reserve call). The fixture's
+-- invariant is that "fx0" is OSC-safe; the @error@ below fires
+-- only if 'registerVoice' is reused with a malformed key later.
 arpeggioFxResolveState :: OSC.ResolveState
 arpeggioFxResolveState =
-  OSC.registerVoice (OBSC.pack "fx0") 1 (OBSC.pack "fx")
-    (OSC.emptyResolveState (patternTemplates arpeggioSendReturn))
+  case OSC.registerVoice (OBSC.pack "fx0") 1 (OBSC.pack "fx")
+         (OSC.emptyResolveState (patternTemplates arpeggioSendReturn)) of
+    Right rs  -> rs
+    Left  iss -> error $ "test fixture: " <> show iss
 
 dispatchTests :: TestTree
 dispatchTests = testGroup "dispatch against arpeggio-send-return/fx"
@@ -9358,21 +9391,38 @@ identifierProfileTests = testGroup "OSC-safe identifier profile"
   , testCase "rejects strings containing spaces" $
       OSC.isOscSafeIdentifier (OBSC.pack "foo bar") @?= False
 
-  , testCase "registers but cannot resolve through dispatch" $ do
-      -- A voice key registered outside the OSC-safe profile is
-      -- reachable in the ResolveState table but unreachable from
-      -- a dispatched message because dispatch validates the
-      -- profile on the path segment first.
-      let rs = OSC.registerVoice (OBSC.pack "bad name") 1 (OBSC.pack "fx")
+  , testCase "registerVoice accepts an OSC-safe key" $
+      case OSC.registerVoice (OBSC.pack "v0") 1 (OBSC.pack "drone")
+             (OSC.emptyResolveState (patternTemplates droneVibrato)) of
+        Right _   -> pure ()
+        Left  iss -> assertFailure (show iss)
+
+  , testCase "registerVoice rejects a reserved word" $
+      OSC.registerVoice (OBSC.pack "swap") 1 (OBSC.pack "fx")
+        (OSC.emptyResolveState (patternTemplates arpeggioSendReturn))
+        @?= Left (OSC.DiReservedPathSegment (OBSC.pack "swap"))
+
+  , testCase "registerVoice rejects an identifier-profile violation" $
+      case OSC.registerVoice (OBSC.pack "bad name") 1 (OBSC.pack "fx")
+             (OSC.emptyResolveState (patternTemplates arpeggioSendReturn)) of
+        Left (OSC.DiIdentifierProfile k) -> k @?= OBSC.pack "bad name"
+        other -> assertFailure (show other)
+
+  , testCase "registerVoiceUnchecked stays reachable in state but not via dispatch" $ do
+      -- Defense-in-depth: even if internal code installs a key
+      -- outside the OSC-safe profile via the escape hatch, the
+      -- dispatch path-segment validator catches non-conforming
+      -- segments before the lookup runs. The registered-but-
+      -- unreachable voice is documentation of the design
+      -- property, not a separate gate.
+      let rs = OSC.registerVoiceUnchecked
+                 (OBSC.pack "bad name") 1 (OBSC.pack "fx")
                  (OSC.emptyResolveState (patternTemplates arpeggioSendReturn))
           msg = OSC.OscMessage (OBSC.pack "/bad/lpf/0")
                                 [OSC.OscArgFloat 1.0]
-          -- The path segment 'bad' is OSC-safe (the dispatch
-          -- never sees 'bad name'), so this surfaces as a
-          -- DiUnknownVoice rather than an identifier-profile
-          -- error. The registered-but-unreachable voice is
-          -- documentation of the design property, not a
-          -- separate gate.
+      -- 'bad' is OSC-safe (dispatch never sees 'bad name'),
+      -- so the path doesn't match any registered key and the
+      -- voice-lookup miss surfaces.
       OSC.dispatch rs msg
         @?= Left (OSC.DiUnknownVoice (OBSC.pack "bad"))
   ]

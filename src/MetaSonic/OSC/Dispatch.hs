@@ -25,6 +25,7 @@ module MetaSonic.OSC.Dispatch
     ResolveState
   , emptyResolveState
   , registerVoice
+  , registerVoiceUnchecked
   , dropVoice
   , installTemplateGraph
   , resolveStateTemplate
@@ -73,7 +74,7 @@ data ResolveState = ResolveState
     -- ^ VoiceKey → (slot_id, TemplateName). TemplateName is the
     -- 'tplName' the voice was spawned against; needed for the
     -- @(template, node-tag) → NodeIndex@ resolution.
-  } deriving stock    (Show, Generic)
+  } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
 emptyResolveState :: TemplateGraph -> ResolveState
@@ -82,16 +83,41 @@ emptyResolveState tg = ResolveState
   , _rsVoices   = M.empty
   }
 
--- | Register a voice. The caller is responsible for validating
--- the voice key against 'isOscSafeIdentifier' before calling;
--- a non-conforming key registers fine but is OSC-unreachable.
+-- | Register a voice with OSC-safe profile validation. This is
+-- the default registration entry: a non-conforming voice key
+-- (reserved word, identifier-profile violation) is refused at
+-- the table-write so the dispatcher's invariants hold for every
+-- key it later sees. Use 'registerVoiceUnchecked' only when
+-- tests or internal code genuinely need to install a key the
+-- default API would refuse.
 registerVoice
   :: ByteString  -- ^ voice key
   -> Int         -- ^ runtime slot id
   -> ByteString  -- ^ template name the voice was spawned against
   -> ResolveState
+  -> Either DispatchIssue ResolveState
+registerVoice key slotId tname rs
+  | key `elem` reservedOscPathSegments =
+      Left (DiReservedPathSegment key)
+  | not (isOscSafeIdentifier key) =
+      Left (DiIdentifierProfile key)
+  | otherwise =
+      Right (registerVoiceUnchecked key slotId tname rs)
+
+-- | Register a voice without validation. Documented escape
+-- hatch: callers must ensure the voice key is OSC-safe
+-- themselves, or accept that the voice is reachable in the
+-- internal table but unreachable from any OSC path. Used by
+-- tests that exercise the dispatch layer's defense-in-depth
+-- against malformed table state; production code should call
+-- 'registerVoice'.
+registerVoiceUnchecked
+  :: ByteString  -- ^ voice key
+  -> Int         -- ^ runtime slot id
+  -> ByteString  -- ^ template name the voice was spawned against
   -> ResolveState
-registerVoice key slotId tname rs =
+  -> ResolveState
+registerVoiceUnchecked key slotId tname rs =
   rs { _rsVoices = M.insert key (slotId, tname) (_rsVoices rs) }
 
 dropVoice :: ByteString -> ResolveState -> ResolveState

@@ -64,8 +64,11 @@ parseMessage bs0 = do
   (tags, after2) <- parseOscString after1
   case BS.uncons tags of
     Just (0x2C, rest) -> do                       -- 0x2C == ','
-      args <- parseArgs (BS.unpack rest) after2
-      Right OscMessage { oscAddr = addr, oscArgs = args }
+      (args, remaining) <- parseArgs (BS.unpack rest) after2
+      if BS.null remaining
+        then Right OscMessage { oscAddr = addr, oscArgs = args }
+        else Left $ "OSC message: " <> show (BS.length remaining)
+                 <> " trailing byte(s) after declared arguments"
     Just _  -> Left "OSC type tag does not start with ','"
     Nothing -> Left "OSC type tag string is empty"
 
@@ -79,8 +82,12 @@ rejectIfBundle bs
     bundlePrefix = BS.pack [0x23, 0x62, 0x75, 0x6E, 0x64, 0x6C, 0x65]  -- "#bundle"
 
 -- An OSC-string is null-terminated and padded to a multiple of
--- 4 bytes. The returned ByteString does NOT include the NUL or
--- the padding. The remainder advances past both.
+-- 4 bytes with zero bytes. The returned ByteString does NOT
+-- include the NUL or the padding. The remainder advances past
+-- both. Non-zero padding bytes are rejected — a conforming
+-- producer always pads with zeros, and accepting non-zero
+-- padding lets malformed packets aliasing later fields slip
+-- past the wire layer.
 parseOscString :: ByteString -> Either String (ByteString, ByteString)
 parseOscString bs =
   case BS.elemIndex 0 bs of
@@ -90,18 +97,23 @@ parseOscString bs =
           afterNul     = BS.drop (n + 1) bs
           !consumedRaw = n + 1
           !padding     = (4 - consumedRaw `mod` 4) `mod` 4
+          padBytes     = BS.take padding afterNul
       in if BS.length afterNul < padding
            then Left "OSC string: insufficient padding bytes"
-           else Right (str, BS.drop padding afterNul)
+           else if BS.any (/= 0) padBytes
+             then Left "OSC string: non-zero byte in 4-byte alignment padding"
+             else Right (str, BS.drop padding afterNul)
 
 -- v1: only 'f' and 'i' are recognised. Any other tag byte
--- terminates parsing with an explicit message.
-parseArgs :: [Word8] -> ByteString -> Either String [OscArg]
-parseArgs []           _  = Right []
+-- terminates parsing with an explicit message. The remaining
+-- bytes are returned alongside the argument list so the caller
+-- can reject trailing bytes after the declared arguments.
+parseArgs :: [Word8] -> ByteString -> Either String ([OscArg], ByteString)
+parseArgs []           bs = Right ([], bs)
 parseArgs (tag : rest) bs = do
-  (arg, bs') <- parseArg tag bs
-  args       <- parseArgs rest bs'
-  Right (arg : args)
+  (arg, bs')   <- parseArg tag bs
+  (args, bs'') <- parseArgs rest bs'
+  Right (arg : args, bs'')
 
 parseArg :: Word8 -> ByteString -> Either String (OscArg, ByteString)
 parseArg 0x66 bs = do                              -- 'f'
