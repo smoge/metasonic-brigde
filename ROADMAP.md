@@ -1279,37 +1279,58 @@ Notes:
 - [Phase 6.C.4 resource-ordering design](notes/2026-05-11-phase-6c4-resource-ordering-design.md)
 - [Minimal RecordBufMono contract](notes/2026-05-11-record-buf-mono-design.md) — design for the first audio-thread writer (next implementation series).
 
-#### 6.C.4 follow-up — minimal `RecordBufMono` (next task)
+#### [x] 6.C.4 follow-up — minimal `RecordBufMono`
 
-First audio-thread writer kind. The 6.C.4 precedence union and
-the slice 4 same-buffer-writers diagnostic land it as a
-mechanical addition: `inferEff (RecordBufMono buf _ _) =
-[BufWrite (bufferId buf)]` and the ordering machinery picks it
-up. The work is in the kernel and the runtime's audio-thread
-write path, not the compiler.
+First audio-thread writer kind. Shipped in three slices, each
+keeping `stack test` green:
 
-Three-commit series:
-
-1. Haskell surface: `KRecordBufMono` (tag 21), `kindSpec` /
-   `ugenView` / `inferEff` / `dependencies` / `portInfo` rows,
-   `recordBufMono` builder. Extend `Bridge.Validate.busEdges`
-   to pair `BufWrite` / `BufRead` at the intra-graph scope.
+1. **[x] Haskell surface + green C++ skeleton** (commit
+   39539bb). `KRecordBufMono` (tag 21), `kindSpec` /
+   `ugenView` / `inferEff` / `dependencies` / `portInfo`
+   rows, `recordBufMono` builder. `Bridge.Validate.busEdges`
+   pairs `BufWrite` / `BufRead` at the intra-graph scope;
    `runtimeNodeResourceFootprint` learns the writer case.
-2. C++ runtime: `process_record_buf_mono` kernel (sample-by-
-   sample write through `samples.data()`, acquire-load
-   `slot.state`, one-shot vs. loop branch at the end-of-buffer
-   boundary, ticks `buffer_write_count` /
-   `buffer_invalid_write_count`). `RecordBufMonoState` carries
-   the frozen `buffer_id` + write head. Conservative band
-   serialization: a region with a writer never lands in a
-   parallel band.
-3. End-to-end tests: record-then-playback, retire-during-write,
-   loop wrap, one-shot boundary, live-set_control regression,
-   cross-template same-buffer rejection.
+   C++ side adds `NodeKind::RecordBufMono`, the kind_from_tag
+   entry, `RecordBufMonoState { int buffer_id; long long
+   write_head; }`, the `configure_spec` row matching the
+   Haskell `KindSpec`, and `init_node_state` freezes
+   `controls[0]` onto state. New counters
+   `buffer_write_count` / `buffer_invalid_write_count` on
+   `RTGraph` with the two `rt_graph_test_buffer_*_write_count`
+   accessors. Kernel body is a stub that pass-throughs
+   `signal_in` and ticks the invalid counter unconditionally;
+   real write path is slice 2.
+2. **[x] Real `process_record_buf_mono` kernel + writer-band
+   barrier** (commit 2448d33). Acquire-load on `slot.state`
+   synchronises with `rt_graph_buffer_retire` / `_alloc`;
+   one-shot vs. loop branch at the end-of-buffer boundary;
+   `buffer_write_count` ticks per valid sample,
+   `buffer_invalid_write_count` ticks per
+   Retired / Unallocated / past-the-end sample. Pass-through
+   audio output is unconditional. New
+   `regionHasBufferWriter` / `isBufferWriterKind` predicates
+   in `Compile.Dependencies` mirror the existing live-bus
+   pair; `Compile.Schedule.regionsToSegments` emits a
+   `Barrier` for any region containing a writer, so the
+   conservative serialization keeps writer kernels off the
+   parallel-band path.
+3. **[x] End-to-end test battery** (commit 61674e5).
+   record-then-playback within one block (precedence union
+   topo-sort, counter-confirmed both sides);
+   retire-during-write → collect re-arms (counter delta
+   across all three blocks); loop wrap (write head crosses
+   the end three times); one-shot stop (valid + invalid
+   split exactly); frozen-buffer-id regression mirroring the
+   §6.C.2 `PlayBufMono` pin; cross-template same-buffer
+   rejection end-to-end via the DSL; scheduler test that
+   walks `segmentByBarrier` and asserts the writer region
+   appears in a `Barrier`, never a `FreeSegment`.
 
 Out of scope: random-access `BufWr`, multichannel, file I/O,
 `start_frame` / `record_run` / `loop_count` controls. The
-design note (linked above) records the Q-1..Q-5 deferrals.
+design note records the Q-1..Q-5 deferrals.
+
+571 tests total (10 new since 6.C.4).
 
 ### Phase 6.D — Spectral Processing
 
