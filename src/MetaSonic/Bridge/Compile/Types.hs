@@ -38,6 +38,11 @@ module MetaSonic.Bridge.Compile.Types
     -- * Bus footprints
   , BusFootprint (..)
   , emptyFootprint
+    -- * §6.C.4 resource footprints (bus + buffer)
+  , BufferFootprint (..)
+  , emptyBufferFootprint
+  , ResourceFootprint (..)
+  , emptyResourceFootprint
   ) where
 
 import           Control.DeepSeq     (NFData)
@@ -679,6 +684,67 @@ data BusFootprint = BusFootprint
 
 emptyFootprint :: BusFootprint
 emptyFootprint = BusFootprint S.empty S.empty S.empty
+
+{- Note [Resource footprints, §6.C.4]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'BufferFootprint' is the buffer-keyed analogue of 'BusFootprint'.
+It carries the buffer indices a unit of execution writes, reads
+live, and reads delayed — exactly the same shape, indexed on a
+disjoint id space. 'ResourceFootprint' is the pair, the
+superset that template- / region-level precedence will
+consume once a writer UGen exists (6.C.4 design note +
+follow-up RecordBufMono work).
+
+In 6.C.4 slice 1 (this commit) the types are not yet
+consumed by any call site. Slice 2 pivots
+'Template.tplFootprint' and 'RuntimeRegion.rrFootprint' to
+carry 'ResourceFootprint'; slice 3 unions the bus + buffer
+edges in the inter-template precedence derivation. Bus-only
+graphs stay bit-identical because 'emptyBufferFootprint' is
+the BufferFootprint identity under union, and 'rfBuses' is a
+zero-cost projection.
+
+Same-buffer 'BufWrite / BufWrite' is rejected at compile time
+in v1 — see the 6.C.4 design note for the rationale and the
+6.C.5+ placeholder for lifting it.
+-}
+
+-- | Buffer-keyed analogue of 'BusFootprint'. The set semantics
+-- and the "delayed reads do not contribute to precedence" rule
+-- are identical; only the id space differs. Bus indices and
+-- buffer indices live in disjoint namespaces, so unioning the
+-- two footprints can never collide.
+data BufferFootprint = BufferFootprint
+  { bfBufWrites       :: !(S.Set Int)
+    -- ^ Buffer indices written by writer kinds (no writer kind
+    -- exists in 6.C.3a/b; populated by the 6.C.4+ writer UGen
+    -- via 'BufWrite' effects).
+  , bfBufReads        :: !(S.Set Int)
+    -- ^ Buffer indices read live by 'KPlayBufMono' (and future
+    -- read kinds). Currently populated from 'BufRead' effects.
+  , bfBufDelayedReads :: !(S.Set Int)
+    -- ^ Buffer indices read delayed. Reserved for symmetry
+    -- with 'bfDelayedReads'; no consumer in 6.C.4.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+emptyBufferFootprint :: BufferFootprint
+emptyBufferFootprint = BufferFootprint S.empty S.empty S.empty
+
+-- | §6.C.4 resource-level interface: the buses and buffers a
+-- unit of execution touches. This is what template- and
+-- region-level precedence consume once writer UGens exist;
+-- bus-only callers can still reach the existing bus surface
+-- through 'rfBuses' without touching the new field. See
+-- Note [Resource footprints, §6.C.4].
+data ResourceFootprint = ResourceFootprint
+  { rfBuses   :: !BusFootprint
+  , rfBuffers :: !BufferFootprint
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+emptyResourceFootprint :: ResourceFootprint
+emptyResourceFootprint = ResourceFootprint emptyFootprint emptyBufferFootprint
 
 -- | One execution region in the runtime graph: a contiguous block
 -- of nodes (in execution order) that 'formRegions' grouped together.
