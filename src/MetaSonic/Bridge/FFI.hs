@@ -131,6 +131,9 @@ module MetaSonic.Bridge.FFI
     c_rt_graph_buffer_alloc
   , c_rt_graph_buffer_load_f32
   , c_rt_graph_buffer_clear
+  , -- * §6.C.3b slice 2 live-safe retire / collect
+    c_rt_graph_buffer_retire
+  , c_rt_graph_buffer_collect_retired
   , c_rt_graph_test_buffer_read_count
   , c_rt_graph_test_buffer_invalid_read_count
   , -- * §2.E lifecycle status values (mirroring rt_graph.h's InstanceStatus)
@@ -986,6 +989,19 @@ foreign import ccall unsafe "rt_graph_buffer_load_f32"
 
 foreign import ccall unsafe "rt_graph_buffer_clear"
   c_rt_graph_buffer_clear
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- §6.C.3b slice 2 live-safe retire / collect. Single-producer
+-- SPSC contract: only one Haskell thread (typically the same
+-- thread that called allocBuffer in the first place) may call
+-- this pair. Concurrent calls from multiple threads would race
+-- on the slot's retire_generation_snapshot field.
+foreign import ccall unsafe "rt_graph_buffer_retire"
+  c_rt_graph_buffer_retire
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_buffer_collect_retired"
+  c_rt_graph_buffer_collect_retired
     :: Ptr RTGraph -> CInt -> IO CInt
 
 foreign import ccall unsafe "rt_graph_test_buffer_read_count"

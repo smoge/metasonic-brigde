@@ -2166,14 +2166,33 @@ private:
 // at a block boundary. RTGraph keeps handle-owned resources (audio
 // stream, realtime queue, worker pool, sample rate, max_frames,
 // switches, and counters) outside this object.
-// Phase §6.C.3a: mono float32 buffer pool slot. Each slot carries
-// the producer-owned sample storage and a guard bit; the audio thread
-// reads through these on each PlayBufMono kernel call. Producer-only
-// mutation (allocBuffer / loadBuffer / clearBuffer); the audio
-// thread never resizes `samples`.
+// Phase §6.C.3b: tristate slot state. v1 had a single `allocated`
+// bit; slice 2 splits the "in use" state into Allocated (the
+// kernel may read) and Retired (the producer has dropped the
+// reference; the kernel takes the invalid-read path on the next
+// block). Retired slots' sample storage is preserved until a
+// successful collect proves the audio thread can no longer hold a
+// samples.data() pointer from a pre-retire block.
+enum class BufferSlotState : int {
+  Unallocated = 0,
+  Allocated   = 1,
+  Retired     = 2,
+};
+
+// Phase §6.C.3a/b: mono float32 buffer pool slot. Each slot carries
+// the producer-owned sample storage and a tristate state. The
+// audio thread reads `state` (acquire) on every PlayBufMono kernel
+// call; producer-side mutation happens through `rt_graph_buffer_*`
+// (alloc/load/clear are stopped-audio-only; retire/collect are
+// live-safe). `retire_generation_snapshot` records the value of
+// g.buffer_retire_generation observed at the moment of retire so
+// collect can prove "the audio thread has crossed at least one
+// block boundary since." Single-producer: retire writes the
+// snapshot, collect reads it.
 struct BufferSlot {
   std::vector<float> samples;
-  bool allocated = false;
+  std::atomic<BufferSlotState> state{BufferSlotState::Unallocated};
+  long long retire_generation_snapshot = 0;
 };
 
 struct RTGraphState {
@@ -2383,6 +2402,17 @@ struct RTGraph {
   std::array<BufferSlot, kMaxBuffers> buffers{};
   long long buffer_read_count = 0;
   long long buffer_invalid_read_count = 0;
+
+  // Phase §6.C.3b slice 2: monotonic block counter the audio
+  // thread ticks at the top of every process_graph call.
+  // rt_graph_buffer_retire snapshots this value at retire time;
+  // rt_graph_buffer_collect_retired returns "still live" until
+  // the counter has advanced past the snapshot — proving the
+  // audio thread has crossed at least one block boundary since
+  // the retire, so no kernel can still be holding a
+  // samples.data() pointer from before. Atomic for cross-thread
+  // visibility (the audio thread writes, the producer reads).
+  std::atomic<long long> buffer_retire_generation{0};
 };
 
 namespace {
@@ -4422,22 +4452,46 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
 Phase §6.C.3a / 3b. The runtime carries a fixed-size pool of mono
 float32 buffers on the RTGraph handle (`buffers`, sized
 kMaxBuffers = 64). The pool moved out of RTGraphState in §6.C.3b
-because a rt_graph_publish_swap moves the old RTGraphState into
-the retire slot wholesale — making buffer IDs swap-scoped would
-silently invalidate every buffer a producer allocated before the
-swap. Keying off the handle means buffers survive
-prepare_swap / publish_swap as well as rt_graph_clear. The
-producer mutates the pool through three C entry points:
+slice 1 because a rt_graph_publish_swap moves the old RTGraphState
+into the retire slot wholesale — making buffer IDs swap-scoped
+would silently invalidate every buffer a producer allocated before
+the swap. Keying off the handle means buffers survive
+prepare_swap / publish_swap as well as rt_graph_clear.
 
-  * rt_graph_buffer_alloc      — find an unused slot, size its
-                                 sample vector, mark allocated;
-                                 returns the slot index.
+Slots are a tristate (BufferSlotState):
+
+  * Unallocated  — free, no kernel access.
+  * Allocated    — kernel reads samples through samples.data().
+  * Retired      — slot is dropped; kernel takes the invalid-read
+                   path on the next block, but samples storage
+                   stays alive until a successful collect.
+
+The producer mutates the pool through five C entry points:
+
+  * rt_graph_buffer_alloc      — find an Unallocated slot, size
+                                 its sample vector, transition to
+                                 Allocated; returns the slot index.
   * rt_graph_buffer_load_f32   — copy producer samples into a slot.
-  * rt_graph_buffer_clear      — mark slot unallocated (the sample
-                                 vector is *not* freed in v1 —
-                                 capacity is kept for reuse). Doc'd
-                                 stopped-audio-only; live-safe
-                                 retire/collect lands in §6.C.3b.
+                                 Requires Allocated.
+  * rt_graph_buffer_clear      — Allocated -> Unallocated, sample
+                                 vector capacity preserved.
+                                 Stopped-audio-only.
+  * rt_graph_buffer_retire     — §6.C.3b slice 2 live-safe drop:
+                                 Allocated -> Retired without
+                                 touching samples. Captures a
+                                 g.buffer_retire_generation
+                                 snapshot on the slot.
+  * rt_graph_buffer_collect_retired — Retired -> Unallocated once
+                                 g.buffer_retire_generation has
+                                 advanced past the snapshot
+                                 (proving the audio thread has
+                                 crossed a block boundary, so no
+                                 captured samples.data() pointer
+                                 from a pre-retire block can
+                                 survive). Returns -2 if still
+                                 live; producer should run one
+                                 more process_graph block and
+                                 retry.
 
 The audio thread reads through `samples.data()` and `samples.size()`;
 it never resizes. PlayBufMono kernels resolve their buffer ID *once*
@@ -4502,7 +4556,13 @@ static void process_play_buf_mono(
   if (bid_in_range) {
     const auto &candidate =
         g.buffers[static_cast<std::size_t>(bid)];
-    if (candidate.allocated && !candidate.samples.empty()) {
+    // Acquire-load synchronizes-with the release-store in
+    // rt_graph_buffer_retire / _alloc so a kernel that sees
+    // Allocated reads a coherent samples vector. Retired and
+    // Unallocated both fall through to the invalid-read path.
+    if (candidate.state.load(std::memory_order_acquire)
+          == BufferSlotState::Allocated
+        && !candidate.samples.empty()) {
       slot = &candidate;
     }
   }
@@ -6810,6 +6870,19 @@ static void process_legacy_schedule(
 }
 
 static void process_graph(RTGraph &g, int nframes) noexcept {
+  // Phase §6.C.3b slice 2: tick the buffer-retire generation
+  // counter before any kernel runs. retire_buffer's
+  // generation-snapshot proof depends on this being the FIRST
+  // observable action of the block — any pre-retire kernel that
+  // captured a samples.data() pointer is already in a previous
+  // block (it has not yet returned from process_graph), so by
+  // the time the producer's next collect call observes the
+  // incremented value, every subsequent kernel call has read
+  // state == Retired through the acquire-load and taken the
+  // invalid path. release ensures the counter write is ordered
+  // before any later kernel state-loads in this block.
+  g.buffer_retire_generation.fetch_add(1, std::memory_order_release);
+
   // Phase 5.1.B: first acquire any pending hot-swap, but do not install
   // it until after the realtime control queue is drained below. The
   // acquire on pending_swap synchronizes-with the producer's
@@ -8762,22 +8835,37 @@ int rt_graph_kind_supported(int node_kind) {
   return kind_from_tag(node_kind).has_value() ? 1 : 0;
 }
 
-// Phase §6.C.3a: producer-side buffer pool. The audio thread reads
-// through `samples.data()` / `samples.size()` on each PlayBufMono
-// kernel call; these three entry points are the only writers. None
-// is safe to call while audio is running (the alloc/load path may
-// reallocate; the clear path drops the allocated bit out from
-// underneath a live read). The realtime helpers in §6.C.3b will
-// add the retire/collect pair for live-safe free.
+// Phase §6.C.3a/b: producer-side buffer pool. The audio thread
+// reads through `samples.data()` / `samples.size()` on each
+// PlayBufMono kernel call after an acquire-load of `slot.state`.
+// Three entry points are stopped-audio-only writers (alloc /
+// load_f32 / clear) — they mutate samples and storage capacity,
+// which is only safe when no kernel can be in flight. Two
+// entry points (retire / collect_retired) are live-safe: retire
+// flips state without touching samples, and collect_retired
+// only releases the slot once the buffer-retire-generation has
+// advanced past the snapshot retire stamped on it. See
+// Note [Buffer pool] above for the slot state machine.
 int rt_graph_buffer_alloc(RTGraph *g, int frames) {
   if (g == nullptr) return -1;
   if (frames < 0) return -1;
   auto &buffers = g->buffers;
   for (int id = 0; id < static_cast<int>(buffers.size()); ++id) {
     auto &slot = buffers[static_cast<std::size_t>(id)];
-    if (slot.allocated) continue;
+    // Skip both Allocated AND Retired: a retired slot is not
+    // reusable until a successful collect_retired flips it back
+    // to Unallocated. The §6.C.3b design pins this so a producer
+    // can't accidentally hand out a slot whose storage might
+    // still be observed by a captured pointer on the audio
+    // thread.
+    if (slot.state.load(std::memory_order_relaxed)
+          != BufferSlotState::Unallocated) continue;
     slot.samples.assign(static_cast<std::size_t>(frames), 0.0f);
-    slot.allocated = true;
+    // Release-store pairs with the kernel's acquire-load so a
+    // kernel that sees Allocated reads the samples vector
+    // contents that the assign() above just published.
+    slot.state.store(BufferSlotState::Allocated,
+                     std::memory_order_release);
     return id;
   }
   return -1;
@@ -8791,7 +8879,8 @@ int rt_graph_buffer_load_f32(
   if (frame_count < 0) return -1;
   if (frame_count > 0 && samples == nullptr) return -1;
   auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
-  if (!slot.allocated) return -1;
+  if (slot.state.load(std::memory_order_relaxed)
+        != BufferSlotState::Allocated) return -1;
   if (static_cast<std::size_t>(frame_count) > slot.samples.size()) {
     return -2;
   }
@@ -8809,13 +8898,80 @@ int rt_graph_buffer_clear(RTGraph *g, int buffer_id) {
   if (g == nullptr) return -1;
   if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
   auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
-  if (!slot.allocated) return -1;
-  slot.allocated = false;
+  // clearBuffer is the stopped-audio-only fast path: it requires
+  // Allocated (not Retired). A retired slot must go through
+  // collect_retired before it can be cleared or reused.
+  if (slot.state.load(std::memory_order_relaxed)
+        != BufferSlotState::Allocated) return -1;
+  slot.state.store(BufferSlotState::Unallocated,
+                   std::memory_order_relaxed);
   // Sample storage capacity is intentionally preserved so a
   // subsequent rt_graph_buffer_alloc of the same size is
-  // allocation-free in steady state. §6.C.3b's retire/collect
-  // path will revisit this when live-safe free needs to release
-  // storage off the audio thread.
+  // allocation-free in steady state.
+  return 0;
+}
+
+// §6.C.3b slice 2. Live-safe retire: flip the slot to Retired so
+// every subsequent block's kernel takes the invalid-read path,
+// without touching samples storage. The audio thread may still
+// hold a samples.data() pointer captured at the top of the
+// current block — the pointer remains valid because retire
+// never resizes / frees samples. Stamps the slot with the
+// generation snapshot collect_retired needs to prove "the
+// audio thread has crossed a block boundary."
+//
+// Returns 0 on success, -1 if buffer_id is out of range or the
+// slot is not currently Allocated.
+int rt_graph_buffer_retire(RTGraph *g, int buffer_id) {
+  if (g == nullptr) return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
+  auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
+  if (slot.state.load(std::memory_order_relaxed)
+        != BufferSlotState::Allocated) return -1;
+  // Snapshot the audio thread's current block counter so collect
+  // can compare against later increments. Acquire is enough
+  // here: any block already running has already incremented
+  // past this value at its top, so the snapshot bounds the
+  // "still possibly in flight" window correctly.
+  slot.retire_generation_snapshot =
+      g->buffer_retire_generation.load(std::memory_order_acquire);
+  // Release pairs with the kernel's acquire-load: a kernel that
+  // sees Retired sees the snapshot already written.
+  slot.state.store(BufferSlotState::Retired,
+                   std::memory_order_release);
+  return 0;
+}
+
+// §6.C.3b slice 2. Live-safe collect: if the audio thread has
+// crossed at least one block boundary since retire (i.e. the
+// generation counter advanced past the snapshot), the slot is
+// safe to reuse — any captured samples.data() pointer from a
+// pre-retire block has gone out of scope, and every block
+// since has seen state == Retired and taken the invalid path.
+// Transitions the slot back to Unallocated; storage capacity is
+// preserved.
+//
+// Returns 0 on success, -1 if buffer_id is out of range or the
+// slot is not currently Retired, -2 if the slot IS retired but
+// the audio thread might still hold a pre-retire pointer (the
+// producer should call rt_graph_process at least once more and
+// retry).
+int rt_graph_buffer_collect_retired(RTGraph *g, int buffer_id) {
+  if (g == nullptr) return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
+  auto &slot = g->buffers[static_cast<std::size_t>(buffer_id)];
+  if (slot.state.load(std::memory_order_relaxed)
+        != BufferSlotState::Retired) return -1;
+  const long long current =
+      g->buffer_retire_generation.load(std::memory_order_acquire);
+  if (current <= slot.retire_generation_snapshot) {
+    // The audio thread has not crossed a block boundary since
+    // retire — wait one block and try again.
+    return -2;
+  }
+  // Safe to reclaim. Storage stays in place for the next alloc.
+  slot.state.store(BufferSlotState::Unallocated,
+                   std::memory_order_relaxed);
   return 0;
 }
 

@@ -99,7 +99,9 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             loadTemplateGraphFused,
                                             withRTGraph)
 import           MetaSonic.Bridge.Buffer   (BufferIssue (..), allocBuffer,
-                                            clearBuffer, loadBuffer)
+                                            clearBuffer,
+                                            collectRetiredBuffer,
+                                            loadBuffer, retireBuffer)
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
@@ -10196,6 +10198,146 @@ playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
 
         _ <- collectRetiredSwapStats rt
         pure ()
+
+  , -- §6.C.3b slice 2 retire-mid-render lifecycle. Alloc two
+    -- buffers with distinguishable fills, build a graph that
+    -- references buffer 0, render one block (assert fill 7.0),
+    -- retire buffer 0 while audio is conceptually running,
+    -- render another block (the kernel must take the
+    -- invalid-read path, emit zeros, tick the invalid counter),
+    -- collect the retired slot (succeeds because process_graph
+    -- between retire and collect advanced the
+    -- buffer-retire-generation counter), re-alloc, confirm we
+    -- get ID 0 back with fresh empty storage.
+    testCase "retire / collect lifecycle reclaims a slot live-safely" $ do
+      let nframes = 64
+          sizeOfF :: Int
+          sizeOfF = 4
+          fillA = replicate nframes (7.0 :: Float)
+          fillB = replicate nframes (99.0 :: Float)
+          graph = runSynth $ do
+            s <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 1.0)
+            out 0 s
+
+      tg <- case compileTemplateGraph [("default", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf0 <- allocBuffer rt nframes
+        buf1 <- allocBuffer rt nframes
+        bufferId buf0 @?= 0
+        bufferId buf1 @?= 1
+        loadBuffer rt buf0 fillA
+        loadBuffer rt buf1 fillB
+
+        loadTemplateGraph rt tg
+
+        let readBlock = allocaBytes (nframes * sizeOfF) $ \bp -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bp)
+              rendered <- peekArray nframes (bp :: PtrCFloat)
+              pure (map (\(CFloat x) -> x) rendered)
+
+        -- Block 1: kernel reads buffer 0 → fill A.
+        c_rt_graph_process rt (fromIntegral nframes)
+        block1 <- readBlock
+        assertBool
+          ("pre-retire block must read fill A (7.0); got "
+           <> show (take 4 block1))
+          (all (\x -> abs (x - 7.0) < 1.0e-5) block1)
+
+        -- Live retire. Audio thread (conceptually running) is now
+        -- between blocks; any captured samples.data() pointer is
+        -- out of scope. The next kernel call must see Retired.
+        retireBuffer rt buf0
+
+        -- Collect IMMEDIATELY — the audio thread has not crossed
+        -- a block boundary since retire, so the slot is still
+        -- live and the call must fail with BiCollectStillLive.
+        early <- try (collectRetiredBuffer rt buf0)
+        case early of
+          Left (BiCollectStillLive i) -> i @?= bufferId buf0
+          Left e -> assertFailure $
+            "expected BiCollectStillLive before a block ran, got "
+              <> show (e :: BufferIssue)
+          Right () -> assertFailure
+            "collect must reject a retired slot before a block has run"
+
+        -- Block 2: kernel sees Retired through the acquire-load
+        -- and takes the invalid-read path. fillA is still in
+        -- the slot's samples vector (retire doesn't touch
+        -- storage), but the kernel never accesses it.
+        c_rt_graph_process rt (fromIntegral nframes)
+        block2 <- readBlock
+        assertBool
+          ("post-retire block must emit silence; got "
+           <> show (take 4 block2))
+          (all (== 0.0) block2)
+
+        -- Now collect succeeds — buffer-retire-generation
+        -- advanced when process_graph ticked at the top of
+        -- block 2.
+        collectRetiredBuffer rt buf0
+
+        -- Re-alloc must return ID 0 (slot is back to Unallocated).
+        -- A regression that left the slot Retired would return
+        -- ID 2 here (next free past the still-allocated buf1).
+        buf0' <- allocBuffer rt nframes
+        bufferId buf0' @?= 0
+
+        -- The fresh alloc zero-initialises samples; nothing
+        -- carries over from fillA. Load a third pattern just to
+        -- confirm the slot is actually writable again, then
+        -- render and assert.
+        loadBuffer rt buf0' (replicate nframes 0.25)
+        c_rt_graph_process rt (fromIntegral nframes)
+        block3 <- readBlock
+        assertBool
+          ("post-realloc block must read the new fill (0.25); got "
+           <> show (take 4 block3))
+          (all (\x -> abs (x - 0.25) < 1.0e-5) block3)
+
+        -- Counter sanity. Two valid render blocks (block 1 + block 3)
+        -- and one invalid render block (block 2). The retire/collect
+        -- cycle itself ticks no read counters.
+        readCount    <- c_rt_graph_test_buffer_read_count         rt
+        invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
+        readCount    @?= fromIntegral (2 * nframes)
+        invalidCount @?= fromIntegral nframes
+
+  , -- §6.C.3b slice 2: collect-without-retire is BiNotRetired,
+    -- not BiCollectStillLive. Tests that the wrapper distinguishes
+    -- the two failure modes correctly.
+    testCase "collectRetiredBuffer on an Allocated slot raises BiNotRetired" $
+      withRTGraph 16 64 $ \rt -> do
+        buf <- allocBuffer rt 8
+        result <- try (collectRetiredBuffer rt buf)
+        case result of
+          Left (BiNotRetired i) -> i @?= bufferId buf
+          Left e                -> assertFailure $
+            "expected BiNotRetired, got " <> show (e :: BufferIssue)
+          Right ()              -> assertFailure
+            "collect must reject a slot that was never retired"
+
+  , -- §6.C.3b slice 2: clearBuffer is stopped-audio-only and now
+    -- refuses to touch Retired slots — callers must go through
+    -- collectRetiredBuffer to recycle a retired slot.
+    testCase "clearBuffer rejects a Retired slot with BiUnknownBufferId" $
+      withRTGraph 16 64 $ \rt -> do
+        buf <- allocBuffer rt 8
+        retireBuffer rt buf
+        result <- try (clearBuffer rt buf)
+        case result of
+          Left (BiUnknownBufferId i) -> i @?= bufferId buf
+          Left e                     -> assertFailure $
+            "expected BiUnknownBufferId on a retired slot, got "
+              <> show (e :: BufferIssue)
+          Right ()                   -> assertFailure
+            "clear must reject a retired slot"
   ]
 
 -- | Test helper: render `nframes` of a `playBufMono` graph over a

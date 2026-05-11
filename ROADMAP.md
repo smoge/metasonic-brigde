@@ -1168,37 +1168,49 @@ invalid read totals so a regression that emits zeros via a
 different code path cannot pass silently. 18 new tests in
 `bufferPoolTests` + `playBufMonoTests` — 544 total.
 
-#### 6.C.3b Lifetime hardening (next task)
+#### [x] 6.C.3b Lifetime hardening
 
-Resource-lifetime hardening step the later phases need.
-Two slices, design note first:
+Resource-lifetime hardening step the later phases will lean on.
+Shipped in two slices:
 
-1. **Move buffer pool + counters from `RTGraphState` to the
-   stable `RTGraph` handle.** No behavior change in the
-   kernel; just ownership relocation so a `prepare_swap` /
-   `publish_swap` cycle does not retire the buffer pool with
-   the old world. Add a hot-swap survival test: build a
-   graph referencing buffer 0, swap to a fresh world, assert
-   the buffer is still readable in the new world. This step
-   has to land first because the §5.3 generation-counter
-   pattern below assumes the pool outlives any one
-   `RTGraphState`.
-2. **Live-safe `retireBuffer` / `collectRetiredBuffers`.**
-   `retire` flips the slot to a "retired" state that makes
-   future reads emit zero + tick the invalid-read counter,
-   but the sample vector storage stays in place (and the
-   slot stays unreusable / non-resizable) until a `collect`
-   call proves the audio thread can no longer hold a pointer
-   from the previous block. `clearBuffer` stays
-   stopped-audio-only and gets a clearer docstring after
-   `retire` exists. Survive-hot-swap test is extended to
-   cover a retire-mid-render → render → collect → realloc
-   sequence.
+1. **[x] Buffer pool relocated to the `RTGraph` handle.** The
+   pool + the two per-block read counters moved out of
+   `RTGraphState` so a `prepare_swap` / `publish_swap` cycle
+   no longer retires buffers with the old world. The kernel
+   and all five C ABI entry points reach the pool through
+   `g.buffers[...]` instead of `world(g).buffers[...]`.
+   `rt_graph_clear` also no longer wipes the pool, since the
+   pool is now keyed off the handle. New tests:
+   "buffer pool survives c_rt_graph_clear" and
+   "buffer pool survives prepare_swap / publish_swap"
+   (counter-confirmed via the handle-scoped read counters).
+2. **[x] Live-safe `retireBuffer` / `collectRetiredBuffer`.**
+   Slot state machine became tristate (`Unallocated`,
+   `Allocated`, `Retired`) backed by
+   `std::atomic<BufferSlotState>` with release-store on
+   write and acquire-load in the kernel. A new
+   `buffer_retire_generation` atomic on `RTGraph` ticks at
+   the top of every `process_graph`; `retire_buffer` stamps
+   the current value on the slot, and `collect_retired`
+   returns `-2` ("still live") until the counter advances
+   past the snapshot. `clearBuffer` stays stopped-audio-only
+   and now refuses to clear `Retired` slots. New
+   `BufferIssue` constructors `BiNotRetired` and
+   `BiCollectStillLive`. New tests:
+   "retire / collect lifecycle reclaims a slot live-safely"
+   (the canonical retire-mid-render → render → collect →
+   realloc sequence, counter-confirmed), plus negative-path
+   coverage for collect-without-retire and clear-after-retire.
 
-Not in 6.C.3b: `BufWrite`, file I/O, 6.D spectral, 6.E
-plugin hosting. After 6.C.3b lands, reassess whether 6.C
-needs write kinds or whether 6.D spectral is the
-higher-signal next path.
+C ABI additions: `rt_graph_buffer_retire`,
+`rt_graph_buffer_collect_retired`. Haskell wrappers:
+`retireBuffer`, `collectRetiredBuffer`. 549 tests total (5 new
+since 6.C.3a).
+
+Not done in 6.C.3b: `BufWrite`, file I/O, multichannel, async
+load, pattern / OSC coupling for retire. Reassess after this
+lands whether 6.C needs write kinds (6.C.4) or whether 6.D
+spectral is the higher-signal next path.
 
 Note: [Phase 6.C.3b lifetime design](notes/2026-05-11-phase-6c3b-lifetime-design.md).
 

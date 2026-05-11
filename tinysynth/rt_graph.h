@@ -604,14 +604,46 @@ int rt_graph_buffer_load_f32(
     const float *samples,
     int frame_count);
 
-// [T:construction] Phase §6.C.3a: mark `buffer_id` unallocated. The
-// underlying storage capacity is preserved for reuse. UNSAFE to
-// call while audio is running — the audio thread may still be
-// reading from this slot. §6.C.3a documents this as a
-// construction / stopped-audio operation; live retire/collect
-// lands in §6.C.3b. Returns 0 on success, -1 if buffer_id is out
-// of range or already unallocated.
+// [T:construction] Phase §6.C.3a: stopped-audio fast path. Flip
+// `buffer_id` from Allocated back to Unallocated. The underlying
+// storage capacity is preserved for reuse. UNSAFE to call while
+// audio is running — the audio thread may still be reading from
+// this slot. For the live-safe path, use rt_graph_buffer_retire
+// + rt_graph_buffer_collect_retired instead. Returns 0 on
+// success, -1 if buffer_id is out of range or the slot is not
+// currently Allocated (callers must collect a Retired slot
+// before they can clear or reuse it).
 int rt_graph_buffer_clear(RTGraph *g, int buffer_id);
+
+// [T:realtime-producer] Phase §6.C.3b slice 2: live-safe drop of a
+// buffer reference. Flips the slot from Allocated to Retired,
+// without touching its samples storage. Every subsequent
+// PlayBufMono kernel call sees state == Retired through an
+// acquire-load and takes the invalid-read path (emits zero +
+// ticks rt_graph_test_buffer_invalid_read_count). The audio
+// thread may still hold a samples.data() pointer captured at
+// the top of the current block — that pointer remains valid
+// because retire never resizes or frees samples. Single-producer
+// (SPSC contract with collect_retired). Returns 0 on success,
+// -1 if buffer_id is out of range or the slot is not currently
+// Allocated.
+int rt_graph_buffer_retire(RTGraph *g, int buffer_id);
+
+// [T:realtime-producer] Phase §6.C.3b slice 2: live-safe reap of a
+// retired buffer slot. If the audio thread has crossed at least
+// one block boundary since the matching retire (i.e. the
+// internal buffer-retire-generation counter has advanced past
+// the snapshot stamped by retire), the slot is safe to reuse —
+// every kernel call since the retire has seen state == Retired
+// and taken the invalid-read path, so no captured
+// samples.data() pointer can survive. Transitions the slot back
+// to Unallocated; storage capacity is preserved for the next
+// rt_graph_buffer_alloc. Returns 0 on success, -1 if buffer_id
+// is out of range or the slot is not currently Retired, -2 if
+// the audio thread might still hold a pre-retire pointer (the
+// producer should call rt_graph_process at least once more and
+// retry).
+int rt_graph_buffer_collect_retired(RTGraph *g, int buffer_id);
 
 // [T:read-only] Phase §6.C.3a test surface: total number of
 // successful sample reads performed by KPlayBufMono kernels since

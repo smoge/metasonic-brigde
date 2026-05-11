@@ -1,8 +1,10 @@
 # Phase 6.C.3b — Buffer Lifetime Hardening (Design)
 
 Date: 2026-05-11
-Status: design only; no contract pinning, no code. Bounds the
-problem before a 6.C.3b.contract note lands.
+Status: shipped (commits 6dbe75c slice 1; slice 2 in the
+follow-up commit on this branch). The contract that landed
+matches this note; Q-1..Q-5 resolutions are inlined in
+section 5 below.
 
 This note follows
 [Phase 6.C.1 buffer I/O bounds](2026-05-10-phase-6c-buffer-io-design.md)
@@ -218,44 +220,49 @@ Slice 2 ships two new entry points and one new error
 constructor (`BiCollectStillLive` or similar — to be
 pinned in the 6.C.3b.contract note).
 
-## 5. Open questions to settle in 6.C.3b.contract
+## 5. Q-1..Q-5 resolutions (settled during 6.C.3b slice 2)
 
-Q-1. **One-deep vs. queue-deep retire slot.** The §5.3 swap
-   slot is one-deep ("a new publish is rejected until
-   collection"). Per-buffer retires are not naturally
-   one-deep: a producer that retires three buffers in a row
-   would want all three queued. Cheapest viable shape:
-   per-slot generation, no queue — but the producer must
-   `collect` each retired ID individually. Confirm vs. a
-   bulk `collect_all_retired`.
+Q-1. **One-deep vs. queue-deep retire slot.** Settled:
+   per-slot generation, no queue. A producer that retires
+   three buffers in a row stamps three separate snapshots,
+   one per slot, and must `collectRetiredBuffer` each id
+   individually. A bulk `collectAllRetiredBuffers` helper
+   was not added — only one v1 consumer (the test suite)
+   exercises retire, and a list-fold inside the producer is
+   cheap. Add the bulk helper if/when a real consumer asks.
 
-Q-2. **`collect` blocking vs. non-blocking.** Slot uses a
-   generation snapshot; `collect` is naturally non-blocking
-   (returns "still live" on no-op). A blocking
-   `collectRetiredBuffersWaiting` analog of the
-   `collectRetiredSwapStats` helper may make tests cleaner.
+Q-2. **`collect` blocking vs. non-blocking.** Settled:
+   non-blocking. `collectRetiredBuffer` returns
+   `BiCollectStillLive` if the audio thread has not crossed
+   a block boundary since retire; the producer retries
+   after driving one more `c_rt_graph_process`. The
+   `collectRetiredSwapStats`-style blocking helper was not
+   added — tests are clean enough with explicit
+   render-and-retry, and a generic "wait for one block" is
+   producer-side trivia.
 
-Q-3. **Should retire be exposed at the Pattern / OSC layer?**
-   6.C.2 deferred this for *load*; the lifetime question is
-   the same. Default: deferred again; pattern access to
-   buffer lifecycle is a separate concern that needs its own
-   reserved-words discussion.
+Q-3. **Pattern / OSC coupling.** Settled: still deferred.
+   No `PEBufferRetire` `PatternEvent` constructor, no
+   `/buffer/retire` reserved OSC path. Same rationale as
+   6.C.2's deferral on load/free: a separate concern that
+   needs its own reserved-words discussion.
 
-Q-4. **Does `clearBuffer` go away once `retireBuffer` exists?**
-   Argument for keeping: tests want a stopped-audio fast
-   path that does not pay the generation-snapshot cost.
-   Argument for dropping: API surface duplication; the
-   stopped-audio case is a degenerate retire + collect.
-   Default: **keep `clearBuffer`**, document as the
-   stopped-audio fast path. Re-evaluate if the wrapper
-   tests stop using it.
+Q-4. **Does `clearBuffer` go away once `retireBuffer`
+   exists?** Settled: **kept**, documented as the
+   stopped-audio fast path. `clearBuffer` now refuses to
+   touch a `Retired` slot (mapped to `BiUnknownBufferId` —
+   the C ABI conflates "not Allocated" cases for the
+   stopped-audio path) so the two APIs do not silently
+   interfere.
 
-Q-5. **Where does the retire generation counter live on
-   the Haskell side?** `BufferRetireGeneration` newtype next
-   to `SwapInstallGeneration`, with a parallel
-   `collectRetiredBuffersStats` helper? Or hidden inside the
-   wrapper and only the `Result` types leak out? Default:
-   hide for v1; expose if a real consumer needs it.
+Q-5. **Retire generation counter on the Haskell side.**
+   Settled: hidden inside the wrapper. `collectRetiredBuffer`
+   returns `IO ()` and throws `BiCollectStillLive` on the
+   not-yet-safe case; no `BufferRetireGeneration` newtype
+   was added to the public surface. The C-side counter is
+   only observable through `BiCollectStillLive`'s
+   wait-and-retry semantics, which matches the v1 goal of
+   keeping the API minimal.
 
 ## 6. What 6.C.3b will NOT include
 

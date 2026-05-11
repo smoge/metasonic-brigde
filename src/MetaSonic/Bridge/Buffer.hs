@@ -4,7 +4,7 @@
 
 -- |
 -- Module      : MetaSonic.Bridge.Buffer
--- Description : §6.C.3a producer-side mono buffer pool wrapper.
+-- Description : §6.C.3a/3b producer-side mono buffer pool wrapper.
 --
 -- Thin IO wrapper around 'MetaSonic.Bridge.FFI''s buffer pool entry
 -- points. The pure 'Buffer' identity newtype lives in
@@ -14,22 +14,39 @@
 -- imports both 'FFI' (for the C ABI) and 'Types' (for the
 -- 'Buffer' newtype) and sits downstream of both.
 --
--- v1 contract (§6.C.3a):
+-- v1 contract (§6.C.3a/b):
 --
--- * Fixed-cap pool of 64 mono float32 buffers.
--- * Allocate, load, clear. No live-safe free; live retire/collect
---   lands in §6.C.3b.
+-- * Fixed-cap pool of 64 mono float32 buffers, keyed off the
+--   'RTGraph' handle so allocations survive 'rt_graph_clear'
+--   and the prepare_swap / publish_swap cycle (§6.C.3b slice 1).
+-- * Two API tiers:
+--
+--     * Stopped-audio fast path: 'allocBuffer', 'loadBuffer',
+--       'clearBuffer'. Cheap, but unsafe to call while audio is
+--       running (the audio thread may still be reading the slot
+--       through a captured @samples.data()@ pointer).
+--     * Live-safe lifecycle: 'retireBuffer' /
+--       'collectRetiredBuffer' (§6.C.3b slice 2). Retire flips
+--       the slot to the invalid-read path on the next block
+--       without touching samples; collect releases the slot for
+--       reuse once the audio thread has crossed a block
+--       boundary (i.e. no captured pointer can survive).
+--
 -- * Errors surface as 'BufferIssue' via 'Control.Exception.throwIO'.
 --
 -- See 'MetaSonic.Bridge.Source.playBufMono' for the consumer-side
 -- UGen and 'notes/2026-05-10-phase-6c2-buffer-io-contract.md' for
--- the full contract.
+-- the read-path contract; lifetime work is in
+-- 'notes/2026-05-11-phase-6c3b-lifetime-design.md'.
 
 module MetaSonic.Bridge.Buffer
-  ( -- * Allocation / load / clear (producer-side IO)
+  ( -- * Allocation / load / clear (stopped-audio fast path)
     allocBuffer
   , loadBuffer
   , clearBuffer
+    -- * Live-safe retire / collect (§6.C.3b slice 2)
+  , retireBuffer
+  , collectRetiredBuffer
     -- * Errors
   , BufferIssue (..)
   ) where
@@ -43,7 +60,9 @@ import           GHC.Generics            (Generic)
 
 import           MetaSonic.Bridge.FFI    (RTGraph, c_rt_graph_buffer_alloc,
                                           c_rt_graph_buffer_clear,
-                                          c_rt_graph_buffer_load_f32)
+                                          c_rt_graph_buffer_collect_retired,
+                                          c_rt_graph_buffer_load_f32,
+                                          c_rt_graph_buffer_retire)
 import           MetaSonic.Types         (Buffer (..))
 
 -- | Producer-side failure mode for the §6.C.3a buffer pool ABI.
@@ -73,6 +92,17 @@ data BufferIssue
     -- exposed across the FFI in 6.C.3a; report only what the
     -- producer asked for to avoid lying about a value we can't
     -- read.)
+  | BiNotRetired !Int
+    -- ^ 'collectRetiredBuffer' returned -1 because the slot is
+    -- not currently in the @Retired@ state — the producer
+    -- called 'collectRetiredBuffer' without a preceding
+    -- 'retireBuffer'. Holds the offending buffer id.
+  | BiCollectStillLive !Int
+    -- ^ 'collectRetiredBuffer' returned -2 because the audio
+    -- thread has not crossed a block boundary since the matching
+    -- 'retireBuffer'. The producer must drive at least one more
+    -- 'MetaSonic.Bridge.FFI.c_rt_graph_process' (or wait for one
+    -- audio callback) before retrying. Holds the buffer id.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData, Exception)
 
@@ -122,19 +152,74 @@ loadBuffer rt (Buffer bid) samples =
          | n == -2   -> throwIO (BiFrameCountExceedsBuffer len)
          | otherwise -> throwIO (BiUnknownBufferId bid)
 
--- | Mark a buffer unallocated. The underlying sample storage's
+-- | Stopped-audio fast path: flip an allocated buffer back to
+-- the @Unallocated@ state. The underlying sample storage's
 -- capacity is preserved for reuse on the next 'allocBuffer'.
 --
 -- UNSAFE to call while audio is running — the audio thread may
--- still be reading from this slot. §6.C.3a documents this as a
--- construction / stopped-audio operation; live-safe
--- retire/collect lands in §6.C.3b.
+-- still be holding a @samples.data()@ pointer captured at the
+-- top of the current block. For the live-safe path, use
+-- 'retireBuffer' (which flips the slot to @Retired@ without
+-- touching samples) followed by 'collectRetiredBuffer' once
+-- the audio thread has crossed a block boundary.
 --
--- Throws 'BiUnknownBufferId' if the buffer is out of range or
--- already unallocated.
+-- Refuses to clear a slot that is currently @Retired@: callers
+-- must drive the slot through 'collectRetiredBuffer' first.
+-- Both error paths raise 'BiUnknownBufferId' with the offending
+-- buffer id (the C ABI does not distinguish "out of range",
+-- "already unallocated", and "currently retired" — they all
+-- mean "not currently Allocated", which the wrapper exposes as
+-- the same exception).
 clearBuffer :: Ptr RTGraph -> Buffer -> IO ()
 clearBuffer rt (Buffer bid) = do
   rc <- c_rt_graph_buffer_clear rt (fromIntegral bid)
   if rc /= 0
     then throwIO (BiUnknownBufferId bid)
     else pure ()
+
+-- | §6.C.3b slice 2 live-safe drop. Flip an allocated buffer to
+-- the @Retired@ state. From the next block onward, every
+-- PlayBufMono kernel that resolved this buffer id sees state ==
+-- @Retired@ through an acquire-load and takes the invalid-read
+-- path (emit zero, tick @buffer_invalid_read_count@). The
+-- slot's sample storage is /not/ touched — the audio thread may
+-- still be holding a @samples.data()@ pointer captured before
+-- the retire, and that pointer must remain valid until the
+-- block completes.
+--
+-- A retired slot stays retired until 'collectRetiredBuffer'
+-- succeeds; 'allocBuffer' will not reuse the slot in the
+-- meantime. Throws 'BiUnknownBufferId' if the buffer id is out
+-- of range or the slot is not currently @Allocated@.
+--
+-- Single-producer: 'retireBuffer' and 'collectRetiredBuffer'
+-- form an SPSC pair. Concurrent calls from multiple threads
+-- would race on the slot's generation-snapshot field.
+retireBuffer :: Ptr RTGraph -> Buffer -> IO ()
+retireBuffer rt (Buffer bid) = do
+  rc <- c_rt_graph_buffer_retire rt (fromIntegral bid)
+  if rc /= 0
+    then throwIO (BiUnknownBufferId bid)
+    else pure ()
+
+-- | §6.C.3b slice 2 live-safe reap. If the audio thread has
+-- crossed at least one block boundary since the matching
+-- 'retireBuffer' (so no captured @samples.data()@ pointer can
+-- survive), transition the slot back to @Unallocated@; storage
+-- capacity is preserved for the next 'allocBuffer'.
+--
+-- Throws 'BiNotRetired' if the slot is not currently
+-- @Retired@ (i.e. there's no matching 'retireBuffer' to
+-- collect). Throws 'BiCollectStillLive' if the slot IS
+-- @Retired@ but the audio thread has not advanced a block
+-- since: the producer should drive at least one more
+-- 'MetaSonic.Bridge.FFI.c_rt_graph_process' (or wait for one
+-- audio callback) and retry.
+collectRetiredBuffer :: Ptr RTGraph -> Buffer -> IO ()
+collectRetiredBuffer rt (Buffer bid) = do
+  rc <- c_rt_graph_buffer_collect_retired rt (fromIntegral bid)
+  case fromIntegral rc :: Int of
+    0  -> pure ()
+    -1 -> throwIO (BiNotRetired bid)
+    -2 -> throwIO (BiCollectStillLive bid)
+    _  -> throwIO (BiNotRetired bid)
