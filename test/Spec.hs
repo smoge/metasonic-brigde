@@ -9786,11 +9786,21 @@ bufferPoolTests = testGroup "Phase 6.C.3a: buffer pool wrapper"
         buf <- allocBuffer rt 4
         result <- try (loadBuffer rt buf [1, 2, 3, 4, 5, 6])
         case result of
-          Left (BiFrameCountExceedsBuffer _ _) -> pure ()
-          Left e                               -> assertFailure $
+          Left (BiFrameCountExceedsBuffer n) -> n @?= 6
+          Left e                             -> assertFailure $
             "expected BiFrameCountExceedsBuffer, got " <> show e
-          Right ()                             -> assertFailure
+          Right ()                           -> assertFailure
             "expected BiFrameCountExceedsBuffer, got success"
+
+  , testCase "allocBuffer rejects negative frame count" $
+      withRTGraph 16 256 $ \rt -> do
+        result <- try (allocBuffer rt (-1))
+        case result of
+          Left (BiInvalidFrameCount n) -> n @?= (-1)
+          Left e                       -> assertFailure $
+            "expected BiInvalidFrameCount (-1), got " <> show e
+          Right b                      -> assertFailure $
+            "expected BiInvalidFrameCount, got Buffer " <> show b
 
   , testCase "clear-then-load reports BiUnknownBufferId" $
       withRTGraph 16 256 $ \rt -> do
@@ -9958,7 +9968,112 @@ playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
           assertBool
             "cleared buffer must emit silence"
             (all (== 0.0) rcvs)
+
+  , testCase "start_frame seeds the playhead at instance reset" $
+      -- 8-frame buffer played back from frame 3 with rate=1.0,
+      -- loop=0. Output: samples[3..7] then silence past the end.
+      -- 5 in-bounds reads (frames 3..7) and 3 past-the-end reads.
+      let table     = [10, 20, 30, 40, 50, 60, 70, 80] :: [Float]
+          nframes   = length table
+          expected  = [40, 50, 60, 70, 80, 0, 0, 0] :: [Float]
+      in runPlayBufScenario table 1.0 3.0 0.0 nframes expected 5 3
+           "start_frame=3"
+
+  , testCase "loop_flag=1 wraps back to start_frame past the end" $
+      -- 4-frame buffer rendered for 12 samples with loop=1: every
+      -- output sample is a valid read after wrap.
+      let table    = [1, 2, 3, 4] :: [Float]
+          expected = [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4] :: [Float]
+      in runPlayBufScenario table 1.0 0.0 1.0 12 expected 12 0
+           "loop wrap"
+
+  , testCase "loop_flag=0 goes silent past the last frame (one-shot)" $
+      -- Same 4-frame buffer, loop=0, 8 samples: 4 in-bounds reads
+      -- then 4 past-the-end zero emits.
+      let table    = [1, 2, 3, 4] :: [Float]
+          expected = [1, 2, 3, 4, 0, 0, 0, 0] :: [Float]
+      in runPlayBufScenario table 1.0 0.0 0.0 8 expected 4 4
+           "one-shot boundary"
+
+  , testCase "fractional rate yields linear interpolation" $
+      -- 8-frame table of even integers, rate=0.5: positions are
+      -- 0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5 — all in-bounds; every
+      -- output sample counts as a valid read.
+      let table    = [0, 2, 4, 6, 8, 10, 12, 14] :: [Float]
+          expected = [0, 1, 2, 3, 4, 5, 6, 7] :: [Float]
+      in runPlayBufScenario table 0.5 0.0 0.0 8 expected 8 0
+           "fractional rate / linear interp"
+
+  , testCase "negative rate is clamped to 0 (playhead frozen)" $
+      -- rate=-1.0 clamps to 0 every sample; the playhead never
+      -- advances and the kernel re-emits samples[0] = 10.
+      let table    = [10, 20, 30, 40] :: [Float]
+          expected = replicate 8 10 :: [Float]
+      in runPlayBufScenario table (-1.0) 0.0 0.0 8 expected 8 0
+           "negative rate clamp"
   ]
+
+-- | Test helper: render `nframes` of a `playBufMono` graph over a
+-- single-template world, with the buffer's samples loaded and the
+-- four `playBufMono` controls fixed to producer-provided defaults.
+-- Asserts the rendered bus-0 output matches `expected` to within
+-- 1e-5 and counter-confirms via @rt_graph_test_buffer_read_count@
+-- (so an all-zeros regression cannot pass a value comparison).
+runPlayBufScenario
+  :: [Float]    -- ^ buffer samples
+  -> Double     -- ^ rate
+  -> Double     -- ^ start_frame argument (Param)
+  -> Double     -- ^ loop_flag (Param)
+  -> Int        -- ^ frames to render
+  -> [Float]    -- ^ expected bus-0 output
+  -> Int        -- ^ expected valid read count (buffer_read_count delta)
+  -> Int        -- ^ expected invalid read count (buffer_invalid_read_count delta)
+  -> String     -- ^ scenario label (used in failure messages)
+  -> IO ()
+runPlayBufScenario
+    table rate start loopFlag nframes expected
+    expectedValid expectedInvalid label = do
+  let bufFrames = length table
+      sizeOfF :: Int
+      sizeOfF = 4
+      graph = runSynthWithBuffer 0 $ \buf -> do
+        s <- playBufMono buf (Param rate) (Param start) (Param loopFlag)
+        out 0 s
+
+  tg <- case compileTemplateGraph [("default", graph)] of
+    Right t  -> pure t
+    Left err -> assertFailure err >> error "unreachable"
+
+  let totalNodes =
+        sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+  withRTGraph totalNodes nframes $ \rt -> do
+    loadTemplateGraph rt tg
+    buf <- allocBuffer rt bufFrames
+    loadBuffer rt buf table
+    bufferId buf @?= 0
+
+    c_rt_graph_process rt (fromIntegral nframes)
+    readCount    <- c_rt_graph_test_buffer_read_count         rt
+    invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
+    -- Counter-confirmed validation: lock the exact read/invalid
+    -- mix so a regression that emits zeros via a different code
+    -- path (e.g. the kernel taking the wrong branch) cannot pass
+    -- silently. See [feedback_counter_confirmed_validation.md].
+    readCount    @?= fromIntegral expectedValid
+    invalidCount @?= fromIntegral expectedInvalid
+
+    allocaBytes (nframes * sizeOfF) $ \bufPtr -> do
+      _ <- c_rt_graph_read_bus rt 0
+             (fromIntegral nframes) (castPtr bufPtr)
+      rendered <- peekArray nframes (bufPtr :: PtrCFloat)
+      let rcvs = map (\(CFloat x) -> x) rendered
+      assertBool
+        (label <> ": rendered output mismatch.\n"
+         <> "expected: " <> show expected <> "\n"
+         <> "got:      " <> show rcvs)
+        (all (\(a, b) -> abs (a - b) < 1.0e-5)
+             (zip rcvs expected))
 
 -- | Test helper: allocate a Buffer (without an RTGraph available)
 -- so that the SynthM closure in the test reads identically to

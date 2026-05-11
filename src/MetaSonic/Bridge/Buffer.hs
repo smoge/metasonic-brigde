@@ -36,7 +36,7 @@ module MetaSonic.Bridge.Buffer
 
 import           Control.DeepSeq         (NFData)
 import           Control.Exception       (Exception, throwIO)
-import           Foreign.C.Types         (CFloat (..))
+import           Foreign.C.Types         (CFloat (..), CInt)
 import           Foreign.Marshal.Array   (withArrayLen)
 import           Foreign.Ptr             (Ptr)
 import           GHC.Generics            (Generic)
@@ -56,30 +56,46 @@ data BufferIssue
   = BiPoolFull
     -- ^ 'rt_graph_buffer_alloc' returned -1 because the pool is at
     -- capacity (64 buffers allocated).
+  | BiInvalidFrameCount !Int
+    -- ^ 'allocBuffer' rejected the requested frame count before
+    -- crossing the FFI: either negative or larger than 'maxBound ::
+    -- CInt'. Holds the rejected value. This is a wrapper-side check
+    -- so the underlying C ABI never has to decide what a negative or
+    -- overflowed @int@ means.
   | BiUnknownBufferId !Int
     -- ^ 'rt_graph_buffer_load_f32' or 'rt_graph_buffer_clear'
     -- returned -1 because the given buffer ID is out of range or
     -- has not been allocated.
-  | BiFrameCountExceedsBuffer !Int !Int
+  | BiFrameCountExceedsBuffer !Int
     -- ^ 'rt_graph_buffer_load_f32' returned -2 because the
     -- requested frame count exceeds the buffer's allocated frame
-    -- count. Fields: requested, capacity.
+    -- count. Field: requested. (The buffer's capacity is not
+    -- exposed across the FFI in 6.C.3a; report only what the
+    -- producer asked for to avoid lying about a value we can't
+    -- read.)
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData, Exception)
 
 -- | Allocate a mono float32 buffer of @frames@ samples. Returns
 -- the producer-side 'Buffer' handle on success. Throws
--- 'BiPoolFull' if the runtime's pool is at capacity.
+-- 'BiInvalidFrameCount' if @frames@ is negative or larger than
+-- 'maxBound :: CInt' (so the wrapper never silently truncates),
+-- or 'BiPoolFull' if the runtime's pool is at capacity.
 --
 -- Construction-only: must be called before
 -- 'MetaSonic.Bridge.FFI.startAudio'. The underlying storage is
 -- zero-initialised; load samples in with 'loadBuffer'.
 allocBuffer :: Ptr RTGraph -> Int -> IO Buffer
-allocBuffer rt frames = do
-  rc <- c_rt_graph_buffer_alloc rt (fromIntegral frames)
-  if rc < 0
-    then throwIO BiPoolFull
-    else pure (Buffer (fromIntegral rc))
+allocBuffer rt frames
+  | frames < 0
+    = throwIO (BiInvalidFrameCount frames)
+  | fromIntegral frames > (fromIntegral (maxBound :: CInt) :: Integer)
+    = throwIO (BiInvalidFrameCount frames)
+  | otherwise = do
+      rc <- c_rt_graph_buffer_alloc rt (fromIntegral frames)
+      if rc < 0
+        then throwIO BiPoolFull
+        else pure (Buffer (fromIntegral rc))
 
 -- | Copy a list of float samples into an allocated buffer,
 -- starting at frame 0. Throws 'BiUnknownBufferId' if the buffer
@@ -103,7 +119,7 @@ loadBuffer rt (Buffer bid) samples =
     case fromIntegral rc :: Int of
       n  | n == len  -> pure ()
          | n == -1   -> throwIO (BiUnknownBufferId bid)
-         | n == -2   -> throwIO (BiFrameCountExceedsBuffer len 0)
+         | n == -2   -> throwIO (BiFrameCountExceedsBuffer len)
          | otherwise -> throwIO (BiUnknownBufferId bid)
 
 -- | Mark a buffer unallocated. The underlying sample storage's

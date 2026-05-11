@@ -653,12 +653,20 @@ Phase 6.C.3a. The playhead position is a floating-point frame index
 into the resolved buffer; linear interpolation reads samples at
 floor(pos) and floor(pos) + 1 and blends by the fractional part.
 
-Initialised from controls[2] (start_frame) at instance reset
-(configure_node). Advances by controls[1] (rate) per output sample
-unless control 1 is wired to an audio source, in which case it
-advances by the per-sample audio value. Negative effective rate is
-clamped to 0 in 6.C.3a; reverse playback is reserved for a future
-sub-phase.
+`buffer_id` is resolved once at instance reset (configure_node) and
+frozen in the state — the kernel never re-reads controls[0] in the
+audio loop. This matches the §6.C.2 contract ("buffer_id consulted
+at instance reset"); live retargeting via a control write is
+intentionally not supported in 6.C.3a, and would be a new feature
+rather than a bug to fix. -1 is the sentinel for "unresolved" and
+takes the invalid-read fast path.
+
+`playhead_pos` is initialised from controls[2] (start_frame) at
+instance reset. Advances by controls[1] (rate) per output sample
+unless input port 0 (rate) is wired to an audio source, in which
+case it advances by the per-sample audio value. Negative effective
+rate is clamped to 0 in 6.C.3a; reverse playback is reserved for a
+future sub-phase.
 
 Per-instance state, no shared resource — the *buffer* is shared,
 but each kernel owns its own playhead. The Eff annotation on the
@@ -666,7 +674,16 @@ Haskell side is 'BufRead n', which crosses the FFI as a runtime
 resolution against the world's mono buffer pool; it does not induce
 template precedence in §6.C.3a (read-only).
 */
+// Phase §6.C.3a: maximum number of mono buffers a world can hold.
+// Fixed-size array on RTGraphState — same shape as the bus-pool cap
+// convention. Q-1 settled this in the 6.C.2 contract. Declared early
+// so configure_node can resolve & range-check controls[0] (buffer_id)
+// at instance reset without depending on RTGraphState's later
+// definition.
+constexpr int kMaxBuffers = 64;
+
 struct PlayBufMonoState {
+  int    buffer_id    = -1;
   double playhead_pos = 0.0;
 };
 
@@ -1403,17 +1420,28 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
     break;
 
   case NodeKind::PlayBufMono: {
-    // §6.C.3a. Playhead is seeded from controls[2] (start_frame)
-    // at instance reset so the kernel starts at the producer-
-    // specified frame; subsequent reads of port 1 are dropped
-    // (PortIgnored). controls[2] is sanitized to a non-negative
-    // finite double here; the kernel re-clamps against the
-    // resolved buffer's frame count on each read.
+    // §6.C.3a. The §6.C.2 contract pins buffer_id resolution at
+    // instance reset, not per-block: resolve controls[0] once here
+    // (round + range-check against the pool size) and freeze it on
+    // the state. An out-of-range or NaN id collapses to the -1
+    // sentinel so the kernel's invalid-read fast path fires
+    // deterministically. Playhead is seeded from controls[2]
+    // (start_frame) so the kernel starts at the producer-specified
+    // frame; subsequent reads of port 1 are dropped (PortIgnored).
+    const double bid_raw =
+        spec.default_controls.size() > 0 ? spec.default_controls[0] : -1.0;
+    int bid = -1;
+    if (std::isfinite(bid_raw)) {
+      const long bid_l = std::lround(bid_raw);
+      if (bid_l >= 0 && bid_l < kMaxBuffers) {
+        bid = static_cast<int>(bid_l);
+      }
+    }
     double start =
         spec.default_controls.size() > 2 ? spec.default_controls[2] : 0.0;
     if (!std::isfinite(start) || start < 0.0) start = 0.0;
     target_outputs = 1;
-    node.state = PlayBufMonoState{start};
+    node.state = PlayBufMonoState{bid, start};
     break;
   }
 
@@ -2147,11 +2175,6 @@ struct BufferSlot {
   std::vector<float> samples;
   bool allocated = false;
 };
-
-// Phase §6.C.3a: maximum number of mono buffers a world can hold.
-// Fixed-size array on RTGraphState — same shape as the bus-pool cap
-// convention. Q-1 settled this in the 6.C.2 contract.
-constexpr int kMaxBuffers = 64;
 
 struct RTGraphState {
   // §2.D.3: vector of MetaDefs (templates). Index i is template_id i,
@@ -4438,15 +4461,14 @@ static void process_play_buf_mono(
     return;
   }
 
-  // Resolve the buffer ID once per block. controls[0] is a double
-  // because the C ABI is uniform across kinds; round to int and
-  // bounds-check against the pool size. -1 (the configure_spec
-  // sentinel) and any out-of-range value land in the invalid path.
-  const double bid_raw = node.controls[0];
-  const int bid =
-      std::isfinite(bid_raw)
-          ? static_cast<int>(std::lround(bid_raw))
-          : -1;
+  // §6.C.2 contract: buffer_id is consulted at instance reset, not
+  // per-block. init_node_state already resolved controls[0] (with
+  // rounding, finiteness check, and range check) and stored the
+  // result on the state. -1 is the "unresolved" sentinel and lands
+  // in the invalid-read fast path. We deliberately do NOT re-read
+  // controls[0] here: live retargeting via a control write is not
+  // supported in 6.C.3a.
+  const int bid = st->buffer_id;
   const bool bid_in_range = (bid >= 0 && bid < kMaxBuffers);
 
   // Borrow a const reference to the resolved slot; nullptr means
@@ -8748,6 +8770,12 @@ int rt_graph_buffer_load_f32(
   if (static_cast<std::size_t>(frame_count) > slot.samples.size()) {
     return -2;
   }
+  // Early return when frame_count == 0: the producer may legitimately
+  // pass samples == nullptr in that case, and forming `samples + 0`
+  // on a null pointer is technically UB. Skipping std::copy here is
+  // also a no-op when samples != nullptr (the bus pool's load path
+  // matches this idiom).
+  if (frame_count == 0) return 0;
   std::copy(samples, samples + frame_count, slot.samples.begin());
   return frame_count;
 }

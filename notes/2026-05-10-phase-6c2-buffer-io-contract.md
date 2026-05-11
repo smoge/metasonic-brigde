@@ -31,7 +31,13 @@ S-6 unloaded/freed ID emits zeros + invalid-read counter.
     the realtime ABI in 6.C.3b). Casting/truncation
     semantics: `static_cast<int32_t>(round(...))`,
     out-of-range clamped to `-1` so the invalid-read path
-    fires deterministically.
+    fires deterministically. Resolved once in
+    `init_node_state` and frozen on `PlayBufMonoState`; the
+    kernel never re-reads `controls[0]` per block. Live
+    retargeting via a control write is intentionally not
+    supported in 6.C.3a — it would be a new feature, not a
+    bug, and lifetime semantics for that case belong with the
+    §5.3 retire/collect work in 6.C.3b.
   - `rate`: playback rate as a multiplier (1.0 = forward,
     real-time; negative reserved for future reverse
     playback, **not** implemented in 6.C.3a — out-of-band
@@ -331,13 +337,23 @@ in `MetaSonic.OSC.Dispatch`, `MetaSonic.Bridge.Templates`):
 
 ```haskell
 data BufferIssue
-  = BiPoolFull         -- alloc returned -1
-  | BiUnknownBufferId  !Int  -- load / clear returned -1
-  | BiFrameCountExceedsBuffer !Int !Int
-                       -- requested, capacity
+  = BiPoolFull              -- alloc returned -1
+  | BiInvalidFrameCount  !Int  -- wrapper-side check before fromIntegral
+  | BiUnknownBufferId    !Int  -- load / clear returned -1
+  | BiFrameCountExceedsBuffer !Int
+                            -- requested (capacity not exposed in v1)
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData, Exception)
 ```
+
+Revised after 6.C.3a review: `BiFrameCountExceedsBuffer` carries
+only the requested frame count because the C ABI does not expose
+the buffer's capacity in 6.C.3a; we report only what we know
+rather than lying about a value we can't read. A separate
+`BiInvalidFrameCount` covers the `allocBuffer` argument check
+that fires before `fromIntegral` crosses the FFI (negative or
+larger than `maxBound :: CInt`) — previously these were silently
+mapped to `BiPoolFull` which was wrong.
 
 The `Exception` instance comes via `deriving anyclass` —
 `BufferIssue` already has `Show`, which is the only
