@@ -10,6 +10,11 @@ module MetaSonic.App.Survey
   , shapeHasKernel
   , renderShape
   , renderProducer
+    -- * Phase 7.B capability tooling
+  , KindTally
+  , shapeMemberKinds
+  , shapeCapabilities
+  , renderCapAbbr
   ) where
 
 import           Data.Either               (partitionEithers)
@@ -605,6 +610,10 @@ data CorpusGraphSummary = CorpusGraphSummary
   , csOppProducers :: ![NodeKind]
   , csDeclaredLatency :: ![DeclaredNodeLatency]
   , csLatencySkews :: ![LatencySkew]
+  , csKindTally    :: !KindTally
+    -- ^ §7.B per-kind node count. Carried through 'CorpusGraphSummary'
+    -- so '--snapshot-check' can aggregate the corpus's
+    -- capability footprint without re-compiling each graph.
   } deriving (Eq, Show)
 
 -- | Phase 6.A.3 corpus-survey entry: compile a 'SynthGraph' and
@@ -623,6 +632,7 @@ surveyCorpusGraph d t g = do
     , csOppProducers = srOppProducers row
     , csDeclaredLatency = srDeclaredLatency row
     , csLatencySkews    = srLatencySkews row
+    , csKindTally       = srKindTally row
     }
 
 -- | Compile every (demo, template) pair, returning one

@@ -25,13 +25,16 @@ import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
                                                 collectFusionCostLabRows,
                                                 familyName)
 import           MetaSonic.App.Survey          (CorpusGraphSummary (..),
+                                                KindTally,
                                                 SinkShape (..), renderShape,
                                                 shapeHasKernel,
                                                 surveyCorpusGraph,
                                                 surveyEnsembleCorpus,
                                                 surveyShapeProbes)
 import           MetaSonic.Bridge.Compile      (DeclaredNodeLatency (..))
-import           MetaSonic.Types               (NodeKind (..))
+import           MetaSonic.Types               (KindCapability (..),
+                                                NodeKind (..),
+                                                kindCapabilities)
 
 data SnapshotCheck = SnapshotCheck
   { scLabel  :: !String
@@ -48,7 +51,9 @@ runSnapshotCheck :: IO ()
 runSnapshotCheck = do
   costRows <- collectFusionCostLabRows FCL.defaultOptions
   let survey = collectSurveySnapshots
-      checks = costLabChecks costRows <> surveyChecks survey
+      checks =  costLabChecks costRows
+             <> surveyChecks survey
+             <> capabilityChecks survey
 
   putStrLn "Phase 7.A survey/cost-lab snapshot checks"
   putStrLn ""
@@ -247,6 +252,76 @@ surveyChecks snapshots =
           <> "; latency=" <> show (csDeclaredLatency row)
         Just (Left err) -> err
         Nothing         -> "missing"
+
+-- §7.B capability invariants on the snapshot corpus. The snapshot
+-- corpus is fixed; if a capability count moves, either the corpus
+-- grew, or 'kindCapabilities' was edited, or a new 'NodeKind' landed
+-- without a row. All three deserve an explicit acknowledgement, so
+-- the expected counts are pinned and treated as a snapshot.
+capabilityChecks :: SurveySnapshots -> [SnapshotCheck]
+capabilityChecks snapshots =
+  [ check "corpus capability counts are stable"
+      (perCap == expectedCap)
+      ("expected=" <> renderCapCounts expectedCap
+       <> "; actual=" <> renderCapCounts perCap)
+
+  , check "corpus contains no CapHardBarrier nodes"
+      (lookupCap CapHardBarrier perCap == 0)
+      ("hard-barrier=" <> show (lookupCap CapHardBarrier perCap))
+
+  , check "corpus CapLatencyBearing nodes match KSpectralFreeze count"
+      (lookupCap CapLatencyBearing perCap == spectralFreezeNodes)
+      ("latency-bearing=" <> show (lookupCap CapLatencyBearing perCap)
+       <> "; spectral-freeze=" <> show spectralFreezeNodes)
+  ]
+  where
+    allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
+    aggTally :: KindTally
+    aggTally =
+      foldr mergeTallies []
+            [ csKindTally row | (_, Right row) <- allRows ]
+
+    perCap =
+      [ (cap, nodesWithCap cap aggTally)
+      | cap <- [minBound .. maxBound :: KindCapability]
+      ]
+
+    spectralFreezeNodes =
+      maybe 0 id (lookup KSpectralFreeze aggTally)
+
+    -- Pinned counts from the current snapshot corpus. Bump these
+    -- intentionally when the corpus changes (or when a kind's
+    -- capability row is edited); a silent shift means one of the
+    -- two tables drifted.
+    expectedCap =
+      [ (CapStatelessOp,    107)
+      , (CapStatefulOp,     112)
+      , (CapSinkTerminal,    72)
+      , (CapResourceAccess,  87)
+      , (CapLatencyBearing,   1)
+      , (CapHardBarrier,      0)
+      ]
+
+mergeTallies :: KindTally -> KindTally -> KindTally
+mergeTallies a b =
+  [ (k, n)
+  | k <- [minBound .. maxBound :: NodeKind]
+  , let n = countOf k a + countOf k b
+  , n > 0
+  ]
+  where
+    countOf k = maybe 0 id . lookup k
+
+nodesWithCap :: KindCapability -> KindTally -> Int
+nodesWithCap cap tally =
+  sum [n | (k, n) <- tally, cap `elem` kindCapabilities k]
+
+lookupCap :: KindCapability -> [(KindCapability, Int)] -> Int
+lookupCap c = maybe 0 id . lookup c
+
+renderCapCounts :: [(KindCapability, Int)] -> String
+renderCapCounts xs =
+  intercalate "," [show c <> "=" <> show n | (c, n) <- xs]
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =
