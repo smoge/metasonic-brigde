@@ -43,6 +43,9 @@ module MetaSonic.Bridge.Compile.Dependencies
     -- * Barrier predicate (§4.E.1c)
   , isLiveBusKind
   , regionHasLiveBus
+    -- * §6.C.4 follow-up writer barrier
+  , isBufferWriterKind
+  , regionHasBufferWriter
   ) where
 
 import qualified Data.Map.Strict as M
@@ -442,3 +445,39 @@ regionHasLiveBus rg r =
         Just n  -> isLiveBusKind (rnKind n)
         Nothing -> False
   in any memberIsLiveBus (rrNodes r)
+
+-- | §6.C.4 follow-up slice 2: whether a region contains any
+-- audio-thread writer kind. Used by the conservative band
+-- serialization policy: a region with a writer never lands in
+-- a parallel band, regardless of whether the buffer it writes
+-- is also read by any other region in the same band.
+--
+-- This is the same shape as 'regionHasLiveBus': the predicate
+-- inspects 'rnKind' rather than the region's footprint, so an
+-- out-of-range buffer id in 'rnControls[0]' (silently excluded
+-- from 'rfBuffers' by 'runtimeNodeResourceFootprint's
+-- sanitisation) still marks the region as a barrier. The point
+-- is that the writer kernel /could/ resolve to a valid buffer
+-- at runtime; the conservative policy doesn't probe that.
+--
+-- A future refinement would consult buffer-disjointness — a
+-- writer for buffer N is safe to parallelise with a
+-- reader/writer for buffer M ≠ N — but that's deferred until
+-- a corpus needs it. See the §6.C.4 follow-up design note Q-3.
+regionHasBufferWriter :: RuntimeGraph -> RuntimeRegion -> Bool
+regionHasBufferWriter rg r =
+  let nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
+      memberIsBufferWriter ix = case M.lookup ix nodeMap of
+        Just n  -> isBufferWriterKind (rnKind n)
+        Nothing -> False
+  in any memberIsBufferWriter (rrNodes r)
+
+-- | §6.C.4 follow-up slice 2: which 'NodeKind's contain an
+-- audio-thread write into shared buffer storage.
+--
+-- Only 'KRecordBufMono' qualifies today; future writer kinds
+-- (random-access 'BufWr', multichannel records) get added
+-- here.
+isBufferWriterKind :: NodeKind -> Bool
+isBufferWriterKind KRecordBufMono = True
+isBufferWriterKind _              = False

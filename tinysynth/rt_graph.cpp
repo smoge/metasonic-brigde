@@ -4727,14 +4727,23 @@ static void process_play_buf_mono(
   g.buffer_invalid_read_count += invalid_samples;
 }
 
-// §6.C.4 follow-up slice 1: skeleton kernel. Passes the input
-// signal through to the audio output unchanged so the kind
-// composes inline (record + monitor without a bus split) and
-// ticks the invalid-write counter unconditionally so the
-// counter-confirmed-validation test pattern has something to
-// observe before the real kernel lands in slice 2. Storage is
-// not touched in this slice; the real write path replaces the
-// invalid-only tick below.
+// §6.C.4 follow-up slice 2 kernel. Writes signal_in into the
+// resolved buffer's samples vector sample-by-sample,
+// advancing a per-instance write head. Pass-through audio
+// output forwards signal_in unchanged. Invalid path (slot
+// Unallocated / Retired / out of range, or write head past
+// the end in one-shot mode) emits no mutation, no head
+// advance, and ticks buffer_invalid_write_count per sample.
+//
+// Memory ordering: acquire-load on slot.state synchronises
+// with the release-stores in rt_graph_buffer_retire /
+// rt_graph_buffer_alloc, so a kernel that sees Allocated
+// sees a coherent samples vector (size + contents).
+// Captured samples.data() pointer is valid for this block
+// only — retire never resizes samples, and a successful
+// collect requires the retire-generation counter to have
+// advanced past the snapshot, which only happens at a
+// process_graph block boundary.
 static void process_record_buf_mono(
     RTGraph &g, GraphInstance &inst,
     std::size_t node_idx, int nframes) noexcept {
@@ -4750,25 +4759,80 @@ static void process_record_buf_mono(
     return;
   }
 
-  // Pass-through: forward signal_in (port 0) unchanged.
   const auto sig_in =
       resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-  const double sig_default = node.controls[1];
+  const auto loop_in =
+      resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const double sig_default  = node.controls[1];
+  const double loop_default = node.controls[2];
+
+  // §6.C.2 contract: buffer_id is frozen at instance reset.
+  // The kernel never re-reads controls[0] in the audio loop.
+  const int bid = st->buffer_id;
+  const bool bid_in_range = (bid >= 0 && bid < kMaxBuffers);
+
+  // Resolve the slot under acquire ordering so a Retired
+  // observation here serialises against the producer's
+  // release-store in rt_graph_buffer_retire. nullptr means
+  // "take the per-sample invalid path."
+  float *samples = nullptr;
+  std::size_t samples_size = 0;
+  if (bid_in_range) {
+    auto &candidate =
+        g.buffers[static_cast<std::size_t>(bid)];
+    if (candidate.state.load(std::memory_order_acquire)
+          == BufferSlotState::Allocated
+        && !candidate.samples.empty()) {
+      samples      = candidate.samples.data();
+      samples_size = candidate.samples.size();
+    }
+  }
+
+  long long valid_samples   = 0;
+  long long invalid_samples = 0;
 
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
-    out[fi] = sig_in.empty()
-                ? static_cast<float>(sig_default)
-                : sig_in[fi];
+
+    // Pass-through is unconditional: producer-visible monitor
+    // signal does not depend on whether the buffer is
+    // writable.
+    const float sig =
+        sig_in.empty()
+          ? static_cast<float>(sig_default)
+          : sig_in[fi];
+    out[fi] = sig;
+
+    if (samples == nullptr) {
+      ++invalid_samples;
+      continue;
+    }
+
+    const double loop_raw =
+        loop_in.empty() ? loop_default
+                        : static_cast<double>(loop_in[fi]);
+    const bool looping = std::isfinite(loop_raw) && loop_raw >= 0.5;
+
+    // Boundary check before write so a head sitting exactly at
+    // frame_count either wraps (looping) or goes invalid
+    // (one-shot) on this sample, not the next.
+    if (st->write_head < 0
+        || static_cast<std::size_t>(st->write_head) >= samples_size) {
+      if (looping) {
+        st->write_head = 0;
+      } else {
+        ++invalid_samples;
+        continue;
+      }
+    }
+
+    samples[static_cast<std::size_t>(st->write_head)] = sig;
+    ++st->write_head;
+    ++valid_samples;
   }
 
-  // Slice 1 leaves the buffer untouched. Every sample increments
-  // the invalid-write counter so a test can prove the kernel ran
-  // (vs. emitting a silent block that happens to match the input).
-  // Slice 2 replaces this with the real write path and the
-  // valid/invalid split.
-  g.buffer_invalid_write_count +=
-      static_cast<long long>(nframes);
+  g.buffer_write_count         += valid_samples;
+  g.buffer_invalid_write_count += invalid_samples;
 }
 
 /* Note [Execution order]

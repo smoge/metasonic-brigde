@@ -10608,21 +10608,22 @@ runSynthWithBuffer :: Int -> (Buffer -> SynthM ()) -> SynthGraph
 runSynthWithBuffer bid k = runSynth (k (Buffer bid))
 
 ------------------------------------------------------------
--- Phase 6.C.4 follow-up slice 1: RecordBufMono skeleton.
+-- Phase 6.C.4 follow-up: RecordBufMono kernel.
 --
--- The slice-1 commit ships the Haskell surface + a minimal C++
--- skeleton that passes the input signal through unchanged and
--- ticks the invalid-write counter for every sample, without
--- actually mutating the buffer. These tests pin both halves of
--- that contract end-to-end so any regression in the wiring is
--- caught here rather than in slice 2's real-kernel commit. The
--- full record-then-playback / retire-during-write / loop-wrap
--- battery lands with the real kernel.
+-- Pins the surface and a minimum-viable end-to-end render:
+-- the kernel writes signal_in into an Allocated slot
+-- sample-by-sample, advances the per-instance write head,
+-- forwards signal_in to the audio output unchanged, and ticks
+-- buffer_write_count per valid sample. The full record-then-
+-- playback / retire-during-write / loop wrap / one-shot
+-- boundary / live set_control regression / same-buffer
+-- rejection / scheduler band coverage lands in the test-suite
+-- commit alongside this slice.
 ------------------------------------------------------------
 
 recordBufMonoSkeletonTests :: TestTree
 recordBufMonoSkeletonTests =
-  testGroup "Phase 6.C.4 follow-up slice 1: RecordBufMono skeleton"
+  testGroup "Phase 6.C.4 follow-up: RecordBufMono kernel"
   [ testCase "inferEff produces a BufWrite on the buffer id" $ do
       let g = runSynth $ do
             src <- sinOsc 440.0 0.0
@@ -10652,12 +10653,15 @@ recordBufMonoSkeletonTests =
         @?= Just (PortInfo PortSampleAccurate "loop_flag")
       portInfo KRecordBufMono (PortIndex 2) @?= Nothing
 
-  , testCase "skeleton kernel passes signal_in through unchanged" $ do
+  , testCase "kernel writes signal_in and passes it through unchanged" $ do
       -- A graph that records a constant 0.25 into a 64-sample
-      -- buffer and routes the pass-through to bus 0. The
-      -- skeleton must (a) emit 0.25 on every output sample, and
-      -- (b) tick the invalid-write counter `nframes` times
-      -- without touching the buffer's samples vector.
+      -- buffer and routes the pass-through to bus 0. After one
+      -- block:
+      --   * bus 0 must read 0.25 everywhere (pass-through).
+      --   * buffer_write_count must equal nframes (every sample
+      --     hit the valid-write path).
+      --   * buffer_invalid_write_count must be 0 (slot stays
+      --     Allocated for the whole block).
       let nframes = 64
           sizeOfF :: Int
           sizeOfF = 4
@@ -10682,13 +10686,8 @@ recordBufMonoSkeletonTests =
 
         writeCount        <- c_rt_graph_test_buffer_write_count          rt
         invalidWriteCount <- c_rt_graph_test_buffer_invalid_write_count  rt
-        -- Slice 1: no real writes; every sample takes the
-        -- invalid-write path so a regression that wires the
-        -- kernel into the wrong branch is caught immediately.
-        -- Slice 2's real-kernel commit flips this expectation
-        -- and adds the record-then-playback verification.
-        writeCount        @?= 0
-        invalidWriteCount @?= fromIntegral nframes
+        writeCount        @?= fromIntegral nframes
+        invalidWriteCount @?= 0
 
         allocaBytes (nframes * sizeOfF) $ \bp -> do
           _ <- c_rt_graph_read_bus rt 0
@@ -10696,7 +10695,7 @@ recordBufMonoSkeletonTests =
           rendered <- peekArray nframes (bp :: PtrCFloat)
           let rcvs = map (\(CFloat x) -> x) rendered
           assertBool
-            ("skeleton must pass signal_in (0.25) through; got "
+            ("monitor output must equal signal_in (0.25); got "
              <> show (take 4 rcvs))
             (all (\x -> abs (x - 0.25) < 1.0e-5) rcvs)
   ]

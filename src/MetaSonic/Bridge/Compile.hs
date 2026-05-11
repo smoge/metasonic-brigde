@@ -58,6 +58,8 @@ module MetaSonic.Bridge.Compile
   , fusedInputSource
   , regionBusPrecedence
   , regionResourcePrecedence
+  , isBufferWriterKind
+  , regionHasBufferWriter
   , regionStructuralPrecedence
   , regionDependencies
   , -- * Scheduler barrier predicate
