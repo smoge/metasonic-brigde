@@ -1209,11 +1209,44 @@ C ABI additions: `rt_graph_buffer_retire`,
 since 6.C.3a).
 
 Not done in 6.C.3b: `BufWrite`, file I/O, multichannel, async
-load, pattern / OSC coupling for retire. Reassess after this
-lands whether 6.C needs write kinds (6.C.4) or whether 6.D
-spectral is the higher-signal next path.
+load, pattern / OSC coupling for retire. The next thing 6.C
+needs is not a writer kind directly — it's the resource-ordering
+layer that a writer kind would require, lifted up to a
+generalized `ResourceFootprint`. That work opens as 6.C.4.
 
 Note: [Phase 6.C.3b lifetime design](notes/2026-05-11-phase-6c3b-lifetime-design.md).
+
+#### 6.C.4 Buffer resource ordering (next task)
+
+Resource-ordering preflight for a future `BufWrite`. Today
+template precedence flows through `BusFootprint`; once a writer
+UGen exists, `BusFootprint` is too narrow. 6.C.4 widens the
+precedence surface to a `ResourceFootprint` covering both bus
+and buffer reads / writes / delayed reads, *before* any writer
+kind lands. Done in a tight series:
+
+1. Add `BufferFootprint` and `ResourceFootprint` types in
+   `Compile.Types`. No call sites yet.
+2. Pivot `Template.tplFootprint` / `RuntimeRegion.rrFootprint`
+   to `ResourceFootprint`. Bus-only graphs are bit-identical.
+3. Union bus + buffer edges in the template-level precedence
+   step. New tests:
+   - `BufWrite → BufRead` on the same buffer adds the edge.
+   - Bus-only corpus precedence stays byte-identical.
+4. Reject same-buffer `BufWrite / BufWrite` in
+   `compileTemplateGraph` with a dedicated diagnostic. Stricter
+   v1 contract; producer must express ordering through a bus or
+   split into separate buffers.
+
+After 6.C.4, the writer UGen (`RecordBufMono`) is a separate
+follow-up that only has to pin `inferEff (RecordBufMono buf
+_ _) = [BufWrite (bufferId buf)]` and ship the kernel — the
+ordering machinery picks it up automatically.
+
+Same-buffer `BufWrite / BufWrite` lifting is reserved for
+6.C.5+ once a real use case forces a pinned ordering primitive.
+
+Note: [Phase 6.C.4 resource-ordering design](notes/2026-05-11-phase-6c4-resource-ordering-design.md).
 
 ### Phase 6.D — Spectral Processing
 
