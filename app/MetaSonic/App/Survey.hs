@@ -128,6 +128,37 @@ renderShape (SinkOscLpfGain k) = renderProducer k <> " → LPF → Gain → sink
 renderShape SinkBusInLpfGain   = "BusIn → LPF → Gain → sink"
 renderShape SinkAddLpfGain     = "Add → LPF → Gain → sink"
 
+-- §7.B: the node sequence implied by a 'SinkShape'. Derived from the
+-- shape's constructor without re-scanning a 'RuntimeGraph'. The sink
+-- is represented as 'KOut' for capability derivation; both 'KOut'
+-- and 'KBusOut' carry the same 'kindCapabilities', so concrete chains
+-- that end in either work the same way.
+shapeMemberKinds :: SinkShape -> [NodeKind]
+shapeMemberKinds (SinkOscGain    k) = [k,                KGain, KOut]
+shapeMemberKinds (SinkOscLpfGain k) = [k,        KLPF,   KGain, KOut]
+shapeMemberKinds SinkBusInLpfGain   = [KBusIn,   KLPF,   KGain, KOut]
+shapeMemberKinds SinkAddLpfGain     = [KAdd,     KLPF,   KGain, KOut]
+
+-- §7.B: the union of 'KindCapability' flags carried by the chain
+-- members of a 'SinkShape'. Returned in 'KindCapability' Enum order
+-- for deterministic display.
+shapeCapabilities :: SinkShape -> [KindCapability]
+shapeCapabilities s =
+  let kinds = shapeMemberKinds s
+  in [ c
+     | c <- [minBound .. maxBound :: KindCapability]
+     , any (\k -> c `elem` kindCapabilities k) kinds
+     ]
+
+-- Two-character abbreviation for use in compact survey columns.
+renderCapAbbr :: KindCapability -> String
+renderCapAbbr CapStatelessOp    = "SL"
+renderCapAbbr CapStatefulOp     = "St"
+renderCapAbbr CapSinkTerminal   = "Sk"
+renderCapAbbr CapResourceAccess = "RA"
+renderCapAbbr CapLatencyBearing = "LB"
+renderCapAbbr CapHardBarrier    = "HB"
+
 -- Whether the §4.B kernel set currently has a kernel that would
 -- claim this shape (independent of whether the kernel
 -- preconditions hold on any specific instance).
@@ -1577,7 +1608,9 @@ printOpportunityScan :: [SurveyRow] -> IO ()
 printOpportunityScan rows = do
   putStrLn "─── Ranked missed-shape table ───"
   putStrLn $ formatScanRow
-    ["shape", "found", "claimed", "missed", "sources", "status", "next"]
+    [ "shape", "found", "claimed", "missed", "sources"
+    , "status", "next", "chain-caps"
+    ]
   mapM_ (putStrLn . formatScanRow) (scanRows rows)
   where
     formatScanRow cols =
@@ -1587,7 +1620,7 @@ printOpportunityScan rows = do
       | otherwise     = s <> replicate (w - length s) ' '
 
 scanColumnWidths :: [Int]
-scanColumnWidths = [32, 6, 8, 7, 8, 10, 16]
+scanColumnWidths = [32, 6, 8, 7, 8, 10, 16, 18]
 
 -- 'ScanStat' is the per-shape aggregate that drives the ranked
 -- table. Built once and reused for the row, the gate evaluation,
@@ -1651,6 +1684,7 @@ scanRows rows =
     , show (scSources st)
     , scanStatus st
     , scanNext   st
+    , intercalate "," (map renderCapAbbr (shapeCapabilities (scShape st)))
     ]
   | st <- sortRanked
             [ st
