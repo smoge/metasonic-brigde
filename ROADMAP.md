@@ -1143,26 +1143,64 @@ module
 exposes `allocBuffer` / `loadBuffer` / `clearBuffer` against
 the new C ABI (`rt_graph_buffer_alloc`,
 `rt_graph_buffer_load_f32`, `rt_graph_buffer_clear`) with
-exception-throwing `BufferIssue` errors. Fixed-cap pool of 64
+exception-throwing `BufferIssue` errors (revised after review:
+`BiFrameCountExceedsBuffer` carries only the requested count
+since capacity is not exposed across the FFI in v1; a separate
+`BiInvalidFrameCount` covers the wrapper-side check that fires
+before `fromIntegral` crosses the FFI). Fixed-cap pool of 64
 `BufferSlot`s on `RTGraphState`; counters
 (`rt_graph_test_buffer_read_count` /
 `_invalid_read_count`) tick per sample. Linear-interpolating
-`process_play_buf_mono` kernel reads from the resolved pool
-slot; invalid / unallocated / cleared IDs emit zeros and
-increment the invalid-read counter. End-to-end test loads a
-256-sample sine table, plays it forward, asserts both the
-sample-match within `1.0e-5` tolerance and a non-zero read
-counter (counter-confirmed validation). 11 new tests in
-`bufferPoolTests` + `playBufMonoTests` — 537 total.
+`process_play_buf_mono` kernel reads from `st->buffer_id`,
+which is resolved from `controls[0]` once at instance reset
+and frozen on `PlayBufMonoState` (the §6.C.2 contract;
+verified by a live-set_control regression test that swaps a
+control write under a running kernel and asserts the playback
+buffer does not flip). Invalid / unallocated / cleared IDs
+emit zeros and increment the invalid-read counter. End-to-end
+test loads a 256-sample sine table, plays it forward, asserts
+both the sample-match within `1.0e-5` tolerance and a non-zero
+read counter (counter-confirmed validation). Focused kernel
+coverage for `start_frame` seeding, loop wrap, one-shot
+boundary, fractional-rate / linear interpolation, and
+negative-rate clamp — each scenario pins exact valid /
+invalid read totals so a regression that emits zeros via a
+different code path cannot pass silently. 18 new tests in
+`bufferPoolTests` + `playBufMonoTests` — 544 total.
 
 #### 6.C.3b Lifetime hardening (next task)
 
-Live-safe retire / collect (§5.3 generation-counter pattern)
-so `clearBuffer` (or a new `retireBuffer`) is callable while
-audio is running. Survive-hot-swap test: build a graph that
-references buffer 0 through a `prepare_swap` /
-`publish_swap` cycle and assert the buffer is still readable
-in the new world.
+Resource-lifetime hardening step the later phases need.
+Two slices, design note first:
+
+1. **Move buffer pool + counters from `RTGraphState` to the
+   stable `RTGraph` handle.** No behavior change in the
+   kernel; just ownership relocation so a `prepare_swap` /
+   `publish_swap` cycle does not retire the buffer pool with
+   the old world. Add a hot-swap survival test: build a
+   graph referencing buffer 0, swap to a fresh world, assert
+   the buffer is still readable in the new world. This step
+   has to land first because the §5.3 generation-counter
+   pattern below assumes the pool outlives any one
+   `RTGraphState`.
+2. **Live-safe `retireBuffer` / `collectRetiredBuffers`.**
+   `retire` flips the slot to a "retired" state that makes
+   future reads emit zero + tick the invalid-read counter,
+   but the sample vector storage stays in place (and the
+   slot stays unreusable / non-resizable) until a `collect`
+   call proves the audio thread can no longer hold a pointer
+   from the previous block. `clearBuffer` stays
+   stopped-audio-only and gets a clearer docstring after
+   `retire` exists. Survive-hot-swap test is extended to
+   cover a retire-mid-render → render → collect → realloc
+   sequence.
+
+Not in 6.C.3b: `BufWrite`, file I/O, 6.D spectral, 6.E
+plugin hosting. After 6.C.3b lands, reassess whether 6.C
+needs write kinds or whether 6.D spectral is the
+higher-signal next path.
+
+Note: [Phase 6.C.3b lifetime design](notes/2026-05-11-phase-6c3b-lifetime-design.md).
 
 ### Phase 6.D — Spectral Processing
 

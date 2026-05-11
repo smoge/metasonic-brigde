@@ -268,7 +268,16 @@ int rt_graph_buffer_load_f32(
     const float *samples,
     int frame_count);
 
-// [T:construction] Release `buffer_id` and zero its slot.
+// [T:construction] Release `buffer_id`: flip the slot's
+// `allocated` bit back to false so a subsequent
+// rt_graph_buffer_alloc can reuse the slot index.
+// The underlying sample vector is *not* shrunk or freed —
+// its capacity is preserved so a re-alloc of the same size
+// is allocation-free (consistent with the bus pool's reuse
+// idiom; the slot's contents stay readable until a fresh
+// loadBuffer overwrites them, but the kernel takes the
+// invalid-read path once `allocated` is false).
+//
 // UNSAFE to call while audio is running — the audio thread
 // may still be reading from this slot. 6.C.3a documents
 // this as a construction / stopped-audio operation; live
@@ -307,14 +316,22 @@ header — same pattern as the bus-pool cap).
 - A `BufferSlot` struct (internal): `{ std::vector<float>
   samples; bool allocated; }`. The world / `RTGraph` carries
   a `std::array<BufferSlot, MAX_BUFFERS>`.
-- `configure_node` case for `KPlayBufMono`: reads
-  `buffer_id`, `start_frame` once at reset; initialises
-  per-instance kernel state `{ float playhead_pos; }`.
-- `process_play_buf_mono(...)`: linear-interpolates samples
-  from the resolved buffer at the current `playhead_pos`,
-  advances by `rate` per sample, applies the `loop_flag`
-  branch at the buffer end, increments the read counter on
-  each valid sample, increments the invalid-read counter
+- `configure_node` case for `KPlayBufMono`: resolves
+  `buffer_id` and `start_frame` from `controls[0]` /
+  `controls[2]` once at instance reset and freezes both on
+  per-instance kernel state
+  `PlayBufMonoState { int buffer_id; double playhead_pos; }`.
+  An out-of-range or NaN `buffer_id` collapses to the `-1`
+  sentinel so the kernel's invalid-read fast path fires
+  deterministically.
+- `process_play_buf_mono(...)`: reads `st->buffer_id`
+  (deliberately never re-reads `controls[0]` per block —
+  live retargeting via a control write is not supported in
+  6.C.3a), linear-interpolates samples from the resolved
+  buffer at the current `playhead_pos`, advances by `rate`
+  per sample, applies the `loop_flag` branch at the buffer
+  end, increments the read counter on each valid sample,
+  increments the invalid-read counter
   and emits zero on each sample where `buffer_id` does not
   resolve.
 - `rt_graph_add_node` case for tag `20`.
