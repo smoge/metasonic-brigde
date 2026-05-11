@@ -11577,23 +11577,48 @@ spectralFreezeSkeletonTests =
         analysis @?= 0
         resynth  @?= expectedResynth
 
-  , testCase "freeze mode sustains the frozen content after the flag turns on" $ do
-      -- Build the freeze transition inside the runtime:
-      -- block 1 (4N frames) runs in pass-through, recording
-      -- the spectrum of a steady sine. Then we drive freeze
-      -- by directly setting the kernel's freeze_default to
-      -- 1.0 via c_rt_graph_instance_set_control on slot 1
-      -- (the freeze_in default), feed Param 0.0 (silence)
-      -- as the signal, and render another 2N frames. The
-      -- frozen sine must continue at non-trivial amplitude
-      -- even though the input has gone silent.
-      let n       = 1024 :: Int
-          frames1 = 4 * n
-          frames2 = 2 * n
+  , testCase "freeze mode sustains the frozen content after the input goes silent" $ do
+      -- The strict freeze-sustain test: input must genuinely
+      -- go silent during the freeze window so the test
+      -- proves the *frozen spectrum* keeps producing output
+      -- (not just that the analysis kept running but the
+      -- counter happens to not advance).
+      --
+      -- Drive signal_in from playBufMono on a precomputed
+      -- buffer: frames1 of 440 Hz sine, then frames2 of
+      -- zeros. Block 1 (frames1 long) runs in pass-through,
+      -- analyzing the sine and persisting the spectrum.
+      -- Then we set freeze_default = 1.0 live; block 2
+      -- (frames2 long) reads zeros from the buffer's tail —
+      -- so signal_in is honestly silent — and the only way
+      -- the output stays non-trivial is if the kernel keeps
+      -- emitting the frozen spectrum.
+      let n        = 1024 :: Int
+          frames1  = 4 * n
+          frames2  = 2 * n
+          totalF   = frames1 + frames2
+          -- Sample rate is wired into the C++ side (48000);
+          -- the exact phase doesn't matter for this test as
+          -- long as the buffer carries a real 440 Hz tone
+          -- through frames 0..frames1-1.
+          sr       = 48000 :: Double
+          freq     = 440   :: Double
+          sineSamples =
+            [ realToFrac
+                (sin (2 * pi * freq * fromIntegral i / sr))
+              :: Float
+            | i <- [0 .. frames1 - 1]
+            ]
+          silenceTail = replicate frames2 (0.0 :: Float)
+          bufContents = sineSamples ++ silenceTail
           graph = runSynth $ do
-            src    <- sinOsc 440.0 0.0
-            -- Wire the freeze_in to a constant; we'll
-            -- override the instance's controls[1] later.
+            -- One-shot playback: rate=1.0, start_frame=0,
+            -- loop=0. After the buffer is exhausted (which
+            -- it is partway through block 2) playBufMono
+            -- emits zeros — also genuinely silent.
+            src <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 0)
+            -- Wire freeze_in to a constant; flip the live
+            -- control between blocks.
             frozen <- spectralFreeze src (Param 0.0)
             out 0 frozen
       tg <- case compileTemplateGraph [("freeze", graph)] of
@@ -11602,29 +11627,36 @@ spectralFreezeSkeletonTests =
       let totalNodes =
             sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
       withRTGraph (totalNodes + 8) (max frames1 frames2) $ \rt -> do
+        buf <- allocBuffer rt totalF
+        bufferId buf @?= 0
+        loadBuffer rt buf bufContents
         loadTemplateGraph rt tg
-        -- Block 1: pass-through, prime the frozen_spectrum.
+
+        -- Block 1: pass-through. The kernel sees the sine,
+        -- records spectra at each hop.
         c_rt_graph_process rt (fromIntegral frames1)
-        analysis1 <- c_rt_graph_test_spectral_analysis_count    rt
+        analysis1 <- c_rt_graph_test_spectral_analysis_count rt
         assertBool
           ("block 1 must record some analyses; got "
            <> show analysis1)
           (analysis1 > 0)
-        -- Block 2: turn the freeze flag on. The
-        -- spectralFreeze node is index 1 in this graph
-        -- (sinOsc=0, spectralFreeze=1, out=2). Its
-        -- controls[1] is the freeze_default. Bumping it to
-        -- 1.0 makes resolve_input return the default at
-        -- hop boundaries (the wired Param 0.0 only set the
-        -- node's controls[1] at construction; we now flip
-        -- it live).
+
+        -- Flip freeze on. spectralFreeze is the second node
+        -- in the topo order (playBufMono = 0, spectralFreeze
+        -- = 1, out = 2); controls[1] is the freeze_default
+        -- that the kernel falls back on when freeze_in is
+        -- empty (Param 0.0 means no wired RFrom source).
         c_rt_graph_instance_set_control rt 0 1 1 1.0
+
+        -- Block 2: input is now silent (buffer exhausted +
+        -- buffer tail is zeros, both render to 0.0 on
+        -- signal_in). The frozen spectrum is the only thing
+        -- left contributing to the output.
         c_rt_graph_process rt (fromIntegral frames2)
-        analysis2 <- c_rt_graph_test_spectral_analysis_count    rt
-        -- analysis_count must not advance during freeze.
+        analysis2 <- c_rt_graph_test_spectral_analysis_count rt
+        -- Analysis_count must not advance during freeze.
         analysis2 @?= analysis1
-        -- Read the freeze-block's output and assert the
-        -- frozen sine survives.
+
         allocaBytes (frames2 * 4) $ \bp -> do
           _ <- c_rt_graph_read_bus rt 0
                  (fromIntegral frames2) (castPtr bp)
@@ -11633,7 +11665,7 @@ spectralFreezeSkeletonTests =
               peak = maximum (map abs rcvs)
           assertBool
             ("frozen output must keep producing the recorded "
-             <> "sine after the input goes silent; peak = "
+             <> "sine after signal_in goes silent; peak = "
              <> show peak)
             (peak > 0.1)
 
