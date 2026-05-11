@@ -1363,13 +1363,47 @@ mixdown primitive is designed; the implicit input-order
    template case; writer + reader on the same buffer still
    composes through E_r. Tests: duplicate writers reject;
    different-buffer writers compose; writer + reader composes.
-3. **[x] Docs / roadmap sync** (this commit). `rt_graph.h`'s
+3. **[x] Docs / roadmap sync** (commit a0dee32). `rt_graph.h`'s
    inter-template precedence comment now spells out the
    bus+buffer rule and the §6.C.5 single-writer-single-
    instance contract; ROADMAP no longer calls the
    `RecordBufMono` note "next implementation series".
 
-577 tests total (6 new since the 6.C.4 follow-up).
+##### 6.C.5 follow-up — close the runtime escape hatches
+
+Review of the three commits above turned up two gaps: the
+Haskell single-template loaders (`loadRuntimeGraph` /
+`loadRuntimeGraphFused`) did not call the clamp, and the public
+C ABI (`rt_graph_template_add_node`, `rt_graph_template_set_-
+polyphony`, the `rt_graph_add_node` template-0 shim) accepted
+the default cap of 8 even for templates carrying a writer node.
+A direct-C-ABI caller could still spawn N live writer instances.
+
+1. **[x] C++ runtime backstop** (commit 787a4d9).
+   `rt_graph_template_add_node` clamps the cap to 1 in place
+   when a `RecordBufMono` kind is added;
+   `rt_graph_template_set_polyphony` refuses to raise the cap
+   above 1 once a writer is present. Two-sided because callers
+   may set the cap and add the node in either order. Documented
+   as Note [§6.C.5 single-writer-single-instance invariant] in
+   `rt_graph.cpp`. Five new doctest cases cover the four
+   direct-ABI paths plus a non-writer baseline.
+2. **[x] Haskell single-template loader clamp** (commit f0e152e).
+   Adds `clampWriterPolyphonyRG` (RuntimeGraph variant) and
+   calls it from both `loadRuntimeGraph` and `loadRuntimeGraph-
+   Fused` right after `c_rt_graph_clear`. Three new tests pin
+   the loader-side clamp for both fused and unfused paths and
+   confirm non-writer graphs keep the default cap.
+3. **[x] Docs sync** (this commit). `rt_graph.h`'s
+   `rt_graph_template_set_polyphony` /
+   `rt_graph_template_add_node` doc comments now describe the
+   §6.C.5 backstop in place. The inter-template precedence
+   comment cross-references both the Haskell-loader clamp and
+   the runtime backstop so the doc names every layer that
+   enforces the invariant.
+
+580 Haskell tests, 308 standalone C++ tests (14 new since the
+6.C.4 follow-up: 9 Haskell + 5 C++).
 
 ### Phase 6.D — Spectral Processing
 

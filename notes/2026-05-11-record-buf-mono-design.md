@@ -467,13 +467,24 @@ Q-5. **DSL pass-through type.** The proposed signature returns
   separate phase.
 - **Same-buffer `BufWrite / BufWrite` lifting.** Still
   rejected at every scope after 6.C.5: across templates
-  (§6.C.4), inside one graph (§6.C.5 commit 2), and at
-  runtime via the polyphony=1 clamp on writer templates
-  (§6.C.5 commit 1). v1 buffer writers are a single-writer,
-  single-template-instance resource. Lifting that constraint
-  needs an explicit ordering / mixdown primitive — the
-  implicit "input declaration order" is the trap §6.C.4
-  declined to pin.
+  (§6.C.4, `checkNoSharedBufferWriters`), inside one graph
+  (§6.C.5 commit 2, `checkUniqueBufferWriters`), and at
+  runtime via the polyphony=1 clamp on writer templates.
+  The runtime clamp is enforced at two independent layers:
+  declaratively in every Haskell loader
+  (`loadRuntimeGraph`, `loadRuntimeGraphFused`,
+  `loadTemplateGraph`, `loadTemplateGraphFused`) via
+  `clampWriterPolyphony` / `clampWriterPolyphonyRG`, and as
+  a runtime backstop on the public C ABI in
+  `rt_graph_template_add_node` /
+  `rt_graph_template_set_polyphony` (§6.C.5 follow-up).
+  Either layer alone is sufficient; both together cover
+  direct-C-ABI callers that never reach the Haskell side.
+  v1 buffer writers are a single-writer, single-template-
+  instance resource. Lifting that constraint needs an
+  explicit ordering / mixdown primitive — the implicit
+  "input declaration order" is the trap §6.C.4 declined to
+  pin.
 - **File I/O, async load, multichannel.** All explicitly
   deferred in 6.C.4's bounds.
 

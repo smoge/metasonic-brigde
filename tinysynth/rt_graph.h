@@ -99,10 +99,17 @@ void rt_graph_clear(RTGraph *g);
 // precedence relation or reorders.
 //
 // §6.C.5 also clamps any template carrying a non-empty bfBufWrites
-// to polyphony=1 at load time so the same-buffer-writer uniqueness
-// invariant survives runtime instance spawning. Lifting that single-
-// writer-single-instance constraint is reserved for §6.C.5+ once a
-// real ordering / mixdown primitive lands.
+// to polyphony=1 so the same-buffer-writer uniqueness invariant
+// survives runtime instance spawning. The clamp is enforced at two
+// independent layers: declaratively in the Haskell loaders
+// (loadRuntimeGraph / loadRuntimeGraphFused / loadTemplateGraph /
+// loadTemplateGraphFused), and as a runtime backstop on the public
+// C ABI in rt_graph_template_add_node / rt_graph_template_set_-
+// polyphony. Either layer alone is enough; both together cover
+// every construction path including direct-C-ABI callers that
+// never reach the Haskell loaders. Lifting the single-writer-
+// single-instance constraint is reserved for §6.C.5+ once a real
+// ordering / mixdown primitive lands.
 //
 // Cross-template signal flow goes through the shared Server bus pool
 // (BusOut/Out -> BusIn/BusInDelayed). The bus pool is single-buffered
@@ -133,6 +140,14 @@ int rt_graph_template_count(RTGraph *g);
 // more declare it explicitly during construction. Values <= 0 are
 // clamped to 1. Silent no-op on invalid template_id.
 //
+// §6.C.5 backstop: if the template currently carries any buffer-
+// writer node (today: NodeKind::RecordBufMono), the cap is silently
+// clamped to 1 regardless of the requested value. Pairs with the
+// matching clamp in rt_graph_template_add_node so the runtime
+// honors the single-writer-single-instance invariant on every
+// public-ABI construction path. See Note [§6.C.5 single-writer-
+// single-instance invariant] in rt_graph.cpp.
+//
 // See Note [Pool model] in rt_graph.cpp for how the cap interacts
 // with the pre-allocated GraphInstance pool, and Note [Thread safety
 // contract] for why this is construction-only.
@@ -145,6 +160,11 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
 // per-template. Instances of other templates are not touched (each
 // template has its own dense node space). Silent no-op if template_id
 // is invalid.
+//
+// §6.C.5 backstop: dropping a buffer-writer kind (today:
+// NodeKind::RecordBufMono) into a template with polyphony > 1
+// silently clamps the cap to 1 in place. See Note [§6.C.5 single-
+// writer-single-instance invariant] in rt_graph.cpp.
 void rt_graph_template_add_node(RTGraph *g, int template_id,
                                 int node_index, int node_kind);
 
