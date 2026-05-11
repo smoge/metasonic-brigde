@@ -211,36 +211,60 @@ checkDependencies g =
       | otherwise = Left $ "Missing dependency: " ++ show nid
 
 
--- | Pairs (writer, reader) for every same-bus 'BusWrite' / 'BusRead'
--- effect in the graph. These are the E_r edges that augment the
--- structural dependency map before topological sort.
+-- | Pairs (writer, reader) for every same-resource 'BusWrite' /
+-- 'BusRead' or 'BufWrite' / 'BufRead' effect in the graph. These
+-- are the E_r edges that augment the structural dependency map
+-- before topological sort.
 --
--- Only the *live* reader effect 'BusRead' is paired here.
--- 'BusReadDelayed' (carried by 'BusInDelayed') is intentionally
--- excluded: a delayed reader targets the *previous* block's snapshot
--- of the bus, which the current block's writers cannot mutate, so
--- there is no execution-order constraint between them. Excluding
--- delayed readers from E_r is what makes feedback loops schedulable —
--- see Note [Effect-induced edges (E_r)] for the rationale.
+-- Only *live* reader effects are paired here. 'BusReadDelayed'
+-- (carried by 'BusInDelayed') is intentionally excluded: a delayed
+-- reader targets the *previous* block's snapshot of the bus, which
+-- the current block's writers cannot mutate, so there is no
+-- execution-order constraint between them. The future
+-- 'BufReadDelayed' will be excluded for the same reason — see Note
+-- [Effect-induced edges (E_r)] for the rationale.
 --
 -- 'BusOut n' produces 'BusWrite n' via 'inferEff' and 'BusIn n'
--- produces 'BusRead n'; this function pairs them up by bus number so
--- the scheduler sees an explicit writer → reader edge.
+-- produces 'BusRead n'; 'RecordBufMono buf' / 'PlayBufMono buf'
+-- analogously produce 'BufWrite (bufferId buf)' / 'BufRead
+-- (bufferId buf)'. Bus and buffer ids live in disjoint
+-- namespaces (a bus 5 / buffer 5 cannot alias), so pairing by
+-- resource discriminator + id never crosses kinds.
+--
+-- The name 'busEdges' is kept for source-level continuity even
+-- though §6.C.4 generalised the rule to buffers; renaming would
+-- churn every caller, and the inner derivation already documents
+-- the union shape.
 --
 -- See Note [Effect-induced edges (E_r)].
 busEdges :: SynthGraph -> [(NodeID, NodeID)]
 busEdges g =
-  let nodes   = M.toList (sgNodes g)
-      writers = [ (nid, n)
-                | (nid, ns) <- nodes
-                , BusWrite n <- inferEff (nsUgen ns) ]
-      readers = [ (nid, n)
-                | (nid, ns) <- nodes
-                , BusRead  n <- inferEff (nsUgen ns) ]
-                    -- BusReadDelayed is *not* listed: it must not
-                    -- contribute to E_r. See Note [Effect-induced
-                    -- edges (E_r)].
-  in [ (w, r) | (w, bw) <- writers, (r, br) <- readers, bw == br ]
+  let nodes        = M.toList (sgNodes g)
+      busWriters   = [ (nid, n)
+                     | (nid, ns) <- nodes
+                     , BusWrite n <- inferEff (nsUgen ns) ]
+      busReaders   = [ (nid, n)
+                     | (nid, ns) <- nodes
+                     , BusRead  n <- inferEff (nsUgen ns) ]
+                          -- BusReadDelayed is *not* listed: it must
+                          -- not contribute to E_r.
+      bufWriters   = [ (nid, n)
+                     | (nid, ns) <- nodes
+                     , BufWrite n <- inferEff (nsUgen ns) ]
+      bufReaders   = [ (nid, n)
+                     | (nid, ns) <- nodes
+                     , BufRead  n <- inferEff (nsUgen ns) ]
+                          -- A future BufReadDelayed would be excluded
+                          -- here for the same reason.
+      busPairs = [ (w, r)
+                 | (w, bw) <- busWriters
+                 , (r, br) <- busReaders
+                 , bw == br ]
+      bufPairs = [ (w, r)
+                 | (w, bw) <- bufWriters
+                 , (r, br) <- bufReaders
+                 , bw == br ]
+  in busPairs ++ bufPairs
 
 
 -- | The effective dependency map used by topological sort: the

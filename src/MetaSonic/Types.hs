@@ -263,6 +263,22 @@ data NodeKind
     -- 0 = one-shot (silence after last frame),
     -- @>= 0.5@ = loop back to @start_frame@. See
     -- Note [Buffer pool] in @tinysynth/rt_graph.cpp@.
+  | KRecordBufMono
+    -- ^ Mono float32 buffer record (§6.C.4 follow-up). Writes
+    -- a producer-allocated buffer (resolved via control slot 0,
+    -- @buffer_id@) sample-by-sample on the audio thread,
+    -- advancing a per-instance write head. Audio inputs in
+    -- declared order: @[signal_in, loop_flag]@. Controls
+    -- @[buffer_id, signal_in_default, loop_default]@.
+    -- @loop_flag@ 0 = one-shot (stop writing after the last
+    -- frame), @>= 0.5@ = wrap the write head back to frame 0.
+    -- The kernel passes the input signal through unchanged on
+    -- its audio output, so the kind composes inline (record +
+    -- monitor without a bus split). 'inferEff' produces
+    -- @[BufWrite (bufferId buf)]@; the §6.C.4 precedence union
+    -- picks up @BufWrite → BufRead@ on the same buffer
+    -- automatically and rejects same-buffer writers in
+    -- 'compileTemplateGraph'.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -424,6 +440,14 @@ kindSpec = \case
   -- once per output sample and the playhead advances per
   -- sample.
   KPlayBufMono  -> KindSpec 20 SampleRate  3 4 "playBufMono"
+  -- Buffer record (§6.C.4 follow-up): producer-allocated mono
+  -- float32 buffer pool, audio-thread sample-by-sample writes
+  -- through a self-advancing write head. 2 audio inputs
+  -- (signal_in, loop_flag), 3 controls
+  -- [buffer_id, signal_in_default, loop_default]. SampleRate
+  -- floor because the kernel writes once per output sample
+  -- and the write head advances per sample.
+  KRecordBufMono -> KindSpec 21 SampleRate  2 3 "recordBufMono"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to
@@ -672,6 +696,13 @@ portInfo k (PortIndex i) = case k of
     -- loop_flag: checked at the playback-position boundary
     -- every sample so live toggling on/off works.
     2 -> Just (PortInfo PortSampleAccurate "loop_flag")
+    _ -> Nothing
+  KRecordBufMono -> case i of
+    -- signal_in: every sample is recorded into the buffer.
+    0 -> Just (PortInfo PortSampleAccurate "signal_in")
+    -- loop_flag: checked at the write-head boundary every
+    -- sample so live toggling between loop and one-shot works.
+    1 -> Just (PortInfo PortSampleAccurate "loop_flag")
     _ -> Nothing
   where
     -- Oscillator family: port 0 = freq (sample-accurate FM when

@@ -57,6 +57,7 @@ module MetaSonic.Bridge.Source
   , delayL
   , smooth
   , playBufMono
+  , recordBufMono
   , tagged
   , cc
   , -- * Connection helpers
@@ -542,6 +543,30 @@ data UGen
     --
     -- Effect is 'BufRead n', wired to the underlying integer
     -- 'bufferId'. Rate is 'SampleRate'.
+  | RecordBufMono !Buffer !Connection !Connection
+    -- ^ Mono float32 buffer record (§6.C.4 follow-up). Writes
+    -- a producer-allocated 'Buffer' sample-by-sample on the
+    -- audio thread. Arguments in declared order: the buffer
+    -- to write, the audio signal to record, and a loop flag
+    -- (0 = one-shot stop at end, >= 0.5 = wrap to frame 0).
+    -- The output is the input signal forwarded unchanged — so
+    -- @recordBufMono buf sig flag >>= gain 0.5 >>= out 0@
+    -- monitors while recording.
+    --
+    -- The buffer ID is captured as control 0 at construction
+    -- and resolved once at instance reset; live
+    -- @set_control@ on slot 0 cannot retarget the writer (see
+    -- the §6.C.2 frozen-buffer-id contract that 'PlayBufMono'
+    -- already obeys). A retired / unallocated / cleared
+    -- buffer ID does not write anything and ticks
+    -- 'MetaSonic.Bridge.FFI.c_rt_graph_test_buffer_invalid_write_count';
+    -- the pass-through audio output is unaffected.
+    --
+    -- Effect is 'BufWrite n', wired to the underlying integer
+    -- 'bufferId' — the §6.C.4 precedence union picks up
+    -- @BufWrite → BufRead@ on the same buffer automatically,
+    -- and 'compileTemplateGraph' rejects same-buffer writers
+    -- across templates. Rate is 'SampleRate'.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -986,6 +1011,55 @@ playBufMono
 playBufMono buf rate startFrame loopFlag =
   insertNodeC "playBufMono" (PlayBufMono buf rate startFrame loopFlag)
 
+-- | Allocate a 'RecordBufMono' node — mono float32 buffer
+-- record at sample rate.
+--
+-- The 'Buffer' handle comes from
+-- 'MetaSonic.Bridge.Buffer.allocBuffer'; it is allocated in
+-- 'IO' against an @RTGraph@ outside the pure 'SynthM'
+-- builder and passed in as data. The runtime resolves the
+-- buffer ID through its mono pool ONCE at instance reset
+-- (the §6.C.2 frozen-buffer-id contract: live
+-- @set_control@ on slot 0 does not retarget). If the buffer
+-- is retired / unallocated / cleared, no samples are
+-- written and
+-- @rt_graph_test_buffer_invalid_write_count@ increments per
+-- sample. The pass-through audio output is unaffected
+-- either way.
+--
+-- Inputs (in declared order):
+--
+--   - @signal_in@: the audio signal to record. Read every
+--     sample.
+--   - @loop_flag@: 0 = one-shot (stop writing after the
+--     last frame), @>= 0.5@ = wrap the write head back to
+--     frame 0. Checked every sample so live toggling works.
+--
+-- The audio output forwards @signal_in@ unchanged so the
+-- node composes inline:
+--
+-- > buf <- allocBuffer rt 256
+-- > runSynth $ do
+-- >   src <- sinOsc 440.0 0.0
+-- >   mon <- recordBufMono buf src (Param 1.0)
+-- >   out 0 mon
+--
+-- @inferEff@ produces @['BufWrite' (bufferId buf)]@; the
+-- §6.C.4 precedence union picks up @BufWrite → BufRead@ on
+-- the same buffer automatically (see
+-- 'MetaSonic.Bridge.Templates.templatePrecedes'), and
+-- 'MetaSonic.Bridge.Templates.compileTemplateGraph' rejects
+-- same-buffer writers across templates
+-- ('MetaSonic.Bridge.Templates.checkNoSharedBufferWriters').
+recordBufMono
+  :: Buffer
+  -> Connection  -- ^ signal_in (the audio signal to record)
+  -> Connection  -- ^ loop_flag (0 = one-shot, >= 0.5 = wrap)
+  -> SynthM Connection
+recordBufMono buf signalIn loopFlag =
+  insertNodeC "recordBufMono"
+    (RecordBufMono buf signalIn loopFlag)
+
 -- | Declare a CC-bound smoothed control input. Allocates a 'Smooth'
 -- node fed by an initially-constant target, records the @(cc_number,
 -- smooth_node, ctl=1, min, max)@ binding in the builder state, and
@@ -1144,6 +1218,13 @@ ugenView = \case
              , connDefault s
              , connDefault lp
              ]
+  RecordBufMono buf sigIn lp ->
+    UGenView KRecordBufMono
+             [sigIn, lp]
+             [ fromIntegral (bufferId buf)
+             , connDefault sigIn
+             , connDefault lp
+             ]
 
 
 {- Note [Per-UGen projections]
@@ -1245,7 +1326,8 @@ inferEff (Out          bus _)       = [BusWrite        bus]
 inferEff (BusOut       bus _)       = [BusWrite        bus]
 inferEff (BusIn        bus)         = [BusRead         bus]
 inferEff (BusInDelayed bus)         = [BusReadDelayed  bus]
-inferEff (PlayBufMono  buf _ _ _)   = [BufRead (bufferId buf)]
+inferEff (PlayBufMono   buf _ _ _)  = [BufRead  (bufferId buf)]
+inferEff (RecordBufMono buf _ _)    = [BufWrite (bufferId buf)]
 inferEff _                          = [Pure]
 
 
@@ -1284,7 +1366,8 @@ dependencies = \case
   Add a b          -> deps [a, b]
   Env g _ _ _ _    -> deps [g]
   Smooth _ v       -> deps [v]
-  PlayBufMono _ r s lp -> deps [r, s, lp]
+  PlayBufMono   _ r s lp -> deps [r, s, lp]
+  RecordBufMono _ sigIn lp -> deps [sigIn, lp]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

@@ -85,6 +85,8 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_test_template_schedule_step_region,
                                             c_rt_graph_test_buffer_read_count,
                                             c_rt_graph_test_buffer_invalid_read_count,
+                                            c_rt_graph_test_buffer_write_count,
+                                            c_rt_graph_test_buffer_invalid_write_count,
                                             instanceStatusLive,
                                             instanceStatusReleasing,
                                             collectRetiredSwapStats,
@@ -143,6 +145,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , oscPortParserTests
   , bufferPoolTests
   , playBufMonoTests
+  , recordBufMonoSkeletonTests
   ]
 
 ------------------------------------------------------------
@@ -10603,3 +10606,97 @@ runPlayBufScenario
 -- time; this just hands the test a stable id.
 runSynthWithBuffer :: Int -> (Buffer -> SynthM ()) -> SynthGraph
 runSynthWithBuffer bid k = runSynth (k (Buffer bid))
+
+------------------------------------------------------------
+-- Phase 6.C.4 follow-up slice 1: RecordBufMono skeleton.
+--
+-- The slice-1 commit ships the Haskell surface + a minimal C++
+-- skeleton that passes the input signal through unchanged and
+-- ticks the invalid-write counter for every sample, without
+-- actually mutating the buffer. These tests pin both halves of
+-- that contract end-to-end so any regression in the wiring is
+-- caught here rather than in slice 2's real-kernel commit. The
+-- full record-then-playback / retire-during-write / loop-wrap
+-- battery lands with the real kernel.
+------------------------------------------------------------
+
+recordBufMonoSkeletonTests :: TestTree
+recordBufMonoSkeletonTests =
+  testGroup "Phase 6.C.4 follow-up slice 1: RecordBufMono skeleton"
+  [ testCase "inferEff produces a BufWrite on the buffer id" $ do
+      let g = runSynth $ do
+            src <- sinOsc 440.0 0.0
+            mon <- recordBufMono (Buffer 7) src (Param 0.0)
+            out 0 mon
+          ir = case lowerGraph g of
+                 Right ir' -> ir'
+                 Left err  -> error err
+          fp = resourceFootprint ir
+      bfBufWrites       (rfBuffers fp) @?= S.singleton 7
+      bfBufReads        (rfBuffers fp) @?= S.empty
+      bfBufDelayedReads (rfBuffers fp) @?= S.empty
+
+  , testCase "kindSpec / portInfo agree on KRecordBufMono shape" $ do
+      -- Cross-check the per-kind table against the contract
+      -- pinned in the design note. ksAudioArity drives every
+      -- post-IR site that walks input ports; ksControlArity
+      -- drives the default-controls vector size.
+      ksTag          (kindSpec KRecordBufMono) @?= 21
+      ksRate         (kindSpec KRecordBufMono) @?= SampleRate
+      ksAudioArity   (kindSpec KRecordBufMono) @?= 2
+      ksControlArity (kindSpec KRecordBufMono) @?= 3
+      ksLabel        (kindSpec KRecordBufMono) @?= "recordBufMono"
+      portInfo KRecordBufMono (PortIndex 0)
+        @?= Just (PortInfo PortSampleAccurate "signal_in")
+      portInfo KRecordBufMono (PortIndex 1)
+        @?= Just (PortInfo PortSampleAccurate "loop_flag")
+      portInfo KRecordBufMono (PortIndex 2) @?= Nothing
+
+  , testCase "skeleton kernel passes signal_in through unchanged" $ do
+      -- A graph that records a constant 0.25 into a 64-sample
+      -- buffer and routes the pass-through to bus 0. The
+      -- skeleton must (a) emit 0.25 on every output sample, and
+      -- (b) tick the invalid-write counter `nframes` times
+      -- without touching the buffer's samples vector.
+      let nframes = 64
+          sizeOfF :: Int
+          sizeOfF = 4
+          graph = runSynth $ do
+            mon <- recordBufMono (Buffer 0) (Param 0.25) (Param 0.0)
+            out 0 mon
+
+      tg <- case compileTemplateGraph [("default", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt nframes
+        bufferId buf @?= 0
+        loadBuffer rt buf (replicate nframes 0.0)
+
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+
+        writeCount        <- c_rt_graph_test_buffer_write_count          rt
+        invalidWriteCount <- c_rt_graph_test_buffer_invalid_write_count  rt
+        -- Slice 1: no real writes; every sample takes the
+        -- invalid-write path so a regression that wires the
+        -- kernel into the wrong branch is caught immediately.
+        -- Slice 2's real-kernel commit flips this expectation
+        -- and adds the record-then-playback verification.
+        writeCount        @?= 0
+        invalidWriteCount @?= fromIntegral nframes
+
+        allocaBytes (nframes * sizeOfF) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+          assertBool
+            ("skeleton must pass signal_in (0.25) through; got "
+             <> show (take 4 rcvs))
+            (all (\x -> abs (x - 0.25) < 1.0e-5) rcvs)
+  ]

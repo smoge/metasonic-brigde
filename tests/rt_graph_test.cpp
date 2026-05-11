@@ -83,12 +83,13 @@ TEST_CASE("kind_from_tag accepts every defined tag") {
     CHECK(rt_graph_kind_supported(18) == 1); // BPF
     CHECK(rt_graph_kind_supported(19) == 1); // Notch
     CHECK(rt_graph_kind_supported(20) == 1); // PlayBufMono
+    CHECK(rt_graph_kind_supported(21) == 1); // RecordBufMono
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
     CHECK(rt_graph_kind_supported(4) == 0);  // intentional gap
-    CHECK(rt_graph_kind_supported(21) == 0); // first unallocated past KPlayBufMono
+    CHECK(rt_graph_kind_supported(22) == 0); // first unallocated past KRecordBufMono
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
 }

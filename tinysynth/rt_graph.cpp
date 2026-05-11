@@ -386,6 +386,7 @@ enum class NodeKind : int {
   BPF          = 18,
   Notch        = 19,
   PlayBufMono  = 20,
+  RecordBufMono = 21,
 };
 
 // Sink-terminal classifier. Both 'Out' and 'BusOut' are pure sinks
@@ -426,6 +427,7 @@ kind_from_tag(int node_kind) noexcept {
   case 18: return NodeKind::BPF;
   case 19: return NodeKind::Notch;
   case 20: return NodeKind::PlayBufMono;
+  case 21: return NodeKind::RecordBufMono;
   default: return std::nullopt;
   }
 }
@@ -687,12 +689,39 @@ struct PlayBufMonoState {
   double playhead_pos = 0.0;
 };
 
+/* Note [Per-node RecordBufMono state]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Phase §6.C.4 follow-up. The write head is a 64-bit signed
+integer because it indexes into the buffer's samples vector;
+size_t would also work, but signed leaves room for "-1 means
+not-yet-resolved" parity with PlayBufMonoState's playhead and
+keeps the contract symmetric.
+
+`buffer_id` is resolved once at instance reset (configure_node)
+from controls[0] and frozen on this state — same §6.C.2
+contract as PlayBufMonoState. The kernel never re-reads
+controls[0] in the audio loop; live set_control on slot 0 does
+NOT retarget the writer. -1 is the sentinel for "unresolved"
+and takes the invalid-write fast path.
+
+`write_head` advances by 1 per output sample whenever the
+kernel writes a valid sample. It wraps back to 0 when
+`loop_flag >= 0.5` and the head reaches `samples.size()`;
+otherwise the kernel stops writing past the end and takes the
+invalid-write path (samples vector contents stay intact).
+*/
+struct RecordBufMonoState {
+  int       buffer_id  = -1;
+  long long write_head = 0;
+};
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
 using NodeState =
     std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState,
                  DelayState, SmoothState, PulseOscState,
-                 HPFState, BPFState, NotchState, PlayBufMonoState>;
+                 HPFState, BPFState, NotchState,
+                 PlayBufMonoState, RecordBufMonoState>;
 
 constexpr int kMigrationKeyMaxBytes = 16;
 
@@ -1335,6 +1364,18 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.default_controls = {-1.0, 1.0, 0.0, 0.0};
     spec.input_refs.resize(3); // [rate_in, start_frame_in, loop_flag_in]
     break;
+
+  case NodeKind::RecordBufMono:
+    // Mono float32 buffer record (§6.C.4 follow-up). Three
+    // controls [buffer_id, signal_in_default, loop_default];
+    // two audio inputs [signal_in, loop_flag_in]. buffer_id
+    // is resolved once at instance reset from controls[0]
+    // (frozen on RecordBufMonoState — §6.C.2 contract); -1
+    // is the unresolved sentinel and takes the invalid-write
+    // fast path.
+    spec.default_controls = {-1.0, 0.0, 0.0};
+    spec.input_refs.resize(2); // [signal_in, loop_flag_in]
+    break;
   }
 
   // Step C (d): fused_inputs is parallel to input_refs. Sizing it
@@ -1442,6 +1483,25 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
     if (!std::isfinite(start) || start < 0.0) start = 0.0;
     target_outputs = 1;
     node.state = PlayBufMonoState{bid, start};
+    break;
+  }
+
+  case NodeKind::RecordBufMono: {
+    // §6.C.4 follow-up. Same §6.C.2 frozen-buffer-id contract
+    // as PlayBufMono: resolve controls[0] once here, freeze it
+    // on the state, kernel never re-reads controls[0]. Write
+    // head starts at 0.
+    const double bid_raw =
+        spec.default_controls.size() > 0 ? spec.default_controls[0] : -1.0;
+    int bid = -1;
+    if (std::isfinite(bid_raw)) {
+      const long bid_l = std::lround(bid_raw);
+      if (bid_l >= 0 && bid_l < kMaxBuffers) {
+        bid = static_cast<int>(bid_l);
+      }
+    }
+    target_outputs = 1;
+    node.state = RecordBufMonoState{bid, 0};
     break;
   }
 
@@ -2406,6 +2466,17 @@ struct RTGraph {
   long long buffer_read_count = 0;
   long long buffer_invalid_read_count = 0;
 
+  // Phase §6.C.4 follow-up: write counters mirror the read pair.
+  // buffer_write_count ticks per valid sample written into an
+  // Allocated slot by a KRecordBufMono kernel; the invalid
+  // counter ticks per sample when the kernel ran but the slot
+  // was Unallocated / Retired / out of range, or when a
+  // one-shot writer's head has passed the end. Same long long
+  // shape, same handle-lifetime cadence (rt_graph_clear does
+  // not reset them).
+  long long buffer_write_count = 0;
+  long long buffer_invalid_write_count = 0;
+
   // Phase §6.C.3b slice 2: monotonic block counter the audio
   // thread ticks at the top of every process_graph call.
   // rt_graph_buffer_retire snapshots this value at retire time;
@@ -2467,6 +2538,12 @@ node_kind_supports_state_migration(NodeKind kind) noexcept {
     // hot-swap is not safe in §6.C.3a (the new graph may
     // reference a different buffer / different start). §6.C.3b
     // will revisit buffer survival across hot-swap.
+    return false;
+
+  case NodeKind::RecordBufMono:
+    // Same shape as PlayBufMono: the write head is tied to a
+    // specific buffer ID + buffer length. Don't migrate;
+    // §6.C.4 follow-up does not extend state migration.
     return false;
 
   case NodeKind::SinOsc:
@@ -2647,6 +2724,7 @@ enum class StateMigrationResult {
   case NodeKind::Delay:
   case NodeKind::Smooth:
   case NodeKind::PlayBufMono:
+  case NodeKind::RecordBufMono:
     return StateMigrationResult::Unsupported;
   }
   return StateMigrationResult::Unsupported;
@@ -4649,6 +4727,50 @@ static void process_play_buf_mono(
   g.buffer_invalid_read_count += invalid_samples;
 }
 
+// §6.C.4 follow-up slice 1: skeleton kernel. Passes the input
+// signal through to the audio output unchanged so the kind
+// composes inline (record + monitor without a bus split) and
+// ticks the invalid-write counter unconditionally so the
+// counter-confirmed-validation test pattern has something to
+// observe before the real kernel lands in slice 2. Storage is
+// not touched in this slice; the real write path replaces the
+// invalid-only tick below.
+static void process_record_buf_mono(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+
+  auto *st = std::get_if<RecordBufMonoState>(&node.state);
+  assert(st && "RecordBufMono node has non-RecordBufMono state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    g.buffer_invalid_write_count +=
+        static_cast<long long>(nframes);
+    return;
+  }
+
+  // Pass-through: forward signal_in (port 0) unchanged.
+  const auto sig_in =
+      resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const double sig_default = node.controls[1];
+
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+    out[fi] = sig_in.empty()
+                ? static_cast<float>(sig_default)
+                : sig_in[fi];
+  }
+
+  // Slice 1 leaves the buffer untouched. Every sample increments
+  // the invalid-write counter so a test can prove the kernel ran
+  // (vs. emitting a silent block that happens to match the input).
+  // Slice 2 replaces this with the real write path and the
+  // valid/invalid split.
+  g.buffer_invalid_write_count +=
+      static_cast<long long>(nframes);
+}
+
 /* Note [Execution order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Inside one instance the runtime processes nodes in storage order.
@@ -5829,6 +5951,9 @@ static inline void dispatch_node(
     break;
   case NodeKind::PlayBufMono:
     process_play_buf_mono(g, inst, i, nframes);
+    break;
+  case NodeKind::RecordBufMono:
+    process_record_buf_mono(g, inst, i, nframes);
     break;
   default:
     assert(false && "unhandled NodeKind in process_instance");
@@ -8981,6 +9106,16 @@ long long rt_graph_test_buffer_read_count(const RTGraph *g) {
 long long rt_graph_test_buffer_invalid_read_count(const RTGraph *g) {
   if (g == nullptr) return 0;
   return g->buffer_invalid_read_count;
+}
+
+long long rt_graph_test_buffer_write_count(const RTGraph *g) {
+  if (g == nullptr) return 0;
+  return g->buffer_write_count;
+}
+
+long long rt_graph_test_buffer_invalid_write_count(const RTGraph *g) {
+  if (g == nullptr) return 0;
+  return g->buffer_invalid_write_count;
 }
 
 // Set one control slot on instance 0. Mutates the *instance*, not

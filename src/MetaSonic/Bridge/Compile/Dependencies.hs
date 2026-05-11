@@ -99,15 +99,17 @@ mergeBusFootprint a b = BusFootprint
 -- | §6.C.4: resource footprint of one runtime node — the bus
 -- footprint from 'runtimeNodeFootprint' plus a buffer footprint
 -- derived from the kind + 'rnControls[0]' (the buffer ID slot,
--- where applicable). Currently only 'KPlayBufMono' contributes
--- a 'BufRead'; writer kinds land in 6.C.4's follow-up.
+-- where applicable). 'KPlayBufMono' contributes a 'BufRead' on
+-- its buffer id; 'KRecordBufMono' contributes a 'BufWrite'.
 runtimeNodeResourceFootprint :: RuntimeNode -> ResourceFootprint
 runtimeNodeResourceFootprint n =
   ResourceFootprint
     { rfBuses   = runtimeNodeFootprint n
     , rfBuffers = case (rnKind n, rnControls n) of
-        (KPlayBufMono, v : _) | Just b <- finiteBufferId v ->
-          emptyBufferFootprint { bfBufReads = S.singleton b }
+        (KPlayBufMono,   v : _) | Just b <- finiteBufferId v ->
+          emptyBufferFootprint { bfBufReads  = S.singleton b }
+        (KRecordBufMono, v : _) | Just b <- finiteBufferId v ->
+          emptyBufferFootprint { bfBufWrites = S.singleton b }
         _ -> emptyBufferFootprint
     }
   where

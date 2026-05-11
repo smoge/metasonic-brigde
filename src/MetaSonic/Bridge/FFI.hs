@@ -136,6 +136,9 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_buffer_collect_retired
   , c_rt_graph_test_buffer_read_count
   , c_rt_graph_test_buffer_invalid_read_count
+  , -- * §6.C.4 follow-up writer counters
+    c_rt_graph_test_buffer_write_count
+  , c_rt_graph_test_buffer_invalid_write_count
   , -- * §2.E lifecycle status values (mirroring rt_graph.h's InstanceStatus)
     instanceStatusLive
   , instanceStatusReleasing
@@ -1010,6 +1013,14 @@ foreign import ccall unsafe "rt_graph_test_buffer_read_count"
 
 foreign import ccall unsafe "rt_graph_test_buffer_invalid_read_count"
   c_rt_graph_test_buffer_invalid_read_count
+    :: Ptr RTGraph -> IO CLLong
+
+foreign import ccall unsafe "rt_graph_test_buffer_write_count"
+  c_rt_graph_test_buffer_write_count
+    :: Ptr RTGraph -> IO CLLong
+
+foreign import ccall unsafe "rt_graph_test_buffer_invalid_write_count"
+  c_rt_graph_test_buffer_invalid_write_count
     :: Ptr RTGraph -> IO CLLong
 
 -- (c_rt_graph_instance_read_bus was removed in the post-§2.E ABI

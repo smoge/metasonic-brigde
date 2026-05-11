@@ -658,6 +658,22 @@ long long rt_graph_test_buffer_read_count(const RTGraph *g);
 // all." Returns 0 if no block has run yet, or if g is null.
 long long rt_graph_test_buffer_invalid_read_count(const RTGraph *g);
 
+// [T:read-only] Phase §6.C.4 follow-up test surface: total number of
+// successful sample writes performed by KRecordBufMono kernels
+// since g was created. Counts one tick per kernel-per-sample.
+// Returns 0 if no block has run yet, or if g is null.
+long long rt_graph_test_buffer_write_count(const RTGraph *g);
+
+// [T:read-only] Phase §6.C.4 follow-up test surface: total number of
+// write attempts against an invalid buffer_id (out of range,
+// unallocated, retired, or past the end in one-shot mode) by
+// KRecordBufMono kernels since g was created. These writes
+// emit no mutation; the counter is the only way to
+// distinguish "kernel skipped a write because no buffer" from
+// "kernel didn't run at all." Returns 0 if no block has run
+// yet, or if g is null.
+long long rt_graph_test_buffer_invalid_write_count(const RTGraph *g);
+
 // [T:read-only] Pure introspection: returns 1 if node_kind names a kind
 // this runtime knows how to construct (i.e. it has a case in
 // rt_graph_add_node), 0 otherwise. Intended for contract tests that
