@@ -100,7 +100,15 @@ import           MetaSonic.Bridge.Templates
 import           MetaSonic.Bridge.Validate
 import qualified MetaSonic.OSC.Dispatch          as OSC
 import qualified MetaSonic.OSC.Dispatch.Internal as OSCI
+import qualified MetaSonic.OSC.Listen            as OSC
 import qualified MetaSonic.OSC.Wire              as OSC
+
+import qualified Network.Socket                  as OSCN
+import qualified Network.Socket.ByteString       as OSCNSB
+import           Data.IORef                      (modifyIORef',
+                                                  newIORef,
+                                                  readIORef)
+import           System.Timeout                  (timeout)
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
 import           MetaSonic.Types
@@ -122,6 +130,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , c1cWorkerScheduleTests
   , patternCorpusTests
   , oscWireAndDispatchTests
+  , oscListenerTests
   ]
 
 ------------------------------------------------------------
@@ -9427,3 +9436,130 @@ identifierProfileTests = testGroup "OSC-safe identifier profile"
       OSC.dispatch rs msg
         @?= Left (OSC.DiUnknownVoice (OBSC.pack "bad"))
   ]
+
+------------------------------------------------------------
+-- Phase 6.B.2b: OSC listener (bracketed UDP)
+--
+-- Four tests:
+--   1. Bracket cleanup: withOscListener returns; the listener
+--      thread and socket are torn down.
+--   2. Loopback: a UDP packet sent to the bound port reaches the
+--      SetControlFn hook with the resolved (slot, node, slot,
+--      value) tuple.
+--   3. Malformed packet: junk bytes surface as LiParseFailure
+--      via the issue hook and do not kill the listener — a
+--      subsequent valid packet still dispatches.
+--   4. Queue-full: a SetControlFn returning False surfaces as
+--      LiQueueFull via the issue hook, not as an exception.
+--
+-- Tests use port 0 (OS-assigned) so they never collide with each
+-- other or with anything bound on a fixed port. A 1-second
+-- timeout wraps the blocking takeMVars so a regression that
+-- breaks the listener hangs the test instead of running forever.
+------------------------------------------------------------
+
+oscListenerTests :: TestTree
+oscListenerTests = testGroup "Phase 6.B.2b: OSC listener (bracketed UDP)"
+  [ testCase "bracket cleanup: body return tears down listener" $ do
+      rsRef <- newIORef arpeggioFxResolveState
+      let hooks = OSC.ListenerHooks
+            { OSC.lhSetControl = \_ _ _ _ -> pure True
+            , OSC.lhOnIssue    = \_ -> pure ()
+            }
+      result <- OSC.withOscListenerHooks hooks rsRef
+                  (OSC.defaultListenerConfig 0)
+                  (\_info -> pure (42 :: Int))
+      result @?= 42
+
+  , testCase "loopback packet reaches the SetControlFn hook" $ do
+      rsRef    <- newIORef arpeggioFxResolveState
+      received <- newEmptyMVar
+      let hooks = OSC.ListenerHooks
+            { OSC.lhSetControl = \slotId nodeIx ctrlSlot val -> do
+                putMVar received (slotId, nodeIx, ctrlSlot, val)
+                pure True
+            , OSC.lhOnIssue = \_ -> pure ()
+            }
+      OSC.withOscListenerHooks hooks rsRef (OSC.defaultListenerConfig 0)
+        $ \info -> do
+            sendUdpLoopback (OSC.liBoundPort info) messageBytesFx0LpfFloat
+            mTuple <- timeout 1000000 (takeMVar received)
+            case mTuple of
+              Just (slotId, _node, ctrlSlot, val) -> do
+                slotId   @?= 1
+                ctrlSlot @?= 0
+                val      @?= 1500.0
+              Nothing ->
+                assertFailure
+                  "listener did not invoke SetControlFn within 1s"
+
+  , testCase "malformed packet surfaces as LiParseFailure; listener continues" $ do
+      rsRef  <- newIORef arpeggioFxResolveState
+      issues <- newIORef []
+      validDone <- newEmptyMVar
+      let hooks = OSC.ListenerHooks
+            { OSC.lhSetControl = \_ _ _ _ -> do
+                putMVar validDone ()
+                pure True
+            , OSC.lhOnIssue = \i -> modifyIORef' issues (i :)
+            }
+      OSC.withOscListenerHooks hooks rsRef (OSC.defaultListenerConfig 0)
+        $ \info -> do
+            -- Junk bytes: no NUL, no valid OSC structure.
+            sendUdpLoopback (OSC.liBoundPort info)
+                            (OBS.pack [0x01, 0x02, 0x03, 0x04])
+            -- Then a well-formed packet to prove the listener
+            -- survived and is still processing.
+            sendUdpLoopback (OSC.liBoundPort info) messageBytesFx0LpfFloat
+            mDone <- timeout 1000000 (takeMVar validDone)
+            case mDone of
+              Just () -> pure ()
+              Nothing ->
+                assertFailure
+                  "valid packet was not dispatched after malformed one"
+      issueList <- readIORef issues
+      assertBool ("expected at least one LiParseFailure issue, got: "
+                  <> show issueList)
+                 (any isParseFailure issueList)
+
+  , testCase "queue-full surfaces as LiQueueFull, not an exception" $ do
+      rsRef  <- newIORef arpeggioFxResolveState
+      issues <- newEmptyMVar
+      let hooks = OSC.ListenerHooks
+            { OSC.lhSetControl = \_ _ _ _ -> pure False
+              -- ^ pretend the realtime queue is always full
+            , OSC.lhOnIssue    = putMVar issues
+            }
+      OSC.withOscListenerHooks hooks rsRef (OSC.defaultListenerConfig 0)
+        $ \info -> do
+            sendUdpLoopback (OSC.liBoundPort info) messageBytesFx0LpfFloat
+            mIssue <- timeout 1000000 (takeMVar issues)
+            case mIssue of
+              Just (OSC.LiQueueFull 1 _ 0) -> pure ()
+              other ->
+                assertFailure $
+                  "expected LiQueueFull, got: " <> show other
+  ]
+  where
+    isParseFailure (OSC.LiParseFailure _) = True
+    isParseFailure _                      = False
+
+-- | Send a UDP datagram to a loopback port. Used by the listener
+-- tests as the OSC client side. Opens, sends, closes — no
+-- response handling.
+sendUdpLoopback :: Int -> OBS.ByteString -> IO ()
+sendUdpLoopback port payload = do
+  let hints = OSCN.defaultHints
+        { OSCN.addrSocketType = OSCN.Datagram
+        , OSCN.addrFamily     = OSCN.AF_INET
+        }
+  addrs <- OSCN.getAddrInfo (Just hints) (Just "127.0.0.1")
+                            (Just (show port))
+  case addrs of
+    []         -> error "sendUdpLoopback: no resolved address"
+    (addr : _) -> do
+      sock <- OSCN.socket (OSCN.addrFamily addr)
+                          (OSCN.addrSocketType addr)
+                          (OSCN.addrProtocol addr)
+      _    <- OSCNSB.sendTo sock payload (OSCN.addrAddress addr)
+      OSCN.close sock

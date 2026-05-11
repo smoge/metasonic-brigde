@@ -13,6 +13,7 @@ dependencies:
   - containers
   - mtl
   - deepseq
+  - network
   # Terminal UI Inspector:
   - brick
   - vty
@@ -49,6 +50,7 @@ library:
     - MetaSonic.OSC.Wire
     - MetaSonic.OSC.Dispatch
     - MetaSonic.OSC.Dispatch.Internal
+    - MetaSonic.OSC.Listen
     - MetaSonic.Pattern
     - MetaSonic.Pattern.Corpus
     - MetaSonic.Visualize.Trace
