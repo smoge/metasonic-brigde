@@ -45,6 +45,7 @@ library:
     - MetaSonic.Bridge.Compile.Schedule
     - MetaSonic.Bridge.Compile.EdgeRates
     - MetaSonic.Bridge.Templates
+    - MetaSonic.Bridge.Buffer
     - MetaSonic.Bridge.FFI
     - MetaSonic.Bridge.MidiDemo
     - MetaSonic.OSC.Wire

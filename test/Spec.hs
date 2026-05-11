@@ -82,6 +82,8 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_test_template_schedule_step_item_count,
                                             c_rt_graph_test_template_schedule_step_kind,
                                             c_rt_graph_test_template_schedule_step_region,
+                                            c_rt_graph_test_buffer_read_count,
+                                            c_rt_graph_test_buffer_invalid_read_count,
                                             instanceStatusLive,
                                             instanceStatusReleasing,
                                             collectRetiredSwapStats,
@@ -95,6 +97,8 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             loadTemplateGraph,
                                             loadTemplateGraphFused,
                                             withRTGraph)
+import           MetaSonic.Bridge.Buffer   (BufferIssue (..), allocBuffer,
+                                            clearBuffer, loadBuffer)
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
@@ -134,6 +138,8 @@ main = defaultMain $ testGroup "MetaSonic"
   , oscListenerTests
   , oscEndToEndTests
   , oscPortParserTests
+  , bufferPoolTests
+  , playBufMonoTests
   ]
 
 ------------------------------------------------------------
@@ -9727,3 +9733,236 @@ oscPortParserTests = testGroup "Phase 6.B.4: --osc-listen port parser"
   , testCase "rejects negative" $
       OSC.parseListenerPort "-7000" @?= Nothing
   ]
+
+------------------------------------------------------------
+-- Phase 6.C.3a: buffer pool wrapper tests
+--
+-- Exercises MetaSonic.Bridge.Buffer (alloc / load / clear)
+-- against the C++ buffer pool ABI. No kernel involvement —
+-- these tests verify the FFI return codes are translated to
+-- BufferIssue exceptions correctly.
+------------------------------------------------------------
+
+bufferPoolTests :: TestTree
+bufferPoolTests = testGroup "Phase 6.C.3a: buffer pool wrapper"
+  [ testCase "alloc returns ID 0 on a fresh graph" $
+      withRTGraph 16 256 $ \rt -> do
+        buf <- allocBuffer rt 256
+        bufferId buf @?= 0
+
+  , testCase "alloc twice returns IDs 0 and 1" $
+      withRTGraph 16 256 $ \rt -> do
+        b0 <- allocBuffer rt 256
+        b1 <- allocBuffer rt 256
+        (bufferId b0, bufferId b1) @?= (0, 1)
+
+  , testCase "alloc past pool capacity raises BiPoolFull" $
+      withRTGraph 16 256 $ \rt -> do
+        -- The pool is 64 wide. Filling it exactly should succeed;
+        -- the 65th call must throw BiPoolFull.
+        forM_ [0 .. 63 :: Int] $ \_ -> allocBuffer rt 1
+        result <- try (allocBuffer rt 1)
+        case result of
+          Left BiPoolFull -> pure ()
+          Left e          -> assertFailure $
+            "expected BiPoolFull, got " <> show e
+          Right b         -> assertFailure $
+            "expected BiPoolFull, got Buffer " <> show (bufferId b)
+
+  , testCase "loadBuffer rejects an unallocated ID" $
+      withRTGraph 16 256 $ \rt -> do
+        -- Construct a Buffer handle that has never been allocated.
+        let fake = Buffer 99
+        result <- try (loadBuffer rt fake [1.0, 2.0, 3.0])
+        case result of
+          Left (BiUnknownBufferId i) -> i @?= 99
+          Left e                     -> assertFailure $
+            "expected BiUnknownBufferId 99, got " <> show e
+          Right _                    -> assertFailure
+            "expected BiUnknownBufferId, got success"
+
+  , testCase "loadBuffer rejects frame_count exceeding capacity" $
+      withRTGraph 16 256 $ \rt -> do
+        buf <- allocBuffer rt 4
+        result <- try (loadBuffer rt buf [1, 2, 3, 4, 5, 6])
+        case result of
+          Left (BiFrameCountExceedsBuffer _ _) -> pure ()
+          Left e                               -> assertFailure $
+            "expected BiFrameCountExceedsBuffer, got " <> show e
+          Right ()                             -> assertFailure
+            "expected BiFrameCountExceedsBuffer, got success"
+
+  , testCase "clear-then-load reports BiUnknownBufferId" $
+      withRTGraph 16 256 $ \rt -> do
+        buf <- allocBuffer rt 4
+        clearBuffer rt buf
+        result <- try (loadBuffer rt buf [1, 2, 3])
+        case result of
+          Left (BiUnknownBufferId i) -> i @?= bufferId buf
+          Left e                     -> assertFailure $
+            "expected BiUnknownBufferId, got " <> show e
+          Right _                    -> assertFailure
+            "expected BiUnknownBufferId, got success"
+
+  , testCase "clearBuffer on unallocated ID raises BiUnknownBufferId" $
+      withRTGraph 16 256 $ \rt -> do
+        result <- try (clearBuffer rt (Buffer 5))
+        case result of
+          Left (BiUnknownBufferId i) -> i @?= 5
+          Left e                     -> assertFailure $
+            "expected BiUnknownBufferId 5, got " <> show e
+          Right _                    -> assertFailure
+            "expected BiUnknownBufferId, got success"
+
+  , testCase "alloc, clear, then alloc again reuses ID 0" $
+      withRTGraph 16 256 $ \rt -> do
+        b0 <- allocBuffer rt 64
+        clearBuffer rt b0
+        b1 <- allocBuffer rt 64
+        bufferId b1 @?= 0
+  ]
+
+------------------------------------------------------------
+-- Phase 6.C.3a: PlayBufMono end-to-end tests
+--
+-- Drives the real audio kernel against a loaded buffer:
+-- load known samples, build playBufMono -> out, render one
+-- block, assert bus-0 matches the loaded samples within
+-- linear-interpolation tolerance, and counter-confirm that
+-- the kernel actually read the buffer (rather than emitting
+-- silent zeros that happened to match).
+------------------------------------------------------------
+
+playBufMonoTests :: TestTree
+playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
+  [ testCase "loads a 256-frame table and plays it forward" $ do
+      let nframes  = 256
+          sizeOfF :: Int
+          sizeOfF = 4
+          -- A 256-sample sine table. The kernel reads at rate=1.0
+          -- starting at frame 0, so bus-0 should reproduce the
+          -- table exactly (linear-interpolation between adjacent
+          -- equal samples — rate=1.0 — is a no-op).
+          table =
+            [ sin (2 * pi * fromIntegral (i :: Int) / 256)
+            | i <- [0 .. nframes - 1]
+            ]
+          graph = runSynthWithBuffer 0 $ \buf -> do
+            s <- playBufMono buf (Param 1.0) (Param 0) (Param 0)
+            out 0 s
+
+      tg <- case compileTemplateGraph [("default", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        -- loadTemplateGraph internally clears RTGraphState (same as
+        -- bus pool ensure-after-load), so allocate the buffer after
+        -- the template load and before the first process call.
+        loadTemplateGraph rt tg
+        buf <- allocBuffer rt nframes
+        loadBuffer rt buf table
+        bufferId buf @?= 0
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        readCount    <- c_rt_graph_test_buffer_read_count    rt
+        invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
+        -- Counter-confirmed validation: the kernel must have
+        -- read every output sample from the buffer. Without
+        -- this assertion an all-zeros output would pass the
+        -- value comparison below (every sample of the sine
+        -- table near the zero crossing is small).
+        readCount    @?= fromIntegral nframes
+        invalidCount @?= 0
+
+        allocaBytes (nframes * sizeOfF) $ \buf' -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr buf')
+          rendered <- peekArray nframes (buf' :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+          assertBool
+            ("rendered output should match the loaded sine table "
+             <> "to within 1e-5 tolerance")
+            (all (\(a, b) -> abs (a - b) < 1.0e-5)
+                 (zip rcvs (map realToFrac table)))
+
+  , testCase "unallocated buffer ID emits zeros + increments invalid-read counter" $ do
+      let nframes  = 128
+          sizeOfF :: Int
+          sizeOfF = 4
+          -- Reference Buffer 99 — well past the allocated set.
+          graph = runSynth $ do
+            s <- playBufMono (Buffer 99) (Param 1.0) (Param 0) (Param 0)
+            out 0 s
+
+      tg <- case compileTemplateGraph [("default", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        readCount    <- c_rt_graph_test_buffer_read_count    rt
+        invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
+        readCount    @?= 0
+        invalidCount @?= fromIntegral nframes
+
+        allocaBytes (nframes * sizeOfF) $ \bufPtr -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bufPtr)
+          rendered <- peekArray nframes (bufPtr :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+          assertBool
+            "unallocated ID must emit silence"
+            (all (== 0.0) rcvs)
+
+  , testCase "clear-then-render emits zeros + increments invalid-read counter" $ do
+      let nframes  = 64
+          sizeOfF :: Int
+          sizeOfF = 4
+          -- Allocate, load, clear *before* loading the graph so
+          -- the configured control-0 value points at a cleared
+          -- buffer ID. The kernel hits the invalid-read path.
+          table = replicate nframes 0.5
+          graphAt buf = runSynth $ do
+            s <- playBufMono buf (Param 1.0) (Param 0) (Param 0)
+            out 0 s
+
+      withRTGraph 16 nframes $ \rt -> do
+        buf <- allocBuffer rt nframes
+        loadBuffer  rt buf table
+        clearBuffer rt buf
+
+        tg <- case compileTemplateGraph [("default", graphAt buf)] of
+          Right t  -> pure t
+          Left err -> assertFailure err >> error "unreachable"
+
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        readCount    <- c_rt_graph_test_buffer_read_count    rt
+        invalidCount <- c_rt_graph_test_buffer_invalid_read_count rt
+        readCount    @?= 0
+        invalidCount @?= fromIntegral nframes
+
+        allocaBytes (nframes * sizeOfF) $ \bufPtr -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bufPtr)
+          rendered <- peekArray nframes (bufPtr :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+          assertBool
+            "cleared buffer must emit silence"
+            (all (== 0.0) rcvs)
+  ]
+
+-- | Test helper: allocate a Buffer (without an RTGraph available)
+-- so that the SynthM closure in the test reads identically to
+-- the producer-side flow. The actual allocation happens at test
+-- time; this just hands the test a stable id.
+runSynthWithBuffer :: Int -> (Buffer -> SynthM ()) -> SynthGraph
+runSynthWithBuffer bid k = runSynth (k (Buffer bid))

@@ -56,6 +56,8 @@ module MetaSonic.Types
     NodeIndex (..)
   , PortIndex (..)
   , ControlIndex (..)
+  , -- * Buffer identity (§6.C)
+    Buffer (..)
   , -- * Node classification
     NodeKind (..)
   , kindTag
@@ -158,6 +160,20 @@ newtype ControlIndex = ControlIndex Int
   deriving stock   (Eq, Ord, Show, Generic)
   deriving newtype (NFData)
 
+-- | Identifies one slot in the runtime's mono-float32 buffer
+-- pool (§6.C). The producer allocates buffers via
+-- 'MetaSonic.Bridge.Buffer.allocBuffer'; the resulting
+-- 'Buffer' is passed to 'PlayBufMono' and crosses the FFI as
+-- a plain integer index. Pure identity, no IO — kept in
+-- this module to keep the import graph acyclic (the
+-- 'Source.PlayBufMono' constructor carries a 'Buffer', and
+-- the IO wrapper in 'MetaSonic.Bridge.Buffer' imports both
+-- 'Source' (via the UGen) and the FFI module, so a
+-- 'Buffer'-in-'Buffer' module would close the cycle).
+newtype Buffer = Buffer { bufferId :: Int }
+  deriving stock   (Eq, Ord, Show, Generic)
+  deriving newtype (NFData)
+
 -- | Note: tag 4 was reserved for a generic biquad family but is
 -- intentionally unallocated. The Haskell→C++ contract test
 -- (see Spec.hs) iterates [minBound..maxBound] via the derived
@@ -233,6 +249,20 @@ data NodeKind
     -- 'KLPF': @[signal, cutoff, q]@. Useful for hum removal and
     -- spectral notching. Cutoff and q are read once per block, like
     -- the rest of the biquad family.
+  | KPlayBufMono
+    -- ^ Mono float32 buffer playback (§6.C.3a). Reads a producer-
+    -- allocated buffer (resolved via control slot 0,
+    -- @buffer_id@) at a configurable @rate@, advancing a per-
+    -- instance playhead by @rate@ frames per sample with linear
+    -- interpolation. Audio inputs in declared order:
+    -- @[rate, start_frame, loop_flag]@. Controls
+    -- @[buffer_id, rate_default, start_frame_default,
+    -- loop_default]@. @start_frame@ is consumed only at instance
+    -- reset (via @rnControls[2]@), so an 'RFrom' wired to that
+    -- port is silently dropped — see 'PortIgnored'. @loop_flag@
+    -- 0 = one-shot (silence after last frame),
+    -- @>= 0.5@ = loop back to @start_frame@. See
+    -- Note [Buffer pool] in @tinysynth/rt_graph.cpp@.
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -386,6 +416,14 @@ kindSpec = \case
   KHPF          -> KindSpec 17 SampleRate  3 2 "hpf"
   KBPF          -> KindSpec 18 SampleRate  3 2 "bpf"
   KNotch        -> KindSpec 19 SampleRate  3 2 "notch"
+  -- Buffer playback: producer-allocated mono float32 buffer
+  -- pool, audio-thread reads with linear interpolation. 3
+  -- audio inputs (rate, start_frame, loop_flag), 4 controls
+  -- [buffer_id, rate_default, start_frame_default,
+  -- loop_default]. SampleRate floor because the kernel reads
+  -- once per output sample and the playhead advances per
+  -- sample.
+  KPlayBufMono  -> KindSpec 20 SampleRate  3 4 "playBufMono"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to
@@ -621,6 +659,19 @@ portInfo k (PortIndex i) = case k of
     _ -> Nothing
   KSmooth       -> case i of
     0 -> Just (PortInfo PortSampleAccurate "target")
+    _ -> Nothing
+  KPlayBufMono  -> case i of
+    -- Rate: read every sample (the kernel advances the
+    -- playhead by 'rate' per output sample).
+    0 -> Just (PortInfo PortSampleAccurate "rate")
+    -- start_frame: consumed once at instance reset via
+    -- rnControls[2]; never resolved in the audio loop. Same
+    -- precedent as oscillator 'phase' (KPulseOsc port 1).
+    -- An RFrom wired here is silently dropped.
+    1 -> Just (PortInfo PortIgnored        "start_frame")
+    -- loop_flag: checked at the playback-position boundary
+    -- every sample so live toggling on/off works.
+    2 -> Just (PortInfo PortSampleAccurate "loop_flag")
     _ -> Nothing
   where
     -- Oscillator family: port 0 = freq (sample-accurate FM when

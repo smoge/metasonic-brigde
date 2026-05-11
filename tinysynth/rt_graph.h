@@ -582,6 +582,51 @@ int rt_graph_wait_started(RTGraph *g, int timeout_ms);
 // audio thread before returning.
 void rt_graph_stop_audio(RTGraph *g);
 
+// [T:construction] Phase §6.C.3a: allocate a mono float32 buffer of
+// `frames` samples. Returns the assigned 0-based buffer ID on
+// success, or -1 if the pool is full (>= 64 allocated). The
+// underlying storage is zero-initialised; load samples in with
+// rt_graph_buffer_load_f32. `frames` must be >= 0; negative values
+// are rejected with -1. Construction-only: must run before
+// rt_graph_start_audio.
+int rt_graph_buffer_alloc(RTGraph *g, int frames);
+
+// [T:construction] Phase §6.C.3a: copy `frame_count` float32 samples
+// from `samples` into buffer `buffer_id`, starting at frame 0.
+// Returns the number of frames written, or:
+//   -1 if buffer_id is out of range or unallocated,
+//   -2 if frame_count > the buffer's allocated frame count,
+//   -1 if samples is null and frame_count > 0.
+// Construction-only: must run before rt_graph_start_audio.
+int rt_graph_buffer_load_f32(
+    RTGraph *g,
+    int buffer_id,
+    const float *samples,
+    int frame_count);
+
+// [T:construction] Phase §6.C.3a: mark `buffer_id` unallocated. The
+// underlying storage capacity is preserved for reuse. UNSAFE to
+// call while audio is running — the audio thread may still be
+// reading from this slot. §6.C.3a documents this as a
+// construction / stopped-audio operation; live retire/collect
+// lands in §6.C.3b. Returns 0 on success, -1 if buffer_id is out
+// of range or already unallocated.
+int rt_graph_buffer_clear(RTGraph *g, int buffer_id);
+
+// [T:read-only] Phase §6.C.3a test surface: total number of
+// successful sample reads performed by KPlayBufMono kernels since
+// g was created. Counts one tick per kernel-per-sample (not
+// per-block). Returns 0 if no block has run yet, or if g is null.
+long long rt_graph_test_buffer_read_count(const RTGraph *g);
+
+// [T:read-only] Phase §6.C.3a test surface: total number of reads
+// against an invalid buffer_id (out of range or unallocated) by
+// KPlayBufMono kernels since g was created. These reads emit
+// zeros; the counter is the only way to distinguish "kernel
+// emitted zeros because no buffer" from "kernel didn't run at
+// all." Returns 0 if no block has run yet, or if g is null.
+long long rt_graph_test_buffer_invalid_read_count(const RTGraph *g);
+
 // [T:read-only] Pure introspection: returns 1 if node_kind names a kind
 // this runtime knows how to construct (i.e. it has a case in
 // rt_graph_add_node), 0 otherwise. Intended for contract tests that

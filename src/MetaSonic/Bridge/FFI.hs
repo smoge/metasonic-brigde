@@ -126,6 +126,12 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_realtime_release
   , c_rt_graph_realtime_remove
   , c_rt_graph_realtime_set_control
+  , -- * §6.C.3a buffer pool ABI
+    c_rt_graph_buffer_alloc
+  , c_rt_graph_buffer_load_f32
+  , c_rt_graph_buffer_clear
+  , c_rt_graph_test_buffer_read_count
+  , c_rt_graph_test_buffer_invalid_read_count
   , -- * §2.E lifecycle status values (mirroring rt_graph.h's InstanceStatus)
     instanceStatusLive
   , instanceStatusReleasing
@@ -964,6 +970,30 @@ foreign import ccall unsafe "rt_graph_realtime_remove"
 foreign import ccall unsafe "rt_graph_realtime_set_control"
   c_rt_graph_realtime_set_control
     :: Ptr RTGraph -> CInt -> CInt -> CInt -> CDouble -> IO CInt
+
+-- §6.C.3a buffer pool ABI. None of these are safe to call while
+-- audio is running — load may reallocate, clear drops the
+-- allocated bit out from under a live read. §6.C.3b adds the
+-- live-safe retire/collect pair.
+foreign import ccall unsafe "rt_graph_buffer_alloc"
+  c_rt_graph_buffer_alloc
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_buffer_load_f32"
+  c_rt_graph_buffer_load_f32
+    :: Ptr RTGraph -> CInt -> Ptr CFloat -> CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_buffer_clear"
+  c_rt_graph_buffer_clear
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+foreign import ccall unsafe "rt_graph_test_buffer_read_count"
+  c_rt_graph_test_buffer_read_count
+    :: Ptr RTGraph -> IO CLLong
+
+foreign import ccall unsafe "rt_graph_test_buffer_invalid_read_count"
+  c_rt_graph_test_buffer_invalid_read_count
+    :: Ptr RTGraph -> IO CLLong
 
 -- (c_rt_graph_instance_read_bus was removed in the post-§2.E ABI
 -- cleanup. The C entry was a thin liveness-gated alias for

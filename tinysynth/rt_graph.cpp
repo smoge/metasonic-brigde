@@ -385,6 +385,7 @@ enum class NodeKind : int {
   HPF          = 17,
   BPF          = 18,
   Notch        = 19,
+  PlayBufMono  = 20,
 };
 
 // Sink-terminal classifier. Both 'Out' and 'BusOut' are pure sinks
@@ -424,6 +425,7 @@ kind_from_tag(int node_kind) noexcept {
   case 17: return NodeKind::HPF;
   case 18: return NodeKind::BPF;
   case 19: return NodeKind::Notch;
+  case 20: return NodeKind::PlayBufMono;
   default: return std::nullopt;
   }
 }
@@ -645,12 +647,35 @@ struct SmoothState {
   float  last_sps       = -1.0f;
 };
 
+/* Note [Per-node PlayBufMono state]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Phase 6.C.3a. The playhead position is a floating-point frame index
+into the resolved buffer; linear interpolation reads samples at
+floor(pos) and floor(pos) + 1 and blends by the fractional part.
+
+Initialised from controls[2] (start_frame) at instance reset
+(configure_node). Advances by controls[1] (rate) per output sample
+unless control 1 is wired to an audio source, in which case it
+advances by the per-sample audio value. Negative effective rate is
+clamped to 0 in 6.C.3a; reverse playback is reserved for a future
+sub-phase.
+
+Per-instance state, no shared resource — the *buffer* is shared,
+but each kernel owns its own playhead. The Eff annotation on the
+Haskell side is 'BufRead n', which crosses the FFI as a runtime
+resolution against the world's mono buffer pool; it does not induce
+template precedence in §6.C.3a (read-only).
+*/
+struct PlayBufMonoState {
+  double playhead_pos = 0.0;
+};
+
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.
 using NodeState =
     std::variant<std::monostate, OscState, NoiseGenState, LPFState, EnvState,
                  DelayState, SmoothState, PulseOscState,
-                 HPFState, BPFState, NotchState>;
+                 HPFState, BPFState, NotchState, PlayBufMonoState>;
 
 constexpr int kMigrationKeyMaxBytes = 16;
 
@@ -1279,6 +1304,20 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.default_controls = {1000.0, 0.707};
     spec.input_refs.resize(3);            // [signal_in, freq_in, q_in]
     break;
+
+  case NodeKind::PlayBufMono:
+    // Mono float32 buffer playback (§6.C.3a). Four controls
+    // [buffer_id, rate_default, start_frame_default, loop_default];
+    // three audio inputs [rate_in, start_frame_in, loop_flag_in].
+    // start_frame is consumed only at instance reset via
+    // controls[2]; the audio loop never resolves port 1
+    // (PortIgnored — same as oscillator phase). buffer_id is
+    // a runtime resolution against the world's mono buffer
+    // pool — a value of -1 (or any out-of-range index) emits
+    // zeros and increments the invalid-read counter.
+    spec.default_controls = {-1.0, 1.0, 0.0, 0.0};
+    spec.input_refs.resize(3); // [rate_in, start_frame_in, loop_flag_in]
+    break;
   }
 
   // Step C (d): fused_inputs is parallel to input_refs. Sizing it
@@ -1362,6 +1401,21 @@ static void init_node_state(NodeInstanceState &node, const NodeSpec &spec, int m
     target_outputs = 1;
     node.state = NotchState{};
     break;
+
+  case NodeKind::PlayBufMono: {
+    // §6.C.3a. Playhead is seeded from controls[2] (start_frame)
+    // at instance reset so the kernel starts at the producer-
+    // specified frame; subsequent reads of port 1 are dropped
+    // (PortIgnored). controls[2] is sanitized to a non-negative
+    // finite double here; the kernel re-clamps against the
+    // resolved buffer's frame count on each read.
+    double start =
+        spec.default_controls.size() > 2 ? spec.default_controls[2] : 0.0;
+    if (!std::isfinite(start) || start < 0.0) start = 0.0;
+    target_outputs = 1;
+    node.state = PlayBufMonoState{start};
+    break;
+  }
 
   case NodeKind::Gain:
   case NodeKind::Add:
@@ -2084,6 +2138,21 @@ private:
 // at a block boundary. RTGraph keeps handle-owned resources (audio
 // stream, realtime queue, worker pool, sample rate, max_frames,
 // switches, and counters) outside this object.
+// Phase §6.C.3a: mono float32 buffer pool slot. Each slot carries
+// the producer-owned sample storage and a guard bit; the audio thread
+// reads through these on each PlayBufMono kernel call. Producer-only
+// mutation (allocBuffer / loadBuffer / clearBuffer); the audio
+// thread never resizes `samples`.
+struct BufferSlot {
+  std::vector<float> samples;
+  bool allocated = false;
+};
+
+// Phase §6.C.3a: maximum number of mono buffers a world can hold.
+// Fixed-size array on RTGraphState — same shape as the bus-pool cap
+// convention. Q-1 settled this in the 6.C.2 contract.
+constexpr int kMaxBuffers = 64;
+
 struct RTGraphState {
   // §2.D.3: vector of MetaDefs (templates). Index i is template_id i,
   // and the iteration order in process_graph is i ascending — i.e.
@@ -2109,6 +2178,17 @@ struct RTGraphState {
   int global_schedule_writer_slot_count = 0;
   std::vector<RegionLayerWorkItem> region_layer_work_items;
   std::vector<GlobalScheduleBand> global_schedule_bands;
+
+  // Phase §6.C.3a: mono buffer pool + per-block read counters. The
+  // pool is producer-allocated through rt_graph_buffer_alloc /
+  // _load_f32 / _clear; the kernel reads through `samples.data()`
+  // unconditionally. The two counters are diagnostic-only
+  // (rt_graph_test_buffer_read_count /
+  // rt_graph_test_buffer_invalid_read_count) — they tick per sample,
+  // so they're long long to leave headroom for multi-block tests.
+  std::array<BufferSlot, kMaxBuffers> buffers{};
+  long long buffer_read_count = 0;
+  long long buffer_invalid_read_count = 0;
 };
 
 enum class MigrationSkipReason : int {
@@ -2309,6 +2389,12 @@ node_kind_supports_state_migration(NodeKind kind) noexcept {
   case NodeKind::Env:
   case NodeKind::Delay:
   case NodeKind::Smooth:
+  case NodeKind::PlayBufMono:
+    // PlayBufMono state ties a per-instance playhead to a
+    // specific buffer ID + start_frame; carrying it across a
+    // hot-swap is not safe in §6.C.3a (the new graph may
+    // reference a different buffer / different start). §6.C.3b
+    // will revisit buffer survival across hot-swap.
     return false;
 
   case NodeKind::SinOsc:
@@ -2488,6 +2574,7 @@ enum class StateMigrationResult {
   case NodeKind::Env:
   case NodeKind::Delay:
   case NodeKind::Smooth:
+  case NodeKind::PlayBufMono:
     return StateMigrationResult::Unsupported;
   }
   return StateMigrationResult::Unsupported;
@@ -4291,6 +4378,171 @@ static void process_smooth(const RTGraph &g, GraphInstance &inst,
   }
 }
 
+/* Note [Buffer pool]
+~~~~~~~~~~~~~~~~~~~~~
+Phase §6.C.3a. The runtime carries a fixed-size pool of mono float32
+buffers on RTGraphState (`buffers`, sized kMaxBuffers = 64). The
+producer mutates the pool through three C entry points:
+
+  * rt_graph_buffer_alloc      — find an unused slot, size its
+                                 sample vector, mark allocated;
+                                 returns the slot index.
+  * rt_graph_buffer_load_f32   — copy producer samples into a slot.
+  * rt_graph_buffer_clear      — mark slot unallocated (the sample
+                                 vector is *not* freed in v1 —
+                                 capacity is kept for reuse). Doc'd
+                                 stopped-audio-only; live-safe
+                                 retire/collect lands in §6.C.3b.
+
+The audio thread reads through `samples.data()` and `samples.size()`;
+it never resizes. PlayBufMono kernels resolve their buffer ID at the
+start of each block from controls[0] and emit zeros + tick the
+invalid-read counter if the slot is unallocated or out of range. The
+read counter ticks per valid sample. Both counters live on
+RTGraphState and are observable through the rt_graph_test_buffer_*
+test surface.
+
+§6.C.3a is read-only — there is no audio-thread write path, no
+BufWrite UGen, and no precedence extension for BufRead (a BufRead
+alone induces no template ordering). §6.C.3b will revisit live-safe
+free; §6.C.4+ may add write kinds and the corresponding
+ResourceFootprint precedence layer.
+*/
+
+// §6.C.3a kernel. Resolves the buffer ID from controls[0],
+// advances a per-instance playhead by `rate` per output sample
+// (read from controls[1] / port 0; clamped to [0, ∞)), reads
+// samples with linear interpolation, and either loops back to
+// `start_frame` (controls[2]) or goes silent past the last frame
+// based on `loop_flag` (controls[3] / port 2). Ticks
+// buffer_read_count per valid sample; ticks
+// buffer_invalid_read_count + emits zero per sample when the
+// buffer ID does not resolve or the buffer is empty.
+//
+// Note: port 1 (start_frame) is PortIgnored on the Haskell side —
+// the kernel never resolves it in the audio loop; start_frame is
+// consumed once from controls[2] at instance reset via
+// init_node_state.
+static void process_play_buf_mono(
+    RTGraph &g, GraphInstance &inst,
+    std::size_t node_idx, int nframes) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+
+  auto *st = std::get_if<PlayBufMonoState>(&node.state);
+  assert(st && "PlayBufMono node has non-PlayBufMono state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    world(g).buffer_invalid_read_count +=
+        static_cast<long long>(nframes);
+    return;
+  }
+
+  // Resolve the buffer ID once per block. controls[0] is a double
+  // because the C ABI is uniform across kinds; round to int and
+  // bounds-check against the pool size. -1 (the configure_spec
+  // sentinel) and any out-of-range value land in the invalid path.
+  const double bid_raw = node.controls[0];
+  const int bid =
+      std::isfinite(bid_raw)
+          ? static_cast<int>(std::lround(bid_raw))
+          : -1;
+  const bool bid_in_range = (bid >= 0 && bid < kMaxBuffers);
+
+  // Borrow a const reference to the resolved slot; nullptr means
+  // "invalid ID, take the fast zero path."
+  const BufferSlot *slot = nullptr;
+  if (bid_in_range) {
+    const auto &candidate =
+        world(g).buffers[static_cast<std::size_t>(bid)];
+    if (candidate.allocated && !candidate.samples.empty()) {
+      slot = &candidate;
+    }
+  }
+
+  if (slot == nullptr) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    world(g).buffer_invalid_read_count +=
+        static_cast<long long>(nframes);
+    return;
+  }
+
+  const auto rate_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const auto loop_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
+
+  const double rate_default      = node.controls[1];
+  const double start_frame       = node.controls[2];
+  const double loop_default      = node.controls[3];
+
+  const double frame_count_d =
+      static_cast<double>(slot->samples.size());
+  // q::delay-style read: read floor(pos) and floor(pos)+1, blend
+  // by the fractional part. Wrap to the start_frame when looping
+  // past the last frame; one-shot mode goes silent.
+  const float *samples = slot->samples.data();
+  double pos = st->playhead_pos;
+  // Sanitize the seeded playhead: a producer-set start_frame >=
+  // frame_count is treated as "one frame past the buffer" so the
+  // first sample emits zero rather than out-of-bounds-reads.
+  if (!std::isfinite(pos) || pos < 0.0) pos = 0.0;
+
+  long long valid_samples = 0;
+  long long invalid_samples = 0;
+
+  for (int i = 0; i < nframes; ++i) {
+    const std::size_t fi = static_cast<std::size_t>(i);
+
+    const double rate_raw =
+        rate_in.empty() ? rate_default
+                        : static_cast<double>(rate_in[fi]);
+    // Negative rate is reserved for future reverse playback; 6.C.3a
+    // clamps to zero. NaN / non-finite values fall through to 0 too
+    // so the playhead never poisons itself.
+    const double rate =
+        (std::isfinite(rate_raw) && rate_raw > 0.0) ? rate_raw : 0.0;
+
+    const double loop_raw =
+        loop_in.empty() ? loop_default
+                        : static_cast<double>(loop_in[fi]);
+    const bool looping = std::isfinite(loop_raw) && loop_raw >= 0.5;
+
+    // Compute the read result before advancing so a playhead at
+    // exactly frame_count yields silence (one-shot) or wraps
+    // (looping) on the same sample, not the next.
+    if (pos >= frame_count_d) {
+      if (looping) {
+        double seed =
+            std::isfinite(start_frame) && start_frame >= 0.0
+                ? start_frame : 0.0;
+        if (seed >= frame_count_d) seed = 0.0;
+        pos = seed;
+      } else {
+        out[fi] = 0.0f;
+        ++invalid_samples;
+        pos += rate;
+        continue;
+      }
+    }
+
+    const double floor_pos = std::floor(pos);
+    const std::size_t idx0 =
+        static_cast<std::size_t>(floor_pos);
+    const std::size_t idx1 =
+        (idx0 + 1 < slot->samples.size()) ? idx0 + 1 : idx0;
+    const float s0 = samples[idx0];
+    const float s1 = samples[idx1];
+    const float frac = static_cast<float>(pos - floor_pos);
+    out[fi] = s0 + frac * (s1 - s0);
+    ++valid_samples;
+
+    pos += rate;
+  }
+
+  st->playhead_pos = pos;
+  world(g).buffer_read_count         += valid_samples;
+  world(g).buffer_invalid_read_count += invalid_samples;
+}
+
 /* Note [Execution order]
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Inside one instance the runtime processes nodes in storage order.
@@ -5468,6 +5720,9 @@ static inline void dispatch_node(
     break;
   case NodeKind::Notch:
     process_notch(g, inst, i, nframes);
+    break;
+  case NodeKind::PlayBufMono:
+    process_play_buf_mono(g, inst, i, nframes);
     break;
   default:
     assert(false && "unhandled NodeKind in process_instance");
@@ -8458,6 +8713,67 @@ where someone adds a NodeKind in Haskell without updating C++.
 
 int rt_graph_kind_supported(int node_kind) {
   return kind_from_tag(node_kind).has_value() ? 1 : 0;
+}
+
+// Phase §6.C.3a: producer-side buffer pool. The audio thread reads
+// through `samples.data()` / `samples.size()` on each PlayBufMono
+// kernel call; these three entry points are the only writers. None
+// is safe to call while audio is running (the alloc/load path may
+// reallocate; the clear path drops the allocated bit out from
+// underneath a live read). The realtime helpers in §6.C.3b will
+// add the retire/collect pair for live-safe free.
+int rt_graph_buffer_alloc(RTGraph *g, int frames) {
+  if (g == nullptr) return -1;
+  if (frames < 0) return -1;
+  auto &buffers = world(*g).buffers;
+  for (int id = 0; id < static_cast<int>(buffers.size()); ++id) {
+    auto &slot = buffers[static_cast<std::size_t>(id)];
+    if (slot.allocated) continue;
+    slot.samples.assign(static_cast<std::size_t>(frames), 0.0f);
+    slot.allocated = true;
+    return id;
+  }
+  return -1;
+}
+
+int rt_graph_buffer_load_f32(
+    RTGraph *g, int buffer_id, const float *samples, int frame_count
+) {
+  if (g == nullptr) return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
+  if (frame_count < 0) return -1;
+  if (frame_count > 0 && samples == nullptr) return -1;
+  auto &slot = world(*g).buffers[static_cast<std::size_t>(buffer_id)];
+  if (!slot.allocated) return -1;
+  if (static_cast<std::size_t>(frame_count) > slot.samples.size()) {
+    return -2;
+  }
+  std::copy(samples, samples + frame_count, slot.samples.begin());
+  return frame_count;
+}
+
+int rt_graph_buffer_clear(RTGraph *g, int buffer_id) {
+  if (g == nullptr) return -1;
+  if (buffer_id < 0 || buffer_id >= kMaxBuffers) return -1;
+  auto &slot = world(*g).buffers[static_cast<std::size_t>(buffer_id)];
+  if (!slot.allocated) return -1;
+  slot.allocated = false;
+  // Sample storage capacity is intentionally preserved so a
+  // subsequent rt_graph_buffer_alloc of the same size is
+  // allocation-free in steady state. §6.C.3b's retire/collect
+  // path will revisit this when live-safe free needs to release
+  // storage off the audio thread.
+  return 0;
+}
+
+long long rt_graph_test_buffer_read_count(const RTGraph *g) {
+  if (g == nullptr) return 0;
+  return world(*g).buffer_read_count;
+}
+
+long long rt_graph_test_buffer_invalid_read_count(const RTGraph *g) {
+  if (g == nullptr) return 0;
+  return world(*g).buffer_invalid_read_count;
 }
 
 // Set one control slot on instance 0. Mutates the *instance*, not

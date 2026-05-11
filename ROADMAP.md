@@ -1111,7 +1111,7 @@ retire/free).
 
 Note: [Phase 6.C buffer I/O design](notes/2026-05-10-phase-6c-buffer-io-design.md).
 
-#### 6.C.2 Contract (current task)
+#### [x] 6.C.2 Contract
 
 Pins the v1 surface 6.C.3a implements. Haskell:
 `MetaSonic.Bridge.Buffer` exposes a `Buffer` newtype handle,
@@ -1130,6 +1130,39 @@ live-safe retire/collect lands in 6.C.3b) plus
 pattern / OSC coupling in v1.
 
 Note: [Phase 6.C.2 buffer I/O contract](notes/2026-05-10-phase-6c2-buffer-io-contract.md).
+
+#### [x] 6.C.3a Resident mono buffer read
+
+Implementation of the v1 read path. `Buffer` newtype in
+[Types.hs](src/MetaSonic/Types.hs); `KPlayBufMono` (tag 20,
+`KindSpec 20 SampleRate 3 4 "playBufMono"`) with audio inputs
+`[rate, start_frame, loop_flag]` and a `PortIgnored` row for
+`start_frame` (consumed once at instance reset). Wrapper
+module
+[MetaSonic.Bridge.Buffer](src/MetaSonic/Bridge/Buffer.hs)
+exposes `allocBuffer` / `loadBuffer` / `clearBuffer` against
+the new C ABI (`rt_graph_buffer_alloc`,
+`rt_graph_buffer_load_f32`, `rt_graph_buffer_clear`) with
+exception-throwing `BufferIssue` errors. Fixed-cap pool of 64
+`BufferSlot`s on `RTGraphState`; counters
+(`rt_graph_test_buffer_read_count` /
+`_invalid_read_count`) tick per sample. Linear-interpolating
+`process_play_buf_mono` kernel reads from the resolved pool
+slot; invalid / unallocated / cleared IDs emit zeros and
+increment the invalid-read counter. End-to-end test loads a
+256-sample sine table, plays it forward, asserts both the
+sample-match within `1.0e-5` tolerance and a non-zero read
+counter (counter-confirmed validation). 11 new tests in
+`bufferPoolTests` + `playBufMonoTests` — 537 total.
+
+#### 6.C.3b Lifetime hardening (next task)
+
+Live-safe retire / collect (§5.3 generation-counter pattern)
+so `clearBuffer` (or a new `retireBuffer`) is callable while
+audio is running. Survive-hot-swap test: build a graph that
+references buffer 0 through a `prepare_swap` /
+`publish_swap` cycle and assert the buffer is still readable
+in the new world.
 
 ### Phase 6.D — Spectral Processing
 

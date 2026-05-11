@@ -56,6 +56,7 @@ module MetaSonic.Bridge.Source
   , busInDelayed
   , delayL
   , smooth
+  , playBufMono
   , tagged
   , cc
   , -- * Connection helpers
@@ -524,6 +525,23 @@ data UGen
     -- blocks. Per-instance state (no shared resource), so 'Eff' is
     -- 'Pure'; rate is 'SampleRate'. See Note [Per-node smooth state]
     -- in @tinysynth/rt_graph.cpp@.
+  | PlayBufMono !Buffer !Connection !Connection !Connection
+    -- ^ Mono float32 buffer playback (§6.C.3a). Reads samples
+    -- from a producer-allocated 'Buffer' and emits them at
+    -- sample rate. Arguments in declared order: the buffer to
+    -- read, playback rate (1.0 = real-time forward), start
+    -- frame (read once at instance reset; an audio source
+    -- wired here is silently dropped — see 'PortIgnored'),
+    -- and a loop flag (0 = one-shot, >= 0.5 = loop back to
+    -- start). The buffer ID is captured as control 0 at
+    -- construction; the audio thread resolves it through the
+    -- runtime's mono buffer pool. An invalid / unallocated /
+    -- cleared buffer ID emits zeros and increments a
+    -- diagnostic counter (see
+    -- 'MetaSonic.Bridge.FFI.c_rt_graph_test_buffer_invalid_read_count').
+    --
+    -- Effect is 'BufRead n', wired to the underlying integer
+    -- 'bufferId'. Rate is 'SampleRate'.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -922,6 +940,52 @@ smooth
   -> SynthM Connection
 smooth baseHz v = insertNodeC "smooth" (Smooth baseHz v)
 
+-- | Read samples from a producer-allocated mono float32
+-- buffer (§6.C.3a).
+--
+-- The 'Buffer' handle comes from
+-- 'MetaSonic.Bridge.Buffer.allocBuffer'; it is allocated in
+-- 'IO' against an @RTGraph@ outside the pure 'SynthM'
+-- builder and passed in as data. The runtime resolves the
+-- buffer ID through its mono pool on each block. If the
+-- buffer is unallocated or has been cleared, the kernel
+-- emits zeros and increments
+-- @rt_graph_test_buffer_invalid_read_count@.
+--
+-- Inputs (in declared order):
+--
+--   - @rate@: playback rate, 1.0 = real-time forward.
+--     Negative values are clamped to 0 in 6.C.3a (reserved
+--     for future reverse playback). Read every sample.
+--
+--   - @start_frame@: floating-point frame index at which a
+--     fresh playhead begins. Consumed once at instance
+--     reset (via 'rnControls[2]'); the audio loop never
+--     resolves this port, so an 'Audio' source wired here
+--     is silently dropped. Same precedent as oscillator
+--     phase. Pass @'Param' f@ to set the start frame.
+--
+--   - @loop_flag@: 0 = one-shot (silence after last frame),
+--     @>= 0.5@ = loop back to @start_frame@. Checked every
+--     sample so live toggling works.
+--
+-- > samples <- pure [sin (2 * pi * fromIntegral i / 256) | i <- [0..255]]
+-- > buf     <- allocBuffer rt 256
+-- > loadBuffer rt buf samples
+-- > runSynth $ do
+-- >   s <- playBufMono buf (Param 1.0) (Param 0) (Param 0)
+-- >   out 0 s
+--
+-- See Note [Buffer pool] in @tinysynth/rt_graph.cpp@.
+playBufMono
+  :: Buffer
+  -> Connection  -- ^ rate
+  -> Connection  -- ^ start_frame
+  -> Connection  -- ^ loop_flag
+  -> SynthM Connection
+playBufMono buf rate startFrame loopFlag =
+  insertNodeC "playBufMono" (PlayBufMono buf rate startFrame loopFlag)
+
 -- | Declare a CC-bound smoothed control input. Allocates a 'Smooth'
 -- node fed by an initially-constant target, records the @(cc_number,
 -- smooth_node, ctl=1, min, max)@ binding in the builder state, and
@@ -1072,6 +1136,14 @@ ugenView = \case
   BusInDelayed bus  -> UGenView KBusInDelayed []     [fromIntegral bus]
   Delay maxT s t    -> UGenView KDelay        [s, t] [maxT, connDefault t]
   Smooth baseHz v   -> UGenView KSmooth       [v]    [baseHz, connDefault v]
+  PlayBufMono buf r s lp ->
+    UGenView KPlayBufMono
+             [r, s, lp]
+             [ fromIntegral (bufferId buf)
+             , connDefault r
+             , connDefault s
+             , connDefault lp
+             ]
 
 
 {- Note [Per-UGen projections]
@@ -1169,11 +1241,12 @@ honesty wins over compactness here.
 -- See Note [Effect-induced edges (E_r)] in "MetaSonic.Bridge.Validate".
 --
 inferEff :: UGen -> [Eff]
-inferEff (Out          bus _) = [BusWrite        bus]
-inferEff (BusOut       bus _) = [BusWrite        bus]
-inferEff (BusIn        bus)   = [BusRead         bus]
-inferEff (BusInDelayed bus)   = [BusReadDelayed  bus]
-inferEff _                    = [Pure]
+inferEff (Out          bus _)       = [BusWrite        bus]
+inferEff (BusOut       bus _)       = [BusWrite        bus]
+inferEff (BusIn        bus)         = [BusRead         bus]
+inferEff (BusInDelayed bus)         = [BusReadDelayed  bus]
+inferEff (PlayBufMono  buf _ _ _)   = [BufRead (bufferId buf)]
+inferEff _                          = [Pure]
 
 
 -- | Extract explicit structural 'NodeID' dependencies from a 'UGen'.
@@ -1211,6 +1284,7 @@ dependencies = \case
   Add a b          -> deps [a, b]
   Env g _ _ _ _    -> deps [g]
   Smooth _ v       -> deps [v]
+  PlayBufMono _ r s lp -> deps [r, s, lp]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc
