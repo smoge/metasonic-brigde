@@ -83,12 +83,13 @@ module MetaSonic.App.FusionCostLab
 import           Control.Monad              (forM, forM_, replicateM_)
 import           Data.List                  (intercalate, sort, sortOn)
 import qualified Data.Map.Strict            as M
-import           Data.Maybe                 (catMaybes, isNothing)
+import           Data.Maybe                 (catMaybes, isNothing, mapMaybe)
 import qualified Data.Set                   as S
 import           Foreign                    (allocaArray, castPtr, peekArray)
 import           Foreign.C.Types            (CFloat (..))
 import           Foreign.Ptr                (Ptr)
 import           GHC.Clock                  (getMonotonicTimeNSec)
+import           System.IO                  (hPutStrLn, stderr)
 import           Text.Printf                (printf)
 
 import           MetaSonic.Bridge.Compile
@@ -911,6 +912,10 @@ runFusionCostLab opts = do
   case fcoFormat opts of
     FormatJSONL   -> mapM_ (putStrLn . rowToJSONL) rows
     FormatSummary -> renderSummary rows
+  -- Phase 7.E step 4: diagnostic-only summary for the generated
+  -- variant. Goes to stderr so it never lands inside a JSONL stream
+  -- a caller is parsing.
+  renderGeneratedDiagnostics rows
 
 collectFusionCostLabRows :: FusionCostLabOptions -> IO [LabRow]
 collectFusionCostLabRows opts =
@@ -1210,3 +1215,110 @@ renderSummary rows = do
       <> " bufW/R=" <> show (fcfBufferWrites f)
       <> "/" <> show (fcfBufferReads f)
       <> " lat=" <> show (fcfMaxLatency f)
+
+------------------------------------------------------------
+-- Generated variant diagnostics (Phase 7.E step 4)
+------------------------------------------------------------
+--
+-- A small stderr block summarising how the generated variant
+-- did on the current corpus. Diagnostic-only: no planner uses
+-- these counts, no profitability gate consumes them. The point
+-- is to make "is the generator wider, is it correct, is it ever
+-- faster" answerable at a glance instead of by reading the JSONL.
+renderGeneratedDiagnostics :: [LabRow] -> IO ()
+renderGeneratedDiagnostics rows = do
+  let generated = [r | r <- rows, lrVariant r == VarGenerated]
+  if null generated
+    then pure ()
+    else do
+      let unsupported = [r | r <- generated, lrError r /= Nothing]
+          emitted     = [r | r <- generated, lrError r == Nothing]
+          nonExact    = [r | r <- emitted,   lrEquivalence r /= EqExact]
+          emittedSpeedups = mapMaybe lrSpeedupVsBase emitted
+          wins  = length [s | s <- emittedSpeedups, s >= measuredWinThreshold]
+          loses = length emittedSpeedups - wins
+          declineReasons = tally [errorBucket e | r <- unsupported, Just e <- [lrError r]]
+          deltas      = [(r, d) | r <- emitted, Just d <- [deltaVsBestNonGenerated rows r]]
+          deltaValues = map snd deltas
+          posDeltas   = length [d | d <- deltaValues, d >= 0]
+          negDeltas   = length deltaValues - posDeltas
+
+      hPutStrLn stderr ""
+      hPutStrLn stderr "=== generated variant diagnostics (Phase 7.E) ==="
+      hPutStrLn stderr $ "  considered:  " <> show (length generated)
+                      <> "  emitted: "    <> show (length emitted)
+                      <> "  unsupported: " <> show (length unsupported)
+      hPutStrLn stderr $ "  equivalence: exact=" <> show (length emitted - length nonExact)
+                      <> "  non-exact=" <> show (length nonExact)
+      unless (null declineReasons) $ do
+        hPutStrLn stderr "  decline reasons:"
+        forM_ declineReasons $ \(reason, n) ->
+          hPutStrLn stderr $ "    " <> reason <> ": " <> show n
+      unless (null emittedSpeedups) $ do
+        let (sMin, sMed, sMax) = minMedMax emittedSpeedups
+        hPutStrLn stderr $ printf
+          "  speedup vs node-loop: min=%.2fx  median=%.2fx  max=%.2fx  win(>=%.2fx)=%d  loss=%d"
+          sMin sMed sMax measuredWinThreshold wins loses
+      unless (null deltaValues) $ do
+        let (dMin, dMed, dMax) = minMedMax deltaValues
+        hPutStrLn stderr $ printf
+          "  delta vs best non-generated (region-kernel/RFused): rows=%d  min=%+.2fx  median=%+.2fx  max=%+.2fx  generated>=best=%d  generated<best=%d"
+          (length deltaValues) dMin dMed dMax posDeltas negDeltas
+      hPutStrLn stderr "=== end generated diagnostics ==="
+  where
+    unless cond act = if cond then pure () else act
+
+    tally :: Ord a => [a] -> [(a, Int)]
+    tally xs =
+      [ (k, length (filter (== k) xs))
+      | k <- sort (nubOrd xs)
+      ]
+
+    nubOrd :: Ord a => [a] -> [a]
+    nubOrd = S.toAscList . S.fromList
+
+    errorBucket s
+      | "not implemented yet" `isInfixOf` s     = "not implemented yet"
+      | "no shape this slice" `isInfixOf` s     = "no shape this slice can emit"
+      | "RFused inputs not supported" `isInfixOf` s = "RFused inputs not supported"
+      | "Out has no bus control" `isInfixOf` s  = "Out has no bus control"
+      | "unexpected input arity" `isInfixOf` s  = "unexpected input arity"
+      | "dangling NodeIndex" `isInfixOf` s      = "dangling NodeIndex"
+      | "not contiguous" `isInfixOf` s          = "owned slice not contiguous"
+      | "region not found" `isInfixOf` s        = "owned slice's region not found"
+      | otherwise                               = s
+
+    isInfixOf needle hay = needle `S.member` S.fromList (substrings hay (length needle))
+
+    substrings s n
+      | length s < n = []
+      | otherwise    = take n s : substrings (drop 1 s) n
+
+minMedMax :: [Double] -> (Double, Double, Double)
+minMedMax xs =
+  let sorted = sort xs
+      n      = length sorted
+      med
+        | n == 0    = 0
+        | odd n     = sorted !! (n `div` 2)
+        | otherwise = (sorted !! (n `div` 2 - 1) + sorted !! (n `div` 2)) / 2
+  in (head sorted, med, last sorted)
+
+-- | Speedup delta between the generated row and the better of
+-- region-kernel / RFused on the same (family, member). Returns
+-- 'Nothing' if generated didn't measure or no non-generated peer
+-- exists.
+deltaVsBestNonGenerated :: [LabRow] -> LabRow -> Maybe Double
+deltaVsBestNonGenerated allRows genRow = do
+  genSpeedup <- lrSpeedupVsBase genRow
+  let peers =
+        [ s
+        | r <- allRows
+        , lrFamily r == lrFamily genRow
+        , lrMember r == lrMember genRow
+        , lrVariant r `elem` [VarRegionKernel, VarRFused]
+        , Just s <- [lrSpeedupVsBase r]
+        ]
+  case peers of
+    [] -> Nothing
+    _  -> Just (genSpeedup - maximum peers)
