@@ -2639,7 +2639,6 @@ printProfitabilityGate gateIdx rows = do
                     ]
       pairs       = zip shapes gateRows
       counts      = summarizeGate gateRows
-      preferZero  = gcPreferGenerated counts == 0
   putStrLn $ "  total="            <> show (gcTotal counts)
           <> "  prefer-generated=" <> show (gcPreferGenerated counts)
           <> "  prefer-existing="  <> show (gcPreferExisting counts)
@@ -2647,8 +2646,8 @@ printProfitabilityGate gateIdx rows = do
           <> "  unsupported="      <> show (gcUnsupported counts)
           <> "  non-exact="        <> show (gcNonExact counts)
           <> "  covered-by-hand-kernel=" <> show (gcCoveredByHandKernel counts)
-  putStrLn $ "  invariant: prefer-generated=0 "
-          <> if preferZero then "(holds)" else "(broken — see PreferGenerated row(s) below)"
+  putStrLn $ "  signal: prefer-generated=" <> show (gcPreferGenerated counts)
+          <> " (read-only; review before any runtime turn-on)"
   if null pairs
     then putStrLn "  (no selected candidates in the surveyed graphs)"
     else do

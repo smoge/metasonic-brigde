@@ -1894,7 +1894,7 @@ priority order, applied by `evaluateGate` in
 
 `--fusion-survey` gained a *Phase 7.F generated profitability
 gate* section: per-verdict counts on the header line, a
-`prefer-generated = N (holds/broken)` invariant line, and a
+read-only `prefer-generated = N` signal line, and a
 per-shape table sorted so any `PreferGenerated` row surfaces
 first. Each row carries kinds, gain features, §4.B match,
 occurrence count, verdict tag, generated speedup, peer speedup,
@@ -1902,27 +1902,25 @@ and the verdict's reason.
 
 Current corpus signal (live `--fusion-survey`):
 
-    total=28  prefer-generated=0  prefer-existing=10
-    needs-benchmark=7  unsupported=1  non-exact=0
+    total=28  prefer-generated=0  prefer-existing=2
+    needs-benchmark=15  unsupported=1  non-exact=0
     covered-by-hand-kernel=10
 
 Snapshot pins on the smaller snapshot corpus:
 
 - `gate total row count`          (23);
-- `gate prefer-generated`         (0 — safety tripwire);
 - `gate non-exact`                (0 — correctness tripwire);
 - `gate unsupported`              (1);
-- `gate needs-benchmark`          (4);
+- `gate needs-benchmark`          (10);
 - `gate covered-by-hand-kernel`   (10);
 - `gate occurrence count matches selected candidates`
   (guards graph-local candidate selection).
 
-`prefer-existing` is intentionally not pinned — rows hovering
-near `measuredWinThreshold` (1.05×) flap between
-`PreferExisting` and `PreferGenerated` under bench noise. The
-two zero pins are tripwires: a flip is a real event (new
-positive signal or a correctness regression) and the snapshot
-should fail so a human reviews.
+`prefer-existing` and `prefer-generated` are intentionally not
+pinned — rows hovering near `measuredWinThreshold` (1.05×) flap
+between those verdicts under bench noise. `non-exact=0` remains
+the correctness tripwire; any positive generated signal stays
+read-only until a later runtime turn-on policy exists.
 
 Hard scope for this slice: read-only. No runtime path consumes
 the verdicts, no FFI changes, no §4.B kernel is replaced by a
@@ -1933,12 +1931,13 @@ not mistaken for readiness. Decision artifact:
 
 Open follow-ups (in roughly the order they unlock value):
 
-- **Generated executor performance work.** Today the gate picks
-  `PreferGenerated` on no row. Either the per-sample interpreter
-  has to get faster (packed instruction stream, branchless tail,
+- **Generated executor performance work.** Today the gate has no
+  stable generated preference; tiny tail rows can hover around
+  `measuredWinThreshold`. Either the per-sample interpreter has
+  to get faster (packed instruction stream, branchless tail,
   fused multiply-add op), or the generator has to handle shapes
   where the existing kernels are weakest. Without one of those,
-  a runtime turn-on switch has nothing to turn on.
+  a runtime turn-on switch has nothing durable to turn on.
 - **Remaining `NeedsBenchmark` families.** The gate currently
   reports needs-benchmark for shapes the cost-lab corpus does
   not measure. Growing the cost-lab corpus to cover those shapes

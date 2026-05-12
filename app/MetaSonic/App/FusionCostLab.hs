@@ -110,6 +110,7 @@ import           MetaSonic.Bridge.Compile.FusionProgram
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR        (lowerGraph)
 import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
+                                             GainAmountMode (..),
                                              planRuntimeGraph,
                                              selectedFusionCandidates)
 import           MetaSonic.Bridge.Source
@@ -1090,20 +1091,24 @@ data GateMeasurement = GateMeasurement
   } deriving (Eq, Show)
 
 -- | Build a 'ShapeKey' -> 'GateMeasurement' map by re-deriving
--- shape keys for each cost-lab member graph (identical machinery
--- to 'costLabShapeIndex') and joining them with that member's
--- per-variant 'LabRow' set.
+-- selected shape keys for each cost-lab member graph (identical
+-- machinery to 'costLabShapeIndex') and joining them with that
+-- member's per-variant 'LabRow' set.
 --
 -- The contributing-row predicate is intentionally lax: a member
 -- contributes even when its @VarGenerated@ row failed (declined
 -- or non-exact). The gate's 'Unsupported' / 'NonExact' verdicts
 -- depend on that signal being visible.
+--
+-- Generated timings attach only to the owned suffix shape the
+-- generator actually emitted. Other selected shapes from the same
+-- member retain peer measurements, but do not borrow the generated
+-- speedup from a sibling/suffix program.
 costLabGateIndex :: [LabRow] -> M.Map ShapeKey GateMeasurement
 costLabGateIndex rows =
   M.fromListWith preferStrongerGenerated $ concat
-    [ [(k, gm) | k <- shapeKeysOf graph]
+    [ memberGateEntries fam name graph
     | (fam, name, graph) <- familyGraphs
-    , Just gm <- [memberMeasurement fam name]
     ]
   where
     familyGraphs =
@@ -1111,6 +1116,25 @@ costLabGateIndex rows =
       | fam <- [minBound .. maxBound :: GraphFamily]
       , FamilyMember name graph <- familyMembers fam
       ]
+
+    memberGateEntries
+      :: GraphFamily -> String -> SynthGraph -> [(ShapeKey, GateMeasurement)]
+    memberGateEntries fam name graph =
+      case memberMeasurement fam name of
+        Nothing -> []
+        Just gm
+          | Just _ <- gmGeneratorError gm ->
+              [(k, gm) | k <- shapeKeysOf graph]
+          | otherwise ->
+              let selectedEntries =
+                    [ (k, peerOnlyMeasurement gm)
+                    | k <- shapeKeysOf graph
+                    ]
+                  generatedEntries =
+                    [ (k, gm)
+                    | Just k <- [generatedOwnedShapeKeyOf graph]
+                    ]
+              in selectedEntries <> generatedEntries
 
     memberMeasurement :: GraphFamily -> String -> Maybe GateMeasurement
     memberMeasurement fam name =
@@ -1160,11 +1184,62 @@ costLabGateIndex rows =
       | otherwise        = b
       where
         rank gm = case gmGeneratedSpeedup gm of
-          Just s  -> s
-          Nothing -> -1/0  -- -Inf: any measured row beats unmeasured
+          Just s  -> (2 :: Int, s)
+          Nothing -> case gmGeneratorError gm of
+            Just _  -> (1, 0)
+            Nothing -> (0, 0)
+
+    peerOnlyMeasurement gm = GateMeasurement
+      { gmGeneratorError   = Nothing
+      , gmGeneratedExact   = True
+      , gmGeneratedSpeedup = Nothing
+      , gmBestPeerSpeedup  = gmBestPeerSpeedup gm
+      }
 
     listToMaybe (x:_) = Just x
     listToMaybe []    = Nothing
+
+-- | Reconstruct the generated variant's chosen owned suffix for a
+-- cost-lab member and encode that suffix as a 'ShapeKey'. This
+-- mirrors 'generateForCostLab': plan on the stripped node-loop
+-- graph, pick the first generator-supported selected candidate,
+-- then use the returned owned node slice rather than the whole
+-- selected candidate.
+generatedOwnedShapeKeyOf :: SynthGraph -> Maybe ShapeKey
+generatedOwnedShapeKeyOf graph = do
+  rg <- case lowerGraph graph >>= compileRuntimeGraphUnfused of
+          Right base -> Just (stripRegionKernels base)
+          Left _     -> Nothing
+  let eligibleOwned =
+        [ owned
+        | c <- selectedFusionCandidates (planRuntimeGraph rg)
+        , isNothing (fcMatchedShape c)
+        , Right (_, owned) <- [generateProgram rg c]
+        ]
+  case eligibleOwned of
+    (owned : _) ->
+      case shapeKeyForOwned rg owned of
+        Right key -> Just key
+        Left _    -> Nothing
+    [] -> Nothing
+
+shapeKeyForOwned :: RuntimeGraph -> [NodeIndex] -> Either String ShapeKey
+shapeKeyForOwned rg owned = do
+  nodes <- mapM (lookupRtNode rg) owned
+  Right ShapeKey
+    { skKinds = map (fromEnum . rnKind) nodes
+    , skGainAmountModes =
+        [ fromEnum (gateGainAmountMode n)
+        | n <- nodes
+        , rnKind n == KGain
+        ]
+    }
+
+gateGainAmountMode :: RuntimeNode -> GainAmountMode
+gateGainAmountMode n = case drop 1 (rnInputs n) of
+  RConst _ : _ -> GainAmountConst
+  _ : _        -> GainAmountDynamic
+  []           -> GainAmountMissing
 
 runFamily :: GraphFamily -> IO [LabRow]
 runFamily fam = concat <$> mapM (runMember fam) (familyMembers fam)

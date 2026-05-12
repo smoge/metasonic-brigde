@@ -42,7 +42,7 @@ Current evidence as of 2026-05-12:
 An honest gate run today against this data should say:
 
 - almost everywhere: **do not auto-generate**;
-- nowhere: **auto-generate**;
+- no stable policy basis yet for: **auto-generate**;
 - a small remainder: **needs benchmark data**.
 
 That outcome by itself is what the gate is for. The compiler /
@@ -117,9 +117,9 @@ Hard exclusions for this slice:
 - **No win-loss split pinned in snapshot.** Like 7.D / 7.E, the
   generated win/loss number flaps with bench noise around the
   1.05x threshold and stays unpinned. The pinned signals are
-  deterministic counts (total rows, prefer-generated, unsupported,
-  non-exact, covered-by-hand-kernel) and the absence of
-  prefer-generated rows.
+  deterministic counts (total rows, unsupported, non-exact,
+  covered-by-hand-kernel, occurrence coverage) and the
+  needs-benchmark backlog.
 - **No CLI knob to override the gate.** The gate is a function;
   callers consume verdicts. Per-shape override is a Phase 8 or
   later concern.
@@ -140,24 +140,25 @@ The new `--fusion-survey` section reports:
   verdict, reason, generated speedup vs node-loop, best
   non-generated peer speedup, and delta. Sorted so
   `PreferGenerated` rows (if any) come first.
-- A one-line summary at the top that surfaces the key invariant:
-  `prefer-generated = 0` on the current corpus.
+- A one-line summary at the top that surfaces the read-only
+  `prefer-generated = N` signal for human review before any
+  runtime turn-on policy consumes it.
 
 ## Snapshot Pins
 
 The pinned counts from this slice:
 
 - total gate rows;
-- prefer-generated count (today: 0);
 - needs-benchmark count (today's signal from the survey
   cost-model join);
 - unsupported count if surfaced;
 - non-exact count (today: 0; surfacing as a pin lets a
   correctness regression fail snapshot before it ships).
+- occurrence count matching the planner's selected candidates.
 
-Generated win/loss split, deltas, and percentile speedups stay
-unpinned. They flap with bench noise; snapshot is for invariants
-that move only when intent moves.
+Generated win/loss split, `prefer-generated`, deltas, and
+percentile speedups stay unpinned. They flap with bench noise;
+snapshot is for invariants that move only when intent moves.
 
 ## Verification Target
 
