@@ -164,6 +164,25 @@ costLabChecks rows =
       ("expected=" <> show expectedGeneratedUnsupported
        <> "; actual=" <> show generatedUnsupportedCount)
 
+  -- §7.G step 6: family-scoped pins on 'generated-tail-sweep'.
+  -- The synthetic family is generator-supported by construction;
+  -- if any member ever fails to emit, fails equivalence, or
+  -- joins the unsupported bucket, the regression should fail
+  -- snapshot immediately rather than rely on the global counts
+  -- surviving alongside corpus growth elsewhere.
+  , check "generated-tail-sweep: every member emitted"
+      (tailSweepEmitted == expectedTailSweepEmitted)
+      ("expected=" <> show expectedTailSweepEmitted
+       <> "; actual=" <> show tailSweepEmitted)
+
+  , check "generated-tail-sweep: every emitted row stays bit-exact"
+      (tailSweepNonExact == 0)
+      ("non-exact=" <> show tailSweepNonExact)
+
+  , check "generated-tail-sweep: no unsupported rows"
+      (tailSweepUnsupported == 0)
+      ("unsupported=" <> show tailSweepUnsupported)
+
   , check "cost-lab corpus carries declared latency coverage"
       corpusLatency
       ("max-latency=" <> show maxLatency)
@@ -249,6 +268,22 @@ costLabChecks rows =
 
     generatedUnsupportedCount =
       length [() | r <- generatedRows, lrError r /= Nothing]
+
+    -- §7.G family-scoped helpers. Every member of
+    -- 'generated-tail-sweep' is generator-supported by
+    -- construction, so each of these counts is structural.
+    tailSweepGenerated =
+      [ r | r <- generatedRows
+          , familyName (lrFamily r) == "generated-tail-sweep" ]
+    tailSweepEmitted =
+      length [() | r <- tailSweepGenerated, lrError r == Nothing]
+    tailSweepUnsupported =
+      length [() | r <- tailSweepGenerated, lrError r /= Nothing]
+    tailSweepNonExact =
+      length [() | r <- tailSweepGenerated
+                 , lrError r == Nothing
+                 , lrEquivalence r /= EqExact ]
+    expectedTailSweepEmitted = 6
 
     corpusFeatures =
       [ f
