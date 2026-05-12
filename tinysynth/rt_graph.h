@@ -480,6 +480,121 @@ void rt_graph_template_add_region_kernel(
 // node kinds.
 int rt_graph_region_kernel_supported(int kernel_kind);
 
+// [T:construction] Phase 7.D: allocate one generated-fusion program
+// in the named template. Returns the new program id (>= 0) usable in
+// subsequent rt_graph_template_program_* and
+// rt_graph_template_add_region_generated calls; returns -1 if
+// template_id is invalid or scratch_slots is negative.
+//
+// scratch_slots is the high-water-mark scratch index plus one. The
+// runtime preallocates one float per scratch slot per program at
+// load time, so 'process_instance' never allocates on the audio
+// thread. Programs do not share scratch with each other.
+//
+// The interpreter ABI in steps §7.D.5+ matches the Haskell
+// 'FusionOp' encoding in MetaSonic.Bridge.Compile.FusionProgram:
+//   0 = OpLoadConst    rt_graph_template_program_load_const
+//   1 = OpLoadInput    rt_graph_template_program_load_input
+//   2 = OpAdd          rt_graph_template_program_add
+//   3 = OpMul          rt_graph_template_program_mul
+//   4 = OpSinkWrite    rt_graph_template_program_sink_write
+// Each op-append entry validates its program_id and silent-no-ops
+// on a stale or invalid id. The append order is the execution
+// order; the runtime does not reorder.
+int rt_graph_template_add_fusion_program(
+    RTGraph *g, int template_id, int scratch_slots);
+
+// [T:construction] Phase 7.D: append an OpLoadConst op to the named
+// program. Writes 'value' into scratch[scratch_dst] per sample.
+// Silent no-op on invalid template_id, program_id, or out-of-range
+// scratch_dst.
+void rt_graph_template_program_load_const(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst, double value);
+
+// [T:construction] Phase 7.D: append an OpLoadInput op. Reads the
+// current sample from node @node_index@'s output port @port_index@
+// into scratch[scratch_dst]. The referenced node must have run
+// earlier in the same block (no feedback in v1). Silent no-op on
+// invalid handles.
+void rt_graph_template_program_load_input(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst, int node_index, int port_index);
+
+// [T:construction] Phase 7.D: append an arithmetic op (OpAdd /
+// OpMul). Each source carries a tag plus a small union of data
+// fields:
+//   src_tag = 0  Const,   src_const used,         idx_a/idx_b ignored
+//   src_tag = 1  Input,   idx_a = node, idx_b = port
+//   src_tag = 2  Control, idx_a = node, idx_b = control slot
+//   src_tag = 3  Scratch, idx_a = scratch index,  idx_b ignored
+// The tags mirror Haskell's 'FusionSource' constructor order.
+// Result lands in scratch[scratch_dst]. Silent no-op on any
+// out-of-range index.
+void rt_graph_template_program_add(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst,
+    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
+    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b);
+
+void rt_graph_template_program_mul(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst,
+    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
+    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b);
+
+// [T:construction] Phase 7.D: append an OpSinkWrite op. Writes or
+// accumulates the source value into output bus @bus_index@ at the
+// current sample. sink_policy mirrors Haskell's 'SinkPolicy' tag:
+//   0 = SinkOverwrite (replace the previous sample value)
+//   1 = SinkAccumulate (add to the previous sample value)
+// v1 only emits SinkOverwrite; SinkAccumulate is in the ABI so a
+// future multi-writer slice does not have to widen the entry.
+// Silent no-op on invalid handles or an unknown sink_policy.
+void rt_graph_template_program_sink_write(
+    RTGraph *g, int template_id, int program_id,
+    int bus_index,
+    int src_tag, double src_const, int src_idx_a, int src_idx_b,
+    int sink_policy);
+
+// [T:construction] Phase 7.D: register a region that dispatches
+// through a generated fusion program instead of a hand-written
+// kernel. Mirrors rt_graph_template_add_region_kernel; the
+// difference is that dispatch reads from
+// MetaDef::fusion_programs[program_id] rather than from the
+// hand-written kernel set.
+//
+// Until the interpreter lands (§7.D step 5), this entry stores the
+// region's program_id reference; process_instance still falls
+// through to per-node dispatch on these regions. The Haskell
+// loader uses it today only for round-trip ABI tests.
+//
+// Silent no-op on invalid template_id, program_id, or
+// first_node/node_count out of range.
+void rt_graph_template_add_region_generated(
+    RTGraph *g, int template_id,
+    int rate, int first_node, int node_count,
+    int program_id);
+
+// [T:introspection] Phase 7.D test surface. Counts and lookups for
+// the per-template fusion-program table populated by
+// rt_graph_template_add_fusion_program /
+// rt_graph_template_program_*. All return -1 on invalid handles.
+int rt_graph_test_template_fusion_program_count(
+    RTGraph *g, int template_id);
+
+int rt_graph_test_template_fusion_program_op_count(
+    RTGraph *g, int template_id, int program_id);
+
+int rt_graph_test_template_fusion_program_scratch_slots(
+    RTGraph *g, int template_id, int program_id);
+
+// Returns the generated program id attached to region
+// @region_index@, or -1 if that region uses kernel-based dispatch
+// or the handle is invalid.
+int rt_graph_test_template_region_generated_program(
+    RTGraph *g, int template_id, int region_index);
+
 // [T:construction] Phase §4.E.2.C0a: append one descriptive
 // schedule step to the named template, layering an interpretation
 // on top of the regions appended via rt_graph_template_add_region.

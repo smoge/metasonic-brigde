@@ -1141,6 +1141,79 @@ struct RegionSpec {
   int first_node = 0;
   int node_count = 0;
   RegionKernel kernel = RegionKernel::NodeLoop;
+
+  // Phase 7.D: when generated_program_id >= 0 the region dispatches
+  // through MetaDef::fusion_programs[generated_program_id] instead of
+  // 'kernel'-based dispatch. Default -1 preserves existing
+  // kernel/NodeLoop behavior for every region the current loader
+  // produces.
+  int generated_program_id = -1;
+};
+
+// Phase 7.D: a per-sample operand source. The tag encoding mirrors
+// Haskell's 'FusionSource' constructor order
+// (MetaSonic.Bridge.Compile.FusionProgram). Only one of the data
+// fields is meaningful per tag:
+//
+//   Const   const_value
+//   Input   idx_a = node index,    idx_b = port index
+//   Control idx_a = node index,    idx_b = control slot
+//   Scratch idx_a = scratch index, idx_b unused
+enum class FusionSrcTag : int {
+  Const   = 0,
+  Input   = 1,
+  Control = 2,
+  Scratch = 3,
+};
+
+struct FusionSourceSpec {
+  FusionSrcTag tag = FusionSrcTag::Const;
+  double const_value = 0.0;
+  int idx_a = 0;
+  int idx_b = 0;
+};
+
+// Phase 7.D: one op in a generated fusion program. The encoding is
+// pinned by the Haskell 'FusionOp' ADT:
+//
+//   LoadConst  dst (scratch), const_value
+//   LoadInput  dst (scratch), src1 (Input tag)
+//   Add / Mul  dst (scratch), src1, src2
+//   SinkWrite  dst (bus index), src1, sink_policy
+//
+// Unused fields are zero. The C ABI append entries fill in only
+// what each op needs; the dispatch path reads only what the op
+// kind requires.
+enum class FusionOpKind : int {
+  LoadConst = 0,
+  LoadInput = 1,
+  Add       = 2,
+  Mul       = 3,
+  SinkWrite = 4,
+};
+
+enum class FusionSinkPolicy : int {
+  Overwrite  = 0,
+  Accumulate = 1,
+};
+
+struct FusionOpSpec {
+  FusionOpKind kind = FusionOpKind::LoadConst;
+  int dst = 0;
+  double const_value = 0.0;
+  FusionSourceSpec src1;
+  FusionSourceSpec src2;
+  FusionSinkPolicy sink_policy = FusionSinkPolicy::Overwrite;
+};
+
+// Phase 7.D: one generated fusion program in a template's
+// fusion-program table. Programs do not share scratch with each
+// other; the executor reuses 'scratch_slots' floats per program
+// per render block (allocated at load time, never on the audio
+// thread).
+struct FusionProgramSpec {
+  int scratch_slots = 0;
+  std::vector<FusionOpSpec> ops;
 };
 
 // Phase §4.E.2.C0a: descriptive layered-schedule shape over the
@@ -1321,6 +1394,14 @@ struct MetaDef {
   // grown in lockstep when a fused input is registered after instances
   // exist).
   int fused_input_count = 0;
+
+  // Phase 7.D: per-template generated-fusion program table. Indexed
+  // by FusionProgramId; populated by
+  // rt_graph_template_add_fusion_program +
+  // rt_graph_template_program_*. Empty for every template the
+  // current loader produces. Regions reference these by id via
+  // RegionSpec::generated_program_id.
+  std::vector<FusionProgramSpec> fusion_programs;
 };
 
 struct GraphInstance {
@@ -9384,6 +9465,216 @@ void rt_graph_template_add_region_kernel(
 // agreement test, mirrors rt_graph_kind_supported for node kinds.
 int rt_graph_region_kernel_supported(int kernel_kind) {
   return region_kernel_from_tag(kernel_kind).has_value() ? 1 : 0;
+}
+
+// ---------------------------------------------------------------
+// Phase 7.D: generated-fusion program construction ABI.
+//
+// All entries are silent no-ops on invalid template_id /
+// program_id / scratch_dst / source-operand fields, matching the
+// rest of the construction surface. The interpreter consumes
+// these specs in §7.D.5; the current implementation only stores
+// them.
+// ---------------------------------------------------------------
+
+namespace {
+
+// Validate a (template, program) handle and return the program
+// spec (or nullptr). Templates are resolved via the file-scope
+// 'template_at' helper that wraps the world(g).defs lookup.
+FusionProgramSpec *resolve_program(RTGraph *g, int template_id,
+                                   int program_id) {
+  if (!g) return nullptr;
+  MetaDef *def = template_at(*g, template_id);
+  if (!def) return nullptr;
+  if (program_id < 0) return nullptr;
+  if (program_id >= static_cast<int>(def->fusion_programs.size()))
+    return nullptr;
+  return &def->fusion_programs[program_id];
+}
+
+// Decode a FusionSrcTag and write a FusionSourceSpec. Returns false
+// if the tag is out of range; in that case the caller must reject
+// the whole op rather than store a malformed source.
+bool decode_fusion_source(int tag, double const_value, int idx_a,
+                          int idx_b, FusionSourceSpec &out) {
+  switch (tag) {
+    case 0: out.tag = FusionSrcTag::Const;   break;
+    case 1: out.tag = FusionSrcTag::Input;   break;
+    case 2: out.tag = FusionSrcTag::Control; break;
+    case 3: out.tag = FusionSrcTag::Scratch; break;
+    default: return false;
+  }
+  out.const_value = const_value;
+  out.idx_a = idx_a;
+  out.idx_b = idx_b;
+  return true;
+}
+
+bool scratch_in_range(const FusionProgramSpec &prog, int dst) {
+  return dst >= 0 && dst < prog.scratch_slots;
+}
+
+} // namespace
+
+int rt_graph_template_add_fusion_program(
+    RTGraph *g, int template_id, int scratch_slots) {
+  MetaDef *def = g ? template_at(*g, template_id) : nullptr;
+  if (!def) return -1;
+  if (scratch_slots < 0) return -1;
+  FusionProgramSpec spec;
+  spec.scratch_slots = scratch_slots;
+  def->fusion_programs.push_back(std::move(spec));
+  return static_cast<int>(def->fusion_programs.size()) - 1;
+}
+
+void rt_graph_template_program_load_const(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst, double value) {
+  FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
+  if (!prog) return;
+  if (!scratch_in_range(*prog, scratch_dst)) return;
+  FusionOpSpec op;
+  op.kind = FusionOpKind::LoadConst;
+  op.dst = scratch_dst;
+  op.const_value = value;
+  prog->ops.push_back(op);
+}
+
+void rt_graph_template_program_load_input(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst, int node_index, int port_index) {
+  MetaDef *def = g ? template_at(*g, template_id) : nullptr;
+  if (!def) return;
+  FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
+  if (!prog) return;
+  if (!scratch_in_range(*prog, scratch_dst)) return;
+  if (node_index < 0 || node_index >= static_cast<int>(def->nodes.size()))
+    return;
+  if (port_index < 0) return;
+  FusionOpSpec op;
+  op.kind = FusionOpKind::LoadInput;
+  op.dst = scratch_dst;
+  op.src1.tag = FusionSrcTag::Input;
+  op.src1.idx_a = node_index;
+  op.src1.idx_b = port_index;
+  prog->ops.push_back(op);
+}
+
+// Shared body for OpAdd / OpMul. Tags both sources, validates them,
+// and pushes the op.
+static void append_arith_op(
+    RTGraph *g, int template_id, int program_id,
+    FusionOpKind kind, int scratch_dst,
+    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
+    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b) {
+  FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
+  if (!prog) return;
+  if (!scratch_in_range(*prog, scratch_dst)) return;
+  FusionOpSpec op;
+  op.kind = kind;
+  op.dst = scratch_dst;
+  if (!decode_fusion_source(src1_tag, src1_const, src1_idx_a, src1_idx_b,
+                            op.src1)) return;
+  if (!decode_fusion_source(src2_tag, src2_const, src2_idx_a, src2_idx_b,
+                            op.src2)) return;
+  prog->ops.push_back(op);
+}
+
+void rt_graph_template_program_add(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst,
+    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
+    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b) {
+  append_arith_op(g, template_id, program_id,
+                  FusionOpKind::Add, scratch_dst,
+                  src1_tag, src1_const, src1_idx_a, src1_idx_b,
+                  src2_tag, src2_const, src2_idx_a, src2_idx_b);
+}
+
+void rt_graph_template_program_mul(
+    RTGraph *g, int template_id, int program_id,
+    int scratch_dst,
+    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
+    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b) {
+  append_arith_op(g, template_id, program_id,
+                  FusionOpKind::Mul, scratch_dst,
+                  src1_tag, src1_const, src1_idx_a, src1_idx_b,
+                  src2_tag, src2_const, src2_idx_a, src2_idx_b);
+}
+
+void rt_graph_template_program_sink_write(
+    RTGraph *g, int template_id, int program_id,
+    int bus_index,
+    int src_tag, double src_const, int src_idx_a, int src_idx_b,
+    int sink_policy) {
+  FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
+  if (!prog) return;
+  if (bus_index < 0) return;
+  FusionSinkPolicy policy;
+  switch (sink_policy) {
+    case 0: policy = FusionSinkPolicy::Overwrite;  break;
+    case 1: policy = FusionSinkPolicy::Accumulate; break;
+    default: return;
+  }
+  FusionOpSpec op;
+  op.kind = FusionOpKind::SinkWrite;
+  op.dst = bus_index;
+  if (!decode_fusion_source(src_tag, src_const, src_idx_a, src_idx_b,
+                            op.src1)) return;
+  op.sink_policy = policy;
+  prog->ops.push_back(op);
+}
+
+void rt_graph_template_add_region_generated(
+    RTGraph *g, int template_id,
+    int rate, int first_node, int node_count,
+    int program_id) {
+  MetaDef *def = g ? template_at(*g, template_id) : nullptr;
+  if (!def) return;
+  if (program_id < 0) return;
+  if (program_id >= static_cast<int>(def->fusion_programs.size())) return;
+  if (first_node < 0 || node_count <= 0) return;
+  if (static_cast<size_t>(first_node) + static_cast<size_t>(node_count) >
+      def->nodes.size())
+    return;
+  RegionSpec spec;
+  spec.rate = rate;
+  spec.first_node = first_node;
+  spec.node_count = node_count;
+  spec.kernel = RegionKernel::NodeLoop;
+  spec.generated_program_id = program_id;
+  def->regions.push_back(spec);
+}
+
+int rt_graph_test_template_fusion_program_count(
+    RTGraph *g, int template_id) {
+  MetaDef *def = g ? template_at(*g, template_id) : nullptr;
+  if (!def) return -1;
+  return static_cast<int>(def->fusion_programs.size());
+}
+
+int rt_graph_test_template_fusion_program_op_count(
+    RTGraph *g, int template_id, int program_id) {
+  FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
+  if (!prog) return -1;
+  return static_cast<int>(prog->ops.size());
+}
+
+int rt_graph_test_template_fusion_program_scratch_slots(
+    RTGraph *g, int template_id, int program_id) {
+  FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
+  if (!prog) return -1;
+  return prog->scratch_slots;
+}
+
+int rt_graph_test_template_region_generated_program(
+    RTGraph *g, int template_id, int region_index) {
+  MetaDef *def = g ? template_at(*g, template_id) : nullptr;
+  if (!def) return -1;
+  if (region_index < 0) return -1;
+  if (region_index >= static_cast<int>(def->regions.size())) return -1;
+  return def->regions[region_index].generated_program_id;
 }
 
 // Phase §4.E.2.C0a: append one descriptive schedule step to the
