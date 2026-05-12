@@ -2184,6 +2184,171 @@ Open follow-ups (in roughly the order the evidence suggests):
   `PreferGenerated` row exists and survives multiple
   snapshot runs.
 
+### Phase 7.I — Superinstruction Probe
+
+[x] First slice landed. The slice answered one question — *can
+a generated path become competitive with node-loop when
+per-op dispatch is fully removed?* — and the answer is
+**partly yes, but not where it would matter for turn-on**. A
+super-mode executor that recognizes two fused shapes
+(`GainOut`, `AddGainOut`) and runs them as one tight per-
+sample C++ branch crossed above `1.0×` against node-loop on
+recognized rows (`max=2.43×`) but every shape it wins on is
+already covered by a §4.B hand kernel, so a planner-level
+`PreferGenerated` row still does not exist.
+
+What changed:
+
+- `process_fusion_program_super` in
+  [tinysynth/rt_graph.cpp](tinysynth/rt_graph.cpp) classifies
+  the `FusionProgram` structurally and dispatches to a
+  recognized-shape kernel when one matches, otherwise calls
+  into `process_fusion_program_block`. The fallback path is
+  byte-equivalent to running block-major directly by
+  construction. v1 recognizes `GainOut` (two-op program,
+  one scratch slot) and `AddGainOut` (three-op program,
+  two scratch slots).
+- A new C ABI entry
+  `rt_graph_template_add_region_generated_super` mirrors
+  the existing `_generated` / `_generated_block` entries and
+  sets `RegionSpec::generated_executor = 2`. The
+  introspection helper
+  `rt_graph_test_fusion_program_super_kind` returns the
+  classifier's verdict so callers can count
+  recognized vs fallback rows at load time without polling
+  a runtime counter.
+- The Haskell `RegionExec` gained a fourth sibling
+  constructor `ExecGeneratedSuper !FusionProgramId`.
+  `addRegionTo`, `validateRegionProgramRef`, and `rrKernel`
+  all handle it the same way they handle the other generated
+  variants.
+- The cost lab gained a `VarGeneratedSuper` variant. Same
+  compile path, same emitted program; the per-region
+  selector flips via `retargetGeneratedAsSuper`. `runMember`
+  iterates over six variants instead of five.
+- `FusionCostLab.classifyFusionSuper` mirrors the C++
+  classifier in pure Haskell. The bit-exact equivalence test
+  pins the two implementations together; the structural
+  index `generatedSuperKindIndex` lets the diagnostics
+  block — and the snapshot — count recognized vs fallback
+  rows deterministically.
+
+Measured median speedups (sample-major / block-major /
+super-mode, all variants vs node-loop, on the cost-lab
+corpus):
+
+      [sample-major] median=0.75×  max=1.86×  win=1  loss=25
+      [block-major]  median=0.64×  max=1.65×  win=1  loss=25
+      [super-mode]   median=0.88×  max=2.43×  win=1  loss=25
+
+Per owned-op size:
+
+      size  2  sample=0.80×  block=0.69×  super=0.94×  †super>block
+      size  3  sample=0.59×  block=0.55×  super=0.56×  †super>block
+      size  4  sample=0.51×  block=0.58×  super=0.59×  †super>block  *block>sample
+      size  5  sample=0.32×  block=0.52×  super=0.52×  *block>sample
+      size  8  sample=0.34×  block=0.48×  super=0.48×  *block>sample
+      size 16  sample=0.22×  block=0.41×  super=0.41×  *block>sample
+
+Super-mode is the median leader across all three generated
+executors (0.88× vs 0.75× vs 0.64×) and exposes the first
+generated row with `max > 2.0×` against node-loop. The
+recognizer matches **18 of 26 emitted rows** (17 `GainOut`,
+1 `AddGainOut`); the remaining 8 fall through to block-major
+and land at identical numbers to that variant by
+construction — exactly what the slice's "fallback is
+byte-equivalent" claim demands.
+
+What the slice does **not** produce: a `PreferGenerated`
+row in the profitability gate. The shapes super-mode wins on
+(`Gain → Out`, `Add → Gain → Out` and friends) are the same
+shapes §4.B's `RSinGainOut` / `RSawGainOut` / `RNoiseGainOut`
+/ etc. claim, so the gate verdict on those rows stays
+`CoveredByHandKernel`. The single `measured-win` row on the
+cost-lab corpus is similarly hand-kernel-covered. The
+generated executor is faster than a generic generator should
+be on its first day, but the rows it wins on already have a
+faster path through §4.B.
+
+The decision recorded in the 7.I note:
+
+  * Above `1.0×` on recognized rows? **Yes** (`max=2.43×`).
+  * Produces stable non-kernel `PreferGenerated` rows? **No**.
+
+That puts the slice in case 2 of the note's outcome ladder:
+super-mode is a middle path between node-loop and hand
+kernels; it stays read-only. Future slices may extend the
+recognizer set or pin a `PreferGenerated` row on a shape no
+§4.B kernel claims, but neither is justified by this
+slice's evidence alone.
+
+Snapshot pins added by this slice (55 total checks, up from
+46):
+
+- `cost-lab generated-super variant: considered count`     (28);
+- `cost-lab generated-super variant: emitted count`        (26);
+- `cost-lab generated-super variant: unsupported count`     (2);
+- `cost-lab generated-super variant: emitted rows stay
+  bit-exact` (correctness tripwire);
+- `cost-lab generated-super recognized count`             (18);
+- `cost-lab generated-super fallback count`                (8);
+- `cost-lab generated-super recognized-by-shape counts`
+  (`AddGainOut=1`, `GainOut=17`, `fallback=8`);
+- `generated-tail-sweep: every super-mode member emitted`   (6);
+- `generated-tail-sweep: every super-mode emitted row stays
+  bit-exact`;
+- per-family row counts bumped 5× → 6× to reflect the new
+  variant fan-out.
+
+Per the bench-noise discipline, super-mode's win/loss split,
+per-bucket medians, delta-vs-best-non-generated values, and
+the crossover-vs-node-loop length stay unpinned. The
+diagnostic text under `--fusion-cost-lab` is where to read
+them. Three new bit-exact tests in [test/Spec.hs](test/Spec.hs)
+cover `[Gain, Out]` (recognized), `[Add, Gain, Out]`
+(recognized), and a length-5 tail-sweep shape (fallback)
+under the super-mode path. The recognized tests also call
+`c_rt_graph_test_fusion_program_super_kind` to assert the
+classifier returns the right tag.
+
+Decision artifact:
+[notes/2026-05-12-phase-7i-superinstruction-probe.md](notes/2026-05-12-phase-7i-superinstruction-probe.md).
+
+Open follow-ups (in roughly the order the evidence suggests):
+
+- **Park generated fusion as a performance path.** 7.I is
+  the strongest evidence so far that the generic generator
+  cannot beat §4.B hand kernels on the shapes that have
+  them, and cannot beat node-loop on the shapes that
+  don't. Future generated-fusion work should be motivated
+  by a specific gap evidence pins down — not by "maybe a
+  better executor will help."
+- **Extend recognizer set only to unkerneled shapes.**
+  Adding `MulAddOut` / `AddGainAddGainOut` etc. is cheap,
+  but only worth doing for shapes that have **no** §4.B
+  kernel. The 7.G `generated-tail-sweep` family is the
+  obvious target. A length-3 add chain (`Add → Add → Add →
+  Out`) has no hand kernel and might produce the first
+  non-kernel `PreferGenerated` row.
+- **Packed instruction stream.** Still a real option for
+  closing the dispatch gap on fallback programs, but the
+  block-major numbers and the super-mode fallback numbers
+  are now identical — block-major is already paying near-
+  zero per-op dispatch cost. Packed instructions probably
+  trim a constant; they will not move the curve.
+- **Native codegen.** Highest-effort option. Not justified
+  by current evidence; the recognized path is already
+  near hand-kernel territory and the gate verdict stays
+  `CoveredByHandKernel` for those shapes anyway.
+- **Runtime turn-on.** Still parked until at least one
+  `PreferGenerated` row exists and survives multiple
+  snapshot runs. 7.I did not produce one.
+- **Stateful owned nodes.** Still deferred. The
+  arithmetic-tail story is now well-characterized; adding
+  oscillator/filter/env state to a generator that still
+  loses to node-loop on pure arithmetic adds lifecycle
+  cost to a path that does not pay back.
+
 ---
 
 ## Phase 8 — Authoring DSL and Composition Layer
