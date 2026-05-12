@@ -225,7 +225,12 @@ costLabChecks rows =
     -- emitting the tail as the owned suffix and leaving the prefix
     -- as node-loop work. This pulls in every existing chain that
     -- happens to end in that pair, not just the length-2 cases.
-    expectedGeneratedRows = 19
+    --
+    -- Phase 7.G step 3: the generator walks any stateless compute
+    -- tail (@KGain@ / @KAdd@) ending in a sink, so @KAdd -> KOut@
+    -- shapes now emit as well. Cost-lab rows move from
+    -- unsupported to emitted accordingly.
+    expectedGeneratedRows = 20
 
     -- §7.E step 5: pin the considered / unsupported split too.
     -- considered = one generated row per cost-lab member; it moves
@@ -234,7 +239,7 @@ costLabChecks rows =
     -- it moves only when the generator's shape coverage changes.
     -- Neither flaps with bench noise.
     expectedGeneratedConsidered  = 22
-    expectedGeneratedUnsupported = 3
+    expectedGeneratedUnsupported = 2
 
     generatedUnsupportedCount =
       length [() | r <- generatedRows, lrError r /= Nothing]
@@ -713,9 +718,16 @@ profitabilityGateChecks gateIdx snapshots =
     -- These numbers are for the smaller snapshot corpus
     -- (ssShapeRows <> ssEnsembleRows), not the wider
     -- --fusion-survey corpus that drives interactive output.
+    -- Phase 7.G step 3: the widened generator accepts KAdd-only
+    -- compute tails, so KAdd -> KOut and any other Add-rooted
+    -- shape now gets a generated measurement. The previous
+    -- unsupported KAdd -> KOut row plus one previously-no-gen
+    -- needs-benchmark row both have peer measurements available
+    -- and lose to them, so they reclassify as prefer-existing.
+    -- Net: needs-benchmark drops by 1.
     expectedTotal          = 23
-    expectedUnsupported    = 1
-    expectedNeedsBenchmark = 10
+    expectedUnsupported    = 0
+    expectedNeedsBenchmark = 9
     expectedCovered        = 10
 
 compileFailures :: [(String, Either String a)] -> [String]

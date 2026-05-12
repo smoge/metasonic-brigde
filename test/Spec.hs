@@ -903,6 +903,251 @@ fusionProgramExecutorTests =
       -- Verification target for §7.D step 7.
       genSamples @?= baseSamples
 
+  , testCase "generated [Gain, Gain, Out] mirrors the multi-scratch tail" $ do
+      -- Phase 7.G step 3: the generalized generator owns a
+      -- contiguous KGain/KAdd tail, mapping each non-sink node
+      -- to one scratch slot. This test hand-authors the program
+      -- the generator would emit for Sin → Gain → Gain → Out
+      -- (prefix [Sin] node-loop, owned tail [Gain, Gain, Out])
+      -- and verifies bit-exact equivalence with the stripped
+      -- node-loop baseline.
+      let nframes = 64
+          srcGraph = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            g1  <- gain osc 0.5
+            g2  <- gain g1  0.7
+            out 0 g2
+
+      baseRG <- case lowerGraph srcGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      length (rgNodes baseRG) @?= 4
+      let sinIdx   = NodeIndex 0
+          gain1Ix  = NodeIndex 1
+          gain2Ix  = NodeIndex 2
+          outIdx   = NodeIndex 3
+      map rnIndex (rgNodes baseRG) @?= [sinIdx, gain1Ix, gain2Ix, outIdx]
+
+      let baseline = baseRG
+            { rgRuntimeRegions =
+                [ r { rrExec = ExecNodeLoop }
+                | r <- rgRuntimeRegions baseRG
+                ]
+            }
+
+          prog = FusionProgram
+            { fpOps =
+                [ OpMul (ScratchIndex 0)
+                    (SrcInput sinIdx (PortIndex 0))
+                    (SrcConst 0.5)
+                , OpMul (ScratchIndex 1)
+                    (SrcScratch (ScratchIndex 0))
+                    (SrcConst 0.7)
+                , OpSinkWrite 0
+                    (SrcScratch (ScratchIndex 1))
+                    SinkAccumulate
+                ]
+            , fpScratchSlots = 2
+            }
+          sinRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 0
+            , rrRate      = SampleRate
+            , rrNodes     = [sinIdx]
+            , rrExec      = ExecNodeLoop
+            , rrFootprint = emptyResourceFootprint
+            }
+          genRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 1
+            , rrRate      = SampleRate
+            , rrNodes     = [gain1Ix, gain2Ix, outIdx]
+            , rrExec      = ExecGenerated (FusionProgramId 0)
+            , rrFootprint = emptyResourceFootprint
+            }
+          generated = baseRG
+            { rgRuntimeRegions = [sinRegion, genRegion]
+            , rgFusionPrograms = [prog]
+            }
+          cap = length (rgNodes baseRG)
+          render rg = withRTGraph cap nframes $ \rt -> do
+            loadRuntimeGraph rt rg
+            c_rt_graph_process rt (fromIntegral nframes)
+            allocaBytes (nframes * 4) $ \bp -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bp)
+              peekArray nframes (bp :: PtrCFloat)
+
+      baseSamples <- render baseline
+      genSamples  <- render generated
+      let peak = maximum (map (\(CFloat x) -> abs x) baseSamples)
+      assertBool ("baseline non-silent; peak=" <> show peak) (peak > 0.0)
+      genSamples @?= baseSamples
+
+  , testCase "generated [Add, Gain, Out] reads two prefix outputs" $ do
+      -- Phase 7.G step 3: KAdd op tests the SrcInput→SrcInput
+      -- path where the owned tail's first op consumes two
+      -- external (prefix) signals rather than a single one. The
+      -- second op then chains into KGain via SrcScratch.
+      let nframes = 64
+          srcGraph = runSynth $ do
+            a <- sinOsc 330.0 0.0
+            b <- sinOsc 440.0 0.0
+            s <- add a b
+            g <- gain s 0.5
+            out 0 g
+
+      baseRG <- case lowerGraph srcGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      length (rgNodes baseRG) @?= 5
+      let sinA = NodeIndex 0
+          sinB = NodeIndex 1
+          addI = NodeIndex 2
+          gainI = NodeIndex 3
+          outI = NodeIndex 4
+      map rnIndex (rgNodes baseRG) @?= [sinA, sinB, addI, gainI, outI]
+
+      let baseline = baseRG
+            { rgRuntimeRegions =
+                [ r { rrExec = ExecNodeLoop }
+                | r <- rgRuntimeRegions baseRG
+                ]
+            }
+
+          prog = FusionProgram
+            { fpOps =
+                [ OpAdd (ScratchIndex 0)
+                    (SrcInput sinA (PortIndex 0))
+                    (SrcInput sinB (PortIndex 0))
+                , OpMul (ScratchIndex 1)
+                    (SrcScratch (ScratchIndex 0))
+                    (SrcConst 0.5)
+                , OpSinkWrite 0
+                    (SrcScratch (ScratchIndex 1))
+                    SinkAccumulate
+                ]
+            , fpScratchSlots = 2
+            }
+          prefRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 0
+            , rrRate      = SampleRate
+            , rrNodes     = [sinA, sinB]
+            , rrExec      = ExecNodeLoop
+            , rrFootprint = emptyResourceFootprint
+            }
+          genRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 1
+            , rrRate      = SampleRate
+            , rrNodes     = [addI, gainI, outI]
+            , rrExec      = ExecGenerated (FusionProgramId 0)
+            , rrFootprint = emptyResourceFootprint
+            }
+          generated = baseRG
+            { rgRuntimeRegions = [prefRegion, genRegion]
+            , rgFusionPrograms = [prog]
+            }
+          cap = length (rgNodes baseRG)
+          render rg = withRTGraph cap nframes $ \rt -> do
+            loadRuntimeGraph rt rg
+            c_rt_graph_process rt (fromIntegral nframes)
+            allocaBytes (nframes * 4) $ \bp -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bp)
+              peekArray nframes (bp :: PtrCFloat)
+
+      baseSamples <- render baseline
+      genSamples  <- render generated
+      let peak = maximum (map (\(CFloat x) -> abs x) baseSamples)
+      assertBool ("baseline non-silent; peak=" <> show peak) (peak > 0.0)
+      genSamples @?= baseSamples
+
+  , testCase "generated [Add, Add, Gain, Out] chains three scratch slots" $ do
+      -- Phase 7.G step 3: deepest tail this slice's op set can
+      -- express. The second OpAdd consumes the first OpAdd's
+      -- scratch slot, exercising scratch-to-scratch dataflow.
+      let nframes = 64
+          srcGraph = runSynth $ do
+            a <- sinOsc 220.0 0.0
+            b <- sinOsc 330.0 0.0
+            c <- sinOsc 440.0 0.0
+            s1 <- add a b
+            s2 <- add s1 c
+            g  <- gain s2 0.5
+            out 0 g
+
+      baseRG <- case lowerGraph srcGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      length (rgNodes baseRG) @?= 7
+      let sin1 = NodeIndex 0
+          sin2 = NodeIndex 1
+          sin3 = NodeIndex 2
+          add1 = NodeIndex 3
+          add2 = NodeIndex 4
+          gainI = NodeIndex 5
+          outI = NodeIndex 6
+      map rnIndex (rgNodes baseRG)
+        @?= [sin1, sin2, sin3, add1, add2, gainI, outI]
+
+      let baseline = baseRG
+            { rgRuntimeRegions =
+                [ r { rrExec = ExecNodeLoop }
+                | r <- rgRuntimeRegions baseRG
+                ]
+            }
+
+          prog = FusionProgram
+            { fpOps =
+                [ OpAdd (ScratchIndex 0)
+                    (SrcInput sin1 (PortIndex 0))
+                    (SrcInput sin2 (PortIndex 0))
+                , OpAdd (ScratchIndex 1)
+                    (SrcScratch (ScratchIndex 0))
+                    (SrcInput sin3 (PortIndex 0))
+                , OpMul (ScratchIndex 2)
+                    (SrcScratch (ScratchIndex 1))
+                    (SrcConst 0.5)
+                , OpSinkWrite 0
+                    (SrcScratch (ScratchIndex 2))
+                    SinkAccumulate
+                ]
+            , fpScratchSlots = 3
+            }
+          prefRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 0
+            , rrRate      = SampleRate
+            , rrNodes     = [sin1, sin2, sin3]
+            , rrExec      = ExecNodeLoop
+            , rrFootprint = emptyResourceFootprint
+            }
+          genRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 1
+            , rrRate      = SampleRate
+            , rrNodes     = [add1, add2, gainI, outI]
+            , rrExec      = ExecGenerated (FusionProgramId 0)
+            , rrFootprint = emptyResourceFootprint
+            }
+          generated = baseRG
+            { rgRuntimeRegions = [prefRegion, genRegion]
+            , rgFusionPrograms = [prog]
+            }
+          cap = length (rgNodes baseRG)
+          render rg = withRTGraph cap nframes $ \rt -> do
+            loadRuntimeGraph rt rg
+            c_rt_graph_process rt (fromIntegral nframes)
+            allocaBytes (nframes * 4) $ \bp -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bp)
+              peekArray nframes (bp :: PtrCFloat)
+
+      baseSamples <- render baseline
+      genSamples  <- render generated
+      let peak = maximum (map (\(CFloat x) -> abs x) baseSamples)
+      assertBool ("baseline non-silent; peak=" <> show peak) (peak > 0.0)
+      genSamples @?= baseSamples
+
   , testCase "invalid generated program fails before clearing previous graph" $ do
       let nframes = 64
           srcGraph = runSynth $ do

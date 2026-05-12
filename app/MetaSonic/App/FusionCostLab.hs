@@ -602,51 +602,106 @@ generateForCostLab rg =
 -- prefix (@fcMembers@ minus the owned suffix) continues to render
 -- as node-loop inside the host region's pre-slice.
 --
--- Phase 7.E recognizes any candidate whose last two members are
--- @[KGain, KOut]@ or @[KGain, KBusOut]@ and returns that pair as
--- the owned suffix. Length-2 candidates reproduce the 7.D
--- behavior exactly (empty prefix, full-candidate suffix); longer
--- candidates (e.g. @[KPulseOsc, KGain, KOut]@,
--- @[KTriOsc, KLPF, KGain, KOut]@) keep their prefix as node-loop
--- work and only generate the tail.
+-- Phase 7.G generalizes the generator from the fixed
+-- @[KGain, KOut]@ / @[KGain, KBusOut]@ shape to any maximal
+-- trailing run of stateless compute nodes (@KGain@, @KAdd@)
+-- followed by a sink (@KOut@ / @KBusOut@). Each owned non-sink
+-- node maps to one scratch slot; inputs from owned siblings
+-- become 'SrcScratch', other inputs stay 'SrcInput' / 'SrcConst'.
+-- The v1 op set ('OpAdd', 'OpMul', 'OpSinkWrite') stays frozen.
 generateProgram
   :: RuntimeGraph
   -> FusionCandidate
   -> Either String (FusionProgram, [NodeIndex])
 generateProgram rg c =
-  case (reverse (fcMembers c), reverse (fcMemberKinds c)) of
-    (outIx : gainIx : _, sinkKind : KGain : _)
-      | sinkKind == KOut || sinkKind == KBusOut -> do
-          prog <- gainOutProgram rg gainIx outIx
-          Right (prog, [gainIx, outIx])
-    _ -> Left "generated: candidate shape not implemented yet"
+  case ownedTailOfCandidate c of
+    Nothing    -> Left "generated: candidate has no eligible owned tail"
+    Just owned -> do
+      prog <- emitTailProgram rg owned
+      Right (prog, owned)
 
--- | Emit the @KGain -> {KOut, KBusOut}@ tail program. Shared
--- between the standalone @[KGain, KOut]@ candidate and any longer
--- candidate whose suffix is this shape (Phase 7.E step 3+).
-gainOutProgram
+-- | Return the maximal contiguous suffix of @fcMembers@ that the
+-- generator can own under the v1 op set: a sink ('KOut' or
+-- 'KBusOut') preceded by a (possibly empty) run of stateless
+-- compute nodes ('KGain' / 'KAdd'). Returns 'Nothing' if the
+-- candidate has no sink, or if the only owned slice would be
+-- the sink alone with no compute (length-1 suffixes are not
+-- worth emitting — see 'PreferExisting' path in the gate).
+ownedTailOfCandidate :: FusionCandidate -> Maybe [NodeIndex]
+ownedTailOfCandidate c =
+  case reverse (zip (fcMembers c) (fcMemberKinds c)) of
+    ((sinkIx, sinkKind) : rest)
+      | sinkKind == KOut || sinkKind == KBusOut ->
+          let compute = takeWhile (statelessCompute . snd) rest
+          in if null compute
+               then Nothing
+               else Just (reverse (map fst compute) ++ [sinkIx])
+    _ -> Nothing
+  where
+    statelessCompute KGain = True
+    statelessCompute KAdd  = True
+    statelessCompute _     = False
+
+-- | Emit a 'FusionProgram' for an owned-tail slice. The last
+-- 'NodeIndex' must be the sink; earlier indices are the
+-- contiguous compute nodes feeding it. Each compute node gets
+-- one scratch slot in emission order; the sink op reads from
+-- the slot of whichever owned node feeds it (or directly from
+-- 'SrcInput' / 'SrcConst' when the sink's input is external).
+emitTailProgram
   :: RuntimeGraph
-  -> NodeIndex
-  -> NodeIndex
+  -> [NodeIndex]
   -> Either String FusionProgram
-gainOutProgram rg gainIx outIx = do
-  gainNode <- lookupRtNode rg gainIx
-  outNode  <- lookupRtNode rg outIx
-  case rnInputs gainNode of
-    [signalIn, amountIn] -> do
-      signal <- inputAsSource signalIn
-      amount <- inputAsSource amountIn
-      bus    <- busFromControls (rnControls outNode)
-      Right FusionProgram
-        { fpOps =
-            [ OpMul (ScratchIndex 0) signal amount
-            , OpSinkWrite bus
-                (SrcScratch (ScratchIndex 0))
-                SinkAccumulate
-            ]
-        , fpScratchSlots = 1
-        }
-    _ -> Left "generated: gain node has unexpected input arity"
+emitTailProgram _  []    = Left "generated: empty owned slice"
+emitTailProgram rg owned =
+  let nonSink = init owned
+      sinkIx  = last owned
+      slotMap = M.fromList (zip nonSink (map ScratchIndex [0 ..]))
+  in do
+    computeOps <- mapM (emitComputeOp rg slotMap) nonSink
+    sinkOp     <- emitSinkOp rg slotMap sinkIx
+    Right FusionProgram
+      { fpOps          = computeOps ++ [sinkOp]
+      , fpScratchSlots = length nonSink
+      }
+
+emitComputeOp
+  :: RuntimeGraph
+  -> M.Map NodeIndex ScratchIndex
+  -> NodeIndex
+  -> Either String FusionOp
+emitComputeOp rg slotMap nodeIx = do
+  node <- lookupRtNode rg nodeIx
+  let slot = slotMap M.! nodeIx
+  case (rnKind node, rnInputs node) of
+    (KGain, [sigIn, amtIn]) -> do
+      signal <- inputAsSource slotMap sigIn
+      amount <- inputAsSource slotMap amtIn
+      Right (OpMul slot signal amount)
+    (KGain, _) ->
+      Left "generated: gain node has unexpected input arity"
+    (KAdd,  [lhsIn, rhsIn]) -> do
+      left  <- inputAsSource slotMap lhsIn
+      right <- inputAsSource slotMap rhsIn
+      Right (OpAdd slot left right)
+    (KAdd, _) ->
+      Left "generated: add node has unexpected input arity"
+    (other, _) ->
+      Left ("generated: unsupported kind in owned tail: " <> show other)
+
+emitSinkOp
+  :: RuntimeGraph
+  -> M.Map NodeIndex ScratchIndex
+  -> NodeIndex
+  -> Either String FusionOp
+emitSinkOp rg slotMap sinkIx = do
+  sinkNode <- lookupRtNode rg sinkIx
+  bus      <- busFromControls (rnControls sinkNode)
+  case rnInputs sinkNode of
+    [sigIn] -> do
+      signal <- inputAsSource slotMap sigIn
+      Right (OpSinkWrite bus signal SinkAccumulate)
+    _ -> Left "generated: sink node has unexpected input arity"
 
 lookupRtNode :: RuntimeGraph -> NodeIndex -> Either String RuntimeNode
 lookupRtNode rg ix =
@@ -654,10 +709,19 @@ lookupRtNode rg ix =
     (n : _) -> Right n
     []      -> Left "generated: dangling NodeIndex in candidate"
 
-inputAsSource :: RuntimeInput -> Either String FusionSource
-inputAsSource (RFrom n p) = Right (SrcInput n p)
-inputAsSource (RConst v)  = Right (SrcConst v)
-inputAsSource (RFused _)  =
+-- | Map a 'RuntimeInput' to a 'FusionSource', routing references
+-- to owned-tail siblings through their scratch slot and leaving
+-- external references as 'SrcInput' / 'SrcConst'.
+inputAsSource
+  :: M.Map NodeIndex ScratchIndex
+  -> RuntimeInput
+  -> Either String FusionSource
+inputAsSource slotMap (RFrom n p) =
+  case M.lookup n slotMap of
+    Just s  -> Right (SrcScratch s)
+    Nothing -> Right (SrcInput n p)
+inputAsSource _ (RConst v) = Right (SrcConst v)
+inputAsSource _ (RFused _) =
   Left "generated: RFused inputs not supported"
 
 busFromControls :: [Double] -> Either String Int
