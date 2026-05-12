@@ -1722,12 +1722,36 @@ Decision notes:
 - [Phase 7.C planner decision](notes/2026-05-11-phase-7c-planner-decision.md).
 - [Phase 7.C cost-model join decision](notes/2026-05-11-phase-7c-cost-model-join-decision.md).
 
-Open follow-ups inside 7.C: shrink `needs-benchmark` by growing
-cost-lab families to cover the corpus's generated-eligible shapes,
-optional stateful-interior allow-list expansion gated on cost-lab
-evidence, `KOut`-as-non-terminal de-prioritization in the rejection
-diagnostic, and broader shape-key feature axes (e.g., `(sinkKind,
-totalLatency)`) once a shape's profitability splits along them.
+7.C gate hardened: the cost-lab side now filters non-exact rows from
+the shape index, the join applies a `measuredWinThreshold` (1.05×) so
+bench-noise wins don't flip across runs, the survey speedup column
+renders to two decimals, and the shape key carries a `KGain.amount`
+scalar-vs-wired feature axis.
+
+Add-chain benchmark coverage landed: a four-member `add-chain`
+cost-lab family isolates `KAdd → KOut`, `KAdd → KLPF → KGain → KOut`,
+and the two nested-Add variants by parking the Add at the source of
+an accepted candidate (an upstream Sin fanout rejects the
+Sin-rooted superset). The four shapes now classify as
+`measured-loss` — current region-kernel and RFused paths do not
+beat the node-loop baseline on Add-chains. The snapshot-corpus
+`needs-benchmark` count moved 14 → 9 (5 Add-rooted shapes
+reclassified); measured-loss moved 4 → 9.
+
+7.D target list is now evidence-backed. The remaining
+`needs-benchmark` shapes (9 in the snapshot, 14 in the full survey)
+are the explicit "missing measurement" list — pick the next
+cost-lab family from there before the executor lands.
+
+Open follow-ups inside 7.C: continue shrinking `needs-benchmark` by
+growing cost-lab families (`KEnv → KGain → KOut`,
+`KDelay → KGain → KOut`, `KSmooth → KGain → KOut`,
+`KPulseOsc/KTriOsc` variants are the most-frequent uncovered
+shapes); optional stateful-interior allow-list expansion gated on
+those measurements; `KOut`-as-non-terminal de-prioritization in the
+rejection diagnostic; broader shape-key feature axes (e.g.,
+`(sinkKind, totalLatency)`) once a shape's profitability splits
+along them.
 
 ### Phase 7.D — Runtime Program ABI and Tiny Executor
 
