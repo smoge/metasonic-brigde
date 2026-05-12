@@ -6858,9 +6858,10 @@ static void finish_global_schedule_instance_blocks(RTGraph &g) noexcept {
 //
 // Sink writes go through 'SinkAccumulator' with the region's
 // writer slot, matching the §4.E.2 contribution machinery the
-// hand-written kernels already use. v1 only emits 'SinkOverwrite'
-// programs; the policy field is preserved in the ABI but does not
-// change interpreter behavior today.
+// hand-written kernels already use. Generated programs that model
+// KOut/KBusOut sinks emit 'SinkAccumulate'. 'SinkOverwrite' remains
+// a reserved ABI tag for a future true overwrite path; the policy
+// field is preserved but does not change interpreter behavior today.
 //
 // Bounded scratch: programs declaring more than 'kMaxScratchSlots'
 // slots silent-no-op rather than spill. The bound is generous (64

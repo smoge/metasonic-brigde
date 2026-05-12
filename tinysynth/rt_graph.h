@@ -543,13 +543,14 @@ void rt_graph_template_program_mul(
     int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
     int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b);
 
-// [T:construction] Phase 7.D: append an OpSinkWrite op. Writes or
-// accumulates the source value into output bus @bus_index@ at the
-// current sample. sink_policy mirrors Haskell's 'SinkPolicy' tag:
-//   0 = SinkOverwrite (replace the previous sample value)
-//   1 = SinkAccumulate (add to the previous sample value)
-// v1 only emits SinkOverwrite; SinkAccumulate is in the ABI so a
-// future multi-writer slice does not have to widen the entry.
+// [T:construction] Phase 7.D: append an OpSinkWrite op. Writes the
+// source value into output bus @bus_index@ at the current sample.
+// sink_policy mirrors Haskell's 'SinkPolicy' tag:
+//   0 = SinkOverwrite (reserved for a future true overwrite path)
+//   1 = SinkAccumulate (KOut/KBusOut-style bus accumulation)
+// v1 accepts both tags but routes both through the existing sink
+// contribution accumulator; generated KOut/KBusOut-equivalent
+// programs should emit SinkAccumulate.
 // Silent no-op on invalid handles or an unknown sink_policy.
 void rt_graph_template_program_sink_write(
     RTGraph *g, int template_id, int program_id,
@@ -564,10 +565,9 @@ void rt_graph_template_program_sink_write(
 // MetaDef::fusion_programs[program_id] rather than from the
 // hand-written kernel set.
 //
-// Until the interpreter lands (§7.D step 5), this entry stores the
-// region's program_id reference; process_instance still falls
-// through to per-node dispatch on these regions. The Haskell
-// loader uses it today only for round-trip ABI tests.
+// The region's program_id reference is resolved at construction
+// time; process_instance dispatches generated regions through the
+// tiny interpreter.
 //
 // Silent no-op on invalid template_id, program_id, or
 // first_node/node_count out of range.

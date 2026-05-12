@@ -44,13 +44,13 @@
 --     translates rows back into the explainable-recommendation form
 --     the cost model will eventually emit.
 --
--- Out of slice 1: generated-fusion variant (the runtime doesn't have
--- one yet; the column slot is reserved but never populated), CSV
--- output, parametric size sweeps beyond a fixed small set,
--- multi-instance / multi-template benchmarks, and the
--- profitability-recommendation labels themselves — slice 1 prints
--- speedups so a human can read them; slice 4+ turns them into
--- /Fuse/ // /DoNotFuse/ // /NeedsBenchmark/ decisions.
+-- Original slice 1 out-of-scope items still parked: CSV output,
+-- parametric size sweeps beyond a fixed small set, multi-instance /
+-- multi-template benchmarks, and the profitability-recommendation
+-- labels themselves. Phase 7.D added the generated-fusion variant as
+-- a measured path; the lab still prints speedups so a human can read
+-- them before later slices turn rows into /Fuse/ // /DoNotFuse/ //
+-- /NeedsBenchmark/ decisions.
 --
 -- See [notes/2026-05-11-phase-7a-fusion-cost-lab-design.md].
 
@@ -92,6 +92,8 @@ import           GHC.Clock                  (getMonotonicTimeNSec)
 import           Text.Printf                (printf)
 
 import           MetaSonic.Bridge.Compile
+import           MetaSonic.Bridge.Compile.Dependencies
+                                            (regionResourceFootprint)
 import           MetaSonic.Bridge.Compile.FusionProgram
                                             (FusionOp (..),
                                              FusionProgram (..),
@@ -578,7 +580,7 @@ generateProgram rg c = case (fcMembers c, fcMemberKinds c) of
               [ OpMul (ScratchIndex 0) signal amount
               , OpSinkWrite bus
                   (SrcScratch (ScratchIndex 0))
-                  SinkOverwrite
+                  SinkAccumulate
               ]
           , fpScratchSlots = 1
           }
@@ -616,7 +618,7 @@ patchForGenerated rg c prog =
   in case break hostsCand regions of
        (_, []) -> Left "generated: candidate's region not found"
        (regsPre, region : regsPost) -> do
-         (mPre, candRegion, mPost) <- splitRegion region candMembers
+         (mPre, candRegion, mPost) <- splitRegion rg region candMembers
          let split      = catMaybes [mPre, Just candRegion, mPost]
              allRegions = regsPre <> split <> regsPost
              renumbered =
@@ -629,25 +631,27 @@ patchForGenerated rg c prog =
            }
 
 splitRegion
-  :: RuntimeRegion
+  :: RuntimeGraph
+  -> RuntimeRegion
   -> [NodeIndex]
   -> Either String
        ( Maybe RuntimeRegion
        , RuntimeRegion
        , Maybe RuntimeRegion
        )
-splitRegion region candMembers =
+splitRegion rg region candMembers =
   let members = rrNodes region
       pre     = takeWhile (`notElem` candMembers) members
       rest    = drop (length pre) members
       cand    = take (length candMembers) rest
       post    = drop (length candMembers) rest
+      nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
       mkRegion nodes ex = RuntimeRegion
         { rrIndex     = RegionIndex 0  -- renumbered by caller
         , rrRate      = rrRate region
         , rrNodes     = nodes
         , rrExec      = ex
-        , rrFootprint = rrFootprint region
+        , rrFootprint = regionResourceFootprint nodeMap nodes
         }
   in if cand /= candMembers
        then Left "generated: candidate not contiguous within its region"

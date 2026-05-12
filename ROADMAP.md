@@ -105,13 +105,13 @@ Parked / deferred:
       today. No further §4.E implementation work until a real workload
       demands it.
 
-  - Whole-region generated fusion. No generated-runtime path is active
-      today. Hand-written DSP bodies plus narrow helpers
+  - Whole-region generated fusion. A generated-runtime path now exists
+      for Phase 7.D experiments, but it remains opt-in and
+      cost-lab-only. Hand-written DSP bodies plus narrow helpers
       (`SinkAccumulator`, `drive_oscillator`) remain the working
-      approach for Phase 4-era kernels. Phase 7 reframes general
-      fusion as an evidence-gated compiler backend: cost lab first,
-      then fusion IR / planner / executor only where measurements
-      justify it.
+      approach for Phase 4-era kernels. Phase 7 keeps general fusion
+      evidence-gated: cost lab first, then planner / executor
+      widening only where measurements justify it.
 
   - Filtered/stateful kernel expansion. Gated behind survey
       recurrence + benchmark evidence (§4.B.x). Tri/Pulse/Add filtered
@@ -1714,9 +1714,11 @@ Surface:
   that should trigger exactly that reason, plus the
   §4.B-matched-acceptance case.
 
-No `FusionProgram` opcode encoding, no C ABI, no runtime program
-table — those belong to Phase 7.D. The cost-model join is
-diagnostic only and makes no execution decision.
+7.C remains diagnostic-only: it selects and classifies candidates but
+does not emit `FusionProgram`s or turn generated execution on. The
+runtime ABI, program table, and tiny interpreter landed in Phase 7.D;
+planner-to-executor emission and profitability decisions still belong
+to the later gate.
 
 Decision notes:
 - [Phase 7.C planner decision](notes/2026-05-11-phase-7c-planner-decision.md).
@@ -1742,12 +1744,11 @@ Dynamic-gain benchmark coverage landed: a three-member
 `KSinOsc → KGain → KGain → KOut` with `gain=dynamic,const`. Each
 member wires a slow `SinOsc` modulator into `KGain.amount` so the
 gain lowers to `RFrom` on that slot rather than `RConst`.
-These rows are measurement coverage, not a turn-on target: the
-dynamic-saw row currently has no §4.B kernel or RFused claim in the
-cost-lab feature columns, so apparent wins over the stripped node-loop
-baseline are same-path timing variance until a generated executor
-exists as a fourth measured variant. Dynamic-gain therefore gives 7.D
-a clean ABI/equivalence probe, but not a profitability decision yet.
+These rows are measurement coverage, not a turn-on target. Before the
+7.D generated variant existed, apparent dynamic-saw wins over the
+stripped node-loop baseline were same-path timing variance. With
+`VarGenerated` now measured directly, the executor can be judged as
+its own fourth path rather than inferred from region scheduling noise.
 
 Snapshot-corpus `needs-benchmark` count moved 14 → 9 → 6 across the
 Add-chain and dynamic-gain slices; total measured count moved
@@ -1762,11 +1763,9 @@ split would force the snapshot to chase bench noise. `covered` and
 are concentrated on stateful sources outside the planner's
 allow-list (`KEnv`, `KDelay`, `KSmooth`, `KPulseOsc`, `KTriOsc`)
 and a couple of `KGain → KOut gain=const` / `KSinOsc → KOut`
-residuals. The first 7.D implementation target should be
-ABI/executor-equivalence for the safe subset — scalar read, input read,
-add, multiply, sink write — with dynamic-gain shapes serving as early
-hand-authored program probes once the generated executor can be timed
-directly.
+residuals. These gaps motivated the 7.D ABI/equivalence-first slice:
+land the executor surface, then measure generated rows directly
+before any planner turn-on.
 
 Open follow-ups inside 7.C: continue shrinking `needs-benchmark` by
 growing cost-lab families. Next candidates: `KPulseOsc/KTriOsc`
@@ -1781,8 +1780,9 @@ profitability splits along them.
 
 ### Phase 7.D — Runtime Program ABI and Tiny Executor
 
-Only after the cost lab and survey-only planner exist, add a runtime
-program table and a tiny executor for a safe subset:
+[x] First slice landed. The runtime now has a generated-program ABI,
+per-template `FusionProgram` table, `ExecGenerated FusionProgramId`
+region selector, and a tiny C++ interpreter for the safe subset:
 
 - scalar read;
 - input read;
@@ -1790,9 +1790,24 @@ program table and a tiny executor for a safe subset:
 - multiply;
 - sink write.
 
-This intentionally overlaps with `RFused`; the overlap gives a
-low-risk equivalence target before stateful source/filter programs are
-attempted.
+The Haskell loaders validate generated program tables before clearing
+the runtime handle: scratch slot bounds, scratch read-before-write,
+node/control references, and generated region program IDs fail loudly
+on the Haskell side. The C++ runtime still range-checks direct ABI
+callers.
+
+`--fusion-cost-lab` gained `VarGenerated` as a fourth measured variant
+and a tiny code generator for `[KGain, KOut]` / `[KGain, KBusOut]`
+candidates. The generated rows are bit-exact against `RNodeLoop`, but
+the first measurements are slower than node-loop on the small shapes
+tested (`dynamic-gain/gain-dyn-out` around 0.66x,
+`corpus/pattern/spectral-freeze/texture` around 0.87x). That is useful
+evidence: 7.D proves the architecture and equivalence path, not an
+automatic turn-on.
+
+Open follow-ups: widen the generator to longer chains only after the
+cost lab can measure them as generated rows, and keep planner-driven
+emission behind Phase 7.F's profitability gate.
 
 ### Phase 7.E — Generated Equivalents of Current Kernel Shapes
 

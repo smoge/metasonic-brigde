@@ -823,8 +823,8 @@ data RuntimeRegion = RuntimeRegion
     -- ^ Region dispatch selector. 'ExecNodeLoop' on every region
     -- produced by 'formRegions'; 'selectRegionKernels' may upgrade
     -- some regions to 'ExecKernel' after splitting. 'ExecGenerated'
-    -- is reserved for §7.D generated programs and is not produced
-    -- by 'compileRuntimeGraph' today.
+    -- is the §7.D generated-program path; it is not produced by
+    -- 'compileRuntimeGraph' today.
     --
     -- See Note [Region execution selector] and the
     -- backward-compatible 'rrKernel' accessor for the previous
@@ -869,9 +869,9 @@ data RuntimeGraph = RuntimeGraph
   , rgRuntimeRegions  :: ![RuntimeRegion]
   , rgFusionPrograms  :: ![FusionProgram]
     -- ^ §7.D generated-fusion program table. Empty for every
-    -- graph 'compileRuntimeGraph' produces today; populated by a
-    -- later slice when the planner is wired to emit generated
-    -- programs. Indexed by 'FusionProgramId' through
-    -- 'ExecGenerated' references in 'rrExec'.
+    -- graph 'compileRuntimeGraph' produces today; populated by
+    -- generated cost-lab variants and, later, by planner-driven
+    -- emission. Indexed by 'FusionProgramId' through 'ExecGenerated'
+    -- references in 'rrExec'.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)

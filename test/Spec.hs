@@ -765,7 +765,7 @@ fusionProgramScaffoldTests =
                     (SrcScratch (ScratchIndex 1))
                 , OpSinkWrite 0
                     (SrcScratch (ScratchIndex 2))
-                    SinkOverwrite
+                    SinkAccumulate
                 ]
             , fpScratchSlots = 3
             }
@@ -860,7 +860,7 @@ fusionProgramExecutorTests =
                     (SrcConst 0.5)
                 , OpSinkWrite 0
                     (SrcScratch (ScratchIndex 0))
-                    SinkOverwrite
+                    SinkAccumulate
                 ]
             , fpScratchSlots = 1
             }
@@ -902,6 +902,59 @@ fusionProgramExecutorTests =
 
       -- Verification target for §7.D step 7.
       genSamples @?= baseSamples
+
+  , testCase "invalid generated program fails before clearing previous graph" $ do
+      let nframes = 64
+          srcGraph = runSynth $ do
+            osc <- sinOsc 220.0 0.0
+            gn  <- gain osc 0.4
+            out 0 gn
+
+      baseRG <- case lowerGraph srcGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      let badProgram = FusionProgram
+            { fpOps =
+                [ OpLoadConst (ScratchIndex 0) 1.0
+                , OpSinkWrite 0
+                    (SrcScratch (ScratchIndex 0))
+                    SinkAccumulate
+                ]
+            , fpScratchSlots = 65
+            }
+          badRG = baseRG { rgFusionPrograms = [badProgram] }
+          renderPeak rt = do
+            c_rt_graph_process rt (fromIntegral nframes)
+            samples <- allocaBytes (nframes * 4) $ \bp -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bp)
+              peekArray nframes (bp :: PtrCFloat)
+            pure (maximum (map (\(CFloat x) -> abs x) samples))
+
+      withRTGraph (length (rgNodes baseRG)) nframes $ \rt -> do
+        loadRuntimeGraph rt baseRG
+        before <- renderPeak rt
+        assertBool
+          ("expected pre-failure graph to render, peak=" <> show before)
+          (before > 0.0)
+
+        let attempt :: IO (Either IOError ())
+            attempt = try $ loadRuntimeGraph rt badRG
+        result <- attempt
+        case result of
+          Right () ->
+            assertFailure "expected generated-program validation to fail"
+          Left e ->
+            assertBool
+              ("expected generated scratch diagnostic in: " <> show e)
+              ("scratch slots" `isInfixOf` show e)
+
+        afterPeak <- renderPeak rt
+        assertBool
+          ("expected previous graph to survive failed load, peak="
+           <> show afterPeak)
+          (afterPeak > 0.0)
   ]
 
 -- | Tally a 'SynthGraph' by 'NodeKind' for shape-pinning tests.

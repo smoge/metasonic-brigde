@@ -190,8 +190,7 @@ import           MetaSonic.Bridge.Compile.FusionProgram
                                              FusionProgram (..),
                                              FusionProgramId (..),
                                              FusionSource (..),
-                                             ScratchIndex (..),
-                                             SinkPolicy (..))
+                                             ScratchIndex (..))
 import           MetaSonic.Bridge.Source    (MigrationKey (..),
                                              migrationKeyUtf8Bytes)
 import           MetaSonic.Bridge.Templates (BufferFootprint (..),
@@ -961,7 +960,9 @@ foreign import ccall unsafe "rt_graph_template_program_mul"
     -> IO ()
 
 -- | Phase 7.D: append an OpSinkWrite op. @sink_policy@ matches
--- the Haskell 'SinkPolicy' Enum (0 = Overwrite, 1 = Accumulate).
+-- the Haskell 'SinkPolicy' Enum (0 = reserved overwrite,
+-- 1 = accumulate). The v1 interpreter accepts both tags but routes
+-- both through the existing sink contribution path.
 foreign import ccall unsafe "rt_graph_template_program_sink_write"
   c_rt_graph_template_program_sink_write
     :: Ptr RTGraph -> CInt -> CInt
@@ -1620,6 +1621,152 @@ addRegionTo g cTid r =
                cRate cFirst cCount
                (fromIntegral pid)
 
+maxGeneratedScratchSlots :: Int
+maxGeneratedScratchSlots = 64
+
+-- | Validate generated-fusion program tables before any loader calls
+-- 'c_rt_graph_clear'. The C++ runtime still range-checks direct ABI
+-- callers, but Haskell loaders should fail loudly and preserve the
+-- previously loaded graph when a generated table is malformed.
+validateGeneratedPrograms :: RuntimeGraph -> Either String ()
+validateGeneratedPrograms rg = do
+  forM_ (zip [0 :: Int ..] (rgFusionPrograms rg)) $
+    \(pid, prog) -> validateFusionProgram rg pid prog
+  forM_ (rgRuntimeRegions rg) validateRegionProgramRef
+  where
+    programCount = length (rgFusionPrograms rg)
+
+    validateRegionProgramRef region =
+      case rrExec region of
+        ExecGenerated (FusionProgramId pid)
+          | pid < 0 ->
+              reject $
+                "region " <> show (rrIndex region)
+                <> " references negative FusionProgramId "
+                <> show pid
+          | pid >= programCount ->
+              reject $
+                "region " <> show (rrIndex region)
+                <> " references FusionProgramId " <> show pid
+                <> ", but table has " <> show programCount
+                <> " programs"
+          | otherwise -> Right ()
+        _ -> Right ()
+
+validateFusionProgram
+  :: RuntimeGraph -> Int -> FusionProgram -> Either String ()
+validateFusionProgram rg pid prog = do
+  when (slotCount < 0) $
+    reject $
+      "program " <> show pid
+      <> " declares negative scratch slot count "
+      <> show slotCount
+  when (slotCount > maxGeneratedScratchSlots) $
+    reject $
+      "program " <> show pid
+      <> " declares " <> show slotCount
+      <> " scratch slots; max is "
+      <> show maxGeneratedScratchSlots
+  when (null (fpOps prog)) $
+    reject $
+      "program " <> show pid
+      <> " has no ops"
+  go S.empty (zip [0 :: Int ..] (fpOps prog))
+  where
+    slotCount = fpScratchSlots prog
+
+    go _ [] = Right ()
+    go written ((opIx, op) : rest) = do
+      written' <- validateFusionOp written opIx op
+      go written' rest
+
+    validateFusionOp written opIx op =
+      case op of
+        OpLoadConst dst _ -> writeScratch written opIx dst
+        OpLoadInput dst node port -> do
+          validateNodeOutputRef pid opIx node port
+          writeScratch written opIx dst
+        OpAdd dst src1 src2 -> do
+          validateSource written opIx src1
+          validateSource written opIx src2
+          writeScratch written opIx dst
+        OpMul dst src1 src2 -> do
+          validateSource written opIx src1
+          validateSource written opIx src2
+          writeScratch written opIx dst
+        OpSinkWrite bus src _ -> do
+          when (bus < 0) $
+            reject $
+              opPrefix pid opIx
+              <> "writes negative bus index "
+              <> show bus
+          validateSource written opIx src
+          Right written
+
+    writeScratch written opIx (ScratchIndex dst) = do
+      validateScratchIndex pid opIx "writes scratch" dst
+      Right (S.insert dst written)
+
+    validateSource written opIx src =
+      case src of
+        SrcConst _ -> Right ()
+        SrcInput node port ->
+          validateNodeOutputRef pid opIx node port
+        SrcControl node control ->
+          validateControlRef pid opIx node control
+        SrcScratch (ScratchIndex ix) -> do
+          validateScratchIndex pid opIx "reads scratch" ix
+          unless (S.member ix written) $
+            reject $
+              opPrefix pid opIx
+              <> "reads scratch " <> show ix
+              <> " before it is written"
+
+    validateNodeOutputRef p opIx node (PortIndex port) = do
+      _ <- lookupRuntimeNode p opIx node
+      when (port < 0) $
+        reject $
+          opPrefix p opIx
+          <> "reads negative output port "
+          <> show port
+
+    validateControlRef p opIx node (ControlIndex control) = do
+      rtNode <- lookupRuntimeNode p opIx node
+      when (control < 0 || control >= length (rnControls rtNode)) $
+        reject $
+          opPrefix p opIx
+          <> "reads control " <> show control
+          <> " on " <> show node
+          <> ", but node has "
+          <> show (length (rnControls rtNode))
+          <> " controls"
+
+    lookupRuntimeNode p opIx node =
+      case [rtNode | rtNode <- rgNodes rg, rnIndex rtNode == node] of
+        rtNode : _ -> Right rtNode
+        [] ->
+          reject $
+            opPrefix p opIx
+            <> "references unknown node "
+            <> show node
+
+    validateScratchIndex p opIx role ix =
+      when (ix < 0 || ix >= slotCount) $
+        reject $
+          opPrefix p opIx
+          <> role <> " " <> show ix
+          <> if slotCount <= 0
+               then " outside declared scratch slots (none)"
+               else " outside declared scratch slot range 0.."
+                    <> show (slotCount - 1)
+
+opPrefix :: Int -> Int -> String
+opPrefix pid opIx =
+  "program " <> show pid <> ", op " <> show opIx <> ": "
+
+reject :: String -> Either String a
+reject msg = Left ("generated fusion validation: " <> msg)
+
 -- | Phase 7.D: push one template's generated-fusion programs into
 -- the C runtime. Programs must be pushed /before/ any region that
 -- references one by 'FusionProgramId' is registered (regions look
@@ -1777,6 +1924,9 @@ loadRuntimeGraph g rg = do
   steps <- case layeredRegionSchedule rg of
     Right ss -> pure ss
     Left err -> fail $ "loadRuntimeGraph: " <> err
+  case validateGeneratedPrograms rg of
+    Right ()  -> pure ()
+    Left err  -> fail $ "loadRuntimeGraph: " <> err
   c_rt_graph_clear g
   -- §6.C.5: writer templates are monophonic at the loader boundary.
   -- The Haskell clamp is declarative; the runtime in rt_graph.cpp
@@ -1899,6 +2049,9 @@ loadRuntimeGraphFused g rg = do
   steps <- case layeredRegionSchedule rg of
     Right ss -> pure ss
     Left err -> fail $ "loadRuntimeGraphFused: " <> err
+  case validateGeneratedPrograms rg of
+    Right ()  -> pure ()
+    Left err  -> fail $ "loadRuntimeGraphFused: " <> err
   c_rt_graph_clear g
   -- §6.C.5: same writer-monophonic clamp as the unfused loader.
   clampWriterPolyphonyRG g 0 rg
@@ -2078,6 +2231,11 @@ loadTemplateGraph g tg = do
         Left err  -> fail $
           "loadTemplateGraph: template "
           <> show (tplName tpl) <> ": " <> err
+      case validateGeneratedPrograms rg of
+        Right () -> pure ()
+        Left err -> fail $
+          "loadTemplateGraph: template "
+          <> show (tplName tpl) <> ": " <> err
       pure (tpl, identityBytes, rs, ss)
 
     populateTemplate
@@ -2190,6 +2348,11 @@ loadTemplateGraphFused g tg = do
       ss <- case layeredRegionSchedule rg of
         Right ss  -> pure ss
         Left err  -> fail $
+          "loadTemplateGraphFused: template "
+          <> show (tplName tpl) <> ": " <> err
+      case validateGeneratedPrograms rg of
+        Right () -> pure ()
+        Left err -> fail $
           "loadTemplateGraphFused: template "
           <> show (tplName tpl) <> ": " <> err
       pure (tpl, identityBytes, rs, ss)

@@ -139,13 +139,13 @@ data FusionSource
 
 -- | How an 'OpSinkWrite' interacts with the destination bus.
 --
---   * 'SinkOverwrite' replaces the previous value at the current
---     sample (typical for a single-writer bus).
---   * 'SinkAccumulate' adds to the previous value, mirroring the
---     §4.E.2 writer-slot-keyed contribution path. v1 of the
---     executor only uses 'SinkOverwrite'; 'SinkAccumulate' is in
---     the data model so that adding multi-writer support later
---     does not change the ABI.
+-- v1 generated execution routes sink writes through the same
+-- writer-slot-keyed contribution path as 'KOut' and 'KBusOut', so
+-- programs that model those nodes should use 'SinkAccumulate'.
+-- 'SinkOverwrite' is a reserved ABI tag for a future true
+-- single-writer overwrite path; the current C++ interpreter accepts
+-- both tags but applies accumulation semantics to preserve the
+-- existing sink contract.
 data SinkPolicy
   = SinkOverwrite
   | SinkAccumulate
