@@ -1732,31 +1732,49 @@ Add-chain benchmark coverage landed: a four-member `add-chain`
 cost-lab family isolates `KAdd → KOut`, `KAdd → KLPF → KGain → KOut`,
 and the two nested-Add variants by parking the Add at the source of
 an accepted candidate (an upstream Sin fanout rejects the
-Sin-rooted superset). The four shapes now classify as
-`measured-loss` — current region-kernel and RFused paths do not
-beat the node-loop baseline on Add-chains. The snapshot-corpus
-`needs-benchmark` count moved 14 → 9 (5 Add-rooted shapes
-reclassified); measured-loss moved 4 → 9.
+Sin-rooted superset). The four shapes classify as `measured-loss` —
+current region-kernel and RFused paths do not beat the node-loop
+baseline on Add-chains.
+
+Dynamic-gain benchmark coverage landed: a three-member
+`dynamic-gain` cost-lab family covers `KGain → KOut` with
+`gain=dynamic`, `KSawOsc → KGain → KOut` with `gain=dynamic`, and
+`KSinOsc → KGain → KGain → KOut` with `gain=dynamic,const`. Each
+member wires a slow `SinOsc` modulator into `KGain.amount` so the
+gain lowers to `RFrom` on that slot rather than `RConst`.
+**`KSawOsc → KGain → KOut gain=dynamic` is the first cleanly-
+measured-profitable shape outside §4.B's covered set: ~1.14× both
+on region-kernel and RFused over the node-loop baseline.** The
+other two dynamic-gain shapes stay near 1.0× (measured-loss).
+
+Snapshot-corpus `needs-benchmark` count moved 14 → 9 → 6 across the
+Add-chain and dynamic-gain slices; total measured count moved
+4 → 9 → 12. The snapshot pin on the win/loss split was loosened to
+just total-measured because shapes hovering near
+`measuredWinThreshold` (1.05×) flap across runs — pinning the
+split would force the snapshot to chase bench noise. `covered` and
+`needs-benchmark` remain rock-solid pins.
 
 7.D target list is now evidence-backed. The remaining
-`needs-benchmark` shapes (9 in the snapshot, 14 in the full survey)
-are the explicit "missing measurement" list — pick the next
-cost-lab family from there before the executor lands.
+`needs-benchmark` shapes (6 in the snapshot, 9 in the full survey)
+are concentrated on stateful sources outside the planner's
+allow-list (`KEnv`, `KDelay`, `KSmooth`, `KPulseOsc`, `KTriOsc`)
+and a couple of `KGain → KOut gain=const` / `KSinOsc → KOut`
+residuals. **The first profitable 7.D target is
+`KSawOsc → KGain → KOut gain=dynamic`** — small, common, exercises
+input-read / multiply / sink-write tiny-executor primitives, and
+has measurement evidence of a real speedup.
 
 Open follow-ups inside 7.C: continue shrinking `needs-benchmark` by
-growing cost-lab families. The first target should be dynamic-gain
-coverage (`KGain → KOut` with `gain=dynamic`,
-`KSawOsc → KGain → KOut` with `gain=dynamic`, and
-`KSinOsc → KGain → KGain → KOut` with `gain=dynamic,const`) because
-it is the highest-count uncovered full-survey row and maps directly to
-the 7.D tiny-executor subset. After that, add `KPulseOsc/KTriOsc`
-source-chain variants, then stateful-source probes (`KEnv → KGain →
-KOut`, `KDelay → KGain → KOut`, `KSmooth → KGain → KOut`) if their
-semantics need allow-list work. Other open items: optional
-stateful-interior allow-list expansion gated on those measurements;
-`KOut`-as-non-terminal de-prioritization in the rejection diagnostic;
-broader shape-key feature axes (e.g., `(sinkKind, totalLatency)`) once
-a shape's profitability splits along them.
+growing cost-lab families. Next candidates: `KPulseOsc/KTriOsc`
+source-chain variants (mirror the `sink-chain` family pattern),
+then stateful-source probes (`KEnv → KGain → KOut`,
+`KDelay → KGain → KOut`, `KSmooth → KGain → KOut`) — those will
+also inform whether the planner's stateful-interior allow-list
+should expand. Other open items: `KOut`-as-non-terminal
+de-prioritization in the rejection diagnostic; broader shape-key
+feature axes (e.g., `(sinkKind, totalLatency)`) once a shape's
+profitability splits along them.
 
 ### Phase 7.D — Runtime Program ABI and Tiny Executor
 
