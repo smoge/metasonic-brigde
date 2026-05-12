@@ -137,6 +137,16 @@ data GraphFamily
     -- rows. These rows keep the lab connected to musical shapes while
     -- still using single 'SynthGraph' members, so the current
     -- equivalence harness can compare variants directly.
+  | FamilyAddChain
+    -- ^ Isolated Add-tail shapes flagged as 'needs-benchmark' by the
+    -- §7.C cost-model join. Each member places an 'Add' chain at the
+    -- source position of an accepted candidate by forcing the
+    -- upstream oscillator to fanout, so the planner selects the
+    -- 'KAdd'-rooted candidate as the maximal accepted shape. Covers
+    -- @KAdd → KOut@, @KAdd → KLPF → KGain → KOut@, and the two
+    -- recurring nested-Add variants. The fanout adds a constant Sin
+    -- overhead across every variant; relative speedups stay
+    -- comparable between variants.
   deriving stock (Eq, Show, Bounded, Enum)
 
 familyName :: GraphFamily -> String
@@ -144,6 +154,7 @@ familyName FamilySinkChain  = "sink-chain"
 familyName FamilyReturnTail = "return-tail"
 familyName FamilyFanout     = "fanout"
 familyName FamilyCorpus     = "corpus"
+familyName FamilyAddChain   = "add-chain"
 
 -- | One member of a family. The string label is the row's stable
 -- identity in JSONL output — keep it short and shell-grep-friendly.
@@ -171,6 +182,12 @@ familyMembers FamilyCorpus =
   ++ templateMembers "pattern/drone-vibrato" Corpus.droneVibratoTemplates
   ++ templateMembers "pattern/hotswap-initial" Corpus.hotSwapEditTemplates
   ++ templateMembers "pattern/spectral-freeze" Corpus.spectralFreezePadTemplates
+familyMembers FamilyAddChain =
+  [ FamilyMember "add-out"                 addChainAddOut
+  , FamilyMember "add-lpf-gain-out"        addChainAddLpfGainOut
+  , FamilyMember "nested-add-gain-out"     addChainNestedGainOut
+  , FamilyMember "nested-add-lpf-gain-out" addChainNestedLpfGainOut
+  ]
 
 templateMembers :: String -> [(String, SynthGraph)] -> [FamilyMember]
 templateMembers prefix entries =
@@ -237,6 +254,58 @@ fanoutTwoOut = runSynth $ do
   g1  <- gain osc 0.4
   out 0 g0
   out 1 g1
+
+------------------------------------------------------------
+-- §7.C Add-chain family
+------------------------------------------------------------
+--
+-- Each member places its Add-tail at the source position of an
+-- accepted candidate. The pattern is the same across all four:
+-- a 'SinOsc' drives the Add-rooted chain to bring the chain up to
+-- 'SampleRate', and is also wired to a secondary 'Out' so the
+-- planner rejects the Sin-rooted candidate via fanout escape. The
+-- Add-rooted chain remains the maximal selected candidate.
+--
+-- The Sin overhead is constant across all three variants, so the
+-- per-variant ratio still reflects the Add-tail's cost. Param
+-- inputs on Add live with the candidate's stateless body; they do
+-- not change the rate because the wired Sin already lifts Add to
+-- 'SampleRate'.
+
+addChainAddOut :: SynthGraph
+addChainAddOut = runSynth $ do
+  osc <- sinOsc 440.0 0.0
+  s   <- add osc (Param 0.3)
+  out 0 s
+  out 1 osc
+
+addChainAddLpfGainOut :: SynthGraph
+addChainAddLpfGainOut = runSynth $ do
+  osc <- sinOsc 440.0 0.0
+  s   <- add osc (Param 0.3)
+  f   <- lpf s 1200.0 0.7
+  g   <- gain f 0.5
+  out 0 g
+  out 1 osc
+
+addChainNestedGainOut :: SynthGraph
+addChainNestedGainOut = runSynth $ do
+  osc <- sinOsc 440.0 0.0
+  s1  <- add osc (Param 0.1)
+  s2  <- add s1  (Param 0.2)
+  g   <- gain s2 0.5
+  out 0 g
+  out 1 osc
+
+addChainNestedLpfGainOut :: SynthGraph
+addChainNestedLpfGainOut = runSynth $ do
+  osc <- sinOsc 440.0 0.0
+  s1  <- add osc (Param 0.1)
+  s2  <- add s1  (Param 0.2)
+  f   <- lpf s2 1200.0 0.7
+  g   <- gain f 0.5
+  out 0 g
+  out 1 osc
 
 ------------------------------------------------------------
 -- Variants and features
