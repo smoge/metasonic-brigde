@@ -255,37 +255,43 @@ template is intentionally minimal (just an LPF) — the point is the
 cross-template plumbing, not DSP cleverness.
 -}
 
--- The send and fx-return templates are authored through
--- 'MetaSonic.Authoring.send' / 'returnBus' (Phase 8.D).
--- The lowered graph is byte-identical to the hand-authored
--- 'busOut 7' / 'busIn 7' pair this demo used previously —
--- the same 'KBusOut' on bus 7 in the voice template, the
--- same 'KBusIn' on bus 7 in the fx template, and the same
--- 'tplFootprint' / template ordering that
--- 'compileTemplateGraph' derives from those.
-sendReturnBus :: Auth.Bus
-sendReturnBus = Auth.bus 7
+-- The voice and fx templates are authored through the Phase
+-- 8.E ensemble builder: 'busNamed "main-send"' allocates the
+-- shared bus deterministically, and both templates pick up
+-- that handle through ordinary closure capture inside the
+-- 'voice' / 'fx' blocks. The compiled 'TemplateGraph' shape
+-- stays structurally equivalent to the 8.D hand-wired
+-- version — same per-template node counts, same writer-before-
+-- reader ordering, same 'bfWrites' / 'bfReads' shape — only
+-- the literal bus index changes from the hand-picked '7' to
+-- the deterministic '16' (the default 'eoBusBase').
+sendReturnEnsemble :: Auth.AuthoredEnsemble
+sendReturnEnsemble = either error id $ Auth.ensemble $ do
+  sendBus <- Auth.busNamed "main-send"
+  Auth.voice "voice" $ runSynth $ do
+    lfo       <- sinOsc 5.0 0.0
+    deviation <- gain lfo 8.0           -- ±8 Hz vibrato depth
+    pitch     <- add 110.0 deviation    -- 110 Hz ± 8 Hz
+    carrier   <- sawOsc pitch 0.0
+    amped     <- gain carrier 0.4       -- attenuate before send
+    Auth.send sendBus (Auth.mono amped)
+  Auth.fx "fx" $ runSynth $ do
+    sent     <- Auth.returnBus sendBus
+    filtered <- Auth.lpfM sent (Param 800.0) (Param 0.7)
+    Auth.outMono 0 filtered             -- → hardware bus 0
 
 sendReturnVoice :: SynthGraph
-sendReturnVoice = runSynth $ do
-  lfo       <- sinOsc 5.0 0.0
-  deviation <- gain lfo 8.0           -- ±8 Hz vibrato depth
-  pitch     <- add 110.0 deviation    -- 110 Hz ± 8 Hz
-  carrier   <- sawOsc pitch 0.0
-  amped     <- gain carrier 0.4       -- attenuate before send
-  Auth.send sendReturnBus (Auth.mono amped)
+sendReturnVoice = case lookup "voice" (Auth.aeTemplates sendReturnEnsemble) of
+  Just g  -> g
+  Nothing -> error "sendReturnVoice: voice template missing from ensemble"
 
 sendReturnFx :: SynthGraph
-sendReturnFx = runSynth $ do
-  sent     <- Auth.returnBus sendReturnBus
-  filtered <- Auth.lpfM sent (Param 800.0) (Param 0.7)
-  Auth.outMono 0 filtered             -- → hardware bus 0
+sendReturnFx = case lookup "fx" (Auth.aeTemplates sendReturnEnsemble) of
+  Just g  -> g
+  Nothing -> error "sendReturnFx: fx template missing from ensemble"
 
 sendReturnDemo :: [(String, SynthGraph)]
-sendReturnDemo =
-  [ ("voice", sendReturnVoice)
-  , ("fx",    sendReturnFx)
-  ]
+sendReturnDemo = Auth.aeTemplates sendReturnEnsemble
 
 {- Note [Demo body: single-graph vs multi-template]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
