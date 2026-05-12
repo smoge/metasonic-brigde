@@ -2690,20 +2690,44 @@ Deliberately out of scope for 8.E:
 - Diagnostic surfaces driven by `TemplateRole`. The role tag
   is recorded but `compileTemplateGraph` does not see it.
 
-### Phase 8.F — Named Controls and External Mapping
+### [x] Phase 8.F — Named Controls and External Mapping
 
-Promote named controls as authoring objects rather than incidental
-nodes:
+`control` / `controlWith` and `ccControl` / `ccControlWith`
+in `MetaSonic.Authoring` lower a name + default + range
+into a single tagged `KSmooth` node whose `MigrationKey`
+matches the control name. `ccControl` additionally records
+a `CCSpec` through `recordCCBinding` (a new exposed helper
+in `MetaSonic.Bridge.Source`) so the existing
+`runSynthCCs` / live-MIDI runner picks it up unchanged.
+OSC dispatch reuses the existing
+`/<voice>/<node-tag>/<slot>` grammar verbatim — the slot
+is `1`, the dispatcher resolves through the same
+`MigrationKey` lookup it already runs for any tagged
+smoother, and the round-trip is pinned by an end-to-end
+test.
 
-- named MIDI CC controls;
-- named OSC-addressable controls;
-- range/default metadata;
-- optional smoothing policy;
-- stable post-compile lookup for runtime control binding.
+What this slice doesn't try to settle:
 
-The existing `cc` builder and OSC control surface stay underneath.
-Phase 8 should make the control vocabulary easier to write and easier
-to inspect.
+- Custom OSC paths (`oscControl "/custom/path"`). The
+  dispatcher grammar stays unchanged; arbitrary paths
+  need a routing-ownership contract first.
+- Runtime range clamping. `ControlRange` is metadata plus
+  MIDI scaling input; OSC writes outside the declared
+  range still reach the smoother target slot.
+- Inspector / survey surfacing of `NamedControlMetadata`.
+  The metadata is recorded for Phase 8.G to consume.
+- Session-level arbitration between MIDI and OSC writes
+  targeting the same control. The dispatcher and live-MIDI
+  runner both write to the same slot today; arbitration
+  is the session layer's problem.
+
+See
+[notes/2026-05-12-phase-8f-named-controls.md](notes/2026-05-12-phase-8f-named-controls.md)
+for the contract.
+
+With 8.F landed, surfacing authoring metadata in the
+inspector and survey is the next ergonomic gap; 8.G picks
+that up.
 
 ### Phase 8.G — Lowering Tests, Demos, and Inspector Hooks
 
