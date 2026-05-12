@@ -993,6 +993,20 @@ foreign import ccall unsafe "rt_graph_template_add_region_generated_block"
     -> CInt
     -> IO ()
 
+-- | Phase 7.I: register a generated region that dispatches
+-- through the super-mode C++ executor, which recognizes a small
+-- set of fused shapes as a single per-sample C++ loop and falls
+-- back to the block-major executor on unrecognized programs.
+-- Wire-compatible with 'c_rt_graph_template_add_region_generated';
+-- the C++ side sets @RegionSpec::generated_executor = 2@ before
+-- pushing the spec.
+foreign import ccall unsafe "rt_graph_template_add_region_generated_super"
+  c_rt_graph_template_add_region_generated_super
+    :: Ptr RTGraph -> CInt
+    -> CInt -> CInt -> CInt
+    -> CInt
+    -> IO ()
+
 -- | Phase 7.D test surface: count of generated programs in a
 -- template, or -1 on invalid template_id.
 foreign import ccall unsafe "rt_graph_test_template_fusion_program_count"
@@ -1014,6 +1028,18 @@ foreign import ccall unsafe "rt_graph_test_template_fusion_program_scratch_slots
 -- region, or -1 if the region uses kernel dispatch.
 foreign import ccall unsafe "rt_graph_test_template_region_generated_program"
   c_rt_graph_test_template_region_generated_program
+    :: Ptr RTGraph -> CInt -> CInt -> IO CInt
+
+-- | Phase 7.I test surface: structural classification of a
+-- registered fusion program against the super-mode recognizer
+-- set. Returns:
+--
+--   0 = NotRecognized (super-mode would fall through to block-major)
+--   1 = GainOut
+--   2 = AddGainOut
+--  -1 = invalid template_id or program_id
+foreign import ccall unsafe "rt_graph_test_fusion_program_super_kind"
+  c_rt_graph_test_fusion_program_super_kind
     :: Ptr RTGraph -> CInt -> CInt -> IO CInt
 
 -- | §4.E.2.C0a: append one descriptive layered-schedule step to the
@@ -1640,6 +1666,16 @@ addRegionTo g cTid r =
              c_rt_graph_template_add_region_generated_block g cTid
                cRate cFirst cCount
                (fromIntegral pid)
+           ExecGeneratedSuper (FusionProgramId pid) ->
+             -- §7.I: same FusionProgram, super-mode executor.
+             -- Recognizes a small set of fused shapes and falls
+             -- back to the block-major executor otherwise. The
+             -- Haskell-side validator already cleared the
+             -- program-id reference; the C ABI mirror just sets
+             -- RegionSpec::generated_executor to 2.
+             c_rt_graph_template_add_region_generated_super g cTid
+               cRate cFirst cCount
+               (fromIntegral pid)
 
 maxGeneratedScratchSlots :: Int
 maxGeneratedScratchSlots = 64
@@ -1660,6 +1696,7 @@ validateGeneratedPrograms rg = do
       case rrExec region of
         ExecGenerated      (FusionProgramId pid) -> checkPid region pid
         ExecGeneratedBlock (FusionProgramId pid) -> checkPid region pid
+        ExecGeneratedSuper (FusionProgramId pid) -> checkPid region pid
         _ -> Right ()
 
     checkPid region pid

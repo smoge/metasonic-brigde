@@ -650,7 +650,8 @@ kernelArity RNodeLoop         = 0
 {- Note [Region execution selector]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-§7.D widens region dispatch to three cases; §7.H adds a fourth:
+§7.D widens region dispatch to three cases; §7.H adds a fourth;
+§7.I adds a fifth:
 
   * 'ExecNodeLoop'        — per-node dispatch, the default.
   * 'ExecKernel'          — a hand-written 'RegionKernel' (existing path).
@@ -663,10 +664,17 @@ kernelArity RNodeLoop         = 0
                             (process_fusion_program_block). The program
                             data is identical; only the dispatch loop
                             order differs.
+  * 'ExecGeneratedSuper'  — same 'FusionProgramId', dispatched through
+                            the super-mode executor
+                            (process_fusion_program_super) which
+                            recognizes a small set of fused shapes
+                            (GainOut, AddGainOut) as a single per-sample
+                            C++ loop and falls through to the block-major
+                            executor on unrecognized programs.
 
-'ExecGeneratedBlock' is a sibling of 'ExecGenerated', not a payload
-or flag on it, because future executors (superinstructions, packed
-native kernels) will each be a new sibling rather than another flag
+Each generated executor is a sibling, not a payload or flag on a
+shared case, because future executors (packed instruction stream,
+native codegen) will each be a new sibling rather than another flag
 on a multi-purpose 'Generated' case.
 
 'rrKernel' survives as a backward-compatible /accessor/ that
@@ -675,8 +683,9 @@ their kernel; everything else returns 'RNodeLoop'. Code that wants
 to tell generated programs apart from node-loop pattern-matches on
 'rrExec' directly.
 
-See @notes/2026-05-12-phase-7d-runtime-program-abi.md@ and
-@notes/2026-05-12-phase-7h-block-major-executor.md@.
+See @notes/2026-05-12-phase-7d-runtime-program-abi.md@,
+@notes/2026-05-12-phase-7h-block-major-executor.md@, and
+@notes/2026-05-12-phase-7i-superinstruction-probe.md@.
 -}
 
 -- | The dispatch selector for one 'RuntimeRegion'. See
@@ -686,6 +695,7 @@ data RegionExec
   | ExecKernel         !RegionKernel
   | ExecGenerated      !FusionProgramId
   | ExecGeneratedBlock !FusionProgramId
+  | ExecGeneratedSuper !FusionProgramId
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -707,6 +717,7 @@ rrKernel r = case rrExec r of
   ExecKernel k         -> k
   ExecGenerated _      -> RNodeLoop
   ExecGeneratedBlock _ -> RNodeLoop
+  ExecGeneratedSuper _ -> RNodeLoop
 
 
 {- Note [Bus footprints, template- vs region-level]

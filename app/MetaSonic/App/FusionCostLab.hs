@@ -535,6 +535,16 @@ data Variant
     -- 'process_fusion_program'. Exists for direct A/B
     -- measurement; a future slice may collapse the variants
     -- once the dispatch-model decision is made.
+  | VarGeneratedSuper
+    -- ^ §7.I generated fusion program, super-mode executor.
+    -- Identical compile-time pipeline and identical emitted
+    -- 'FusionProgram' as 'VarGenerated' and 'VarGeneratedBlock';
+    -- only the per-region 'RegionExec' selector differs
+    -- ('ExecGeneratedSuper'). The C++ side recognizes 'GainOut'
+    -- and 'AddGainOut' fused shapes as a single per-sample loop
+    -- and falls through to 'process_fusion_program_block' on
+    -- everything else. Exists for direct A/B/C measurement
+    -- across the three generated executors.
   deriving stock (Eq, Show, Bounded, Enum)
 
 variantName :: Variant -> String
@@ -543,6 +553,7 @@ variantName VarRegionKernel   = "region-kernel"
 variantName VarRFused         = "rfused"
 variantName VarGenerated      = "generated"
 variantName VarGeneratedBlock = "generated-block"
+variantName VarGeneratedSuper = "generated-super"
 
 -- | The compiler facts we record per graph. The row schema stays
 -- deliberately small enough to inspect in JSONL, but it now includes
@@ -648,6 +659,9 @@ compileForVariant variant graph = do
     VarGeneratedBlock -> do
       baseRG <- stripRegionKernels <$> compileRuntimeGraphUnfused ir
       retargetGeneratedAsBlock <$> generateForCostLab baseRG
+    VarGeneratedSuper -> do
+      baseRG <- stripRegionKernels <$> compileRuntimeGraphUnfused ir
+      retargetGeneratedAsSuper <$> generateForCostLab baseRG
 
 loadForVariant :: Variant -> Ptr RTGraph -> RuntimeGraph -> IO ()
 loadForVariant VarNodeLoop       rt rg = loadRuntimeGraph      rt rg
@@ -655,6 +669,7 @@ loadForVariant VarRegionKernel   rt rg = loadRuntimeGraph      rt rg
 loadForVariant VarRFused         rt rg = loadRuntimeGraphFused rt rg
 loadForVariant VarGenerated      rt rg = loadRuntimeGraph      rt rg
 loadForVariant VarGeneratedBlock rt rg = loadRuntimeGraph      rt rg
+loadForVariant VarGeneratedSuper rt rg = loadRuntimeGraph      rt rg
 
 -- §7.H: take a graph patched for the sample-major generated
 -- variant and retarget every 'ExecGenerated' region at the
@@ -669,6 +684,23 @@ retargetGeneratedAsBlock rg = rg
   where
     flipExec r = case rrExec r of
       ExecGenerated pid -> r { rrExec = ExecGeneratedBlock pid }
+      _                 -> r
+
+-- §7.I: take a graph patched for the sample-major generated
+-- variant and retarget every 'ExecGenerated' region at the
+-- super-mode executor. The program data, owned slice, and
+-- region split are identical to the sample-major build — only
+-- the dispatch selector changes. The C++ side then recognizes
+-- 'GainOut' / 'AddGainOut' programs and falls back to the
+-- block-major executor for unrecognized ones.
+retargetGeneratedAsSuper :: RuntimeGraph -> RuntimeGraph
+retargetGeneratedAsSuper rg = rg
+  { rgRuntimeRegions =
+      map flipExec (rgRuntimeRegions rg)
+  }
+  where
+    flipExec r = case rrExec r of
+      ExecGenerated pid -> r { rrExec = ExecGeneratedSuper pid }
       _                 -> r
 
 stripRegionKernels :: RuntimeGraph -> RuntimeGraph
@@ -1455,7 +1487,7 @@ runMember fam (FamilyMember label graph) = do
   -- recorded as a row with no timing, never aborts the lab run.
   let variants =
         [ VarNodeLoop, VarRegionKernel, VarRFused
-        , VarGenerated, VarGeneratedBlock
+        , VarGenerated, VarGeneratedBlock, VarGeneratedSuper
         ]
       compiled =
         [ (v, compileForVariant v graph) | v <- variants ]
