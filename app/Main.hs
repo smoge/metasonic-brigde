@@ -313,7 +313,7 @@ usage prog = unlines
   , "                   gain. Press Enter to stop. Demo targets are"
   , "                   ignored."
   , ""
-  , "Availavle demos:"
+  , "Available demos:"
   , "  " <> intercalate ", " (map demoKey demoTable)
   , ""
   , "Examples:"
