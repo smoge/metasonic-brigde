@@ -177,6 +177,16 @@ data GraphFamily
     -- gain is the cleanest bridge into 7.D because it exercises the
     -- tiny-executor primitives (input read, multiply, sink write)
     -- without adding stateful lifecycle questions.
+  | FamilyGeneratedTailSweep
+    -- ^ Phase 7.G synthetic family. Each member feeds one
+    -- @pulseOsc@ prefix (not §4.B-covered) into a contiguous
+    -- @KGain@ / @KAdd@ tail of increasing length and terminates
+    -- in @KOut@. The point is to bracket the interpreter's
+    -- per-op amortization curve: as the owned tail grows, do
+    -- generated speedups vs node-loop trend upward? The members
+    -- intentionally use a single stateful source so the prefix
+    -- cost stays constant; the only thing that changes between
+    -- rows is how much arithmetic the generated path owns.
   deriving stock (Eq, Show, Bounded, Enum)
 
 familyName :: GraphFamily -> String
@@ -186,6 +196,7 @@ familyName FamilyFanout      = "fanout"
 familyName FamilyCorpus      = "corpus"
 familyName FamilyAddChain    = "add-chain"
 familyName FamilyDynamicGain = "dynamic-gain"
+familyName FamilyGeneratedTailSweep = "generated-tail-sweep"
 
 -- | One member of a family. The string label is the row's stable
 -- identity in JSONL output — keep it short and shell-grep-friendly.
@@ -225,6 +236,14 @@ familyMembers FamilyDynamicGain =
   [ FamilyMember "gain-dyn-out"         dynGainOut
   , FamilyMember "saw-gain-dyn-out"     dynGainSawOut
   , FamilyMember "sin-gain-dyn-gain-const-out" dynGainNestedOut
+  ]
+familyMembers FamilyGeneratedTailSweep =
+  [ FamilyMember "tail-2-gain"        tailSweep2Gain
+  , FamilyMember "tail-3-gain-gain"   tailSweep3GainGain
+  , FamilyMember "tail-3-add-gain"    tailSweep3AddGain
+  , FamilyMember "tail-5-mixed"       tailSweep5Mixed
+  , FamilyMember "tail-8-mixed"       tailSweep8Mixed
+  , FamilyMember "tail-16-mixed"      tailSweep16Mixed
   ]
 
 templateMembers :: String -> [(String, SynthGraph)] -> [FamilyMember]
@@ -407,6 +426,72 @@ dynGainNestedOut = runSynth $ do
   y1  <- gain src amt           -- gain 1: dynamic amount
   y2  <- gain y1 (Param 0.5)    -- gain 2: const amount
   out 0 y2
+
+------------------------------------------------------------
+-- §7.G generated-tail-sweep family
+------------------------------------------------------------
+--
+-- Each member feeds one 'pulseOsc' prefix into a stateless
+-- compute tail of increasing length. PulseOsc is intentional:
+-- 'KPulseOsc → KGain → KOut' is not §4.B-covered, so the
+-- planner-selected candidate's matched-shape stays 'Nothing'
+-- and the gate cannot short-circuit to 'CoveredByHandKernel'.
+-- The owned tail (everything from the first compute node up to
+-- and including the sink) is what the generator emits; the
+-- single pulseOsc stays in the host region's pre-slice as
+-- node-loop work.
+--
+-- 'add' nodes consume @(prev, Param k)@ so the planner sees a
+-- signal-rate input (the prev node) plus a constant on the
+-- second slot — same pattern @FamilyAddChain@ uses.
+
+tailSweep2Gain :: SynthGraph
+tailSweep2Gain = runSynth $ do
+  src <- pulseOsc 110.0 0.0 0.5
+  g   <- gain src 0.5
+  out 0 g
+
+tailSweep3GainGain :: SynthGraph
+tailSweep3GainGain = runSynth $ do
+  src <- pulseOsc 110.0 0.0 0.5
+  g1  <- gain src 0.5
+  g2  <- gain g1  0.7
+  out 0 g2
+
+tailSweep3AddGain :: SynthGraph
+tailSweep3AddGain = runSynth $ do
+  src <- pulseOsc 110.0 0.0 0.5
+  s1  <- add src (Param 0.3)
+  g1  <- gain s1 0.5
+  out 0 g1
+
+tailSweep5Mixed :: SynthGraph
+tailSweep5Mixed = runSynth $ do
+  src <- pulseOsc 110.0 0.0 0.5
+  s1  <- add src (Param 0.1); g1 <- gain s1 0.5
+  s2  <- add g1  (Param 0.2); g2 <- gain s2 0.7
+  out 0 g2
+
+tailSweep8Mixed :: SynthGraph
+tailSweep8Mixed = runSynth $ do
+  src <- pulseOsc 110.0 0.0 0.5
+  s1  <- add src (Param 0.1); g1 <- gain s1 0.5
+  s2  <- add g1  (Param 0.2); g2 <- gain s2 0.6
+  s3  <- add g2  (Param 0.3); g3 <- gain s3 0.7
+  out 0 g3
+
+tailSweep16Mixed :: SynthGraph
+tailSweep16Mixed = runSynth $ do
+  src <- pulseOsc 110.0 0.0 0.5
+  s1  <- add src (Param 0.1); g1 <- gain s1 0.5
+  s2  <- add g1  (Param 0.2); g2 <- gain s2 0.5
+  s3  <- add g2  (Param 0.3); g3 <- gain s3 0.5
+  s4  <- add g3  (Param 0.4); g4 <- gain s4 0.5
+  s5  <- add g4  (Param 0.5); g5 <- gain s5 0.5
+  s6  <- add g5  (Param 0.6); g6 <- gain s6 0.5
+  s7  <- add g6  (Param 0.7); g7 <- gain s7 0.5
+  g8  <- gain g7 0.5
+  out 0 g8
 
 ------------------------------------------------------------
 -- Variants and features

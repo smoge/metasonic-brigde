@@ -185,12 +185,13 @@ costLabChecks rows =
       ]
 
     expectedFamilyCounts =
-      [ ("add-chain",    16)
-      , ("corpus",       28)
-      , ("dynamic-gain", 12)
-      , ("fanout",        4)
-      , ("return-tail",   4)
-      , ("sink-chain",   24)
+      [ ("add-chain",             16)
+      , ("corpus",                28)
+      , ("dynamic-gain",          12)
+      , ("fanout",                 4)
+      , ("generated-tail-sweep",  24)
+      , ("return-tail",            4)
+      , ("sink-chain",            24)
       ]
 
     expectedRowCount =
@@ -230,7 +231,12 @@ costLabChecks rows =
     -- tail (@KGain@ / @KAdd@) ending in a sink, so @KAdd -> KOut@
     -- shapes now emit as well. Cost-lab rows move from
     -- unsupported to emitted accordingly.
-    expectedGeneratedRows = 20
+    --
+    -- Phase 7.G step 4: the synthetic 'generated-tail-sweep'
+    -- family contributes six more generator-supported members,
+    -- pushing emitted 20 -> 26 and considered 22 -> 28.
+    -- unsupported stays at 2.
+    expectedGeneratedRows = 26
 
     -- §7.E step 5: pin the considered / unsupported split too.
     -- considered = one generated row per cost-lab member; it moves
@@ -238,7 +244,7 @@ costLabChecks rows =
     -- whose maximal selected candidate the generator declines;
     -- it moves only when the generator's shape coverage changes.
     -- Neither flaps with bench noise.
-    expectedGeneratedConsidered  = 22
+    expectedGeneratedConsidered  = 28
     expectedGeneratedUnsupported = 2
 
     generatedUnsupportedCount =
