@@ -108,8 +108,9 @@ costLabChecks rows =
        <> "/" <> show expectedRowCount)
 
   , check "cost-lab covers the expected families"
-      (familyNames == ["add-chain", "corpus", "fanout", "return-tail", "sink-chain"])
-      ("families=" <> intercalate "," familyNames)
+      (familyNames == expectedFamilyNames)
+      ("expected=" <> intercalate "," expectedFamilyNames
+       <> "; actual=" <> intercalate "," familyNames)
 
   , check "cost-lab variants compile and measure"
       (all rowMeasured rows)
@@ -150,6 +151,9 @@ costLabChecks rows =
 
     expectedRowCount =
       sum (map snd expectedFamilyCounts)
+
+    expectedFamilyNames =
+      map fst expectedFamilyCounts
 
     renderCounts xs =
       intercalate "," [fam <> ":" <> show n | (fam, n) <- xs]

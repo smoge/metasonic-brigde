@@ -1742,10 +1742,12 @@ Dynamic-gain benchmark coverage landed: a three-member
 `KSinOsc → KGain → KGain → KOut` with `gain=dynamic,const`. Each
 member wires a slow `SinOsc` modulator into `KGain.amount` so the
 gain lowers to `RFrom` on that slot rather than `RConst`.
-**`KSawOsc → KGain → KOut gain=dynamic` is the first cleanly-
-measured-profitable shape outside §4.B's covered set: ~1.14× both
-on region-kernel and RFused over the node-loop baseline.** The
-other two dynamic-gain shapes stay near 1.0× (measured-loss).
+These rows are measurement coverage, not a turn-on target: the
+dynamic-saw row currently has no §4.B kernel or RFused claim in the
+cost-lab feature columns, so apparent wins over the stripped node-loop
+baseline are same-path timing variance until a generated executor
+exists as a fourth measured variant. Dynamic-gain therefore gives 7.D
+a clean ABI/equivalence probe, but not a profitability decision yet.
 
 Snapshot-corpus `needs-benchmark` count moved 14 → 9 → 6 across the
 Add-chain and dynamic-gain slices; total measured count moved
@@ -1755,15 +1757,16 @@ just total-measured because shapes hovering near
 split would force the snapshot to chase bench noise. `covered` and
 `needs-benchmark` remain rock-solid pins.
 
-7.D target list is now evidence-backed. The remaining
+7.D measurement gaps are now explicit. The remaining
 `needs-benchmark` shapes (6 in the snapshot, 9 in the full survey)
 are concentrated on stateful sources outside the planner's
 allow-list (`KEnv`, `KDelay`, `KSmooth`, `KPulseOsc`, `KTriOsc`)
 and a couple of `KGain → KOut gain=const` / `KSinOsc → KOut`
-residuals. **The first profitable 7.D target is
-`KSawOsc → KGain → KOut gain=dynamic`** — small, common, exercises
-input-read / multiply / sink-write tiny-executor primitives, and
-has measurement evidence of a real speedup.
+residuals. The first 7.D implementation target should be
+ABI/executor-equivalence for the safe subset — scalar read, input read,
+add, multiply, sink write — with dynamic-gain shapes serving as early
+hand-authored program probes once the generated executor can be timed
+directly.
 
 Open follow-ups inside 7.C: continue shrinking `needs-benchmark` by
 growing cost-lab families. Next candidates: `KPulseOsc/KTriOsc`

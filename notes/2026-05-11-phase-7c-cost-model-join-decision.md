@@ -109,7 +109,7 @@ stays `needs-benchmark` from the survey's perspective.
     KSinOsc → KGain → KOut         gain=const   RSinGainOut       covered         …      n/a
     KBusIn → KLPF → KGain → KOut   gain=const   RBusInLpfGainOut  covered         …      n/a
     KGain → KOut                   gain=const   —                 measured-loss   …      1.02×
-    KGain → KOut                   gain=dynamic —                 needs-benchmark …      —
+    KGain → KOut                   gain=dynamic —                 measured-loss   …      1.00×
     KAdd → KOut                    —            —                 measured-loss   …      1.02×
     KAdd → KLPF → KGain → KOut     gain=const   —                 measured-loss   …      1.00×
 ```
