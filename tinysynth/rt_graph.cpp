@@ -1148,6 +1148,14 @@ struct RegionSpec {
   // kernel/NodeLoop behavior for every region the current loader
   // produces.
   int generated_program_id = -1;
+
+  // Phase 7.H: per-region selector between the sample-major and
+  // block-major generated executors. 0 = sample-major (the
+  // existing process_fusion_program), 1 = block-major (the new
+  // process_fusion_program_block). Only consulted when
+  // generated_program_id >= 0. Default 0 keeps existing rows
+  // routed through the original executor.
+  int generated_executor = 0;
 };
 
 // Phase 7.D: a per-sample operand source. The tag encoding mirrors
@@ -6968,6 +6976,121 @@ static void process_fusion_program(
   }
 }
 
+// Phase 7.H block-major generated executor. Same FusionProgram ABI
+// as 'process_fusion_program' above; the only difference is the
+// loop nest. The op loop is now the outer loop and the per-sample
+// loop is the inner loop, which means each op's per-sample work
+// runs as a tight contiguous sweep over the block. Scratch grows
+// from one float per slot to 'nframes' floats per slot, populated
+// by the producing op and read by downstream ops at the same
+// sample index.
+//
+// Stack-allocated scratch is bounded at kMaxScratchSlots x
+// kMaxBlockFrames floats. Programs with nframes greater than the
+// bound silent-no-op, matching the existing scratch_slots bound
+// policy.
+static void process_fusion_program_block(
+    RTGraph &g,
+    GraphInstance &inst,
+    const FusionProgramSpec &program,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode) noexcept {
+  constexpr int kMaxScratchSlots = 64;
+  constexpr int kMaxBlockFrames  = 256;
+  if (program.scratch_slots < 0
+      || program.scratch_slots > kMaxScratchSlots
+      || nframes < 0
+      || nframes > kMaxBlockFrames) {
+    return;
+  }
+  float scratch[kMaxScratchSlots][kMaxBlockFrames]{};
+
+  auto read_source_at = [&](const FusionSourceSpec &src, int sample) -> float {
+    switch (src.tag) {
+      case FusionSrcTag::Const:
+        return static_cast<float>(src.const_value);
+      case FusionSrcTag::Input: {
+        if (src.idx_a < 0
+            || src.idx_a >= static_cast<int>(inst.nodes.size()))
+          return 0.0f;
+        const auto &n = inst.nodes[src.idx_a];
+        if (src.idx_b < 0
+            || src.idx_b >= static_cast<int>(n.outputs.size()))
+          return 0.0f;
+        if (sample
+            >= static_cast<int>(n.outputs[src.idx_b].size()))
+          return 0.0f;
+        return n.outputs[src.idx_b][sample];
+      }
+      case FusionSrcTag::Control: {
+        if (src.idx_a < 0
+            || src.idx_a >= static_cast<int>(inst.nodes.size()))
+          return 0.0f;
+        const auto &n = inst.nodes[src.idx_a];
+        if (src.idx_b < 0
+            || src.idx_b >= static_cast<int>(n.controls.size()))
+          return 0.0f;
+        return static_cast<float>(n.controls[src.idx_b]);
+      }
+      case FusionSrcTag::Scratch:
+        if (src.idx_a < 0 || src.idx_a >= program.scratch_slots)
+          return 0.0f;
+        return scratch[src.idx_a][sample];
+    }
+    return 0.0f;  // unreachable; clang -Wreturn-type
+  };
+
+  std::optional<SinkAccumulator> sink;
+  int sink_bus = -1;
+
+  for (const FusionOpSpec &op : program.ops) {
+    const bool scratch_dst_ok =
+        op.kind == FusionOpKind::SinkWrite
+        || (op.dst >= 0 && op.dst < program.scratch_slots);
+    if (!scratch_dst_ok) continue;
+
+    switch (op.kind) {
+      case FusionOpKind::LoadConst: {
+        const float v = static_cast<float>(op.const_value);
+        for (int s = 0; s < nframes; ++s) scratch[op.dst][s] = v;
+        break;
+      }
+      case FusionOpKind::LoadInput:
+        for (int s = 0; s < nframes; ++s)
+          scratch[op.dst][s] = read_source_at(op.src1, s);
+        break;
+      case FusionOpKind::Add:
+        for (int s = 0; s < nframes; ++s)
+          scratch[op.dst][s] =
+              read_source_at(op.src1, s) + read_source_at(op.src2, s);
+        break;
+      case FusionOpKind::Mul:
+        for (int s = 0; s < nframes; ++s)
+          scratch[op.dst][s] =
+              read_source_at(op.src1, s) * read_source_at(op.src2, s);
+        break;
+      case FusionOpKind::SinkWrite: {
+        if (!sink.has_value() || sink_bus != op.dst) {
+          if (sink.has_value()) sink->flush_to(inst);
+          sink.emplace(SinkAccumulator::open(
+              g, inst, static_cast<double>(op.dst), writer_slot,
+              nframes, mode));
+          sink_bus = op.dst;
+        }
+        for (int s = 0; s < nframes; ++s)
+          sink->push(static_cast<std::size_t>(s),
+                     read_source_at(op.src1, s));
+        break;
+      }
+    }
+  }
+
+  if (sink.has_value()) {
+    sink->flush_to(inst);
+  }
+}
+
 static void process_region(
     RTGraph &g,
     const MetaDef &def,
@@ -6991,10 +7114,18 @@ static void process_region(
       && r.generated_program_id
              < static_cast<int>(def.fusion_programs.size())) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    process_fusion_program(
-        g, inst,
-        def.fusion_programs[r.generated_program_id],
-        nframes, writer_slot, ctx.bus_writes.mode);
+    const FusionProgramSpec &prog =
+        def.fusion_programs[r.generated_program_id];
+    // Phase 7.H: per-region selector picks between the
+    // sample-major executor (0, default) and the block-major
+    // executor (1). Any future executor is a new value here.
+    if (r.generated_executor == 1) {
+      process_fusion_program_block(
+          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
+    } else {
+      process_fusion_program(
+          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
+    }
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     return;
   }
