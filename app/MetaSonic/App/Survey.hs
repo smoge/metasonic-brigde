@@ -1549,6 +1549,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printPlannerVerdicts allRows
   putStrLn ""
+  printCostModelJoin allRows
+  putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
   case allErrs of
@@ -2422,6 +2424,152 @@ padR :: Int -> String -> String
 padR w s
   | length s >= w = s
   | otherwise     = s <> replicate (w - length s) ' '
+
+--------------------------------------------------------------------------------
+-- §7.C cost-model join
+--------------------------------------------------------------------------------
+
+-- | One row in the §7.C cost-model join table: a unique selected-
+-- candidate shape across the survey, its §4.B-match status, total
+-- occurrence count, classification, and an optional measured speedup.
+--
+-- v1 keys on 'fcMemberKinds' alone (see
+-- @notes/2026-05-11-phase-7c-cost-model-join-decision.md@). Speedup
+-- is reported only for 'ClsMeasuredWin' / 'ClsMeasuredLoss'.
+data CostModelRow = CostModelRow
+  { cmrKinds   :: ![NodeKind]
+  , cmrMatched :: !(Maybe RegionKernel)
+  , cmrCount   :: !Int
+  , cmrClass   :: !CostModelClass
+  , cmrSpeedup :: !(Maybe Double)
+  } deriving (Eq, Show)
+
+data CostModelClass
+  = ClsCovered
+  | ClsMeasuredWin
+  | ClsMeasuredLoss
+  | ClsNeedsBenchmark
+  deriving (Eq, Show)
+
+renderCostModelClass :: CostModelClass -> String
+renderCostModelClass ClsCovered        = "covered"
+renderCostModelClass ClsMeasuredWin    = "measured-win"
+renderCostModelClass ClsMeasuredLoss   = "measured-loss"
+renderCostModelClass ClsNeedsBenchmark = "needs-benchmark"
+
+-- | Aggregate selected candidates across the survey, group by
+-- @(fcMemberKinds, fcMatchedShape)@, and classify. The classifier
+-- callback supplies a 'CostModelClass' and optional speedup given
+-- the candidate's shape key and matched-shape status. Commit 2
+-- supplies a placeholder that maps everything generated-eligible to
+-- 'ClsNeedsBenchmark'; commit 3 (the cost-lab join) replaces it.
+costModelRows
+  :: (([NodeKind], Maybe RegionKernel) -> (CostModelClass, Maybe Double))
+  -> [SurveyRow]
+  -> [CostModelRow]
+costModelRows classify rows =
+  let selected = concatMap (selectedFusionCandidates . srPlannerVerdicts) rows
+      keys     = nub
+                   [ (fcMemberKinds c, fcMatchedShape c)
+                   | c <- selected ]
+      counted  =
+        [ ((kinds, mshape), count)
+        | (kinds, mshape) <- keys
+        , let count =
+                length [ ()
+                       | c <- selected
+                       , fcMemberKinds c == kinds
+                       , fcMatchedShape c == mshape ]
+        ]
+      -- Sort: by class ordering (covered → measured-win → ... →
+      -- needs-benchmark), then count desc, then chain length asc,
+      -- then kinds Enum order.
+      withCls =
+        [ CostModelRow
+            { cmrKinds   = kinds
+            , cmrMatched = mshape
+            , cmrCount   = count
+            , cmrClass   = cls
+            , cmrSpeedup = spd
+            }
+        | ((kinds, mshape), count) <- counted
+        , let (cls, spd) = classify (kinds, mshape)
+        ]
+  in sortOn rowKey withCls
+  where
+    rowKey r =
+      ( classRank (cmrClass r)
+      , negate (cmrCount r)
+      , length (cmrKinds r)
+      , map fromEnum (cmrKinds r)
+      )
+
+    classRank ClsCovered        = 0 :: Int
+    classRank ClsMeasuredWin    = 1
+    classRank ClsMeasuredLoss   = 2
+    classRank ClsNeedsBenchmark = 3
+
+-- | Placeholder classifier used by commit 2: every generated-eligible
+-- shape becomes 'ClsNeedsBenchmark'. The real classifier is layered
+-- on by the cost-lab join slice.
+defaultCostModelClassifier
+  :: ([NodeKind], Maybe RegionKernel) -> (CostModelClass, Maybe Double)
+defaultCostModelClassifier (_, Just _)  = (ClsCovered,        Nothing)
+defaultCostModelClassifier (_, Nothing) = (ClsNeedsBenchmark, Nothing)
+
+printCostModelJoin :: [SurveyRow] -> IO ()
+printCostModelJoin rows = do
+  putStrLn "─── Phase 7.C cost-model join ───"
+  let allRows = costModelRows defaultCostModelClassifier rows
+      total   = sum (map cmrCount allRows)
+      countOf cls =
+        sum [ cmrCount r | r <- allRows, cmrClass r == cls ]
+  putStrLn $ "  selected=" <> show total
+          <> "  covered="  <> show (countOf ClsCovered)
+          <> "  measured-win="  <> show (countOf ClsMeasuredWin)
+          <> "  measured-loss=" <> show (countOf ClsMeasuredLoss)
+          <> "  needs-benchmark=" <> show (countOf ClsNeedsBenchmark)
+  if null allRows
+    then putStrLn "  (no selected candidates in the surveyed graphs)"
+    else do
+      putStrLn ""
+      putStrLn "  Per-shape table (selected candidates only):"
+      putStrLn $ formatCmrRow
+        ["kinds", "matched-shape", "class", "count", "speedup"]
+      mapM_ (putStrLn . formatCmrRow . renderCmrCells) allRows
+
+renderCmrCells :: CostModelRow -> [String]
+renderCmrCells r =
+  [ intercalate " → " (map show (cmrKinds r))
+  , maybe "—" show (cmrMatched r)
+  , renderCostModelClass (cmrClass r)
+  , show (cmrCount r)
+  , case cmrClass r of
+      ClsCovered        -> "n/a"
+      _ -> case cmrSpeedup r of
+             Just s  -> showSpeedup s
+             Nothing -> "—"
+  ]
+
+showSpeedup :: Double -> String
+showSpeedup s = pad1 s <> "×"
+  where
+    -- Round to one decimal place without bringing in Text.Printf.
+    pad1 x =
+      let tenths = round (x * 10) :: Int
+          (whole, frac) = tenths `divMod` 10
+      in show whole <> "." <> show (abs frac)
+
+costModelColumnWidths :: [Int]
+costModelColumnWidths = [40, 18, 16, 6, 8]
+
+formatCmrRow :: [String] -> String
+formatCmrRow cols =
+  "  " <> intercalate "  " (zipWith pad costModelColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
 
 showNodeIndex :: NodeIndex -> String
 showNodeIndex (NodeIndex i) = show i
