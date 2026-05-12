@@ -96,6 +96,14 @@ module MetaSonic.Authoring
   , envS
   , envC
 
+    -- * Routing helpers (Phase 8.D)
+  , balance
+  , spread
+  , Bus (..)
+  , bus
+  , send
+  , returnBus
+
     -- * Outputs
   , outMono
   , outStereo
@@ -442,6 +450,104 @@ envC (Channels []) _ _ _ _ _ = pure (Channels [])
 envC (Channels cs) gate a d s r = do
   e <- env gate a d s r
   Channels <$> mapM (`gain` e) cs
+
+------------------------------------------------------------
+-- Routing helpers (Phase 8.D)
+------------------------------------------------------------
+--
+-- 'balance' and 'spread' are *static* helpers: their pan
+-- arguments are 'Double's read at graph-build time and lower
+-- to constant 'Gain' amounts. The current primitive set
+-- cannot honestly express audio-rate equal-power pan (no
+-- sqrt opcode the gain family understands at audio rate),
+-- so 8.D deliberately stops at compile-time balance. A
+-- future slice can revisit if a sqrt control-rate path
+-- lands.
+--
+-- 'Bus' / 'send' / 'returnBus' wrap the existing 'busOut' /
+-- 'busIn' primitives without adding any allocation policy.
+-- Bus indices remain user-managed in 8.D; deterministic
+-- allocation belongs to 8.E ensemble builders where
+-- template names and roles exist to drive it.
+
+-- | Static balance for a stereo signal. @balance s p@ where
+-- @p ∈ [-1, 1]@: negative values attenuate the right
+-- channel and leave the left at unity; positive values
+-- attenuate the left and leave the right at unity. @p = 0@
+-- is the identity (both gains are 1.0). Values outside
+-- the range are clamped.
+--
+-- Emits exactly two 'KGain' nodes (one per channel).
+balance :: Stereo -> Double -> SynthM Stereo
+balance (Stereo l r) p = do
+  let pc = clamp (-1.0) 1.0 p
+      gL = if pc <= 0 then 1.0          else 1.0 - pc
+      gR = if pc <= 0 then 1.0 + pc     else 1.0
+  Stereo <$> gain l (Param gL) <*> gain r (Param gR)
+
+-- | Static spread: pan @N@ mono sources across the stereo
+-- field. @spread monos width@ where @width ∈ [0, 1]@
+-- scales the per-source pan positions; @width = 1@ is full
+-- spread (-1 to +1), @width = 0@ collapses every source to
+-- center (pan2 0.0), and intermediate values scale
+-- linearly. Negative widths are clamped to 0.
+--
+-- The per-source pan positions for @N@ sources are
+-- @-width, -width + 2*width/(N-1), …, +width@ for @N ≥ 2@.
+-- @N = 1@ uses pan2 with width = 0 (centered). @N = 0@
+-- returns silence on both channels and emits no nodes.
+--
+-- Concrete shape pins:
+--   * @spread [] _@                 → 0 'KGain' / 0 'KAdd'
+--   * @spread [m] _@                → 2 'KGain' / 0 'KAdd'
+--   * @spread [m_1..m_N] _@ (N ≥ 2) → 2N 'KGain' / 2(N-1) 'KAdd'
+spread :: [Mono] -> Double -> SynthM Stereo
+spread []  _ = pure (Stereo (Param 0.0) (Param 0.0))
+spread [m] _ = pan2 m 0.0
+spread monos width = do
+  let n  = length monos
+      w  = clamp 0.0 1.0 width
+      step
+        | n <= 1    = 0.0
+        | otherwise = (2 * w) / fromIntegral (n - 1)
+      positions = [ -w + step * fromIntegral i
+                  | i <- [0 .. n - 1]
+                  ]
+  panned <- zipWithM pan2 monos positions
+  let lefts  = [ l | Stereo l _ <- panned ]
+      rights = [ r | Stereo _ r <- panned ]
+  l <- foldM' add (head lefts)  (tail lefts)
+  r <- foldM' add (head rights) (tail rights)
+  pure (Stereo l r)
+
+-- | Authoring-level bus handle. Wraps an 'Int' bus index.
+-- The wrapping exists for call-site clarity: a 'Bus' value
+-- is what 'send' writes to and 'returnBus' reads from, and
+-- the bus index stays visible in every signature.
+newtype Bus = Bus { unBus :: Int }
+  deriving (Eq, Ord, Show)
+
+-- | Smart constructor for a 'Bus' value. Equivalent to the
+-- 'Bus' constructor; provided so call sites can read as
+-- @Auth.bus 7@ rather than @Bus 7@.
+bus :: Int -> Bus
+bus = Bus
+
+-- | Write a mono signal to a shared audio bus. Lowers to a
+-- single 'KBusOut' node on the named bus, exactly like the
+-- primitive 'busOut'. Carries the same 'BusWrite' effect,
+-- so 'compileTemplateGraph' picks it up in the template's
+-- 'tplFootprint' without any new metadata.
+send :: Bus -> Mono -> SynthM ()
+send (Bus n) (Mono c) = busOut n c
+
+-- | Read a shared audio bus into a 'Mono' authoring shape.
+-- Lowers to a single 'KBusIn' node, exactly like the
+-- primitive 'busIn'. Carries the 'BusRead' effect that
+-- forces same-bus writers to precede this template at
+-- 'compileTemplateGraph' time.
+returnBus :: Bus -> SynthM Mono
+returnBus (Bus n) = Mono <$> busIn n
 
 ------------------------------------------------------------
 -- Outputs
