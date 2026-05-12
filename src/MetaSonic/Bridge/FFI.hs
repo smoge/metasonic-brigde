@@ -71,6 +71,8 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_test_last_serialized_free_band_count
   , c_rt_graph_test_last_c1d_parallel_entry_count
   , c_rt_graph_test_last_c1d_parallel_region_item_count
+  , -- * §7.I super-mode classifier (test-only introspection)
+    c_rt_graph_test_fusion_program_super_kind
   , -- * §4.E.2.C0a layered-schedule metadata (test-only introspection)
     c_rt_graph_test_template_schedule_step_count
   , c_rt_graph_test_template_schedule_step_kind
