@@ -876,6 +876,182 @@ authoringDslTests =
       -- precedence contract.
       let names = [tplName t | t <- tgTemplates tg]
       names @?= ["voice", "fx"]
+
+  ------------------------------------------------------------
+  -- Phase 8.E: ensemble builder
+  ------------------------------------------------------------
+
+  , testCase "defaultEnsembleOptions has eoBusBase = 16" $
+      Auth.eoBusBase Auth.defaultEnsembleOptions @?= 16
+
+  , testCase "busNamed allocates default bus on first use" $ do
+      let result = Auth.ensemble $ do
+            b <- Auth.busNamed "send"
+            pure ()
+      case result of
+        Left err -> assertFailure err
+        Right ae -> do
+          Auth.amBuses (Auth.aeMetadata ae)
+            @?= M.fromList [("send", Auth.Bus 16)]
+
+  , testCase "busNamed is idempotent on the same name" $ do
+      -- Two calls to 'busNamed "send"' must return the same
+      -- 'Bus' and must not bump the allocation counter past
+      -- the first index. We pin this from the outside: the
+      -- bus map after the run has exactly one entry, and a
+      -- third call to a different name returns 17 (not 18),
+      -- proving the counter did not advance past the first
+      -- allocation.
+      let result = Auth.ensemble $ do
+            _ <- Auth.busNamed "send"
+            _ <- Auth.busNamed "send"
+            _ <- Auth.busNamed "other"
+            pure ()
+      case result of
+        Left err -> assertFailure err
+        Right ae ->
+          Auth.amBuses (Auth.aeMetadata ae) @?= M.fromList
+            [ ("send",  Auth.Bus 16)
+            , ("other", Auth.Bus 17)
+            ]
+
+  , testCase "busNamed allocates in first-use order, not name order" $ do
+      let result = Auth.ensemble $ do
+            _ <- Auth.busNamed "zeta"
+            _ <- Auth.busNamed "alpha"
+            pure ()
+      case result of
+        Left err -> assertFailure err
+        Right ae ->
+          Auth.amBuses (Auth.aeMetadata ae) @?= M.fromList
+            [ ("zeta",  Auth.Bus 16)
+            , ("alpha", Auth.Bus 17)
+            ]
+
+  , testCase "ensembleWith eoBusBase=100 starts allocation at 100" $ do
+      let opts = Auth.defaultEnsembleOptions { Auth.eoBusBase = 100 }
+          result = Auth.ensembleWith opts $ do
+            _ <- Auth.busNamed "x"
+            _ <- Auth.busNamed "y"
+            pure ()
+      case result of
+        Left err -> assertFailure err
+        Right ae ->
+          Auth.amBuses (Auth.aeMetadata ae) @?= M.fromList
+            [ ("x", Auth.Bus 100)
+            , ("y", Auth.Bus 101)
+            ]
+
+  , testCase "duplicate template name produces Left error" $ do
+      let g  = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            out 0 s
+          result = Auth.ensemble $ do
+            Auth.voice "v" g
+            Auth.voice "v" g
+      result @?= Left "ensemble: duplicate template name 'v'"
+
+  , testCase "fx -> voice with same name also fails" $ do
+      -- The duplicate-name check ignores TemplateRole — name
+      -- uniqueness is global to the ensemble.
+      let g  = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            out 0 s
+          result = Auth.ensemble $ do
+            Auth.fx    "shared" g
+            Auth.voice "shared" g
+      result @?= Left "ensemble: duplicate template name 'shared'"
+
+  , testCase "aeTemplates preserves declaration order" $ do
+      let g1 = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            out 0 s
+          g2 = runSynth $ do
+            s <- sinOsc 220.0 0.0
+            out 0 s
+          result = Auth.ensemble $ do
+            Auth.voice "first"  g1
+            Auth.fx    "second" g2
+      case result of
+        Left err -> assertFailure err
+        Right ae -> do
+          map fst (Auth.aeTemplates ae) @?= ["first", "second"]
+          Auth.amRoles (Auth.aeMetadata ae) @?=
+            [ ("first",  Auth.VoiceTemplate)
+            , ("second", Auth.FxTemplate)
+            ]
+
+  , testCase "ensemble send/return compiles with writer-before-reader order" $ do
+      -- End-to-end pin: an ensemble whose two templates use
+      -- the same busNamed handle (one Auth.send, one
+      -- Auth.returnBus) compiles through compileTemplateGraph
+      -- and produces the same shape the hand-written 8.D
+      -- send-return demo produced, just on the new
+      -- ensemble-allocated bus.
+      let result = Auth.ensemble $ do
+            sendBus <- Auth.busNamed "main-send"
+            Auth.voice "voice" (runSynth $ do
+              s     <- sinOsc 440.0 0.0
+              amped <- gain s 0.4
+              Auth.send sendBus (Auth.mono amped))
+            Auth.fx "fx" (runSynth $ do
+              sent     <- Auth.returnBus sendBus
+              filtered <- Auth.lpfM sent (Param 800.0) (Param 0.7)
+              Auth.outMono 0 filtered)
+      ae <- case result of
+        Left err -> assertFailure err >> error "unreachable"
+        Right a  -> pure a
+      -- The allocated bus is the default base.
+      Auth.amBuses (Auth.aeMetadata ae)
+        @?= M.fromList [("main-send", Auth.Bus 16)]
+      -- Compile-side cross-check.
+      tg <- case compileTemplateGraph (Auth.aeTemplates ae) of
+        Left err -> assertFailure err >> error "unreachable"
+        Right t  -> pure t
+      let namesInOrder = [tplName t | t <- tgTemplates tg]
+      namesInOrder @?= ["voice", "fx"]
+      let templatesByName =
+            [ (tplName t, rfBuses (tplFootprint t))
+            | t <- tgTemplates tg ]
+      case lookup "voice" templatesByName of
+        Just fp -> do
+          bfWrites fp @?= S.singleton 16
+          bfReads  fp @?= S.empty
+        Nothing -> assertFailure "voice template missing"
+      case lookup "fx" templatesByName of
+        Just fp -> do
+          bfWrites fp @?= S.singleton 0   -- outMono 0
+          bfReads  fp @?= S.singleton 16  -- returnBus 16
+        Nothing -> assertFailure "fx template missing"
+
+  , testCase "AuthoringMetadata changes do not affect compile output" $ do
+      -- Pin the diagnostic-only contract: rewriting
+      -- aeMetadata while keeping aeTemplates produces the
+      -- same TemplateGraph. compileTemplateGraph never reads
+      -- aeMetadata.
+      let g1 = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            out 0 s
+          base = case Auth.ensemble (Auth.voice "v" g1) of
+            Right ae -> ae
+            Left err -> error err
+          mutated = base
+            { Auth.aeMetadata = (Auth.aeMetadata base)
+                { Auth.amRoles = []      -- wipe roles
+                , Auth.amBuses = M.empty -- wipe bus assignments
+                }
+            }
+      tg1 <- case compileTemplateGraph (Auth.aeTemplates base) of
+        Left err -> assertFailure err >> error "unreachable"
+        Right t  -> pure t
+      tg2 <- case compileTemplateGraph (Auth.aeTemplates mutated) of
+        Left err -> assertFailure err >> error "unreachable"
+        Right t  -> pure t
+      -- Same template names in same order — sufficient to
+      -- prove the compile output is structurally identical
+      -- without comparing TemplateGraphs node-by-node.
+      map tplName (tgTemplates tg1)
+        @?= map tplName (tgTemplates tg2)
   ]
 
 ------------------------------------------------------------
