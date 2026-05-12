@@ -1744,14 +1744,19 @@ are the explicit "missing measurement" list — pick the next
 cost-lab family from there before the executor lands.
 
 Open follow-ups inside 7.C: continue shrinking `needs-benchmark` by
-growing cost-lab families (`KEnv → KGain → KOut`,
-`KDelay → KGain → KOut`, `KSmooth → KGain → KOut`,
-`KPulseOsc/KTriOsc` variants are the most-frequent uncovered
-shapes); optional stateful-interior allow-list expansion gated on
-those measurements; `KOut`-as-non-terminal de-prioritization in the
-rejection diagnostic; broader shape-key feature axes (e.g.,
-`(sinkKind, totalLatency)`) once a shape's profitability splits
-along them.
+growing cost-lab families. The first target should be dynamic-gain
+coverage (`KGain → KOut` with `gain=dynamic`,
+`KSawOsc → KGain → KOut` with `gain=dynamic`, and
+`KSinOsc → KGain → KGain → KOut` with `gain=dynamic,const`) because
+it is the highest-count uncovered full-survey row and maps directly to
+the 7.D tiny-executor subset. After that, add `KPulseOsc/KTriOsc`
+source-chain variants, then stateful-source probes (`KEnv → KGain →
+KOut`, `KDelay → KGain → KOut`, `KSmooth → KGain → KOut`) if their
+semantics need allow-list work. Other open items: optional
+stateful-interior allow-list expansion gated on those measurements;
+`KOut`-as-non-terminal de-prioritization in the rejection diagnostic;
+broader shape-key feature axes (e.g., `(sinkKind, totalLatency)`) once
+a shape's profitability splits along them.
 
 ### Phase 7.D — Runtime Program ABI and Tiny Executor
 

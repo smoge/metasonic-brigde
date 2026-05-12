@@ -108,9 +108,10 @@ stays `needs-benchmark` from the survey's perspective.
     kinds                          features     matched-shape     class           count  speedup
     KSinOsc → KGain → KOut         gain=const   RSinGainOut       covered         …      n/a
     KBusIn → KLPF → KGain → KOut   gain=const   RBusInLpfGainOut  covered         …      n/a
-    KGain → KOut                   gain=const   —                 needs-benchmark …      —
-    KAdd → KOut                    —            —                 measured-win    …      1.40×
-    KAdd → KLPF → KGain → KOut     gain=const   —                 needs-benchmark …      —
+    KGain → KOut                   gain=const   —                 measured-loss   …      1.02×
+    KGain → KOut                   gain=dynamic —                 needs-benchmark …      —
+    KAdd → KOut                    —            —                 measured-loss   …      1.02×
+    KAdd → KLPF → KGain → KOut     gain=const   —                 measured-loss   …      1.00×
 ```
 
 `speedup` is reported only for `measured-win` and `measured-loss`
