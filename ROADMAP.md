@@ -2593,26 +2593,47 @@ What 8.C still does not cover (deliberately): exotic primitives
 (`send` / `returnBus` — Phase 8.D). Both can wait until the
 patch shape calling for them is needed.
 
-### Phase 8.D — Mixing, Panning, and Routing Helpers (partial)
+### [x] Phase 8.D — Mixing, Panning, and Routing Helpers
 
-Add authoring-level operations that remove routine boilerplate:
+All four routing helpers landed:
 
-- `pan2` (landed, constant equal-power pan);
-- `balance`;
-- `mixN` (landed, list-of-mono mixdown);
-- `spread`;
-- `send`;
-- `returnBus`;
-- `stereoOut` (landed as the noun-first `outStereo` alias).
+- `pan2` (constant equal-power pan; earlier slice);
+- `mixN` (list-of-mono mixdown; earlier slice);
+- `stereoOut` (noun-first `outStereo` alias; earlier slice);
+- `balance` (static stereo balance, two `KGain` nodes);
+- `spread` (static N-source pan-spread; lowers to `pan2` per
+  source plus per-channel `KAdd` mixdown — `0` / `1` / `N`-
+  source shapes pinned by tests);
+- `send` and `returnBus` over an explicit `Bus` handle —
+  lower to single `KBusOut` / `KBusIn` nodes with the same
+  bus footprint the hand-authored primitive pair already
+  produced.
 
-The first helper slice also rewrote the `stereo-saw` demo to use
-`pan2`, `addS`, `gainS`, and `stereoOut`, with lowering tests pinning
-the primitive Gain/Add/Out graph shape.
+Lowering tests pin the primitive graph shape for each helper
+and the cross-template `BusFootprint` that
+`compileTemplateGraph` derives from a paired `send` →
+`returnBus` graph. The `send-return` demo is rewritten to go
+through `Auth.send` / `Auth.returnBus`; the compiled
+template graph stays byte-identical (same node count, same
+`bfWrites = {7}` / `bfReads = {7}` split, same writer-before-
+reader ordering).
 
-The important design point is bus visibility. Helpers may allocate or
-thread bus identifiers, but the lowered graph must still expose the
-actual bus reads/writes so `BusFootprint`, template ordering, survey
-tools, and inspectors remain truthful.
+Deliberately out of scope for 8.D:
+
+- A deterministic bus allocator. Bus indices remain user-
+  managed; allocation belongs to 8.E ensemble builders where
+  template names and roles drive the mapping.
+- Dynamic equal-power pan. The current primitive set has no
+  honest audio-rate sqrt path; 8.D stops at compile-time
+  balance and notes the gap in the decision artifact.
+
+Decision artifact:
+[notes/2026-05-12-phase-8d-routing-helpers.md](notes/2026-05-12-phase-8d-routing-helpers.md).
+
+The bus-visibility contract holds: every 8.D helper lowers
+through `BusOut` / `BusIn` / `Out`, so `BusFootprint`,
+template ordering, survey tools, and inspectors continue to
+read the same shape they always have.
 
 ### Phase 8.E — Template and Ensemble Builders
 
@@ -2629,6 +2650,13 @@ This should lower to the existing `compileTemplateGraph` input shape,
 not replace it. The value of the layer is stable naming, less manual
 bus plumbing, and clearer intent around voice templates, shared FX,
 and return chains.
+
+8.D's explicit `Bus` handle is the primitive 8.E will allocate
+*against*. The next layer's job is naming and deterministic
+bus assignment (a `voice "bass"` declaration knows which send
+bus its FX chain reads from without an integer hard-coded at
+the call site), with the lowered `compileTemplateGraph` input
+unchanged from what 8.D already produces.
 
 ### Phase 8.F — Named Controls and External Mapping
 
