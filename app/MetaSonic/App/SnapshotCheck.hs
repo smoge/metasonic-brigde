@@ -140,11 +140,12 @@ costLabChecks rows =
       ]
 
     expectedFamilyCounts =
-      [ ("add-chain",  12)
-      , ("corpus",     21)
-      , ("fanout",      3)
-      , ("return-tail", 3)
-      , ("sink-chain", 12)
+      [ ("add-chain",    12)
+      , ("corpus",       21)
+      , ("dynamic-gain",  9)
+      , ("fanout",        3)
+      , ("return-tail",   3)
+      , ("sink-chain",   12)
       ]
 
     expectedRowCount =
@@ -462,17 +463,42 @@ renderReasonCounts xs =
   intercalate "," [tag <> "=" <> show n | (tag, n) <- xs]
 
 -- §7.C cost-model join invariants on the snapshot corpus. Counts
--- per class (covered / measured-win / measured-loss / needs-
--- benchmark) are pinned. The needs-benchmark count is the Phase
--- 7.D gate signal — when it is high relative to generated-eligible,
--- the cost lab needs new families before the executor lands.
+-- The three pinned signals are stable across bench-noise:
+--
+--   * covered count — purely structural (§4.B kernel match).
+--   * total measured count (win + loss) — every cost-lab row that
+--     compiled, equivalence-checked, and timed contributes,
+--     regardless of which side of 'measuredWinThreshold' its
+--     speedup lands on.
+--   * needs-benchmark count — the Phase 7.D gate signal: shapes
+--     the cost lab has no measurement for at all.
+--
+-- The win/loss split is intentionally NOT pinned: shapes whose
+-- speedup hovers near 'measuredWinThreshold' (1.05×) flap across
+-- runs, and locking the split here would force the snapshot to
+-- chase noise. The total measurement count is what tells us
+-- "the cost lab has evidence" regardless of which side the speedup
+-- lands on.
 costModelJoinChecks :: M.Map ShapeKey ShapeSummary
                     -> SurveySnapshots -> [SnapshotCheck]
 costModelJoinChecks shapeIdx snapshots =
-  [ check "cost-model join class totals are stable"
-      (classCounts == expectedClassCounts)
-      ("expected=" <> renderClassCounts expectedClassCounts
-       <> "; actual=" <> renderClassCounts classCounts)
+  [ check "cost-model join covered count is stable"
+      (lookupClass "covered" classCounts == expectedCovered)
+      ("expected covered=" <> show expectedCovered
+       <> "; actual=" <> show (lookupClass "covered" classCounts))
+
+  , check "cost-model join total measured count is stable"
+      (measuredTotal == expectedMeasured)
+      ("expected measured=" <> show expectedMeasured
+       <> "; actual measured-win+measured-loss=" <> show measuredTotal
+       <> " (win=" <> show (lookupClass "measured-win" classCounts)
+       <> " loss=" <> show (lookupClass "measured-loss" classCounts)
+       <> ")")
+
+  , check "cost-model join needs-benchmark count is stable"
+      (lookupClass "needs-benchmark" classCounts == expectedNeedsBenchmark)
+      ("expected needs-benchmark=" <> show expectedNeedsBenchmark
+       <> "; actual=" <> show (lookupClass "needs-benchmark" classCounts))
 
   , check "cost-model join total matches selected-candidate count"
       (sumClasses classCounts == selectedCount)
@@ -506,6 +532,12 @@ costModelJoinChecks shapeIdx snapshots =
       | cls <- classOrder
       ]
 
+    measuredTotal =
+      lookupClass "measured-win" classCounts
+        + lookupClass "measured-loss" classCounts
+
+    lookupClass cls = maybe 0 id . lookup cls
+
     sumClasses = sum . map snd
 
     classOrder =
@@ -518,17 +550,9 @@ costModelJoinChecks shapeIdx snapshots =
     -- Pinned snapshot. Bump these intentionally when the cost-lab
     -- corpus changes, a planner rule changes, or the snapshot
     -- corpus changes; a silent shift means the join drifted.
-    expectedClassCounts :: [(String, Int)]
-    expectedClassCounts =
-      [ ("covered",        51)
-      , ("measured-win",    0)
-      , ("measured-loss",   9)
-      , ("needs-benchmark", 9)
-      ]
-
-renderClassCounts :: [(String, Int)] -> String
-renderClassCounts xs =
-  intercalate "," [cls <> "=" <> show n | (cls, n) <- xs]
+    expectedCovered        = 51
+    expectedMeasured       = 12
+    expectedNeedsBenchmark = 6
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =
