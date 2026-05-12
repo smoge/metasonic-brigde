@@ -190,6 +190,8 @@ familyMembers FamilySinkChain =
   , FamilyMember "saw-gain-out"          sinkSawGainOut
   , FamilyMember "saw-lpf-gain-out"      sinkSawLpfGainOut
   , FamilyMember "busin-lpf-gain-out"    sinkBusInLpfGainOut
+  , FamilyMember "pulse-gain-out"        sinkPulseGainOut
+  , FamilyMember "tri-lpf-gain-out"      sinkTriLpfGainOut
   ]
 familyMembers FamilyReturnTail =
   [ FamilyMember "send-busout-return" returnSendReceive
@@ -262,6 +264,28 @@ sinkBusInLpfGainOut = runSynth $ do
   bi  <- busIn 8
   f   <- lpf bi 1500.0 0.7
   g   <- gain f 0.5
+  out 0 g
+
+-- | Phase 7.E first source-prefix probe. Pulse oscillator into the
+-- canonical @Gain -> Out@ tail. The generator owns only
+-- @[KGain, KOut]@; @KPulseOsc@ (stateful source) stays as
+-- node-loop work in the host region's pre-slice.
+sinkPulseGainOut :: SynthGraph
+sinkPulseGainOut = runSynth $ do
+  osc <- pulseOsc 110.0 0.0 0.5
+  g   <- gain osc 0.4
+  out 0 g
+
+-- | Phase 7.E second source-prefix probe. Triangle oscillator
+-- through a low-pass into the canonical @Gain -> Out@ tail. The
+-- generator owns only @[KGain, KOut]@; @KTriOsc@ and @KLPF@ both
+-- stay as node-loop work in the host region's pre-slice, which
+-- exercises a multi-node prefix instead of a single-source one.
+sinkTriLpfGainOut :: SynthGraph
+sinkTriLpfGainOut = runSynth $ do
+  osc <- triOsc 220.0 0.0
+  f   <- lpf osc 1200.0 0.7
+  g   <- gain f 0.4
   out 0 g
 
 returnSendReceive :: SynthGraph
@@ -571,19 +595,24 @@ generateForCostLab rg =
 -- prefix (@fcMembers@ minus the owned suffix) continues to render
 -- as node-loop inside the host region's pre-slice.
 --
--- This slice (Phase 7.E step 2) keeps the existing
--- @[KGain, KOut]@ / @[KGain, KBusOut]@ shape behavior identical
--- by returning the full @fcMembers@ as the owned slice. Suffix-
--- shorter-than-candidate shapes land in the next step.
+-- Phase 7.E recognizes any candidate whose last two members are
+-- @[KGain, KOut]@ or @[KGain, KBusOut]@ and returns that pair as
+-- the owned suffix. Length-2 candidates reproduce the 7.D
+-- behavior exactly (empty prefix, full-candidate suffix); longer
+-- candidates (e.g. @[KPulseOsc, KGain, KOut]@,
+-- @[KTriOsc, KLPF, KGain, KOut]@) keep their prefix as node-loop
+-- work and only generate the tail.
 generateProgram
   :: RuntimeGraph
   -> FusionCandidate
   -> Either String (FusionProgram, [NodeIndex])
-generateProgram rg c = case (fcMembers c, fcMemberKinds c) of
-  ([gainIx, outIx], [KGain, k]) | k == KOut || k == KBusOut -> do
-    prog <- gainOutProgram rg gainIx outIx
-    Right (prog, [gainIx, outIx])
-  _ -> Left "generated: candidate shape not implemented yet"
+generateProgram rg c =
+  case (reverse (fcMembers c), reverse (fcMemberKinds c)) of
+    (outIx : gainIx : _, sinkKind : KGain : _)
+      | sinkKind == KOut || sinkKind == KBusOut -> do
+          prog <- gainOutProgram rg gainIx outIx
+          Right (prog, [gainIx, outIx])
+    _ -> Left "generated: candidate shape not implemented yet"
 
 -- | Emit the @KGain -> {KOut, KBusOut}@ tail program. Shared
 -- between the standalone @[KGain, KOut]@ candidate and any longer

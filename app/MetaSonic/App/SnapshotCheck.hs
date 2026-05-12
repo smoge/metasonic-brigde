@@ -163,7 +163,7 @@ costLabChecks rows =
       , ("dynamic-gain", 12)
       , ("fanout",        4)
       , ("return-tail",   4)
-      , ("sink-chain",   16)
+      , ("sink-chain",   24)
       ]
 
     expectedRowCount =
@@ -192,7 +192,13 @@ costLabChecks rows =
     -- Pinned: the number of cost-lab members whose maximal
     -- selected candidate the current generator handles. Bump this
     -- intentionally when the generator widens to more shapes.
-    expectedGeneratedRows = 2
+    --
+    -- Phase 7.E step 3: generator now accepts any candidate whose
+    -- last two members are @[KGain, KOut]@ or @[KGain, KBusOut]@,
+    -- emitting the tail as the owned suffix and leaving the prefix
+    -- as node-loop work. This pulls in every existing chain that
+    -- happens to end in that pair, not just the length-2 cases.
+    expectedGeneratedRows = 19
 
     corpusFeatures =
       [ f
@@ -585,9 +591,14 @@ costModelJoinChecks shapeIdx snapshots =
     -- Pinned snapshot. Bump these intentionally when the cost-lab
     -- corpus changes, a planner rule changes, or the snapshot
     -- corpus changes; a silent shift means the join drifted.
+    --
+    -- Phase 7.E step 3: pulse-gain-out and tri-lpf-gain-out joined
+    -- the cost-lab corpus, so the two survey shapes
+    -- ([KPulseOsc,KGain,KOut], [KTriOsc,KLPF,KGain,KOut]) that
+    -- were previously needs-benchmark now have measurements.
     expectedCovered        = 51
-    expectedMeasured       = 12
-    expectedNeedsBenchmark = 6
+    expectedMeasured       = 14
+    expectedNeedsBenchmark = 4
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =
