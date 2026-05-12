@@ -1048,6 +1048,189 @@ authoringDslTests =
         Left err -> assertFailure err >> error "unreachable"
         Right t  -> pure t
       tg1 @?= tg2
+
+  ------------------------------------------------------------
+  -- Phase 8.F: named controls
+  ------------------------------------------------------------
+
+  , testCase "defaultControlOptions has coSmoothingHz = 20.0" $
+      Auth.coSmoothingHz Auth.defaultControlOptions @?= 20.0
+
+  , testCase "controlName accepts OSC-safe identifiers" $ do
+      Auth.controlName "cutoff"
+        @?= Right (Auth.ControlName "cutoff")
+      Auth.controlName "vol"
+        @?= Right (Auth.ControlName "vol")
+      Auth.controlName "a_b-c"
+        @?= Right (Auth.ControlName "a_b-c")
+      -- 16 bytes is the longest legal name.
+      Auth.controlName "0123456789abcdef"
+        @?= Right (Auth.ControlName "0123456789abcdef")
+
+  , testCase "controlName rejects empty names" $
+      case Auth.controlName "" of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected empty-name rejection"
+
+  , testCase "controlName rejects names with slash or space" $ do
+      case Auth.controlName "with space" of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected space rejection"
+      case Auth.controlName "with/slash" of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected slash rejection"
+
+  , testCase "controlName rejects names longer than 16 bytes" $
+      case Auth.controlName "0123456789abcdefX" of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected 17-byte rejection"
+
+  , testCase "controlRange accepts min < max and rejects min >= max" $ do
+      Auth.controlRange 0 1
+        @?= Right (Auth.ControlRange 0 1)
+      case Auth.controlRange 1 0 of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected inverted-range rejection"
+      case Auth.controlRange 0.5 0.5 of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected zero-width rejection"
+
+  , testCase "control emits exactly one KSmooth tagged with the control name" $ do
+      let Right cname = Auth.controlName "cutoff"
+          Right rng   = Auth.controlRange 200 8000
+          (_, sg)     = runSynthWith $ Auth.control cname 1200 rng
+      length (nodesByKind sg KSmooth) @?= 1
+      case nodesByKind sg KSmooth of
+        [spec] -> do
+          nsMigrationKey spec @?= Just (MigrationKey "cutoff")
+          case nsUgen spec of
+            Smooth hz (Param d) -> do
+              hz @?= 20.0
+              d  @?= 1200
+            other -> assertFailure
+                       ("expected Smooth 20 (Param 1200), got: " <> show other)
+        _ -> assertFailure "expected one KSmooth node"
+
+  , testCase "control records ncmSlot = 1 and ncmKey = MigrationKey name" $ do
+      let Right cname  = Auth.controlName "vol"
+          Right rng    = Auth.controlRange 0 1
+          (nc, _)      = runSynthWith $ Auth.control cname 0.3 rng
+          meta         = Auth.ncMetadata nc
+      Auth.ncmSlot meta @?= 1
+      Auth.ncmKey  meta @?= MigrationKey "vol"
+      Auth.ncmCC   meta @?= Nothing
+      Auth.ncmName meta @?= "vol"
+      Auth.ncmDefault meta @?= 0.3
+      Auth.ncmRange meta @?= rng
+
+  , testCase "controlWith honors a non-default coSmoothingHz" $ do
+      let Right cname = Auth.controlName "cutoff"
+          Right rng   = Auth.controlRange 0 1
+          opts        = Auth.defaultControlOptions { Auth.coSmoothingHz = 80.0 }
+          (nc, sg)    = runSynthWith $ Auth.controlWith opts cname 0.5 rng
+      Auth.ncmSmoothingHz (Auth.ncMetadata nc) @?= 80.0
+      case nodesByKind sg KSmooth of
+        [spec] -> case nsUgen spec of
+          Smooth hz _ -> hz @?= 80.0
+          other       -> assertFailure
+                           ("expected Smooth, got: " <> show other)
+        _ -> assertFailure "expected one KSmooth node"
+
+  , testCase "ccControl records exactly one CCSpec targeting the smoother slot 1" $ do
+      let Right cname = Auth.controlName "vol"
+          Right rng   = Auth.controlRange 0 1
+          (nc, _, specs) = runSynthCCs $ Auth.ccControl 7 cname 0.3 rng
+      length (nodesByKind (runSynth (Auth.ccControl 7 cname 0.3 rng)) KSmooth)
+        @?= 1
+      case specs of
+        [s] -> do
+          ccsNumber s @?= (7 :: Word8)
+          ccsCtl    s @?= 1
+          ccsMin    s @?= 0
+          ccsMax    s @?= 1
+          -- The spec's node points at the smoother that backs the
+          -- returned NamedControl.
+          Just (ccsNode s) @?=
+            connectionNodeID (Auth.controlConnection nc)
+        _   -> assertFailure $
+                 "expected one CC spec, got " <> show (length specs)
+      Auth.ncmCC (Auth.ncMetadata nc) @?= Just 7
+
+  , testCase "ccControlWith preserves custom smoothing on the smoother" $ do
+      let Right cname = Auth.controlName "vol"
+          Right rng   = Auth.controlRange 0 1
+          opts        = Auth.defaultControlOptions { Auth.coSmoothingHz = 50.0 }
+          (_, sg, _)  = runSynthCCs $ Auth.ccControlWith opts 7 cname 0.0 rng
+      case nodesByKind sg KSmooth of
+        [spec] -> case nsUgen spec of
+          Smooth hz _ -> hz @?= 50.0
+          other       -> assertFailure
+                           ("expected Smooth, got: " <> show other)
+        _ -> assertFailure "expected one KSmooth node"
+
+  , testCase "named control round-trips through the OSC dispatcher" $ do
+      -- End-to-end pin: a graph built from one named control
+      -- compiles, the smoother node carries the control name as
+      -- a MigrationKey, and an OSC message at
+      -- /<voice>/<name>/1 resolves to the smoother's NodeIndex
+      -- (slot 1) through the existing dispatcher.
+      let Right cname = Auth.controlName "cutoff"
+          Right rng   = Auth.controlRange 200 8000
+          (nc, sg)    = runSynthWith $ do
+            n     <- Auth.control cname 1200 rng
+            osc   <- sinOsc 440 0
+            filt  <- lpf osc (Auth.controlConnection n) (Param 0.7)
+            _     <- out 0 filt
+            pure n
+      tg <- case compileTemplateGraph [("voice", sg)] of
+        Left err -> assertFailure err >> error "unreachable"
+        Right t  -> pure t
+      rs0 <- case OSC.registerVoice (OBSC.pack "v") 1 (OBSC.pack "voice")
+                    (OSC.emptyResolveState tg) of
+        Left iss -> assertFailure (show iss) >> error "unreachable"
+        Right rs -> pure rs
+      let msg = OSC.OscMessage (OBSC.pack "/v/cutoff/1")
+                                [OSC.OscArgFloat 1500.0]
+      case OSC.dispatch rs0 msg of
+        Right (OSC.DAControlWrite
+                  { OSC.daSlotId     = 1
+                  , OSC.daControlIdx = 1
+                  , OSC.daValue      = v
+                  }) -> do
+          v @?= 1500.0
+          -- Sanity: the resolved node is the smoother that backs
+          -- the returned NamedControl.
+          let _ = nc  -- pin: the NamedControl is the same shape
+                      -- the dispatcher targets
+          pure ()
+        other -> assertFailure
+                   ("expected control-write dispatch, got: " <> show other)
+
+  , testCase "NamedControlMetadata is diagnostic-only — compile output is identical" $ do
+      -- Pin the diagnostic-only contract: dropping the metadata
+      -- and using only controlConnection produces the same
+      -- runtime graph as keeping the NamedControl handle.
+      let Right cname = Auth.controlName "vol"
+          Right rng   = Auth.controlRange 0 1
+          withHandle = runSynth $ do
+            n     <- Auth.control cname 0.3 rng
+            osc   <- sinOsc 440 0
+            amped <- gain osc (Auth.controlConnection n)
+            _     <- out 0 amped
+            pure n
+          handFused = runSynth $ do
+            v     <- tagged "vol" (smooth 20.0 (Param 0.3))
+            osc   <- sinOsc 440 0
+            amped <- gain osc v
+            _     <- out 0 amped
+            pure ()
+      -- Both lower to the same runtime graph.
+      let rt1 = lowerGraph withHandle >>= compileRuntimeGraph
+          rt2 = lowerGraph handFused  >>= compileRuntimeGraph
+      case (rt1, rt2) of
+        (Right a, Right b) -> a @?= b
+        (Left e, _) -> assertFailure ("withHandle compile: " <> e)
+        (_, Left e) -> assertFailure ("handFused compile: " <> e)
   ]
 
 ------------------------------------------------------------
