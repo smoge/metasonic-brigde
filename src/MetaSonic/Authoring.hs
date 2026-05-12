@@ -116,6 +116,20 @@ module MetaSonic.Authoring
   , outChannels
 
     -- * Ensemble builder (Phase 8.E)
+  , ControlName (..)
+  , ControlRange (..)
+  , ControlOptions (..)
+  , defaultControlOptions
+  , NamedControlMetadata (..)
+  , NamedControl (..)
+  , controlName
+  , controlRange
+  , control
+  , controlWith
+  , ccControl
+  , ccControlWith
+  , controlMono
+  , controlConnection
   , AuthoredEnsemble (..)
   , EnsembleOptions (..)
   , defaultEnsembleOptions
@@ -131,6 +145,7 @@ module MetaSonic.Authoring
 
 import           Control.Monad        (ap, zipWithM)
 import qualified Data.Map.Strict      as M
+import           Data.Word            (Word8)
 
 import           MetaSonic.Bridge.Source
 
@@ -595,6 +610,212 @@ stereoOut = outStereo
 outChannels :: Int -> Channels -> SynthM ()
 outChannels bus_ (Channels cs) =
   mapM_ (\(i, c) -> out (bus_ + i) c) (zip [0 ..] cs)
+
+------------------------------------------------------------
+-- Named controls (Phase 8.F)
+------------------------------------------------------------
+--
+-- A named control is a tagged smoother node. The authoring
+-- layer adds a name + default + range; the lowered graph is
+-- the same @tagged name (smooth hz (Param default))@ pattern
+-- callers already write by hand. MIDI CC binding is recorded
+-- through the existing 'recordCCBinding' helper; OSC
+-- resolution reuses the existing dispatcher grammar by
+-- targeting the smoother's control slot 1.
+--
+-- The smoother's target slot is @1@ — the same slot 'cc'
+-- targets. The dispatcher's '/<voice>/<node-tag>/<slot>'
+-- grammar resolves to that slot through the migration key
+-- the smoother carries.
+
+-- | A validated control name. Constructed via 'controlName',
+-- which checks the same identifier profile the OSC dispatcher
+-- enforces (ASCII letters, digits, underscore, or hyphen;
+-- non-empty; ≤16 UTF-8 bytes).
+newtype ControlName = ControlName { unControlName :: String }
+  deriving (Eq, Ord, Show)
+
+-- | A validated value range. Constructed via 'controlRange',
+-- which rejects @crMin >= crMax@.
+--
+-- Range is metadata plus MIDI CC scaling input. It is not
+-- enforced at OSC runtime: an OSC write outside the declared
+-- range still reaches the smoother target slot. Clamping is a
+-- separate concern from authoring shape.
+data ControlRange = ControlRange
+  { crMin :: !Double
+  , crMax :: !Double
+  } deriving (Eq, Show)
+
+-- | Options that parameterize a named-control build. Currently
+-- just the smoother frequency; future slices can add fields
+-- without breaking callers that use 'defaultControlOptions'.
+data ControlOptions = ControlOptions
+  { coSmoothingHz :: !Double
+    -- ^ Smoother frequency for the underlying 'smooth' node.
+    -- Default 20 Hz, matching 'cc'.
+  } deriving (Eq, Show)
+
+-- | Default options. 20 Hz matches the existing 'cc' smoother.
+-- The exact value is pinned by tests; what matters is
+-- agreement with 'cc' so a mixed CC + named-control patch has
+-- one smoothing time constant.
+defaultControlOptions :: ControlOptions
+defaultControlOptions = ControlOptions { coSmoothingHz = 20.0 }
+
+-- | Diagnostic-only metadata recorded alongside a 'NamedControl'.
+-- The compile pipeline never sees this; it is for future
+-- inspector / survey surfacing (Phase 8.G).
+data NamedControlMetadata = NamedControlMetadata
+  { ncmName        :: !String
+  , ncmDefault     :: !Double
+  , ncmRange       :: !ControlRange
+  , ncmSmoothingHz :: !Double
+  , ncmCC          :: !(Maybe Word8)
+    -- ^ MIDI CC number, if the control was built via 'ccControl' /
+    -- 'ccControlWith'; 'Nothing' for plain OSC-only controls.
+  , ncmKey         :: !MigrationKey
+    -- ^ The migration key stamped on the smoother node — the
+    -- same bytes the OSC dispatcher matches against.
+  , ncmSlot        :: !Int
+    -- ^ Pinned to @1@: the smoother's target slot.
+  } deriving (Eq, Show)
+
+-- | An authored named control. 'ncMono' is the same mono
+-- authoring shape every other helper returns; downstream
+-- consumers compose against it without any new combinators.
+-- 'ncMetadata' is diagnostic-only.
+data NamedControl = NamedControl
+  { ncMono     :: !Mono
+  , ncMetadata :: !NamedControlMetadata
+  } deriving (Eq, Show)
+
+-- | Validate an OSC-safe identifier and wrap it as a
+-- 'ControlName'. Mirrors the dispatcher's
+-- 'isOscSafeIdentifier' rule: non-empty, at most 16 ASCII
+-- bytes, made up of letters, digits, underscore, or hyphen.
+-- Rejection happens at authoring time so an invalid name
+-- never reaches the dispatcher in the first place.
+controlName :: String -> Either String ControlName
+controlName s
+  | null s =
+      Left "controlName: empty name"
+  | length s > 16 =
+      Left $ "controlName: name '" <> s
+          <> "' is longer than 16 bytes"
+  | not (all isOscChar s) =
+      Left $ "controlName: name '" <> s
+          <> "' contains characters outside [A-Za-z0-9_-]"
+  | otherwise =
+      Right (ControlName s)
+  where
+    isOscChar c =
+         (c >= 'a' && c <= 'z')
+      || (c >= 'A' && c <= 'Z')
+      || (c >= '0' && c <= '9')
+      || c == '_' || c == '-'
+
+-- | Validate a @[min, max]@ range. Rejects @min >= max@: a
+-- zero-width range has no meaningful MIDI scaling, and the
+-- OSC layer does not clamp at runtime, so an inverted range
+-- would silently produce surprising behavior.
+controlRange :: Double -> Double -> Either String ControlRange
+controlRange mn mx
+  | mn >= mx =
+      Left $ "controlRange: min ("
+          <> show mn
+          <> ") must be strictly less than max ("
+          <> show mx
+          <> ")"
+  | otherwise =
+      Right ControlRange { crMin = mn, crMax = mx }
+
+-- | Author a named, smoothed control under
+-- 'defaultControlOptions'. Emits exactly one tagged 'KSmooth'
+-- node carrying the control's name as its 'MigrationKey'. The
+-- returned 'NamedControl' wraps the smoother's audio output
+-- as a 'Mono', plus diagnostic metadata.
+control
+  :: ControlName
+  -> Double         -- ^ initial \/ default target value
+  -> ControlRange
+  -> SynthM NamedControl
+control = controlWith defaultControlOptions
+
+-- | 'control' with explicit options. Use when a control needs
+-- a non-default smoothing time constant.
+controlWith
+  :: ControlOptions
+  -> ControlName
+  -> Double
+  -> ControlRange
+  -> SynthM NamedControl
+controlWith opts (ControlName name) defaultVal range = do
+  conn <- tagged name
+            (smooth (coSmoothingHz opts) (Param defaultVal))
+  pure NamedControl
+    { ncMono     = Mono conn
+    , ncMetadata = NamedControlMetadata
+        { ncmName        = name
+        , ncmDefault     = defaultVal
+        , ncmRange       = range
+        , ncmSmoothingHz = coSmoothingHz opts
+        , ncmCC          = Nothing
+        , ncmKey         = MigrationKey name
+        , ncmSlot        = 1
+        }
+    }
+
+-- | Author a named, smoothed control that is also bound to a
+-- MIDI CC number. The lowered shape is the same single tagged
+-- 'KSmooth' as 'control'; the only difference is that the
+-- builder records a 'CCSpec' targeting the smoother's slot 1
+-- with the supplied range. The live-MIDI runner picks this up
+-- through the existing 'runSynthCCs' path.
+ccControl
+  :: Word8
+  -> ControlName
+  -> Double
+  -> ControlRange
+  -> SynthM NamedControl
+ccControl = ccControlWith defaultControlOptions
+
+-- | 'ccControl' with explicit options.
+ccControlWith
+  :: ControlOptions
+  -> Word8
+  -> ControlName
+  -> Double
+  -> ControlRange
+  -> SynthM NamedControl
+ccControlWith opts ccNum cname defaultVal range = do
+  nc <- controlWith opts cname defaultVal range
+  case connectionNodeID (monoConnection (ncMono nc)) of
+    Nothing ->
+      error $ "ccControlWith: smoother for '"
+           <> unControlName cname
+           <> "' did not produce an audio node"
+    Just nid -> do
+      recordCCBinding CCSpec
+        { ccsNumber = ccNum
+        , ccsNode   = nid
+        , ccsCtl    = 1
+        , ccsMin    = crMin range
+        , ccsMax    = crMax range
+        }
+      pure nc
+        { ncMetadata = (ncMetadata nc) { ncmCC = Just ccNum } }
+
+-- | Project a 'NamedControl' to its 'Mono' shape. Use when a
+-- downstream helper expects 'Mono' directly.
+controlMono :: NamedControl -> Mono
+controlMono = ncMono
+
+-- | Project a 'NamedControl' to the underlying 'Connection'.
+-- Use when wiring into a primitive builder that takes
+-- 'Connection' directly (e.g., 'lpf', 'gain').
+controlConnection :: NamedControl -> Connection
+controlConnection = monoConnection . ncMono
 
 ------------------------------------------------------------
 -- Ensemble builder (Phase 8.E)
