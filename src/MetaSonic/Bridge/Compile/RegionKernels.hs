@@ -186,7 +186,7 @@ selectRegionKernels rg =
                 { rrIndex     = placeholder
                 , rrRate      = rate
                 , rrNodes     = ks
-                , rrKernel    = ker
+                , rrExec      = execKernel ker
                 , rrFootprint = emptyResourceFootprint
                   -- Re-derived by 'attachRegionFootprints' after
                   -- 'selectRegionKernels' finishes splitting; safe to
@@ -219,7 +219,7 @@ selectRegionKernels rg =
                         { rrIndex     = placeholder
                         , rrRate      = rate
                         , rrNodes     = post
-                        , rrKernel    = RNodeLoop
+                        , rrExec      = ExecNodeLoop
                         , rrFootprint = emptyResourceFootprint
                           -- See note on 'mkPart'.
                         }

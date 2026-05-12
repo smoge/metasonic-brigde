@@ -182,6 +182,7 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              ScheduleStep (..),
                                              kernelTag,
                                              layeredRegionSchedule,
+                                             rrKernel,
                                              scheduledRuntimeRegions)
 import           MetaSonic.Bridge.Source    (MigrationKey (..),
                                              migrationKeyUtf8Bytes)

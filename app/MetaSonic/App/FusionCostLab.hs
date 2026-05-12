@@ -503,7 +503,7 @@ loadForVariant VarRFused       rt rg = loadRuntimeGraphFused rt rg
 stripRegionKernels :: RuntimeGraph -> RuntimeGraph
 stripRegionKernels rg = rg
   { rgRuntimeRegions =
-      map (\r -> r { rrKernel = RNodeLoop }) (rgRuntimeRegions rg)
+      map (\r -> r { rrExec = ExecNodeLoop }) (rgRuntimeRegions rg)
   }
 
 writtenOutputBuses :: RuntimeGraph -> [Int]

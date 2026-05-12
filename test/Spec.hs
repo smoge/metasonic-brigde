@@ -781,6 +781,29 @@ fusionProgramScaffoldTests =
       SrcScratch (ScratchIndex 2)               @?= SrcScratch (ScratchIndex 2)
       assertBool "distinct sources are not equal"
         (SrcConst 0.5 /= SrcScratch (ScratchIndex 0))
+
+  , testCase "execKernel collapses RNodeLoop into ExecNodeLoop" $ do
+      execKernel RNodeLoop       @?= ExecNodeLoop
+      execKernel RSinGainOut     @?= ExecKernel RSinGainOut
+      execKernel RSawLpfGainOut  @?= ExecKernel RSawLpfGainOut
+
+  , testCase "rrKernel projects RegionExec back to RegionKernel" $ do
+      let region exec = RuntimeRegion
+            { rrIndex     = RegionIndex 0
+            , rrRate      = SampleRate
+            , rrNodes     = []
+            , rrExec      = exec
+            , rrFootprint = emptyResourceFootprint
+            }
+      rrKernel (region ExecNodeLoop)                       @?= RNodeLoop
+      rrKernel (region (ExecKernel RSinGainOut))           @?= RSinGainOut
+      -- Generated regions project to RNodeLoop through the legacy
+      -- lens; readers that need to distinguish must pattern-match
+      -- on 'rrExec' directly.
+      rrKernel (region (ExecGenerated (FusionProgramId 0))) @?= RNodeLoop
+
+  , testCase "RuntimeGraph carries an empty FusionProgram table by default" $
+      rgFusionPrograms (RuntimeGraph [] [] []) @?= []
   ]
 
 -- | Tally a 'SynthGraph' by 'NodeKind' for shape-pinning tests.
@@ -1672,7 +1695,7 @@ unitTests = testGroup "Unit tests"
       , testCase "computePrecedence: bus + buffer edges both register" $ do
           -- Three templates: A writes bus 0, B writes buffer 7,
           -- C reads both. computePrecedence should map C \8594 {A, B}.
-          let dummyRG = RuntimeGraph [] []
+          let dummyRG = RuntimeGraph [] [] []
               tA = Template (TemplateID 0) "A" dummyRG
                    emptyResourceFootprint
                      { rfBuses = emptyFootprint
@@ -1700,7 +1723,7 @@ unitTests = testGroup "Unit tests"
       -- lands in the §6.C.4 follow-up).
 
       , testCase "checkNoSharedBufferWriters: distinct writers on distinct buffers is OK" $ do
-          let dummyRG = RuntimeGraph [] []
+          let dummyRG = RuntimeGraph [] [] []
               tA = Template (TemplateID 0) "A" dummyRG
                    emptyResourceFootprint
                      { rfBuffers = emptyBufferFootprint
@@ -1712,7 +1735,7 @@ unitTests = testGroup "Unit tests"
           checkNoSharedBufferWriters [tA, tB] @?= Right ()
 
       , testCase "checkNoSharedBufferWriters: BufWrite + BufRead on the same buffer is OK" $ do
-          let dummyRG = RuntimeGraph [] []
+          let dummyRG = RuntimeGraph [] [] []
               tWriter = Template (TemplateID 0) "writer" dummyRG
                    emptyResourceFootprint
                      { rfBuffers = emptyBufferFootprint
@@ -1724,7 +1747,7 @@ unitTests = testGroup "Unit tests"
           checkNoSharedBufferWriters [tWriter, tReader] @?= Right ()
 
       , testCase "checkNoSharedBufferWriters: two writers on the same buffer is rejected" $ do
-          let dummyRG = RuntimeGraph [] []
+          let dummyRG = RuntimeGraph [] [] []
               tA = Template (TemplateID 0) "first" dummyRG
                    emptyResourceFootprint
                      { rfBuffers = emptyBufferFootprint
@@ -1751,7 +1774,7 @@ unitTests = testGroup "Unit tests"
           -- Regression guard for the disjoint-id-space property:
           -- two templates writing BUS 5 and BUFFER 5 respectively
           -- must not be flagged as a buffer-write conflict.
-          let dummyRG = RuntimeGraph [] []
+          let dummyRG = RuntimeGraph [] [] []
               tBus = Template (TemplateID 0) "bus_writer" dummyRG
                    emptyResourceFootprint
                      { rfBuses = emptyFootprint
@@ -7833,7 +7856,7 @@ prop_fusedRenderEqualsUnfused graph =
 stripRegionKernels :: RuntimeGraph -> RuntimeGraph
 stripRegionKernels rg = rg
   { rgRuntimeRegions =
-      map (\r -> r { rrKernel = RNodeLoop }) (rgRuntimeRegions rg)
+      map (\r -> r { rrExec = ExecNodeLoop }) (rgRuntimeRegions rg)
   }
 
 -- | A 'RuntimeGraph' has been touched by some form of fusion if it

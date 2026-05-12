@@ -33,6 +33,9 @@ module MetaSonic.Bridge.Compile
   , RuntimeRegion (..)
   , RegionKernel (..)
   , kernelTag
+  , RegionExec (..)
+  , execKernel
+  , rrKernel
   , RuntimeGraph (..)
   , RegionIndex (..)
   , NodeOutputUse (..)
@@ -232,7 +235,7 @@ compileRuntimeGraph ir = do
   -- — §4.E.1 metadata, no runtime behavior change.
   pure $!
     attachRegionFootprints
-      (selectRegionKernels (RuntimeGraph rtNodes rtRegions))
+      (selectRegionKernels (RuntimeGraph rtNodes rtRegions []))
 
   where
     compileNode
@@ -291,7 +294,7 @@ compileRuntimeGraph ir = do
         { rrIndex  = RegionIndex i
         , rrRate   = regRate region
         , rrNodes  = members
-        , rrKernel = RNodeLoop
+        , rrExec   = ExecNodeLoop
           -- Default for every region produced by 'formRegions'.
           -- 'selectRegionKernels' may upgrade some regions to a
           -- fused kernel after splitting, before the final

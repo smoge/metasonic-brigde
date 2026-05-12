@@ -35,6 +35,10 @@ module MetaSonic.Bridge.Compile.Types
   , RegionKernel (..)
   , kernelTag
   , kernelArity
+    -- * §7.D region execution selector
+  , RegionExec (..)
+  , execKernel
+  , rrKernel
     -- * Bus footprints
   , BusFootprint (..)
   , emptyFootprint
@@ -50,6 +54,8 @@ import qualified Data.Set            as S
 import           Foreign.C.Types     (CInt)
 import           GHC.Generics        (Generic)
 
+import           MetaSonic.Bridge.Compile.FusionProgram (FusionProgram,
+                                                         FusionProgramId)
 import           MetaSonic.Bridge.Source (MigrationKey)
 import           MetaSonic.Types
 
@@ -640,6 +646,60 @@ kernelArity RBusInLpfGainOut  = 4
 kernelArity RNoiseLpfGainOut  = 4
 kernelArity RNodeLoop         = 0
 
+
+{- Note [Region execution selector]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+§7.D widens region dispatch to three cases:
+
+  * 'ExecNodeLoop'    — per-node dispatch, the default.
+  * 'ExecKernel'      — a hand-written 'RegionKernel' (existing path).
+  * 'ExecGenerated'   — a generated 'FusionProgram', referenced by id
+                        into the runtime graph's program table.
+
+The selector is intentionally a sum type rather than a
+@'Maybe' 'FusionProgramId'@ field alongside the previous
+'rrKernel'. Encoding the three cases structurally prevents a hidden
+invariant ("when generated id is 'Just', kernel must be
+'RNodeLoop'") that future code could violate.
+
+'rrKernel' survives as a backward-compatible /accessor/ that
+projects out the previous enum view: 'ExecKernel' regions return
+their kernel; everything else returns 'RNodeLoop'. Code that wants
+to tell generated programs apart from node-loop pattern-matches on
+'rrExec' directly.
+
+See @notes/2026-05-12-phase-7d-runtime-program-abi.md@.
+-}
+
+-- | The dispatch selector for one 'RuntimeRegion'. See
+-- Note [Region execution selector].
+data RegionExec
+  = ExecNodeLoop
+  | ExecKernel    !RegionKernel
+  | ExecGenerated !FusionProgramId
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
+-- | Smart constructor: build an 'ExecKernel' from a 'RegionKernel',
+-- collapsing 'RNodeLoop' to 'ExecNodeLoop'. Kernel-selection code
+-- that produces a @'RegionKernel'@ value and wants to set the
+-- region's exec should use this rather than wrap directly.
+execKernel :: RegionKernel -> RegionExec
+execKernel RNodeLoop = ExecNodeLoop
+execKernel k         = ExecKernel k
+
+-- | Backward-compatible accessor: projects 'rrExec' into the
+-- previous 'RegionKernel' enum view. 'ExecGenerated' regions read
+-- as 'RNodeLoop' through this lens — readers that need to
+-- distinguish should pattern-match on 'rrExec' directly.
+rrKernel :: RuntimeRegion -> RegionKernel
+rrKernel r = case rrExec r of
+  ExecNodeLoop    -> RNodeLoop
+  ExecKernel k    -> k
+  ExecGenerated _ -> RNodeLoop
+
+
 {- Note [Bus footprints, template- vs region-level]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 'BusFootprint' is the bus-level interface a unit of execution
@@ -759,11 +819,16 @@ data RuntimeRegion = RuntimeRegion
     -- ^ Member nodes in execution order. Currently always contiguous
     -- (greedy 'formRegions' invariant), but the type does not encode
     -- that.
-  , rrKernel :: !RegionKernel
-    -- ^ Region kernel selector. 'RNodeLoop' on every region produced
-    -- by 'formRegions'; 'selectRegionKernels' may upgrade some
-    -- regions to a fused kernel after splitting the region to
-    -- contain only the matched members. See 'RegionKernel'.
+  , rrExec   :: !RegionExec
+    -- ^ Region dispatch selector. 'ExecNodeLoop' on every region
+    -- produced by 'formRegions'; 'selectRegionKernels' may upgrade
+    -- some regions to 'ExecKernel' after splitting. 'ExecGenerated'
+    -- is reserved for §7.D generated programs and is not produced
+    -- by 'compileRuntimeGraph' today.
+    --
+    -- See Note [Region execution selector] and the
+    -- backward-compatible 'rrKernel' accessor for the previous
+    -- 'RegionKernel'-only view.
   , rrFootprint :: !ResourceFootprint
     -- ^ §6.C.4: resource-level interface of this region. The
     -- bus half ('rfBuses') carries the writes / live-reads /
@@ -800,7 +865,13 @@ data RuntimeRegion = RuntimeRegion
 --
 -- See Note [Dense lowering] and Note [Runtime regions overlay].
 data RuntimeGraph = RuntimeGraph
-  { rgNodes          :: ![RuntimeNode]
-  , rgRuntimeRegions :: ![RuntimeRegion]
+  { rgNodes           :: ![RuntimeNode]
+  , rgRuntimeRegions  :: ![RuntimeRegion]
+  , rgFusionPrograms  :: ![FusionProgram]
+    -- ^ §7.D generated-fusion program table. Empty for every
+    -- graph 'compileRuntimeGraph' produces today; populated by a
+    -- later slice when the planner is wired to emit generated
+    -- programs. Indexed by 'FusionProgramId' through
+    -- 'ExecGenerated' references in 'rrExec'.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)

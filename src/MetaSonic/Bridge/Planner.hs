@@ -48,7 +48,8 @@ import           MetaSonic.Bridge.Compile.Types   (RegionIndex,
                                                    RuntimeInput (..),
                                                    RuntimeGraph (..),
                                                    RuntimeNode (..),
-                                                   RuntimeRegion (..))
+                                                   RuntimeRegion (..),
+                                                   rrKernel)
 import           MetaSonic.Types                  (KindCapability (..),
                                                    NodeIndex, NodeKind (..),
                                                    PortIndex (..),
