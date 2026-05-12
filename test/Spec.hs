@@ -32,7 +32,8 @@ import           Data.List                 (find, isInfixOf, isPrefixOf, nub,
                                             sort, sortBy)
 import           Control.Concurrent        (forkIO, newEmptyMVar, putMVar,
                                             takeMVar, threadDelay)
-import           Control.Exception         (try)
+import           Control.Exception         (SomeException, displayException,
+                                            evaluate, try)
 import           Control.Monad             (forM, forM_, when)
 import           Data.Maybe                (isJust, isNothing, listToMaybe,
                                             mapMaybe)
@@ -12246,6 +12247,19 @@ sessionStateTests = testGroup "Session Prep B: admission and commits"
       OSC.resolveStateVoices (ssResolve st1)
         @?= M.fromList [(OBSC.pack "v0", (11, OBSC.pack "drone"))]
 
+  , testCase "voice-start commit rejects invalid runtime binding loudly" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding (VoiceKey "bad/key") 11 (TemplateName "drone")
+      thrown <- try (evaluate (applySessionCommit (CommitVoiceStarted binding) st0))
+                  :: IO (Either SomeException SessionState)
+      case thrown of
+        Left ex ->
+          assertBool
+            "exception should explain the SessionCommit invariant"
+            ("invariant violated" `isInfixOf` displayException ex)
+        Right _ ->
+          assertFailure "expected invalid committed binding to fail loudly"
+
   , testCase "duplicate active voice rejects after start commit" $ do
       let st0 = initialSessionState (patternTemplates droneVibrato)
           binding = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
@@ -12299,6 +12313,33 @@ sessionStateTests = testGroup "Session Prep B: admission and commits"
       ssGraph st0 @?= oldGraph
       OSC.resolveStateTemplate (ssResolve st0) @?= oldGraph
 
+  , testCase "graph-install commit reports authoritative drops" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          binding0 = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
+          binding1 = VoiceBinding (VoiceKey "v1") 12 (TemplateName "drone")
+          st0 = applySessionCommit
+                  (CommitVoiceStarted binding0)
+                  (initialSessionState oldGraph)
+          cmd = CmdHotSwap (SwapLabel "remove-drone") newGraph
+          previewDrop =
+            [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
+          commitDrop =
+            [ RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")
+            , RriMissingTemplate (VoiceKey "v1") (TemplateName "drone")
+            ]
+      case admitSessionCommand cmd st0 of
+        SessionAdmitted _ (PlanHotSwap _ _ preview) ->
+          rrrDropped preview @?= previewDrop
+        other ->
+          assertFailure ("expected hot-swap plan, got: " <> show other)
+      let st1 = applySessionCommit (CommitVoiceStarted binding1) st0
+          (st2, committed) =
+            commitGraphInstalled (SwapLabel "remove-drone") newGraph st1
+      rrrDropped committed @?= commitDrop
+      ssVoices st2 @?= M.empty
+      OSC.resolveStateTemplate (ssResolve st2) @?= newGraph
+
   , testCase "graph-install commit rebuilds resolve and drops missing voices" $ do
       let oldGraph = patternTemplates droneVibrato
           newGraph = patternTemplates polyphonicStab
@@ -12306,13 +12347,14 @@ sessionStateTests = testGroup "Session Prep B: admission and commits"
           st0 = applySessionCommit
                   (CommitVoiceStarted binding)
                   (initialSessionState oldGraph)
-          st1 = applySessionCommit
-                  (CommitGraphInstalled (SwapLabel "remove-drone") newGraph)
-                  st0
+          (st1, result) =
+            commitGraphInstalled (SwapLabel "remove-drone") newGraph st0
       ssGraph st1 @?= newGraph
       ssVoices st1 @?= M.empty
       OSC.resolveStateTemplate (ssResolve st1) @?= newGraph
       OSC.resolveStateVoices (ssResolve st1) @?= M.empty
+      rrrDropped result
+        @?= [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
 
   , testCase "graph-install commit preserves surviving voices" $ do
       let graph = patternTemplates droneVibrato
@@ -12320,13 +12362,12 @@ sessionStateTests = testGroup "Session Prep B: admission and commits"
           st0 = applySessionCommit
                   (CommitVoiceStarted binding)
                   (initialSessionState graph)
-          st1 = applySessionCommit
-                  (CommitGraphInstalled (SwapLabel "same") graph)
-                  st0
+          (st1, result) = commitGraphInstalled (SwapLabel "same") graph st0
       ssGraph st1 @?= graph
       ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
       OSC.resolveStateVoices (ssResolve st1)
         @?= M.fromList [(OBSC.pack "v0", (11, OBSC.pack "drone"))]
+      rrrDropped result @?= []
   ]
 
 ------------------------------------------------------------

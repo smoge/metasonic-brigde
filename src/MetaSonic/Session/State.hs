@@ -30,6 +30,7 @@ module MetaSonic.Session.State
     -- * Commits
   , SessionCommit (..)
   , applySessionCommit
+  , commitGraphInstalled
   ) where
 
 import           Control.DeepSeq            (NFData)
@@ -143,23 +144,38 @@ applySessionCommit commit st = case commit of
            , ssResolve = resolve'
            }
       Left _ ->
-        st
+        error "applySessionCommit: invariant violated; invalid committed voice binding"
 
   CommitVoiceStopped vkey ->
     st { ssVoices  = M.delete vkey (ssVoices st)
        , ssResolve = dropVoice (voiceKeyBytes vkey) (ssResolve st)
        }
 
-  CommitGraphInstalled _ graph ->
-    let result = previewResolveRebuild graph st
-        dropped = S.fromList (map rebuildIssueVoiceKey (rrrDropped result))
-    in st { ssGraph   = graph
-          , ssVoices  = M.withoutKeys (ssVoices st) dropped
-          , ssResolve = rrrState result
-          }
+  CommitGraphInstalled label graph ->
+    fst (commitGraphInstalled label graph st)
+
+-- | Commit a graph install and return the authoritative resolve
+-- rebuild result produced at commit time. This is the API to use when
+-- the caller needs to log or route the actual dropped-voice list; a
+-- 'PlanHotSwap' preview is admission-time only and may be stale.
+commitGraphInstalled
+  :: SwapLabel
+  -> TemplateGraph
+  -> SessionState
+  -> (SessionState, ResolveRebuildResult)
+commitGraphInstalled _label graph st =
+  let result = previewResolveRebuild graph st
+      dropped = S.fromList (map rebuildIssueVoiceKey (rrrDropped result))
+      st' = st { ssGraph   = graph
+               , ssVoices  = M.withoutKeys (ssVoices st) dropped
+               , ssResolve = rrrState result
+               }
+  in (st', result)
 
 previewResolveRebuild :: TemplateGraph -> SessionState -> ResolveRebuildResult
 previewResolveRebuild graph st =
+  -- SessionState keys voices by VoiceKey, so rebuild diagnostics use
+  -- deterministic key order rather than runtime/start order.
   rebuildResolveState graph (M.elems (ssVoices st))
 
 templateExists :: TemplateName -> TemplateGraph -> Bool

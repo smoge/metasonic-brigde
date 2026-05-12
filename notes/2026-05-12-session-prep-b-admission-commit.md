@@ -81,8 +81,8 @@ Admission must not:
 - call any FFI function;
 - read or write buffer/plugin lifecycle counters.
 
-The only function allowed to mutate pure session state is
-`applySessionCommit`.
+The only functions allowed to produce mutated pure session state are
+the commit helpers in `MetaSonic.Session.State`.
 
 ## Proposed State Shape
 
@@ -186,6 +186,14 @@ Commits describe runtime facts that have already happened:
 
     applySessionCommit :: SessionCommit -> SessionState -> SessionState
 
+Graph install also needs a result-bearing helper:
+
+    commitGraphInstalled
+      :: SwapLabel
+      -> TemplateGraph
+      -> SessionState
+      -> (SessionState, ResolveRebuildResult)
+
 Commit policy:
 
 - `CommitVoiceStarted` inserts the `VoiceBinding` into `ssVoices` and
@@ -198,11 +206,17 @@ Commit policy:
   The admission-time `ResolveRebuildResult` preview is advisory and
   may become stale. The authoritative rebuild happens at commit time
   against the current `ssVoices`. The eventual runtime owner must
-  serialize commits before calling `applySessionCommit`, but it does
-  not need to block every producer between hot-swap admission and
-  install completion. The commit-time `ResolveRebuildResult` is the
-  runtime caller's to log or route to producers; Prep B does not retain
-  its drop list inside `SessionState`.
+  serialize commits before applying them, but it does not need to
+  block every producer between hot-swap admission and install
+  completion. Callers that need to log or route the actual
+  commit-time drop list must use `commitGraphInstalled`; the
+  `applySessionCommit` wrapper returns only the new state. Prep B does
+  not retain the drop list inside `SessionState`.
+
+`SessionState` stores active voices in `Map VoiceKey VoiceBinding`.
+Therefore rebuild diagnostics emitted by `commitGraphInstalled` are
+deterministic in `VoiceKey` order, not runtime/start order. Prep B does
+not track start order.
 
 There is deliberately no `CommitControlWritten` constructor. Symbolic
 control writes have no state to mutate at this layer, and an empty
@@ -353,14 +367,17 @@ Recommended commit shape:
 3. **State module scaffold.** Add `MetaSonic.Session.State` with
    `SessionState`, `SessionPlan`, `SessionCommit`,
    `SessionAdmissionResult`, `initialSessionState`,
-   `admitSessionCommand`, and `applySessionCommit`.
+   `admitSessionCommand`, `applySessionCommit`, and
+   `commitGraphInstalled`.
 4. **Admission tests.** Pin known-template voice start, unknown
    template rejection, invalid/reserved voice key rejection, duplicate
    voice rejection after commit, stale voice-off/control-write
    rejection, and valid control-write planning.
 5. **Commit tests.** Pin voice-start insertion, voice-stop removal,
    graph-install rebuild, hot-swap dropping missing-template voices,
-   and the absence-of-commit behavior on simulated runtime failure.
+   authoritative commit-time rebuild reporting, invariant failure on
+   invalid committed bindings, and the absence-of-commit behavior on
+   simulated runtime failure.
 6. **Roadmap sync.** Add Session Prep B under the same
    Session-Layer Scoping Gate while keeping runtime session
    implementation explicitly gated.
