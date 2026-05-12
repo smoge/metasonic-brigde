@@ -28,6 +28,7 @@ import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
                                                 Variant (..),
                                                 collectFusionCostLabRows,
                                                 costLabGateIndex,
+                                                costLabGateIndexFor,
                                                 costLabShapeIndex,
                                                 familyName,
                                                 generatedSuperKindIndex,
@@ -81,6 +82,7 @@ runSnapshotCheck = do
              <> plannerChecks survey
              <> costModelJoinChecks shapeIdx survey
              <> profitabilityGateChecks gateIdx survey
+             <> gateByExecutorChecks costRows survey
 
   putStrLn "Phase 7 survey/cost-lab snapshot checks"
   putStrLn ""
@@ -973,6 +975,105 @@ profitabilityGateChecks gateIdx snapshots =
     expectedUnsupported    = 0
     expectedNeedsBenchmark = 9
     expectedCovered        = 10
+
+-- | Phase 7.J cross-executor gate pins. Computes a gate index
+-- per generated executor ('VarGenerated', 'VarGeneratedBlock',
+-- 'VarGeneratedSuper'), evaluates the shared rule set against
+-- the same selected-candidate aggregation 'profitabilityGateChecks'
+-- uses, and pins the structural facts the slice promised the
+-- snapshot would now break on.
+--
+-- 'expectedPreferGenerated' is pinned to the observed snapshot
+-- value (one row at the time of writing). The 7.I writeup
+-- claimed this would be 0; the snapshot corpus contradicts that
+-- and the 7.J entry calls out the discrepancy. Pinning the
+-- observed value means future drift in either direction triggers
+-- a deliberate decision rather than silently moving.
+--
+-- Speedup payloads, win/loss splits, and per-bucket medians
+-- stay unpinned per the bench-noise discipline.
+gateByExecutorChecks :: [LabRow] -> SurveySnapshots -> [SnapshotCheck]
+gateByExecutorChecks costRows snapshots =
+  [ check "gate-by-executor sample-major prefer-generated count is stable"
+      (gcPreferGenerated sampleCounts == expectedPreferGenerated)
+      ("expected=" <> show expectedPreferGenerated
+       <> "; actual=" <> show (gcPreferGenerated sampleCounts)
+       <> samplePreferGenDetail)
+
+  , check "gate-by-executor block-major prefer-generated count is stable"
+      (gcPreferGenerated blockCounts == expectedPreferGenerated)
+      ("expected=" <> show expectedPreferGenerated
+       <> "; actual=" <> show (gcPreferGenerated blockCounts))
+
+  , check "gate-by-executor super-mode prefer-generated count is stable"
+      (gcPreferGenerated superCounts == expectedPreferGenerated)
+      ("expected=" <> show expectedPreferGenerated
+       <> "; actual=" <> show (gcPreferGenerated superCounts))
+
+  , check "gate-by-executor non-exact = 0 across all executors"
+      (gcNonExact sampleCounts == 0
+        && gcNonExact blockCounts == 0
+        && gcNonExact superCounts == 0)
+      ("sample=" <> show (gcNonExact sampleCounts)
+       <> "; block=" <> show (gcNonExact blockCounts)
+       <> "; super=" <> show (gcNonExact superCounts))
+
+  , check "gate-by-executor row totals agree across executors"
+      (gcTotal sampleCounts == gcTotal blockCounts
+        && gcTotal sampleCounts == gcTotal superCounts)
+      ("sample=" <> show (gcTotal sampleCounts)
+       <> "; block=" <> show (gcTotal blockCounts)
+       <> "; super=" <> show (gcTotal superCounts))
+
+  , check "gate-by-executor prefer-generated agrees across executors"
+      (gcPreferGenerated sampleCounts == gcPreferGenerated blockCounts
+        && gcPreferGenerated sampleCounts == gcPreferGenerated superCounts)
+      ("sample=" <> show (gcPreferGenerated sampleCounts)
+       <> "; block=" <> show (gcPreferGenerated blockCounts)
+       <> "; super=" <> show (gcPreferGenerated superCounts))
+  ]
+  where
+    allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
+    verdictGroups =
+      [ csPlannerVerdicts row | (_, Right row) <- allRows ]
+    shapes = aggregateGateShapes verdictGroups
+    countsFor v =
+      let idx = costLabGateIndexFor v costRows
+          gateRows =
+            [ GateRow input (evaluateGate input)
+            | s <- shapes
+            , let input = gateInputFor idx s
+            ]
+      in summarizeGate gateRows
+    sampleCounts = countsFor VarGenerated
+    blockCounts  = countsFor VarGeneratedBlock
+    superCounts  = countsFor VarGeneratedSuper
+
+    -- Snapshot corpus produces a single non-§4.B-claimed shape
+    -- whose generated speedup beats the best non-generated peer
+    -- (typically Sin → Gain → Out via a candidate that lost the
+    -- §4.B match for structural reasons, falling through to the
+    -- generator). 7.I's "no prefer-generated row" claim was
+    -- evaluated on the wider --fusion-survey corpus; this pin
+    -- records what the structural snapshot actually sees.
+    expectedPreferGenerated :: Int
+    expectedPreferGenerated = 1
+
+    sampleIdx = costLabGateIndexFor VarGenerated costRows
+    samplePreferGenShapes =
+      [ s
+      | s <- shapes
+      , let gi = gateInputFor sampleIdx s
+      , gcPreferGenerated (summarizeGate
+          [GateRow gi (evaluateGate gi)]) == 1
+      ]
+    samplePreferGenDetail =
+      case samplePreferGenShapes of
+        []  -> ""
+        rs  -> "; rows=" <>
+               intercalate ", "
+                 [ intercalate "→" (map show (gsrKinds s))
+                 | s <- rs ]
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =
