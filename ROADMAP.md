@@ -2067,6 +2067,122 @@ Open follow-ups (in roughly the order the evidence suggests):
   `PreferGenerated` row exists and survives multiple
   snapshot runs.
 
+### Phase 7.H — Block-Major Executor Experiment
+
+[x] First slice landed. The slice answered one question — *is
+the per-sample dispatch loop what makes 7.G's amortization
+curve trend down?* — and the answer is **partly yes**. A
+block-major executor (op loop outside, sample loop inside,
+otherwise identical to the existing sample-major one) catches
+up with the sample-major executor around length 4–5 and is
+~1.6× ahead of it at length 16. Neither executor beats
+node-loop on any measured row.
+
+What changed:
+
+- `process_fusion_program_block` in
+  [tinysynth/rt_graph.cpp](tinysynth/rt_graph.cpp) implements
+  the block-major dispatch over the existing v1 op set. The
+  `FusionProgram` ABI did not change; only the C++ loop nest
+  did. Scratch grew from `kMaxScratchSlots` floats to
+  `kMaxScratchSlots × kMaxBlockFrames = 64 × 256 = 64 KiB`,
+  with silent fall-through above the bound.
+- A new C ABI entry
+  `rt_graph_template_add_region_generated_block` mirrors the
+  existing `_generated` entry and sets
+  `RegionSpec::generated_executor = 1`. `process_region`
+  routes between the two executors on that field whenever
+  `generated_program_id >= 0`.
+- The Haskell `RegionExec` gained a sibling constructor
+  `ExecGeneratedBlock !FusionProgramId`. `rrKernel` projects
+  it to `RNodeLoop`, same as `ExecGenerated`. `addRegionTo`
+  and `validateRegionProgramRef` handle both constructors;
+  the validators are shared via a `checkPid` helper.
+- The cost lab gained a `VarGeneratedBlock` variant. Same
+  compile path, same emitted program; only the per-region
+  selector flips via `retargetGeneratedAsBlock`. `runMember`
+  iterates over five variants instead of four.
+
+Measured amortization curve (sample-major vs block-major
+generated speedups, all variants vs node-loop):
+
+      size  2  sample=0.78×  block=0.69×
+      size  3  sample=0.60×  block=0.56×
+      size  4  sample=0.55×  block=0.57×  *block-major ahead
+      size  5  sample=0.49×  block=0.52×  *block-major ahead
+      size  8  sample=0.37×  block=0.48×  *block-major ahead
+      size 16  sample=0.25×  block=0.41×  *block-major ahead
+
+Block-major loses on the very-short tails (the per-op block
+setup beats the per-sample dispatch on length-2/3 cases) and
+takes over from length 4 onward. The slope of block-major is
+much flatter, so its lead grows with tail length. The
+synthetic `generated-tail-sweep` family shows the same
+crossover at length 4–5.
+
+The hypothesis the slice tested is supported: per-sample
+dispatch overhead was a real cost in 7.G's curve. But the
+remaining gap to node-loop is still wide — at length 16,
+block-major sits at 0.41× and would need ~2.6× more headroom
+to cross `measuredWinThreshold` against node-loop. Dispatch-
+model alone does not close that gap on this op set.
+
+Snapshot pins added by this slice:
+
+- `cost-lab generated-block variant: considered count`     (28);
+- `cost-lab generated-block variant: emitted count`        (26);
+- `cost-lab generated-block variant: unsupported count`     (2);
+- `cost-lab generated-block variant: emitted rows stay
+  bit-exact` (correctness tripwire);
+- `generated-tail-sweep: every block-major member emitted`   (6);
+- `generated-tail-sweep: every block-major emitted row stays
+  bit-exact`;
+- per-family row counts bumped 4× → 5× to reflect the new
+  variant fan-out.
+
+Per the bench-noise discipline, block-major's win/loss split,
+per-bucket medians, delta-vs-best-non-generated values, and
+the crossover length itself stay unpinned. The diagnostic text
+under `--fusion-cost-lab` is where to read them. Three new
+bit-exact tests in [test/Spec.hs](test/Spec.hs) cover
+`[Gain, Out]`, `[Add, Gain, Out]`, and a length-5 tail-sweep
+shape under the block-major path.
+
+Decision artifact:
+[notes/2026-05-12-phase-7h-block-major-executor.md](notes/2026-05-12-phase-7h-block-major-executor.md).
+
+Open follow-ups (in roughly the order the evidence suggests):
+
+- **Superinstructions.** Fold the common short shapes
+  (`GainOut`, `AddGainOut`, `MulAddOut`, …) into single C++
+  branches that read the program once and run their fused
+  arithmetic per sample. This is the kernel-shaped end of the
+  spectrum: each superinstruction is essentially a
+  hand-written kernel the generator emits a reference to
+  instead of a generic op stream. The 7.H amortization-by-
+  size diagnostic is the evaluation surface for whichever
+  candidate shape lands first.
+- **Packed instruction stream.** Pre-decode the program at
+  load time into a compact byte sequence with no `switch`
+  dispatch overhead per op. Cheaper than superinstructions
+  but only moves a constant factor; the 7.H curve suggests
+  it would lift sample-major into rough parity with
+  block-major without changing the gap to node-loop.
+- **Generated-tail-sweep extension under block-major.** If
+  the next executor experiment also produces a crossover,
+  longer tails (32, 64) might be useful for resolving the
+  asymptote question. Trivial corpus extension; deferred until
+  the next executor is in.
+- **Minimum-owned-size gate policy.** Not warranted yet —
+  block-major still loses to node-loop everywhere — but worth
+  mentioning: if a future executor produces `PreferGenerated`
+  only above some N, the planner's profitability rule grows
+  a minimum-tail-length floor. Stays parked behind 7.F until
+  evidence justifies it.
+- **Runtime turn-on.** Still parked until at least one
+  `PreferGenerated` row exists and survives multiple
+  snapshot runs.
+
 ---
 
 ## Phase 8 — Authoring DSL and Composition Layer
