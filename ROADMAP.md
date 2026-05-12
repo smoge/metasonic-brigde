@@ -2636,28 +2636,59 @@ through `BusOut` / `BusIn` / `Out`, so `BusFootprint`,
 template ordering, survey tools, and inspectors continue to
 read the same shape they always have.
 
-### Phase 8.E — Template and Ensemble Builders
+### [x] Phase 8.E — Template and Ensemble Builders
 
-Provide a higher-level way to describe multi-template systems:
+A small authoring monad that produces an ordered
+`[(String, SynthGraph)]` plus deterministic bus assignments,
+ready to feed straight into the existing
+`compileTemplateGraph`. Multi-template synth + FX patches no
+longer require hand-managing template lists or hand-picking
+bus indices.
+
+What landed:
 
 ```haskell
-ensemble $ do
-  voice "bass" ...
-  voice "pad" ...
-  fx "return" ...
+ensemble :: EnsembleM () -> Either String AuthoredEnsemble
+ensembleWith :: EnsembleOptions -> EnsembleM () -> Either String AuthoredEnsemble
+
+busNamed :: String -> EnsembleM Bus
+voice    :: String -> SynthGraph -> EnsembleM ()
+fx       :: String -> SynthGraph -> EnsembleM ()
 ```
 
-This should lower to the existing `compileTemplateGraph` input shape,
-not replace it. The value of the layer is stable naming, less manual
-bus plumbing, and clearer intent around voice templates, shared FX,
-and return chains.
+`busNamed "send"` is idempotent: repeated calls in the same
+ensemble return the same `Bus`. First-use order drives the
+allocation counter, starting from `eoBusBase` (default 16,
+pinned by tests). `Either String` on the entry points
+surfaces authoring errors (duplicate template names) without
+contaminating `SynthM`.
 
-8.D's explicit `Bus` handle is the primitive 8.E will allocate
-*against*. The next layer's job is naming and deterministic
-bus assignment (a `voice "bass"` declaration knows which send
-bus its FX chain reads from without an integer hard-coded at
-the call site), with the lowered `compileTemplateGraph` input
-unchanged from what 8.D already produces.
+`AuthoredEnsemble` carries `aeTemplates` (the input
+`compileTemplateGraph` already accepts) and `aeMetadata`
+(diagnostic-only `amRoles` per template plus `amBuses`
+name → `Bus` table). Tests pin that `compileTemplateGraph`
+output is independent of `aeMetadata`.
+
+The `send-return` demo's voice and fx graphs are rewritten
+through `ensemble $ do …`. The compiled `TemplateGraph` shape
+stays structurally equivalent to the 8.D version — same node
+counts, same writer-before-reader ordering, same `bfWrites` /
+`bfReads` split. Only the literal bus index changes from the
+hand-picked `7` to the deterministic `16` (default
+`eoBusBase`).
+
+Decision artifact:
+[notes/2026-05-12-phase-8e-ensemble-builder.md](notes/2026-05-12-phase-8e-ensemble-builder.md).
+
+Deliberately out of scope for 8.E:
+
+- Federated bus names across multiple `AuthoredEnsemble`s.
+  Each ensemble starts allocating from its own `eoBusBase`.
+- Sub-ensembles / nested scopes. v1 is a single flat scope;
+  a future slice can add sub-scopes if a real patch needs
+  them.
+- Diagnostic surfaces driven by `TemplateRole`. The role tag
+  is recorded but `compileTemplateGraph` does not see it.
 
 ### Phase 8.F — Named Controls and External Mapping
 
