@@ -23,6 +23,7 @@ module MetaSonic.Bridge.Planner
   ( -- * Verdict surface
     Verdict (..)
   , FusionCandidate (..)
+  , GainAmountMode (..)
   , RejectionReason (..)
     -- * Convenience predicates
   , verdictCandidate
@@ -71,6 +72,11 @@ data FusionCandidate = FusionCandidate
     -- ^ The 'NodeKind' for each member, parallel to 'fcMembers'.
     -- Carried explicitly so consumers don't need to re-lookup
     -- against the 'RuntimeGraph' for shape reporting.
+  , fcGainAmountModes :: ![GainAmountMode]
+    -- ^ One entry per 'KGain' member, in member order. This is a
+    -- deliberately tiny feature axis for the §7.C cost-model join:
+    -- scalar-gain chains and audio-modulated-gain chains share the
+    -- same 'fcMemberKinds', but must not share measurement evidence.
   , fcMatchedShape :: !(Maybe RegionKernel)
     -- ^ The §4.B kernel that already claims this segment, if any.
     -- 'Just k' means a hand-written kernel already handles this
@@ -83,6 +89,17 @@ data FusionCandidate = FusionCandidate
     -- it; the planner asserts this matches 'fcMembers' length.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+-- | How a 'KGain' candidate member receives its amount input.
+-- 'GainAmountConst' is the scalar-gain case that §4.B kernels and
+-- current RFused measurements cover. 'GainAmountDynamic' means the
+-- amount is wired or fused and therefore needs separate evidence.
+data GainAmountMode
+  = GainAmountConst
+  | GainAmountDynamic
+  | GainAmountMissing
+  deriving stock    (Eq, Show, Generic, Enum)
+  deriving anyclass (NFData)
 
 -- | Why the planner rejected a candidate. Each constructor cites
 -- the specific node or structural fact that caused the rejection,
@@ -228,9 +245,17 @@ mkCandidate region nodes =
     { fcRegion       = rrIndex region
     , fcMembers      = map rnIndex nodes
     , fcMemberKinds  = map rnKind  nodes
+    , fcGainAmountModes =
+        [ gainAmountMode n | n <- nodes, rnKind n == KGain ]
     , fcMatchedShape = matchedShape region nodes
     , fcLengthNodes  = length nodes
     }
+
+gainAmountMode :: RuntimeNode -> GainAmountMode
+gainAmountMode n = case drop 1 (rnInputs n) of
+  RConst _ : _ -> GainAmountConst
+  _ : _        -> GainAmountDynamic
+  []           -> GainAmountMissing
 
 -- | A candidate's matched shape is the region's kernel iff the
 -- candidate's members are exactly the region's members and the

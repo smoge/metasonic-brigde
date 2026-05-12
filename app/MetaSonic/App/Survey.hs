@@ -23,15 +23,19 @@ import           Data.List                 (intercalate, isPrefixOf, nub, sort,
 import qualified Data.Map.Strict           as M
 import           Foreign.C.Types           (CInt)
 import           System.Exit               (die)
+import           Text.Printf               (printf)
 
 import           MetaSonic.App.Demos
 import qualified MetaSonic.App.FusionCostLab as FCL
-import           MetaSonic.App.FusionCostLab (ShapeSummary (..),
+import           MetaSonic.App.FusionCostLab (ShapeKey,
+                                              ShapeSummary (..),
                                               costLabShapeIndex,
+                                              measuredWinThreshold,
                                               shapeKeyOf)
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
+                                             GainAmountMode (..),
                                              RejectionReason (..),
                                              Verdict (..), isAccepted,
                                              isRejected, planRuntimeGraph,
@@ -2439,15 +2443,17 @@ padR w s
 -- candidate shape across the survey, its §4.B-match status, total
 -- occurrence count, classification, and an optional measured speedup.
 --
--- v1 keys on 'fcMemberKinds' alone (see
+-- v1 keys on 'fcMemberKinds' plus gain amount mode (see
 -- @notes/2026-05-11-phase-7c-cost-model-join-decision.md@). Speedup
 -- is reported only for 'ClsMeasuredWin' / 'ClsMeasuredLoss'.
 data CostModelRow = CostModelRow
-  { cmrKinds   :: ![NodeKind]
-  , cmrMatched :: !(Maybe RegionKernel)
-  , cmrCount   :: !Int
-  , cmrClass   :: !CostModelClass
-  , cmrSpeedup :: !(Maybe Double)
+  { cmrKey       :: !ShapeKey
+  , cmrKinds     :: ![NodeKind]
+  , cmrGainModes :: ![GainAmountMode]
+  , cmrMatched   :: !(Maybe RegionKernel)
+  , cmrCount     :: !Int
+  , cmrClass     :: !CostModelClass
+  , cmrSpeedup   :: !(Maybe Double)
   } deriving (Eq, Show)
 
 data CostModelClass
@@ -2463,28 +2469,30 @@ renderCostModelClass ClsMeasuredWin    = "measured-win"
 renderCostModelClass ClsMeasuredLoss   = "measured-loss"
 renderCostModelClass ClsNeedsBenchmark = "needs-benchmark"
 
--- | Aggregate selected candidates across the survey, group by
--- @(fcMemberKinds, fcMatchedShape)@, and classify. The classifier
--- callback supplies a 'CostModelClass' and optional speedup given
--- the candidate's shape key and matched-shape status. Commit 2
--- supplies a placeholder that maps everything generated-eligible to
--- 'ClsNeedsBenchmark'; commit 3 (the cost-lab join) replaces it.
+-- | Aggregate selected candidates across the survey, group by the
+-- cost-model shape key plus matched-shape status, and classify. The
+-- shape key includes the ordered member kinds plus the tiny v1 feature
+-- axis carried by 'fcGainAmountModes', so scalar-gain and dynamic-gain
+-- candidates do not share measurement evidence.
 costModelRows
-  :: (([NodeKind], Maybe RegionKernel) -> (CostModelClass, Maybe Double))
+  :: ((ShapeKey, Maybe RegionKernel) -> (CostModelClass, Maybe Double))
   -> [SurveyRow]
   -> [CostModelRow]
 costModelRows classify rows =
   let selected = concatMap (selectedFusionCandidates . srPlannerVerdicts) rows
       keys     = nub
-                   [ (fcMemberKinds c, fcMatchedShape c)
+                   [ ( shapeKeyOf c
+                     , fcMemberKinds c
+                     , fcGainAmountModes c
+                     , fcMatchedShape c )
                    | c <- selected ]
       counted  =
-        [ ((kinds, mshape), count)
-        | (kinds, mshape) <- keys
+        [ ((key, kinds, gainModes, mshape), count)
+        | (key, kinds, gainModes, mshape) <- keys
         , let count =
                 length [ ()
                        | c <- selected
-                       , fcMemberKinds c == kinds
+                       , shapeKeyOf c == key
                        , fcMatchedShape c == mshape ]
         ]
       -- Sort: by class ordering (covered → measured-win → ... →
@@ -2492,14 +2500,16 @@ costModelRows classify rows =
       -- then kinds Enum order.
       withCls =
         [ CostModelRow
-            { cmrKinds   = kinds
-            , cmrMatched = mshape
-            , cmrCount   = count
-            , cmrClass   = cls
-            , cmrSpeedup = spd
+            { cmrKey       = key
+            , cmrKinds     = kinds
+            , cmrGainModes = gainModes
+            , cmrMatched   = mshape
+            , cmrCount     = count
+            , cmrClass     = cls
+            , cmrSpeedup   = spd
             }
-        | ((kinds, mshape), count) <- counted
-        , let (cls, spd) = classify (kinds, mshape)
+        | ((key, kinds, gainModes, mshape), count) <- counted
+        , let (cls, spd) = classify (key, mshape)
         ]
   in sortOn rowKey withCls
   where
@@ -2508,6 +2518,7 @@ costModelRows classify rows =
       , negate (cmrCount r)
       , length (cmrKinds r)
       , map fromEnum (cmrKinds r)
+      , cmrKey r
       )
 
     classRank ClsCovered        = 0 :: Int
@@ -2521,18 +2532,20 @@ costModelRows classify rows =
 -- by key and split into measured-win / measured-loss / needs-
 -- benchmark.
 costModelClassifier
-  :: M.Map [Int] ShapeSummary
-  -> ([NodeKind], Maybe RegionKernel)
+  :: M.Map ShapeKey ShapeSummary
+  -> (ShapeKey, Maybe RegionKernel)
   -> (CostModelClass, Maybe Double)
 costModelClassifier _ (_, Just _) = (ClsCovered, Nothing)
-costModelClassifier idx (kinds, Nothing) =
-  case M.lookup (shapeKeyOf kinds) idx of
+costModelClassifier idx (key, Nothing) =
+  case M.lookup key idx of
     Just summ
-      | ssSpeedup summ > 1.0 -> (ClsMeasuredWin,  Just (ssSpeedup summ))
-      | otherwise            -> (ClsMeasuredLoss, Just (ssSpeedup summ))
+      | ssSpeedup summ >= measuredWinThreshold ->
+          (ClsMeasuredWin,  Just (ssSpeedup summ))
+      | otherwise ->
+          (ClsMeasuredLoss, Just (ssSpeedup summ))
     Nothing                  -> (ClsNeedsBenchmark, Nothing)
 
-printCostModelJoin :: M.Map [Int] ShapeSummary -> [SurveyRow] -> IO ()
+printCostModelJoin :: M.Map ShapeKey ShapeSummary -> [SurveyRow] -> IO ()
 printCostModelJoin idx rows = do
   putStrLn "─── Phase 7.C cost-model join ───"
   let allRows = costModelRows (costModelClassifier idx) rows
@@ -2550,12 +2563,13 @@ printCostModelJoin idx rows = do
       putStrLn ""
       putStrLn "  Per-shape table (selected candidates only):"
       putStrLn $ formatCmrRow
-        ["kinds", "matched-shape", "class", "count", "speedup"]
+        ["kinds", "features", "matched-shape", "class", "count", "speedup"]
       mapM_ (putStrLn . formatCmrRow . renderCmrCells) allRows
 
 renderCmrCells :: CostModelRow -> [String]
 renderCmrCells r =
   [ intercalate " → " (map show (cmrKinds r))
+  , renderGainFeatures (cmrGainModes r)
   , maybe "—" show (cmrMatched r)
   , renderCostModelClass (cmrClass r)
   , show (cmrCount r)
@@ -2566,17 +2580,20 @@ renderCmrCells r =
              Nothing -> "—"
   ]
 
-showSpeedup :: Double -> String
-showSpeedup s = pad1 s <> "×"
+renderGainFeatures :: [GainAmountMode] -> String
+renderGainFeatures [] = "—"
+renderGainFeatures modes =
+  "gain=" <> intercalate "," (map renderGainMode modes)
   where
-    -- Round to one decimal place without bringing in Text.Printf.
-    pad1 x =
-      let tenths = round (x * 10) :: Int
-          (whole, frac) = tenths `divMod` 10
-      in show whole <> "." <> show (abs frac)
+    renderGainMode GainAmountConst   = "const"
+    renderGainMode GainAmountDynamic = "dynamic"
+    renderGainMode GainAmountMissing = "missing"
+
+showSpeedup :: Double -> String
+showSpeedup s = printf "%.2f×" s
 
 costModelColumnWidths :: [Int]
-costModelColumnWidths = [40, 18, 16, 6, 8]
+costModelColumnWidths = [40, 18, 18, 16, 6, 8]
 
 formatCmrRow :: [String] -> String
 formatCmrRow cols =

@@ -73,7 +73,9 @@ module MetaSonic.App.FusionCostLab
   , extractFeatures
   , EquivalenceStatus (..)
     -- * Shape-keyed cost-model index (§7.C cost-model join)
+  , ShapeKey (..)
   , ShapeSummary (..)
+  , measuredWinThreshold
   , costLabShapeIndex
   , shapeKeyOf
   ) where
@@ -578,14 +580,22 @@ collectFusionCostLabRows opts =
 -- §7.C cost-model join: shape-keyed cost-lab index
 ------------------------------------------------------------
 
--- | Per-shape measurement summary keyed by 'shapeKeyOf' (the
--- 'fromEnum'-encoded 'NodeKind' sequence of a candidate's
--- 'fcMemberKinds'). Built once from a @[LabRow]@ corpus by
--- 'costLabShapeIndex' and consumed by the survey to classify
--- selected planner candidates.
+-- | Compact key for joining selected candidates to cost-lab rows.
+-- 'skKinds' is the 'fromEnum'-encoded 'fcMemberKinds' sequence.
+-- 'skGainAmountModes' is the tiny v1 feature axis: one encoded
+-- 'GainAmountMode' per 'KGain' member, in member order. This keeps
+-- scalar-gain and dynamic-gain chains from sharing measurements.
+data ShapeKey = ShapeKey
+  { skKinds           :: ![Int]
+  , skGainAmountModes :: ![Int]
+  } deriving (Eq, Ord, Show)
+
+-- | Per-shape measurement summary keyed by 'shapeKeyOf'. Built once
+-- from a @[LabRow]@ corpus by 'costLabShapeIndex' and consumed by the
+-- survey to classify selected planner candidates.
 --
--- 'ssSpeedup' is @ssBaselineNs / ssFastestNs@. A value > 1 is a
--- measured win for the non-baseline path; ≤ 1 is a measured loss.
+-- 'ssSpeedup' is @ssBaselineNs / ssFastestNs@. The survey compares it
+-- to 'measuredWinThreshold' before calling the row a measured win.
 data ShapeSummary = ShapeSummary
   { ssSpeedup        :: !Double
   , ssFastestVariant :: !Variant
@@ -593,11 +603,20 @@ data ShapeSummary = ShapeSummary
   , ssFastestNs      :: !Double
   } deriving (Eq, Show)
 
--- | Encode a candidate's 'fcMemberKinds' as an order-preserving key
+-- | Minimum speedup before the diagnostic join calls a row a measured
+-- win. Tiny >1.0 movements are benchmark noise for this tool; keeping
+-- them in measured-loss prevents the 7.D gate from flapping.
+measuredWinThreshold :: Double
+measuredWinThreshold = 1.05
+
+-- | Encode a selected planner candidate as an order-preserving key
 -- usable in a 'Data.Map' (since 'NodeKind' lacks 'Ord' but has
 -- 'Enum').
-shapeKeyOf :: [NodeKind] -> [Int]
-shapeKeyOf = map fromEnum
+shapeKeyOf :: FusionCandidate -> ShapeKey
+shapeKeyOf c = ShapeKey
+  { skKinds           = map fromEnum (fcMemberKinds c)
+  , skGainAmountModes = map fromEnum (fcGainAmountModes c)
+  }
 
 -- | Build a map from candidate shape key to the best measured
 -- speedup. For each cost-lab family member, the function
@@ -620,7 +639,7 @@ shapeKeyOf = map fromEnum
 -- favors the measurement most likely to make a shape look
 -- @measured-win@; the join intentionally surfaces the strongest
 -- evidence for a shape, not the average.
-costLabShapeIndex :: [LabRow] -> M.Map [Int] ShapeSummary
+costLabShapeIndex :: [LabRow] -> M.Map ShapeKey ShapeSummary
 costLabShapeIndex rows =
   M.fromListWith preferFaster $ concat
     [ [(k, summ) | k <- shapeKeysOf graph]
@@ -642,6 +661,7 @@ costLabShapeIndex rows =
             , lrFamily r  == fam
             , lrMember r  == name
             , lrError r   == Nothing
+            , lrEquivalence r == EqExact
             ]
           baseline =
             [ ns
@@ -668,7 +688,7 @@ costLabShapeIndex rows =
     shapeKeysOf graph =
       case lowerGraph graph >>= compileRuntimeGraph of
         Right rg ->
-          [ shapeKeyOf (fcMemberKinds c)
+          [ shapeKeyOf c
           | c <- selectedFusionCandidates (planRuntimeGraph rg)
           ]
         Left _ -> []

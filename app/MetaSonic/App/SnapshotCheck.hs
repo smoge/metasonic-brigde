@@ -22,11 +22,14 @@ import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
                                                 FusionCaseFeatures (..),
                                                 GraphFamily (..),
                                                 LabRow (..),
+                                                ShapeKey,
                                                 ShapeSummary (..),
                                                 Variant (..),
                                                 collectFusionCostLabRows,
                                                 costLabShapeIndex,
-                                                familyName, shapeKeyOf)
+                                                familyName,
+                                                measuredWinThreshold,
+                                                shapeKeyOf)
 import           MetaSonic.App.Survey          (CorpusGraphSummary (..),
                                                 KindTally,
                                                 SinkShape (..), renderShape,
@@ -462,7 +465,7 @@ renderReasonCounts xs =
 -- benchmark) are pinned. The needs-benchmark count is the Phase
 -- 7.D gate signal — when it is high relative to generated-eligible,
 -- the cost lab needs new families before the executor lands.
-costModelJoinChecks :: M.Map [Int] ShapeSummary
+costModelJoinChecks :: M.Map ShapeKey ShapeSummary
                     -> SurveySnapshots -> [SnapshotCheck]
 costModelJoinChecks shapeIdx snapshots =
   [ check "cost-model join class totals are stable"
@@ -478,10 +481,10 @@ costModelJoinChecks shapeIdx snapshots =
   where
     allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
 
-    -- One (kinds, matchedShape) pair per selected candidate
+    -- One (shapeKey, matchedShape) pair per selected candidate
     -- occurrence — same granularity as the survey table count.
     candidates =
-      [ (fcMemberKinds c, fcMatchedShape c)
+      [ (shapeKeyOf c, fcMatchedShape c)
       | (_, Right row) <- allRows
       , c <- selectedFusionCandidates (csPlannerVerdicts row)
       ]
@@ -489,11 +492,11 @@ costModelJoinChecks shapeIdx snapshots =
     selectedCount = length candidates
 
     classifyEntry (_, Just _) = "covered"
-    classifyEntry (kinds, Nothing) =
-      case M.lookup (shapeKeyOf kinds) shapeIdx of
+    classifyEntry (key, Nothing) =
+      case M.lookup key shapeIdx of
         Just summ
-          | ssSpeedup summ > 1.0 -> "measured-win"
-          | otherwise            -> "measured-loss"
+          | ssSpeedup summ >= measuredWinThreshold -> "measured-win"
+          | otherwise                              -> "measured-loss"
         Nothing                  -> "needs-benchmark"
 
     classCounts :: [(String, Int)]
@@ -517,9 +520,9 @@ costModelJoinChecks shapeIdx snapshots =
     expectedClassCounts :: [(String, Int)]
     expectedClassCounts =
       [ ("covered",         51)
-      , ("measured-win",     7)
-      , ("measured-loss",    0)
-      , ("needs-benchmark", 11)
+      , ("measured-win",     0)
+      , ("measured-loss",    4)
+      , ("needs-benchmark", 14)
       ]
 
 renderClassCounts :: [(String, Int)] -> String

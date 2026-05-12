@@ -1695,12 +1695,15 @@ Surface:
 - `--fusion-survey` then layers a "Phase 7.C cost-model join"
   section: a shape-keyed table of selected candidates classified as
   `covered` (§4.B already claims the shape), `measured-win`
-  (cost-lab speedup > 1.0× over the node-loop baseline),
-  `measured-loss` (≤ 1.0×), or `needs-benchmark` (no matching cost-
-  lab row). Class assignment uses `costLabShapeIndex` in
+  (cost-lab speedup clears `measuredWinThreshold`, currently 1.05×
+  over the node-loop baseline), `measured-loss` (measured but below
+  that margin), or `needs-benchmark` (no matching cost-lab row). The
+  key is member kinds plus the `KGain.amount` mode
+  feature axis, so dynamic-gain misses do not inherit scalar-gain
+  measurements. Class assignment uses `costLabShapeIndex` in
   `MetaSonic.App.FusionCostLab`, which re-runs the planner against
   each cost-lab member to derive shape keys without new
-  measurement cost.
+  measurement cost, and non-exact cost-lab rows do not contribute.
 - `--snapshot-check` pins planner total / accepted / rejected
   counts, selected accepted / generated-eligible counts,
   per-rejection-reason counts, and per-class cost-model join
@@ -1723,9 +1726,8 @@ Open follow-ups inside 7.C: shrink `needs-benchmark` by growing
 cost-lab families to cover the corpus's generated-eligible shapes,
 optional stateful-interior allow-list expansion gated on cost-lab
 evidence, `KOut`-as-non-terminal de-prioritization in the rejection
-diagnostic, and an optional feature axis on the shape key (e.g.,
-`(sinkKind, totalLatency)`) once a shape's profitability splits
-along it.
+diagnostic, and broader shape-key feature axes (e.g., `(sinkKind,
+totalLatency)`) once a shape's profitability splits along them.
 
 ### Phase 7.D — Runtime Program ABI and Tiny Executor
 
