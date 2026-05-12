@@ -73,6 +73,28 @@ module MetaSonic.Authoring
   , lpfM
   , lpfS
   , lpfC
+  , hpfM
+  , hpfS
+  , hpfC
+  , bpfM
+  , bpfS
+  , bpfC
+  , notchM
+  , notchS
+  , notchC
+
+    -- * Lifted stateful primitives (Phase 8.C2)
+  , delayM
+  , delayS
+  , delayC
+  , smoothM
+  , smoothS
+  , smoothC
+
+    -- * Envelope application (Phase 8.C2)
+  , envM
+  , envS
+  , envC
 
     -- * Outputs
   , outMono
@@ -260,6 +282,166 @@ lpfS (Stereo l r) cutoff q =
 lpfC :: Channels -> Connection -> Connection -> SynthM Channels
 lpfC (Channels cs) cutoff q =
   Channels <$> mapM (\c -> lpf c cutoff q) cs
+
+-- High-pass biquads. Mirrors 'lpfM' / 'lpfS' / 'lpfC' exactly:
+-- one 'KHPF' per channel, no filter state shared across
+-- channels. Stereo HPF emits two independent filters; channel-
+-- wise HPF emits one per slot.
+
+hpfM :: Mono -> Connection -> Connection -> SynthM Mono
+hpfM (Mono c) cutoff q = Mono <$> hpf c cutoff q
+
+hpfS :: Stereo -> Connection -> Connection -> SynthM Stereo
+hpfS (Stereo l r) cutoff q =
+  Stereo <$> hpf l cutoff q <*> hpf r cutoff q
+
+hpfC :: Channels -> Connection -> Connection -> SynthM Channels
+hpfC (Channels cs) cutoff q =
+  Channels <$> mapM (\c -> hpf c cutoff q) cs
+
+-- Band-pass biquads. Same shape as the LPF / HPF families.
+
+bpfM :: Mono -> Connection -> Connection -> SynthM Mono
+bpfM (Mono c) cutoff q = Mono <$> bpf c cutoff q
+
+bpfS :: Stereo -> Connection -> Connection -> SynthM Stereo
+bpfS (Stereo l r) cutoff q =
+  Stereo <$> bpf l cutoff q <*> bpf r cutoff q
+
+bpfC :: Channels -> Connection -> Connection -> SynthM Channels
+bpfC (Channels cs) cutoff q =
+  Channels <$> mapM (\c -> bpf c cutoff q) cs
+
+-- Notch biquads. Same shape as the LPF / HPF / BPF families.
+
+notchM :: Mono -> Connection -> Connection -> SynthM Mono
+notchM (Mono c) cutoff q = Mono <$> notch c cutoff q
+
+notchS :: Stereo -> Connection -> Connection -> SynthM Stereo
+notchS (Stereo l r) cutoff q =
+  Stereo <$> notch l cutoff q <*> notch r cutoff q
+
+notchC :: Channels -> Connection -> Connection -> SynthM Channels
+notchC (Channels cs) cutoff q =
+  Channels <$> mapM (\c -> notch c cutoff q) cs
+
+------------------------------------------------------------
+-- Lifted stateful primitives (Phase 8.C2)
+------------------------------------------------------------
+--
+-- These wrap 'delayL' and 'smooth'. Each preserves primitive
+-- visibility — the lowered graph still shows one 'KDelay' or
+-- 'KSmooth' per channel. The runtime allocates per-instance
+-- state per node, so sharing the helper across multiple
+-- channels would silently collapse the multi-channel image
+-- (every channel would carry the same delay history). The
+-- multichannel lifts therefore emit one node per channel,
+-- exactly as a hand-authored patch would.
+
+-- | Mono fractional delay line. The first argument is the
+-- compile-time maximum delay in seconds (sizes the per-instance
+-- ring buffer); the third is the runtime delay time, which may
+-- be an audio-rate 'Connection' or a constant 'Param'.
+delayM :: Double -> Mono -> Connection -> SynthM Mono
+delayM maxT (Mono c) time = Mono <$> delayL maxT c time
+
+-- | Stereo delay. Emits two independent 'KDelay' nodes, both
+-- sized to the same compile-time maximum. The delay time
+-- input is shared across channels — pan-style varying delays
+-- still need per-channel time inputs and should call 'delayM'
+-- per channel.
+delayS :: Double -> Stereo -> Connection -> SynthM Stereo
+delayS maxT (Stereo l r) time =
+  Stereo <$> delayL maxT l time <*> delayL maxT r time
+
+-- | Channel-wise delay. Empty 'Channels' emits no nodes.
+delayC :: Double -> Channels -> Connection -> SynthM Channels
+delayC maxT (Channels cs) time =
+  Channels <$> mapM (\c -> delayL maxT c time) cs
+
+-- | Mono dynamic-smoother. The first argument is the
+-- compile-time smoothing frequency in Hz (smaller = laggier).
+-- See the 'smooth' primitive's haddock for the safe-range
+-- discussion.
+smoothM :: Double -> Mono -> SynthM Mono
+smoothM baseHz (Mono c) = Mono <$> smooth baseHz c
+
+-- | Stereo smoother. Two independent 'KSmooth' nodes; the
+-- inputs are the stereo pair's two channels.
+smoothS :: Double -> Stereo -> SynthM Stereo
+smoothS baseHz (Stereo l r) =
+  Stereo <$> smooth baseHz l <*> smooth baseHz r
+
+-- | Channel-wise smoother. Empty 'Channels' emits no nodes.
+smoothC :: Double -> Channels -> SynthM Channels
+smoothC baseHz (Channels cs) =
+  Channels <$> mapM (smooth baseHz) cs
+
+------------------------------------------------------------
+-- Envelope application (Phase 8.C2)
+------------------------------------------------------------
+--
+-- 'envM' / 'envS' / 'envC' apply an envelope to a signal
+-- shape rather than just re-exporting the 'env' primitive
+-- builder. The multichannel variants share a single 'KEnv'
+-- node across all channels: one coherent amplitude
+-- trajectory drives N parallel 'KGain' multiplies, instead of
+-- N independent envelopes that could drift if the gate inputs
+-- ever differed. If the author wants per-channel envelope
+-- state, the documented path is calling 'envM' per channel.
+--
+-- Empty 'Channels' policy: 'envC (Channels [])' emits **zero**
+-- nodes — no dead 'KEnv'. The semantics of "apply an envelope
+-- to nothing" is "nothing happens." This matches 'gainC' /
+-- 'lpfC' / 'mapChannels' behavior on empty input.
+
+-- | Apply an ADSR envelope to a mono signal. Emits one 'KEnv'
+-- and one 'KGain' node; the gain's amount is the envelope
+-- output and its signal input is the source.
+envM
+  :: Mono       -- ^ signal to envelope
+  -> Connection -- ^ gate
+  -> Connection -- ^ attack (s)
+  -> Connection -- ^ decay (s)
+  -> Connection -- ^ sustain (linear 0..1)
+  -> Connection -- ^ release (s)
+  -> SynthM Mono
+envM (Mono c) gate a d s r = do
+  e <- env gate a d s r
+  Mono <$> gain c e
+
+-- | Apply a single shared ADSR envelope to a stereo signal.
+-- Emits exactly one 'KEnv' plus two 'KGain' nodes; both
+-- 'KGain's read from the same 'KEnv' output, keeping the
+-- stereo image coherent under amplitude modulation.
+envS
+  :: Stereo
+  -> Connection -- ^ gate
+  -> Connection -- ^ attack (s)
+  -> Connection -- ^ decay (s)
+  -> Connection -- ^ sustain (linear 0..1)
+  -> Connection -- ^ release (s)
+  -> SynthM Stereo
+envS (Stereo l r) gate a d s rel = do
+  e <- env gate a d s rel
+  Stereo <$> gain l e <*> gain r e
+
+-- | Apply a single shared ADSR envelope to a multichannel
+-- signal. Emits one 'KEnv' plus N 'KGain' nodes; every
+-- 'KGain' reads from the same 'KEnv'. Empty 'Channels' emits
+-- zero nodes, no dead envelope.
+envC
+  :: Channels
+  -> Connection -- ^ gate
+  -> Connection -- ^ attack (s)
+  -> Connection -- ^ decay (s)
+  -> Connection -- ^ sustain (linear 0..1)
+  -> Connection -- ^ release (s)
+  -> SynthM Channels
+envC (Channels []) _ _ _ _ _ = pure (Channels [])
+envC (Channels cs) gate a d s r = do
+  e <- env gate a d s r
+  Channels <$> mapM (`gain` e) cs
 
 ------------------------------------------------------------
 -- Outputs
