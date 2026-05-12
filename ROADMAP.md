@@ -2836,8 +2836,11 @@ OSC resolve-state rebuild, and buffer/plugin lifecycle
 reports. **Session Prep B** now adds a pure admission/commit
 state boundary on top of those nouns. **Session Prep C** adds
 a checked plan/commit handshake so successful runtime facts
-cannot be applied to the wrong admitted plan. The session
-runtime itself is still gated on the items below.
+cannot be applied to the wrong admitted plan. **Session Prep D**
+adds an injected runtime adapter contract and a single-step
+mock shell so the orchestrator's behavior is pinned before any
+real runtime adapter ships. The session runtime itself is still
+gated on the items below.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2849,7 +2852,7 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, and C supply the
+cost/profitability table. Session Prep A, B, C, and D supply the
 library-side contracts the future session owner will consume, without
 creating that owner yet.
 
@@ -2869,6 +2872,14 @@ Session prep artifacts:
   handshakes leave `SessionState` unchanged, and hot-swap commits
   return the authoritative commit-time resolve rebuild result. This is
   still not the runtime session layer.
+- [Session Prep D - Runtime Adapter Shell](notes/2026-05-12-session-prep-d-runtime-adapter-shell.md)
+  records the narrow injected `SessionRuntimeAdapter` vocabulary and a
+  single-step orchestrator that composes admission, the adapter, and
+  the plan/commit handshake. The orchestrator's failure classes —
+  admission rejection, runtime failure, commit mismatch, and adapter
+  protocol bug — stay structurally distinct. This is still not the
+  runtime session layer; the first real adapter belongs to a later
+  slice.
 
 Landed prep contracts:
 
@@ -2882,15 +2893,23 @@ Landed prep contracts:
   voices, and OSC resolve state (`MetaSonic.Session.State`).
 - [x] Checked plan/commit handshake for voice start/stop, control
   write, and hot-swap plans (`MetaSonic.Session.State`).
+- [x] Narrow injected runtime adapter vocabulary
+  (`MetaSonic.Session.Runtime`).
+- [x] Single-step orchestrator that composes admission, adapter, and
+  handshake (`MetaSonic.Session.Step`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
-  policy, lifecycle report counters, admission decisions, and
-  commit-only mutation behavior, and plan/commit handshake mismatch
-  behavior.
+  policy, lifecycle report counters, admission decisions,
+  commit-only mutation behavior, plan/commit handshake mismatch
+  behavior, and the mock-adapter step shell across all four failure
+  classes and both success cases.
 
 Still gated:
 
-- [ ] A runtime session owner and command queue.
-- [ ] Graph install / hot-swap execution policy.
+- [ ] A real runtime adapter that drives the existing Haskell load
+  path (`loadTemplateGraph`, `rt_graph_realtime_*`).
+- [ ] A realtime command queue and producer-thread arbitration.
+- [ ] Graph install / hot-swap execution policy with audio-thread
+  cooperation.
 - [ ] MIDI, OSC, and pattern arbitration.
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
