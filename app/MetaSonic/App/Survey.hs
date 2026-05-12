@@ -30,6 +30,8 @@ import           System.Exit               (die)
 import           Text.Printf               (printf)
 
 import           MetaSonic.App.Demos
+import           MetaSonic.Authoring.Report (AuthoringReport (..),
+                                             ReportedControl (..))
 import qualified MetaSonic.App.FusionCostLab as FCL
 import           MetaSonic.App.FusionCostLab (GateMeasurement (..),
                                               ShapeKey,
@@ -1584,6 +1586,7 @@ runFusionSurvey demos = do
   putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
+  printAuthoringSurvey demos
   case allErrs of
     [] -> putStrLn "Done."
     es -> do
@@ -2872,6 +2875,68 @@ formatEdgeRateRow cols =
 -- Mixing the two would smear that signal — corpus shapes are picked
 -- to stress the matcher, so they typically claim at a higher rate
 -- than demos and would inflate the demo-subset coverage number.
+-- Phase 8.G: print the authoring-metadata totals across the
+-- surveyed demo list, plus a short per-demo row for demos
+-- that opt in. Empty bodies emit no block (so demo lists
+-- without authoring metadata don't add noise).
+printAuthoringSurvey :: [Demo] -> IO ()
+printAuthoringSurvey demos =
+  case authoringRows of
+    [] -> pure ()
+    rs -> do
+      putStrLn "─── Authoring metadata totals ───"
+      putStrLn $ "  demos with authoring metadata : "
+              <> show (length rs)
+      putStrLn $ "  total named templates         : "
+              <> show (sum (map authoringRowTemplates rs))
+      putStrLn $ "  total named buses             : "
+              <> show (sum (map authoringRowBuses rs))
+      putStrLn $ "  total named controls          : "
+              <> show (sum (map authoringRowControls rs))
+      putStrLn $ "  CC-bound named controls       : "
+              <> show (sum (map authoringRowCCControls rs))
+      putStrLn ""
+      putStrLn "─── Per-demo authoring rows ───"
+      mapM_ (putStrLn . formatAuthoringRow) rs
+      putStrLn ""
+  where
+    authoringRows =
+      [ AuthoringSurveyRow
+          { arsKey       = demoKey d
+          , arsReport    = r
+          , authoringRowTemplates   = length (arTemplates r)
+          , authoringRowBuses       = length (arBuses r)
+          , authoringRowControls    = length (arControls r)
+          , authoringRowCCControls  =
+              length [ () | c <- arControls r
+                          , case rcCC c of
+                              Just _  -> True
+                              Nothing -> False ]
+          }
+      | d <- demos
+      , Just r <- [demoAuthoring d]
+      ]
+
+data AuthoringSurveyRow = AuthoringSurveyRow
+  { arsKey                 :: !String
+  , arsReport              :: !AuthoringReport
+  , authoringRowTemplates  :: !Int
+  , authoringRowBuses      :: !Int
+  , authoringRowControls   :: !Int
+  , authoringRowCCControls :: !Int
+  }
+
+formatAuthoringRow :: AuthoringSurveyRow -> String
+formatAuthoringRow r =
+  let pad n s
+        | length s >= n = s
+        | otherwise     = s <> replicate (n - length s) ' '
+  in pad 16 (arsKey r)
+     <> "templates="  <> show (authoringRowTemplates r)
+     <> "  buses="    <> show (authoringRowBuses r)
+     <> "  controls=" <> show (authoringRowControls r)
+     <> "  cc-controls=" <> show (authoringRowCCControls r)
+
 printSurveyTotals :: [SurveyRow] -> [SurveyRow] -> IO ()
 printSurveyTotals demoRows corpusRows = do
   let allRows = demoRows <> corpusRows
