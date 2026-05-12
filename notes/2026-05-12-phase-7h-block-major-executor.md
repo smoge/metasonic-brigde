@@ -98,24 +98,23 @@ keep the existing `SinkAccumulator` lifecycle.
 
 ## Scratch Sizing
 
-The current executor allocates `kMaxScratchSlots = 64` floats
-on the stack per call. Block-major needs
-`kMaxScratchSlots × nframes`. At the default `kBlockFrames`
-the cost lab uses today (64 frames) this is 64 × 64 = 4096
-floats = 16 KiB on the stack. At 256 frames it would be 64 KiB
-— still fine on a desktop thread but already near the limit on
-realtime-audio stack sizes (Linux 8 KiB default for realtime
-threads can be tighter).
+The sample-major executor allocates `kMaxScratchSlots = 64`
+floats on the stack per call. Block-major keeps every scratch
+slot for the whole block, so at the cost lab's current
+`kBlockFrames = 256` this is 64 x 256 = 16384 floats = 64 KiB
+on the stack -- still fine on a desktop thread but already near
+the limit on realtime-audio stack sizes (Linux 8 KiB default for
+realtime threads can be tighter).
 
 v1 picks the pragmatic answer: **stack-allocate
 `scratch[kMaxScratchSlots][kMaxBlockFrames]` with
 `kMaxBlockFrames = 256`**. Programs called with
-`nframes > kMaxBlockFrames` silent-fall-through to the existing
-sample-major executor (or no-op, matching the existing
-`scratch_slots > kMaxScratchSlots` policy). The cost lab runs
-at 64 frames so it always exercises the block-major path; a
-future audio caller with longer blocks would either chunk or
-fall through.
+`nframes > kMaxBlockFrames` are a silent no-op, matching the
+existing `scratch_slots > kMaxScratchSlots` policy. The cost lab
+runs at 256 frames, so it always exercises the block-major path;
+a future audio caller with longer blocks would need chunking, a
+separate scratch buffer, or an explicit fallback before live
+turn-on.
 
 A future slice can revisit the buffer source (thread-local
 heap, world-scoped pool, per-template buffer) if either bound
@@ -175,8 +174,8 @@ codegen would confound the result.
   the path of record for matched shapes.
 - **No `PreferGenerated` pin movement.** Block-major may
   produce the first non-noise `PreferGenerated` row; if so,
-  the existing 7.F tripwire surfaces it for human review. The
-  slice does not authorize a turn-on.
+  the diagnostics surface it for human review. The slice does
+  not authorize a turn-on.
 - **No CLI knob to switch live audio between executors.** The
   selector is internal to the cost lab in v1.
 - **No replacement of the sample-major executor.** Both paths
