@@ -137,6 +137,22 @@ costLabChecks rows =
       ("expected=" <> show expectedGeneratedRows
        <> "; actual=" <> show (length generatedEmittedRows))
 
+  -- §7.E step 5: pin the generator's coverage explicitly. The
+  -- considered count is just the cost-lab corpus size (one
+  -- generated row per member); the unsupported count tracks how
+  -- many of those the generator declined. Both are deterministic
+  -- and bench-noise-free, unlike the win/loss split, so they
+  -- belong in the snapshot.
+  , check "cost-lab generated variant: considered count is stable"
+      (length generatedRows == expectedGeneratedConsidered)
+      ("expected=" <> show expectedGeneratedConsidered
+       <> "; actual=" <> show (length generatedRows))
+
+  , check "cost-lab generated variant: unsupported count is stable"
+      (generatedUnsupportedCount == expectedGeneratedUnsupported)
+      ("expected=" <> show expectedGeneratedUnsupported
+       <> "; actual=" <> show generatedUnsupportedCount)
+
   , check "cost-lab corpus carries declared latency coverage"
       corpusLatency
       ("max-latency=" <> show maxLatency)
@@ -199,6 +215,18 @@ costLabChecks rows =
     -- as node-loop work. This pulls in every existing chain that
     -- happens to end in that pair, not just the length-2 cases.
     expectedGeneratedRows = 19
+
+    -- §7.E step 5: pin the considered / unsupported split too.
+    -- considered = one generated row per cost-lab member; it moves
+    -- only when the cost-lab corpus changes. unsupported = members
+    -- whose maximal selected candidate the generator declines;
+    -- it moves only when the generator's shape coverage changes.
+    -- Neither flaps with bench noise.
+    expectedGeneratedConsidered  = 22
+    expectedGeneratedUnsupported = 3
+
+    generatedUnsupportedCount =
+      length [() | r <- generatedRows, lrError r /= Nothing]
 
     corpusFeatures =
       [ f

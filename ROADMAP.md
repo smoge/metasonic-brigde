@@ -1809,18 +1809,66 @@ Open follow-ups: widen the generator to longer chains only after the
 cost lab can measure them as generated rows, and keep planner-driven
 emission behind Phase 7.F's profitability gate.
 
-### Phase 7.E — Generated Equivalents of Current Kernel Shapes
+### Phase 7.E — Measured Suffix-Generation (no planner turn-on)
 
-Teach the planner/executor to generate programs equivalent to the
-current hand-written sink-terminal kernel families, then compare all
-three paths:
+[x] First slice landed. The generator now claims a contiguous
+**suffix** of a planner-selected candidate while the prefix
+members keep running as node-loop. The v1 op set stays frozen
+(scalar const, input read, add, multiply, sink write); the suffix
+rule moves the boundary between generated and node-loop work
+without expanding what the interpreter can do.
 
-- stripped node-loop baseline;
-- hand-written region kernel;
-- generated fusion program.
+Generator signature widened to
+`generateProgram :: RuntimeGraph -> FusionCandidate -> Either String (FusionProgram, [NodeIndex])`
+where the `[NodeIndex]` is the contiguous suffix the program
+owns. `patchForGenerated` uses that slice for region splitting,
+so the unowned prefix of the candidate falls into the host
+region's pre-slice automatically.
 
-The hand-written kernels stay as references and may remain fast paths
-where they beat the generated executor.
+Shape coverage: any candidate whose last two members are
+`[KGain, KOut]` or `[KGain, KBusOut]` qualifies. Length-2
+candidates reproduce the 7.D behavior exactly (empty prefix);
+longer candidates such as `KPulseOsc -> KGain -> KOut` and
+`KTriOsc -> KLPF -> KGain -> KOut` keep their prefix as node-loop
+work and only generate the tail.
+
+Measured outcome: 19 generated rows on the current cost-lab
+corpus, all bit-exact against `RNodeLoop`. Speedups span ~0.64x
+to ~1.80x. Only `sink-chain/sin-gain-out` is a measured win
+(>=1.05x) and is also the only row where generated beats both
+hand-written region-kernel and `RFused`. The remaining 18 rows
+sit below the win threshold; median delta against the best
+non-generated peer is ~-0.26x.
+
+`--fusion-cost-lab` now emits a stderr diagnostic block at the
+end of its run summarising the generated variant: considered /
+emitted / unsupported counts, exact vs non-exact equivalence,
+speedup distribution, and delta vs the best non-generated peer.
+Diagnostic-only — no planner consumes the numbers.
+
+Snapshot pins added or moved by this slice:
+
+- `cost-lab generated variant: considered count is stable` (22);
+- `cost-lab generated variant: unsupported count is stable` (3);
+- `cost-lab generated variant: measured row count is stable` (19);
+- `cost-lab generated variant: emitted programs stay
+  bit-equivalent` (non-exact=0);
+- `cost-model join total measured count is stable` (14, was 12);
+- `cost-model join needs-benchmark count is stable` (4, was 6);
+- sink-chain family row count (24, was 16) — covers two new
+  cost-lab members `pulse-gain-out` and `tri-lpf-gain-out`.
+
+Win/loss split and delta values are intentionally NOT pinned —
+they flap with bench noise around the 1.05x threshold, the same
+discipline that already shields the 7.D measurement pins.
+
+Open follow-ups: the generated interpreter is universally slower
+than node-loop on this corpus except for the one `sin-gain-out`
+row, so a profitability gate would today turn nothing on. Before
+7.F can decide on a turn-on, either (a) the interpreter has to
+get faster (packed instruction stream, branchless tail, fused
+multiply-add), or (b) the generator has to handle shapes where
+the existing kernels are weakest. Both are downstream slices.
 
 ### Phase 7.F — Profitability Gate and Turn-On Decision
 
