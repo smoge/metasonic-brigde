@@ -164,6 +164,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , capabilityTableTests
   , plannerTests
   , fusionProgramScaffoldTests
+  , fusionProgramExecutorTests
   ]
 
 ------------------------------------------------------------
@@ -804,6 +805,103 @@ fusionProgramScaffoldTests =
 
   , testCase "RuntimeGraph carries an empty FusionProgram table by default" $
       rgFusionPrograms (RuntimeGraph [] [] []) @?= []
+  ]
+
+------------------------------------------------------------
+-- §7.D executor: bit-exact equivalence with RNodeLoop
+------------------------------------------------------------
+
+fusionProgramExecutorTests :: TestTree
+fusionProgramExecutorTests =
+  testGroup "Phase 7.D: tiny executor bit-exact equivalence"
+  [ testCase "generated [Gain, Out] reading Sin's output matches RNodeLoop" $ do
+      -- Baseline: Sin → Gain(0.5) → Out, compiled normally then
+      -- stripped to ExecNodeLoop on every region. This is the
+      -- reference timeline.
+      --
+      -- Generated variant: same nodes, but the region overlay is
+      -- split into:
+      --   * Region 0 = [Sin]       ExecNodeLoop
+      --   * Region 1 = [Gain, Out] ExecGenerated (FusionProgramId 0)
+      -- The hand-authored program reads Sin's output buffer per
+      -- sample, multiplies by 0.5, and writes to bus 0.
+      --
+      -- Both runs share node identity (Sin sits at NodeIndex 0 in
+      -- both worlds; phase init is the same), so the per-sample
+      -- output should be bit-identical on bus 0.
+      let nframes = 64
+          srcGraph = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            gn  <- gain osc 0.5
+            out 0 gn
+
+      baseRG <- case lowerGraph srcGraph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+
+      -- Sanity: the compiler produced the expected dense order.
+      length (rgNodes baseRG) @?= 3
+      let sinIdx  = NodeIndex 0
+          gainIdx = NodeIndex 1
+          outIdx  = NodeIndex 2
+      map rnIndex (rgNodes baseRG) @?= [sinIdx, gainIdx, outIdx]
+
+      let baseline = baseRG
+            { rgRuntimeRegions =
+                [ r { rrExec = ExecNodeLoop }
+                | r <- rgRuntimeRegions baseRG
+                ]
+            }
+
+          prog = FusionProgram
+            { fpOps =
+                [ OpMul (ScratchIndex 0)
+                    (SrcInput sinIdx (PortIndex 0))
+                    (SrcConst 0.5)
+                , OpSinkWrite 0
+                    (SrcScratch (ScratchIndex 0))
+                    SinkOverwrite
+                ]
+            , fpScratchSlots = 1
+            }
+          sinRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 0
+            , rrRate      = SampleRate
+            , rrNodes     = [sinIdx]
+            , rrExec      = ExecNodeLoop
+            , rrFootprint = emptyResourceFootprint
+            }
+          genRegion = RuntimeRegion
+            { rrIndex     = RegionIndex 1
+            , rrRate      = SampleRate
+            , rrNodes     = [gainIdx, outIdx]
+            , rrExec      = ExecGenerated (FusionProgramId 0)
+            , rrFootprint = emptyResourceFootprint
+            }
+          generated = baseRG
+            { rgRuntimeRegions = [sinRegion, genRegion]
+            , rgFusionPrograms = [prog]
+            }
+
+          cap = length (rgNodes baseRG)
+          render rg = withRTGraph cap nframes $ \rt -> do
+            loadRuntimeGraph rt rg
+            c_rt_graph_process rt (fromIntegral nframes)
+            allocaBytes (nframes * 4) $ \bp -> do
+              _ <- c_rt_graph_read_bus rt 0
+                     (fromIntegral nframes) (castPtr bp)
+              peekArray nframes (bp :: PtrCFloat)
+
+      baseSamples <- render baseline
+      genSamples  <- render generated
+
+      let peak = maximum (map (\(CFloat x) -> abs x) baseSamples)
+      assertBool
+        ("baseline output should be non-silent; peak=" <> show peak)
+        (peak > 0.0)
+
+      -- Verification target for §7.D step 7.
+      genSamples @?= baseSamples
   ]
 
 -- | Tally a 'SynthGraph' by 'NodeKind' for shape-pinning tests.
