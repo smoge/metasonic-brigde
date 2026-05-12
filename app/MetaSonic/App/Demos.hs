@@ -19,9 +19,22 @@ module MetaSonic.App.Demos
   , DemoBody (..)
   , Demo (..)
   , demoTable
+    -- * Phase 8.G: authoring metadata reporting
+  , DemoAuthoringMetadata (..)
+  , DemoTemplateMetadata (..)
+  , DemoBusMetadata (..)
+  , DemoNamedControlView (..)
+  , emptyAuthoringMetadata
+  , ensembleMetadata
+  , addNamedControl
+  , namedControlGraph
+  , namedControlAuthoring
+  , sendReturnAuthoring
   ) where
 
+import           Data.List                 (sortBy)
 import           Data.Word                 (Word8)
+import qualified Data.Map.Strict           as M
 
 import qualified MetaSonic.Authoring       as Auth
 import           MetaSonic.Bridge.Source
@@ -342,48 +355,242 @@ data DemoBody
     -- 'MetaSonic.Bridge.MidiDemo.MidiDemo' session around the
     -- realtime audio bracket.
 
+------------------------------------------------------------
+-- Phase 8.G: authoring metadata reporting
+------------------------------------------------------------
+--
+-- DemoAuthoringMetadata is an app-level projection of the
+-- authoring constructs a demo used: ensemble templates +
+-- roles, named buses, and named controls. It is *not*
+-- embedded in SynthGraph or TemplateGraph. The reporting
+-- layer (--inspect-only, --fusion-survey) reads it; the
+-- compiler ignores it.
+--
+-- Demos opt in by setting 'demoAuthoring = Just dam'. Legacy
+-- demos leave it 'Nothing' and the rendering paths short-
+-- circuit, so adding the field does not produce noise on
+-- pre-existing demos.
+
+data DemoTemplateMetadata = DemoTemplateMetadata
+  { dtmName :: !String
+  , dtmRole :: !Auth.TemplateRole
+  } deriving (Eq, Show)
+
+data DemoBusMetadata = DemoBusMetadata
+  { dbmName  :: !String
+  , dbmIndex :: !Int
+  } deriving (Eq, Show)
+
+data DemoNamedControlView = DemoNamedControlView
+  { dncName        :: !String
+  , dncDefault     :: !Double
+  , dncRange       :: !(Double, Double)
+  , dncSmoothingHz :: !Double
+  , dncCC          :: !(Maybe Word8)
+  , dncKey         :: !MigrationKey
+  , dncSlot        :: !Int
+  } deriving (Eq, Show)
+
+data DemoAuthoringMetadata = DemoAuthoringMetadata
+  { damTemplates :: ![DemoTemplateMetadata]
+  , damBuses     :: ![DemoBusMetadata]
+  , damControls  :: ![DemoNamedControlView]
+  } deriving (Eq, Show)
+
+emptyAuthoringMetadata :: DemoAuthoringMetadata
+emptyAuthoringMetadata = DemoAuthoringMetadata
+  { damTemplates = []
+  , damBuses     = []
+  , damControls  = []
+  }
+
+-- | Project an 'AuthoredEnsemble' into demo-layer metadata.
+-- Templates and roles come from 'amRoles' in declaration
+-- order. Named buses come from 'amBuses', sorted by bus
+-- index so the reporting layer's row order is stable
+-- regardless of 'Map' iteration.
+ensembleMetadata :: Auth.AuthoredEnsemble -> DemoAuthoringMetadata
+ensembleMetadata ae = DemoAuthoringMetadata
+  { damTemplates =
+      [ DemoTemplateMetadata { dtmName = n, dtmRole = r }
+      | (n, r) <- Auth.amRoles meta
+      ]
+  , damBuses =
+      [ DemoBusMetadata
+          { dbmName  = name
+          , dbmIndex = Auth.unBus b
+          }
+      | (name, b) <- sortBy cmpBus (M.toList (Auth.amBuses meta))
+      ]
+  , damControls = []
+  }
+  where
+    meta = Auth.aeMetadata ae
+    cmpBus (_, b1) (_, b2) =
+      compare (Auth.unBus b1) (Auth.unBus b2)
+
+-- | Append one named control's metadata to a
+-- 'DemoAuthoringMetadata' record. Demos call this for each
+-- 'NamedControl' returned by 'runSynthWith'.
+addNamedControl
+  :: Auth.NamedControl
+  -> DemoAuthoringMetadata
+  -> DemoAuthoringMetadata
+addNamedControl nc dam = dam
+  { damControls = damControls dam <> [view] }
+  where
+    md   = Auth.ncMetadata nc
+    view = DemoNamedControlView
+      { dncName        = Auth.ncmName md
+      , dncDefault     = Auth.ncmDefault md
+      , dncRange       =
+          ( Auth.crMin (Auth.ncmRange md)
+          , Auth.crMax (Auth.ncmRange md)
+          )
+      , dncSmoothingHz = Auth.ncmSmoothingHz md
+      , dncCC          = Auth.ncmCC md
+      , dncKey         = Auth.ncmKey md
+      , dncSlot        = Auth.ncmSlot md
+      }
+
+------------------------------------------------------------
+-- Named-control demo (Phase 8.G)
+------------------------------------------------------------
+--
+-- Single-template demo that exercises 'control' + 'ccControl'.
+-- The graph itself is tiny — its job is to prove the
+-- authoring metadata path, not to demonstrate DSP.
+--
+-- Shape: saw -> lpf (cutoff via 'control') -> gain (vol via
+-- 'ccControl') -> out 0. Both controls flow through tagged
+-- KSmooth nodes; OSC dispatch resolves them at
+-- /<voice>/<name>/1 and the CC binding lands on the same
+-- smoother slot 1 — see notes/2026-05-12-phase-8f-named-controls.md.
+
+namedControlBuild :: SynthM (Auth.NamedControl, Auth.NamedControl)
+namedControlBuild = do
+  cutoffName <- case Auth.controlName "cutoff" of
+    Right n  -> pure n
+    Left err -> error $ "named-control demo: " <> err
+  cutoffRng <- case Auth.controlRange 200 8000 of
+    Right r  -> pure r
+    Left err -> error $ "named-control demo: " <> err
+  cutoff <- Auth.control cutoffName 1200.0 cutoffRng
+
+  volName <- case Auth.controlName "vol" of
+    Right n  -> pure n
+    Left err -> error $ "named-control demo: " <> err
+  volRng <- case Auth.controlRange 0 1 of
+    Right r  -> pure r
+    Left err -> error $ "named-control demo: " <> err
+  vol <- Auth.ccControl 7 volName 0.3 volRng
+
+  osc    <- sawOsc 220.0 0.0
+  filt   <- lpf osc (Auth.controlConnection cutoff)
+                    (Param 0.7)
+  master <- gain filt (Auth.controlConnection vol)
+  _      <- out 0 master
+  pure (cutoff, vol)
+
+namedControlGraph :: SynthGraph
+namedControlGraph =
+  let (_, g) = runSynthWith namedControlBuild
+  in g
+
+namedControlAuthoring :: DemoAuthoringMetadata
+namedControlAuthoring =
+  let ((cutoff, vol), _) = runSynthWith namedControlBuild
+      base = emptyAuthoringMetadata
+        { damTemplates =
+            [ DemoTemplateMetadata
+                { dtmName = "named-control"
+                , dtmRole = Auth.VoiceTemplate
+                }
+            ]
+        }
+  in addNamedControl vol (addNamedControl cutoff base)
+
+------------------------------------------------------------
+-- send-return ensemble metadata projection (Phase 8.G)
+------------------------------------------------------------
+
+sendReturnAuthoring :: DemoAuthoringMetadata
+sendReturnAuthoring = ensembleMetadata sendReturnEnsemble
+
+------------------------------------------------------------
+
 data Demo = Demo
-  { demoKey   :: String
-  , demoLabel :: String
-  , demoBody  :: DemoBody
+  { demoKey       :: String
+  , demoLabel     :: String
+  , demoBody      :: DemoBody
+  , demoAuthoring :: Maybe DemoAuthoringMetadata
+    -- ^ 'Just' for demos that opt in to Phase 8.G metadata
+    -- reporting; 'Nothing' for legacy demos.
+  }
+
+-- | Build a demo with no authoring metadata. Use this for
+-- legacy single-graph or multi-template demos that haven't
+-- been migrated through Phase 8.G's reporting layer.
+demoNoAuth :: String -> String -> DemoBody -> Demo
+demoNoAuth key lbl body = Demo
+  { demoKey       = key
+  , demoLabel     = lbl
+  , demoBody      = body
+  , demoAuthoring = Nothing
+  }
+
+-- | Build a demo with Phase 8.G authoring metadata.
+demoWithAuth
+  :: String -> String -> DemoBody
+  -> DemoAuthoringMetadata -> Demo
+demoWithAuth key lbl body dam = Demo
+  { demoKey       = key
+  , demoLabel     = lbl
+  , demoBody      = body
+  , demoAuthoring = Just dam
   }
 
 demoTable :: [Demo]
 demoTable =
-  [ Demo "simple"    "Simple (SinOsc → Out)"
+  [ demoNoAuth "simple"    "Simple (SinOsc → Out)"
          (SingleGraph simpleGraph)
-  , Demo "chain"     "Chain (SinOsc → Gain → Out)"
+  , demoNoAuth "chain"     "Chain (SinOsc → Gain → Out)"
          (SingleGraph chainGraph)
-  , Demo "fanout"    "Fan-out (SinOsc → 2×Gain → 2×Out)"
+  , demoNoAuth "fanout"    "Fan-out (SinOsc → 2×Gain → 2×Out)"
          (SingleGraph fanOutGraph)
-  , Demo "saw"       "Saw oscillator (SawOsc → Gain → Out)"
+  , demoNoAuth "saw"       "Saw oscillator (SawOsc → Gain → Out)"
          (SingleGraph sawGraph)
-  , Demo "noise"     "White noise (NoiseGen → Gain → Out)"
+  , demoNoAuth "noise"     "White noise (NoiseGen → Gain → Out)"
          (SingleGraph noiseGraph)
-  , Demo "noise-lpf" "Filtered noise (NoiseGen → LPF → Gain → Out)"
+  , demoNoAuth "noise-lpf" "Filtered noise (NoiseGen → LPF → Gain → Out)"
          (SingleGraph noiseLpfGraph)
-  , Demo "saw-lpf"   "Resonant bass (SawOsc → LPF → Gain → Out)"
+  , demoNoAuth "saw-lpf"   "Resonant bass (SawOsc → LPF → Gain → Out)"
          (SingleGraph filteredSawGraph)
-  , Demo "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"
+  , demoNoAuth "detune"    "Detuned saws (2×SawOsc beating → bus 0 → Out)"
          (SingleGraph detunedSawGraph)
-  , Demo "stereo-saw"
+  , demoNoAuth "stereo-saw"
          "Stereo detuned saws via MetaSonic.Authoring (Phase 8.D)"
          (SingleGraph authoringStereoSawGraph)
-  , Demo "stereo-fx"
+  , demoNoAuth "stereo-fx"
          "Stereo fx chain (hpfS → envS → delayS → gainS → stereoOut, Phase 8.C2)"
          (SingleGraph authoringStereoFxChainGraph)
-  , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"
+  , demoNoAuth "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"
          (SingleGraph ringModGraph)
-  , Demo "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)"
+  , demoNoAuth "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)"
          (SingleGraph fmGraph)
-  , Demo "env-pluck" "Plucked-tone envelope (Env → Gain × SinOsc → Out)"
+  , demoNoAuth "env-pluck" "Plucked-tone envelope (Env → Gain × SinOsc → Out)"
          (SingleGraph envPluckGraph)
-  , Demo "im"        "Intermodulation showcase (PulseOsc-PWM → BPF-sweep → Out)"
+  , demoNoAuth "im"        "Intermodulation showcase (PulseOsc-PWM → BPF-sweep → Out)"
          (SingleGraph intermodGraph)
-  , Demo "send-return"
-         "Send/return (voice → BusOut 7 │ fx: BusIn 7 → LPF → Out)"
+  , demoWithAuth "named-control"
+         "Named controls (Saw → LPF[cutoff] → Gain[vol=CC7] → Out, Phase 8.F/G)"
+         (SingleGraph namedControlGraph)
+         namedControlAuthoring
+  , demoWithAuth "send-return"
+         "Send/return (voice → BusOut 16 │ fx: BusIn 16 → LPF → Out, Phase 8.E/G)"
          (MultiTemplate sendReturnDemo)
-  , Demo "midi-poly"
+         sendReturnAuthoring
+  , demoNoAuth "midi-poly"
          "Live MIDI poly synth (8 voices; CC7 → master, pitch-bend ±2)"
          (MidiPoly 8 midiPolySynth)
   ]
