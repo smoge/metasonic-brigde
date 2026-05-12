@@ -20,6 +20,7 @@ import qualified Data.Map.Strict               as M
 import qualified MetaSonic.App.FusionCostLab   as FCL
 import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
                                                 FusionCaseFeatures (..),
+                                                FusionSuperKind (..),
                                                 GraphFamily (..),
                                                 LabRow (..),
                                                 ShapeKey,
@@ -29,6 +30,7 @@ import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
                                                 costLabGateIndex,
                                                 costLabShapeIndex,
                                                 familyName,
+                                                generatedSuperKindIndex,
                                                 GateMeasurement,
                                                 measuredWinThreshold,
                                                 shapeKeyOf)
@@ -229,6 +231,59 @@ costLabChecks rows =
       ("expected=" <> show expectedTailSweepOwnedLengths
        <> "; actual=" <> show FCL.generatedTailSweepOwnedLengths)
 
+  -- §7.I step 6: super-mode pins. Like block-major, super-mode
+  -- shares emitted programs with sample-major (same generator,
+  -- same FusionProgram), so the considered / emitted /
+  -- unsupported counts mirror the sample-major numbers. The new
+  -- pin is the recognized / fallback split: classification is
+  -- structural so the counts are deterministic across runs and
+  -- moves only when either the generator widens or the
+  -- recognizer set grows.
+  , check "cost-lab generated-super variant: considered count is stable"
+      (length generatedSuperRows == expectedGeneratedConsidered)
+      ("expected=" <> show expectedGeneratedConsidered
+       <> "; actual=" <> show (length generatedSuperRows))
+
+  , check "cost-lab generated-super variant: emitted count is stable"
+      (length generatedSuperEmittedRows == expectedGeneratedRows)
+      ("expected=" <> show expectedGeneratedRows
+       <> "; actual=" <> show (length generatedSuperEmittedRows))
+
+  , check "cost-lab generated-super variant: unsupported count is stable"
+      (generatedSuperUnsupportedCount == expectedGeneratedUnsupported)
+      ("expected=" <> show expectedGeneratedUnsupported
+       <> "; actual=" <> show generatedSuperUnsupportedCount)
+
+  , check "cost-lab generated-super variant: emitted rows stay bit-exact"
+      (all ((== EqExact) . lrEquivalence) generatedSuperEmittedRows)
+      ("non-exact=" <> show
+        (length [() | r <- generatedSuperEmittedRows
+                    , lrEquivalence r /= EqExact]))
+
+  , check "cost-lab generated-super recognized count is stable"
+      (superRecognizedCount == expectedSuperRecognized)
+      ("expected=" <> show expectedSuperRecognized
+       <> "; actual=" <> show superRecognizedCount)
+
+  , check "cost-lab generated-super fallback count is stable"
+      (superFallbackCount == expectedSuperFallback)
+      ("expected=" <> show expectedSuperFallback
+       <> "; actual=" <> show superFallbackCount)
+
+  , check "cost-lab generated-super recognized-by-shape counts are stable"
+      (superKindCounts == expectedSuperKindCounts)
+      ("expected=" <> show expectedSuperKindCounts
+       <> "; actual=" <> show superKindCounts)
+
+  , check "generated-tail-sweep: every super-mode member emitted"
+      (tailSweepSuperEmitted == expectedTailSweepEmitted)
+      ("expected=" <> show expectedTailSweepEmitted
+       <> "; actual=" <> show tailSweepSuperEmitted)
+
+  , check "generated-tail-sweep: every super-mode emitted row stays bit-exact"
+      (tailSweepSuperNonExact == 0)
+      ("non-exact=" <> show tailSweepSuperNonExact)
+
   , check "cost-lab corpus carries declared latency coverage"
       corpusLatency
       ("max-latency=" <> show maxLatency)
@@ -249,18 +304,18 @@ costLabChecks rows =
       | fam <- familyNames
       ]
 
-    -- Variant fan-out is now 5 (node-loop, region-kernel, rfused,
-    -- generated, generated-block). Bumping per-family row counts
-    -- 4x -> 5x; the underlying member counts per family are
-    -- unchanged.
+    -- Variant fan-out is now 6 (node-loop, region-kernel, rfused,
+    -- generated, generated-block, generated-super). Bumping
+    -- per-family row counts 5x -> 6x; the underlying member
+    -- counts per family are unchanged.
     expectedFamilyCounts =
-      [ ("add-chain",             20)
-      , ("corpus",                35)
-      , ("dynamic-gain",          15)
-      , ("fanout",                 5)
-      , ("generated-tail-sweep",  30)
-      , ("return-tail",            5)
-      , ("sink-chain",            30)
+      [ ("add-chain",             24)
+      , ("corpus",                42)
+      , ("dynamic-gain",          18)
+      , ("fanout",                 6)
+      , ("generated-tail-sweep",  36)
+      , ("return-tail",            6)
+      , ("sink-chain",            36)
       ]
 
     expectedRowCount =
@@ -277,17 +332,19 @@ costLabChecks rows =
         && lrFeatures r /= Nothing
         && lrNsPerSample r /= Nothing
 
-    -- §7.D step 8 / §7.H step 3: split the row set so neither
-    -- generated variant's partial-generator state (a real "no
-    -- shape implemented yet" signal) trips the non-generated
-    -- checks. Both VarGenerated (sample-major) and
-    -- VarGeneratedBlock (block-major) share the same emit-or-
+    -- §7.D step 8 / §7.H step 3 / §7.I step 6: split the row set
+    -- so no generated variant's partial-generator state (a real
+    -- "no shape implemented yet" signal) trips the non-generated
+    -- checks. The three generated variants — VarGenerated
+    -- (sample-major), VarGeneratedBlock (block-major), and
+    -- VarGeneratedSuper (super-mode) — share the same emit-or-
     -- decline behavior because they consume the same emitted
     -- program.
     nonGeneratedRows =
       [ r | r <- rows
           , lrVariant r /= VarGenerated
           , lrVariant r /= VarGeneratedBlock
+          , lrVariant r /= VarGeneratedSuper
       ]
     generatedRows =
       [r | r <- rows, lrVariant r == VarGenerated]
@@ -364,6 +421,72 @@ costLabChecks rows =
       length [() | r <- tailSweepBlockGenerated
                  , lrError r == Nothing
                  , lrEquivalence r /= EqExact ]
+
+    -- §7.I super-mode helpers. The super executor shares emitted
+    -- programs with the other generated variants, so the
+    -- considered / emitted / unsupported counts mirror them by
+    -- construction. The new piece is the recognized / fallback
+    -- split, which is structural and pinned below.
+    generatedSuperRows =
+      [r | r <- rows, lrVariant r == VarGeneratedSuper]
+    generatedSuperEmittedRows =
+      [r | r <- generatedSuperRows, lrError r == Nothing]
+    generatedSuperUnsupportedCount =
+      length [() | r <- generatedSuperRows, lrError r /= Nothing]
+
+    -- Look up an emitted super-mode row's recognizer
+    -- classification by re-using the structural index built once
+    -- in 'FusionCostLab.generatedSuperKindIndex'. The map covers
+    -- every cost-lab member; rows whose graph the generator
+    -- declines just don't appear under VarGeneratedSuper either,
+    -- so the lookup miss case is unreachable in practice.
+    superKindOf r =
+      M.lookup (familyName (lrFamily r), lrMember r) generatedSuperKindIndex
+
+    superRecognizedCount =
+      length [ () | r <- generatedSuperEmittedRows
+                  , Just k <- [superKindOf r]
+                  , k /= FusionSuperNotRecognized ]
+    superFallbackCount =
+      length [ () | r <- generatedSuperEmittedRows
+                  , Just FusionSuperNotRecognized <- [superKindOf r] ]
+
+    superKindCounts :: [(String, Int)]
+    superKindCounts =
+      [ ("AddGainOut", countKind FusionSuperAddGainOut)
+      , ("GainOut",    countKind FusionSuperGainOut)
+      , ("fallback",   countKind FusionSuperNotRecognized)
+      ]
+      where
+        countKind kind = length
+          [ () | r <- generatedSuperEmittedRows
+               , Just k <- [superKindOf r]
+               , k == kind ]
+
+    -- §7.I super-mode family-scoped helpers.
+    tailSweepSuperGenerated =
+      [ r | r <- generatedSuperRows
+          , familyName (lrFamily r) == "generated-tail-sweep" ]
+    tailSweepSuperEmitted =
+      length [() | r <- tailSweepSuperGenerated, lrError r == Nothing]
+    tailSweepSuperNonExact =
+      length [() | r <- tailSweepSuperGenerated
+                 , lrError r == Nothing
+                 , lrEquivalence r /= EqExact ]
+
+    -- Pinned super-mode classification counts. Derived from the
+    -- diagnostic output the first run reported: 17 GainOut + 1
+    -- AddGainOut recognized, 8 fallback (= 26 emitted - 18
+    -- recognized). All structural; will shift only when the
+    -- generator widens or the recognizer set grows.
+    expectedSuperRecognized = 18
+    expectedSuperFallback   = 8
+    expectedSuperKindCounts :: [(String, Int)]
+    expectedSuperKindCounts =
+      [ ("AddGainOut",  1)
+      , ("GainOut",    17)
+      , ("fallback",    8)
+      ]
 
     corpusFeatures =
       [ f

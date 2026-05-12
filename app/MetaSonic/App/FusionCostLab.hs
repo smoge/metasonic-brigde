@@ -83,6 +83,11 @@ module MetaSonic.App.FusionCostLab
   , costLabGateIndex
     -- * Phase 7.G diagnostic helpers
   , generatedTailSweepOwnedLengths
+    -- * Phase 7.I super-mode classifier
+  , FusionSuperKind (..)
+  , classifyFusionSuper
+  , generatedSuperKindFor
+  , generatedSuperKindIndex
   ) where
 
 import           Control.Monad              (forM, forM_, replicateM_)
@@ -1460,6 +1465,77 @@ generatedTailSweepOwnedLengths =
     , Just sz <- [generatedOwnedTailLength graph]
     ]
 
+-- | Phase 7.I super-mode recognizer classification. The Haskell
+-- side classifier mirrors the C++ 'classify_fusion_super' in
+-- @rt_graph.cpp@: pure structural inspection of the op sequence
+-- and tagged operands, never an execution. The bit-exact
+-- equivalence test pins the two implementations together; the
+-- enum below decides recognized vs fallback counts at snapshot
+-- time without polling any runtime counter.
+data FusionSuperKind
+  = FusionSuperNotRecognized
+    -- ^ Super-mode would fall through to the block-major executor.
+  | FusionSuperGainOut
+    -- ^ Two-op program: @OpMul s0 a b ; OpSinkWrite bus (SrcScratch s0)@.
+  | FusionSuperAddGainOut
+    -- ^ Three-op program: @OpAdd s0 a b ; OpMul s1 (SrcScratch s0) c ;@
+    --   @OpSinkWrite bus (SrcScratch s1)@.
+  deriving (Eq, Show, Bounded, Enum)
+
+-- | Classify a 'FusionProgram' against the v1 super-mode
+-- recognizer set. Programs that don't match any recognized
+-- shape return 'FusionSuperNotRecognized'.
+classifyFusionSuper :: FusionProgram -> FusionSuperKind
+classifyFusionSuper prog = case fpOps prog of
+  -- GainOut: [OpMul s0 _ _, OpSinkWrite _ (SrcScratch s0) _]
+  [ OpMul (ScratchIndex 0) _ _
+   , OpSinkWrite _ (SrcScratch (ScratchIndex 0)) _
+   ] | fpScratchSlots prog == 1 -> FusionSuperGainOut
+
+  -- AddGainOut: [OpAdd s0 _ _, OpMul s1 (SrcScratch s0) _,
+  --              OpSinkWrite _ (SrcScratch s1) _]
+  [ OpAdd (ScratchIndex 0) _ _
+   , OpMul (ScratchIndex 1) (SrcScratch (ScratchIndex 0)) _
+   , OpSinkWrite _ (SrcScratch (ScratchIndex 1)) _
+   ] | fpScratchSlots prog == 2 -> FusionSuperAddGainOut
+
+  _ -> FusionSuperNotRecognized
+
+-- | Classify the generator's first eligible candidate for the
+-- given source graph. 'Nothing' for graphs the generator
+-- declines (no eligible candidate, compile failure, etc.); the
+-- same condition under which 'generatedOwnedTailLength' returns
+-- 'Nothing'.
+generatedSuperKindFor :: SynthGraph -> Maybe FusionSuperKind
+generatedSuperKindFor graph = do
+  rg <- case lowerGraph graph >>= compileRuntimeGraphUnfused of
+          Right base -> Just (stripRegionKernels base)
+          Left _     -> Nothing
+  let emitted =
+        [ prog
+        | c <- selectedFusionCandidates (planRuntimeGraph rg)
+        , isNothing (fcMatchedShape c)
+        , Right (prog, _owned) <- [generateProgram rg c]
+        ]
+  case emitted of
+    (prog : _) -> Just (classifyFusionSuper prog)
+    []         -> Nothing
+
+-- | @(familyName, member) -> FusionSuperKind@ for every
+-- cost-lab member whose graph the generator emits a program for.
+-- Built once over the full corpus. Used by the cost-lab
+-- diagnostics block to print recognized vs fallback counts, and
+-- by [SnapshotCheck.hs] to pin those counts structurally.
+-- Members the generator declines are absent from the map; that
+-- matches the absence of a corresponding super-mode emitted row.
+generatedSuperKindIndex :: M.Map (String, String) FusionSuperKind
+generatedSuperKindIndex = M.fromList
+  [ ((familyName fam, name), kind)
+  | fam <- [minBound .. maxBound :: GraphFamily]
+  , FamilyMember name graph <- familyMembers fam
+  , Just kind <- [generatedSuperKindFor graph]
+  ]
+
 shapeKeyForOwned :: RuntimeGraph -> [NodeIndex] -> Either String ShapeKey
 shapeKeyForOwned rg owned = do
   nodes <- mapM (lookupRtNode rg) owned
@@ -1667,26 +1743,33 @@ renderGeneratedDiagnostics :: Handle -> [LabRow] -> IO ()
 renderGeneratedDiagnostics handle rows = do
   let sampleRows = [r | r <- rows, lrVariant r == VarGenerated]
       blockRows  = [r | r <- rows, lrVariant r == VarGeneratedBlock]
-  if null sampleRows && null blockRows
+      superRows  = [r | r <- rows, lrVariant r == VarGeneratedSuper]
+  if null sampleRows && null blockRows && null superRows
     then pure ()
     else do
       hPutStrLn handle ""
-      hPutStrLn handle "=== generated variant diagnostics (Phase 7.E/7.G/7.H) ==="
+      hPutStrLn handle "=== generated variant diagnostics (Phase 7.E/7.G/7.H/7.I) ==="
       printVariantSummary "sample-major" sampleRows
       printVariantSummary "block-major"  blockRows
-      -- §7.H A/B owned-size bucket views. Sample-major and
-      -- block-major share the same emitted programs, so each row
-      -- appears in both variants' bucket counts on identical
-      -- owned-tail-length keys. The compact side-by-side table
-      -- surfaces the crossover length where block-major starts
-      -- winning.
-      printAbBuckets
-        "  by owned-op count (all emitted rows; rows / sample / block medians):"
-        sampleRows blockRows
-      printAbBuckets
-        "  generated-tail-sweep only (rows / sample / block medians):"
+      printVariantSummary "super-mode"   superRows
+      -- §7.I recognized vs fallback breakdown. The classifier
+      -- is structural so the counts are deterministic across
+      -- runs; snapshot pins them in [SnapshotCheck.hs].
+      printSuperBreakdown superRows
+      -- §7.H / §7.I A/B/C owned-size bucket views. All three
+      -- generated variants share the same emitted programs, so
+      -- each row appears under the same owned-tail-length key.
+      -- The compact side-by-side table surfaces both the
+      -- block-major crossover and the super-mode delta where
+      -- the recognizer fast path kicks in.
+      printAbcBuckets
+        "  by owned-op count (all emitted rows; medians):"
+        sampleRows blockRows superRows
+      printAbcBuckets
+        "  generated-tail-sweep only (medians):"
         [r | r <- sampleRows, lrFamily r == FamilyGeneratedTailSweep]
         [r | r <- blockRows,  lrFamily r == FamilyGeneratedTailSweep]
+        [r | r <- superRows,  lrFamily r == FamilyGeneratedTailSweep]
       hPutStrLn handle "=== end generated diagnostics ==="
       hFlush handle
   where
@@ -1730,19 +1813,47 @@ renderGeneratedDiagnostics handle rows = do
     ownedSizeOf r =
       M.lookup (familyName (lrFamily r), lrMember r) ownedSizeIndex
 
-    -- Side-by-side amortization-curve table. Each size row shows
-    -- the bucket population (sample-major member count, which
-    -- equals block-major member count by construction since the
-    -- two variants share emitted programs) and the median speedup
-    -- under each executor. A '*' marks rows where block-major
-    -- beats sample-major.
-    printAbBuckets
-      :: String -> [LabRow] -> [LabRow] -> IO ()
-    printAbBuckets title sampleSrc blockSrc = do
+    -- §7.I recognized vs fallback breakdown of super-mode rows.
+    -- Classification is structural so the counts are
+    -- deterministic across runs.
+    printSuperBreakdown :: [LabRow] -> IO ()
+    printSuperBreakdown superSrc = do
+      let emittedSuper =
+            [ r | r <- superSrc, lrError r == Nothing ]
+          kindOf r = case M.lookup (familyName (lrFamily r), lrMember r)
+                                   generatedSuperKindIndex of
+            Just FusionSuperGainOut    -> Just "GainOut"
+            Just FusionSuperAddGainOut -> Just "AddGainOut"
+            Just FusionSuperNotRecognized -> Just "fallback"
+            Nothing                    -> Nothing
+          tagged    = mapMaybe kindOf emittedSuper
+          counts    = tally tagged
+          recognized = length [() | t <- tagged, t /= "fallback"]
+          fallback   = length [() | t <- tagged, t == "fallback"]
+      unless (null emittedSuper) $ do
+        hPutStrLn handle "  [super-mode recognized vs fallback]"
+        hPutStrLn handle $
+          "    emitted=" <> show (length emittedSuper)
+          <> "  recognized=" <> show recognized
+          <> "  fallback="   <> show fallback
+        unless (null counts) $ do
+          hPutStrLn handle "    by shape:"
+          forM_ counts $ \(shape, n) ->
+            hPutStrLn handle $ "      " <> shape <> ": " <> show n
+
+    -- §7.H/§7.I side-by-side amortization-curve table. Each size
+    -- row shows the bucket population (all three variants share
+    -- the same emitted programs by construction) and the median
+    -- speedup under each executor. A '*' marks rows where
+    -- block-major beats sample-major; a '†' marks rows where
+    -- super-mode beats block-major.
+    printAbcBuckets
+      :: String -> [LabRow] -> [LabRow] -> [LabRow] -> IO ()
+    printAbcBuckets title sampleSrc blockSrc superSrc = do
       let bucketSizes =
             sort (nubOrd
                    [ s
-                   | r <- sampleSrc ++ blockSrc
+                   | r <- sampleSrc ++ blockSrc ++ superSrc
                    , Just s <- [ownedSizeOf r]
                    ])
       unless (null bucketSizes) $ do
@@ -1750,19 +1861,28 @@ renderGeneratedDiagnostics handle rows = do
         forM_ bucketSizes $ \sz ->
           let rowsAtS = [r | r <- sampleSrc, ownedSizeOf r == Just sz]
               rowsAtB = [r | r <- blockSrc,  ownedSizeOf r == Just sz]
+              rowsAtU = [r | r <- superSrc,  ownedSizeOf r == Just sz]
               medAt rs = case mapMaybe lrSpeedupVsBase rs of
                            [] -> Nothing
                            xs -> let (_, m, _) = minMedMax xs in Just m
               fmtMed   = maybe "n/a" (printf "%.2fx") :: Maybe Double -> String
               mS = medAt rowsAtS
               mB = medAt rowsAtB
-              marker = case (mS, mB) of
-                (Just s, Just b) | b > s -> " *block-major ahead"
+              mU = medAt rowsAtU
+              blockMarker = case (mS, mB) of
+                (Just s, Just b) | b > s -> " *block>sample"
                 _                        -> ""
+              superMarker = case (mB, mU) of
+                (Just b, Just u) | u > b -> " \x2020super>block"
+                _                        -> ""
+              rowCount = maximum
+                [length rowsAtS, length rowsAtB, length rowsAtU]
           in hPutStrLn handle $ printf
-               "    size=%2d  rows=%d  sample=%s  block=%s%s"
-               sz (max (length rowsAtS) (length rowsAtB))
-               (fmtMed mS) (fmtMed mB) (marker :: String)
+               "    size=%2d  rows=%d  sample=%s  block=%s  super=%s%s%s"
+               sz rowCount
+               (fmtMed mS) (fmtMed mB) (fmtMed mU)
+               (blockMarker :: String) (superMarker :: String)
+
 
     -- Built once per call: (familyName, member) -> owned tail
     -- length for the generator's first eligible candidate on the
