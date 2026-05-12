@@ -68,6 +68,7 @@ module MetaSonic.Bridge.Source
   , staticPlugin
   , tagged
   , cc
+  , recordCCBinding
   , -- * Connection helpers
     audio
   , connectionNodeID
@@ -1243,16 +1244,25 @@ cc
   -> SynthM Connection
 cc num initial mn mx = do
   nid <- insertNode "cc" (Smooth 20.0 (Param initial))
-  modify $ \st -> st
-    { ssCCs = CCSpec
-        { ccsNumber = num
-        , ccsNode   = nid
-        , ccsCtl    = 1
-        , ccsMin    = mn
-        , ccsMax    = mx
-        } : ssCCs st
+  recordCCBinding CCSpec
+    { ccsNumber = num
+    , ccsNode   = nid
+    , ccsCtl    = 1
+    , ccsMin    = mn
+    , ccsMax    = mx
     }
   pure (audio nid)
+
+-- | Append a CC binding to the builder state. Intended for
+-- authoring helpers that compose 'smooth' + 'tagged' themselves
+-- (Phase 8.F's @ccControl@): they emit the smoother node, then
+-- record the binding through this helper without duplicating
+-- Source's state-monad plumbing. Bindings accumulate in
+-- reverse-registration order; 'runSynthCCs' reverses to a stable
+-- left-to-right view.
+recordCCBinding :: CCSpec -> SynthM ()
+recordCCBinding spec =
+  modify $ \st -> st { ssCCs = spec : ssCCs st }
 
 -- | Read the previous block's accumulated contents of a shared audio
 -- bus. The feedback primitive: unlike 'busIn', a 'busInDelayed'
