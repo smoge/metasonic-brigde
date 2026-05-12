@@ -2830,11 +2830,11 @@ See
 for the full contract.
 
 With 8.H landed, the manifest is a stable input shape for
-the eventual session layer. The next slice can begin
-**session scoping prep**: command/event ADT, OSC
-resolve-state rebuild contract, and the buffer/plugin
-lifecycle report shape. The session runtime itself is
-still gated on the items below.
+the eventual session layer. **Session Prep A** is now the
+first non-runtime session-scoping slice: command/event
+vocabulary, OSC resolve-state rebuild, and buffer/plugin
+lifecycle reports. The session runtime itself is still gated
+on the items below.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2844,11 +2844,43 @@ It crosses `RTGraph` ownership, producer fan-in, OSC resolve-state
 updates on hot-swap, MIDI/pattern coexistence, and buffer/plugin
 lifecycle reporting.
 
-Current decision: write and refine the scoping contract now, but do not
-start session runtime code until Phase 7 has capability metadata,
-survey-only planner output, and a first cost-model table. That places
-session implementation after a planner/cost-model v1, but it does not
-require waiting for a generated fusion executor to ship.
+The original planner/cost precondition is now satisfied: Phase 7 has
+capability metadata, survey-only planner output, and a first
+cost/profitability table. Session Prep A supplies the library-side
+contracts the future session owner will consume, without creating that
+owner yet.
+
+Session Prep A artifact:
+- [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
+  records the Haskell-only command/event vocabulary, pure OSC
+  resolve-state rebuild helper, and read-only buffer/plugin lifecycle
+  reports. This is not the runtime session layer.
+
+Landed prep contracts:
+
+- [x] Command/event vocabulary for producer fan-in
+  (`MetaSonic.Session.Command`).
+- [x] Pure OSC resolve-state rebuild helper for graph hot-swap prep
+  (`MetaSonic.Session.Resolve`).
+- [x] Read-only buffer/plugin lifecycle report shapes and readers
+  (`MetaSonic.Session.Report`).
+- [x] Focused library tests pin the command adapter, resolve rebuild
+  policy, and lifecycle report counters.
+
+Still gated:
+
+- [ ] A runtime session owner and command queue.
+- [ ] Graph install / hot-swap execution policy.
+- [ ] MIDI, OSC, and pattern arbitration.
+- [ ] Manifest reload and resource allocation policy.
+- [ ] Failure/event semantics across compile, allocation, install, and
+  stale producer commands.
+
+Current decision: do not start session runtime code until those
+ownership and execution policies are specified and tested in their own
+slice. The session does not need a generated fusion executor to ship;
+generated execution remains a read-only diagnostic/performance
+experiment unless later measurements justify automatic turn-on.
 
 ---
 

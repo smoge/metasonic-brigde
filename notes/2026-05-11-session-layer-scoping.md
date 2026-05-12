@@ -1,22 +1,26 @@
 # Session Layer Scoping Gate
 
 Date: 2026-05-11
+Updated: 2026-05-12
 
-Status: direction note, not an implementation phase.
+Status: direction note, not an implementation phase. Session Prep A
+now supplies the first library-side command, resolve, and lifecycle
+contracts; runtime session ownership remains out of scope.
 
 ## Decision
 
-Treat session/authoring as a next product direction, not the next
-implementation phase. The scoping pass can happen now, but session
-runtime implementation should wait until Phase 7 has a real planner
-story: capability metadata, survey-only planning, and a first cost
-model table derived from `--fusion-cost-lab` / `--snapshot-check`.
+Treat session/authoring as a next product direction, not a small
+continuation of the authoring DSL. The original planner precondition is
+now satisfied: Phase 7 has capability metadata, survey-only planning,
+and cost/profitability tables derived from `--fusion-cost-lab` /
+`--snapshot-check`, and Session Prep A supplies the first command,
+resolve, and lifecycle contracts.
 
-This puts session implementation after a cost-model v1, but before any
-requirement to ship a generated fusion executor. That order gives the
-session layer a stable enough compiler/planner contract while still
-letting later real musical workloads exercise generated-fusion
-decisions before generated execution becomes default.
+That means session scoping can move beyond the planner gate, but
+runtime implementation still needs a dedicated ownership and execution
+policy pass. It does not need to wait for a generated fusion executor
+to ship; generated execution remains a diagnostic/performance track
+unless later measurements justify automatic turn-on.
 
 ## Why This Is Not A Small Slice
 
@@ -122,15 +126,18 @@ Out of v0:
 
 ## Planning Gate
 
-Do not promote this to a numbered phase until these artifacts exist:
+The original prep gate is now satisfied:
 
 1. [x] Phase 7.B capability metadata for fusion legality.
-2. Phase 7.C survey-only planner output.
-3. A v1 profitability/cost table from the cost lab.
-4. A command/event ADT sketch for session producer fan-in.
-5. A hot-swap/OSC resolve-state update contract.
-6. A buffer/plugin lifecycle reporting contract.
+2. [x] Phase 7.C survey-only planner output.
+3. [x] A v1 profitability/cost table from the cost lab.
+4. [x] A command/event ADT sketch for session producer fan-in.
+5. [x] A hot-swap/OSC resolve-state update contract.
+6. [x] A buffer/plugin lifecycle reporting contract.
 
-The next implementation work should therefore stay on the planner
-story first. Session scoping can continue in notes, but session runtime
-code should not compete with the Phase 7 planner gate.
+That does not make the runtime session layer a small follow-up. The
+next session slice still needs its own scoping pass for runtime
+ownership, command queue semantics, graph install / hot-swap execution,
+MIDI/OSC/pattern arbitration, manifest reload, and failure/event
+policy. Session runtime code should start only after those policies are
+specified and tested separately.

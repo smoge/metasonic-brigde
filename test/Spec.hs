@@ -134,6 +134,9 @@ import           Data.IORef                      (modifyIORef',
 import           System.Timeout                  (timeout)
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
+import           MetaSonic.Session.Command
+import           MetaSonic.Session.Resolve
+import           MetaSonic.Session.Report
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -169,6 +172,9 @@ main = defaultMain $ testGroup "MetaSonic"
   , c0cScheduleExecutorTests
   , c0dGlobalScheduleBandTests
   , c1cWorkerScheduleTests
+  , sessionCommandTests
+  , sessionResolveTests
+  , sessionReportTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -11927,6 +11933,244 @@ c1cWorkerScheduleTests =
                         (bands > 0)
              entries @?= 3
        ]
+
+------------------------------------------------------------
+-- Session Prep A: command/event vocabulary
+--
+-- These tests pin only the structural adapter from the existing
+-- pattern producer vocabulary into the future session vocabulary.
+-- No command execution, queue writes, or runtime ownership is implied.
+------------------------------------------------------------
+
+sessionCommandTests :: TestTree
+sessionCommandTests = testGroup "Session Prep A: command vocabulary"
+  [ testCase "PEVoiceOn adapts to CmdVoiceOn" $ do
+      let tname = TemplateName "voice"
+          vkey  = VoiceKey "v0"
+          ctrls =
+            [ (ControlTag (MigrationKey "freq") 0, 440.0)
+            , (ControlTag (MigrationKey "amp")  1, 0.25)
+            ]
+      fromPatternEvent (PEVoiceOn tname vkey ctrls)
+        @?= CmdVoiceOn tname vkey ctrls
+
+  , testCase "PEVoiceOff adapts to CmdVoiceOff" $ do
+      let vkey = VoiceKey "v0"
+      fromPatternEvent (PEVoiceOff vkey)
+        @?= CmdVoiceOff vkey
+
+  , testCase "PEControlWrite adapts to CmdControlWrite" $ do
+      let vkey   = VoiceKey "v0"
+          target = ControlTag (MigrationKey "cutoff") 0
+      fromPatternEvent (PEControlWrite vkey target 1200.0)
+        @?= CmdControlWrite vkey target 1200.0
+
+  , testCase "PEHotSwap adapts to CmdHotSwap and preserves payload" $ do
+      let swapLabel = SwapLabel "edit-cutoff"
+          tg        = patternTemplates hotSwapEdit
+      fromPatternEvent (PEHotSwap swapLabel tg)
+        @?= CmdHotSwap swapLabel tg
+
+  , testCase "diagnostic events are structural values, not execution" $ do
+      let cmd   = CmdVoiceOff (VoiceKey "stale")
+          issue = SiStaleVoice (VoiceKey "stale")
+      SessionCommandRejected cmd issue
+        @?= SessionCommandRejected cmd issue
+  ]
+
+------------------------------------------------------------
+-- Session Prep A: OSC resolve-state rebuild
+--
+-- These tests pin the pure rebuild policy a future session owner will
+-- use after a successful graph install. The helper rebuilds symbolic
+-- OSC resolution only; it does not install graphs or touch RTGraph.
+------------------------------------------------------------
+
+sessionResolveTests :: TestTree
+sessionResolveTests = testGroup "Session Prep A: resolve rebuild"
+  [ testCase "valid binding survives rebuild" $ do
+      let tg = patternTemplates droneVibrato
+          result = rebuildResolveState tg
+            [ VoiceBinding
+                { vbVoiceKey     = VoiceKey "v0"
+                , vbSlotId       = 7
+                , vbTemplateName = TemplateName "drone"
+                }
+            ]
+      rrrDropped result @?= []
+      OSC.resolveStateVoices (rrrState result)
+        @?= M.fromList [(OBSC.pack "v0", (7, OBSC.pack "drone"))]
+
+  , testCase "missing template binding is dropped" $ do
+      let tg = patternTemplates polyphonicStab
+          result = rebuildResolveState tg
+            [ VoiceBinding
+                { vbVoiceKey     = VoiceKey "v0"
+                , vbSlotId       = 7
+                , vbTemplateName = TemplateName "drone"
+                }
+            ]
+      rrrDropped result
+        @?= [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
+      OSC.resolveStateVoices (rrrState result) @?= M.empty
+
+  , testCase "invalid voice key is dropped through OSC validation" $ do
+      let tg = patternTemplates droneVibrato
+          result = rebuildResolveState tg
+            [ VoiceBinding
+                { vbVoiceKey     = VoiceKey "bad/key"
+                , vbSlotId       = 7
+                , vbTemplateName = TemplateName "drone"
+                }
+            ]
+      rrrDropped result
+        @?= [ RriInvalidVoiceKey
+                (VoiceKey "bad/key")
+                (OSC.DiIdentifierProfile (OBSC.pack "bad/key"))
+            ]
+      OSC.resolveStateVoices (rrrState result) @?= M.empty
+
+  , testCase "dropped binding diagnostics preserve input order" $ do
+      let tg = patternTemplates droneVibrato
+          result = rebuildResolveState tg
+            [ VoiceBinding (VoiceKey "gone")    1 (TemplateName "missing")
+            , VoiceBinding (VoiceKey "bad/key") 2 (TemplateName "drone")
+            , VoiceBinding (VoiceKey "v0")      3 (TemplateName "drone")
+            ]
+      rrrDropped result
+        @?= [ RriMissingTemplate (VoiceKey "gone") (TemplateName "missing")
+            , RriInvalidVoiceKey
+                (VoiceKey "bad/key")
+                (OSC.DiIdentifierProfile (OBSC.pack "bad/key"))
+            ]
+      OSC.resolveStateVoices (rrrState result)
+        @?= M.fromList [(OBSC.pack "v0", (3, OBSC.pack "drone"))]
+
+  , testCase "retained binding resolves through rebuilt state" $ do
+      let tg = patternTemplates droneVibrato
+          result = rebuildResolveState tg
+            [ VoiceBinding
+                { vbVoiceKey     = VoiceKey "v0"
+                , vbSlotId       = 7
+                , vbTemplateName = TemplateName "drone"
+                }
+            ]
+          msg = OSC.OscMessage (OBSC.pack "/v0/lpf/0")
+                               [OSC.OscArgFloat 1800.0]
+      rrrDropped result @?= []
+      case OSC.dispatch (rrrState result) msg of
+        Right (OSC.DAControlWrite
+                  { OSC.daSlotId     = slotId
+                  , OSC.daNodeIndex  = nodeIx
+                  , OSC.daControlIdx = ctrlIx
+                  , OSC.daValue      = value
+                  }) -> do
+          slotId @?= 7
+          ctrlIx @?= 0
+          value @?= 1800.0
+          let lpfTargets =
+                [ rnIndex n
+                | tpl <- tgTemplates tg
+                , tplName tpl == "drone"
+                , n   <- rgNodes (tplGraph tpl)
+                , rnMigrationKey n == Just (MigrationKey "lpf")
+                ]
+          assertBool
+            ("expected lpf target, got " <> show nodeIx
+             <> " from " <> show lpfTargets)
+            (nodeIx `elem` lpfTargets)
+        other ->
+          assertFailure ("expected control-write dispatch, got: " <> show other)
+  ]
+
+------------------------------------------------------------
+-- Session Prep A: lifecycle reports
+--
+-- These tests pin the read-only reporting surface that a future
+-- session owner can render or log outside the audio thread. The
+-- module reads existing counters/metadata only.
+------------------------------------------------------------
+
+sessionReportTests :: TestTree
+sessionReportTests = testGroup "Session Prep A: lifecycle reports"
+  [ testCase "fresh report starts with zero counters and static plugins" $
+      withRTGraph 4 64 $ \rt -> do
+        report <- readSessionLifecycleReport rt
+        slrBuffers report @?= BufferLifecycleReport 0 0 0 0
+        plrCallCount (slrPlugins report) @?= 0
+        plrInvalidCallCount (slrPlugins report) @?= 0
+        assertBool
+          ("expected identity plugin in registry: "
+           <> show (plrRegistered (slrPlugins report)))
+          (any ((== "identity") . pluginEntryName)
+               (plrRegistered (slrPlugins report)))
+
+  , testCase "plugin report observes identity dispatch counters" $ do
+      let nframes = 64
+          graph = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sinOsc 220.0 0.0
+            y <- staticPlugin identityPlugin a b
+            out 0 y
+      tg <- case compileTemplateGraph [("plugin", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        before <- readPluginLifecycleReport rt
+        plrCallCount before @?= 0
+        plrInvalidCallCount before @?= 0
+
+        c_rt_graph_process rt (fromIntegral nframes)
+        pluginAfter <- readPluginLifecycleReport rt
+        plrCallCount pluginAfter @?= 1
+        plrInvalidCallCount pluginAfter @?= 0
+        assertBool
+          "plugin registry should remain visible after processing"
+          (any ((== "identity") . pluginEntryName)
+               (plrRegistered pluginAfter))
+
+  , testCase "buffer report observes invalid read counters" $ do
+      let nframes = 32
+          graph = runSynth $ do
+            s <- playBufMono (Buffer 99) (Param 1.0) (Param 0) (Param 0)
+            out 0 s
+      rtGraph <- case lowerGraph graph >>= compileRuntimeGraph of
+        Right r  -> pure r
+        Left err -> assertFailure err >> error "unreachable"
+      withRTGraph (length (rgNodes rtGraph)) nframes $ \rt -> do
+        loadRuntimeGraph rt rtGraph
+        c_rt_graph_process rt (fromIntegral nframes)
+        report <- readBufferLifecycleReport rt
+        blrReadCount report @?= 0
+        blrInvalidReadCount report @?= fromIntegral nframes
+        blrWriteCount report @?= 0
+        blrInvalidWriteCount report @?= 0
+
+  , testCase "buffer report observes recordBufMono write counters" $ do
+      let nframes = 64
+          graph = runSynth $ do
+            mon <- recordBufMono (Buffer 0) (Param 0.25) (Param 0.0)
+            out 0 mon
+      tg <- case compileTemplateGraph [("record", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt nframes
+        bufferId buf @?= 0
+        loadBuffer rt buf (replicate nframes 0.0)
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        report <- readBufferLifecycleReport rt
+        blrReadCount report @?= 0
+        blrInvalidReadCount report @?= 0
+        blrWriteCount report @?= fromIntegral nframes
+        blrInvalidWriteCount report @?= 0
+  ]
 
 ------------------------------------------------------------
 -- Phase 6.A.2: pattern corpus

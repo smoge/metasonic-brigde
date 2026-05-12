@@ -42,6 +42,9 @@ library
       MetaSonic.OSC.Listen
       MetaSonic.Pattern
       MetaSonic.Pattern.Corpus
+      MetaSonic.Session.Command
+      MetaSonic.Session.Resolve
+      MetaSonic.Session.Report
       MetaSonic.Authoring
       MetaSonic.Authoring.Report
       MetaSonic.Authoring.Manifest
