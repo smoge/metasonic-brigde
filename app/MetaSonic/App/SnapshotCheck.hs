@@ -108,7 +108,7 @@ costLabChecks rows =
        <> "/" <> show expectedRowCount)
 
   , check "cost-lab covers the expected families"
-      (familyNames == ["corpus", "fanout", "return-tail", "sink-chain"])
+      (familyNames == ["add-chain", "corpus", "fanout", "return-tail", "sink-chain"])
       ("families=" <> intercalate "," familyNames)
 
   , check "cost-lab variants compile and measure"
@@ -140,10 +140,11 @@ costLabChecks rows =
       ]
 
     expectedFamilyCounts =
-      [ ("corpus",      21)
-      , ("fanout",       3)
-      , ("return-tail",  3)
-      , ("sink-chain",  12)
+      [ ("add-chain",  12)
+      , ("corpus",     21)
+      , ("fanout",      3)
+      , ("return-tail", 3)
+      , ("sink-chain", 12)
       ]
 
     expectedRowCount =
@@ -519,10 +520,10 @@ costModelJoinChecks shapeIdx snapshots =
     -- corpus changes; a silent shift means the join drifted.
     expectedClassCounts :: [(String, Int)]
     expectedClassCounts =
-      [ ("covered",         51)
-      , ("measured-win",     0)
-      , ("measured-loss",    4)
-      , ("needs-benchmark", 14)
+      [ ("covered",        51)
+      , ("measured-win",    0)
+      , ("measured-loss",   9)
+      , ("needs-benchmark", 9)
       ]
 
 renderClassCounts :: [(String, Int)] -> String
