@@ -591,6 +591,22 @@ void rt_graph_template_add_region_generated_block(
     int rate, int first_node, int node_count,
     int program_id);
 
+// [T:construction] Phase 7.I: register a generated region that
+// dispatches through the super-mode executor
+// (process_fusion_program_super) which recognizes a small set of
+// fused shapes and falls back to the block-major executor
+// otherwise. Wire-compatible with
+// rt_graph_template_add_region_generated except the registered
+// region's RegionSpec::generated_executor is set to 2.
+//
+// Same FusionProgram is consumed by every executor; the difference
+// is which C++ function runs it. Silent no-op rules match
+// rt_graph_template_add_region_generated.
+void rt_graph_template_add_region_generated_super(
+    RTGraph *g, int template_id,
+    int rate, int first_node, int node_count,
+    int program_id);
+
 // [T:introspection] Phase 7.D test surface. Counts and lookups for
 // the per-template fusion-program table populated by
 // rt_graph_template_add_fusion_program /
@@ -609,6 +625,17 @@ int rt_graph_test_template_fusion_program_scratch_slots(
 // or the handle is invalid.
 int rt_graph_test_template_region_generated_program(
     RTGraph *g, int template_id, int region_index);
+
+// [T:introspection] Phase 7.I: classify a registered fusion program
+// against the super-mode recognizer set. Returns:
+//   0 = not recognized (super-mode would fall back to block-major)
+//   1 = GainOut
+//   2 = AddGainOut
+//  -1 = invalid template_id / program_id
+// Classification is structural: it inspects the program's op
+// sequence and tagged operands, never executes the program.
+int rt_graph_test_fusion_program_super_kind(
+    RTGraph *g, int template_id, int program_id);
 
 // [T:construction] Phase §4.E.2.C0a: append one descriptive
 // schedule step to the named template, layering an interpretation

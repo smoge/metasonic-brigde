@@ -1149,12 +1149,13 @@ struct RegionSpec {
   // produces.
   int generated_program_id = -1;
 
-  // Phase 7.H: per-region selector between the sample-major and
-  // block-major generated executors. 0 = sample-major (the
-  // existing process_fusion_program), 1 = block-major (the new
-  // process_fusion_program_block). Only consulted when
-  // generated_program_id >= 0. Default 0 keeps existing rows
-  // routed through the original executor.
+  // Phase 7.H / 7.I: per-region selector between generated
+  // executors. 0 = sample-major (the original
+  // process_fusion_program), 1 = block-major
+  // (process_fusion_program_block), 2 = super-mode
+  // (process_fusion_program_super, recognizer-with-fallback). Only
+  // consulted when generated_program_id >= 0. Default 0 keeps
+  // existing rows routed through the original executor.
   int generated_executor = 0;
 };
 
@@ -7091,6 +7092,141 @@ static void process_fusion_program_block(
   }
 }
 
+// Phase 7.I superinstruction kind. Pure structural classification of
+// a FusionProgram: a value other than NotRecognized is a promise that
+// the program's op sequence matches one of the v1 recognized shapes
+// exactly. The recognizer reads the same FusionProgramSpec fields
+// the block-major and sample-major executors do; nothing else
+// influences classification.
+enum class FusionSuperKind : int {
+  NotRecognized = 0,
+  GainOut       = 1,  // OpMul s0 a b ; OpSinkWrite bus (SrcScratch s0)
+  AddGainOut    = 2,  // OpAdd s0 a b ; OpMul s1 (SrcScratch s0) c ;
+                      // OpSinkWrite bus (SrcScratch s1)
+};
+
+static FusionSuperKind classify_fusion_super(
+    const FusionProgramSpec &program) noexcept {
+  // GainOut: two ops, scratch slot 0, multiply-into-scratch then
+  // sink-from-scratch.
+  if (program.ops.size() == 2 && program.scratch_slots == 1) {
+    const FusionOpSpec &mul  = program.ops[0];
+    const FusionOpSpec &sink = program.ops[1];
+    if (mul.kind == FusionOpKind::Mul && mul.dst == 0
+        && sink.kind == FusionOpKind::SinkWrite
+        && sink.src1.tag == FusionSrcTag::Scratch
+        && sink.src1.idx_a == 0) {
+      return FusionSuperKind::GainOut;
+    }
+  }
+  // AddGainOut: three ops, scratch slots 0 and 1, add-into-s0 then
+  // mul(s0, c)-into-s1 then sink-from-s1.
+  if (program.ops.size() == 3 && program.scratch_slots == 2) {
+    const FusionOpSpec &add  = program.ops[0];
+    const FusionOpSpec &mul  = program.ops[1];
+    const FusionOpSpec &sink = program.ops[2];
+    if (add.kind == FusionOpKind::Add && add.dst == 0
+        && mul.kind == FusionOpKind::Mul && mul.dst == 1
+        && mul.src1.tag == FusionSrcTag::Scratch
+        && mul.src1.idx_a == 0
+        && sink.kind == FusionOpKind::SinkWrite
+        && sink.src1.tag == FusionSrcTag::Scratch
+        && sink.src1.idx_a == 1) {
+      return FusionSuperKind::AddGainOut;
+    }
+  }
+  return FusionSuperKind::NotRecognized;
+}
+
+// Phase 7.I super-mode generated executor. Recognizes a small set of
+// fused shapes and runs them as one tight per-sample loop with no
+// scratch indirection or per-op dispatch. Programs that don't match
+// fall through to the block-major executor; that fallback is byte-
+// equivalent to running block-major directly, by construction.
+static void process_fusion_program_super(
+    RTGraph &g,
+    GraphInstance &inst,
+    const FusionProgramSpec &program,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode) noexcept {
+  const FusionSuperKind kind = classify_fusion_super(program);
+
+  auto read_source = [&](const FusionSourceSpec &src, int sample) -> float {
+    switch (src.tag) {
+      case FusionSrcTag::Const:
+        return static_cast<float>(src.const_value);
+      case FusionSrcTag::Input: {
+        if (src.idx_a < 0
+            || src.idx_a >= static_cast<int>(inst.nodes.size()))
+          return 0.0f;
+        const auto &n = inst.nodes[src.idx_a];
+        if (src.idx_b < 0
+            || src.idx_b >= static_cast<int>(n.outputs.size()))
+          return 0.0f;
+        if (sample
+            >= static_cast<int>(n.outputs[src.idx_b].size()))
+          return 0.0f;
+        return n.outputs[src.idx_b][sample];
+      }
+      case FusionSrcTag::Control: {
+        if (src.idx_a < 0
+            || src.idx_a >= static_cast<int>(inst.nodes.size()))
+          return 0.0f;
+        const auto &n = inst.nodes[src.idx_a];
+        if (src.idx_b < 0
+            || src.idx_b >= static_cast<int>(n.controls.size()))
+          return 0.0f;
+        return static_cast<float>(n.controls[src.idx_b]);
+      }
+      case FusionSrcTag::Scratch:
+        // Recognized super kernels never read SrcScratch directly;
+        // their scratch operands have been extracted into operand
+        // FusionSourceSpecs already. This branch is reachable only
+        // from the fallback path, which uses block-major's reader.
+        return 0.0f;
+    }
+    return 0.0f;
+  };
+
+  switch (kind) {
+    case FusionSuperKind::GainOut: {
+      const FusionOpSpec &mul  = program.ops[0];
+      const FusionOpSpec &sink = program.ops[1];
+      SinkAccumulator acc = SinkAccumulator::open(
+          g, inst, static_cast<double>(sink.dst), writer_slot,
+          nframes, mode);
+      for (int s = 0; s < nframes; ++s) {
+        const float v = read_source(mul.src1, s) * read_source(mul.src2, s);
+        acc.push(static_cast<std::size_t>(s), v);
+      }
+      acc.flush_to(inst);
+      return;
+    }
+    case FusionSuperKind::AddGainOut: {
+      const FusionOpSpec &add  = program.ops[0];
+      const FusionOpSpec &mul  = program.ops[1];
+      const FusionOpSpec &sink = program.ops[2];
+      SinkAccumulator acc = SinkAccumulator::open(
+          g, inst, static_cast<double>(sink.dst), writer_slot,
+          nframes, mode);
+      for (int s = 0; s < nframes; ++s) {
+        const float a   = read_source(add.src1, s);
+        const float b   = read_source(add.src2, s);
+        const float c   = read_source(mul.src2, s);
+        const float out = (a + b) * c;
+        acc.push(static_cast<std::size_t>(s), out);
+      }
+      acc.flush_to(inst);
+      return;
+    }
+    case FusionSuperKind::NotRecognized:
+      process_fusion_program_block(
+          g, inst, program, nframes, writer_slot, mode);
+      return;
+  }
+}
+
 static void process_region(
     RTGraph &g,
     const MetaDef &def,
@@ -7116,10 +7252,14 @@ static void process_region(
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
     const FusionProgramSpec &prog =
         def.fusion_programs[r.generated_program_id];
-    // Phase 7.H: per-region selector picks between the
-    // sample-major executor (0, default) and the block-major
-    // executor (1). Any future executor is a new value here.
-    if (r.generated_executor == 1) {
+    // Phase 7.H / 7.I: per-region selector picks between the
+    // sample-major executor (0, default), the block-major executor
+    // (1), and the super-mode recognizer-with-fallback executor (2).
+    // Any future executor is a new value here.
+    if (r.generated_executor == 2) {
+      process_fusion_program_super(
+          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
+    } else if (r.generated_executor == 1) {
       process_fusion_program_block(
           g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
     } else {
@@ -9941,6 +10081,41 @@ void rt_graph_template_add_region_generated_block(
   spec.generated_program_id = program_id;
   spec.generated_executor   = 1;
   def->regions.push_back(spec);
+}
+
+void rt_graph_template_add_region_generated_super(
+    RTGraph *g, int template_id,
+    int rate, int first_node, int node_count,
+    int program_id) {
+  MetaDef *def = g ? template_at(*g, template_id) : nullptr;
+  if (!def) return;
+  if (program_id < 0) return;
+  if (program_id >= static_cast<int>(def->fusion_programs.size())) return;
+  if (first_node < 0 || node_count <= 0) return;
+  if (static_cast<size_t>(first_node) + static_cast<size_t>(node_count) >
+      def->nodes.size())
+    return;
+  RegionSpec spec;
+  spec.rate = rate;
+  spec.first_node = first_node;
+  spec.node_count = node_count;
+  spec.kernel = RegionKernel::NodeLoop;
+  spec.generated_program_id = program_id;
+  spec.generated_executor   = 2;
+  def->regions.push_back(spec);
+}
+
+// Phase 7.I introspection: classify a registered fusion program
+// against the super-mode recognizer set. Returns the FusionSuperKind
+// integer value: 0 = NotRecognized, 1 = GainOut, 2 = AddGainOut.
+// -1 for missing template/program. The cost-lab uses this at load
+// time to compute recognized vs fallback counts without polling any
+// runtime counter.
+int rt_graph_test_fusion_program_super_kind(
+    RTGraph *g, int template_id, int program_id) {
+  FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
+  if (!prog) return -1;
+  return static_cast<int>(classify_fusion_super(*prog));
 }
 
 int rt_graph_test_template_fusion_program_count(
