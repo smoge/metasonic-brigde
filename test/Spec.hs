@@ -138,7 +138,9 @@ import           MetaSonic.Pattern.Corpus
 import           MetaSonic.Session.Command
 import           MetaSonic.Session.Resolve
 import           MetaSonic.Session.Report
+import           MetaSonic.Session.Runtime
 import           MetaSonic.Session.State
+import           MetaSonic.Session.Step
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -178,6 +180,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionResolveTests
   , sessionReportTests
   , sessionStateTests
+  , sessionStepTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -12507,6 +12510,137 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
       ssGraph directWrongLabel @?= newGraph
       ssVoices directWrongLabel @?= M.empty
       OSC.resolveStateVoices (ssResolve directWrongLabel) @?= M.empty
+  ]
+
+------------------------------------------------------------
+-- Session Prep D: runtime adapter shell and orchestrator
+--
+-- These tests pin 'stepSessionCommand' against mock
+-- 'SessionRuntimeAdapter' implementations. No RTGraph, audio backend,
+-- or realtime queue is touched; the real adapter belongs to a later
+-- slice and must satisfy the same contract.
+------------------------------------------------------------
+
+constantAdapter
+  :: Applicative m
+  => Either SessionRuntimeIssue SessionRuntimeSuccess
+  -> SessionRuntimeAdapter m
+constantAdapter outcome =
+  SessionRuntimeAdapter $ \_ -> pure outcome
+
+sessionStepTests :: TestTree
+sessionStepTests = testGroup "Session Prep D: runtime adapter shell"
+  [ testCase "admission rejection does not call the runtime adapter" $ do
+      counter <- newIORef (0 :: Int)
+      let adapter = SessionRuntimeAdapter $ \_ -> do
+            modifyIORef' counter (+1)
+            pure (Left SriBackendStopped)
+          st  = initialSessionState (patternTemplates droneVibrato)
+          cmd = CmdVoiceOn (TemplateName "missing") (VoiceKey "v0") []
+      result <- stepSessionCommand adapter cmd st
+      result @?= StepRejected (SiUnknownTemplate (TemplateName "missing"))
+      calls <- readIORef counter
+      calls @?= 0
+
+  , testCase "voice-start success commits the runtime VoiceBinding" $ do
+      let st0     = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding (VoiceKey "v0") 17 (TemplateName "drone")
+          adapter = constantAdapter
+                      (Right (RuntimeCommitted (CommitVoiceStarted binding)))
+          cmd     = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      result <- stepSessionCommand adapter cmd st0
+      case result of
+        StepCommitted st1 rebuild -> do
+          rebuild @?= Nothing
+          ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
+          OSC.resolveStateVoices (ssResolve st1)
+            @?= M.fromList [(OBSC.pack "v0", (17, OBSC.pack "drone"))]
+        other ->
+          assertFailure ("expected StepCommitted, got: " <> show other)
+
+  , testCase "voice-start runtime failure leaves state unchanged" $ do
+      let st0     = initialSessionState (patternTemplates droneVibrato)
+          adapter = constantAdapter (Left SriVoiceAllocationFailed)
+          cmd     = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      result <- stepSessionCommand adapter cmd st0
+      result @?= StepRuntimeFailed SriVoiceAllocationFailed
+      admitSessionCommand cmd st0
+        @?= SessionAdmitted cmd
+              (PlanVoiceStart (TemplateName "drone") (VoiceKey "v0") [])
+
+  , testCase "wrong runtime commit surfaces as StepCommitMismatch" $ do
+      let st0       = initialSessionState (patternTemplates droneVibrato)
+          wrongBind = VoiceBinding (VoiceKey "v1") 17 (TemplateName "drone")
+          adapter   = constantAdapter
+                        (Right (RuntimeCommitted (CommitVoiceStarted wrongBind)))
+          cmd       = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      result <- stepSessionCommand adapter cmd st0
+      result @?= StepCommitMismatch
+                   (SciVoiceKeyMismatch (VoiceKey "v0") (VoiceKey "v1"))
+
+  , testCase "control-write success leaves SessionState unchanged" $ do
+      let graph   = patternTemplates droneVibrato
+          binding = VoiceBinding (VoiceKey "v0") 17 (TemplateName "drone")
+          st0     = applySessionCommit
+                      (CommitVoiceStarted binding)
+                      (initialSessionState graph)
+          adapter = constantAdapter (Right RuntimeControlWriteAccepted)
+          cmd     = CmdControlWrite
+                      (VoiceKey "v0")
+                      (ControlTag (MigrationKey "lpf") 0)
+                      1800.0
+      result <- stepSessionCommand adapter cmd st0
+      result @?= StepControlAccepted
+      admitSessionCommand cmd st0
+        @?= SessionAdmitted cmd
+              (PlanControlWrite binding (ControlTag (MigrationKey "lpf") 0) 1800.0)
+
+  , testCase "hot-swap success returns commit-time ResolveRebuildResult" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          binding  = VoiceBinding (VoiceKey "v0") 17 (TemplateName "drone")
+          st0      = applySessionCommit
+                       (CommitVoiceStarted binding)
+                       (initialSessionState oldGraph)
+          adapter  = constantAdapter
+                       (Right (RuntimeCommitted
+                                 (CommitGraphInstalled (SwapLabel "swap") newGraph)))
+          cmd      = CmdHotSwap (SwapLabel "swap") newGraph
+          expected = [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
+      result <- stepSessionCommand adapter cmd st0
+      case result of
+        StepCommitted st1 (Just rebuild) -> do
+          ssGraph st1 @?= newGraph
+          ssVoices st1 @?= M.empty
+          rrrDropped rebuild @?= expected
+        other ->
+          assertFailure ("expected StepCommitted with rebuild, got: " <> show other)
+
+  , testCase "control-write ack on a non-control plan is a protocol bug" $ do
+      let st0     = initialSessionState (patternTemplates droneVibrato)
+          adapter = constantAdapter (Right RuntimeControlWriteAccepted)
+          cmd     = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      result <- stepSessionCommand adapter cmd st0
+      case result of
+        StepAdapterProtocolBug msg ->
+          assertBool ("expected PlanVoiceStart in protocol-bug message: " <> msg)
+                     ("PlanVoiceStart" `isInfixOf` msg)
+        other ->
+          assertFailure ("expected StepAdapterProtocolBug, got: " <> show other)
+
+  , testCase "PEVoiceOn flows through fromPatternEvent and stepSessionCommand" $ do
+      let st0     = initialSessionState (patternTemplates droneVibrato)
+          ev      = PEVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          cmd     = fromPatternEvent ev
+          binding = VoiceBinding (VoiceKey "v0") 17 (TemplateName "drone")
+          adapter = constantAdapter
+                      (Right (RuntimeCommitted (CommitVoiceStarted binding)))
+      result <- stepSessionCommand adapter cmd st0
+      case result of
+        StepCommitted st1 Nothing ->
+          ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
+        other ->
+          assertFailure ("expected StepCommitted via pattern event, got: " <> show other)
   ]
 
 ------------------------------------------------------------
