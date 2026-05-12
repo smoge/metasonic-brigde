@@ -2834,8 +2834,10 @@ the eventual session layer. **Session Prep A** was the first
 non-runtime session-scoping slice: command/event vocabulary,
 OSC resolve-state rebuild, and buffer/plugin lifecycle
 reports. **Session Prep B** now adds a pure admission/commit
-state boundary on top of those nouns. The session runtime
-itself is still gated on the items below.
+state boundary on top of those nouns. **Session Prep C** adds
+a checked plan/commit handshake so successful runtime facts
+cannot be applied to the wrong admitted plan. The session
+runtime itself is still gated on the items below.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2847,9 +2849,9 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A and B supply the library-side
-contracts the future session owner will consume, without creating that
-owner yet.
+cost/profitability table. Session Prep A, B, and C supply the
+library-side contracts the future session owner will consume, without
+creating that owner yet.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2861,6 +2863,12 @@ Session prep artifacts:
   commands and returns plans without mutation; commits update pure
   session-visible state only after the caller reports a successful
   runtime action. This is still not the runtime session layer.
+- [Session Prep C - Plan/Commit Handshake](notes/2026-05-12-session-prep-c-plan-commit-handshake.md)
+  records the checked relationship between an admitted `SessionPlan`
+  and the later `SessionCommit` returned by a runtime shell. Failed
+  handshakes leave `SessionState` unchanged, and hot-swap commits
+  return the authoritative commit-time resolve rebuild result. This is
+  still not the runtime session layer.
 
 Landed prep contracts:
 
@@ -2872,9 +2880,12 @@ Landed prep contracts:
   (`MetaSonic.Session.Report`).
 - [x] Pure admission/commit state mirror for known templates, active
   voices, and OSC resolve state (`MetaSonic.Session.State`).
+- [x] Checked plan/commit handshake for voice start/stop, control
+  write, and hot-swap plans (`MetaSonic.Session.State`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions, and
-  commit-only mutation behavior.
+  commit-only mutation behavior, and plan/commit handshake mismatch
+  behavior.
 
 Still gated:
 

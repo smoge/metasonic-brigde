@@ -29,7 +29,9 @@ module MetaSonic.Session.State
 
     -- * Commits
   , SessionCommit (..)
+  , SessionCommitIssue (..)
   , applySessionCommit
+  , applyPlannedCommit
   , commitGraphInstalled
   ) where
 
@@ -98,6 +100,18 @@ data SessionCommit
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
+-- | Internal issue vocabulary for matching an admitted plan with the
+-- runtime fact that claims the attempted work succeeded.
+data SessionCommitIssue
+  = SciUnexpectedCommit !SessionPlan !SessionCommit
+  | SciVoiceKeyMismatch !VoiceKey !VoiceKey
+  | SciTemplateMismatch !TemplateName !TemplateName
+  | SciSwapLabelMismatch !SwapLabel !SwapLabel
+  | SciGraphMismatch
+  | SciControlPlanHasNoStateCommit
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
 -- | Validate a command against the current pure session state without
 -- mutating that state.
 admitSessionCommand :: SessionCommand -> SessionState -> SessionAdmissionResult
@@ -153,6 +167,51 @@ applySessionCommit commit st = case commit of
 
   CommitGraphInstalled label graph ->
     fst (commitGraphInstalled label graph st)
+
+-- | Apply a commit only after proving it matches the admitted plan
+-- that authorized the runtime attempt. A 'Left' result never mutates
+-- the supplied 'SessionState'.
+applyPlannedCommit
+  :: SessionPlan
+  -> SessionCommit
+  -> SessionState
+  -> Either SessionCommitIssue (SessionState, Maybe ResolveRebuildResult)
+applyPlannedCommit plan commit st =
+  case (plan, commit) of
+    (PlanVoiceStart expectedTemplate expectedVoice _, CommitVoiceStarted binding)
+      | vbVoiceKey binding /= expectedVoice ->
+          Left (SciVoiceKeyMismatch expectedVoice (vbVoiceKey binding))
+      | vbTemplateName binding /= expectedTemplate ->
+          Left (SciTemplateMismatch expectedTemplate (vbTemplateName binding))
+      | otherwise ->
+          Right (applySessionCommit commit st, Nothing)
+
+    (PlanVoiceStart {}, _) ->
+      Left (SciUnexpectedCommit plan commit)
+
+    (PlanVoiceStop binding, CommitVoiceStopped actualVoice)
+      | actualVoice /= vbVoiceKey binding ->
+          Left (SciVoiceKeyMismatch (vbVoiceKey binding) actualVoice)
+      | otherwise ->
+          Right (applySessionCommit commit st, Nothing)
+
+    (PlanVoiceStop {}, _) ->
+      Left (SciUnexpectedCommit plan commit)
+
+    (PlanControlWrite {}, _) ->
+      Left SciControlPlanHasNoStateCommit
+
+    (PlanHotSwap expectedLabel expectedGraph _, CommitGraphInstalled actualLabel actualGraph)
+      | actualLabel /= expectedLabel ->
+          Left (SciSwapLabelMismatch expectedLabel actualLabel)
+      | actualGraph /= expectedGraph ->
+          Left SciGraphMismatch
+      | otherwise ->
+          let (st', result) = commitGraphInstalled actualLabel actualGraph st
+          in Right (st', Just result)
+
+    (PlanHotSwap {}, _) ->
+      Left (SciUnexpectedCommit plan commit)
 
 -- | Commit a graph install and return the authoritative resolve
 -- rebuild result produced at commit time. This is the API to use when

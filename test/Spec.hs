@@ -12176,15 +12176,16 @@ sessionReportTests = testGroup "Session Prep A: lifecycle reports"
   ]
 
 ------------------------------------------------------------
--- Session Prep B: pure admission and commit state
+-- Session Prep B/C: pure admission, commit state, and handshake
 --
 -- These tests pin the split between read-only command admission
--- and state-changing commits. They do not allocate runtime voices,
--- install graphs, write queues, or touch RTGraph.
+-- and state-changing commits, plus the Prep C checked plan/commit
+-- handshake. They do not allocate runtime voices, install graphs,
+-- write queues, or touch RTGraph.
 ------------------------------------------------------------
 
 sessionStateTests :: TestTree
-sessionStateTests = testGroup "Session Prep B: admission and commits"
+sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handshake"
   [ testCase "initial state accepts an empty graph as boot state" $ do
       let bootGraph = TemplateGraph [] M.empty
           st  = initialSessionState bootGraph
@@ -12368,6 +12369,138 @@ sessionStateTests = testGroup "Session Prep B: admission and commits"
       OSC.resolveStateVoices (ssResolve st1)
         @?= M.fromList [(OBSC.pack "v0", (11, OBSC.pack "drone"))]
       rrrDropped result @?= []
+
+  , testCase "planned voice-start accepts matching commit" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          plan = PlanVoiceStart (TemplateName "drone") (VoiceKey "v0") []
+          binding = VoiceBinding (VoiceKey "v0") 21 (TemplateName "drone")
+          commit = CommitVoiceStarted binding
+      case applyPlannedCommit plan commit st0 of
+        Right (st1, result) -> do
+          result @?= Nothing
+          ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
+          OSC.resolveStateVoices (ssResolve st1)
+            @?= M.fromList [(OBSC.pack "v0", (21, OBSC.pack "drone"))]
+        Left issue ->
+          assertFailure ("expected planned voice-start commit, got: " <> show issue)
+
+  , testCase "planned voice-start rejects mismatches without mutation" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          plan = PlanVoiceStart (TemplateName "drone") (VoiceKey "v0") []
+          wrongKey = CommitVoiceStarted
+            (VoiceBinding (VoiceKey "v1") 21 (TemplateName "drone"))
+          wrongTemplate = CommitVoiceStarted
+            (VoiceBinding (VoiceKey "v0") 21 (TemplateName "other"))
+          wrongCtor = CommitVoiceStopped (VoiceKey "v0")
+      applyPlannedCommit plan wrongKey st0
+        @?= Left (SciVoiceKeyMismatch (VoiceKey "v0") (VoiceKey "v1"))
+      applyPlannedCommit plan wrongTemplate st0
+        @?= Left (SciTemplateMismatch (TemplateName "drone") (TemplateName "other"))
+      applyPlannedCommit plan wrongCtor st0
+        @?= Left (SciUnexpectedCommit plan wrongCtor)
+      ssVoices st0 @?= M.empty
+      OSC.resolveStateVoices (ssResolve st0) @?= M.empty
+
+  , testCase "planned voice-stop accepts matching commit" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding (VoiceKey "v0") 21 (TemplateName "drone")
+          st1 = applySessionCommit (CommitVoiceStarted binding) st0
+          plan = PlanVoiceStop binding
+          commit = CommitVoiceStopped (VoiceKey "v0")
+      case applyPlannedCommit plan commit st1 of
+        Right (st2, result) -> do
+          result @?= Nothing
+          ssVoices st2 @?= M.empty
+          OSC.resolveStateVoices (ssResolve st2) @?= M.empty
+        Left issue ->
+          assertFailure ("expected planned voice-stop commit, got: " <> show issue)
+
+  , testCase "planned voice-stop rejects mismatches without mutation" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding (VoiceKey "v0") 21 (TemplateName "drone")
+          st1 = applySessionCommit (CommitVoiceStarted binding) st0
+          plan = PlanVoiceStop binding
+          wrongKey = CommitVoiceStopped (VoiceKey "v1")
+          wrongCtor = CommitVoiceStarted
+            (VoiceBinding (VoiceKey "v0") 22 (TemplateName "drone"))
+      applyPlannedCommit plan wrongKey st1
+        @?= Left (SciVoiceKeyMismatch (VoiceKey "v0") (VoiceKey "v1"))
+      applyPlannedCommit plan wrongCtor st1
+        @?= Left (SciUnexpectedCommit plan wrongCtor)
+      ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
+      OSC.resolveStateVoices (ssResolve st1)
+        @?= M.fromList [(OBSC.pack "v0", (21, OBSC.pack "drone"))]
+
+  , testCase "planned control-write rejects all state commits" $ do
+      let graph = patternTemplates droneVibrato
+          binding = VoiceBinding (VoiceKey "v0") 21 (TemplateName "drone")
+          plan = PlanControlWrite
+            binding
+            (ControlTag (MigrationKey "lpf") 0)
+            1800.0
+          commits =
+            [ CommitVoiceStarted binding
+            , CommitVoiceStopped (VoiceKey "v0")
+            , CommitGraphInstalled (SwapLabel "same") graph
+            ]
+      forM_ commits $ \commit ->
+        applyPlannedCommit plan commit (initialSessionState graph)
+          @?= Left SciControlPlanHasNoStateCommit
+
+  , testCase "planned hot-swap returns authoritative commit-time rebuild" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          swapLabel = SwapLabel "remove-drone"
+          binding0 = VoiceBinding (VoiceKey "v0") 21 (TemplateName "drone")
+          binding1 = VoiceBinding (VoiceKey "v1") 22 (TemplateName "drone")
+          st0 = applySessionCommit
+                  (CommitVoiceStarted binding0)
+                  (initialSessionState oldGraph)
+          cmd = CmdHotSwap swapLabel newGraph
+          expectedPreview =
+            [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
+          expectedCommit =
+            [ RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")
+            , RriMissingTemplate (VoiceKey "v1") (TemplateName "drone")
+            ]
+      case admitSessionCommand cmd st0 of
+        SessionAdmitted _ plan@(PlanHotSwap _ _ preview) -> do
+          rrrDropped preview @?= expectedPreview
+          let st1 = applySessionCommit (CommitVoiceStarted binding1) st0
+              commit = CommitGraphInstalled swapLabel newGraph
+          case applyPlannedCommit plan commit st1 of
+            Right (st2, Just committed) -> do
+              rrrDropped committed @?= expectedCommit
+              ssGraph st2 @?= newGraph
+              ssVoices st2 @?= M.empty
+            other ->
+              assertFailure ("expected planned hot-swap commit, got: " <> show other)
+        other ->
+          assertFailure ("expected hot-swap plan, got: " <> show other)
+
+  , testCase "planned hot-swap rejects mismatches without mutation" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          swapLabel = SwapLabel "remove-drone"
+          wrongLabel = SwapLabel "other"
+          binding = VoiceBinding (VoiceKey "v0") 21 (TemplateName "drone")
+          st0 = applySessionCommit
+                  (CommitVoiceStarted binding)
+                  (initialSessionState oldGraph)
+          plan = PlanHotSwap swapLabel newGraph (rebuildResolveState newGraph [binding])
+          wrongLabelCommit = CommitGraphInstalled wrongLabel newGraph
+          wrongGraphCommit = CommitGraphInstalled swapLabel oldGraph
+          wrongCtor = CommitVoiceStopped (VoiceKey "v0")
+      applyPlannedCommit plan wrongLabelCommit st0
+        @?= Left (SciSwapLabelMismatch swapLabel wrongLabel)
+      applyPlannedCommit plan wrongGraphCommit st0
+        @?= Left SciGraphMismatch
+      applyPlannedCommit plan wrongCtor st0
+        @?= Left (SciUnexpectedCommit plan wrongCtor)
+      ssGraph st0 @?= oldGraph
+      ssVoices st0 @?= M.fromList [(VoiceKey "v0", binding)]
+      OSC.resolveStateVoices (ssResolve st0)
+        @?= M.fromList [(OBSC.pack "v0", (21, OBSC.pack "drone"))]
   ]
 
 ------------------------------------------------------------
