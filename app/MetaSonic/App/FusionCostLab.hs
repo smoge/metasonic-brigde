@@ -540,52 +540,77 @@ stripRegionKernels rg = rg
 
 -- | Wire a 'RuntimeGraph' for the generated cost-lab variant.
 -- Picks the first selected planner candidate this slice's
--- generator handles, emits a 'FusionProgram' for it, and patches
--- the graph so the candidate's region splits into
--- @[pre (NodeLoop), candidate (ExecGenerated), post (NodeLoop)]@.
--- The patched graph runs through 'loadRuntimeGraph' identically
--- to the other variants — the only difference is one region
--- dispatches through the tiny C++ interpreter.
+-- generator handles, emits a 'FusionProgram' plus the suffix of
+-- the candidate the program owns, and patches the graph so the
+-- host region splits into
+-- @[pre (NodeLoop), owned-suffix (ExecGenerated), post (NodeLoop)]@.
+-- The unowned prefix of the candidate (Phase 7.E: stateful
+-- sources, filters) ends up inside @pre@ and continues to run as
+-- node-loop. The patched graph runs through 'loadRuntimeGraph'
+-- identically to the other variants — the only difference is one
+-- region dispatches through the tiny C++ interpreter.
 generateForCostLab :: RuntimeGraph -> Either String RuntimeGraph
 generateForCostLab rg =
   let verdicts = planRuntimeGraph rg
       eligible =
-        [ (c, prog)
+        [ (c, prog, owned)
         | c <- selectedFusionCandidates verdicts
           -- 'fcMatchedShape == Nothing' = generated-eligible; a
           -- §4.B-covered shape has a hand-written kernel already
           -- and is not the cost-lab's target for the generated
           -- column.
         , isNothing (fcMatchedShape c)
-        , Right prog <- [generateProgram rg c]
+        , Right (prog, owned) <- [generateProgram rg c]
         ]
   in case eligible of
-       []           -> Left "generated: no shape this slice can emit a program for"
-       (c, prog) :_ -> patchForGenerated rg c prog
+       []                  -> Left "generated: no shape this slice can emit a program for"
+       (_, prog, owned) :_ -> patchForGenerated rg owned prog
 
--- | v1 program generator. Handles @[KGain, KOut]@ /
--- @[KGain, KBusOut]@ candidates only. Other shapes return 'Left'.
-generateProgram :: RuntimeGraph -> FusionCandidate -> Either String FusionProgram
+-- | v1 program generator. Returns both the emitted 'FusionProgram'
+-- and the contiguous suffix of @fcMembers@ the program owns. The
+-- prefix (@fcMembers@ minus the owned suffix) continues to render
+-- as node-loop inside the host region's pre-slice.
+--
+-- This slice (Phase 7.E step 2) keeps the existing
+-- @[KGain, KOut]@ / @[KGain, KBusOut]@ shape behavior identical
+-- by returning the full @fcMembers@ as the owned slice. Suffix-
+-- shorter-than-candidate shapes land in the next step.
+generateProgram
+  :: RuntimeGraph
+  -> FusionCandidate
+  -> Either String (FusionProgram, [NodeIndex])
 generateProgram rg c = case (fcMembers c, fcMemberKinds c) of
   ([gainIx, outIx], [KGain, k]) | k == KOut || k == KBusOut -> do
-    gainNode <- lookupRtNode rg gainIx
-    outNode  <- lookupRtNode rg outIx
-    case rnInputs gainNode of
-      [signalIn, amountIn] -> do
-        signal <- inputAsSource signalIn
-        amount <- inputAsSource amountIn
-        bus    <- busFromControls (rnControls outNode)
-        Right FusionProgram
-          { fpOps =
-              [ OpMul (ScratchIndex 0) signal amount
-              , OpSinkWrite bus
-                  (SrcScratch (ScratchIndex 0))
-                  SinkAccumulate
-              ]
-          , fpScratchSlots = 1
-          }
-      _ -> Left "generated: gain node has unexpected input arity"
+    prog <- gainOutProgram rg gainIx outIx
+    Right (prog, [gainIx, outIx])
   _ -> Left "generated: candidate shape not implemented yet"
+
+-- | Emit the @KGain -> {KOut, KBusOut}@ tail program. Shared
+-- between the standalone @[KGain, KOut]@ candidate and any longer
+-- candidate whose suffix is this shape (Phase 7.E step 3+).
+gainOutProgram
+  :: RuntimeGraph
+  -> NodeIndex
+  -> NodeIndex
+  -> Either String FusionProgram
+gainOutProgram rg gainIx outIx = do
+  gainNode <- lookupRtNode rg gainIx
+  outNode  <- lookupRtNode rg outIx
+  case rnInputs gainNode of
+    [signalIn, amountIn] -> do
+      signal <- inputAsSource signalIn
+      amount <- inputAsSource amountIn
+      bus    <- busFromControls (rnControls outNode)
+      Right FusionProgram
+        { fpOps =
+            [ OpMul (ScratchIndex 0) signal amount
+            , OpSinkWrite bus
+                (SrcScratch (ScratchIndex 0))
+                SinkAccumulate
+            ]
+        , fpScratchSlots = 1
+        }
+    _ -> Left "generated: gain node has unexpected input arity"
 
 lookupRtNode :: RuntimeGraph -> NodeIndex -> Either String RuntimeNode
 lookupRtNode rg ix =
@@ -603,22 +628,24 @@ busFromControls :: [Double] -> Either String Int
 busFromControls (b : _) = Right (truncate b)
 busFromControls []      = Left "generated: Out has no bus control"
 
--- | Split the candidate's region into pre / candidate / post and
--- attach the program. The candidate must be contiguous within its
--- region (dense-order property the planner already enforces).
+-- | Split the host region around the generator's owned suffix and
+-- attach the program. The owned slice must be a contiguous range
+-- of the host region's member list (dense-order property the
+-- planner enforces for candidates; the suffix inherits it because
+-- the candidate itself was contiguous). The unowned prefix of the
+-- candidate falls into the @pre@ node-loop slice automatically.
 patchForGenerated
   :: RuntimeGraph
-  -> FusionCandidate
+  -> [NodeIndex]
   -> FusionProgram
   -> Either String RuntimeGraph
-patchForGenerated rg c prog =
-  let regions     = rgRuntimeRegions rg
-      candMembers = fcMembers c
-      hostsCand r = any (`elem` rrNodes r) candMembers
+patchForGenerated rg owned prog =
+  let regions   = rgRuntimeRegions rg
+      hostsCand r = any (`elem` rrNodes r) owned
   in case break hostsCand regions of
-       (_, []) -> Left "generated: candidate's region not found"
+       (_, []) -> Left "generated: owned slice's region not found"
        (regsPre, region : regsPost) -> do
-         (mPre, candRegion, mPost) <- splitRegion rg region candMembers
+         (mPre, candRegion, mPost) <- splitRegion rg region owned
          let split      = catMaybes [mPre, Just candRegion, mPost]
              allRegions = regsPre <> split <> regsPost
              renumbered =
@@ -639,12 +666,12 @@ splitRegion
        , RuntimeRegion
        , Maybe RuntimeRegion
        )
-splitRegion rg region candMembers =
+splitRegion rg region owned =
   let members = rrNodes region
-      pre     = takeWhile (`notElem` candMembers) members
+      pre     = takeWhile (`notElem` owned) members
       rest    = drop (length pre) members
-      cand    = take (length candMembers) rest
-      post    = drop (length candMembers) rest
+      cand    = take (length owned) rest
+      post    = drop (length owned) rest
       nodeMap = M.fromList [(rnIndex n, n) | n <- rgNodes rg]
       mkRegion nodes ex = RuntimeRegion
         { rrIndex     = RegionIndex 0  -- renumbered by caller
@@ -653,8 +680,8 @@ splitRegion rg region candMembers =
         , rrExec      = ex
         , rrFootprint = regionResourceFootprint nodeMap nodes
         }
-  in if cand /= candMembers
-       then Left "generated: candidate not contiguous within its region"
+  in if cand /= owned
+       then Left "generated: owned slice not contiguous within its region"
        else
          Right
            ( if null pre  then Nothing else Just (mkRegion pre  ExecNodeLoop)
