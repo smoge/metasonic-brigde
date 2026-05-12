@@ -100,6 +100,28 @@ authoringStereoSawGraph = runSynth $ do
   master     <- Auth.gainS stereoSig (Param 0.3)
   Auth.stereoOut 0 master
 
+-- Phase 8.C2 showcase: a stereo fx chain authored entirely through
+-- the lifted helpers. Shape goes
+-- 'stereoSrc -> hpfS -> envS -> delayS -> stereoOut', and the lowered
+-- graph still inspects as ordinary 'KHPF / KEnv / KGain / KDelay /
+-- KOut' nodes — 8.C2 only removes per-channel boilerplate, not
+-- primitive visibility.
+authoringStereoFxChainGraph :: SynthGraph
+authoringStereoFxChainGraph = runSynth $ do
+  l    <- sawOsc 110.0 0.0
+  r    <- sawOsc 110.5 0.5
+  let src = Auth.stereo l r
+  filt <- Auth.hpfS   src  (Param 200.0) (Param 0.7)
+  amped <- Auth.envS  filt
+             (Param 1.0)    -- always-on gate
+             (Param 0.02)   -- attack
+             (Param 0.25)   -- decay
+             (Param 0.7)    -- sustain
+             (Param 0.6)    -- release
+  delayed <- Auth.delayS 0.4 amped (Param 0.18)
+  master  <- Auth.gainS delayed (Param 0.25)
+  Auth.stereoOut 0 master
+
 -- Ring modulation: 440 Hz carrier multiplied sample-by-sample by a 7 Hz
 -- modulator. Both signals are bipolar, so this is genuine ring mod
 -- (sum/difference frequencies) rather than amplitude modulation.
@@ -330,6 +352,9 @@ demoTable =
   , Demo "stereo-saw"
          "Stereo detuned saws via MetaSonic.Authoring (Phase 8.D)"
          (SingleGraph authoringStereoSawGraph)
+  , Demo "stereo-fx"
+         "Stereo fx chain (hpfS → envS → delayS → stereoOut, Phase 8.C2)"
+         (SingleGraph authoringStereoFxChainGraph)
   , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"
          (SingleGraph ringModGraph)
   , Demo "fm"        "Frequency modulation (LFO → SinOsc.freq → Out)"
