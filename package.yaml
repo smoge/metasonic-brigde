@@ -65,6 +65,7 @@ library:
     - MetaSonic.Session.Resolve
     - MetaSonic.Session.Report
     - MetaSonic.Session.State
+    - MetaSonic.Session.Runtime
     - MetaSonic.Authoring
     - MetaSonic.Authoring.Report
     - MetaSonic.Authoring.Manifest
