@@ -81,6 +81,8 @@ module MetaSonic.App.FusionCostLab
     -- * Phase 7.F profitability gate index
   , GateMeasurement (..)
   , costLabGateIndex
+    -- * Phase 7.G diagnostic helpers
+  , generatedTailSweepOwnedLengths
   ) where
 
 import           Control.Monad              (forM, forM_, replicateM_)
@@ -1392,6 +1394,16 @@ generatedOwnedTailLength graph = do
     (owned : _) -> Just (length owned)
     []          -> Nothing
 
+-- | Structural owned-tail lengths for the synthetic §7.G family.
+-- Exported for snapshot only; timing remains intentionally unpinned.
+generatedTailSweepOwnedLengths :: [Int]
+generatedTailSweepOwnedLengths =
+  sort
+    [ sz
+    | FamilyMember _ graph <- familyMembers FamilyGeneratedTailSweep
+    , Just sz <- [generatedOwnedTailLength graph]
+    ]
+
 shapeKeyForOwned :: RuntimeGraph -> [NodeIndex] -> Either String ShapeKey
 shapeKeyForOwned rg owned = do
   nodes <- mapM (lookupRtNode rg) owned
@@ -1610,11 +1622,10 @@ renderGeneratedDiagnostics handle rows = do
           deltaValues = map snd deltas
           posDeltas   = length [d | d <- deltaValues, d >= 0]
           negDeltas   = length deltaValues - posDeltas
-          ownedSizeOf r = M.lookup (familyName (lrFamily r), lrMember r) ownedSizeIndex
-          emittedByOwnedSize =
-            [ (sz, [r | r <- emitted, ownedSizeOf r == Just sz])
-            | sz <- sort (nubOrd [s | r <- emitted, Just s <- [ownedSizeOf r]])
-            ]
+          emittedByOwnedSize = bucketByOwnedSize emitted
+          tailSweepByOwnedSize =
+            bucketByOwnedSize
+              [ r | r <- emitted, lrFamily r == FamilyGeneratedTailSweep ]
 
       hPutStrLn handle ""
       hPutStrLn handle "=== generated variant diagnostics (Phase 7.E/7.G) ==="
@@ -1637,23 +1648,42 @@ renderGeneratedDiagnostics handle rows = do
         hPutStrLn handle $ printf
           "  delta vs best non-generated (region-kernel/RFused): rows=%d  min=%+.2fx  median=%+.2fx  max=%+.2fx  generated>=best=%d  generated<best=%d"
           (length deltaValues) dMin dMed dMax posDeltas negDeltas
-      -- §7.G owned-size buckets. Re-derives the owned tail length
-      -- for each emitted row's source graph and groups rows by
-      -- that length. Median speedup per bucket lets a reader see
-      -- the amortization curve at a glance without crunching JSONL.
-      unless (null emittedByOwnedSize) $ do
-        hPutStrLn handle "  by owned-op count (rows / median speedup vs node-loop):"
-        forM_ emittedByOwnedSize $ \(sz, srows) ->
-          let speedups = mapMaybe lrSpeedupVsBase srows
-              (_, sMed, _) = minMedMax speedups
-              medStr = if null speedups then "n/a" else printf "%.2fx" sMed
-          in hPutStrLn handle $ printf
-               "    size=%2d  rows=%d  median=%s"
-               sz (length srows) (medStr :: String)
+      -- §7.G owned-size buckets. The first table covers every
+      -- generated row the current corpus emits. The second isolates
+      -- the synthetic 'generated-tail-sweep' family, which is the
+      -- actual amortization probe; keeping both views visible avoids
+      -- mistaking corpus mix for the length curve.
+      printOwnedSizeBuckets
+        "  by owned-op count (all emitted rows; rows / median speedup vs node-loop):"
+        emittedByOwnedSize
+      printOwnedSizeBuckets
+        "  generated-tail-sweep by owned-op count (rows / median speedup vs node-loop):"
+        tailSweepByOwnedSize
       hPutStrLn handle "=== end generated diagnostics ==="
       hFlush handle
   where
     unless cond act = if cond then pure () else act
+
+    ownedSizeOf :: LabRow -> Maybe Int
+    ownedSizeOf r =
+      M.lookup (familyName (lrFamily r), lrMember r) ownedSizeIndex
+
+    printOwnedSizeBuckets :: String -> [(Int, [LabRow])] -> IO ()
+    printOwnedSizeBuckets title buckets = unless (null buckets) $ do
+      hPutStrLn handle title
+      forM_ buckets $ \(sz, srows) ->
+        let speedups = mapMaybe lrSpeedupVsBase srows
+            (_, sMed, _) = minMedMax speedups
+            medStr = if null speedups then "n/a" else printf "%.2fx" sMed
+        in hPutStrLn handle $ printf
+             "    size=%2d  rows=%d  median=%s"
+             sz (length srows) (medStr :: String)
+
+    bucketByOwnedSize :: [LabRow] -> [(Int, [LabRow])]
+    bucketByOwnedSize rs =
+      [ (sz, [r | r <- rs, ownedSizeOf r == Just sz])
+      | sz <- sort (nubOrd [s | r <- rs, Just s <- [ownedSizeOf r]])
+      ]
 
     -- Built once per call: (familyName, member) -> owned tail
     -- length for the generator's first eligible candidate on the

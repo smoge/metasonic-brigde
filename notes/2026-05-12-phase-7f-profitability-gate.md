@@ -83,8 +83,10 @@ rules do not run.
    audit-only.
 4. **NeedsBenchmark.** If there is no cost-lab row matching the
    candidate's shape key (the cost lab has not measured this
-   shape), verdict is `NeedsBenchmark`. The fix is corpus growth,
-   not a gate change.
+   shape), or if the generated row measured only an owned suffix
+   rather than the whole selected candidate, verdict is
+   `NeedsBenchmark`. The fix is corpus growth, generator widening,
+   or a later executor redesign, not a gate override.
 5. **PreferExisting.** If the generated row's measured speedup
    relative to node-loop is below `measuredWinThreshold` (1.05x)
    or below the best non-generated peer's speedup (the better of
@@ -99,11 +101,13 @@ rules do not run.
    it on."
 
 In all verdicts, "generated speedup" means
-`lrSpeedupVsBase` for the `VarGenerated` row of the same
-(family, member). "Peer speedup" means the same field on the
-matching `VarRegionKernel` / `VarRFused` rows. All comparisons
-use the same float arithmetic discipline the rest of the cost-lab
-join uses.
+`lrSpeedupVsBase` for the `VarGenerated` row whose generated
+program owns the same shape key as the selected candidate. A
+longer candidate does not borrow a generated suffix's timing.
+"Peer speedup" means the same field on the matching
+`VarRegionKernel` / `VarRFused` rows. All comparisons use the
+same float arithmetic discipline the rest of the cost-lab join
+uses.
 
 ## Coverage Boundaries
 

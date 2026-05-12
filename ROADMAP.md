@@ -1954,13 +1954,16 @@ Open follow-ups (in roughly the order they unlock value):
   `CoveredByHandKernel` to `PreferGenerated` for those shapes.
   v1 keeps the hand-written kernels untouched.
 
-### Phase 7.G — Tail-Length Evidence (interpreter still loses)
+### Phase 7.G — Tail-Length Evidence (synthetic long tails still lose)
 
 [x] First slice landed. The slice answered one question — *does
 the per-sample interpreter amortize over longer stateless
-tails?* — and the answer on this op set / dispatch model is
-**no**. Generated execution does not become profitable at any
-owned-op count the v1 interpreter can express.
+tails?* — and the answer for the isolated `generated-tail-sweep`
+family is **no**. The current generated interpreter loses to
+node-loop on every synthetic tail length tested through 16 owned
+nodes. Other emitted size-2 corpus rows can still flap around the
+win threshold, but those are read-only signals, not a runtime
+turn-on basis.
 
 What changed:
 
@@ -1983,21 +1986,32 @@ What changed:
   brackets the amortization curve. Each member feeds one
   `pulseOsc` prefix (not §4.B-covered) into a stateless
   compute tail of length 2, 3, 3, 5, 8, 16 owned nodes.
-- `--fusion-cost-lab` diagnostic gained a per-owned-op-size
-  bucket section. Generated speedup vs node-loop, by owned
-  size, on the current corpus:
+- `--fusion-cost-lab` diagnostic gained per-owned-op-size
+  bucket sections: one for all emitted generated rows, and one
+  isolated to the synthetic `generated-tail-sweep` family. The
+  isolated sweep is the amortization probe; the all-emitted table
+  is corpus context.
 
-      size  2  rows=18  median=0.79×
-      size  3  rows=4   median=0.61×
-      size  4  rows=1   median=0.54×
-      size  5  rows=1   median=0.50×
-      size  8  rows=1   median=0.40×
-      size 16  rows=1   median=0.25×
+  Example isolated `generated-tail-sweep` result:
 
-  The trend is monotonically downward. Dispatch overhead
-  scales linearly (or worse) with owned-op count while
-  node-loop's per-node cost stays small, so longer generated
-  tails compound the loss rather than amortize it.
+      size  2  rows=1  median≈0.73×
+      size  3  rows=2  median≈0.64×
+      size  5  rows=1  median≈0.49×
+      size  8  rows=1  median≈0.40×
+      size 16  rows=1  median≈0.26×
+
+  The all-emitted corpus view still includes more rows at the
+  short sizes:
+
+      size  2  rows=18
+      size  3  rows=4
+      size  4  rows=1
+      size  5  rows=1
+      size  8  rows=1
+      size 16  rows=1
+
+  In the isolated sweep, longer generated tails compound the loss
+  rather than amortize it.
 
 Snapshot pins added or moved by this slice:
 
@@ -2009,14 +2023,16 @@ Snapshot pins added or moved by this slice:
 - `generated-tail-sweep: every member emitted` (= 6);
 - `generated-tail-sweep: every emitted row stays bit-exact`;
 - `generated-tail-sweep: no unsupported rows`;
+- `generated-tail-sweep: owned tail lengths stay stable`
+  (`[2, 3, 3, 5, 8, 16]`);
 - gate's `unsupported` count drops 1 → 0 (same `KAdd → KOut`
   reclassifies as `prefer-existing`);
 - gate's `needs-benchmark` count drops 10 → 9 on the snapshot
   corpus (one row's measurement now exists).
 
-`prefer-generated` stays a 7.F tripwire at 0; per-bucket
-speedups and win/loss splits stay unpinned for bench-noise
-reasons. Three new bit-exact tests in
+`prefer-generated` stays a read-only signal and is intentionally
+not pinned; per-bucket speedups and win/loss splits also stay
+unpinned for bench-noise reasons. Three new bit-exact tests in
 [test/Spec.hs](test/Spec.hs) cover `[Gain,Gain,Out]`,
 `[Add,Gain,Out]`, `[Add,Add,Gain,Out]`.
 

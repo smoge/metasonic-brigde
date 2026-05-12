@@ -79,11 +79,11 @@ Hard exclusions:
 - **No runtime emission, no FFI change, no §4.B kernel
   replacement.** Strictly cost-lab and gate diagnostics.
 - **No CLI knob to override the gate.** Same as 7.F.
-- **No `PreferGenerated` pin movement in snapshot.** The slice
-  may produce the first `PreferGenerated` row on synthetic
-  long tails; if it does, the existing safety tripwire in 7.F
-  fires and a human reviews. The slice does not by itself
-  declare that outcome a turn-on signal.
+- **No `PreferGenerated` snapshot pin.** The slice may produce
+  a positive `PreferGenerated` signal on synthetic long tails,
+  but that value is read-only and noise-sensitive. A human
+  reviews any positive signal before runtime turn-on; snapshot
+  pins only the deterministic structural counts.
 
 ## Generator Generalization
 
@@ -154,21 +154,28 @@ changes, which 7.G is explicitly making).
 
 ## Owned-Size Diagnostics
 
-Generated-variant diagnostics gain a per-owned-op bucket:
+Generated-variant diagnostics gain two per-owned-op bucket views:
 
 ```
 === generated variant diagnostics (Phase 7.G) ===
   considered: N  emitted: M  exact: M  unsupported: K  non-exact: 0
-  by owned-op count:
-    1: …    2: …    3: …    5: …    8: …    16: …
+  by owned-op count (all emitted rows; rows / median speedup vs node-loop):
+    size= 2  rows=…
+  generated-tail-sweep by owned-op count (rows / median speedup vs node-loop):
+    size= 2  rows=1
+    size= 3  rows=2
+    size= 5  rows=1
+    size= 8  rows=1
+    size=16  rows=1
 === end generated diagnostics ===
 ```
 
-Each bucket reports the median generated speedup vs node-loop
-across rows of that owned-size. Stderr-only, diagnostic, no
-caller consumes the bucket map. This is more useful than another
-flat win/loss count because the entire point of the slice is the
-amortization curve.
+Each bucket reports the median generated speedup vs node-loop.
+The all-emitted view shows the current corpus mix; the
+`generated-tail-sweep` view isolates the synthetic amortization
+probe. Stderr-only, diagnostic, no caller consumes the bucket
+map. This is more useful than another flat win/loss count because
+the entire point of the slice is the amortization curve.
 
 ## Snapshot Pins
 
@@ -181,6 +188,8 @@ Pinned (deterministic, bench-noise-free):
   every member is generator-supported by construction);
 - generated exact count for the family (= emitted, modulo a
   correctness bug);
+- generated owned-tail lengths for the family
+  (`[2, 3, 3, 5, 8, 16]`);
 - gate's combined `NeedsBenchmark` total (whatever the new
   number is post-corpus growth);
 - gate's occurrence-count invariant (sum of per-verdict counts
@@ -188,10 +197,10 @@ Pinned (deterministic, bench-noise-free):
 
 Intentionally **not pinned**:
 
-- `prefer-generated` — still a tripwire at 0; the slice may
-  produce the first non-zero count on synthetic length 8 or 16,
-  but locking a number would chase bench noise. The existing
-  7.F tripwire fires regardless.
+- `prefer-generated` — read-only and intentionally unpinned.
+  Locking a number would chase bench noise; any positive signal
+  still needs human review before a runtime turn-on policy can use
+  it.
 - per-bucket speedups in the owned-size diagnostic — same
   reason.
 - win/loss split.

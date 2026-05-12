@@ -183,6 +183,11 @@ costLabChecks rows =
       (tailSweepUnsupported == 0)
       ("unsupported=" <> show tailSweepUnsupported)
 
+  , check "generated-tail-sweep: owned tail lengths stay stable"
+      (FCL.generatedTailSweepOwnedLengths == expectedTailSweepOwnedLengths)
+      ("expected=" <> show expectedTailSweepOwnedLengths
+       <> "; actual=" <> show FCL.generatedTailSweepOwnedLengths)
+
   , check "cost-lab corpus carries declared latency coverage"
       corpusLatency
       ("max-latency=" <> show maxLatency)
@@ -284,6 +289,7 @@ costLabChecks rows =
                  , lrError r == Nothing
                  , lrEquivalence r /= EqExact ]
     expectedTailSweepEmitted = 6
+    expectedTailSweepOwnedLengths = [2, 3, 3, 5, 8, 16]
 
     corpusFeatures =
       [ f
