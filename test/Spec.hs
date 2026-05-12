@@ -113,6 +113,7 @@ import           MetaSonic.Bridge.Buffer   (BufferIssue (..), allocBuffer,
                                             clearBuffer,
                                             collectRetiredBuffer,
                                             loadBuffer, retireBuffer)
+import           MetaSonic.Bridge.Compile.FusionProgram
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Planner
 import           MetaSonic.Bridge.Source
@@ -162,6 +163,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , authoringDslTests
   , capabilityTableTests
   , plannerTests
+  , fusionProgramScaffoldTests
   ]
 
 ------------------------------------------------------------
@@ -738,6 +740,48 @@ plannerTests =
 
     isFanoutEscape ReasonFanoutEscape{} = True
     isFanoutEscape _                    = False
+
+------------------------------------------------------------
+-- §7.D scaffold: FusionProgram data-model invariants
+------------------------------------------------------------
+
+fusionProgramScaffoldTests :: TestTree
+fusionProgramScaffoldTests =
+  testGroup "Phase 7.D: FusionProgram data-model scaffold"
+  [ testCase "emptyFusionProgram has no ops and no scratch" $ do
+      fpOps          emptyFusionProgram @?= []
+      fpScratchSlots emptyFusionProgram @?= 0
+      programOpCount emptyFusionProgram @?= 0
+
+  , testCase "programOpCount counts ops in declaration order" $ do
+      let prog = FusionProgram
+            { fpOps =
+                [ OpLoadConst (ScratchIndex 0) 0.5
+                , OpLoadInput (ScratchIndex 1)
+                    (NodeIndex 7) (PortIndex 0)
+                , OpMul (ScratchIndex 2)
+                    (SrcScratch (ScratchIndex 0))
+                    (SrcScratch (ScratchIndex 1))
+                , OpSinkWrite 0
+                    (SrcScratch (ScratchIndex 2))
+                    SinkOverwrite
+                ]
+            , fpScratchSlots = 3
+            }
+      programOpCount prog @?= 4
+      fpScratchSlots prog @?= 3
+
+  , testCase "SinkPolicy enumerates both writer modes" $
+      [minBound .. maxBound] @?= [SinkOverwrite, SinkAccumulate]
+
+  , testCase "FusionSource constructors compare structurally" $ do
+      SrcConst   0.5                            @?= SrcConst 0.5
+      SrcInput   (NodeIndex 1) (PortIndex 0)    @?= SrcInput   (NodeIndex 1) (PortIndex 0)
+      SrcControl (NodeIndex 1) (ControlIndex 0) @?= SrcControl (NodeIndex 1) (ControlIndex 0)
+      SrcScratch (ScratchIndex 2)               @?= SrcScratch (ScratchIndex 2)
+      assertBool "distinct sources are not equal"
+        (SrcConst 0.5 /= SrcScratch (ScratchIndex 0))
+  ]
 
 -- | Tally a 'SynthGraph' by 'NodeKind' for shape-pinning tests.
 -- 'NodeKind' has no 'Ord' instance, so the tally is a sorted-by-show
