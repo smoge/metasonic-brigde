@@ -34,10 +34,13 @@ import qualified MetaSonic.App.FusionCostLab as FCL
 import           MetaSonic.App.FusionCostLab (GateMeasurement (..),
                                               ShapeKey,
                                               ShapeSummary (..),
+                                              Variant (..),
                                               costLabGateIndex,
+                                              costLabGateIndexFor,
                                               costLabShapeIndex,
                                               measuredWinThreshold,
-                                              shapeKeyOf)
+                                              shapeKeyOf,
+                                              variantName)
 import           MetaSonic.App.ProfitabilityGate (GateCounts (..),
                                                   GateInput (..),
                                                   GateRow (..),
@@ -1577,6 +1580,8 @@ runFusionSurvey demos = do
   putStrLn ""
   printProfitabilityGate gateIdx allRows
   putStrLn ""
+  printProfitabilityGateByExecutor costLabRows allRows
+  putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
   case allErrs of
@@ -2755,6 +2760,76 @@ gateColumnWidths = [40, 14, 18, 6, 22, 8, 8, 40]
 formatGateRow :: [String] -> String
 formatGateRow cols =
   "  " <> intercalate "  " (zipWith pad gateColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
+
+-- | Phase 7.J gate-by-executor section. Re-uses 'evaluateGate'
+-- verbatim, only the cost-lab gate index feeding 'gateInputFor'
+-- changes. Three rows:
+--
+--   * @sample-major@ — 'VarGenerated', mirrors the canonical
+--     7.F gate; included so the row layout is self-explanatory
+--     and the snapshot can cross-check it against the existing
+--     7.F numbers.
+--   * @block-major@   — 'VarGeneratedBlock'.
+--   * @super-mode@    — 'VarGeneratedSuper'.
+--
+-- The shape aggregation ('aggregateGateShapes') is shared
+-- across rows — every executor's gate scans the same candidate
+-- set, so total counts agree by construction; only the
+-- verdict mix differs.
+printProfitabilityGateByExecutor
+  :: [FCL.LabRow] -> [SurveyRow] -> IO ()
+printProfitabilityGateByExecutor costLabRows rows = do
+  putStrLn "─── Phase 7.J gate by generated executor ───"
+  let shapes = aggregateGateShapes (map srPlannerVerdicts rows)
+      countsFor v =
+        let idx     = costLabGateIndexFor v costLabRows
+            gateRs  =
+              [ GateRow input (evaluateGate input)
+              | s <- shapes
+              , let input = gateInputFor idx s
+              ]
+        in summarizeGate gateRs
+      rowsBy =
+        [ (variantName VarGenerated,      countsFor VarGenerated)
+        , (variantName VarGeneratedBlock, countsFor VarGeneratedBlock)
+        , (variantName VarGeneratedSuper, countsFor VarGeneratedSuper)
+        ]
+  putStrLn $ formatExecGateRow
+    [ "executor", "total", "prefer-gen", "prefer-exist"
+    , "needs-bench", "unsupported", "non-exact", "covered-by-hk"
+    ]
+  mapM_ (putStrLn . formatExecGateRow . renderExecGateCells) rowsBy
+  let preferGenByExecutor =
+        [ (name, gcPreferGenerated c) | (name, c) <- rowsBy ]
+  putStrLn $ "  signal: prefer-generated counts by executor — "
+          <> intercalate ", "
+               [ name <> "=" <> show n
+               | (name, n) <- preferGenByExecutor ]
+  putStrLn $ "  (read-only; non-zero on any executor reopens the"
+          <> " turn-on question for that path)"
+
+renderExecGateCells :: (String, GateCounts) -> [String]
+renderExecGateCells (name, c) =
+  [ name
+  , show (gcTotal c)
+  , show (gcPreferGenerated c)
+  , show (gcPreferExisting c)
+  , show (gcNeedsBenchmark c)
+  , show (gcUnsupported c)
+  , show (gcNonExact c)
+  , show (gcCoveredByHandKernel c)
+  ]
+
+execGateColumnWidths :: [Int]
+execGateColumnWidths = [16, 6, 12, 14, 13, 13, 11, 14]
+
+formatExecGateRow :: [String] -> String
+formatExecGateRow cols =
+  "  " <> intercalate "  " (zipWith pad execGateColumnWidths cols)
   where
     pad w s
       | length s >= w = s
