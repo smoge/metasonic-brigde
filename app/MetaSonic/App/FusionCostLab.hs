@@ -1633,83 +1633,104 @@ renderSummary rows = do
 -- faster" answerable at a glance instead of by reading the JSONL.
 renderGeneratedDiagnostics :: Handle -> [LabRow] -> IO ()
 renderGeneratedDiagnostics handle rows = do
-  let generated = [r | r <- rows, lrVariant r == VarGenerated]
-  if null generated
+  let sampleRows = [r | r <- rows, lrVariant r == VarGenerated]
+      blockRows  = [r | r <- rows, lrVariant r == VarGeneratedBlock]
+  if null sampleRows && null blockRows
     then pure ()
     else do
-      let unsupported = [r | r <- generated, lrError r /= Nothing]
-          emitted     = [r | r <- generated, lrError r == Nothing]
-          nonExact    = [r | r <- emitted,   lrEquivalence r /= EqExact]
-          emittedSpeedups = mapMaybe lrSpeedupVsBase emitted
-          wins  = length [s | s <- emittedSpeedups, s >= measuredWinThreshold]
-          loses = length emittedSpeedups - wins
-          declineReasons = tally [errorBucket e | r <- unsupported, Just e <- [lrError r]]
-          deltas      = [(r, d) | r <- emitted, Just d <- [deltaVsBestNonGenerated rows r]]
-          deltaValues = map snd deltas
-          posDeltas   = length [d | d <- deltaValues, d >= 0]
-          negDeltas   = length deltaValues - posDeltas
-          emittedByOwnedSize = bucketByOwnedSize emitted
-          tailSweepByOwnedSize =
-            bucketByOwnedSize
-              [ r | r <- emitted, lrFamily r == FamilyGeneratedTailSweep ]
-
       hPutStrLn handle ""
-      hPutStrLn handle "=== generated variant diagnostics (Phase 7.E/7.G) ==="
-      hPutStrLn handle $ "  considered:  " <> show (length generated)
-                      <> "  emitted: "    <> show (length emitted)
-                      <> "  unsupported: " <> show (length unsupported)
-      hPutStrLn handle $ "  equivalence: exact=" <> show (length emitted - length nonExact)
-                      <> "  non-exact=" <> show (length nonExact)
-      unless (null declineReasons) $ do
-        hPutStrLn handle "  decline reasons:"
-        forM_ declineReasons $ \(reason, n) ->
-          hPutStrLn handle $ "    " <> reason <> ": " <> show n
-      unless (null emittedSpeedups) $ do
-        let (sMin, sMed, sMax) = minMedMax emittedSpeedups
-        hPutStrLn handle $ printf
-          "  speedup vs node-loop: min=%.2fx  median=%.2fx  max=%.2fx  win(>=%.2fx)=%d  loss=%d"
-          sMin sMed sMax measuredWinThreshold wins loses
-      unless (null deltaValues) $ do
-        let (dMin, dMed, dMax) = minMedMax deltaValues
-        hPutStrLn handle $ printf
-          "  delta vs best non-generated (region-kernel/RFused): rows=%d  min=%+.2fx  median=%+.2fx  max=%+.2fx  generated>=best=%d  generated<best=%d"
-          (length deltaValues) dMin dMed dMax posDeltas negDeltas
-      -- §7.G owned-size buckets. The first table covers every
-      -- generated row the current corpus emits. The second isolates
-      -- the synthetic 'generated-tail-sweep' family, which is the
-      -- actual amortization probe; keeping both views visible avoids
-      -- mistaking corpus mix for the length curve.
-      printOwnedSizeBuckets
-        "  by owned-op count (all emitted rows; rows / median speedup vs node-loop):"
-        emittedByOwnedSize
-      printOwnedSizeBuckets
-        "  generated-tail-sweep by owned-op count (rows / median speedup vs node-loop):"
-        tailSweepByOwnedSize
+      hPutStrLn handle "=== generated variant diagnostics (Phase 7.E/7.G/7.H) ==="
+      printVariantSummary "sample-major" sampleRows
+      printVariantSummary "block-major"  blockRows
+      -- §7.H A/B owned-size bucket views. Sample-major and
+      -- block-major share the same emitted programs, so each row
+      -- appears in both variants' bucket counts on identical
+      -- owned-tail-length keys. The compact side-by-side table
+      -- surfaces the crossover length where block-major starts
+      -- winning.
+      printAbBuckets
+        "  by owned-op count (all emitted rows; rows / sample / block medians):"
+        sampleRows blockRows
+      printAbBuckets
+        "  generated-tail-sweep only (rows / sample / block medians):"
+        [r | r <- sampleRows, lrFamily r == FamilyGeneratedTailSweep]
+        [r | r <- blockRows,  lrFamily r == FamilyGeneratedTailSweep]
       hPutStrLn handle "=== end generated diagnostics ==="
       hFlush handle
   where
     unless cond act = if cond then pure () else act
 
+    printVariantSummary :: String -> [LabRow] -> IO ()
+    printVariantSummary label generated = unless (null generated) $ do
+      let unsupported    = [r | r <- generated, lrError r /= Nothing]
+          emitted        = [r | r <- generated, lrError r == Nothing]
+          nonExact       = [r | r <- emitted,   lrEquivalence r /= EqExact]
+          emittedSpeeds  = mapMaybe lrSpeedupVsBase emitted
+          wins           = length [s | s <- emittedSpeeds, s >= measuredWinThreshold]
+          loses          = length emittedSpeeds - wins
+          declineReasons = tally [errorBucket e | r <- unsupported, Just e <- [lrError r]]
+          deltas         = [d | r <- emitted, Just d <- [deltaVsBestNonGenerated rows r]]
+          posDeltas      = length [d | d <- deltas, d >= 0]
+          negDeltas      = length deltas - posDeltas
+
+      hPutStrLn handle $ "  [" <> label <> "]"
+      hPutStrLn handle $ "    considered:  " <> show (length generated)
+                      <> "  emitted: "      <> show (length emitted)
+                      <> "  unsupported: "  <> show (length unsupported)
+      hPutStrLn handle $ "    equivalence: exact=" <> show (length emitted - length nonExact)
+                      <> "  non-exact="     <> show (length nonExact)
+      unless (null declineReasons) $ do
+        hPutStrLn handle "    decline reasons:"
+        forM_ declineReasons $ \(reason, n) ->
+          hPutStrLn handle $ "      " <> reason <> ": " <> show n
+      unless (null emittedSpeeds) $ do
+        let (sMin, sMed, sMax) = minMedMax emittedSpeeds
+        hPutStrLn handle $ printf
+          "    speedup vs node-loop: min=%.2fx  median=%.2fx  max=%.2fx  win(>=%.2fx)=%d  loss=%d"
+          sMin sMed sMax measuredWinThreshold wins loses
+      unless (null deltas) $ do
+        let (dMin, dMed, dMax) = minMedMax deltas
+        hPutStrLn handle $ printf
+          "    delta vs best non-generated (region-kernel/RFused): rows=%d  min=%+.2fx  median=%+.2fx  max=%+.2fx  variant>=best=%d  variant<best=%d"
+          (length deltas) dMin dMed dMax posDeltas negDeltas
+
     ownedSizeOf :: LabRow -> Maybe Int
     ownedSizeOf r =
       M.lookup (familyName (lrFamily r), lrMember r) ownedSizeIndex
 
-    printOwnedSizeBuckets :: String -> [(Int, [LabRow])] -> IO ()
-    printOwnedSizeBuckets title buckets = unless (null buckets) $ do
-      hPutStrLn handle title
-      forM_ buckets $ \(sz, srows) ->
-        let speedups = mapMaybe lrSpeedupVsBase srows
-            (_, sMed, _) = minMedMax speedups
-            medStr = if null speedups then "n/a" else printf "%.2fx" sMed
-        in hPutStrLn handle $ printf
-             "    size=%2d  rows=%d  median=%s"
-             sz (length srows) (medStr :: String)
-
-    bucketByOwnedSize :: [LabRow] -> [(Int, [LabRow])]
-    bucketByOwnedSize rs =
-      [ (sz, [r | r <- rs, ownedSizeOf r == Just sz])
-      | sz <- sort (nubOrd [s | r <- rs, Just s <- [ownedSizeOf r]])
-      ]
+    -- Side-by-side amortization-curve table. Each size row shows
+    -- the bucket population (sample-major member count, which
+    -- equals block-major member count by construction since the
+    -- two variants share emitted programs) and the median speedup
+    -- under each executor. A '*' marks rows where block-major
+    -- beats sample-major.
+    printAbBuckets
+      :: String -> [LabRow] -> [LabRow] -> IO ()
+    printAbBuckets title sampleSrc blockSrc = do
+      let bucketSizes =
+            sort (nubOrd
+                   [ s
+                   | r <- sampleSrc ++ blockSrc
+                   , Just s <- [ownedSizeOf r]
+                   ])
+      unless (null bucketSizes) $ do
+        hPutStrLn handle title
+        forM_ bucketSizes $ \sz ->
+          let rowsAtS = [r | r <- sampleSrc, ownedSizeOf r == Just sz]
+              rowsAtB = [r | r <- blockSrc,  ownedSizeOf r == Just sz]
+              medAt rs = case mapMaybe lrSpeedupVsBase rs of
+                           [] -> Nothing
+                           xs -> let (_, m, _) = minMedMax xs in Just m
+              fmtMed   = maybe "n/a" (printf "%.2fx") :: Maybe Double -> String
+              mS = medAt rowsAtS
+              mB = medAt rowsAtB
+              marker = case (mS, mB) of
+                (Just s, Just b) | b > s -> " *block-major ahead"
+                _                        -> ""
+          in hPutStrLn handle $ printf
+               "    size=%2d  rows=%d  sample=%s  block=%s%s"
+               sz (max (length rowsAtS) (length rowsAtB))
+               (fmtMed mS) (fmtMed mB) (marker :: String)
 
     -- Built once per call: (familyName, member) -> owned tail
     -- length for the generator's first eligible candidate on the
