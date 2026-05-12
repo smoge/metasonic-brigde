@@ -173,6 +173,7 @@ import           System.Timeout             (timeout)
 import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              FreeLayer (..),
                                              FusedInput (..),
+                                             RegionExec (..),
                                              RegionKernel (..),
                                              RuntimeGraph (..),
                                              RuntimeInput (..),
@@ -184,6 +185,13 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              layeredRegionSchedule,
                                              rrKernel,
                                              scheduledRuntimeRegions)
+import           MetaSonic.Bridge.Compile.FusionProgram
+                                            (FusionOp (..),
+                                             FusionProgram (..),
+                                             FusionProgramId (..),
+                                             FusionSource (..),
+                                             ScratchIndex (..),
+                                             SinkPolicy (..))
 import           MetaSonic.Bridge.Source    (MigrationKey (..),
                                              migrationKeyUtf8Bytes)
 import           MetaSonic.Bridge.Templates (BufferFootprint (..),
@@ -909,6 +917,92 @@ foreign import ccall unsafe "rt_graph_template_add_region_kernel"
 foreign import ccall unsafe "rt_graph_region_kernel_supported"
   c_rt_graph_region_kernel_supported :: CInt -> IO CInt
 
+-- | Phase 7.D: allocate a generated fusion program in a template.
+-- Returns the new program id (>= 0) usable in subsequent program-
+-- op and region-generated calls; returns -1 on invalid template
+-- or negative scratch_slots.
+foreign import ccall unsafe "rt_graph_template_add_fusion_program"
+  c_rt_graph_template_add_fusion_program
+    :: Ptr RTGraph -> CInt -> CInt -> IO CInt
+
+-- | Phase 7.D: append an OpLoadConst op to a program.
+foreign import ccall unsafe "rt_graph_template_program_load_const"
+  c_rt_graph_template_program_load_const
+    :: Ptr RTGraph -> CInt -> CInt
+    -> CInt -> CDouble
+    -> IO ()
+
+-- | Phase 7.D: append an OpLoadInput op.
+foreign import ccall unsafe "rt_graph_template_program_load_input"
+  c_rt_graph_template_program_load_input
+    :: Ptr RTGraph -> CInt -> CInt
+    -> CInt -> CInt -> CInt
+    -> IO ()
+
+-- | Phase 7.D: append an OpAdd op. The two sources are encoded as
+-- @(tag, const_value, idx_a, idx_b)@ tuples, mirroring the C side's
+-- decoder.
+foreign import ccall unsafe "rt_graph_template_program_add"
+  c_rt_graph_template_program_add
+    :: Ptr RTGraph -> CInt -> CInt
+    -> CInt
+    -> CInt -> CDouble -> CInt -> CInt
+    -> CInt -> CDouble -> CInt -> CInt
+    -> IO ()
+
+-- | Phase 7.D: append an OpMul op. Same source encoding as
+-- 'c_rt_graph_template_program_add'.
+foreign import ccall unsafe "rt_graph_template_program_mul"
+  c_rt_graph_template_program_mul
+    :: Ptr RTGraph -> CInt -> CInt
+    -> CInt
+    -> CInt -> CDouble -> CInt -> CInt
+    -> CInt -> CDouble -> CInt -> CInt
+    -> IO ()
+
+-- | Phase 7.D: append an OpSinkWrite op. @sink_policy@ matches
+-- the Haskell 'SinkPolicy' Enum (0 = Overwrite, 1 = Accumulate).
+foreign import ccall unsafe "rt_graph_template_program_sink_write"
+  c_rt_graph_template_program_sink_write
+    :: Ptr RTGraph -> CInt -> CInt
+    -> CInt
+    -> CInt -> CDouble -> CInt -> CInt
+    -> CInt
+    -> IO ()
+
+-- | Phase 7.D: register a region that dispatches through a
+-- generated fusion program. Mirrors 'c_rt_graph_template_add_region'
+-- /  '..._kernel' but takes a program id instead of a kernel tag.
+foreign import ccall unsafe "rt_graph_template_add_region_generated"
+  c_rt_graph_template_add_region_generated
+    :: Ptr RTGraph -> CInt
+    -> CInt -> CInt -> CInt
+    -> CInt
+    -> IO ()
+
+-- | Phase 7.D test surface: count of generated programs in a
+-- template, or -1 on invalid template_id.
+foreign import ccall unsafe "rt_graph_test_template_fusion_program_count"
+  c_rt_graph_test_template_fusion_program_count
+    :: Ptr RTGraph -> CInt -> IO CInt
+
+-- | Phase 7.D test surface: count of ops in a program.
+foreign import ccall unsafe "rt_graph_test_template_fusion_program_op_count"
+  c_rt_graph_test_template_fusion_program_op_count
+    :: Ptr RTGraph -> CInt -> CInt -> IO CInt
+
+-- | Phase 7.D test surface: scratch_slots a program was created
+-- with.
+foreign import ccall unsafe "rt_graph_test_template_fusion_program_scratch_slots"
+  c_rt_graph_test_template_fusion_program_scratch_slots
+    :: Ptr RTGraph -> CInt -> CInt -> IO CInt
+
+-- | Phase 7.D test surface: generated program id attached to a
+-- region, or -1 if the region uses kernel dispatch.
+foreign import ccall unsafe "rt_graph_test_template_region_generated_program"
+  c_rt_graph_test_template_region_generated_program
+    :: Ptr RTGraph -> CInt -> CInt -> IO CInt
+
 -- | §4.E.2.C0a: append one descriptive layered-schedule step to the
 -- named template, layering an interpretation on top of the regions
 -- registered via 'c_rt_graph_template_add_region'. The integer
@@ -1501,13 +1595,13 @@ addRegionTo g cTid r =
       let cRate  = fromIntegral (fromEnum (rrRate r))
           cFirst = fromIntegral h
           cCount = fromIntegral (length (rrNodes r))
-      in case rrKernel r of
-           RNodeLoop ->
+      in case rrExec r of
+           ExecNodeLoop ->
              -- Default behavior: existing entry, identical wire
              -- format to pre-§4.B graphs.
              c_rt_graph_template_add_region g cTid
                cRate cFirst cCount
-           kernel ->
+           ExecKernel kernel ->
              -- §4.B: fused-kernel region. The kernel tag tells the
              -- runtime which hand-written kernel to dispatch
              -- instead of iterating member nodes. See
@@ -1517,6 +1611,85 @@ addRegionTo g cTid r =
              c_rt_graph_template_add_region_kernel g cTid
                (kernelTag kernel)
                cRate cFirst cCount
+           ExecGenerated (FusionProgramId pid) ->
+             -- §7.D: generated fusion program. The program must
+             -- already exist in the template's program table
+             -- (pushed by 'loadFusionProgramsTo' before this
+             -- region is registered).
+             c_rt_graph_template_add_region_generated g cTid
+               cRate cFirst cCount
+               (fromIntegral pid)
+
+-- | Phase 7.D: push one template's generated-fusion programs into
+-- the C runtime. Programs must be pushed /before/ any region that
+-- references one by 'FusionProgramId' is registered (regions look
+-- up their program at construction time and otherwise silent-no-op).
+--
+-- The programs are pushed in list order so 'FusionProgramId 0' on
+-- the Haskell side corresponds to the first call's return; we
+-- verify against that and 'fail' on a divergence rather than
+-- silently shipping a misindexed table.
+loadFusionProgramsTo
+  :: Ptr RTGraph -> CInt -> [FusionProgram] -> IO ()
+loadFusionProgramsTo g cTid programs =
+  forM_ (zip [0 :: Int ..] programs) $ \(expectedId, prog) -> do
+    actualId <-
+      c_rt_graph_template_add_fusion_program g cTid
+        (fromIntegral (fpScratchSlots prog))
+    when (fromIntegral actualId /= expectedId) $
+      fail $ "loadFusionProgramsTo: program id divergence: "
+          <> "expected " <> show expectedId
+          <> ", got " <> show actualId
+    forM_ (fpOps prog) $ \op ->
+      appendFusionOp g cTid actualId op
+
+-- | Append one 'FusionOp' to a program. Marshals to the
+-- per-op-kind C entry; 'FusionSource' operands are encoded as
+-- @(tag, const_value, idx_a, idx_b)@ tuples mirroring the C
+-- side's decoder.
+appendFusionOp :: Ptr RTGraph -> CInt -> CInt -> FusionOp -> IO ()
+appendFusionOp g cTid cPid op = case op of
+  OpLoadConst (ScratchIndex dst) value ->
+    c_rt_graph_template_program_load_const g cTid cPid
+      (fromIntegral dst) (CDouble value)
+  OpLoadInput (ScratchIndex dst) node port ->
+    c_rt_graph_template_program_load_input g cTid cPid
+      (fromIntegral dst) (cNodeIndex node) (cPortIndex port)
+  OpAdd (ScratchIndex dst) src1 src2 ->
+    let (t1, c1, a1, b1) = encodeFusionSource src1
+        (t2, c2, a2, b2) = encodeFusionSource src2
+    in c_rt_graph_template_program_add g cTid cPid
+         (fromIntegral dst)
+         t1 c1 a1 b1
+         t2 c2 a2 b2
+  OpMul (ScratchIndex dst) src1 src2 ->
+    let (t1, c1, a1, b1) = encodeFusionSource src1
+        (t2, c2, a2, b2) = encodeFusionSource src2
+    in c_rt_graph_template_program_mul g cTid cPid
+         (fromIntegral dst)
+         t1 c1 a1 b1
+         t2 c2 a2 b2
+  OpSinkWrite bus src policy ->
+    let (t, k, a, b) = encodeFusionSource src
+    in c_rt_graph_template_program_sink_write g cTid cPid
+         (fromIntegral bus)
+         t k a b
+         (fromIntegral (fromEnum policy))
+
+-- | Encode a 'FusionSource' as a four-tuple @(tag, const_value,
+-- idx_a, idx_b)@. Unused fields are zero. Tags mirror the
+-- Haskell 'FusionSource' constructor order and the C decoder in
+-- @rt_graph.cpp@.
+encodeFusionSource :: FusionSource -> (CInt, CDouble, CInt, CInt)
+encodeFusionSource s = case s of
+  SrcConst v ->
+    (0, CDouble v, 0, 0)
+  SrcInput node port ->
+    (1, 0, cNodeIndex node, cPortIndex port)
+  SrcControl node ctrl ->
+    (2, 0, cNodeIndex node, cControlIndex ctrl)
+  SrcScratch (ScratchIndex i) ->
+    (3, 0, fromIntegral i, 0)
 
 -- | Cross the fused-input ABI for one consumer port. Dispatches
 -- between the single-scale and chain entry points so the loaders
@@ -1618,6 +1791,12 @@ loadRuntimeGraph g rg = do
   mapM_ addNode (rgNodes rg)
   -- Pass 2: wire connections (all nodes now exist).
   mapM_ wireNode (rgNodes rg)
+  -- Pass 2.5 (§7.D): push the generated-fusion program table so
+  -- regions referencing 'FusionProgramId' can resolve at
+  -- registration time. Empty for every graph 'compileRuntimeGraph'
+  -- produces today; the equivalence test loads programs into a
+  -- hand-built 'RuntimeGraph'.
+  loadFusionProgramsTo g 0 (rgFusionPrograms rg)
   -- Pass 3: register the region overlay on template 0 in
   -- /scheduled/ order (today this is identical to rrIndex order;
   -- the planner is the identity when 'compileRuntimeGraph'
@@ -1739,6 +1918,11 @@ loadRuntimeGraphFused g rg = do
   -- left elided without a fused override on every consumer would
   -- still be skipped and produce silence).
   mapM_ markElided (rgNodes rg)
+  -- Pass 2d (§7.D): push the generated-fusion program table. Same
+  -- contract as the unfused loader: empty for every graph produced
+  -- by 'compileRuntimeGraph' / 'fuseRuntimeGraph'; the equivalence
+  -- test loads programs into a hand-built 'RuntimeGraph'.
+  loadFusionProgramsTo g 0 (rgFusionPrograms rg)
   -- Pass 3: region overlay in scheduled order (same contract as
   -- the unfused loader).
   mapM_ (addRegionTo g 0) scheduled
@@ -1939,6 +2123,9 @@ loadTemplateGraph g tg = do
               fail "loadTemplateGraph: RFused input requires the \
                    \fused loader; use loadTemplateGraphFused or \
                    \pass an unfused TemplateGraph."
+      -- Pass 2.5 (§7.D): generated-fusion program table for this
+      -- template. Same contract as the single-template loader.
+      loadFusionProgramsTo g cTid (rgFusionPrograms rg)
       -- Pass 3: register the region overlay in scheduled order
       -- (today identical to rrIndex order; see the matching note
       -- in 'loadRuntimeGraph'). See Note [Region fallback] in
@@ -2050,6 +2237,9 @@ loadTemplateGraphFused g tg = do
         when (rnElided node) $
           c_rt_graph_template_set_node_elided g cTid
             (cNodeIndex (rnIndex node))
+      -- Pass 2d (§7.D): generated-fusion program table for this
+      -- template. Same contract as the single-template loaders.
+      loadFusionProgramsTo g cTid (rgFusionPrograms rg)
       mapM_ (addRegionTo g cTid) scheduled
       -- Pass 4 (§4.E.2.C0a): layered-schedule metadata.
       addScheduleStepsTo g cTid scheduled steps
