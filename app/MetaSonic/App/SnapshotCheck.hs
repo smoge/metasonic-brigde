@@ -26,13 +26,21 @@ import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
                                                 ShapeSummary (..),
                                                 Variant (..),
                                                 collectFusionCostLabRows,
+                                                costLabGateIndex,
                                                 costLabShapeIndex,
                                                 familyName,
+                                                GateMeasurement,
                                                 measuredWinThreshold,
                                                 shapeKeyOf)
+import           MetaSonic.App.ProfitabilityGate (GateCounts (..),
+                                                  GateRow (..),
+                                                  evaluateGate,
+                                                  summarizeGate)
 import           MetaSonic.App.Survey          (CorpusGraphSummary (..),
                                                 KindTally,
-                                                SinkShape (..), renderShape,
+                                                SinkShape (..),
+                                                aggregateGateShapes,
+                                                gateInputFor, renderShape,
                                                 shapeHasKernel,
                                                 surveyCorpusGraph,
                                                 surveyEnsembleCorpus,
@@ -63,11 +71,13 @@ runSnapshotCheck = do
   costRows <- collectFusionCostLabRows FCL.defaultOptions
   let survey   = collectSurveySnapshots
       shapeIdx = costLabShapeIndex costRows
+      gateIdx  = costLabGateIndex  costRows
       checks =  costLabChecks costRows
              <> surveyChecks survey
              <> capabilityChecks survey
              <> plannerChecks survey
              <> costModelJoinChecks shapeIdx survey
+             <> profitabilityGateChecks gateIdx survey
 
   putStrLn "Phase 7 survey/cost-lab snapshot checks"
   putStrLn ""
@@ -627,6 +637,82 @@ costModelJoinChecks shapeIdx snapshots =
     expectedCovered        = 51
     expectedMeasured       = 14
     expectedNeedsBenchmark = 4
+
+-- §7.F profitability-gate invariants. The gate is a verdict
+-- function over the cost-model join; the pinned signals here are
+-- deliberately the deterministic, bench-noise-free ones:
+--
+--   * total gate rows — structural, moves only with corpus or
+--     planner-rule changes.
+--   * prefer-generated count — the safety invariant. Today it is
+--     0 on the snapshot corpus; if it flips above 0, a row newly
+--     prefers generated execution and a human should look before
+--     the snapshot moves.
+--   * needs-benchmark / unsupported / non-exact /
+--     covered-by-hand-kernel counts — all structural; move with
+--     corpus, generator coverage, §4.B kernel coverage, or
+--     correctness regressions respectively.
+--
+-- prefer-existing is intentionally NOT pinned: rows hovering near
+-- 'measuredWinThreshold' (1.05x) flap between prefer-existing and
+-- prefer-generated under bench noise, and locking that split
+-- would force snapshot to chase noise. The same discipline that
+-- already shields the 7.D/7.E pins.
+profitabilityGateChecks
+  :: M.Map ShapeKey GateMeasurement -> SurveySnapshots -> [SnapshotCheck]
+profitabilityGateChecks gateIdx snapshots =
+  [ check "gate total row count is stable"
+      (gcTotal counts == expectedTotal)
+      ("expected=" <> show expectedTotal
+       <> "; actual=" <> show (gcTotal counts))
+
+  , check "gate prefer-generated stays 0 (safety invariant)"
+      (gcPreferGenerated counts == 0)
+      ("expected=0; actual=" <> show (gcPreferGenerated counts))
+
+  , check "gate non-exact stays 0 (correctness invariant)"
+      (gcNonExact counts == 0)
+      ("expected=0; actual=" <> show (gcNonExact counts))
+
+  , check "gate unsupported count is stable"
+      (gcUnsupported counts == expectedUnsupported)
+      ("expected=" <> show expectedUnsupported
+       <> "; actual=" <> show (gcUnsupported counts))
+
+  , check "gate needs-benchmark count is stable"
+      (gcNeedsBenchmark counts == expectedNeedsBenchmark)
+      ("expected=" <> show expectedNeedsBenchmark
+       <> "; actual=" <> show (gcNeedsBenchmark counts))
+
+  , check "gate covered-by-hand-kernel count is stable"
+      (gcCoveredByHandKernel counts == expectedCovered)
+      ("expected=" <> show expectedCovered
+       <> "; actual=" <> show (gcCoveredByHandKernel counts))
+  ]
+  where
+    allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
+    verdicts =
+      [ v | (_, Right row) <- allRows, v <- csPlannerVerdicts row ]
+    shapes   = aggregateGateShapes verdicts
+    gateRows =
+      [ GateRow input (evaluateGate input)
+      | s <- shapes
+      , let input = gateInputFor gateIdx s
+      ]
+    counts = summarizeGate gateRows
+
+    -- Pinned. Bump intentionally when the survey corpus, planner
+    -- rule set, generator coverage, or §4.B kernel coverage
+    -- changes. Silent drift = the gate moved without a deliberate
+    -- decision.
+    --
+    -- These numbers are for the smaller snapshot corpus
+    -- (ssShapeRows <> ssEnsembleRows), not the wider
+    -- --fusion-survey corpus that drives interactive output.
+    expectedTotal          = 12
+    expectedUnsupported    = 1
+    expectedNeedsBenchmark = 1
+    expectedCovered        = 7
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =
