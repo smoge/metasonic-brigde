@@ -112,13 +112,30 @@ costLabChecks rows =
       ("expected=" <> intercalate "," expectedFamilyNames
        <> "; actual=" <> intercalate "," familyNames)
 
-  , check "cost-lab variants compile and measure"
-      (all rowMeasured rows)
-      ("unmeasured=" <> show (length [() | r <- rows, not (rowMeasured r)]))
+  , check "cost-lab non-generated variants compile and measure"
+      (all rowMeasured nonGeneratedRows)
+      ("unmeasured=" <> show (length [() | r <- nonGeneratedRows, not (rowMeasured r)]))
 
-  , check "cost-lab variants remain bit-equivalent"
-      (all ((== EqExact) . lrEquivalence) rows)
-      ("non-exact=" <> show (length [() | r <- rows, lrEquivalence r /= EqExact]))
+  , check "cost-lab non-generated variants remain bit-equivalent"
+      (all ((== EqExact) . lrEquivalence) nonGeneratedRows)
+      ("non-exact=" <> show (length [() | r <- nonGeneratedRows, lrEquivalence r /= EqExact]))
+
+  -- §7.D step 8: the generated variant has a narrow generator
+  -- today (only @[KGain, KOut]@ / @[KGain, KBusOut]@ shapes). Rows
+  -- the generator can emit a program for must measure and stay
+  -- bit-equivalent with the node-loop baseline; rows whose
+  -- selected candidate falls outside the generator's shape set
+  -- record an error and are honest "unchecked" entries.
+  , check "cost-lab generated variant: emitted programs stay bit-equivalent"
+      (all ((== EqExact) . lrEquivalence) generatedEmittedRows)
+      ("non-exact=" <> show
+        (length [() | r <- generatedEmittedRows
+                    , lrEquivalence r /= EqExact]))
+
+  , check "cost-lab generated variant: measured row count is stable"
+      (length generatedEmittedRows == expectedGeneratedRows)
+      ("expected=" <> show expectedGeneratedRows
+       <> "; actual=" <> show (length generatedEmittedRows))
 
   , check "cost-lab corpus carries declared latency coverage"
       corpusLatency
@@ -141,12 +158,12 @@ costLabChecks rows =
       ]
 
     expectedFamilyCounts =
-      [ ("add-chain",    12)
-      , ("corpus",       21)
-      , ("dynamic-gain",  9)
-      , ("fanout",        3)
-      , ("return-tail",   3)
-      , ("sink-chain",   12)
+      [ ("add-chain",    16)
+      , ("corpus",       28)
+      , ("dynamic-gain", 12)
+      , ("fanout",        4)
+      , ("return-tail",   4)
+      , ("sink-chain",   16)
       ]
 
     expectedRowCount =
@@ -162,6 +179,20 @@ costLabChecks rows =
       lrError r == Nothing
         && lrFeatures r /= Nothing
         && lrNsPerSample r /= Nothing
+
+    -- §7.D step 8: split the row set so the generated variant's
+    -- partial generator state (a real "no shape implemented yet"
+    -- signal) doesn't fail the non-generated checks.
+    nonGeneratedRows =
+      [r | r <- rows, lrVariant r /= VarGenerated]
+    generatedRows =
+      [r | r <- rows, lrVariant r == VarGenerated]
+    generatedEmittedRows =
+      [r | r <- generatedRows, lrError r == Nothing]
+    -- Pinned: the number of cost-lab members whose maximal
+    -- selected candidate the current generator handles. Bump this
+    -- intentionally when the generator widens to more shapes.
+    expectedGeneratedRows = 2
 
     corpusFeatures =
       [ f

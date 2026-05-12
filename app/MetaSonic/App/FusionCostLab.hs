@@ -83,6 +83,7 @@ module MetaSonic.App.FusionCostLab
 import           Control.Monad              (forM, forM_, replicateM_)
 import           Data.List                  (intercalate, sort, sortOn)
 import qualified Data.Map.Strict            as M
+import           Data.Maybe                 (catMaybes, isNothing)
 import qualified Data.Set                   as S
 import           Foreign                    (allocaArray, castPtr, peekArray)
 import           Foreign.C.Types            (CFloat (..))
@@ -91,6 +92,13 @@ import           GHC.Clock                  (getMonotonicTimeNSec)
 import           Text.Printf                (printf)
 
 import           MetaSonic.Bridge.Compile
+import           MetaSonic.Bridge.Compile.FusionProgram
+                                            (FusionOp (..),
+                                             FusionProgram (..),
+                                             FusionProgramId (..),
+                                             FusionSource (..),
+                                             ScratchIndex (..),
+                                             SinkPolicy (..))
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR        (lowerGraph)
 import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
@@ -100,7 +108,8 @@ import           MetaSonic.Bridge.Source
 import qualified MetaSonic.App.Demos        as Demos
 import qualified MetaSonic.Pattern.Corpus   as Corpus
 
-import           MetaSonic.Types            (NodeKind (..), kindLatency)
+import           MetaSonic.Types            (NodeIndex, NodeKind (..),
+                                             kindLatency)
 
 
 ------------------------------------------------------------
@@ -389,12 +398,25 @@ data Variant
     -- 'loadRuntimeGraphFused'. The fused regions live alongside
     -- the kernels, so this variant is "kernels + RFused", not
     -- "RFused alone."
+  | VarGenerated
+    -- ^ §7.D generated fusion program. Compiles to a stripped
+    -- 'RuntimeGraph' (every region 'ExecNodeLoop'), runs the
+    -- planner, then patches in a hand-emitted 'FusionProgram' for
+    -- the first generatable selected candidate. The generator is
+    -- intentionally narrow at this slice: it handles only the
+    -- @[KGain, KOut]@ / @[KGain, KBusOut]@ shape produced by the
+    -- dynamic-gain cost-lab family. Members whose maximal
+    -- selected candidate falls outside that shape record a compile
+    -- error for the row instead of silently falling back to
+    -- another variant — the column is meant to surface "does the
+    -- generated path exist for this shape" as an honest signal.
   deriving stock (Eq, Show, Bounded, Enum)
 
 variantName :: Variant -> String
 variantName VarNodeLoop     = "node-loop"
 variantName VarRegionKernel = "region-kernel"
 variantName VarRFused       = "rfused"
+variantName VarGenerated    = "generated"
 
 -- | The compiler facts we record per graph. The row schema stays
 -- deliberately small enough to inspect in JSONL, but it now includes
@@ -494,17 +516,147 @@ compileForVariant variant graph = do
     VarNodeLoop     -> stripRegionKernels <$> compileRuntimeGraphUnfused ir
     VarRegionKernel -> compileRuntimeGraph        ir
     VarRFused       -> compileRuntimeGraphFused   ir
+    VarGenerated    -> do
+      baseRG <- stripRegionKernels <$> compileRuntimeGraphUnfused ir
+      generateForCostLab baseRG
 
 loadForVariant :: Variant -> Ptr RTGraph -> RuntimeGraph -> IO ()
 loadForVariant VarNodeLoop     rt rg = loadRuntimeGraph      rt rg
 loadForVariant VarRegionKernel rt rg = loadRuntimeGraph      rt rg
 loadForVariant VarRFused       rt rg = loadRuntimeGraphFused rt rg
+loadForVariant VarGenerated    rt rg = loadRuntimeGraph      rt rg
 
 stripRegionKernels :: RuntimeGraph -> RuntimeGraph
 stripRegionKernels rg = rg
   { rgRuntimeRegions =
       map (\r -> r { rrExec = ExecNodeLoop }) (rgRuntimeRegions rg)
   }
+
+------------------------------------------------------------
+-- §7.D step 8: generator + region patcher for VarGenerated
+------------------------------------------------------------
+
+-- | Wire a 'RuntimeGraph' for the generated cost-lab variant.
+-- Picks the first selected planner candidate this slice's
+-- generator handles, emits a 'FusionProgram' for it, and patches
+-- the graph so the candidate's region splits into
+-- @[pre (NodeLoop), candidate (ExecGenerated), post (NodeLoop)]@.
+-- The patched graph runs through 'loadRuntimeGraph' identically
+-- to the other variants — the only difference is one region
+-- dispatches through the tiny C++ interpreter.
+generateForCostLab :: RuntimeGraph -> Either String RuntimeGraph
+generateForCostLab rg =
+  let verdicts = planRuntimeGraph rg
+      eligible =
+        [ (c, prog)
+        | c <- selectedFusionCandidates verdicts
+          -- 'fcMatchedShape == Nothing' = generated-eligible; a
+          -- §4.B-covered shape has a hand-written kernel already
+          -- and is not the cost-lab's target for the generated
+          -- column.
+        , isNothing (fcMatchedShape c)
+        , Right prog <- [generateProgram rg c]
+        ]
+  in case eligible of
+       []           -> Left "generated: no shape this slice can emit a program for"
+       (c, prog) :_ -> patchForGenerated rg c prog
+
+-- | v1 program generator. Handles @[KGain, KOut]@ /
+-- @[KGain, KBusOut]@ candidates only. Other shapes return 'Left'.
+generateProgram :: RuntimeGraph -> FusionCandidate -> Either String FusionProgram
+generateProgram rg c = case (fcMembers c, fcMemberKinds c) of
+  ([gainIx, outIx], [KGain, k]) | k == KOut || k == KBusOut -> do
+    gainNode <- lookupRtNode rg gainIx
+    outNode  <- lookupRtNode rg outIx
+    case rnInputs gainNode of
+      [signalIn, amountIn] -> do
+        signal <- inputAsSource signalIn
+        amount <- inputAsSource amountIn
+        bus    <- busFromControls (rnControls outNode)
+        Right FusionProgram
+          { fpOps =
+              [ OpMul (ScratchIndex 0) signal amount
+              , OpSinkWrite bus
+                  (SrcScratch (ScratchIndex 0))
+                  SinkOverwrite
+              ]
+          , fpScratchSlots = 1
+          }
+      _ -> Left "generated: gain node has unexpected input arity"
+  _ -> Left "generated: candidate shape not implemented yet"
+
+lookupRtNode :: RuntimeGraph -> NodeIndex -> Either String RuntimeNode
+lookupRtNode rg ix =
+  case [n | n <- rgNodes rg, rnIndex n == ix] of
+    (n : _) -> Right n
+    []      -> Left "generated: dangling NodeIndex in candidate"
+
+inputAsSource :: RuntimeInput -> Either String FusionSource
+inputAsSource (RFrom n p) = Right (SrcInput n p)
+inputAsSource (RConst v)  = Right (SrcConst v)
+inputAsSource (RFused _)  =
+  Left "generated: RFused inputs not supported"
+
+busFromControls :: [Double] -> Either String Int
+busFromControls (b : _) = Right (truncate b)
+busFromControls []      = Left "generated: Out has no bus control"
+
+-- | Split the candidate's region into pre / candidate / post and
+-- attach the program. The candidate must be contiguous within its
+-- region (dense-order property the planner already enforces).
+patchForGenerated
+  :: RuntimeGraph
+  -> FusionCandidate
+  -> FusionProgram
+  -> Either String RuntimeGraph
+patchForGenerated rg c prog =
+  let regions     = rgRuntimeRegions rg
+      candMembers = fcMembers c
+      hostsCand r = any (`elem` rrNodes r) candMembers
+  in case break hostsCand regions of
+       (_, []) -> Left "generated: candidate's region not found"
+       (regsPre, region : regsPost) -> do
+         (mPre, candRegion, mPost) <- splitRegion region candMembers
+         let split      = catMaybes [mPre, Just candRegion, mPost]
+             allRegions = regsPre <> split <> regsPost
+             renumbered =
+               [ r { rrIndex = RegionIndex i }
+               | (i, r) <- zip [0 ..] allRegions
+               ]
+         Right rg
+           { rgRuntimeRegions = renumbered
+           , rgFusionPrograms = [prog]
+           }
+
+splitRegion
+  :: RuntimeRegion
+  -> [NodeIndex]
+  -> Either String
+       ( Maybe RuntimeRegion
+       , RuntimeRegion
+       , Maybe RuntimeRegion
+       )
+splitRegion region candMembers =
+  let members = rrNodes region
+      pre     = takeWhile (`notElem` candMembers) members
+      rest    = drop (length pre) members
+      cand    = take (length candMembers) rest
+      post    = drop (length candMembers) rest
+      mkRegion nodes ex = RuntimeRegion
+        { rrIndex     = RegionIndex 0  -- renumbered by caller
+        , rrRate      = rrRate region
+        , rrNodes     = nodes
+        , rrExec      = ex
+        , rrFootprint = rrFootprint region
+        }
+  in if cand /= candMembers
+       then Left "generated: candidate not contiguous within its region"
+       else
+         Right
+           ( if null pre  then Nothing else Just (mkRegion pre  ExecNodeLoop)
+           , mkRegion cand (ExecGenerated (FusionProgramId 0))
+           , if null post then Nothing else Just (mkRegion post ExecNodeLoop)
+           )
 
 writtenOutputBuses :: RuntimeGraph -> [Int]
 writtenOutputBuses rg =
@@ -832,7 +984,8 @@ runMember :: GraphFamily -> FamilyMember -> IO [LabRow]
 runMember fam (FamilyMember label graph) = do
   -- Compile every variant once up front. Compile failure is
   -- recorded as a row with no timing, never aborts the lab run.
-  let variants = [VarNodeLoop, VarRegionKernel, VarRFused]
+  let variants =
+        [VarNodeLoop, VarRegionKernel, VarRFused, VarGenerated]
       compiled =
         [ (v, compileForVariant v graph) | v <- variants ]
 
