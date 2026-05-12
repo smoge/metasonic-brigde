@@ -6844,6 +6844,129 @@ static void finish_global_schedule_instance_blocks(RTGraph &g) noexcept {
   }
 }
 
+// Phase 7.D: tiny per-sample interpreter for a generated fusion
+// program. Iterates ops in declaration order each sample, reading
+// sources and writing scratch or bus values per op kind.
+//
+// Source resolution mirrors the hand-written kernels: 'Input' reads
+// 'node.outputs[port][sample]' (the referenced node must have
+// produced its output in an earlier region of the same block — the
+// planner's source-position rule + 'selectedFusionCandidates'
+// already enforces this), 'Control' reads 'node.controls[slot]'
+// once per sample without staging, 'Const' embeds the literal,
+// 'Scratch' reads the local per-program slot.
+//
+// Sink writes go through 'SinkAccumulator' with the region's
+// writer slot, matching the §4.E.2 contribution machinery the
+// hand-written kernels already use. v1 only emits 'SinkOverwrite'
+// programs; the policy field is preserved in the ABI but does not
+// change interpreter behavior today.
+//
+// Bounded scratch: programs declaring more than 'kMaxScratchSlots'
+// slots silent-no-op rather than spill. The bound is generous (64
+// floats) and rebuildable if a real shape needs more.
+static void process_fusion_program(
+    RTGraph &g,
+    GraphInstance &inst,
+    const FusionProgramSpec &program,
+    int nframes,
+    int writer_slot,
+    BusWriteMode mode) noexcept {
+  constexpr int kMaxScratchSlots = 64;
+  if (program.scratch_slots < 0
+      || program.scratch_slots > kMaxScratchSlots) {
+    return;
+  }
+  float scratch[kMaxScratchSlots]{};
+
+  // Open the sink lazily on the first 'SinkWrite' op so programs
+  // with no sink write (legal in the ABI; just a no-op) skip the
+  // writer-slot bookkeeping entirely. v1 expects one sink per
+  // program; if a future program writes to multiple buses, the
+  // 'sink_bus != op.dst' guard re-opens.
+  std::optional<SinkAccumulator> sink;
+  int sink_bus = -1;
+
+  for (int sample = 0; sample < nframes; ++sample) {
+    for (const FusionOpSpec &op : program.ops) {
+      auto read_source = [&](const FusionSourceSpec &src) -> float {
+        switch (src.tag) {
+          case FusionSrcTag::Const:
+            return static_cast<float>(src.const_value);
+          case FusionSrcTag::Input: {
+            if (src.idx_a < 0
+                || src.idx_a >= static_cast<int>(inst.nodes.size()))
+              return 0.0f;
+            const auto &n = inst.nodes[src.idx_a];
+            if (src.idx_b < 0
+                || src.idx_b >= static_cast<int>(n.outputs.size()))
+              return 0.0f;
+            if (sample
+                >= static_cast<int>(n.outputs[src.idx_b].size()))
+              return 0.0f;
+            return n.outputs[src.idx_b][sample];
+          }
+          case FusionSrcTag::Control: {
+            if (src.idx_a < 0
+                || src.idx_a >= static_cast<int>(inst.nodes.size()))
+              return 0.0f;
+            const auto &n = inst.nodes[src.idx_a];
+            if (src.idx_b < 0
+                || src.idx_b >= static_cast<int>(n.controls.size()))
+              return 0.0f;
+            return static_cast<float>(n.controls[src.idx_b]);
+          }
+          case FusionSrcTag::Scratch:
+            if (src.idx_a < 0 || src.idx_a >= program.scratch_slots)
+              return 0.0f;
+            return scratch[src.idx_a];
+        }
+        return 0.0f;  // unreachable; clang -Wreturn-type
+      };
+
+      // Scratch-destination ops bounds-check; sink-write checks
+      // its own dst (bus index) separately.
+      const bool scratch_dst_ok =
+          op.kind == FusionOpKind::SinkWrite
+          || (op.dst >= 0 && op.dst < program.scratch_slots);
+      if (!scratch_dst_ok) continue;
+
+      switch (op.kind) {
+        case FusionOpKind::LoadConst:
+          scratch[op.dst] = static_cast<float>(op.const_value);
+          break;
+        case FusionOpKind::LoadInput:
+          scratch[op.dst] = read_source(op.src1);
+          break;
+        case FusionOpKind::Add:
+          scratch[op.dst] =
+              read_source(op.src1) + read_source(op.src2);
+          break;
+        case FusionOpKind::Mul:
+          scratch[op.dst] =
+              read_source(op.src1) * read_source(op.src2);
+          break;
+        case FusionOpKind::SinkWrite: {
+          const float value = read_source(op.src1);
+          if (!sink.has_value() || sink_bus != op.dst) {
+            if (sink.has_value()) sink->flush_to(inst);
+            sink.emplace(SinkAccumulator::open(
+                g, inst, static_cast<double>(op.dst), writer_slot,
+                nframes, mode));
+            sink_bus = op.dst;
+          }
+          sink->push(static_cast<std::size_t>(sample), value);
+          break;
+        }
+      }
+    }
+  }
+
+  if (sink.has_value()) {
+    sink->flush_to(inst);
+  }
+}
+
 static void process_region(
     RTGraph &g,
     const MetaDef &def,
@@ -6856,6 +6979,24 @@ static void process_region(
   const std::size_t first = static_cast<std::size_t>(r.first_node);
   const std::size_t end_excl =
       std::min(node_count, first + static_cast<std::size_t>(r.node_count));
+
+  // Phase 7.D: generated fusion program dispatch. Takes priority
+  // over kernel-based dispatch — a region carrying a valid
+  // generated_program_id runs the interpreter and skips the
+  // per-node loop. Invalid ids (program table empty, id out of
+  // range) silent-fall-through to the kernel/per-node paths,
+  // matching the construction-side silent-no-op policy.
+  if (r.generated_program_id >= 0
+      && r.generated_program_id
+             < static_cast<int>(def.fusion_programs.size())) {
+    const int writer_slot = ctx.bus_writes.reserve_writer_slot();
+    process_fusion_program(
+        g, inst,
+        def.fusion_programs[r.generated_program_id],
+        nframes, writer_slot, ctx.bus_writes.mode);
+    fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
+    return;
+  }
 
   // Fused-kernel dispatch. A kind-sequence mismatch falls back
   // to per-node iteration so a stale or misshapen tag silently
