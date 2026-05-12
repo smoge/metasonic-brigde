@@ -7095,24 +7095,38 @@ static void process_fusion_program_block(
 // Phase 7.I superinstruction kind. Pure structural classification of
 // a FusionProgram: a value other than NotRecognized is a promise that
 // the program's op sequence matches one of the v1 recognized shapes
-// exactly. The recognizer reads the same FusionProgramSpec fields
+// exactly *and* that every operand the super executor extracts as an
+// "external" read (Input / Const / Control) is not in fact a scratch
+// reference. The recognizer reads the same FusionProgramSpec fields
 // the block-major and sample-major executors do; nothing else
 // influences classification.
 enum class FusionSuperKind : int {
   NotRecognized = 0,
   GainOut       = 1,  // OpMul s0 a b ; OpSinkWrite bus (SrcScratch s0)
+                      // where a, b are not SrcScratch.
   AddGainOut    = 2,  // OpAdd s0 a b ; OpMul s1 (SrcScratch s0) c ;
-                      // OpSinkWrite bus (SrcScratch s1)
+                      // OpSinkWrite bus (SrcScratch s1) where a, b, c
+                      // are not SrcScratch.
 };
+
+// True iff @src is anything but a scratch read. The super executor
+// inlines such operands without going through scratch storage; if a
+// recognized shape carried a scratch operand here, the fast path
+// would read 0.0f and silently miscompute. Keep this gate honest.
+static bool is_extractable_operand(const FusionSourceSpec &src) noexcept {
+  return src.tag != FusionSrcTag::Scratch;
+}
 
 static FusionSuperKind classify_fusion_super(
     const FusionProgramSpec &program) noexcept {
   // GainOut: two ops, scratch slot 0, multiply-into-scratch then
-  // sink-from-scratch.
+  // sink-from-scratch. Mul operands must be inline-extractable.
   if (program.ops.size() == 2 && program.scratch_slots == 1) {
     const FusionOpSpec &mul  = program.ops[0];
     const FusionOpSpec &sink = program.ops[1];
     if (mul.kind == FusionOpKind::Mul && mul.dst == 0
+        && is_extractable_operand(mul.src1)
+        && is_extractable_operand(mul.src2)
         && sink.kind == FusionOpKind::SinkWrite
         && sink.src1.tag == FusionSrcTag::Scratch
         && sink.src1.idx_a == 0) {
@@ -7120,15 +7134,20 @@ static FusionSuperKind classify_fusion_super(
     }
   }
   // AddGainOut: three ops, scratch slots 0 and 1, add-into-s0 then
-  // mul(s0, c)-into-s1 then sink-from-s1.
+  // mul(s0, c)-into-s1 then sink-from-s1. The add's operands and the
+  // mul's second operand must be inline-extractable; only the mul's
+  // first operand is allowed (and required) to be SrcScratch[0].
   if (program.ops.size() == 3 && program.scratch_slots == 2) {
     const FusionOpSpec &add  = program.ops[0];
     const FusionOpSpec &mul  = program.ops[1];
     const FusionOpSpec &sink = program.ops[2];
     if (add.kind == FusionOpKind::Add && add.dst == 0
+        && is_extractable_operand(add.src1)
+        && is_extractable_operand(add.src2)
         && mul.kind == FusionOpKind::Mul && mul.dst == 1
         && mul.src1.tag == FusionSrcTag::Scratch
         && mul.src1.idx_a == 0
+        && is_extractable_operand(mul.src2)
         && sink.kind == FusionOpKind::SinkWrite
         && sink.src1.tag == FusionSrcTag::Scratch
         && sink.src1.idx_a == 1) {
@@ -7180,10 +7199,14 @@ static void process_fusion_program_super(
         return static_cast<float>(n.controls[src.idx_b]);
       }
       case FusionSrcTag::Scratch:
-        // Recognized super kernels never read SrcScratch directly;
-        // their scratch operands have been extracted into operand
-        // FusionSourceSpecs already. This branch is reachable only
-        // from the fallback path, which uses block-major's reader.
+        // Unreachable for recognized super kernels by construction:
+        // 'classify_fusion_super' rejects any program whose
+        // inline-extracted operands are SrcScratch, and the only
+        // SrcScratch read the recognized shapes do carry (the
+        // AddGainOut mul.src1) is handled directly in the kernel
+        // body without going through 'read_source'. The fallback
+        // path uses 'process_fusion_program_block' and never enters
+        // this lambda.
         return 0.0f;
     }
     return 0.0f;

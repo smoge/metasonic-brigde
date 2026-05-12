@@ -1472,32 +1472,61 @@ generatedTailSweepOwnedLengths =
 -- equivalence test pins the two implementations together; the
 -- enum below decides recognized vs fallback counts at snapshot
 -- time without polling any runtime counter.
+--
+-- The classifier additionally rejects programs whose
+-- inline-extracted operands are 'SrcScratch'. The super executor
+-- inlines such operands directly into a per-sample kernel; a
+-- scratch reference there would read 0 and silently miscompute.
+-- The only scratch reference a recognized shape may carry is the
+-- 'AddGainOut' multiply's first operand (the add result); both
+-- the C++ and Haskell sides handle that one specially.
 data FusionSuperKind
   = FusionSuperNotRecognized
     -- ^ Super-mode would fall through to the block-major executor.
   | FusionSuperGainOut
-    -- ^ Two-op program: @OpMul s0 a b ; OpSinkWrite bus (SrcScratch s0)@.
+    -- ^ Two-op program: @OpMul s0 a b ; OpSinkWrite bus (SrcScratch s0)@
+    --   where @a@ and @b@ are not 'SrcScratch'.
   | FusionSuperAddGainOut
     -- ^ Three-op program: @OpAdd s0 a b ; OpMul s1 (SrcScratch s0) c ;@
-    --   @OpSinkWrite bus (SrcScratch s1)@.
+    --   @OpSinkWrite bus (SrcScratch s1)@ where @a@, @b@, and @c@
+    --   are not 'SrcScratch'.
   deriving (Eq, Show, Bounded, Enum)
+
+-- | True iff @src@ is anything but a scratch read. The super-mode
+-- executor extracts such operands inline into a per-sample
+-- arithmetic expression; a scratch operand in that position would
+-- silently read 0 and miscompute the kernel.
+isExtractableOperand :: FusionSource -> Bool
+isExtractableOperand (SrcScratch _) = False
+isExtractableOperand _              = True
 
 -- | Classify a 'FusionProgram' against the v1 super-mode
 -- recognizer set. Programs that don't match any recognized
--- shape return 'FusionSuperNotRecognized'.
+-- shape — including ones whose op kinds match but whose
+-- inline-extracted operands are 'SrcScratch' — return
+-- 'FusionSuperNotRecognized'.
 classifyFusionSuper :: FusionProgram -> FusionSuperKind
 classifyFusionSuper prog = case fpOps prog of
-  -- GainOut: [OpMul s0 _ _, OpSinkWrite _ (SrcScratch s0) _]
-  [ OpMul (ScratchIndex 0) _ _
+  -- GainOut: [OpMul s0 a b, OpSinkWrite _ (SrcScratch s0) _]
+  -- with a, b inline-extractable.
+  [ OpMul (ScratchIndex 0) a b
    , OpSinkWrite _ (SrcScratch (ScratchIndex 0)) _
-   ] | fpScratchSlots prog == 1 -> FusionSuperGainOut
+   ] | fpScratchSlots prog == 1
+     , isExtractableOperand a
+     , isExtractableOperand b
+     -> FusionSuperGainOut
 
-  -- AddGainOut: [OpAdd s0 _ _, OpMul s1 (SrcScratch s0) _,
-  --              OpSinkWrite _ (SrcScratch s1) _]
-  [ OpAdd (ScratchIndex 0) _ _
-   , OpMul (ScratchIndex 1) (SrcScratch (ScratchIndex 0)) _
+  -- AddGainOut: [OpAdd s0 a b, OpMul s1 (SrcScratch s0) c,
+  --              OpSinkWrite _ (SrcScratch s1) _] with a, b, c
+  -- inline-extractable.
+  [ OpAdd (ScratchIndex 0) a b
+   , OpMul (ScratchIndex 1) (SrcScratch (ScratchIndex 0)) c
    , OpSinkWrite _ (SrcScratch (ScratchIndex 1)) _
-   ] | fpScratchSlots prog == 2 -> FusionSuperAddGainOut
+   ] | fpScratchSlots prog == 2
+     , isExtractableOperand a
+     , isExtractableOperand b
+     , isExtractableOperand c
+     -> FusionSuperAddGainOut
 
   _ -> FusionSuperNotRecognized
 
