@@ -33,9 +33,12 @@
 --     deterministic bus-name allocation and diagnostic-only
 --     authoring metadata.
 --
--- Out of the current slice: named-control authoring objects
--- (Phase 8.F), and inspector metadata that surfaces authoring
--- constructs alongside the primitive graph (Phase 8.G).
+--   * Named controls that lower to tagged 'KSmooth' nodes and
+--     optionally record MIDI CC bindings through the same Source-layer
+--     path as 'cc'.
+--
+-- Out of the current slice: inspector metadata that surfaces
+-- authoring constructs alongside the primitive graph (Phase 8.G).
 --
 -- The deliberate-lowering contract is pinned by tests in
 -- @authoringDslTests@ (see @test/Spec.hs@): every public helper
@@ -115,9 +118,12 @@ module MetaSonic.Authoring
   , stereoOut
   , outChannels
 
-    -- * Ensemble builder (Phase 8.E)
-  , ControlName (..)
-  , ControlRange (..)
+    -- * Named controls (Phase 8.F)
+  , ControlName
+  , unControlName
+  , ControlRange
+  , crMin
+  , crMax
   , ControlOptions (..)
   , defaultControlOptions
   , NamedControlMetadata (..)
@@ -130,6 +136,8 @@ module MetaSonic.Authoring
   , ccControlWith
   , controlMono
   , controlConnection
+
+    -- * Ensemble builder (Phase 8.E)
   , AuthoredEnsemble (..)
   , EnsembleOptions (..)
   , defaultEnsembleOptions
@@ -715,12 +723,15 @@ controlName s
       || (c >= '0' && c <= '9')
       || c == '_' || c == '-'
 
--- | Validate a @[min, max]@ range. Rejects @min >= max@: a
--- zero-width range has no meaningful MIDI scaling, and the
--- OSC layer does not clamp at runtime, so an inverted range
+-- | Validate a @[min, max]@ range. Rejects non-finite values and
+-- @min >= max@: a zero-width range has no meaningful MIDI scaling,
+-- and the OSC layer does not clamp at runtime, so an inverted range
 -- would silently produce surprising behavior.
 controlRange :: Double -> Double -> Either String ControlRange
 controlRange mn mx
+  | not (finite mn) || not (finite mx) =
+      Left $ "controlRange: bounds must be finite (min="
+          <> show mn <> ", max=" <> show mx <> ")"
   | mn >= mx =
       Left $ "controlRange: min ("
           <> show mn
@@ -729,6 +740,8 @@ controlRange mn mx
           <> ")"
   | otherwise =
       Right ControlRange { crMin = mn, crMax = mx }
+  where
+    finite x = not (isNaN x || isInfinite x)
 
 -- | Author a named, smoothed control under
 -- 'defaultControlOptions'. Emits exactly one tagged 'KSmooth'

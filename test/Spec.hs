@@ -1057,15 +1057,15 @@ authoringDslTests =
       Auth.coSmoothingHz Auth.defaultControlOptions @?= 20.0
 
   , testCase "controlName accepts OSC-safe identifiers" $ do
-      Auth.controlName "cutoff"
-        @?= Right (Auth.ControlName "cutoff")
-      Auth.controlName "vol"
-        @?= Right (Auth.ControlName "vol")
-      Auth.controlName "a_b-c"
-        @?= Right (Auth.ControlName "a_b-c")
+      fmap Auth.unControlName (Auth.controlName "cutoff")
+        @?= Right "cutoff"
+      fmap Auth.unControlName (Auth.controlName "vol")
+        @?= Right "vol"
+      fmap Auth.unControlName (Auth.controlName "a_b-c")
+        @?= Right "a_b-c"
       -- 16 bytes is the longest legal name.
-      Auth.controlName "0123456789abcdef"
-        @?= Right (Auth.ControlName "0123456789abcdef")
+      fmap Auth.unControlName (Auth.controlName "0123456789abcdef")
+        @?= Right "0123456789abcdef"
 
   , testCase "controlName rejects empty names" $
       case Auth.controlName "" of
@@ -1086,14 +1086,30 @@ authoringDslTests =
         Right _ -> assertFailure "expected 17-byte rejection"
 
   , testCase "controlRange accepts min < max and rejects min >= max" $ do
-      Auth.controlRange 0 1
-        @?= Right (Auth.ControlRange 0 1)
+      case Auth.controlRange 0 1 of
+        Right rng -> do
+          Auth.crMin rng @?= 0
+          Auth.crMax rng @?= 1
+        Left err -> assertFailure err
       case Auth.controlRange 1 0 of
         Left _  -> pure ()
         Right _ -> assertFailure "expected inverted-range rejection"
       case Auth.controlRange 0.5 0.5 of
         Left _  -> pure ()
         Right _ -> assertFailure "expected zero-width rejection"
+
+  , testCase "controlRange rejects non-finite bounds" $ do
+      let nan = 0 / 0 :: Double
+          inf = 1 / 0 :: Double
+      case Auth.controlRange nan 1 of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected NaN min rejection"
+      case Auth.controlRange 0 nan of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected NaN max rejection"
+      case Auth.controlRange 0 inf of
+        Left _  -> pure ()
+        Right _ -> assertFailure "expected infinite max rejection"
 
   , testCase "control emits exactly one KSmooth tagged with the control name" $ do
       let Right cname = Auth.controlName "cutoff"
@@ -1194,15 +1210,21 @@ authoringDslTests =
       case OSC.dispatch rs0 msg of
         Right (OSC.DAControlWrite
                   { OSC.daSlotId     = 1
+                  , OSC.daNodeIndex  = nodeIx
                   , OSC.daControlIdx = 1
                   , OSC.daValue      = v
                   }) -> do
           v @?= 1500.0
           -- Sanity: the resolved node is the smoother that backs
           -- the returned NamedControl.
-          let _ = nc  -- pin: the NamedControl is the same shape
-                      -- the dispatcher targets
-          pure ()
+          let smootherTargets =
+                [ rnIndex n
+                | tpl <- tgTemplates tg
+                , n   <- rgNodes (tplGraph tpl)
+                , rnKind n == KSmooth
+                , rnMigrationKey n == Just (Auth.ncmKey (Auth.ncMetadata nc))
+                ]
+          smootherTargets @?= [nodeIx]
         other -> assertFailure
                    ("expected control-write dispatch, got: " <> show other)
 
