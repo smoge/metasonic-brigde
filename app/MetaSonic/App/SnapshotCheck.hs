@@ -16,14 +16,17 @@ import           Control.Monad                 (forM_)
 import           Data.List                     (intercalate, nub, sort)
 import           System.Exit                   (die)
 
+import qualified Data.Map.Strict               as M
 import qualified MetaSonic.App.FusionCostLab   as FCL
 import           MetaSonic.App.FusionCostLab   (EquivalenceStatus (..),
                                                 FusionCaseFeatures (..),
                                                 GraphFamily (..),
                                                 LabRow (..),
+                                                ShapeSummary (..),
                                                 Variant (..),
                                                 collectFusionCostLabRows,
-                                                familyName)
+                                                costLabShapeIndex,
+                                                familyName, shapeKeyOf)
 import           MetaSonic.App.Survey          (CorpusGraphSummary (..),
                                                 KindTally,
                                                 SinkShape (..), renderShape,
@@ -55,11 +58,13 @@ data SurveySnapshots = SurveySnapshots
 runSnapshotCheck :: IO ()
 runSnapshotCheck = do
   costRows <- collectFusionCostLabRows FCL.defaultOptions
-  let survey = collectSurveySnapshots
+  let survey   = collectSurveySnapshots
+      shapeIdx = costLabShapeIndex costRows
       checks =  costLabChecks costRows
              <> surveyChecks survey
              <> capabilityChecks survey
              <> plannerChecks survey
+             <> costModelJoinChecks shapeIdx survey
 
   putStrLn "Phase 7 survey/cost-lab snapshot checks"
   putStrLn ""
@@ -451,6 +456,75 @@ reasonTagName r = case r of
 renderReasonCounts :: [(String, Int)] -> String
 renderReasonCounts xs =
   intercalate "," [tag <> "=" <> show n | (tag, n) <- xs]
+
+-- §7.C cost-model join invariants on the snapshot corpus. Counts
+-- per class (covered / measured-win / measured-loss / needs-
+-- benchmark) are pinned. The needs-benchmark count is the Phase
+-- 7.D gate signal — when it is high relative to generated-eligible,
+-- the cost lab needs new families before the executor lands.
+costModelJoinChecks :: M.Map [Int] ShapeSummary
+                    -> SurveySnapshots -> [SnapshotCheck]
+costModelJoinChecks shapeIdx snapshots =
+  [ check "cost-model join class totals are stable"
+      (classCounts == expectedClassCounts)
+      ("expected=" <> renderClassCounts expectedClassCounts
+       <> "; actual=" <> renderClassCounts classCounts)
+
+  , check "cost-model join total matches selected-candidate count"
+      (sumClasses classCounts == selectedCount)
+      ("class-sum=" <> show (sumClasses classCounts)
+       <> "; selected=" <> show selectedCount)
+  ]
+  where
+    allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
+
+    -- One (kinds, matchedShape) pair per selected candidate
+    -- occurrence — same granularity as the survey table count.
+    candidates =
+      [ (fcMemberKinds c, fcMatchedShape c)
+      | (_, Right row) <- allRows
+      , c <- selectedFusionCandidates (csPlannerVerdicts row)
+      ]
+
+    selectedCount = length candidates
+
+    classifyEntry (_, Just _) = "covered"
+    classifyEntry (kinds, Nothing) =
+      case M.lookup (shapeKeyOf kinds) shapeIdx of
+        Just summ
+          | ssSpeedup summ > 1.0 -> "measured-win"
+          | otherwise            -> "measured-loss"
+        Nothing                  -> "needs-benchmark"
+
+    classCounts :: [(String, Int)]
+    classCounts =
+      [ (cls, length (filter ((== cls) . classifyEntry) candidates))
+      | cls <- classOrder
+      ]
+
+    sumClasses = sum . map snd
+
+    classOrder =
+      [ "covered"
+      , "measured-win"
+      , "measured-loss"
+      , "needs-benchmark"
+      ]
+
+    -- Pinned snapshot. Bump these intentionally when the cost-lab
+    -- corpus changes, a planner rule changes, or the snapshot
+    -- corpus changes; a silent shift means the join drifted.
+    expectedClassCounts :: [(String, Int)]
+    expectedClassCounts =
+      [ ("covered",         51)
+      , ("measured-win",     7)
+      , ("measured-loss",    0)
+      , ("needs-benchmark", 11)
+      ]
+
+renderClassCounts :: [(String, Int)] -> String
+renderClassCounts xs =
+  intercalate "," [cls <> "=" <> show n | (cls, n) <- xs]
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =
