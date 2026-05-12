@@ -25,6 +25,10 @@ import           Foreign.C.Types           (CInt)
 import           System.Exit               (die)
 
 import           MetaSonic.App.Demos
+import qualified MetaSonic.App.FusionCostLab as FCL
+import           MetaSonic.App.FusionCostLab (ShapeSummary (..),
+                                              costLabShapeIndex,
+                                              shapeKeyOf)
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
@@ -1549,7 +1553,9 @@ runFusionSurvey demos = do
   putStrLn ""
   printPlannerVerdicts allRows
   putStrLn ""
-  printCostModelJoin allRows
+  costLabRows <- FCL.collectFusionCostLabRows FCL.defaultOptions
+  let shapeIdx = costLabShapeIndex costLabRows
+  printCostModelJoin shapeIdx allRows
   putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
@@ -2509,18 +2515,27 @@ costModelRows classify rows =
     classRank ClsMeasuredLoss   = 2
     classRank ClsNeedsBenchmark = 3
 
--- | Placeholder classifier used by commit 2: every generated-eligible
--- shape becomes 'ClsNeedsBenchmark'. The real classifier is layered
--- on by the cost-lab join slice.
-defaultCostModelClassifier
-  :: ([NodeKind], Maybe RegionKernel) -> (CostModelClass, Maybe Double)
-defaultCostModelClassifier (_, Just _)  = (ClsCovered,        Nothing)
-defaultCostModelClassifier (_, Nothing) = (ClsNeedsBenchmark, Nothing)
+-- | Classify a selected-candidate shape against the cost-lab index.
+-- §4.B-matched shapes are 'ClsCovered' (the hand-written kernel is
+-- the path); generated-eligible shapes look up the cost-lab summary
+-- by key and split into measured-win / measured-loss / needs-
+-- benchmark.
+costModelClassifier
+  :: M.Map [Int] ShapeSummary
+  -> ([NodeKind], Maybe RegionKernel)
+  -> (CostModelClass, Maybe Double)
+costModelClassifier _ (_, Just _) = (ClsCovered, Nothing)
+costModelClassifier idx (kinds, Nothing) =
+  case M.lookup (shapeKeyOf kinds) idx of
+    Just summ
+      | ssSpeedup summ > 1.0 -> (ClsMeasuredWin,  Just (ssSpeedup summ))
+      | otherwise            -> (ClsMeasuredLoss, Just (ssSpeedup summ))
+    Nothing                  -> (ClsNeedsBenchmark, Nothing)
 
-printCostModelJoin :: [SurveyRow] -> IO ()
-printCostModelJoin rows = do
+printCostModelJoin :: M.Map [Int] ShapeSummary -> [SurveyRow] -> IO ()
+printCostModelJoin idx rows = do
   putStrLn "─── Phase 7.C cost-model join ───"
-  let allRows = costModelRows defaultCostModelClassifier rows
+  let allRows = costModelRows (costModelClassifier idx) rows
       total   = sum (map cmrCount allRows)
       countOf cls =
         sum [ cmrCount r | r <- allRows, cmrClass r == cls ]

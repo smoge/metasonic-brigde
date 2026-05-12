@@ -72,10 +72,15 @@ module MetaSonic.App.FusionCostLab
   , FusionCaseFeatures (..)
   , extractFeatures
   , EquivalenceStatus (..)
+    -- * Shape-keyed cost-model index (§7.C cost-model join)
+  , ShapeSummary (..)
+  , costLabShapeIndex
+  , shapeKeyOf
   ) where
 
 import           Control.Monad              (forM, forM_, replicateM_)
-import           Data.List                  (intercalate, sort)
+import           Data.List                  (intercalate, sort, sortOn)
+import qualified Data.Map.Strict            as M
 import qualified Data.Set                   as S
 import           Foreign                    (allocaArray, castPtr, peekArray)
 import           Foreign.C.Types            (CFloat (..))
@@ -86,6 +91,9 @@ import           Text.Printf                (printf)
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR        (lowerGraph)
+import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
+                                             planRuntimeGraph,
+                                             selectedFusionCandidates)
 import           MetaSonic.Bridge.Source
 import qualified MetaSonic.App.Demos        as Demos
 import qualified MetaSonic.Pattern.Corpus   as Corpus
@@ -565,6 +573,109 @@ runFusionCostLab opts = do
 collectFusionCostLabRows :: FusionCostLabOptions -> IO [LabRow]
 collectFusionCostLabRows opts =
   concat <$> mapM runFamily (fcoFamilies opts)
+
+------------------------------------------------------------
+-- §7.C cost-model join: shape-keyed cost-lab index
+------------------------------------------------------------
+
+-- | Per-shape measurement summary keyed by 'shapeKeyOf' (the
+-- 'fromEnum'-encoded 'NodeKind' sequence of a candidate's
+-- 'fcMemberKinds'). Built once from a @[LabRow]@ corpus by
+-- 'costLabShapeIndex' and consumed by the survey to classify
+-- selected planner candidates.
+--
+-- 'ssSpeedup' is @ssBaselineNs / ssFastestNs@. A value > 1 is a
+-- measured win for the non-baseline path; ≤ 1 is a measured loss.
+data ShapeSummary = ShapeSummary
+  { ssSpeedup        :: !Double
+  , ssFastestVariant :: !Variant
+  , ssBaselineNs     :: !Double
+  , ssFastestNs      :: !Double
+  } deriving (Eq, Show)
+
+-- | Encode a candidate's 'fcMemberKinds' as an order-preserving key
+-- usable in a 'Data.Map' (since 'NodeKind' lacks 'Ord' but has
+-- 'Enum').
+shapeKeyOf :: [NodeKind] -> [Int]
+shapeKeyOf = map fromEnum
+
+-- | Build a map from candidate shape key to the best measured
+-- speedup. For each cost-lab family member, the function
+-- re-compiles the member's 'SynthGraph', runs the planner, and
+-- maps each selected candidate's shape key to a 'ShapeSummary'
+-- derived from the row's measured ns/sample.
+--
+-- Pre-conditions for a member to contribute:
+--
+--   * The 'VarNodeLoop' row has a non-Nothing 'lrNsPerSample'.
+--   * At least one non-baseline row ('VarRegionKernel' or
+--     'VarRFused') has a non-Nothing 'lrNsPerSample'.
+--
+-- Members that fail equivalence or compile checks contribute
+-- nothing; the corresponding shape remains @needs-benchmark@ from
+-- the survey's perspective.
+--
+-- When two members contribute the same shape key with different
+-- speedups, the entry with the larger 'ssSpeedup' wins. This
+-- favors the measurement most likely to make a shape look
+-- @measured-win@; the join intentionally surfaces the strongest
+-- evidence for a shape, not the average.
+costLabShapeIndex :: [LabRow] -> M.Map [Int] ShapeSummary
+costLabShapeIndex rows =
+  M.fromListWith preferFaster $ concat
+    [ [(k, summ) | k <- shapeKeysOf graph]
+    | (fam, name, graph) <- familyGraphs
+    , Just summ <- [memberSummary fam name]
+    ]
+  where
+    familyGraphs =
+      [ (fam, name, graph)
+      | fam <- [minBound .. maxBound :: GraphFamily]
+      , FamilyMember name graph <- familyMembers fam
+      ]
+
+    memberSummary :: GraphFamily -> String -> Maybe ShapeSummary
+    memberSummary fam name =
+      let memberRows =
+            [ r
+            | r <- rows
+            , lrFamily r  == fam
+            , lrMember r  == name
+            , lrError r   == Nothing
+            ]
+          baseline =
+            [ ns
+            | r <- memberRows
+            , lrVariant r == VarNodeLoop
+            , Just ns <- [lrNsPerSample r]
+            ]
+          nonBaseline =
+            [ (lrVariant r, ns)
+            | r <- memberRows
+            , lrVariant r /= VarNodeLoop
+            , Just ns <- [lrNsPerSample r]
+            ]
+      in case (baseline, sortOn snd nonBaseline) of
+           (bns : _, (variant, fns) : _) ->
+             Just ShapeSummary
+               { ssSpeedup        = bns / fns
+               , ssFastestVariant = variant
+               , ssBaselineNs     = bns
+               , ssFastestNs      = fns
+               }
+           _ -> Nothing
+
+    shapeKeysOf graph =
+      case lowerGraph graph >>= compileRuntimeGraph of
+        Right rg ->
+          [ shapeKeyOf (fcMemberKinds c)
+          | c <- selectedFusionCandidates (planRuntimeGraph rg)
+          ]
+        Left _ -> []
+
+    preferFaster a b
+      | ssSpeedup a >= ssSpeedup b = a
+      | otherwise                   = b
 
 runFamily :: GraphFamily -> IO [LabRow]
 runFamily fam = concat <$> mapM (runMember fam) (familyMembers fam)
