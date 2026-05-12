@@ -37,6 +37,7 @@ import           MetaSonic.App.ProfitabilityGate (GateCounts (..),
                                                   evaluateGate,
                                                   summarizeGate)
 import           MetaSonic.App.Survey          (CorpusGraphSummary (..),
+                                                GateShapeRow (..),
                                                 KindTally,
                                                 SinkShape (..),
                                                 aggregateGateShapes,
@@ -688,18 +689,26 @@ profitabilityGateChecks gateIdx snapshots =
       (gcCoveredByHandKernel counts == expectedCovered)
       ("expected=" <> show expectedCovered
        <> "; actual=" <> show (gcCoveredByHandKernel counts))
+
+  , check "gate occurrence count matches selected candidates"
+      (selectedOccurrenceCount == selectedCount)
+      ("gate-occurrences=" <> show selectedOccurrenceCount
+       <> "; selected=" <> show selectedCount)
   ]
   where
     allRows = ssShapeRows snapshots <> ssEnsembleRows snapshots
-    verdicts =
-      [ v | (_, Right row) <- allRows, v <- csPlannerVerdicts row ]
-    shapes   = aggregateGateShapes verdicts
+    verdictGroups =
+      [ csPlannerVerdicts row | (_, Right row) <- allRows ]
+    selectedCount =
+      sum (map (length . selectedFusionCandidates) verdictGroups)
+    shapes   = aggregateGateShapes verdictGroups
     gateRows =
       [ GateRow input (evaluateGate input)
       | s <- shapes
       , let input = gateInputFor gateIdx s
       ]
     counts = summarizeGate gateRows
+    selectedOccurrenceCount = sum (map gsrCount shapes)
 
     -- Pinned. Bump intentionally when the survey corpus, planner
     -- rule set, generator coverage, or §4.B kernel coverage
@@ -709,10 +718,10 @@ profitabilityGateChecks gateIdx snapshots =
     -- These numbers are for the smaller snapshot corpus
     -- (ssShapeRows <> ssEnsembleRows), not the wider
     -- --fusion-survey corpus that drives interactive output.
-    expectedTotal          = 12
+    expectedTotal          = 23
     expectedUnsupported    = 1
-    expectedNeedsBenchmark = 1
-    expectedCovered        = 7
+    expectedNeedsBenchmark = 4
+    expectedCovered        = 10
 
 compileFailures :: [(String, Either String a)] -> [String]
 compileFailures rows =

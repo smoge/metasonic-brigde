@@ -2632,7 +2632,7 @@ printProfitabilityGate
   :: M.Map ShapeKey GateMeasurement -> [SurveyRow] -> IO ()
 printProfitabilityGate gateIdx rows = do
   putStrLn "─── Phase 7.F generated profitability gate ───"
-  let shapes      = aggregateGateShapes (concatMap srPlannerVerdicts rows)
+  let shapes      = aggregateGateShapes (map srPlannerVerdicts rows)
       gateRows    = [ GateRow input (evaluateGate input)
                     | (shape, input) <- map (\s -> (s, gateInputFor gateIdx s)) shapes
                     , let _ = shape  -- keep shape carrier visible for table render
@@ -2662,14 +2662,15 @@ printProfitabilityGate gateIdx rows = do
 
 -- | Aggregate selected candidates into 'GateShapeRow' values:
 -- one row per unique (shape key, gain features, matched-shape)
--- triple, carrying the survey-wide occurrence count. The input
--- is a flat list of all verdicts across whatever corpus is being
--- summarized; callers flatten from 'SurveyRow' / corpus-summary
--- containers upstream so this function stays independent of the
--- container shape.
-aggregateGateShapes :: [Verdict] -> [GateShapeRow]
-aggregateGateShapes verdicts =
-  let selected = selectedFusionCandidates verdicts
+-- triple, carrying the survey-wide occurrence count.
+--
+-- Selection must happen per verdict group. 'NodeIndex' and
+-- 'RegionIndex' are graph-local, so flattening verdicts before
+-- 'selectedFusionCandidates' would let unrelated candidates from
+-- different graphs contain each other by accident.
+aggregateGateShapes :: [[Verdict]] -> [GateShapeRow]
+aggregateGateShapes verdictGroups =
+  let selected = concatMap selectedFusionCandidates verdictGroups
       keys     = nub
                    [ ( shapeKeyOf c
                      , fcMemberKinds c

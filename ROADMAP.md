@@ -1908,12 +1908,14 @@ Current corpus signal (live `--fusion-survey`):
 
 Snapshot pins on the smaller snapshot corpus:
 
-- `gate total row count`          (12);
+- `gate total row count`          (23);
 - `gate prefer-generated`         (0 — safety tripwire);
 - `gate non-exact`                (0 — correctness tripwire);
 - `gate unsupported`              (1);
-- `gate needs-benchmark`          (1);
-- `gate covered-by-hand-kernel`   (7).
+- `gate needs-benchmark`          (4);
+- `gate covered-by-hand-kernel`   (10);
+- `gate occurrence count matches selected candidates`
+  (guards graph-local candidate selection).
 
 `prefer-existing` is intentionally not pinned — rows hovering
 near `measuredWinThreshold` (1.05×) flap between
