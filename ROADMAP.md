@@ -2729,19 +2729,54 @@ With 8.F landed, surfacing authoring metadata in the
 inspector and survey is the next ergonomic gap; 8.G picks
 that up.
 
-### Phase 8.G — Lowering Tests, Demos, and Inspector Hooks
+### [x] Phase 8.G — Authoring Metadata Reporting (textual)
 
-Every high-level combinator should have tests that prove what
-primitive graph it emits. The first demo rewrite should be small but
-real: for example, a stereo detuned patch or a send/return ensemble
-that becomes substantially clearer with the new layer.
+`MetaSonic.Authoring.Report` carries `AuthoringReport` —
+templates, named buses, and named controls — and renders
+it as plain lines. `--inspect-only` prints the block after
+the existing compile summary; `--fusion-survey` adds an
+"Authoring metadata totals" section plus a one-line
+per-demo row. The renderer is silent on demos without
+metadata, so the existing 14 legacy demos see no output
+change.
 
-Inspector and survey output should eventually be able to show both:
+The first opt-in demo (`named-control`, new) exercises
+`control` + `ccControl` end-to-end through a tiny saw →
+lpf[cutoff] → gain[vol=CC7] → out patch. The existing
+`send-return` ensemble demo gains its metadata via
+`ensembleReport sendReturnEnsemble`.
 
-- the authoring-level construct;
-- the generated primitive nodes/templates/buses.
+What this slice does **not** try to settle:
 
-This prevents the authoring DSL from becoming opaque.
+- Multi-template Brick TUI. The inspector stays
+  single-graph, same as before; multi-template demos keep
+  their textual summary.
+- Metadata embedded in `SynthGraph` or `TemplateGraph`.
+  The compiler IR remains untouched. The report is an
+  app-level projection of the `Auth.AuthoringMetadata` and
+  `Auth.NamedControlMetadata` that 8.E and 8.F already
+  recorded.
+- Metadata persistence / export (no JSON, no hot-swap
+  state shape).
+- Snapshot-check pins on the corpus-level authoring
+  totals: the demo table lives in `app/` and is not
+  reachable from the library-side snapshot tool. The
+  10-test `authoringReportTests` group covers the
+  rendering + projection contracts inline; corpus-level
+  drift catches will need a later slice that either lifts
+  demo metadata into the library or adds an
+  app-side snapshot runner.
+
+See
+[notes/2026-05-12-phase-8g-metadata-reporting.md](notes/2026-05-12-phase-8g-metadata-reporting.md)
+for the full contract.
+
+With 8.G landed, the cleanest next gaps are (a) metadata
+persistence/export so a session can be reloaded with the
+same authoring view, or (b) session-layer scoping (see
+below). Both are larger than 8.G's elaboration-only
+contract; pick based on which the next user actually
+needs.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
