@@ -2559,20 +2559,39 @@ The first helper surface should be boring and explicit:
 This gives the project multichannel authoring without changing the
 runtime audio buffer model.
 
-### Phase 8.C — Lifted UGen Combinators and Multichannel Expansion (partial)
+### [x] Phase 8.C — Lifted UGen Combinators and Multichannel Expansion
 
-First slice added lifted versions of common primitives that expand
-channel-wise:
+Two slices landed. The first (8.C1) added the basic lifted surface
+(`gain` / `add` / `lpf` over mono/stereo/channel sets, `outStereo` /
+`outChannels`, plus deterministic expansion tests). The second
+(8.C2) closes out the common musical surface:
 
-- gain over mono/stereo/channel sets;
-- filter over mono/stereo/channel sets;
-- add/mix over compatible channel shapes;
-- `outStereo` / `outChannels`;
-- deterministic expansion tests that pin the generated primitive graph.
+- High-/band-/notch biquads: `hpfM/S/C`, `bpfM/S/C`, `notchM/S/C`.
+  Same per-channel shape as `lpfM/S/C`; one filter node per slot,
+  no state sharing across channels.
+- Delay lines: `delayM/S/C`. Stereo emits two independent `KDelay`
+  nodes sharing the same compile-time `maxDelay`; channel-wise
+  emits one per slot. Empty `Channels` emits no nodes.
+- Control smoothers: `smoothM/S/C`. One `KSmooth` per channel.
+- Envelope **application** (not raw `env` wrappers): `envM/S/C`
+  emit *one shared* `KEnv` plus N `KGain` nodes, keeping the
+  amplitude trajectory coherent across all channels. Authors
+  wanting per-channel envelope state call `envM` per channel.
+  `envC (channels [])` emits zero nodes — no dead `KEnv`.
 
-The first implementation should cover only the common musical surface:
-gain, add, LPF/HPF/BPF/Notch, delay where safe, and output routing.
-More exotic nodes can wait until the shape is needed.
+Lowering tests in `authoringDslTests` pin the primitive graph
+shape for each helper (kind counts, shared-env identity check
+via gain-amount `connectionNodeID` agreement, empty-channels
+behavior). A new `stereo-fx` demo exercises the chain end-to-end:
+`stereoSrc → hpfS → envS → delayS → stereoOut`.
+
+Decision artifact:
+[notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md](notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md).
+
+What 8.C still does not cover (deliberately): exotic primitives
+(spectral, plugin, buffer I/O) and the bus-allocation helpers
+(`send` / `returnBus` — Phase 8.D). Both can wait until the
+patch shape calling for them is needed.
 
 ### Phase 8.D — Mixing, Panning, and Routing Helpers (partial)
 
