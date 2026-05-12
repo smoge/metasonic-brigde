@@ -124,7 +124,7 @@ refactor.
 One small authored demo extension: a stereo patch using the
 new helpers end-to-end —
 
-    stereoSrc → hpfS → envS → delayS → stereoOut
+    stereoSrc → hpfS → envS → delayS → gainS → stereoOut
 
 This replaces the existing `stereo-saw` demo's wording (or
 adds a sibling demo, depending on what fits the demoTable
@@ -162,15 +162,16 @@ boundary.
 ## What this enables (and what it doesn't)
 
 After 8.C2, an authored stereo patch with the standard
-musical chain — filter, envelope, delay, output — can be
-written without dropping into mono primitives:
+musical chain — filter, envelope, delay, master gain,
+output — can be written without dropping into mono primitives:
 
     g = runSynth $ do
       src    <- ...
       filtSt <- Auth.hpfS src 1200.0 0.7
       envSt  <- Auth.envS  filtSt gate 0.01 0.2 0.8 0.5
       delSt  <- Auth.delayS 0.3 envSt 0.15
-      Auth.stereoOut 0 delSt
+      outSt  <- Auth.gainS delSt 0.25
+      Auth.stereoOut 0 outSt
 
 What 8.C2 still does **not** give the author:
 - Named controls. `gate` / `attack` etc. still come in as

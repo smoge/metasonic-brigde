@@ -2583,7 +2583,7 @@ Lowering tests in `authoringDslTests` pin the primitive graph
 shape for each helper (kind counts, shared-env identity check
 via gain-amount `connectionNodeID` agreement, empty-channels
 behavior). A new `stereo-fx` demo exercises the chain end-to-end:
-`stereoSrc → hpfS → envS → delayS → stereoOut`.
+`stereoSrc → hpfS → envS → delayS → gainS → stereoOut`.
 
 Decision artifact:
 [notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md](notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md).

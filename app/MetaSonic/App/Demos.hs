@@ -102,10 +102,10 @@ authoringStereoSawGraph = runSynth $ do
 
 -- Phase 8.C2 showcase: a stereo fx chain authored entirely through
 -- the lifted helpers. Shape goes
--- 'stereoSrc -> hpfS -> envS -> delayS -> stereoOut', and the lowered
--- graph still inspects as ordinary 'KHPF / KEnv / KGain / KDelay /
--- KOut' nodes — 8.C2 only removes per-channel boilerplate, not
--- primitive visibility.
+-- 'stereoSrc -> hpfS -> envS -> delayS -> gainS -> stereoOut',
+-- and the lowered graph still inspects as ordinary 'KHPF / KEnv /
+-- KGain / KDelay / KOut' nodes — 8.C2 only removes per-channel
+-- boilerplate, not primitive visibility.
 authoringStereoFxChainGraph :: SynthGraph
 authoringStereoFxChainGraph = runSynth $ do
   l    <- sawOsc 110.0 0.0
@@ -353,7 +353,7 @@ demoTable =
          "Stereo detuned saws via MetaSonic.Authoring (Phase 8.D)"
          (SingleGraph authoringStereoSawGraph)
   , Demo "stereo-fx"
-         "Stereo fx chain (hpfS → envS → delayS → stereoOut, Phase 8.C2)"
+         "Stereo fx chain (hpfS → envS → delayS → gainS → stereoOut, Phase 8.C2)"
          (SingleGraph authoringStereoFxChainGraph)
   , Demo "ringmod"   "Ring modulation (SinOsc × SinOsc → Out)"
          (SingleGraph ringModGraph)

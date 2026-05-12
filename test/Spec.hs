@@ -515,6 +515,28 @@ authoringDslTests =
   -- Phase 8.C2: lifted stateful / common UGens
   ------------------------------------------------------------
 
+  , testCase "mono lifts emit one node of each wrapped primitive kind" $ do
+      let maxT = 0.25
+          g = runSynth $ do
+            src <- sinOsc 440.0 0.0
+            hp  <- Auth.hpfM    (Auth.mono src) (Param 1200.0) (Param 0.7)
+            bp  <- Auth.bpfM    hp              (Param 800.0)  (Param 1.5)
+            nt  <- Auth.notchM  bp              (Param 60.0)   (Param 4.0)
+            dly <- Auth.delayM  maxT            nt             (Param 0.15)
+            _   <- Auth.smoothM 20.0            dly
+            pure ()
+          maxes =
+            [ m
+            | spec <- nodesByKind g KDelay
+            , Delay m _ _ <- [nsUgen spec]
+            ]
+      length (nodesByKind g KHPF)    @?= 1
+      length (nodesByKind g KBPF)    @?= 1
+      length (nodesByKind g KNotch)  @?= 1
+      length (nodesByKind g KDelay)  @?= 1
+      length (nodesByKind g KSmooth) @?= 1
+      maxes @?= [maxT]
+
   , testCase "hpfS emits two KHPF nodes" $ do
       let g = runSynth $ do
             l <- sinOsc 440.0 0.0
@@ -658,17 +680,18 @@ authoringDslTests =
       length (nodesByKind g KGain) @?= 0
 
   , testCase "lifted authored fx chain compiles end-to-end" $ do
-      -- stereoSrc -> hpfS -> envS -> delayS -> stereoOut
+      -- stereoSrc -> hpfS -> envS -> delayS -> gainS -> stereoOut
       let g = runSynth $ do
             l    <- sinOsc 440.0 0.0
             r    <- sinOsc 660.0 0.0
             filt <- Auth.hpfS   (Auth.stereo l r) (Param 1200.0) (Param 0.7)
-            env  <- Auth.envS   filt
-                      (Param 1.0)
-                      (Param 0.01) (Param 0.2)
-                      (Param 0.8)  (Param 0.5)
-            dly  <- Auth.delayS 0.3 env (Param 0.15)
-            Auth.outStereo 0 dly
+            shaped <- Auth.envS   filt
+                        (Param 1.0)
+                        (Param 0.01) (Param 0.2)
+                        (Param 0.8)  (Param 0.5)
+            dly    <- Auth.delayS 0.3 shaped (Param 0.15)
+            master <- Auth.gainS dly (Param 0.25)
+            Auth.outStereo 0 master
       case lowerGraph g >>= compileRuntimeGraph of
         Left err -> assertFailure $
           "expected authored 8.C2 patch to compile, got: " <> err
@@ -681,7 +704,7 @@ authoringDslTests =
           kindCount KSinOsc @?= 2
           kindCount KHPF    @?= 2
           kindCount KEnv    @?= 1
-          kindCount KGain   @?= 2  -- the env's two gains
+          kindCount KGain   @?= 4  -- envS gains + master gainS
           kindCount KDelay  @?= 2
           kindCount KOut    @?= 2
   ]
