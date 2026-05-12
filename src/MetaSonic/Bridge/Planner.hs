@@ -4,17 +4,16 @@
 
 -- |
 -- Module      : MetaSonic.Bridge.Planner
--- Description : Phase 7.C survey-only fusion planner (data types)
+-- Description : Phase 7.C survey-only fusion planner
 --
 -- The Phase 7.C planner is a Haskell-only, diagnostic-only pass that
 -- walks a 'RuntimeGraph', identifies contiguous sink-terminal
 -- candidates within single regions, and emits a 'Verdict' per
 -- candidate. Nothing executes; nothing crosses the FFI.
 --
--- This module defines the verdict-bearing data types only. The
--- pass that produces them lives in a follow-up slice ('planRegion',
--- 'planRuntimeGraph') so the type contract can be reviewed in
--- isolation.
+-- This module defines the verdict-bearing data types, the planner
+-- pass that produces them, and the selected-candidate view consumed
+-- by survey/snapshot tooling.
 --
 -- See @notes/2026-05-11-phase-7c-planner-decision.md@ for the
 -- legality rule list, the "no chain-caps union" constraint, and the
@@ -29,6 +28,7 @@ module MetaSonic.Bridge.Planner
   , verdictCandidate
   , isAccepted
   , isRejected
+  , selectedFusionCandidates
     -- * Planning pass
   , planRuntimeGraph
   , planRegion
@@ -37,18 +37,20 @@ module MetaSonic.Bridge.Planner
   ) where
 
 import           Control.DeepSeq                  (NFData)
-import           Data.List                        (find)
+import           Data.List                        (find, isInfixOf)
 import           Data.Maybe                       (fromMaybe, listToMaybe,
                                                    mapMaybe)
 import           GHC.Generics                     (Generic)
 
 import           MetaSonic.Bridge.Compile.Types   (RegionIndex,
                                                    RegionKernel (..),
+                                                   RuntimeInput (..),
                                                    RuntimeGraph (..),
                                                    RuntimeNode (..),
                                                    RuntimeRegion (..))
 import           MetaSonic.Types                  (KindCapability (..),
                                                    NodeIndex, NodeKind (..),
+                                                   PortIndex (..),
                                                    kindCapabilities,
                                                    kindLatency)
 
@@ -116,6 +118,10 @@ data RejectionReason
     -- profitability question, not legality, but the planner
     -- rejects fanout candidates today so the cost lab can study
     -- the duplicated-work tradeoff in isolation.
+  | ReasonNonAdjacentDataflow !NodeIndex !NodeIndex !NodeKind
+    -- ^ The previous member does not feed the next member's
+    -- principal signal input. The fields are previous member,
+    -- next member, and next kind.
   | ReasonTooShort !Int
     -- ^ The candidate is below the minimum length (today: 2). The
     -- 'Int' is the actual length.
@@ -151,6 +157,30 @@ isAccepted _            = False
 isRejected :: Verdict -> Bool
 isRejected (Rejected _ _) = True
 isRejected _              = False
+
+-- | Accepted candidates after nested candidates have been coalesced
+-- to maximal same-region segments. The raw 'Verdict' stream remains
+-- useful for diagnostics; this selected view is the executor-facing
+-- shape that avoids treating @Gain -> Out@ as generated-eligible when
+-- it is just a suffix of an accepted @Sin -> Gain -> Out@ candidate.
+--
+-- Call this per 'RuntimeGraph' / survey row. 'NodeIndex' and
+-- 'RegionIndex' are graph-local, so aggregating verdicts across
+-- graphs before selection would merge unrelated candidates.
+selectedFusionCandidates :: [Verdict] -> [FusionCandidate]
+selectedFusionCandidates verdicts =
+  [ c
+  | c <- accepted
+  , not (any (`strictlyContainsCandidate` c) accepted)
+  ]
+  where
+    accepted = [c | Accepted c <- verdicts]
+
+strictlyContainsCandidate :: FusionCandidate -> FusionCandidate -> Bool
+strictlyContainsCandidate outer inner =
+  fcRegion outer == fcRegion inner
+    && fcLengthNodes outer > fcLengthNodes inner
+    && fcMembers inner `isInfixOf` fcMembers outer
 
 ------------------------------------------------------------
 -- Planning pass
@@ -240,6 +270,7 @@ firstViolation nodes =
                   else Just ReasonNoTerminalSink
               , firstJust [ checkNonSinkAt pos n
                           | (pos, n) <- nonSinkIndexed ]
+              , checkAdjacentDataflow nodes
               ]
 
 checkLength :: Int -> Maybe RejectionReason
@@ -277,6 +308,21 @@ checkNonSinkAt pos n
   | otherwise = Nothing
   where
     caps = kindCapabilities (rnKind n)
+
+checkAdjacentDataflow :: [RuntimeNode] -> Maybe RejectionReason
+checkAdjacentDataflow nodes =
+  firstJust
+    [ if principalInputFrom (rnIndex prev) next
+        then Nothing
+        else Just (ReasonNonAdjacentDataflow
+                    (rnIndex prev) (rnIndex next) (rnKind next))
+    | (prev, next) <- zip nodes (drop 1 nodes)
+    ]
+
+principalInputFrom :: NodeIndex -> RuntimeNode -> Bool
+principalInputFrom srcIx node = case rnInputs node of
+  RFrom s (PortIndex 0) : _ -> s == srcIx
+  _                         -> False
 
 isSinkTerminal :: RuntimeNode -> Bool
 isSinkTerminal n =

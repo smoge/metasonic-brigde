@@ -30,7 +30,8 @@ import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
                                              RejectionReason (..),
                                              Verdict (..), isAccepted,
-                                             isRejected, planRuntimeGraph)
+                                             isRejected, planRuntimeGraph,
+                                             selectedFusionCandidates)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Types            (KindCapability (..),
@@ -2298,7 +2299,8 @@ formatCapRow cols =
 --------------------------------------------------------------------------------
 
 -- Per-row 'srPlannerVerdicts' is aggregated across every surveyed
--- graph and rendered as two sub-sections:
+-- graph and rendered as two diagnostic sub-sections plus the
+-- selected/maximal accepted-candidate surface:
 --
 --   1. Per-rejection-reason counts plus one example per reason.
 --   2. Accepted candidates grouped by their matched §4.B kernel,
@@ -2307,25 +2309,30 @@ formatCapRow cols =
 --
 -- The planner over-reports by design: a 4-node sink-terminal chain
 -- yields nested 2/3/4-length candidates, all with their own
--- verdicts. The counts here therefore exceed the per-graph node
--- count; that is expected and the cost-lab consumption pass will
--- coalesce.
+-- verdicts. Raw counts are printed first for drift diagnostics; the
+-- selected view coalesces nested accepted candidates per graph before
+-- exposing the generated-eligible count that a future executor should
+-- consume.
 printPlannerVerdicts :: [SurveyRow] -> IO ()
 printPlannerVerdicts rows = do
   putStrLn "─── Phase 7.C planner verdicts ───"
   let verdicts = concatMap srPlannerVerdicts rows
       accs     = filter isAccepted verdicts
       rejs     = filter isRejected verdicts
+      selected = concatMap (selectedFusionCandidates . srPlannerVerdicts) rows
   putStrLn $ "  candidates=" <> show (length verdicts)
           <> "  accepted="   <> show (length accs)
           <> "  rejected="   <> show (length rejs)
+          <> "  selected-accepted=" <> show (length selected)
   if null verdicts
     then putStrLn "  (no candidates in the surveyed graphs)"
     else do
       putStrLn ""
       printRejectionSummary rejs
       putStrLn ""
-      printAcceptedByShape accs
+      printAcceptedByShape "  Raw accepted candidates by matched shape:" [c | Accepted c <- accs]
+      putStrLn ""
+      printAcceptedByShape "  Selected accepted candidates by matched shape:" selected
 
 printRejectionSummary :: [Verdict] -> IO ()
 printRejectionSummary [] =
@@ -2346,7 +2353,7 @@ printRejectionSummary rejs = do
       sorted    = sortOn (\(_, c, _) -> negate c) grouped
   mapM_
     (\(tag, count, ex) ->
-        putStrLn $ "    " <> padR 24 tag
+        putStrLn $ "    " <> padR 30 tag
                  <> "count=" <> padR 5 (show count)
                  <> "example=" <> ex)
     sorted
@@ -2358,6 +2365,7 @@ reasonTag r = case r of
   ReasonResourceMidChain{} -> "ReasonResourceMidChain"
   ReasonStatefulInterior{} -> "ReasonStatefulInterior"
   ReasonFanoutEscape{}     -> "ReasonFanoutEscape"
+  ReasonNonAdjacentDataflow{} -> "ReasonNonAdjacentDataflow"
   ReasonTooShort{}         -> "ReasonTooShort"
   ReasonNoTerminalSink     -> "ReasonNoTerminalSink"
   ReasonCrossesRegion{}    -> "ReasonCrossesRegion"
@@ -2375,6 +2383,10 @@ renderReasonExample r = case r of
     "node " <> show (nodeIxInt ix) <> " " <> show k
   ReasonFanoutEscape ix cc      ->
     "node " <> show (nodeIxInt ix) <> " consumers=" <> show cc
+  ReasonNonAdjacentDataflow prev next k ->
+    "node " <> show (nodeIxInt prev)
+      <> " does not feed node " <> show (nodeIxInt next)
+      <> " " <> show k
   ReasonTooShort n              -> "len=" <> show n
   ReasonNoTerminalSink          -> "(structural)"
   ReasonCrossesRegion ix        -> "node " <> show (nodeIxInt ix)
@@ -2382,11 +2394,10 @@ renderReasonExample r = case r of
 nodeIxInt :: NodeIndex -> Int
 nodeIxInt (NodeIndex i) = i
 
-printAcceptedByShape :: [Verdict] -> IO ()
-printAcceptedByShape accs = do
-  putStrLn "  Accepted candidates by matched shape:"
-  let cands     = [c | Accepted c <- accs]
-      kernels   = nub [k | c <- cands, Just k <- [fcMatchedShape c]]
+printAcceptedByShape :: String -> [FusionCandidate] -> IO ()
+printAcceptedByShape header cands = do
+  putStrLn header
+  let kernels   = nub [k | c <- cands, Just k <- [fcMatchedShape c]]
       perKernel =
         [ (show k, length [c | c <- cands, fcMatchedShape c == Just k])
         | k <- kernels

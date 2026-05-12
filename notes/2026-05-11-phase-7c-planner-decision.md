@@ -11,14 +11,13 @@ diagnostic only and never produces a runtime program.
 Add a Haskell-only planner that walks the existing `RuntimeGraph`,
 identifies **fusion candidates** at the granularity of contiguous
 node segments within a single region, and emits a **verdict** for
-each candidate: accepted with a structured benefit estimate, or
-rejected with a structured reason. Output is diagnostic, surfaced
-through `--fusion-survey`. Nothing executes.
+each candidate: accepted as structurally legal, or rejected with a
+structured reason. Output is diagnostic, surfaced through
+`--fusion-survey`. Nothing executes.
 
-This slice introduces the `FusionProgram` representation as the
-verdict-bearing data type but stays one step short of a runtime
-program table; no FFI, no `RuntimeGraph` change, no new
-`RegionKernel`.
+This slice introduces the verdict-bearing data types but stays one
+step short of a runtime program table; no FFI, no `RuntimeGraph`
+change, no new `RegionKernel`.
 
 ## Legality Inputs
 
@@ -35,9 +34,11 @@ The planner reads five existing facts and combines them. It does
 
 `inferEff` is the source of truth for **which specific** bus or
 buffer a UGen touches; `kindCapabilities` declares only that a kind
-**may** touch a resource. The planner consults `inferEff` whenever a
-decision depends on resource identity (e.g. "this segment reads bus
-N and writes bus N").
+**may** touch a resource. The current planner slice uses kind-level
+resource capability only; any future decision that depends on
+resource identity (e.g. "this segment reads bus N and writes bus N")
+must consult `inferEff` or an equivalent lowered per-node effect
+surface.
 
 ## Why Not Use The `chain-caps` Union
 
@@ -87,8 +88,10 @@ the sink). Single-sink-only candidates are dropped.
 
 Candidates may be **nested** in the sense that a 4-node candidate
 `A → B → C → sink` contains the 3-node candidate `B → C → sink`.
-The planner reports both and lets the consumer (cost-lab consumer in
-a later slice) decide whether to coalesce.
+The planner reports both in the raw verdict stream, then exposes a
+per-graph selected/maximal accepted-candidate view for survey and
+snapshot tooling so future executor work does not treat suffixes as
+separate generated targets.
 
 ## Per-Node Legality Rules
 
@@ -136,13 +139,18 @@ The rules are checked in this priority order, per node:
    with `rnConsumerCount /= 1` rejects. Duplicating a fanout
    producer is a profitability question, not a legality question,
    and the planner defers it.
+6. **Adjacent members must be dataflow-adjacent.** For every
+   neighboring pair in the candidate, the later node's principal
+   signal input must be `RFrom` the previous member's port 0. Dense
+   contiguity in a region is not enough: independent nodes can sit
+   next to each other in topological order without forming a chain.
 
 These rules are **per-node** by design: the planner cites the
 specific `NodeIndex` and `NodeKind` that caused the rejection.
 
 ## Segment-Level Legality Rules
 
-Three rules apply to the segment as a whole rather than to any
+Four rules apply to the segment as a whole rather than to any
 individual node.
 
 1. **Terminal sink required.** Every candidate must end in a node
@@ -156,6 +164,9 @@ individual node.
    must have `rnConsumerCount == 1`. A node that fans out cannot be
    absorbed without duplicating its work, and that decision belongs
    to the profitability model, not the legality model.
+4. **Adjacent dataflow required.** Every consecutive pair must form
+   the principal dataflow chain. A non-chain contiguous slice is a
+   diagnostic candidate but not an executable fusion candidate.
 
 ## Rejection Reason Shape
 
@@ -169,6 +180,7 @@ data RejectionReason
   | ReasonResourceMidChain   !NodeIndex !NodeKind
   | ReasonStatefulInterior   !NodeIndex !NodeKind
   | ReasonFanoutEscape       !NodeIndex !Int          -- consumer count
+  | ReasonNonAdjacentDataflow !NodeIndex !NodeIndex !NodeKind
   | ReasonTooShort           !Int                     -- length
   -- structural; included for future-proofing, not triggerable today:
   | ReasonNoTerminalSink
@@ -227,22 +239,26 @@ auditable and lets the cost model change independently.
 
 ```
 ─── Phase 7.C planner verdicts ───
-  accepted=N  rejected=M  matched-by-§4.B=K  matched-no-kernel=L
+  candidates=N  accepted=A  rejected=R  selected-accepted=S
 
   Top rejection reasons:
     ReasonResourceMidChain  count=…  example=node 7 KBusOut
     ReasonStatefulInterior  count=…  example=node 3 KEnv
     ReasonFanoutEscape      count=…  example=node 5 consumers=3
 
-  Accepted candidates per matched shape:
+  Raw accepted candidates per matched shape:
     RSinGainOut       claimed=…  generated-eligible=…
     RSawLpfGainOut    claimed=…  generated-eligible=…
     no-§4.B-match     candidate-length=3  count=…
+
+  Selected accepted candidates per matched shape:
+    RSinGainOut       count=…
+    no-§4.B-match     count=…
 ```
 
-`--snapshot-check` pins three numbers: total accepted count, total
-rejected count, and per-reason rejection counts. Drift on any of
-them signals the candidate set or rule table changed.
+`--snapshot-check` pins raw total/accepted/rejected counts, selected
+accepted/generated-eligible counts, and per-reason rejection counts.
+Drift on any of them signals the candidate set or rule table changed.
 
 ## Initial Scope For The First Implementation Slice
 
@@ -286,10 +302,10 @@ this order:
   benefit, not just legality. The allow-list lives in
   `MetaSonic.Bridge.Planner` and is intentionally a separate table
   from `kindCapabilities`.
-- **Nested-candidate coalescing.** Reporting both 3-node and 4-node
-  candidates for the same chain is fine for diagnostics but
-  inefficient for the cost-lab join. The right fix is in the
-  cost-lab side, not the planner.
+- **Cost-lab join over selected candidates.** The planner now exposes
+  selected/maximal accepted candidates, but the cost-lab still needs
+  to join those rows to measured features before Phase 7.D can make
+  execution decisions.
 - **Module placement.** `MetaSonic.Bridge.Planner` keeps the planner
   in the bridge tree alongside `IR.hs`, `Compile.hs`, `FFI.hs`. The
   alternative `MetaSonic.Fusion.Planner` signals a separate sub-tree

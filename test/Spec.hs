@@ -610,6 +610,19 @@ plannerTests =
          <> show verdicts)
         (not (null matched))
 
+  , testCase "selected candidates coalesce nested accepted suffixes" $ do
+      let g = runSynth $ do
+            o <- sinOsc 440 0
+            y <- gain o 0.5
+            out 0 y
+          verdicts = runPlanner g
+          selected = selectedFusionCandidates verdicts
+      [fcLengthNodes c | c <- selected] @?= [3]
+      assertBool
+        ("expected selected candidate to keep the §4.B match; got "
+         <> show selected)
+        (any (isJust . fcMatchedShape) selected)
+
   , testCase "spectralFreeze as true-interior triggers ReasonLatencyMidChain" $ do
       let g = runSynth $ do
             o <- sinOsc 440 0
@@ -652,6 +665,36 @@ plannerTests =
          <> show rejections)
         (any isStatefulInterior rejections)
 
+  , testCase "BusOut as true-interior triggers ReasonResourceMidChain" $ do
+      let g = runSynth $ do
+            o1 <- triOsc 440 0
+            y1 <- gain o1 0.5
+            busOut 5 y1
+            o2 <- sinOsc 220 0
+            out 0 o2
+          verdicts = runPlanner g
+          rejections = [r | Rejected _ r <- verdicts]
+      assertBool
+        ("expected ReasonResourceMidChain in rejections; got "
+         <> show rejections)
+        (any isResourceMid rejections)
+
+  , testCase "contiguous but disconnected members trigger ReasonNonAdjacentDataflow" $ do
+      let g = runSynth $ do
+            o1 <- sinOsc 440 0
+            o2 <- sinOsc 220 0
+            y1 <- gain o1 0.5
+            y2 <- gain o2 0.25
+            out 0 y2
+            _  <- gain y1 0.9
+            pure ()
+          verdicts = runPlanner g
+          rejections = [r | Rejected _ r <- verdicts]
+      assertBool
+        ("expected ReasonNonAdjacentDataflow in rejections; got "
+         <> show rejections)
+        (any isNonAdjacent rejections)
+
   , testCase "fanout producer triggers ReasonFanoutEscape" $ do
       -- Same osc feeds two output chains. The osc has
       -- consumerCount=2 and shows up as a non-sink position with
@@ -686,6 +729,12 @@ plannerTests =
 
     isStatefulInterior ReasonStatefulInterior{} = True
     isStatefulInterior _                        = False
+
+    isResourceMid ReasonResourceMidChain{} = True
+    isResourceMid _                        = False
+
+    isNonAdjacent ReasonNonAdjacentDataflow{} = True
+    isNonAdjacent _                           = False
 
     isFanoutEscape ReasonFanoutEscape{} = True
     isFanoutEscape _                    = False

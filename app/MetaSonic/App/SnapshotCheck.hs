@@ -2,7 +2,7 @@
 -- Module      : MetaSonic.App.SnapshotCheck
 -- Description : Read-only invariants for survey and cost-lab tooling.
 --
--- This is a lightweight gate for the Phase 7.A tooling surface. It
+-- This is a lightweight gate for the Phase 7 tooling surface. It
 -- deliberately checks structural invariants over the current survey
 -- corpus and fusion cost lab instead of comparing full textual output:
 -- row counts, compile success, equivalence, feature columns, latency
@@ -35,7 +35,8 @@ import           MetaSonic.Bridge.Compile      (DeclaredNodeLatency (..))
 import           MetaSonic.Bridge.Planner      (FusionCandidate (..),
                                                 RejectionReason (..),
                                                 Verdict (..), isAccepted,
-                                                isRejected)
+                                                isRejected,
+                                                selectedFusionCandidates)
 import           MetaSonic.Types               (KindCapability (..),
                                                 NodeKind (..),
                                                 kindCapabilities)
@@ -330,7 +331,8 @@ renderCapCounts xs =
 
 -- §7.C planner verdict invariants on the snapshot corpus.
 -- Pinned counts are intentionally specific: candidate/accepted/
--- rejected totals plus per-rejection-reason counts. Drift means
+-- rejected totals, selected accepted totals, and per-rejection-
+-- reason counts. Drift means
 -- either the corpus changed, a planner rule changed, or
 -- 'kindCapabilities' moved a kind to a different bucket. All three
 -- deserve an explicit acknowledgement, so the counts are pinned
@@ -349,6 +351,16 @@ plannerChecks snapshots =
        <> " rejected=" <> show expectedRejected
        <> "; actual accepted=" <> show acceptedCount
        <> " rejected=" <> show rejectedCount)
+
+  , check "planner selected accepted count is stable"
+      (selectedCount == expectedSelected)
+      ("expected=" <> show expectedSelected
+       <> "; actual=" <> show selectedCount)
+
+  , check "planner selected generated-eligible count is stable"
+      (selectedNoMatchCount == expectedSelectedNoMatch)
+      ("expected=" <> show expectedSelectedNoMatch
+       <> "; actual=" <> show selectedNoMatchCount)
 
   , check "planner per-rejection-reason counts are stable"
       (rejectionCounts == expectedRejectionCounts)
@@ -370,6 +382,14 @@ plannerChecks snapshots =
     totalCandidates = length verdicts
     acceptedCount   = length (filter isAccepted verdicts)
     rejectedCount   = length (filter isRejected verdicts)
+    selectedCands   =
+      concat
+        [ selectedFusionCandidates (csPlannerVerdicts row)
+        | (_, Right row) <- allRows
+        ]
+    selectedCount   = length selectedCands
+    selectedNoMatchCount =
+      length [() | c <- selectedCands, fcMatchedShape c == Nothing]
     matchedCount    =
       length [ ()
              | Accepted c <- verdicts
@@ -389,14 +409,17 @@ plannerChecks snapshots =
     -- rule or the corpus changes; a silent shift means the
     -- planner output drifted.
     expectedTotal      = 193
-    expectedAccepted   = 163
-    expectedRejected   = 30
+    expectedAccepted   = 158
+    expectedRejected   = 35
+    expectedSelected   = 69
+    expectedSelectedNoMatch = 18
     expectedRejectionCounts :: [(String, Int)]
     expectedRejectionCounts =
       [ ("ReasonStatefulInterior", 13)
       , ("ReasonFanoutEscape",     13)
       , ("ReasonResourceMidChain",  2)
       , ("ReasonLatencyMidChain",   2)
+      , ("ReasonNonAdjacentDataflow", 5)
       ]
 
     -- Display order for rejection reasons; matches
@@ -406,6 +429,7 @@ plannerChecks snapshots =
       , "ReasonFanoutEscape"
       , "ReasonResourceMidChain"
       , "ReasonLatencyMidChain"
+      , "ReasonNonAdjacentDataflow"
       , "ReasonHardBarrier"
       , "ReasonTooShort"
       , "ReasonNoTerminalSink"
@@ -419,6 +443,7 @@ reasonTagName r = case r of
   ReasonResourceMidChain{} -> "ReasonResourceMidChain"
   ReasonStatefulInterior{} -> "ReasonStatefulInterior"
   ReasonFanoutEscape{}     -> "ReasonFanoutEscape"
+  ReasonNonAdjacentDataflow{} -> "ReasonNonAdjacentDataflow"
   ReasonTooShort{}         -> "ReasonTooShort"
   ReasonNoTerminalSink     -> "ReasonNoTerminalSink"
   ReasonCrossesRegion{}    -> "ReasonCrossesRegion"
