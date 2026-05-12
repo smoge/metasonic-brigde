@@ -81,6 +81,8 @@ module MetaSonic.App.FusionCostLab
     -- * Phase 7.F profitability gate index
   , GateMeasurement (..)
   , costLabGateIndex
+    -- * Phase 7.J gate-by-executor view
+  , costLabGateIndexFor
     -- * Phase 7.G diagnostic helpers
   , generatedTailSweepOwnedLengths
     -- * Phase 7.I super-mode classifier
@@ -1318,7 +1320,30 @@ data GateMeasurement = GateMeasurement
 -- member retain peer measurements, but do not borrow the generated
 -- speedup from a sibling/suffix program.
 costLabGateIndex :: [LabRow] -> M.Map ShapeKey GateMeasurement
-costLabGateIndex rows =
+costLabGateIndex = costLabGateIndexFor VarGenerated
+
+-- | Phase 7.J generalization of 'costLabGateIndex'. Builds a
+-- @ShapeKey -> GateMeasurement@ map joining planner-selected
+-- shape keys against the cost-lab row set, with the generated
+-- side of every measurement populated from the chosen
+-- 'Variant' (must be one of 'VarGenerated', 'VarGeneratedBlock',
+-- or 'VarGeneratedSuper'). 'gmBestPeerSpeedup' is variant-
+-- independent — it always reflects the strongest of
+-- 'VarRegionKernel' / 'VarRFused' for the same member.
+--
+-- 'costLabGateIndex' is exactly @'costLabGateIndexFor'
+-- 'VarGenerated'@; --fusion-survey's canonical Phase 7.F gate
+-- numbers stay byte-for-byte identical after this slice. The
+-- 7.J gate-by-executor section is the only caller that passes
+-- a different variant.
+--
+-- For non-generated variants ('VarNodeLoop', 'VarRegionKernel',
+-- 'VarRFused'), the function still returns a map but the
+-- generated-side fields will look identical to the variant's
+-- own timing — useful as an audit point if someone calls it,
+-- but not what the 7.J slice ships.
+costLabGateIndexFor :: Variant -> [LabRow] -> M.Map ShapeKey GateMeasurement
+costLabGateIndexFor genVariant rows =
   M.fromListWith preferStrongerGenerated $ concat
     [ memberGateEntries fam name graph
     | (fam, name, graph) <- familyGraphs
@@ -1361,7 +1386,7 @@ costLabGateIndex rows =
               , Just ns <- [lrNsPerSample r]
               ]
           generatedRow =
-            listToMaybe [ r | r <- memberRows, lrVariant r == VarGenerated ]
+            listToMaybe [ r | r <- memberRows, lrVariant r == genVariant ]
           speedupVs base ns = base / ns
           peerSpeedup base =
             case [ s
