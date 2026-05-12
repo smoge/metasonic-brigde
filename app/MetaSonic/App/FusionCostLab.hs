@@ -478,7 +478,8 @@ tailSweep8Mixed = runSynth $ do
   s1  <- add src (Param 0.1); g1 <- gain s1 0.5
   s2  <- add g1  (Param 0.2); g2 <- gain s2 0.6
   s3  <- add g2  (Param 0.3); g3 <- gain s3 0.7
-  out 0 g3
+  g4  <- gain g3 0.8
+  out 0 g4
 
 tailSweep16Mixed :: SynthGraph
 tailSweep16Mixed = runSynth $ do
@@ -1372,6 +1373,25 @@ generatedOwnedShapeKeyOf graph = do
         Left _    -> Nothing
     [] -> Nothing
 
+-- | Number of nodes the generator would own on the first
+-- eligible candidate inside @graph@ — i.e. the per-sample op
+-- count the generated path would execute. Used by the §7.G
+-- owned-size diagnostic to bucket cost-lab rows by tail length.
+generatedOwnedTailLength :: SynthGraph -> Maybe Int
+generatedOwnedTailLength graph = do
+  rg <- case lowerGraph graph >>= compileRuntimeGraphUnfused of
+          Right base -> Just (stripRegionKernels base)
+          Left _     -> Nothing
+  let eligibleOwned =
+        [ owned
+        | c <- selectedFusionCandidates (planRuntimeGraph rg)
+        , isNothing (fcMatchedShape c)
+        , Right (_, owned) <- [generateProgram rg c]
+        ]
+  case eligibleOwned of
+    (owned : _) -> Just (length owned)
+    []          -> Nothing
+
 shapeKeyForOwned :: RuntimeGraph -> [NodeIndex] -> Either String ShapeKey
 shapeKeyForOwned rg owned = do
   nodes <- mapM (lookupRtNode rg) owned
@@ -1590,9 +1610,14 @@ renderGeneratedDiagnostics handle rows = do
           deltaValues = map snd deltas
           posDeltas   = length [d | d <- deltaValues, d >= 0]
           negDeltas   = length deltaValues - posDeltas
+          ownedSizeOf r = M.lookup (familyName (lrFamily r), lrMember r) ownedSizeIndex
+          emittedByOwnedSize =
+            [ (sz, [r | r <- emitted, ownedSizeOf r == Just sz])
+            | sz <- sort (nubOrd [s | r <- emitted, Just s <- [ownedSizeOf r]])
+            ]
 
       hPutStrLn handle ""
-      hPutStrLn handle "=== generated variant diagnostics (Phase 7.E) ==="
+      hPutStrLn handle "=== generated variant diagnostics (Phase 7.E/7.G) ==="
       hPutStrLn handle $ "  considered:  " <> show (length generated)
                       <> "  emitted: "    <> show (length emitted)
                       <> "  unsupported: " <> show (length unsupported)
@@ -1612,10 +1637,37 @@ renderGeneratedDiagnostics handle rows = do
         hPutStrLn handle $ printf
           "  delta vs best non-generated (region-kernel/RFused): rows=%d  min=%+.2fx  median=%+.2fx  max=%+.2fx  generated>=best=%d  generated<best=%d"
           (length deltaValues) dMin dMed dMax posDeltas negDeltas
+      -- §7.G owned-size buckets. Re-derives the owned tail length
+      -- for each emitted row's source graph and groups rows by
+      -- that length. Median speedup per bucket lets a reader see
+      -- the amortization curve at a glance without crunching JSONL.
+      unless (null emittedByOwnedSize) $ do
+        hPutStrLn handle "  by owned-op count (rows / median speedup vs node-loop):"
+        forM_ emittedByOwnedSize $ \(sz, srows) ->
+          let speedups = mapMaybe lrSpeedupVsBase srows
+              (_, sMed, _) = minMedMax speedups
+              medStr = if null speedups then "n/a" else printf "%.2fx" sMed
+          in hPutStrLn handle $ printf
+               "    size=%2d  rows=%d  median=%s"
+               sz (length srows) (medStr :: String)
       hPutStrLn handle "=== end generated diagnostics ==="
       hFlush handle
   where
     unless cond act = if cond then pure () else act
+
+    -- Built once per call: (familyName, member) -> owned tail
+    -- length for the generator's first eligible candidate on the
+    -- member's source graph. 'Nothing' for graphs the generator
+    -- declines; those rows just don't appear in any bucket.
+    -- Keyed by family-name string rather than 'GraphFamily'
+    -- because the enum has no 'Ord' instance.
+    ownedSizeIndex :: M.Map (String, String) Int
+    ownedSizeIndex = M.fromList
+      [ ((familyName fam, name), sz)
+      | fam <- [minBound .. maxBound :: GraphFamily]
+      , FamilyMember name graph <- familyMembers fam
+      , Just sz <- [generatedOwnedTailLength graph]
+      ]
 
     tally :: Ord a => [a] -> [(a, Int)]
     tally xs =
