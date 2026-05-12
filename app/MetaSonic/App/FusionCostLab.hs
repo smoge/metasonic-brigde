@@ -147,14 +147,27 @@ data GraphFamily
     -- recurring nested-Add variants. The fanout adds a constant Sin
     -- overhead across every variant; relative speedups stay
     -- comparable between variants.
+  | FamilyDynamicGain
+    -- ^ Dynamic-gain shapes flagged as 'needs-benchmark' after the
+    -- §7.C 'KGain.amount' feature axis split scalar-gain measurements
+    -- away from audio-rate-modulated ones. Members wire a slow
+    -- 'SinOsc' modulator into 'KGain.amount' so the gain's
+    -- 'rnInputs' include 'RFrom' on the amount slot (not 'RConst').
+    -- Covers @KGain → KOut gain=dynamic@,
+    -- @KSawOsc → KGain → KOut gain=dynamic@, and
+    -- @KSinOsc → KGain → KGain → KOut gain=dynamic,const@. Dynamic
+    -- gain is the cleanest bridge into 7.D because it exercises the
+    -- tiny-executor primitives (input read, multiply, sink write)
+    -- without adding stateful lifecycle questions.
   deriving stock (Eq, Show, Bounded, Enum)
 
 familyName :: GraphFamily -> String
-familyName FamilySinkChain  = "sink-chain"
-familyName FamilyReturnTail = "return-tail"
-familyName FamilyFanout     = "fanout"
-familyName FamilyCorpus     = "corpus"
-familyName FamilyAddChain   = "add-chain"
+familyName FamilySinkChain   = "sink-chain"
+familyName FamilyReturnTail  = "return-tail"
+familyName FamilyFanout      = "fanout"
+familyName FamilyCorpus      = "corpus"
+familyName FamilyAddChain    = "add-chain"
+familyName FamilyDynamicGain = "dynamic-gain"
 
 -- | One member of a family. The string label is the row's stable
 -- identity in JSONL output — keep it short and shell-grep-friendly.
@@ -187,6 +200,11 @@ familyMembers FamilyAddChain =
   , FamilyMember "add-lpf-gain-out"        addChainAddLpfGainOut
   , FamilyMember "nested-add-gain-out"     addChainNestedGainOut
   , FamilyMember "nested-add-lpf-gain-out" addChainNestedLpfGainOut
+  ]
+familyMembers FamilyDynamicGain =
+  [ FamilyMember "gain-dyn-out"         dynGainOut
+  , FamilyMember "saw-gain-dyn-out"     dynGainSawOut
+  , FamilyMember "sin-gain-dyn-gain-const-out" dynGainNestedOut
   ]
 
 templateMembers :: String -> [(String, SynthGraph)] -> [FamilyMember]
@@ -306,6 +324,47 @@ addChainNestedLpfGainOut = runSynth $ do
   g   <- gain f 0.5
   out 0 g
   out 1 osc
+
+------------------------------------------------------------
+-- §7.C dynamic-gain family
+------------------------------------------------------------
+--
+-- Each member wires a slow 'SinOsc' (1 Hz) into the gain's amount
+-- input so the gain lowers to 'RFrom' on that slot rather than
+-- 'RConst'. The modulator is declared before the signal source so
+-- it lands earlier in dense order — that keeps the
+-- amount-modulator out of the maximal accepted candidate (it lives
+-- at a true-interior 'KSinOsc' position, which the planner rejects
+-- as stateful-not-on-allow-list).
+--
+-- The 'dynGainOut' member also needs a fanout on the signal so the
+-- 2-length 'KGain → KOut' candidate is the maximal selected one
+-- (the 3-length 'src → gain → out' candidate gets rejected on the
+-- src fanout). The other two members get a long-enough accepted
+-- chain that fanout is unnecessary.
+
+dynGainOut :: SynthGraph
+dynGainOut = runSynth $ do
+  amt <- sinOsc 1.0 0.0     -- modulator declared first
+  src <- sinOsc 440.0 0.0
+  y   <- gain src amt
+  out 0 y
+  out 1 src                  -- forces src fanout to truncate the candidate
+
+dynGainSawOut :: SynthGraph
+dynGainSawOut = runSynth $ do
+  amt <- sinOsc 1.0 0.0
+  saw <- sawOsc 220.0 0.0
+  y   <- gain saw amt
+  out 0 y
+
+dynGainNestedOut :: SynthGraph
+dynGainNestedOut = runSynth $ do
+  amt <- sinOsc 1.0 0.0
+  src <- sinOsc 440.0 0.0
+  y1  <- gain src amt           -- gain 1: dynamic amount
+  y2  <- gain y1 (Param 0.5)    -- gain 2: const amount
+  out 0 y2
 
 ------------------------------------------------------------
 -- Variants and features
