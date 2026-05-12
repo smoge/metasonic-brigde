@@ -16,6 +16,7 @@ module MetaSonic.OSC.Dispatch
     ResolveState
   , emptyResolveState
   , registerVoice
+  , validateVoiceKey
   , dropVoice
   , installTemplateGraph
   , resolveStateTemplate
@@ -42,4 +43,5 @@ import           MetaSonic.OSC.Dispatch.Internal
                    , reservedOscPathSegments
                    , resolveStateTemplate
                    , resolveStateVoices
+                   , validateVoiceKey
                    )

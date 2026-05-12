@@ -22,6 +22,7 @@ module MetaSonic.OSC.Dispatch.Internal
   , emptyResolveState
   , registerVoice
   , registerVoiceUnchecked
+  , validateVoiceKey
   , dropVoice
   , installTemplateGraph
   , resolveStateTemplate
@@ -92,13 +93,20 @@ registerVoice
   -> ByteString  -- ^ template name the voice was spawned against
   -> ResolveState
   -> Either DispatchIssue ResolveState
-registerVoice key slotId tname rs
+registerVoice key slotId tname rs = do
+  validateVoiceKey key
+  pure (registerVoiceUnchecked key slotId tname rs)
+
+-- | Validate a voice key with the same OSC-safe profile enforced by
+-- 'registerVoice', without mutating a 'ResolveState'.
+validateVoiceKey :: ByteString -> Either DispatchIssue ()
+validateVoiceKey key
   | key `elem` reservedOscPathSegments =
       Left (DiReservedPathSegment key)
   | not (isOscSafeIdentifier key) =
       Left (DiIdentifierProfile key)
   | otherwise =
-      Right (registerVoiceUnchecked key slotId tname rs)
+      Right ()
 
 -- | Register a voice without validation. Documented escape
 -- hatch: callers must ensure the voice key is OSC-safe

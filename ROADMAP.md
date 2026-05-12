@@ -2830,11 +2830,12 @@ See
 for the full contract.
 
 With 8.H landed, the manifest is a stable input shape for
-the eventual session layer. **Session Prep A** is now the
-first non-runtime session-scoping slice: command/event
-vocabulary, OSC resolve-state rebuild, and buffer/plugin
-lifecycle reports. The session runtime itself is still gated
-on the items below.
+the eventual session layer. **Session Prep A** was the first
+non-runtime session-scoping slice: command/event vocabulary,
+OSC resolve-state rebuild, and buffer/plugin lifecycle
+reports. **Session Prep B** now adds a pure admission/commit
+state boundary on top of those nouns. The session runtime
+itself is still gated on the items below.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2846,15 +2847,20 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A supplies the library-side
+cost/profitability table. Session Prep A and B supply the library-side
 contracts the future session owner will consume, without creating that
 owner yet.
 
-Session Prep A artifact:
+Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
   records the Haskell-only command/event vocabulary, pure OSC
   resolve-state rebuild helper, and read-only buffer/plugin lifecycle
   reports. This is not the runtime session layer.
+- [Session Prep B - Admission And Commit Contract](notes/2026-05-12-session-prep-b-admission-commit.md)
+  records the Haskell-only admission/commit split: admission validates
+  commands and returns plans without mutation; commits update pure
+  session-visible state only after the caller reports a successful
+  runtime action. This is still not the runtime session layer.
 
 Landed prep contracts:
 
@@ -2864,8 +2870,11 @@ Landed prep contracts:
   (`MetaSonic.Session.Resolve`).
 - [x] Read-only buffer/plugin lifecycle report shapes and readers
   (`MetaSonic.Session.Report`).
+- [x] Pure admission/commit state mirror for known templates, active
+  voices, and OSC resolve state (`MetaSonic.Session.State`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
-  policy, and lifecycle report counters.
+  policy, lifecycle report counters, admission decisions, and
+  commit-only mutation behavior.
 
 Still gated:
 

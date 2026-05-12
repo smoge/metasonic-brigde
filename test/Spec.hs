@@ -137,6 +137,7 @@ import           MetaSonic.Pattern.Corpus
 import           MetaSonic.Session.Command
 import           MetaSonic.Session.Resolve
 import           MetaSonic.Session.Report
+import           MetaSonic.Session.State
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -175,6 +176,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionCommandTests
   , sessionResolveTests
   , sessionReportTests
+  , sessionStateTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -12170,6 +12172,161 @@ sessionReportTests = testGroup "Session Prep A: lifecycle reports"
         blrInvalidReadCount report @?= 0
         blrWriteCount report @?= fromIntegral nframes
         blrInvalidWriteCount report @?= 0
+  ]
+
+------------------------------------------------------------
+-- Session Prep B: pure admission and commit state
+--
+-- These tests pin the split between read-only command admission
+-- and state-changing commits. They do not allocate runtime voices,
+-- install graphs, write queues, or touch RTGraph.
+------------------------------------------------------------
+
+sessionStateTests :: TestTree
+sessionStateTests = testGroup "Session Prep B: admission and commits"
+  [ testCase "initial state accepts an empty graph as boot state" $ do
+      let bootGraph = TemplateGraph [] M.empty
+          st  = initialSessionState bootGraph
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      ssGraph st @?= bootGraph
+      ssVoices st @?= M.empty
+      OSC.resolveStateVoices (ssResolve st) @?= M.empty
+      admitSessionCommand cmd st
+        @?= SessionRejected cmd (SiUnknownTemplate (TemplateName "drone"))
+
+  , testCase "known-template voice start plans without mutating state" $ do
+      let tg       = patternTemplates droneVibrato
+          st       = initialSessionState tg
+          controls = [(ControlTag (MigrationKey "amp") 0, 0.25)]
+          cmd      = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") controls
+      admitSessionCommand cmd st
+        @?= SessionAdmitted cmd
+              (PlanVoiceStart (TemplateName "drone") (VoiceKey "v0") controls)
+      ssVoices st @?= M.empty
+      OSC.resolveStateVoices (ssResolve st) @?= M.empty
+
+  , testCase "admitted voice start has no effect without commit" $ do
+      let tg  = patternTemplates droneVibrato
+          st  = initialSessionState tg
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          off = CmdVoiceOff (VoiceKey "v0")
+      admitSessionCommand cmd st
+        @?= SessionAdmitted cmd
+              (PlanVoiceStart (TemplateName "drone") (VoiceKey "v0") [])
+      -- Simulated runtime failure: no CommitVoiceStarted is applied.
+      ssVoices st @?= M.empty
+      OSC.resolveStateVoices (ssResolve st) @?= M.empty
+      admitSessionCommand off st
+        @?= SessionRejected off (SiStaleVoice (VoiceKey "v0"))
+
+  , testCase "unknown template and malformed keys reject at admission" $ do
+      let st = initialSessionState (patternTemplates droneVibrato)
+          unknown =
+            CmdVoiceOn (TemplateName "missing") (VoiceKey "v0") []
+          malformed =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "bad/key") []
+          reserved =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "swap") []
+      admitSessionCommand unknown st
+        @?= SessionRejected unknown (SiUnknownTemplate (TemplateName "missing"))
+      admitSessionCommand malformed st
+        @?= SessionRejected malformed (SiInvalidVoiceKey (VoiceKey "bad/key"))
+      admitSessionCommand reserved st
+        @?= SessionRejected reserved (SiInvalidVoiceKey (VoiceKey "swap"))
+
+  , testCase "voice-start commit inserts binding and resolve entry" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding
+            { vbVoiceKey     = VoiceKey "v0"
+            , vbSlotId       = 11
+            , vbTemplateName = TemplateName "drone"
+            }
+          st1 = applySessionCommit (CommitVoiceStarted binding) st0
+      ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
+      OSC.resolveStateVoices (ssResolve st1)
+        @?= M.fromList [(OBSC.pack "v0", (11, OBSC.pack "drone"))]
+
+  , testCase "duplicate active voice rejects after start commit" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
+          st1 = applySessionCommit (CommitVoiceStarted binding) st0
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      admitSessionCommand cmd st1
+        @?= SessionRejected cmd (SiVoiceAlreadyActive (VoiceKey "v0"))
+
+  , testCase "voice off and control write plan only for active voices" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
+          st1 = applySessionCommit (CommitVoiceStarted binding) st0
+          target = ControlTag (MigrationKey "lpf") 0
+          off = CmdVoiceOff (VoiceKey "v0")
+          write = CmdControlWrite (VoiceKey "v0") target 1800.0
+          staleOff = CmdVoiceOff (VoiceKey "missing")
+          staleWrite = CmdControlWrite (VoiceKey "missing") target 1800.0
+      admitSessionCommand off st1
+        @?= SessionAdmitted off (PlanVoiceStop binding)
+      admitSessionCommand write st1
+        @?= SessionAdmitted write (PlanControlWrite binding target 1800.0)
+      admitSessionCommand staleOff st1
+        @?= SessionRejected staleOff (SiStaleVoice (VoiceKey "missing"))
+      admitSessionCommand staleWrite st1
+        @?= SessionRejected staleWrite (SiStaleVoice (VoiceKey "missing"))
+
+  , testCase "voice-stop commit removes binding and resolve entry" $ do
+      let st0 = initialSessionState (patternTemplates droneVibrato)
+          binding = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
+          st1 = applySessionCommit (CommitVoiceStarted binding) st0
+          st2 = applySessionCommit (CommitVoiceStopped (VoiceKey "v0")) st1
+      ssVoices st2 @?= M.empty
+      OSC.resolveStateVoices (ssResolve st2) @?= M.empty
+
+  , testCase "hot-swap admission previews drops without installing graph" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          binding = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
+          st0 = applySessionCommit
+                  (CommitVoiceStarted binding)
+                  (initialSessionState oldGraph)
+          cmd = CmdHotSwap (SwapLabel "remove-drone") newGraph
+          expectedDrop =
+            [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
+      case admitSessionCommand cmd st0 of
+        SessionAdmitted _ (PlanHotSwap _ graph preview) -> do
+          graph @?= newGraph
+          rrrDropped preview @?= expectedDrop
+        other ->
+          assertFailure ("expected hot-swap plan, got: " <> show other)
+      ssGraph st0 @?= oldGraph
+      OSC.resolveStateTemplate (ssResolve st0) @?= oldGraph
+
+  , testCase "graph-install commit rebuilds resolve and drops missing voices" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          binding = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
+          st0 = applySessionCommit
+                  (CommitVoiceStarted binding)
+                  (initialSessionState oldGraph)
+          st1 = applySessionCommit
+                  (CommitGraphInstalled (SwapLabel "remove-drone") newGraph)
+                  st0
+      ssGraph st1 @?= newGraph
+      ssVoices st1 @?= M.empty
+      OSC.resolveStateTemplate (ssResolve st1) @?= newGraph
+      OSC.resolveStateVoices (ssResolve st1) @?= M.empty
+
+  , testCase "graph-install commit preserves surviving voices" $ do
+      let graph = patternTemplates droneVibrato
+          binding = VoiceBinding (VoiceKey "v0") 11 (TemplateName "drone")
+          st0 = applySessionCommit
+                  (CommitVoiceStarted binding)
+                  (initialSessionState graph)
+          st1 = applySessionCommit
+                  (CommitGraphInstalled (SwapLabel "same") graph)
+                  st0
+      ssGraph st1 @?= graph
+      ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
+      OSC.resolveStateVoices (ssResolve st1)
+        @?= M.fromList [(OBSC.pack "v0", (11, OBSC.pack "drone"))]
   ]
 
 ------------------------------------------------------------

@@ -76,6 +76,7 @@ data SessionCommand
 data SessionIssue
   = SiUnknownTemplate !TemplateName
   | SiInvalidVoiceKey !VoiceKey
+  | SiVoiceAlreadyActive !VoiceKey
   | SiStaleVoice      !VoiceKey
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
