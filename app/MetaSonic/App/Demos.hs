@@ -255,6 +255,17 @@ template is intentionally minimal (just an LPF) — the point is the
 cross-template plumbing, not DSP cleverness.
 -}
 
+-- The send and fx-return templates are authored through
+-- 'MetaSonic.Authoring.send' / 'returnBus' (Phase 8.D).
+-- The lowered graph is byte-identical to the hand-authored
+-- 'busOut 7' / 'busIn 7' pair this demo used previously —
+-- the same 'KBusOut' on bus 7 in the voice template, the
+-- same 'KBusIn' on bus 7 in the fx template, and the same
+-- 'tplFootprint' / template ordering that
+-- 'compileTemplateGraph' derives from those.
+sendReturnBus :: Auth.Bus
+sendReturnBus = Auth.bus 7
+
 sendReturnVoice :: SynthGraph
 sendReturnVoice = runSynth $ do
   lfo       <- sinOsc 5.0 0.0
@@ -262,13 +273,13 @@ sendReturnVoice = runSynth $ do
   pitch     <- add 110.0 deviation    -- 110 Hz ± 8 Hz
   carrier   <- sawOsc pitch 0.0
   amped     <- gain carrier 0.4       -- attenuate before send
-  busOut 7 amped                      -- → shared send bus 7
+  Auth.send sendReturnBus (Auth.mono amped)
 
 sendReturnFx :: SynthGraph
 sendReturnFx = runSynth $ do
-  send     <- busIn 7                 -- read voice's send
-  filtered <- lpf send 800.0 0.7      -- LPF at 800 Hz
-  out 0 filtered                      -- → hardware bus 0
+  sent     <- Auth.returnBus sendReturnBus
+  filtered <- Auth.lpfM sent (Param 800.0) (Param 0.7)
+  Auth.outMono 0 filtered             -- → hardware bus 0
 
 sendReturnDemo :: [(String, SynthGraph)]
 sendReturnDemo =
