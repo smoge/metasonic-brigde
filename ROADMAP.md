@@ -2086,7 +2086,8 @@ What changed:
   `FusionProgram` ABI did not change; only the C++ loop nest
   did. Scratch grew from `kMaxScratchSlots` floats to
   `kMaxScratchSlots × kMaxBlockFrames = 64 × 256 = 64 KiB`,
-  with silent fall-through above the bound.
+  with a silent no-op above the bound (matching the existing
+  `scratch_slots > kMaxScratchSlots` policy).
 - A new C ABI entry
   `rt_graph_template_add_region_generated_block` mirrors the
   existing `_generated` entry and sets
