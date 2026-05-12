@@ -49,19 +49,21 @@ and activated on the audio thread without allocation. See the
 and tested independently:
 
 ```
-metasonic-core       DSL — no C++ dependencies, pure Haskell
+metasonic-core       future DSL — no C++ dependencies, pure Haskell
      ↓
-metasonic-bridge     graph compiler+FFI+TUI inspectior
+metasonic-bridge     graph compiler + FFI + authoring helpers + TUI inspector
      ↓
-tinysynth            real-time audio engine — pure C++20 + q_lib 
+tinysynth            real-time audio engine — pure C++20 + q_lib
      ↓
-tinysynth-ui         runtime-facing UI on the C++ side 
+tinysynth-ui         runtime-facing UI on the C++ side
 ```
 
-- **metasonic-core** defines the user-facing DSL. No FFI involvement. Type
-  discipline is the bridge's responsibility, not the DSL's.
+- **metasonic-core** is the future home for the user-facing DSL. No FFI
+  involvement. Type discipline is the bridge's responsibility, not the DSL's.
 - **metasonic-bridge** compiles graphs into a strongly typed IR and
-  marshals across the FFI boundary.
+  marshals across the FFI boundary. It also carries the current
+  `MetaSonic.Authoring` facade: a transparent authoring layer that elaborates
+  back to ordinary `SynthGraph` / `TemplateGraph` values.
 - **tinysynth** is the audio engine. Plugins are authored and tested entirely in
   C++ — no Haskell toolchain required.
 - **tinysynth-ui** provides real-time parameter control and audio visualization
@@ -86,7 +88,7 @@ keeping their architectural modularity. This repo layout is temporary.
 - **GHC** — tested with 9.10.3
 - **Stack** — deterministic dependency management
 - **C++20 compiler** — GCC or Clang
-- **PortAudio** — must be installed separately on your system
+- **PortAudio / PortMIDI** — must be installed separately on your system
 - **Q** (C++20 library) — infra and q_lib modules, included as git
   submodules
 
@@ -103,7 +105,8 @@ stack exec metasonic-bridge
 
 ## Usage
 
-The executable supports five run modes and an optional set of demo targets.
+The executable supports audio playback, inspection, and non-audio reporting
+modes. Most modes accept optional demo targets.
 
 ```
 stack exec -- metasonic-bridge [MODE] [DEMO ...]
@@ -111,15 +114,26 @@ stack exec -- metasonic-bridge [MODE] [DEMO ...]
 
 ### Run modes
 
-| Flag               | Behavior                                               |
-|--------------------|--------------------------------------------------------|
-| *(default)*        | Compile and play audio directly                        |
-| `--inspect`        | Open the TUI pipeline inspector, then play audio       |
-| `--inspect-only`   | Open the TUI pipeline inspector, skip audio            |
-| `--fusion-survey`  | Compile demos through both runtime paths and report    |
-|                    | fusion coverage and corpus FreeLayer-width             |
-| `--worker-bench`   | Compile demos plus the fixed corpus and benchmark      |
-|                    | the schedule worker dispatch path                      |
+| Flag                          | Behavior                                      |
+|-------------------------------|-----------------------------------------------|
+| *(default)* / `--audio-only`  | Compile and play audio directly               |
+| `--inspect`                   | Open the TUI inspector, then play audio       |
+| `--inspect-only`              | Open the TUI inspector and skip audio         |
+| `--fusion-survey`             | Report fusion, schedule, rate, and gate data  |
+| `--worker-bench`              | Benchmark schedule worker dispatch modes      |
+| `--swap-bench`                | Benchmark the hot-swap helper path            |
+| `--corpus-survey`             | Run the pattern corpus through survey tooling |
+| `--fusion-cost-lab [--summary]` | Measure fusion variants and equivalence     |
+| `--snapshot-check`            | Run survey / cost-lab invariant checks        |
+| `--midi-list`                 | List Q / PortMIDI devices                     |
+| `--plugin-list`               | Print the linked static plugin registry       |
+| `--osc-listen [PORT]`         | Run the OSC-controlled demo graph             |
+
+Useful modifiers:
+
+- `--fused` selects the fused-input loader path for applicable demo modes.
+- `--summary` switches `--fusion-cost-lab` from JSONL to a readable table.
+- `--midi-device N` selects the PortMIDI input for the `midi-poly` demo.
 
 ### Demo targets
 
@@ -148,6 +162,15 @@ stack exec -- metasonic-bridge --inspect-only
 
 # Inspect a specific graph
 stack exec -- metasonic-bridge --inspect-only fanout
+
+# Human-readable fusion cost-lab summary
+stack exec -- metasonic-bridge --fusion-cost-lab --summary
+
+# Run the structural snapshot checks
+stack exec -- metasonic-bridge --snapshot-check
+
+# Run the OSC control demo on UDP port 7000
+stack exec -- metasonic-bridge --osc-listen 7000
 ```
 
 ### Compilation inspector (TUI)
@@ -163,10 +186,48 @@ entirely.
 
 ---
 
-## SynthGraph syntax
+## Authoring layer
 
-The DSL for building graphs looks like this (these are some of the
-included demos, one can play audio and inspect each one via TUI):
+`MetaSonic.Authoring` is the current bridge-local authoring facade. It adds
+typed mono/stereo/channel wrappers, lifted UGen helpers, routing helpers, and
+an ensemble builder, but it does not add runtime concepts. Every helper
+elaborates to ordinary primitive `SynthGraph` or `TemplateGraph` input.
+
+The ensemble builder is useful for multi-template patches because it gives
+shared buses stable names instead of hard-coded integers:
+
+```haskell
+-- import qualified MetaSonic.Authoring as Auth
+
+sendReturnEnsemble :: Auth.AuthoredEnsemble
+sendReturnEnsemble = either error id $ Auth.ensemble $ do
+  sendBus <- Auth.busNamed "main-send"
+
+  Auth.voice "voice" $ runSynth $ do
+    osc <- sawOsc 110.0 0.0
+    g   <- gain osc 0.4
+    Auth.send sendBus (Auth.mono g)
+
+  Auth.fx "fx" $ runSynth $ do
+    sent <- Auth.returnBus sendBus
+    f    <- Auth.lpfM sent (Param 800.0) (Param 0.7)
+    Auth.outMono 0 f
+
+sendReturnTemplates :: [(String, SynthGraph)]
+sendReturnTemplates = Auth.aeTemplates sendReturnEnsemble
+```
+
+`sendReturnTemplates` is the same shape `compileTemplateGraph` already
+accepts. Template ordering, bus footprints, fusion, schedule analysis, and FFI
+loading still belong to the existing compiler pipeline.
+
+---
+
+## Low-level SynthGraph syntax
+
+The lower-level graph builder remains available directly. It looks like this
+(these are some of the included demos, and each can be played or inspected via
+the TUI):
 
 ```haskell
 chainGraph :: SynthGraph
@@ -239,18 +300,21 @@ Inter-template precedence (voice runs before master) is derived automatically
 from the `busOut 7` / `busIn 7` connectivity at compile time — there is no
 runtime ordering knob.
 
-This syntax belongs to `metasonic-bridge` — the compilation layer that
-constructs IR nodes and lowers them to C++. The authoring DSL in
-`metasonic-core` sits above this, offering alternative interfaces.
+This low-level syntax belongs to `metasonic-bridge` — the compilation layer
+that constructs IR nodes and lowers them to C++. The `MetaSonic.Authoring`
+facade sits above it for common authoring patterns while preserving the same
+lowered graph shape.
 
 ---
 
 ## Current state
 
 - Block-based DSP execution
-- Static, precompiled graphs
+- Static, precompiled graphs and multi-template `TemplateGraph`s
 - DSP layer grounded on q_lib
-- Minimal node set (tinysynth includes q_lib "plugins" and will extend it)
-- TUI inspector for stepping through compilation stages (use command-line options)
-- Survey/benchmark reporting modes for fusion coverage and schedule worker dispatch
-
+- Authoring helpers for mono/stereo/channel expansion, routing, and ensembles
+- Static plugin metadata registry shared across Haskell and C++
+- OSC listener / dispatcher for the current v1 control surface
+- Hand-written fusion kernels plus read-only generated-fusion experiments
+- TUI inspector for stepping through compilation stages
+- Survey, benchmark, cost-lab, and snapshot-check modes for regression evidence
