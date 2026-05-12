@@ -12,20 +12,19 @@ stays single-graph as it is today.
 
 No `SynthGraph`, `TemplateGraph`, runtime ABI, IR, planner,
 or compiler changes. The slice is read-only metadata
-plumbing in the **app layer**.
+plumbing outside the compile path: a small library-side
+report carrier, plus app-side demo/reporting hooks.
 
 ## Scope
 
 Five sites:
 
-1. **App-level demo metadata carrier.** A new
-   `DemoAuthoringMetadata` record on the demo model
-   ([app/MetaSonic/App/Demos.hs](app/MetaSonic/App/Demos.hs))
-   carries the per-demo authoring view: ensemble roles and
-   named bus assignments from `AuthoredEnsemble`, named
-   controls from Phase 8.F, and explicit template/voice
-   names so survey row labels stay stable. The field is
-   `Maybe`; legacy single-graph demos leave it `Nothing`.
+1. **Report carrier + demo opt-in field.**
+   `MetaSonic.Authoring.Report` defines `AuthoringReport`
+   plus `ReportedTemplate`, `ReportedBus`, and
+   `ReportedControl`. `Demo` carries
+   `demoAuthoring :: Maybe AuthoringReport`; legacy demos
+   leave it `Nothing`.
 
 2. **One small named-control demo.** Adds an authored
    single-template demo that exercises `control`,
@@ -47,74 +46,72 @@ Five sites:
    named controls, CC-bound named-control count. Plus a
    short per-demo row for demos that carry metadata.
 
-5. **Tests + snapshot pins.** Tests assert (a) the demo's
+5. **Tests, no snapshot pins.** Tests assert (a) the demo's
    reported metadata matches the underlying `SynthGraph` /
    `AuthoredEnsemble`, (b) the rendered text is stable
    enough to catch drift, (c) the send/return ensemble's
-   bus index reports as `16`. Snapshot pins for the
-   corpus-level counts.
+   bus index reports as `16`. Corpus-level authoring
+   snapshot pins stay out of scope because the snapshot tool
+   does not currently own the app demo table.
 
 ### Types
 
-In [app/MetaSonic/App/Demos.hs](app/MetaSonic/App/Demos.hs):
+In
+[src/MetaSonic/Authoring/Report.hs](src/MetaSonic/Authoring/Report.hs):
 
-    data DemoAuthoringMetadata = DemoAuthoringMetadata
-      { damTemplates :: ![DemoTemplateMetadata]
-        -- per-template role + footprint view, in
-        -- ensemble declaration order
-      , damBuses     :: ![DemoBusMetadata]
-        -- named bus → index, in stable allocation order
-      , damControls  :: ![DemoNamedControlView]
-        -- named controls, in declaration order
+    data AuthoringReport = AuthoringReport
+      { arTemplates :: ![ReportedTemplate]
+      , arBuses     :: ![ReportedBus]
+      , arControls  :: ![ReportedControl]
       }
 
-    data DemoTemplateMetadata = DemoTemplateMetadata
-      { dtmName :: !String
-      , dtmRole :: !TemplateRole
+    data ReportedTemplate = ReportedTemplate
+      { rtName :: !String
+      , rtRole :: !TemplateRole
       }
 
-    data DemoBusMetadata = DemoBusMetadata
-      { dbmName  :: !String
-      , dbmIndex :: !Int
+    data ReportedBus = ReportedBus
+      { rbName  :: !String
+      , rbIndex :: !Int
       }
 
-    data DemoNamedControlView = DemoNamedControlView
-      { dncName        :: !String
-      , dncDefault     :: !Double
-      , dncRange       :: !(Double, Double)
-      , dncSmoothingHz :: !Double
-      , dncCC          :: !(Maybe Word8)
-      , dncKey         :: !MigrationKey
-      , dncSlot        :: !Int
+    data ReportedControl = ReportedControl
+      { rcName        :: !String
+      , rcDefault     :: !Double
+      , rcRange       :: !(Double, Double)
+      , rcSmoothingHz :: !Double
+      , rcCC          :: !(Maybe Word8)
+      , rcKey         :: !MigrationKey
+      , rcSlot        :: !Int
       }
 
-The new `demoAuthoring :: Demo -> Maybe DemoAuthoringMetadata`
+The new `demoAuthoring :: Demo -> Maybe AuthoringReport`
 field hangs off `Demo`. Existing demos initialize it to
 `Nothing` and rendering paths short-circuit on `Nothing`,
-so adding the field does not produce noise on any of the
-20+ pre-existing demos.
+so adding the field does not produce noise on legacy demos.
 
-These types live in the app layer. They are **not**
-exposed by `MetaSonic.Authoring` and they are **not**
-visible to the compiler. Authoring constructs (a
-`NamedControl`, an `AuthoredEnsemble`) populate these
-records at demo-construction time; the reporting layer
-reads them. Nothing rewrites a `SynthGraph`.
+These report types live beside the authoring layer so the
+app, tests, and future tooling can share projection +
+rendering code. They are **not** embedded in `SynthGraph`,
+`TemplateGraph`, or compiler IR. Authoring constructs (a
+`NamedControl`, an `AuthoredEnsemble`) populate the report
+at demo-construction time; the reporting layer reads it.
+Nothing rewrites a `SynthGraph`.
 
 ### Builder helpers
 
 To keep demo-side metadata construction terse:
 
-    ensembleMetadata
-      :: Auth.AuthoredEnsemble -> DemoAuthoringMetadata
+    ensembleReport
+      :: Auth.AuthoredEnsemble -> AuthoringReport
     -- Projects role + bus tables from an AuthoredEnsemble.
-    -- Sets damControls = [].
+    -- Sets arControls = [].
 
-    addNamedControl
+    addReportedControl
       :: Auth.NamedControl
-      -> DemoAuthoringMetadata
-      -> DemoAuthoringMetadata
-    -- Appends one control's metadata to damControls. The
+      -> AuthoringReport
+      -> AuthoringReport
+    -- Appends one control's metadata to arControls. The
     -- demo body captures the NamedControl in a let-binding
     -- (via runSynthWith) and threads it through this helper.
 
@@ -142,7 +139,7 @@ demo table, and in `--fusion-survey`.
 
 After `printTraceSummary` and `printFusionSummaryFor`, a
 new helper `printAuthoringMetadata :: Demo -> IO ()` runs.
-When `demoAuthoring demo = Just dam`, the helper emits:
+When `demoAuthoring demo = Just report`, the helper emits:
 
     ─── Authoring metadata ───
     Templates:
@@ -155,8 +152,7 @@ When `demoAuthoring demo = Just dam`, the helper emits:
       vol      default=0.3     range=[0.0, 1.0]       smooth=20.0  cc=7 key=vol slot=1
 
 When `demoAuthoring demo = Nothing`, nothing prints. This
-keeps the inspector output unchanged for the 20+ pre-
-existing demos.
+keeps the inspector output unchanged for legacy demos.
 
 ### `--fusion-survey` authoring section
 
@@ -165,7 +161,7 @@ After `printSurveyTotals`, a new helper
 
     ─── Authoring metadata totals ───
     demos with authoring metadata : 2
-    total named templates         : 2
+    total named templates         : 3
     total named buses             : 1
     total named controls          : 2
     CC-bound named controls       : 1
@@ -202,7 +198,7 @@ counts.
 
 ## Test discipline
 
-Tests live in a new `authoringMetadataTests` group in
+Tests live in a new `authoringReportTests` group in
 [test/Spec.hs](test/Spec.hs):
 
 - The `named-control` demo's `demoAuthoring` projection
@@ -211,24 +207,21 @@ Tests live in a new `authoringMetadataTests` group in
   `RuntimeGraph` (via `rnMigrationKey`); the CC binding's
   node maps to the right smoother.
 - The `send-return` ensemble demo reports
-  `damBuses = [("main-send", 16)]` and
-  `damTemplates = [("voice", VoiceTemplate), ("fx",
-  FxTemplate)]`.
+  `arBuses = [ReportedBus "main-send" 16]` and
+  `arTemplates = [ReportedTemplate "voice" VoiceTemplate,
+  ReportedTemplate "fx" FxTemplate]`.
 - `printAuthoringMetadata` renders stable text for the
   two demos that carry metadata — fixed-line, no
   Map-iteration-order surprise.
-- `printAuthoringSurvey`'s totals match the per-demo
-  metadata for the full demo table.
+- `renderAuthoringReport` returns stable line lists for
+  the two report shapes that carry metadata.
 
-Snapshot pins:
-
-- corpus authoring-metadata count is stable
-  (`demos with authoring metadata = 2` at slice close);
-- total-named-controls = 2, CC-bound-controls = 1,
-  total-named-buses = 1.
-
-These are structural counts, not measurements, so they
-will not move under bench noise.
+Snapshot pins are deliberately parked. The demo table lives
+in `app/`, while the current snapshot checker is a
+library-side diagnostic. A future slice can add an app-side
+snapshot runner or move the demo metadata catalogue into a
+library-visible module before pinning corpus-level authoring
+counts.
 
 ## Verification
 
@@ -242,12 +235,12 @@ No C++ test run needed.
 
 ## Outcome ladder
 
-  1. App-level metadata carrier + one named-control demo
+  1. Report carrier + one named-control demo
      + `--inspect-only` block + `--fusion-survey` section
-     + tests + snapshot pins land. **Mark 8.G complete
-     (textual surface).** Multi-template Brick stays
-     listed as a non-goal for this slice; the next layer
-     is session/ownership scoping or metadata
+     + tests land; snapshot pins stay parked. **Mark 8.G
+     complete (textual surface).** Multi-template Brick
+     stays listed as a non-goal for this slice; the next
+     layer is session/ownership scoping or metadata
      persistence/export, whichever pulls harder.
   2. Carrier + demo land but `--inspect-only` and survey
      output drift from the underlying ensemble. **Mark

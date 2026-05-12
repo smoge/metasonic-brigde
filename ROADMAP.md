@@ -2737,8 +2737,7 @@ it as plain lines. `--inspect-only` prints the block after
 the existing compile summary; `--fusion-survey` adds an
 "Authoring metadata totals" section plus a one-line
 per-demo row. The renderer is silent on demos without
-metadata, so the existing 14 legacy demos see no output
-change.
+metadata, so legacy demos see no output change.
 
 The first opt-in demo (`named-control`, new) exercises
 `control` + `ccControl` end-to-end through a tiny saw →
