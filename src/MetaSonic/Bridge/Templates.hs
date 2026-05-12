@@ -246,6 +246,9 @@ data TemplateGraph = TemplateGraph
     -- ^ Reader-keyed: @tgPrecedence ! reader@ is every template that
     -- must execute before @reader@. A template absent from the map
     -- has no predecessors.
+    --
+    -- 'Eq' is structural and load-bearing: session hot-swap commits use it
+    -- as the planned-graph identity check.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 

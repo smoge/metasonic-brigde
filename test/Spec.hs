@@ -12387,8 +12387,9 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
   , testCase "planned voice-start rejects mismatches without mutation" $ do
       let st0 = initialSessionState (patternTemplates droneVibrato)
           plan = PlanVoiceStart (TemplateName "drone") (VoiceKey "v0") []
-          wrongKey = CommitVoiceStarted
-            (VoiceBinding (VoiceKey "v1") 21 (TemplateName "drone"))
+          wrongKeyBinding =
+            VoiceBinding (VoiceKey "v1") 21 (TemplateName "drone")
+          wrongKey = CommitVoiceStarted wrongKeyBinding
           wrongTemplate = CommitVoiceStarted
             (VoiceBinding (VoiceKey "v0") 21 (TemplateName "other"))
           wrongCtor = CommitVoiceStopped (VoiceKey "v0")
@@ -12398,8 +12399,10 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
         @?= Left (SciTemplateMismatch (TemplateName "drone") (TemplateName "other"))
       applyPlannedCommit plan wrongCtor st0
         @?= Left (SciUnexpectedCommit plan wrongCtor)
-      ssVoices st0 @?= M.empty
-      OSC.resolveStateVoices (ssResolve st0) @?= M.empty
+      let directWrongKey = applySessionCommit wrongKey st0
+      ssVoices directWrongKey @?= M.fromList [(VoiceKey "v1", wrongKeyBinding)]
+      OSC.resolveStateVoices (ssResolve directWrongKey)
+        @?= M.fromList [(OBSC.pack "v1", (21, OBSC.pack "drone"))]
 
   , testCase "planned voice-stop accepts matching commit" $ do
       let st0 = initialSessionState (patternTemplates droneVibrato)
@@ -12421,15 +12424,18 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
           st1 = applySessionCommit (CommitVoiceStarted binding) st0
           plan = PlanVoiceStop binding
           wrongKey = CommitVoiceStopped (VoiceKey "v1")
-          wrongCtor = CommitVoiceStarted
-            (VoiceBinding (VoiceKey "v0") 22 (TemplateName "drone"))
+          wrongStartBinding =
+            VoiceBinding (VoiceKey "v0") 22 (TemplateName "drone")
+          wrongCtor = CommitVoiceStarted wrongStartBinding
       applyPlannedCommit plan wrongKey st1
         @?= Left (SciVoiceKeyMismatch (VoiceKey "v0") (VoiceKey "v1"))
       applyPlannedCommit plan wrongCtor st1
         @?= Left (SciUnexpectedCommit plan wrongCtor)
-      ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
-      OSC.resolveStateVoices (ssResolve st1)
-        @?= M.fromList [(OBSC.pack "v0", (21, OBSC.pack "drone"))]
+      let directWrongCtor = applySessionCommit wrongCtor st1
+      ssVoices directWrongCtor
+        @?= M.fromList [(VoiceKey "v0", wrongStartBinding)]
+      OSC.resolveStateVoices (ssResolve directWrongCtor)
+        @?= M.fromList [(OBSC.pack "v0", (22, OBSC.pack "drone"))]
 
   , testCase "planned control-write rejects all state commits" $ do
       let graph = patternTemplates droneVibrato
@@ -12497,10 +12503,10 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
         @?= Left SciGraphMismatch
       applyPlannedCommit plan wrongCtor st0
         @?= Left (SciUnexpectedCommit plan wrongCtor)
-      ssGraph st0 @?= oldGraph
-      ssVoices st0 @?= M.fromList [(VoiceKey "v0", binding)]
-      OSC.resolveStateVoices (ssResolve st0)
-        @?= M.fromList [(OBSC.pack "v0", (21, OBSC.pack "drone"))]
+      let directWrongLabel = applySessionCommit wrongLabelCommit st0
+      ssGraph directWrongLabel @?= newGraph
+      ssVoices directWrongLabel @?= M.empty
+      OSC.resolveStateVoices (ssResolve directWrongLabel) @?= M.empty
   ]
 
 ------------------------------------------------------------
