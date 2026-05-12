@@ -2307,6 +2307,19 @@ the recognizer set toward shapes no §4.B kernel claims and
 where `RFused` does not already win. Neither is justified by
 this slice's evidence alone.
 
+> **Update (Phase 7.J):** the "no `PreferGenerated` row"
+> claim above is more nuanced than originally written.
+> 7.J wires `costLabGateIndexFor` and adds a gate-by-executor
+> snapshot pin. On the wider `--fusion-survey` corpus all
+> three executors do report `prefer-generated=0`, matching
+> the 7.I claim. But on the smaller snapshot corpus all three
+> agree on **one** `prefer-generated` row, `KGain → KOut`,
+> because that corpus's peer coverage is thinner. The
+> super-mode recognizer is not what produces it — sample-major
+> and block-major produce the same row at lower speedup
+> ratios. See the 7.J entry below for the gate-by-executor
+> table and the pinned values.
+
 Snapshot pins added by this slice (55 total checks, up from
 46):
 
@@ -2373,6 +2386,97 @@ Open follow-ups (in roughly the order the evidence suggests):
   oscillator/filter/env state to a generator that still
   loses to node-loop on pure arithmetic adds lifecycle
   cost to a path that does not pay back.
+
+### [x] Phase 7.J — Gate Closeout
+
+Read-only slice that turns the 7.I analytical claim
+("super-mode would not produce a `PreferGenerated` row")
+into computed data, then parks generated fusion as a
+performance path until evidence reopens it. No new executor,
+no runtime turn-on, no recognizer changes, no ABI surface.
+
+Three small, paired changes:
+
+1. **Parameterized the gate index by variant.**
+   `costLabGateIndexFor :: Variant -> [LabRow] -> Map ShapeKey GateMeasurement`
+   in [app/MetaSonic/App/FusionCostLab.hs](app/MetaSonic/App/FusionCostLab.hs).
+   `costLabGateIndex = costLabGateIndexFor VarGenerated`
+   preserves today's canonical `--fusion-survey` Phase 7.F
+   numbers byte-for-byte. The parameter selects which
+   generated row (`VarGenerated` /
+   `VarGeneratedBlock` / `VarGeneratedSuper`) populates the
+   measurement; `gmBestPeerSpeedup` stays variant-
+   independent and continues to read from `VarRegionKernel`
+   / `VarRFused`.
+
+2. **Added a gate-by-executor section to
+   `--fusion-survey`.** A compact 3-row table printed below
+   the existing 7.F gate output, comparing
+   `prefer-generated` / `prefer-existing` / `needs-benchmark`
+   / `unsupported` / `non-exact` / `covered-by-hand-kernel`
+   counts across the three executors. Re-uses `evaluateGate`
+   verbatim — only the index feeding `gateInputFor` changes.
+   On the wider `--fusion-survey` corpus, all three executors
+   report `prefer-generated=0`, matching the 7.I claim.
+
+3. **Pinned the structural facts at snapshot time** (6 new
+   checks, 61 total up from 55):
+   - sample-major / block-major / super-mode
+     `prefer-generated` counts match the observed value;
+   - all three executors agree on `non-exact = 0` (the
+     correctness invariant the bit-exact tests already
+     guarantee — now visible in the gate column);
+   - row totals agree across executors;
+   - `prefer-generated` count agrees across executors (the
+     recognizer-level differences don't move the gate
+     decision on this corpus).
+
+What the snapshot actually surfaced is the slice's main
+finding: the smaller snapshot corpus
+(`surveyShapeProbes <> surveyEnsembleCorpus`) produces **one**
+`prefer-generated` row, `KGain → KOut`, across all three
+executors. That contradicts the 7.I writeup's "no
+`PreferGenerated` row" claim, and the 7.J note breaks down
+why:
+
+- The 7.I claim was evaluated on the wider `--fusion-survey`
+  corpus. On that corpus the same shape lands as
+  `prefer-existing` with `gen=1.72× peer=2.06×` because a
+  demo-side measurement gives `gmBestPeerSpeedup` a value
+  that beats the generator.
+- The snapshot corpus lacks that demo-side measurement, so
+  the gate runs the `gen >= peer` branch against a different
+  `gmBestPeerSpeedup` and lands on `PreferGenerated`.
+- **Crucially**, sample-major, block-major, and super-mode
+  all agree on this same `prefer-generated` row. The
+  recognizer set doesn't move the verdict — the underlying
+  generator is what beats the peer, and super-mode only
+  widens the margin. The 7.I "no PreferGenerated row" claim
+  was overstated about super-mode specifically; the real
+  finding is that the snapshot corpus's peer coverage is
+  thinner than the wider survey's.
+
+Decision artifact:
+[notes/2026-05-12-phase-7j-gate-closeout.md](notes/2026-05-12-phase-7j-gate-closeout.md)
+records the slice's scope, the case-3 outcome on the
+ladder, and the followup-not-to-do list.
+
+Generated fusion is now parked as a read-only performance
+path. The pinned `expectedPreferGenerated = 1` on the
+snapshot corpus is what reopens the question if it moves:
+either a future cost-lab generator coverage change, or a
+future corpus addition that lowers the peer measurement
+further. Until then, the next implementation lane is Phase
+8.
+
+What this slice did **not** change:
+- `evaluateGate` / `GateInput` / `GateRow` / `GateCounts`
+  are unchanged; the rules stay the canonical 7.F surface.
+- Sample-major numbers in `--fusion-survey`'s 7.F section
+  are byte-identical to before the slice.
+- No executor turn-on, no planner emission change, no
+  recognizer extension, no ABI surface change, no new C++
+  code.
 
 ---
 
