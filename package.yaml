@@ -14,6 +14,10 @@ dependencies:
   - mtl
   - deepseq
   - network
+  - text
+  # Authoring manifest export (Phase 8.H):
+  - aeson
+  - aeson-pretty
   # Terminal UI Inspector:
   - brick
   - vty
@@ -59,6 +63,7 @@ library:
     - MetaSonic.Pattern.Corpus
     - MetaSonic.Authoring
     - MetaSonic.Authoring.Report
+    - MetaSonic.Authoring.Manifest
     - MetaSonic.Visualize.Trace
     - MetaSonic.Visualize.TUI
 
