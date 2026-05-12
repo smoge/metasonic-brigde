@@ -22,6 +22,7 @@ module MetaSonic.App.ProfitabilityGate
   ( -- * Verdicts
     GateVerdict (..)
   , PreferExistingReason (..)
+  , NeedsBenchmarkReason (..)
   , verdictTag
   , verdictReason
     -- * Per-shape inputs and rows
@@ -48,10 +49,14 @@ data GateVerdict
     -- ^ Generated is exact but is not better than what already
     -- ships. 'PreferExistingReason' carries the comparison the
     -- gate used to make the call.
-  | NeedsBenchmark
-    -- ^ Generated is exact but the gate has no peer measurement
-    -- to compare against, or no generated measurement at all.
-    -- Resolution is corpus growth, not a rule change.
+  | NeedsBenchmark !NeedsBenchmarkReason
+    -- ^ The gate cannot reach a profitability decision from the
+    -- evidence on hand. The reason payload distinguishes the
+    -- three concrete gaps (no generated row, no peer row,
+    -- neither measured). The tally tag in 'verdictTag' stays
+    -- @\"needs-benchmark\"@ — the sub-split is for diagnostics
+    -- and snapshot reason-aware pins, not for the headline
+    -- counts.
   | Unsupported !String
     -- ^ Generator declined to emit a program for this candidate.
     -- The 'String' is the decline-reason bucket from the cost-lab
@@ -76,6 +81,27 @@ data PreferExistingReason
     -- ^ Generated beat node-loop but lost to the best measured
     -- non-generated peer (region-kernel / RFused). Carries
     -- @(generatedSpeedup, bestPeerSpeedup)@.
+  deriving stock (Eq, Show)
+
+-- | Which evidence gap left the gate at 'NeedsBenchmark'.
+-- Splitting the verdict keeps the per-shape diagnostic
+-- actionable without splitting the tally (a 'NeedsBenchmark' of
+-- any flavor still counts as a single gate row).
+data NeedsBenchmarkReason
+  = NoGenerated
+    -- ^ No 'VarGenerated' speedup recorded for this shape: the
+    -- generator declined a different sibling, the cost lab
+    -- timed only a sibling-suffix, or the shape is not present
+    -- in the cost-lab corpus at all. Resolution: corpus growth
+    -- or generator widening.
+  | NoPeer
+    -- ^ 'VarGenerated' measured and beat the win threshold, but
+    -- no exact 'VarRegionKernel' / 'VarRFused' speedup is
+    -- available to compare against. The gate cannot promote to
+    -- 'PreferGenerated' without that comparison.
+  | NoMeasurement
+    -- ^ Neither generated nor peer measurements exist for this
+    -- shape. The cost lab has nothing to say.
   deriving stock (Eq, Show)
 
 -- | All facts the gate needs about one (shape, member) row.
@@ -135,16 +161,18 @@ evaluateGate gi
                                     = Unsupported err
   | not (giGeneratedExact gi)       = NonExact
   | giHasHandKernel gi              = CoveredByHandKernel
-  | otherwise = case giGeneratedSpeedup gi of
-      Nothing -> NeedsBenchmark
-      Just gen
-        | gen < measuredWinThreshold ->
-            PreferExisting (SlowerThanNodeLoop gen)
-        | otherwise -> case giBestPeerSpeedup gi of
-            Nothing  -> NeedsBenchmark
-            Just peer
-              | gen >= peer -> PreferGenerated
-              | otherwise   -> PreferExisting (SlowerThanBestPeer gen peer)
+  | otherwise =
+      case (giGeneratedSpeedup gi, giBestPeerSpeedup gi) of
+        (Nothing, Nothing) -> NeedsBenchmark NoMeasurement
+        (Nothing, Just _)  -> NeedsBenchmark NoGenerated
+        (Just gen, mpeer)
+          | gen < measuredWinThreshold ->
+              PreferExisting (SlowerThanNodeLoop gen)
+          | otherwise -> case mpeer of
+              Nothing  -> NeedsBenchmark NoPeer
+              Just peer
+                | gen >= peer -> PreferGenerated
+                | otherwise   -> PreferExisting (SlowerThanBestPeer gen peer)
 
 -- | One-word constructor tag suitable for tally headers and
 -- snapshot diagnostics. Keeps printing code from carrying the
@@ -152,7 +180,7 @@ evaluateGate gi
 verdictTag :: GateVerdict -> String
 verdictTag PreferGenerated       = "prefer-generated"
 verdictTag (PreferExisting _)    = "prefer-existing"
-verdictTag NeedsBenchmark        = "needs-benchmark"
+verdictTag (NeedsBenchmark _)    = "needs-benchmark"
 verdictTag (Unsupported _)       = "unsupported"
 verdictTag NonExact              = "non-exact"
 verdictTag CoveredByHandKernel   = "covered-by-hand-kernel"
@@ -162,7 +190,6 @@ verdictTag CoveredByHandKernel   = "covered-by-hand-kernel"
 -- that carry a reason payload.
 verdictReason :: GateVerdict -> String
 verdictReason PreferGenerated     = ""
-verdictReason NeedsBenchmark      = ""
 verdictReason NonExact            = ""
 verdictReason CoveredByHandKernel = ""
 verdictReason (Unsupported s)     = s
@@ -172,6 +199,10 @@ verdictReason (PreferExisting r)  = case r of
   SlowerThanBestPeer gen peer ->
     "generated " <> showSpeedup gen
       <> " < peer " <> showSpeedup peer
+verdictReason (NeedsBenchmark r) = case r of
+  NoGenerated   -> "no generated measurement"
+  NoPeer        -> "no peer measurement"
+  NoMeasurement -> "no measurement at all"
 
 showSpeedup :: Double -> String
 showSpeedup x =
@@ -204,7 +235,7 @@ summarizeGate = foldr step emptyGateCounts
              acc' { gcPreferGenerated = gcPreferGenerated acc' + 1 }
            PreferExisting _    ->
              acc' { gcPreferExisting = gcPreferExisting acc' + 1 }
-           NeedsBenchmark      ->
+           NeedsBenchmark _    ->
              acc' { gcNeedsBenchmark = gcNeedsBenchmark acc' + 1 }
            Unsupported _       ->
              acc' { gcUnsupported = gcUnsupported acc' + 1 }
