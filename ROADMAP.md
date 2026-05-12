@@ -1692,23 +1692,40 @@ Surface:
   reason), raw accepted candidates, and a selected/maximal accepted
   candidate view grouped by matched §4.B kernel vs.
   "no-§4.B-match" (generated-eligible).
+- `--fusion-survey` then layers a "Phase 7.C cost-model join"
+  section: a shape-keyed table of selected candidates classified as
+  `covered` (§4.B already claims the shape), `measured-win`
+  (cost-lab speedup > 1.0× over the node-loop baseline),
+  `measured-loss` (≤ 1.0×), or `needs-benchmark` (no matching cost-
+  lab row). Class assignment uses `costLabShapeIndex` in
+  `MetaSonic.App.FusionCostLab`, which re-runs the planner against
+  each cost-lab member to derive shape keys without new
+  measurement cost.
 - `--snapshot-check` pins planner total / accepted / rejected
-  counts, selected accepted / generated-eligible counts, and
-  per-rejection-reason counts.
+  counts, selected accepted / generated-eligible counts,
+  per-rejection-reason counts, and per-class cost-model join
+  totals. The pinned `needs-benchmark` count is the Phase 7.D gate
+  signal — when it shrinks toward zero, the cost lab covers enough
+  generated-eligible shapes to license the executor.
 - `test/Spec.hs` covers each rejection rule with a small SynthGraph
   that should trigger exactly that reason, plus the
   §4.B-matched-acceptance case.
 
 No `FusionProgram` opcode encoding, no C ABI, no runtime program
-table — those belong to Phase 7.D.
+table — those belong to Phase 7.D. The cost-model join is
+diagnostic only and makes no execution decision.
 
-Decision note:
+Decision notes:
 - [Phase 7.C planner decision](notes/2026-05-11-phase-7c-planner-decision.md).
+- [Phase 7.C cost-model join decision](notes/2026-05-11-phase-7c-cost-model-join-decision.md).
 
-Open follow-ups inside 7.C: join the selected candidate surface to
-cost-lab features, optional stateful-interior allow-list expansion
-gated on cost-lab evidence, and `KOut`-as-non-terminal
-de-prioritization in the rejection diagnostic.
+Open follow-ups inside 7.C: shrink `needs-benchmark` by growing
+cost-lab families to cover the corpus's generated-eligible shapes,
+optional stateful-interior allow-list expansion gated on cost-lab
+evidence, `KOut`-as-non-terminal de-prioritization in the rejection
+diagnostic, and an optional feature axis on the shape key (e.g.,
+`(sinkKind, totalLatency)`) once a shape's profitability splits
+along it.
 
 ### Phase 7.D — Runtime Program ABI and Tiny Executor
 
