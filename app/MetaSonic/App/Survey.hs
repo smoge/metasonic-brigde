@@ -27,11 +27,20 @@ import           Text.Printf               (printf)
 
 import           MetaSonic.App.Demos
 import qualified MetaSonic.App.FusionCostLab as FCL
-import           MetaSonic.App.FusionCostLab (ShapeKey,
+import           MetaSonic.App.FusionCostLab (GateMeasurement (..),
+                                              ShapeKey,
                                               ShapeSummary (..),
+                                              costLabGateIndex,
                                               costLabShapeIndex,
                                               measuredWinThreshold,
                                               shapeKeyOf)
+import           MetaSonic.App.ProfitabilityGate (GateCounts (..),
+                                                  GateInput (..),
+                                                  GateRow (..),
+                                                  evaluateGate,
+                                                  summarizeGate,
+                                                  verdictReason,
+                                                  verdictTag)
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
@@ -1559,7 +1568,10 @@ runFusionSurvey demos = do
   putStrLn ""
   costLabRows <- FCL.collectFusionCostLabRows FCL.defaultOptions
   let shapeIdx = costLabShapeIndex costLabRows
+      gateIdx  = costLabGateIndex  costLabRows
   printCostModelJoin shapeIdx allRows
+  putStrLn ""
+  printProfitabilityGate gateIdx allRows
   putStrLn ""
   printSurveyTotals demoRows corpusRows
   putStrLn ""
@@ -2591,6 +2603,154 @@ renderGainFeatures modes =
 
 showSpeedup :: Double -> String
 showSpeedup s = printf "%.2f×" s
+
+--------------------------------------------------------------------------------
+-- Phase 7.F profitability gate (read-only)
+--------------------------------------------------------------------------------
+
+-- | A row's worth of facts the gate consumes: the candidate's
+-- shape key plus the surface bits we want printed alongside the
+-- verdict (kinds, gain-amount features, §4.B match, occurrence
+-- count across the survey).
+data GateShapeRow = GateShapeRow
+  { gsrKey       :: !ShapeKey
+  , gsrKinds     :: ![NodeKind]
+  , gsrGainModes :: ![GainAmountMode]
+  , gsrMatched   :: !(Maybe RegionKernel)
+  , gsrCount     :: !Int
+  } deriving (Eq, Show)
+
+-- | Print the Phase 7.F generated profitability gate section.
+-- Pure consumer of the cost-lab gate index plus the survey's
+-- selected candidates. Strictly diagnostic — no caller mutates
+-- runtime state from these verdicts.
+printProfitabilityGate
+  :: M.Map ShapeKey GateMeasurement -> [SurveyRow] -> IO ()
+printProfitabilityGate gateIdx rows = do
+  putStrLn "─── Phase 7.F generated profitability gate ───"
+  let shapes      = aggregateGateShapes rows
+      gateRows    = [ GateRow input (evaluateGate input)
+                    | (shape, input) <- map (\s -> (s, gateInputFor gateIdx s)) shapes
+                    , let _ = shape  -- keep shape carrier visible for table render
+                    ]
+      pairs       = zip shapes gateRows
+      counts      = summarizeGate gateRows
+      preferZero  = gcPreferGenerated counts == 0
+  putStrLn $ "  total="            <> show (gcTotal counts)
+          <> "  prefer-generated=" <> show (gcPreferGenerated counts)
+          <> "  prefer-existing="  <> show (gcPreferExisting counts)
+          <> "  needs-benchmark="  <> show (gcNeedsBenchmark counts)
+          <> "  unsupported="      <> show (gcUnsupported counts)
+          <> "  non-exact="        <> show (gcNonExact counts)
+          <> "  covered-by-hand-kernel=" <> show (gcCoveredByHandKernel counts)
+  putStrLn $ "  invariant: prefer-generated=0 "
+          <> if preferZero then "(holds)" else "(broken — see PreferGenerated row(s) below)"
+  if null pairs
+    then putStrLn "  (no selected candidates in the surveyed graphs)"
+    else do
+      putStrLn ""
+      putStrLn "  Per-shape verdicts (selected candidates only):"
+      putStrLn $ formatGateRow
+        [ "kinds", "features", "matched-shape", "count"
+        , "verdict", "gen", "peer", "reason"
+        ]
+      mapM_ (putStrLn . formatGateRow . renderGateCells) (sortGatePairs pairs)
+
+-- | Aggregate selected candidates into 'GateShapeRow' values:
+-- one row per unique (shape key, gain features, matched-shape)
+-- triple, carrying the survey-wide occurrence count.
+aggregateGateShapes :: [SurveyRow] -> [GateShapeRow]
+aggregateGateShapes rows =
+  let selected = concatMap (selectedFusionCandidates . srPlannerVerdicts) rows
+      keys     = nub
+                   [ ( shapeKeyOf c
+                     , fcMemberKinds c
+                     , fcGainAmountModes c
+                     , fcMatchedShape c )
+                   | c <- selected ]
+  in [ GateShapeRow
+         { gsrKey       = key
+         , gsrKinds     = kinds
+         , gsrGainModes = gainModes
+         , gsrMatched   = mshape
+         , gsrCount     =
+             length [ ()
+                    | c <- selected
+                    , shapeKeyOf c == key
+                    , fcMatchedShape c == mshape
+                    ]
+         }
+     | (key, kinds, gainModes, mshape) <- keys ]
+
+-- | Join a survey-aggregated shape row with the cost-lab gate
+-- measurement to produce the 'GateInput' the rules consume.
+-- Unmeasured shapes set the generated-* fields to the
+-- "nothing-observed" default so the rules fall through to
+-- 'NeedsBenchmark' (or 'CoveredByHandKernel' when applicable).
+gateInputFor :: M.Map ShapeKey GateMeasurement -> GateShapeRow -> GateInput
+gateInputFor gateIdx s =
+  let label = intercalate " → " (map show (gsrKinds s))
+        <> case renderGainFeatures (gsrGainModes s) of
+             "—"  -> ""
+             feat -> " (" <> feat <> ")"
+      gmM = M.lookup (gsrKey s) gateIdx
+  in GateInput
+       { giShapeLabel       = label
+       , giHasHandKernel    = case gsrMatched s of Just _ -> True; _ -> False
+       , giGeneratorError   = maybe Nothing gmGeneratorError gmM
+       , giGeneratedExact   = maybe True    gmGeneratedExact gmM
+       , giGeneratedSpeedup = gmM >>= gmGeneratedSpeedup
+       , giBestPeerSpeedup  = gmM >>= gmBestPeerSpeedup
+       }
+
+-- | Sort gate output so 'PreferGenerated' rows surface first
+-- (they are the actionable ones), then by occurrence count
+-- descending, then by kind sequence for stability.
+sortGatePairs :: [(GateShapeRow, GateRow)] -> [(GateShapeRow, GateRow)]
+sortGatePairs = sortOn $ \(s, r) ->
+  ( verdictRank (grVerdict r)
+  , negate (gsrCount s)
+  , length (gsrKinds s)
+  , map fromEnum (gsrKinds s)
+  , gsrKey s
+  )
+  where
+    verdictRank v = case verdictTag v of
+      "prefer-generated"        -> 0 :: Int
+      "prefer-existing"         -> 1
+      "needs-benchmark"         -> 2
+      "covered-by-hand-kernel"  -> 3
+      "unsupported"             -> 4
+      "non-exact"               -> 5
+      _                         -> 6
+
+renderGateCells :: (GateShapeRow, GateRow) -> [String]
+renderGateCells (s, r) =
+  let gi = grInput r
+      vt = verdictTag (grVerdict r)
+      rs = case verdictReason (grVerdict r) of
+             ""  -> "—"
+             txt -> txt
+  in [ intercalate " → " (map show (gsrKinds s))
+     , renderGainFeatures (gsrGainModes s)
+     , maybe "—" show (gsrMatched s)
+     , show (gsrCount s)
+     , vt
+     , maybe "—" showSpeedup (giGeneratedSpeedup gi)
+     , maybe "—" showSpeedup (giBestPeerSpeedup gi)
+     , rs
+     ]
+
+gateColumnWidths :: [Int]
+gateColumnWidths = [40, 14, 18, 6, 22, 8, 8, 40]
+
+formatGateRow :: [String] -> String
+formatGateRow cols =
+  "  " <> intercalate "  " (zipWith pad gateColumnWidths cols)
+  where
+    pad w s
+      | length s >= w = s
+      | otherwise     = s <> replicate (w - length s) ' '
 
 costModelColumnWidths :: [Int]
 costModelColumnWidths = [40, 18, 18, 16, 6, 8]

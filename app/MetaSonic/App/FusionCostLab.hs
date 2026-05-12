@@ -78,6 +78,9 @@ module MetaSonic.App.FusionCostLab
   , measuredWinThreshold
   , costLabShapeIndex
   , shapeKeyOf
+    -- * Phase 7.F profitability gate index
+  , GateMeasurement (..)
+  , costLabGateIndex
   ) where
 
 import           Control.Monad              (forM, forM_, replicateM_)
@@ -1036,17 +1039,132 @@ costLabShapeIndex rows =
                }
            _ -> Nothing
 
-    shapeKeysOf graph =
-      case lowerGraph graph >>= compileRuntimeGraph of
-        Right rg ->
-          [ shapeKeyOf c
-          | c <- selectedFusionCandidates (planRuntimeGraph rg)
-          ]
-        Left _ -> []
-
     preferFaster a b
       | ssSpeedup a >= ssSpeedup b = a
       | otherwise                   = b
+
+-- | Re-compile a cost-lab member graph and list the shape keys
+-- the planner would select on its runtime form. Shared between
+-- 'costLabShapeIndex' and 'costLabGateIndex'; both keys join
+-- cost-lab measurements to selected-candidate shape keys.
+shapeKeysOf :: SynthGraph -> [ShapeKey]
+shapeKeysOf graph =
+  case lowerGraph graph >>= compileRuntimeGraph of
+    Right rg ->
+      [ shapeKeyOf c
+      | c <- selectedFusionCandidates (planRuntimeGraph rg)
+      ]
+    Left _ -> []
+
+------------------------------------------------------------
+-- Phase 7.F profitability-gate index
+------------------------------------------------------------
+
+-- | Per-shape cost-lab measurement view tailored for the
+-- read-only profitability gate. Carries the four facts the
+-- gate's rules need to decide a verdict:
+--
+--   * 'gmGeneratorError' — decline/error bucket for the
+--     @VarGenerated@ row (Just _) or 'Nothing' if the generator
+--     emitted a program and the row produced a timing.
+--   * 'gmGeneratedExact' — True iff the emitted program matched
+--     'RNodeLoop' bit-for-bit. Only meaningful when
+--     'gmGeneratorError' is 'Nothing'.
+--   * 'gmGeneratedSpeedup' — @VarGenerated@ speedup vs node-loop
+--     for the strongest member contributing this shape key.
+--   * 'gmBestPeerSpeedup' — best of @VarRegionKernel@ and
+--     @VarRFused@ for the same member, so the gate can compare
+--     generated against the strongest existing path.
+--
+-- When two cost-lab members produce the same shape key, the
+-- member with the larger generated speedup wins. This mirrors the
+-- 'costLabShapeIndex' convention: the index surfaces the
+-- strongest evidence for a shape, not the average. The gate then
+-- decides whether that strongest evidence is actually good
+-- enough.
+data GateMeasurement = GateMeasurement
+  { gmGeneratorError   :: !(Maybe String)
+  , gmGeneratedExact   :: !Bool
+  , gmGeneratedSpeedup :: !(Maybe Double)
+  , gmBestPeerSpeedup  :: !(Maybe Double)
+  } deriving (Eq, Show)
+
+-- | Build a 'ShapeKey' -> 'GateMeasurement' map by re-deriving
+-- shape keys for each cost-lab member graph (identical machinery
+-- to 'costLabShapeIndex') and joining them with that member's
+-- per-variant 'LabRow' set.
+--
+-- The contributing-row predicate is intentionally lax: a member
+-- contributes even when its @VarGenerated@ row failed (declined
+-- or non-exact). The gate's 'Unsupported' / 'NonExact' verdicts
+-- depend on that signal being visible.
+costLabGateIndex :: [LabRow] -> M.Map ShapeKey GateMeasurement
+costLabGateIndex rows =
+  M.fromListWith preferStrongerGenerated $ concat
+    [ [(k, gm) | k <- shapeKeysOf graph]
+    | (fam, name, graph) <- familyGraphs
+    , Just gm <- [memberMeasurement fam name]
+    ]
+  where
+    familyGraphs =
+      [ (fam, name, graph)
+      | fam <- [minBound .. maxBound :: GraphFamily]
+      , FamilyMember name graph <- familyMembers fam
+      ]
+
+    memberMeasurement :: GraphFamily -> String -> Maybe GateMeasurement
+    memberMeasurement fam name =
+      let memberRows =
+            [ r | r <- rows, lrFamily r == fam, lrMember r == name ]
+          baselineNs =
+            listToMaybe
+              [ ns
+              | r <- memberRows
+              , lrVariant r == VarNodeLoop
+              , Just ns <- [lrNsPerSample r]
+              ]
+          generatedRow =
+            listToMaybe [ r | r <- memberRows, lrVariant r == VarGenerated ]
+          speedupVs base ns = base / ns
+          peerSpeedup base =
+            case [ s
+                 | r <- memberRows
+                 , lrVariant r `elem` [VarRegionKernel, VarRFused]
+                 , lrError r == Nothing
+                 , lrEquivalence r == EqExact
+                 , Just ns <- [lrNsPerSample r]
+                 , let s = speedupVs base ns
+                 ] of
+              [] -> Nothing
+              xs -> Just (maximum xs)
+      in case (baselineNs, generatedRow) of
+           (Just base, Just gen) ->
+             Just GateMeasurement
+               { gmGeneratorError =
+                   case lrError gen of
+                     Just e  -> Just e
+                     Nothing -> Nothing
+               , gmGeneratedExact =
+                   lrError gen == Nothing
+                     && lrEquivalence gen == EqExact
+               , gmGeneratedSpeedup =
+                   case (lrError gen, lrNsPerSample gen) of
+                     (Nothing, Just ns) -> Just (speedupVs base ns)
+                     _                  -> Nothing
+               , gmBestPeerSpeedup = peerSpeedup base
+               }
+           _ -> Nothing
+
+    preferStrongerGenerated a b
+      | rank a >= rank b = a
+      | otherwise        = b
+      where
+        rank gm = case gmGeneratedSpeedup gm of
+          Just s  -> s
+          Nothing -> -1/0  -- -Inf: any measured row beats unmeasured
+
+    listToMaybe (x:_) = Just x
+    listToMaybe []    = Nothing
 
 runFamily :: GraphFamily -> IO [LabRow]
 runFamily fam = concat <$> mapM (runMember fam) (familyMembers fam)
