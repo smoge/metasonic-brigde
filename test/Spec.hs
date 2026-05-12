@@ -510,6 +510,180 @@ authoringDslTests =
         Right rg -> do
           -- Two oscillators + two gains + two outs = 6 nodes
           length (rgNodes rg) @?= 6
+
+  ------------------------------------------------------------
+  -- Phase 8.C2: lifted stateful / common UGens
+  ------------------------------------------------------------
+
+  , testCase "hpfS emits two KHPF nodes" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.hpfS (Auth.stereo l r) (Param 1200.0) (Param 0.7)
+            pure ()
+      length (nodesByKind g KHPF) @?= 2
+
+  , testCase "bpfS emits two KBPF nodes" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.bpfS (Auth.stereo l r) (Param 800.0) (Param 1.5)
+            pure ()
+      length (nodesByKind g KBPF) @?= 2
+
+  , testCase "notchS emits two KNotch nodes" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.notchS (Auth.stereo l r) (Param 60.0) (Param 4.0)
+            pure ()
+      length (nodesByKind g KNotch) @?= 2
+
+  , testCase "hpfC / bpfC / notchC emit one filter node per channel" $ do
+      let chCount = 4
+          g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let inCh = Auth.duplicate chCount (Auth.mono osc)
+            h <- Auth.hpfC inCh (Param 1200.0) (Param 0.7)
+            b <- Auth.bpfC h    (Param 800.0)  (Param 1.5)
+            _ <- Auth.notchC b  (Param 60.0)   (Param 4.0)
+            pure ()
+      length (nodesByKind g KHPF)   @?= chCount
+      length (nodesByKind g KBPF)   @?= chCount
+      length (nodesByKind g KNotch) @?= chCount
+
+  , testCase "delayS emits two KDelay nodes sharing the same maxDelay" $ do
+      let maxT = 0.25
+          g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.delayS maxT (Auth.stereo l r) (Param 0.15)
+            pure ()
+          maxes =
+            [ m
+            | spec <- nodesByKind g KDelay
+            , Delay m _ _ <- [nsUgen spec]
+            ]
+      length (nodesByKind g KDelay) @?= 2
+      maxes @?= [maxT, maxT]
+
+  , testCase "delayC emits one KDelay per channel" $ do
+      let chCount = 3
+          g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let inCh = Auth.duplicate chCount (Auth.mono osc)
+            _ <- Auth.delayC 0.1 inCh (Param 0.05)
+            pure ()
+      length (nodesByKind g KDelay) @?= chCount
+
+  , testCase "smoothC emits one KSmooth per channel" $ do
+      let chCount = 5
+          g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let inCh = Auth.duplicate chCount (Auth.mono osc)
+            _ <- Auth.smoothC 20.0 inCh
+            pure ()
+      length (nodesByKind g KSmooth) @?= chCount
+
+  , testCase "smoothS emits two KSmooth nodes" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.smoothS 20.0 (Auth.stereo l r)
+            pure ()
+      length (nodesByKind g KSmooth) @?= 2
+
+  , testCase "envM emits one KEnv plus one KGain" $ do
+      let g = runSynth $ do
+            src <- sinOsc 440.0 0.0
+            _ <- Auth.envM (Auth.mono src)
+                   (Param 1.0)  -- gate (always on, for test)
+                   (Param 0.01) -- attack
+                   (Param 0.1)  -- decay
+                   (Param 0.8)  -- sustain
+                   (Param 0.5)  -- release
+            pure ()
+      length (nodesByKind g KEnv)  @?= 1
+      length (nodesByKind g KGain) @?= 1
+
+  , testCase "envS emits one shared KEnv plus two KGains driven by it" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.envS (Auth.stereo l r)
+                   (Param 1.0)
+                   (Param 0.01) (Param 0.1) (Param 0.8) (Param 0.5)
+            pure ()
+          envSpecs = nodesByKind g KEnv
+          envIds   = map nsID envSpecs
+          -- Every Gain's *amount* input should be Audio <envId> _
+          gainAmountIds =
+            [ nid
+            | spec <- nodesByKind g KGain
+            , Gain _ amt <- [nsUgen spec]
+            , Just nid <- [connectionNodeID amt]
+            ]
+      length envSpecs @?= 1
+      length (nodesByKind g KGain) @?= 2
+      gainAmountIds @?= replicate 2 (head envIds)
+
+  , testCase "envC emits one shared KEnv plus N KGains driven by it" $ do
+      let chCount = 4
+          g = runSynth $ do
+            osc <- sinOsc 440.0 0.0
+            let inCh = Auth.duplicate chCount (Auth.mono osc)
+            _ <- Auth.envC inCh
+                   (Param 1.0)
+                   (Param 0.01) (Param 0.1) (Param 0.8) (Param 0.5)
+            pure ()
+          envSpecs      = nodesByKind g KEnv
+          envIds        = map nsID envSpecs
+          gainAmountIds =
+            [ nid
+            | spec <- nodesByKind g KGain
+            , Gain _ amt <- [nsUgen spec]
+            , Just nid <- [connectionNodeID amt]
+            ]
+      length envSpecs @?= 1
+      length (nodesByKind g KGain) @?= chCount
+      gainAmountIds @?= replicate chCount (head envIds)
+
+  , testCase "envC on empty Channels emits no KEnv and no KGain" $ do
+      let g = runSynth $ do
+            _ <- Auth.envC (Auth.channels [])
+                   (Param 1.0)
+                   (Param 0.01) (Param 0.1) (Param 0.8) (Param 0.5)
+            pure ()
+      length (nodesByKind g KEnv)  @?= 0
+      length (nodesByKind g KGain) @?= 0
+
+  , testCase "lifted authored fx chain compiles end-to-end" $ do
+      -- stereoSrc -> hpfS -> envS -> delayS -> stereoOut
+      let g = runSynth $ do
+            l    <- sinOsc 440.0 0.0
+            r    <- sinOsc 660.0 0.0
+            filt <- Auth.hpfS   (Auth.stereo l r) (Param 1200.0) (Param 0.7)
+            env  <- Auth.envS   filt
+                      (Param 1.0)
+                      (Param 0.01) (Param 0.2)
+                      (Param 0.8)  (Param 0.5)
+            dly  <- Auth.delayS 0.3 env (Param 0.15)
+            Auth.outStereo 0 dly
+      case lowerGraph g >>= compileRuntimeGraph of
+        Left err -> assertFailure $
+          "expected authored 8.C2 patch to compile, got: " <> err
+        Right rg -> do
+          -- Sanity counts: every helper preserves primitive
+          -- visibility, so the lowered graph has the kinds we
+          -- expect by structural inspection.
+          let kindCount k =
+                length [ () | n <- rgNodes rg, rnKind n == k ]
+          kindCount KSinOsc @?= 2
+          kindCount KHPF    @?= 2
+          kindCount KEnv    @?= 1
+          kindCount KGain   @?= 2  -- the env's two gains
+          kindCount KDelay  @?= 2
+          kindCount KOut    @?= 2
   ]
 
 ------------------------------------------------------------
