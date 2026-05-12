@@ -2815,13 +2815,14 @@ What this slice doesn't try to settle:
   Anyone who needs the lowered graph back must rebuild
   it from source.
 
-12 new tests in `authoringManifestTests` pin
-`manifestSchemaVersion = 1`, projection ordering,
-semantic JSON round-trip (every `ManifestControl` field),
-and decoder rejection of unsupported versions / missing
-fields / unknown roles. No new snapshot pins (the demo
-table lives in `app/` and is not reachable from the
-library-side snapshot tool); the unit tests cover the
+14 new tests in `authoringManifestTests` pin
+`manifestSchemaVersion = 1`, encoder version
+normalization, projection ordering, semantic JSON
+round-trip (every `ManifestControl` field), and decoder
+rejection of unsupported versions / missing fields /
+unknown roles. No new snapshot pins (the demo table lives
+in `app/` and is not reachable from the library-side
+snapshot tool); the unit tests cover the
 same structural facts inline.
 
 See

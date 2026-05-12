@@ -48,9 +48,8 @@ module MetaSonic.Authoring.Manifest
   , decodeManifestDoc
   ) where
 
-import           Data.Aeson           (FromJSON (..), ToJSON (..), Value (..),
-                                       (.:), (.:?), (.=), object, withObject,
-                                       eitherDecode)
+import           Data.Aeson           (FromJSON (..), ToJSON (..), (.:), (.=),
+                                       eitherDecode, object, withObject)
 import           Data.Aeson.Encode.Pretty (Config (..), Indent (..),
                                             NumberFormat (..), defConfig,
                                             encodePretty', keyOrder)
@@ -213,7 +212,7 @@ instance FromJSON ManifestControl where
       <*> o .:  "rangeMin"
       <*> o .:  "rangeMax"
       <*> o .:  "smoothingHz"
-      <*> o .:? "cc"
+      <*> o .:  "cc"
       <*> o .:  "key"
       <*> o .:  "slot"
 
@@ -234,8 +233,12 @@ instance FromJSON AuthoringManifest where
       <*> o .: "controls"
 
 instance ToJSON AuthoringManifestDoc where
+  -- The public encoder owns the wire version. Keep the
+  -- in-memory field so decoded docs can report what they saw,
+  -- but never let callers emit a non-v1 document through this
+  -- v1 encoder.
   toJSON d = object
-    [ "schemaVersion" .= docSchemaVersion d
+    [ "schemaVersion" .= manifestSchemaVersion
     , "demos"         .= docDemos d
     ]
 

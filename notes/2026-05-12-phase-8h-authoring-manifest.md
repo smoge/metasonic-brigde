@@ -117,6 +117,12 @@ Explicit instances, not generic-derived. Reasons:
   with a clear error message. Reading a version-2 doc
   with a version-1 decoder fails honestly rather than
   silently producing wrong data.
+- Encoders always emit `schemaVersion = 1`, even if a
+  caller constructs an `AuthoringManifestDoc` with a stale
+  in-memory version field.
+- `cc` is a required v1 key for every control. Plain
+  controls encode it as JSON `null`; omitting the key
+  rejects on decode.
 
 ### CLI surface
 
@@ -162,7 +168,8 @@ This keeps scripts that pipe through `jq` happy.
 Tests live in `authoringManifestTests` in
 [test/Spec.hs](test/Spec.hs):
 
-- `manifestSchemaVersion = 1` (pinned).
+- `manifestSchemaVersion = 1` (pinned), and the encoder
+  always emits schema version 1.
 - An inline `named-control` report (two named controls,
   one CC-bound) produces a manifest with 1 template, 2
   controls, 1 of which has `mcCC = Just 7`.
@@ -175,6 +182,9 @@ Tests live in `authoringManifestTests` in
 - A version-2 input rejects on decode with a non-empty
   error message.
 - An input with a missing `schemaVersion` rejects.
+- A `ManifestControl` input with a missing `cc` key
+  rejects, while JSON `null` round-trips as `mcCC =
+  Nothing`.
 - Projection order is stable: templates and controls in
   declaration order, buses in allocation-index order.
 - Unknown `role` strings reject on decode.

@@ -1523,6 +1523,12 @@ authoringManifestTests =
   [ testCase "manifestSchemaVersion is 1" $
       manifestSchemaVersion @?= 1
 
+  , testCase "encoder always emits schemaVersion 1" $ do
+      let doc = AuthoringManifestDoc 99 []
+      case decodeManifestDoc (encodeManifestDoc doc) of
+        Right d  -> docSchemaVersion d @?= manifestSchemaVersion
+        Left err -> assertFailure err
+
   , testCase "named-control manifest has 1 template, 2 controls, 1 CC-bound" $ do
       let m = manifestFromReport "named-control" namedControlReport
       mfDemoKey m @?= "named-control"
@@ -1594,6 +1600,27 @@ authoringManifestTests =
       case decodeManifestDoc badDoc of
         Left _   -> pure ()
         Right _  -> assertFailure "expected missing schemaVersion to reject"
+
+  , testCase "FromJSON rejects ManifestControl missing cc field" $ do
+      let badDoc = BL.pack $
+            "{ \"schemaVersion\": 1, \"demos\": ["
+            <> "{ \"demo\": \"d\""
+            <> ", \"templates\": []"
+            <> ", \"buses\": []"
+            <> ", \"controls\": ["
+            <> "    { \"name\": \"cutoff\""
+            <> "    , \"default\": 1200"
+            <> "    , \"rangeMin\": 200"
+            <> "    , \"rangeMax\": 8000"
+            <> "    , \"smoothingHz\": 20"
+            <> "    , \"key\": \"cutoff\""
+            <> "    , \"slot\": 1"
+            <> "    }"
+            <> "  ]"
+            <> "} ] }"
+      case decodeManifestDoc badDoc of
+        Left _   -> pure ()
+        Right _  -> assertFailure "expected missing cc field to reject"
 
   , testCase "FromJSON rejects unknown template role" $ do
       let badDoc = BL.pack $
