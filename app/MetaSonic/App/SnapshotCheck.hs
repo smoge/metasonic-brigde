@@ -208,14 +208,18 @@ costLabChecks rows =
       | fam <- familyNames
       ]
 
+    -- Variant fan-out is now 5 (node-loop, region-kernel, rfused,
+    -- generated, generated-block). Bumping per-family row counts
+    -- 4x -> 5x; the underlying member counts per family are
+    -- unchanged.
     expectedFamilyCounts =
-      [ ("add-chain",             16)
-      , ("corpus",                28)
-      , ("dynamic-gain",          12)
-      , ("fanout",                 4)
-      , ("generated-tail-sweep",  24)
-      , ("return-tail",            4)
-      , ("sink-chain",            24)
+      [ ("add-chain",             20)
+      , ("corpus",                35)
+      , ("dynamic-gain",          15)
+      , ("fanout",                 5)
+      , ("generated-tail-sweep",  30)
+      , ("return-tail",            5)
+      , ("sink-chain",            30)
       ]
 
     expectedRowCount =
@@ -232,13 +236,22 @@ costLabChecks rows =
         && lrFeatures r /= Nothing
         && lrNsPerSample r /= Nothing
 
-    -- §7.D step 8: split the row set so the generated variant's
-    -- partial generator state (a real "no shape implemented yet"
-    -- signal) doesn't fail the non-generated checks.
+    -- §7.D step 8 / §7.H step 3: split the row set so neither
+    -- generated variant's partial-generator state (a real "no
+    -- shape implemented yet" signal) trips the non-generated
+    -- checks. Both VarGenerated (sample-major) and
+    -- VarGeneratedBlock (block-major) share the same emit-or-
+    -- decline behavior because they consume the same emitted
+    -- program.
     nonGeneratedRows =
-      [r | r <- rows, lrVariant r /= VarGenerated]
+      [ r | r <- rows
+          , lrVariant r /= VarGenerated
+          , lrVariant r /= VarGeneratedBlock
+      ]
     generatedRows =
       [r | r <- rows, lrVariant r == VarGenerated]
+    generatedBlockRows =
+      [r | r <- rows, lrVariant r == VarGeneratedBlock]
     generatedEmittedRows =
       [r | r <- generatedRows, lrError r == Nothing]
     -- Pinned: the number of cost-lab members whose maximal

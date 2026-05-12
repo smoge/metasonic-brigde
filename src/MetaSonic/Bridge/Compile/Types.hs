@@ -650,18 +650,24 @@ kernelArity RNodeLoop         = 0
 {- Note [Region execution selector]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-§7.D widens region dispatch to three cases:
+§7.D widens region dispatch to three cases; §7.H adds a fourth:
 
-  * 'ExecNodeLoop'    — per-node dispatch, the default.
-  * 'ExecKernel'      — a hand-written 'RegionKernel' (existing path).
-  * 'ExecGenerated'   — a generated 'FusionProgram', referenced by id
-                        into the runtime graph's program table.
+  * 'ExecNodeLoop'        — per-node dispatch, the default.
+  * 'ExecKernel'          — a hand-written 'RegionKernel' (existing path).
+  * 'ExecGenerated'       — a generated 'FusionProgram', referenced by id
+                            into the runtime graph's program table.
+                            Runs through the sample-major C++ executor
+                            (process_fusion_program).
+  * 'ExecGeneratedBlock'  — same 'FusionProgramId', but the region runs
+                            through the block-major C++ executor
+                            (process_fusion_program_block). The program
+                            data is identical; only the dispatch loop
+                            order differs.
 
-The selector is intentionally a sum type rather than a
-@'Maybe' 'FusionProgramId'@ field alongside the previous
-'rrKernel'. Encoding the three cases structurally prevents a hidden
-invariant ("when generated id is 'Just', kernel must be
-'RNodeLoop'") that future code could violate.
+'ExecGeneratedBlock' is a sibling of 'ExecGenerated', not a payload
+or flag on it, because future executors (superinstructions, packed
+native kernels) will each be a new sibling rather than another flag
+on a multi-purpose 'Generated' case.
 
 'rrKernel' survives as a backward-compatible /accessor/ that
 projects out the previous enum view: 'ExecKernel' regions return
@@ -669,15 +675,17 @@ their kernel; everything else returns 'RNodeLoop'. Code that wants
 to tell generated programs apart from node-loop pattern-matches on
 'rrExec' directly.
 
-See @notes/2026-05-12-phase-7d-runtime-program-abi.md@.
+See @notes/2026-05-12-phase-7d-runtime-program-abi.md@ and
+@notes/2026-05-12-phase-7h-block-major-executor.md@.
 -}
 
 -- | The dispatch selector for one 'RuntimeRegion'. See
 -- Note [Region execution selector].
 data RegionExec
   = ExecNodeLoop
-  | ExecKernel    !RegionKernel
-  | ExecGenerated !FusionProgramId
+  | ExecKernel         !RegionKernel
+  | ExecGenerated      !FusionProgramId
+  | ExecGeneratedBlock !FusionProgramId
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -695,9 +703,10 @@ execKernel k         = ExecKernel k
 -- distinguish should pattern-match on 'rrExec' directly.
 rrKernel :: RuntimeRegion -> RegionKernel
 rrKernel r = case rrExec r of
-  ExecNodeLoop    -> RNodeLoop
-  ExecKernel k    -> k
-  ExecGenerated _ -> RNodeLoop
+  ExecNodeLoop         -> RNodeLoop
+  ExecKernel k         -> k
+  ExecGenerated _      -> RNodeLoop
+  ExecGeneratedBlock _ -> RNodeLoop
 
 
 {- Note [Bus footprints, template- vs region-level]

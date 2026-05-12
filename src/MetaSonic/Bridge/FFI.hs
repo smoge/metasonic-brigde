@@ -981,6 +981,18 @@ foreign import ccall unsafe "rt_graph_template_add_region_generated"
     -> CInt
     -> IO ()
 
+-- | Phase 7.H: register a generated region that dispatches
+-- through the block-major C++ executor instead of the
+-- sample-major one. Wire-compatible with
+-- 'c_rt_graph_template_add_region_generated'; the C++ side sets
+-- @RegionSpec::generated_executor = 1@ before pushing the spec.
+foreign import ccall unsafe "rt_graph_template_add_region_generated_block"
+  c_rt_graph_template_add_region_generated_block
+    :: Ptr RTGraph -> CInt
+    -> CInt -> CInt -> CInt
+    -> CInt
+    -> IO ()
+
 -- | Phase 7.D test surface: count of generated programs in a
 -- template, or -1 on invalid template_id.
 foreign import ccall unsafe "rt_graph_test_template_fusion_program_count"
@@ -1620,6 +1632,14 @@ addRegionTo g cTid r =
              c_rt_graph_template_add_region_generated g cTid
                cRate cFirst cCount
                (fromIntegral pid)
+           ExecGeneratedBlock (FusionProgramId pid) ->
+             -- §7.H: same FusionProgram, block-major executor.
+             -- The Haskell-side validator already cleared the
+             -- program-id reference; the C ABI mirror just sets
+             -- RegionSpec::generated_executor to 1.
+             c_rt_graph_template_add_region_generated_block g cTid
+               cRate cFirst cCount
+               (fromIntegral pid)
 
 maxGeneratedScratchSlots :: Int
 maxGeneratedScratchSlots = 64
@@ -1638,20 +1658,23 @@ validateGeneratedPrograms rg = do
 
     validateRegionProgramRef region =
       case rrExec region of
-        ExecGenerated (FusionProgramId pid)
-          | pid < 0 ->
-              reject $
-                "region " <> show (rrIndex region)
-                <> " references negative FusionProgramId "
-                <> show pid
-          | pid >= programCount ->
-              reject $
-                "region " <> show (rrIndex region)
-                <> " references FusionProgramId " <> show pid
-                <> ", but table has " <> show programCount
-                <> " programs"
-          | otherwise -> Right ()
+        ExecGenerated      (FusionProgramId pid) -> checkPid region pid
+        ExecGeneratedBlock (FusionProgramId pid) -> checkPid region pid
         _ -> Right ()
+
+    checkPid region pid
+      | pid < 0 =
+          reject $
+            "region " <> show (rrIndex region)
+            <> " references negative FusionProgramId "
+            <> show pid
+      | pid >= programCount =
+          reject $
+            "region " <> show (rrIndex region)
+            <> " references FusionProgramId " <> show pid
+            <> ", but table has " <> show programCount
+            <> " programs"
+      | otherwise = Right ()
 
 validateFusionProgram
   :: RuntimeGraph -> Int -> FusionProgram -> Either String ()

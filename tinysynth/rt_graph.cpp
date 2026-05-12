@@ -9917,6 +9917,29 @@ void rt_graph_template_add_region_generated(
   spec.node_count = node_count;
   spec.kernel = RegionKernel::NodeLoop;
   spec.generated_program_id = program_id;
+  spec.generated_executor   = 0;
+  def->regions.push_back(spec);
+}
+
+void rt_graph_template_add_region_generated_block(
+    RTGraph *g, int template_id,
+    int rate, int first_node, int node_count,
+    int program_id) {
+  MetaDef *def = g ? template_at(*g, template_id) : nullptr;
+  if (!def) return;
+  if (program_id < 0) return;
+  if (program_id >= static_cast<int>(def->fusion_programs.size())) return;
+  if (first_node < 0 || node_count <= 0) return;
+  if (static_cast<size_t>(first_node) + static_cast<size_t>(node_count) >
+      def->nodes.size())
+    return;
+  RegionSpec spec;
+  spec.rate = rate;
+  spec.first_node = first_node;
+  spec.node_count = node_count;
+  spec.kernel = RegionKernel::NodeLoop;
+  spec.generated_program_id = program_id;
+  spec.generated_executor   = 1;
   def->regions.push_back(spec);
 }
 

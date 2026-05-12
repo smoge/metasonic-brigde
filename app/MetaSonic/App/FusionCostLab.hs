@@ -520,24 +520,29 @@ data Variant
     -- the kernels, so this variant is "kernels + RFused", not
     -- "RFused alone."
   | VarGenerated
-    -- ^ §7.D generated fusion program. Compiles to a stripped
-    -- 'RuntimeGraph' (every region 'ExecNodeLoop'), runs the
-    -- planner, then patches in a hand-emitted 'FusionProgram' for
-    -- the first generatable selected candidate. The generator is
-    -- intentionally narrow at this slice: it handles only the
-    -- @[KGain, KOut]@ / @[KGain, KBusOut]@ shape produced by the
-    -- dynamic-gain cost-lab family. Members whose maximal
-    -- selected candidate falls outside that shape record a compile
-    -- error for the row instead of silently falling back to
-    -- another variant — the column is meant to surface "does the
-    -- generated path exist for this shape" as an honest signal.
+    -- ^ §7.D generated fusion program, sample-major executor.
+    -- Compiles to a stripped 'RuntimeGraph' (every region
+    -- 'ExecNodeLoop'), runs the planner, then patches in a
+    -- generated 'FusionProgram' for the first generatable
+    -- selected candidate.
+  | VarGeneratedBlock
+    -- ^ §7.H generated fusion program, block-major executor.
+    -- Identical compile-time pipeline and identical emitted
+    -- 'FusionProgram' as 'VarGenerated'; only the per-region
+    -- 'RegionExec' selector differs ('ExecGeneratedBlock' rather
+    -- than 'ExecGenerated'), so the C++ side dispatches through
+    -- 'process_fusion_program_block' instead of the sample-major
+    -- 'process_fusion_program'. Exists for direct A/B
+    -- measurement; a future slice may collapse the variants
+    -- once the dispatch-model decision is made.
   deriving stock (Eq, Show, Bounded, Enum)
 
 variantName :: Variant -> String
-variantName VarNodeLoop     = "node-loop"
-variantName VarRegionKernel = "region-kernel"
-variantName VarRFused       = "rfused"
-variantName VarGenerated    = "generated"
+variantName VarNodeLoop       = "node-loop"
+variantName VarRegionKernel   = "region-kernel"
+variantName VarRFused         = "rfused"
+variantName VarGenerated      = "generated"
+variantName VarGeneratedBlock = "generated-block"
 
 -- | The compiler facts we record per graph. The row schema stays
 -- deliberately small enough to inspect in JSONL, but it now includes
@@ -640,12 +645,31 @@ compileForVariant variant graph = do
     VarGenerated    -> do
       baseRG <- stripRegionKernels <$> compileRuntimeGraphUnfused ir
       generateForCostLab baseRG
+    VarGeneratedBlock -> do
+      baseRG <- stripRegionKernels <$> compileRuntimeGraphUnfused ir
+      retargetGeneratedAsBlock <$> generateForCostLab baseRG
 
 loadForVariant :: Variant -> Ptr RTGraph -> RuntimeGraph -> IO ()
-loadForVariant VarNodeLoop     rt rg = loadRuntimeGraph      rt rg
-loadForVariant VarRegionKernel rt rg = loadRuntimeGraph      rt rg
-loadForVariant VarRFused       rt rg = loadRuntimeGraphFused rt rg
-loadForVariant VarGenerated    rt rg = loadRuntimeGraph      rt rg
+loadForVariant VarNodeLoop       rt rg = loadRuntimeGraph      rt rg
+loadForVariant VarRegionKernel   rt rg = loadRuntimeGraph      rt rg
+loadForVariant VarRFused         rt rg = loadRuntimeGraphFused rt rg
+loadForVariant VarGenerated      rt rg = loadRuntimeGraph      rt rg
+loadForVariant VarGeneratedBlock rt rg = loadRuntimeGraph      rt rg
+
+-- §7.H: take a graph patched for the sample-major generated
+-- variant and retarget every 'ExecGenerated' region at the
+-- block-major executor. The program data, owned slice, and
+-- region split are identical to the sample-major build — only
+-- the dispatch selector changes.
+retargetGeneratedAsBlock :: RuntimeGraph -> RuntimeGraph
+retargetGeneratedAsBlock rg = rg
+  { rgRuntimeRegions =
+      map flipExec (rgRuntimeRegions rg)
+  }
+  where
+    flipExec r = case rrExec r of
+      ExecGenerated pid -> r { rrExec = ExecGeneratedBlock pid }
+      _                 -> r
 
 stripRegionKernels :: RuntimeGraph -> RuntimeGraph
 stripRegionKernels rg = rg
@@ -1430,7 +1454,9 @@ runMember fam (FamilyMember label graph) = do
   -- Compile every variant once up front. Compile failure is
   -- recorded as a row with no timing, never aborts the lab run.
   let variants =
-        [VarNodeLoop, VarRegionKernel, VarRFused, VarGenerated]
+        [ VarNodeLoop, VarRegionKernel, VarRFused
+        , VarGenerated, VarGeneratedBlock
+        ]
       compiled =
         [ (v, compileForVariant v graph) | v <- variants ]
 

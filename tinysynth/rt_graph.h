@@ -576,6 +576,21 @@ void rt_graph_template_add_region_generated(
     int rate, int first_node, int node_count,
     int program_id);
 
+// [T:construction] Phase 7.H: register a generated region that
+// dispatches through the block-major executor
+// (process_fusion_program_block) instead of the sample-major
+// executor (process_fusion_program). Wire-compatible with
+// rt_graph_template_add_region_generated except the registered
+// region's RegionSpec::generated_executor is set to 1.
+//
+// Same FusionProgram is consumed by both executors; the
+// difference is the C++ loop nest. Silent no-op rules match
+// rt_graph_template_add_region_generated.
+void rt_graph_template_add_region_generated_block(
+    RTGraph *g, int template_id,
+    int rate, int first_node, int node_count,
+    int program_id);
+
 // [T:introspection] Phase 7.D test surface. Counts and lookups for
 // the per-template fusion-program table populated by
 // rt_graph_template_add_fusion_program /
