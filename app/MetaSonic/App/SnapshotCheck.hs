@@ -183,6 +183,47 @@ costLabChecks rows =
       (tailSweepUnsupported == 0)
       ("unsupported=" <> show tailSweepUnsupported)
 
+  -- §7.H step 6: block-major executor pins. Block-major shares
+  -- emitted programs with sample-major (same generator, same
+  -- FusionProgram), so the considered / emitted / unsupported
+  -- counts mirror the sample-major numbers by construction. The
+  -- pins exist so a regression — e.g. the loader silently failing
+  -- to route a block-major region through the new C ABI entry —
+  -- fails snapshot rather than disappearing into a per-variant
+  -- speedup table.
+  , check "cost-lab generated-block variant: considered count is stable"
+      (length generatedBlockRows == expectedGeneratedConsidered)
+      ("expected=" <> show expectedGeneratedConsidered
+       <> "; actual=" <> show (length generatedBlockRows))
+
+  , check "cost-lab generated-block variant: emitted count is stable"
+      (length generatedBlockEmittedRows == expectedGeneratedRows)
+      ("expected=" <> show expectedGeneratedRows
+       <> "; actual=" <> show (length generatedBlockEmittedRows))
+
+  , check "cost-lab generated-block variant: unsupported count is stable"
+      (generatedBlockUnsupportedCount == expectedGeneratedUnsupported)
+      ("expected=" <> show expectedGeneratedUnsupported
+       <> "; actual=" <> show generatedBlockUnsupportedCount)
+
+  , check "cost-lab generated-block variant: emitted rows stay bit-exact"
+      (all ((== EqExact) . lrEquivalence) generatedBlockEmittedRows)
+      ("non-exact=" <> show
+        (length [() | r <- generatedBlockEmittedRows
+                    , lrEquivalence r /= EqExact]))
+
+  -- generated-tail-sweep family-scoped pins under the block-major
+  -- executor. Mirror the sample-major family pins so the
+  -- synthetic corpus's integrity is locked under both executors.
+  , check "generated-tail-sweep: every block-major member emitted"
+      (tailSweepBlockEmitted == expectedTailSweepEmitted)
+      ("expected=" <> show expectedTailSweepEmitted
+       <> "; actual=" <> show tailSweepBlockEmitted)
+
+  , check "generated-tail-sweep: every block-major emitted row stays bit-exact"
+      (tailSweepBlockNonExact == 0)
+      ("non-exact=" <> show tailSweepBlockNonExact)
+
   , check "generated-tail-sweep: owned tail lengths stay stable"
       (FCL.generatedTailSweepOwnedLengths == expectedTailSweepOwnedLengths)
       ("expected=" <> show expectedTailSweepOwnedLengths
@@ -287,6 +328,15 @@ costLabChecks rows =
     generatedUnsupportedCount =
       length [() | r <- generatedRows, lrError r /= Nothing]
 
+    -- §7.H block-major mirrors of the sample-major helpers
+    -- above. Same emitted programs flow through both executors,
+    -- so the structural counts should match the sample-major
+    -- side; the pins exist to catch loader / FFI regressions.
+    generatedBlockEmittedRows =
+      [r | r <- generatedBlockRows, lrError r == Nothing]
+    generatedBlockUnsupportedCount =
+      length [() | r <- generatedBlockRows, lrError r /= Nothing]
+
     -- §7.G family-scoped helpers. Every member of
     -- 'generated-tail-sweep' is generator-supported by
     -- construction, so each of these counts is structural.
@@ -303,6 +353,17 @@ costLabChecks rows =
                  , lrEquivalence r /= EqExact ]
     expectedTailSweepEmitted = 6
     expectedTailSweepOwnedLengths = [2, 3, 3, 5, 8, 16]
+
+    -- §7.H block-major family-scoped helpers.
+    tailSweepBlockGenerated =
+      [ r | r <- generatedBlockRows
+          , familyName (lrFamily r) == "generated-tail-sweep" ]
+    tailSweepBlockEmitted =
+      length [() | r <- tailSweepBlockGenerated, lrError r == Nothing]
+    tailSweepBlockNonExact =
+      length [() | r <- tailSweepBlockGenerated
+                 , lrError r == Nothing
+                 , lrEquivalence r /= EqExact ]
 
     corpusFeatures =
       [ f
