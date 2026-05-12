@@ -41,20 +41,21 @@ Two groups of helpers, all in
      - Emits exactly two `KGain` nodes (one per channel)
        with constant amounts.
 
-   `spread monos p` for `p ∈ [-1, 1]`:
+   `spread monos width` for `width ∈ [0, 1]`:
      - With `monos = []`, emits zero nodes and returns
        silence on both channels (`Param 0.0` / `Param 0.0`).
-     - With `monos = [single]`, emits one `pan2 single
-       (p)` — exactly two `KGain` nodes, no `KAdd`.
+     - With `monos = [single]`, emits one centered
+       `pan2 single 0.0` — exactly two `KGain` nodes, no
+       `KAdd`.
      - With `monos = [m_1, …, m_N]` for `N ≥ 2`, the N
-       sources are panned across a `-1 .. +1` arc using
-       `pan2` and then mixed: emits `2N` `KGain` nodes
-       (two per source from `pan2`) and `2(N-1)` `KAdd`
-       nodes (mixing left and right separately).
-     - The `p` parameter clamps the spread width: `p = 1`
-       is full spread, `p = 0` is collapsed center, and
-       intermediate values scale the per-source pan
-       positions linearly.
+       sources are panned across a `-width .. +width` arc
+       using `pan2` and then mixed: emits `2N` `KGain`
+       nodes (two per source from `pan2`) and `2(N-1)`
+       `KAdd` nodes (mixing left and right separately).
+     - The `width` parameter clamps to `[0, 1]`: `width = 1`
+       is full spread, `width = 0` is collapsed center, and
+       intermediate values scale the per-source pan positions
+       linearly.
 
    Neither helper introduces a new DSP node; the math is
    ordinary `gain` and `add` chains with constants.
@@ -138,7 +139,8 @@ Per-helper pins:
     - `tplFootprint` for the send-side template has
       `bfWrites = {7}` and `bfLiveReads = ∅`;
     - `tplFootprint` for the return-side template has
-      `bfWrites = ∅` and `bfLiveReads = {7}`;
+      `bfWrites = {0}` (the hardware `Out 0`) and
+      `bfLiveReads = {7}`;
     - `tgTemplates` orders the send template before the
       return template (the `compileTemplateGraph`
       precedence contract).

@@ -22,15 +22,16 @@
 --   * Lifted gain / add / output helpers that expand channel-wise
 --     to the existing primitive builders.
 --
---   * First routing/mix helpers ('mixN', constant equal-power
---     'pan2', and 'stereoOut') that remain transparent wrappers over
---     primitive Add/Gain/Out nodes.
+--   * Routing/mix helpers ('mixN', constant equal-power 'pan2',
+--     static 'balance' / 'spread', explicit 'Bus' handles,
+--     'send' / 'returnBus', and 'stereoOut') that remain
+--     transparent wrappers over primitive Add/Gain/BusOut/BusIn/Out
+--     nodes.
 --
--- Out of the current slice: 'balance' / 'spread' / 'send' /
--- 'returnBus' (Phase 8.D), ensemble builders that lower to
+-- Out of the current slice: ensemble builders that lower to
 -- @[(String, SynthGraph)]@ (Phase 8.E), named-control authoring
--- objects (Phase 8.F), an inspector that surfaces authoring
--- metadata alongside the primitive graph (Phase 8.G).
+-- objects (Phase 8.F), and inspector metadata that surfaces
+-- authoring constructs alongside the primitive graph (Phase 8.G).
 --
 -- The deliberate-lowering contract is pinned by tests in
 -- @authoringDslTests@ (see @test/Spec.hs@): every public helper

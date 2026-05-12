@@ -2615,8 +2615,9 @@ and the cross-template `BusFootprint` that
 `returnBus` graph. The `send-return` demo is rewritten to go
 through `Auth.send` / `Auth.returnBus`; the compiled
 template graph stays byte-identical (same node count, same
-`bfWrites = {7}` / `bfReads = {7}` split, same writer-before-
-reader ordering).
+footprint split: voice writes send bus `{7}`, fx reads `{7}`
+and writes hardware bus `{0}`, same writer-before-reader
+ordering).
 
 Deliberately out of scope for 8.D:
 
