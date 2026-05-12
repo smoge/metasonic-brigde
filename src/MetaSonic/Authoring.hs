@@ -110,9 +110,23 @@ module MetaSonic.Authoring
   , outStereo
   , stereoOut
   , outChannels
+
+    -- * Ensemble builder (Phase 8.E)
+  , AuthoredEnsemble (..)
+  , EnsembleOptions (..)
+  , defaultEnsembleOptions
+  , TemplateRole (..)
+  , AuthoringMetadata (..)
+  , EnsembleM
+  , ensemble
+  , ensembleWith
+  , busNamed
+  , voice
+  , fx
   ) where
 
-import           Control.Monad        (zipWithM)
+import           Control.Monad        (ap, zipWithM)
+import qualified Data.Map.Strict      as M
 
 import           MetaSonic.Bridge.Source
 
@@ -575,5 +589,187 @@ stereoOut = outStereo
 -- | Multi-channel output: channel @i@ lands on @bus + i@. Emits
 -- one 'Out' node per channel in left-to-right order.
 outChannels :: Int -> Channels -> SynthM ()
-outChannels bus (Channels cs) =
-  mapM_ (\(i, c) -> out (bus + i) c) (zip [0 ..] cs)
+outChannels bus_ (Channels cs) =
+  mapM_ (\(i, c) -> out (bus_ + i) c) (zip [0 ..] cs)
+
+------------------------------------------------------------
+-- Ensemble builder (Phase 8.E)
+------------------------------------------------------------
+--
+-- The ensemble builder is a thin authoring monad that produces
+-- an ordered '[(String, SynthGraph)]' plus deterministic bus
+-- assignments. The output is exactly the shape
+-- 'compileTemplateGraph' already consumes, so 'aeTemplates' can
+-- be passed straight through. The metadata side
+-- ('aeMetadata') is diagnostic only — 'compileTemplateGraph'
+-- never sees it.
+--
+-- The builder is *not* a second compiler: it composes
+-- pre-built 'SynthGraph' values built via the existing
+-- 'runSynth'. Errors at the ensemble level (duplicate
+-- template names, etc.) are surfaced via the 'Either String'
+-- on 'ensemble' / 'ensembleWith', not threaded through
+-- 'SynthM'.
+
+-- | One authored ensemble: the declaration-order template list
+-- plus the diagnostic-only metadata the builder collected.
+-- 'aeTemplates' is what feeds 'compileTemplateGraph'.
+data AuthoredEnsemble = AuthoredEnsemble
+  { aeTemplates :: ![(String, SynthGraph)]
+  , aeMetadata  :: !AuthoringMetadata
+  } deriving (Eq, Show)
+
+-- | Options that parameterize an ensemble build. Currently just
+-- the bus base; future slices can add fields without breaking
+-- callers that use 'defaultEnsembleOptions'.
+data EnsembleOptions = EnsembleOptions
+  { eoBusBase :: !Int
+    -- ^ First bus index 'busNamed' allocates. Tests pin the
+    -- default ('eoBusBase = 16').
+  } deriving (Eq, Show)
+
+-- | Default options. Bus base is @16@: above the common
+-- 0-15 hardware/explicit-bus range typical patches use, so an
+-- authored ensemble does not collide with a hand-managed bus
+-- assignment by accident. The exact value is pinned by a
+-- snapshot test; the stability of the choice is what matters,
+-- not the specific number.
+defaultEnsembleOptions :: EnsembleOptions
+defaultEnsembleOptions = EnsembleOptions { eoBusBase = 16 }
+
+-- | Per-template role tag, recorded for diagnostic use only.
+-- The compile pipeline does not see this.
+data TemplateRole = VoiceTemplate | FxTemplate
+  deriving (Eq, Show)
+
+-- | Diagnostic-only metadata. Lives on 'AuthoredEnsemble' and
+-- carries the per-template role tags and the bus-name
+-- assignment table. 'compileTemplateGraph' never reads this.
+data AuthoringMetadata = AuthoringMetadata
+  { amRoles :: ![(String, TemplateRole)]
+    -- ^ Per-template role, in declaration order. Same length
+    -- and order as 'aeTemplates'.
+  , amBuses :: !(M.Map String Bus)
+    -- ^ Bus name → 'Bus' assignment for every 'busNamed' call.
+    -- Stable across 'ensemble' runs given the same builder
+    -- input — see the determinism tests.
+  } deriving (Eq, Show)
+
+-- | Internal builder state. Hidden from the public surface.
+data EnsembleState = EnsembleState
+  { esTemplates :: ![(String, SynthGraph)]
+    -- ^ Accumulated in *reverse* (prepended on add) so adds
+    -- are O(1); reversed once at 'ensemble' time.
+  , esRoles     :: ![(String, TemplateRole)]
+    -- ^ Same reverse-accumulation rule.
+  , esBuses     :: !(M.Map String Bus)
+  , esNextBus   :: !Int
+  }
+
+initialState :: EnsembleOptions -> EnsembleState
+initialState opts = EnsembleState
+  { esTemplates = []
+  , esRoles     = []
+  , esBuses     = M.empty
+  , esNextBus   = eoBusBase opts
+  }
+
+-- | The ensemble authoring monad. State + error. Deliberately
+-- minimal — no IO, no reader, no parallelism. The 'Either
+-- String' surface is where authoring-level errors land
+-- ("duplicate template name", etc.). Users do not pattern
+-- match on 'EnsembleM' directly; they compose 'busNamed' /
+-- 'voice' / 'fx' inside a do-block and call 'ensemble' to run.
+newtype EnsembleM a = EnsembleM
+  { runEnsembleM :: EnsembleState
+                 -> Either String (a, EnsembleState)
+  }
+
+instance Functor EnsembleM where
+  fmap f (EnsembleM run) = EnsembleM $ \s ->
+    case run s of
+      Left err      -> Left err
+      Right (a, s') -> Right (f a, s')
+
+instance Applicative EnsembleM where
+  pure a = EnsembleM $ \s -> Right (a, s)
+  (<*>) = ap
+
+instance Monad EnsembleM where
+  return = pure
+  EnsembleM run >>= k = EnsembleM $ \s ->
+    case run s of
+      Left err      -> Left err
+      Right (a, s') -> runEnsembleM (k a) s'
+
+-- | Build an 'AuthoredEnsemble' from a builder block under
+-- 'defaultEnsembleOptions'. Authoring-level errors (duplicate
+-- template names, etc.) come back as 'Left'; the right side is
+-- always a fully-populated 'AuthoredEnsemble' whose
+-- 'aeTemplates' can be passed straight to
+-- 'compileTemplateGraph'.
+ensemble :: EnsembleM () -> Either String AuthoredEnsemble
+ensemble = ensembleWith defaultEnsembleOptions
+
+-- | 'ensemble' with an explicit options record. Use this when
+-- the default bus base would collide with a hand-managed
+-- portion of the same patch, or when a future slice adds an
+-- option this slice does not yet expose.
+ensembleWith
+  :: EnsembleOptions
+  -> EnsembleM ()
+  -> Either String AuthoredEnsemble
+ensembleWith opts (EnsembleM run) = do
+  (_, finalState) <- run (initialState opts)
+  pure AuthoredEnsemble
+    { aeTemplates = reverse (esTemplates finalState)
+    , aeMetadata  = AuthoringMetadata
+        { amRoles = reverse (esRoles finalState)
+        , amBuses = esBuses finalState
+        }
+    }
+
+-- | Allocate a 'Bus' under a stable name. Repeated calls with
+-- the same name in the same ensemble return the same 'Bus'
+-- without consuming a new index; the first call at name @n@
+-- allocates the next free bus, starting from 'eoBusBase'.
+--
+-- Two ensembles built independently do *not* share bus
+-- assignments — names are scoped to a single 'ensemble' run.
+-- Federation across ensembles is a future slice's problem; this
+-- one keeps the scope flat and the determinism local.
+busNamed :: String -> EnsembleM Bus
+busNamed name = EnsembleM $ \s ->
+  case M.lookup name (esBuses s) of
+    Just b  -> Right (b, s)
+    Nothing ->
+      let b   = Bus (esNextBus s)
+          s'  = s { esBuses   = M.insert name b (esBuses s)
+                  , esNextBus = esNextBus s + 1
+                  }
+      in Right (b, s')
+
+-- | Internal: shared implementation for 'voice' / 'fx'.
+addTemplate :: TemplateRole -> String -> SynthGraph -> EnsembleM ()
+addTemplate role name g = EnsembleM $ \s ->
+  if any ((== name) . fst) (esTemplates s)
+    then Left $ "ensemble: duplicate template name '" <> name <> "'"
+    else Right
+      ( ()
+      , s { esTemplates = (name, g) : esTemplates s
+          , esRoles     = (name, role) : esRoles s
+          }
+      )
+
+-- | Declare a voice template under the given name. Voice and
+-- 'fx' differ only in the diagnostic role tag they record;
+-- both append to 'aeTemplates' in declaration order. Duplicate
+-- names at the ensemble level fail the whole build with
+-- @Left "ensemble: duplicate template name '...'"@.
+voice :: String -> SynthGraph -> EnsembleM ()
+voice = addTemplate VoiceTemplate
+
+-- | Declare an effect template under the given name. See
+-- 'voice' for the contract.
+fx :: String -> SynthGraph -> EnsembleM ()
+fx = addTemplate FxTemplate
