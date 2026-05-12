@@ -1954,6 +1954,103 @@ Open follow-ups (in roughly the order they unlock value):
   `CoveredByHandKernel` to `PreferGenerated` for those shapes.
   v1 keeps the hand-written kernels untouched.
 
+### Phase 7.G — Tail-Length Evidence (interpreter still loses)
+
+[x] First slice landed. The slice answered one question — *does
+the per-sample interpreter amortize over longer stateless
+tails?* — and the answer on this op set / dispatch model is
+**no**. Generated execution does not become profitable at any
+owned-op count the v1 interpreter can express.
+
+What changed:
+
+- The tiny generator generalizes from the fixed
+  `[KGain, sink]` shape to any maximal trailing run of
+  stateless compute nodes (`KGain` / `KAdd`) followed by
+  `KOut` / `KBusOut`. Each owned non-sink node gets one
+  scratch slot; inputs from owned siblings become
+  `SrcScratch`, external inputs stay `SrcInput` / `SrcConst`.
+  v1 op set frozen: `OpAdd`, `OpMul`, `OpSinkWrite`. The
+  generator declines cleanly on anything else.
+- `NeedsBenchmark` refines into a reason set
+  (`NoGenerated` / `NoPeer` / `NoMeasurement`) so the gate's
+  per-shape table distinguishes "we measured the suffix but
+  not the full candidate" from "we never measured this shape
+  at all." Verdict tag stays aggregated; the sub-split is
+  diagnostic only.
+- A new synthetic cost-lab family
+  `generated-tail-sweep` (6 members × 4 variants = 24 rows)
+  brackets the amortization curve. Each member feeds one
+  `pulseOsc` prefix (not §4.B-covered) into a stateless
+  compute tail of length 2, 3, 3, 5, 8, 16 owned nodes.
+- `--fusion-cost-lab` diagnostic gained a per-owned-op-size
+  bucket section. Generated speedup vs node-loop, by owned
+  size, on the current corpus:
+
+      size  2  rows=18  median=0.79×
+      size  3  rows=4   median=0.61×
+      size  4  rows=1   median=0.54×
+      size  5  rows=1   median=0.50×
+      size  8  rows=1   median=0.40×
+      size 16  rows=1   median=0.25×
+
+  The trend is monotonically downward. Dispatch overhead
+  scales linearly (or worse) with owned-op count while
+  node-loop's per-node cost stays small, so longer generated
+  tails compound the loss rather than amortize it.
+
+Snapshot pins added or moved by this slice:
+
+- cost-lab family list adds `generated-tail-sweep` (24 rows);
+- `cost-lab generated variant: measured row count` 20 → 26;
+- `cost-lab generated variant: considered count` 22 → 28;
+- `cost-lab generated variant: unsupported count` 3 → 2
+  (the previously-declined `KAdd → KOut` shape now emits);
+- `generated-tail-sweep: every member emitted` (= 6);
+- `generated-tail-sweep: every emitted row stays bit-exact`;
+- `generated-tail-sweep: no unsupported rows`;
+- gate's `unsupported` count drops 1 → 0 (same `KAdd → KOut`
+  reclassifies as `prefer-existing`);
+- gate's `needs-benchmark` count drops 10 → 9 on the snapshot
+  corpus (one row's measurement now exists).
+
+`prefer-generated` stays a 7.F tripwire at 0; per-bucket
+speedups and win/loss splits stay unpinned for bench-noise
+reasons. Three new bit-exact tests in
+[test/Spec.hs](test/Spec.hs) cover `[Gain,Gain,Out]`,
+`[Add,Gain,Out]`, `[Add,Add,Gain,Out]`.
+
+Decision artifact:
+[notes/2026-05-12-phase-7g-generated-tail-sweep.md](notes/2026-05-12-phase-7g-generated-tail-sweep.md).
+
+Open follow-ups (in roughly the order the evidence suggests):
+
+- **Executor redesign.** The 7.G curve says wider shape
+  coverage will not unlock `PreferGenerated`; the per-sample
+  dispatch loop has to get cheaper first. Concrete candidates:
+  packed instruction stream (one decoded record per op
+  instead of an ADT case-tree), superinstructions
+  (`GainOut`, `AddGainOut`, `MulAddOut`) so common short
+  tails collapse to one C++ branch, or block-loop generation
+  so the dispatch cost gets paid once per block rather than
+  per sample. The 7.G amortization-by-size diagnostic is the
+  evaluation surface for whichever candidate lands first.
+- **Remaining `NeedsBenchmark` families.** Some survey
+  shapes still report `NoMeasurement` (no cost-lab member
+  measures them). Growing the cost-lab corpus to cover them
+  resolves the gap without changing any rule, but unlikely
+  to surface a `PreferGenerated` row until the interpreter
+  cost story changes.
+- **State-bearing kinds in the owned tail.** `KEnv`,
+  oscillators, filters, `KDelay`, `KSmooth` still need new
+  ops or lifecycle plumbing. Parked behind the executor
+  redesign decision: an interpreter that already loses on
+  pure arithmetic should not pick up state-management cost
+  before its dispatch model is fixed.
+- **Runtime turn-on.** Still parked until at least one
+  `PreferGenerated` row exists and survives multiple
+  snapshot runs.
+
 ---
 
 ## Phase 8 — Authoring DSL and Composition Layer
