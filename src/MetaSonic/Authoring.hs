@@ -1,6 +1,6 @@
 -- |
 -- Module      : MetaSonic.Authoring
--- Description : Phase 8.A authoring DSL — first slice
+-- Description : Phase 8 authoring DSL — transparent composition helpers
 --
 -- The authoring layer elaborates down to ordinary 'SynthGraph' /
 -- 'TemplateGraph' values. It is not a second compiler: every helper
@@ -28,10 +28,14 @@
 --     transparent wrappers over primitive Add/Gain/BusOut/BusIn/Out
 --     nodes.
 --
--- Out of the current slice: ensemble builders that lower to
--- @[(String, SynthGraph)]@ (Phase 8.E), named-control authoring
--- objects (Phase 8.F), and inspector metadata that surfaces
--- authoring constructs alongside the primitive graph (Phase 8.G).
+--   * An ensemble builder that lowers to the existing
+--     @[(String, SynthGraph)]@ template input shape while adding
+--     deterministic bus-name allocation and diagnostic-only
+--     authoring metadata.
+--
+-- Out of the current slice: named-control authoring objects
+-- (Phase 8.F), and inspector metadata that surfaces authoring
+-- constructs alongside the primitive graph (Phase 8.G).
 --
 -- The deliberate-lowering contract is pinned by tests in
 -- @authoringDslTests@ (see @test/Spec.hs@): every public helper

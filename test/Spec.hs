@@ -1047,11 +1047,7 @@ authoringDslTests =
       tg2 <- case compileTemplateGraph (Auth.aeTemplates mutated) of
         Left err -> assertFailure err >> error "unreachable"
         Right t  -> pure t
-      -- Same template names in same order — sufficient to
-      -- prove the compile output is structurally identical
-      -- without comparing TemplateGraphs node-by-node.
-      map tplName (tgTemplates tg1)
-        @?= map tplName (tgTemplates tg2)
+      tg1 @?= tg2
   ]
 
 ------------------------------------------------------------
