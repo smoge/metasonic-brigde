@@ -1870,21 +1870,88 @@ get faster (packed instruction stream, branchless tail, fused
 multiply-add), or (b) the generator has to handle shapes where
 the existing kernels are weakest. Both are downstream slices.
 
-### Phase 7.F — Profitability Gate and Turn-On Decision
+### Phase 7.F — Read-Only Profitability Gate (no runtime turn-on)
 
-Generated fusion should become default behavior only when the planner
-can explain both legality and measured benefit. The decision should be
-driven by the cost lab and real corpus signal, not by the existence of
-a backend.
+[x] First slice landed: a read-only verdict function over the
+existing cost-model join. The gate classifies each
+planner-selected candidate as one of six verdicts in fixed
+priority order, applied by `evaluateGate` in
+[MetaSonic.App.ProfitabilityGate](app/MetaSonic/App/ProfitabilityGate.hs):
 
-Possible planner decisions:
+1. `Unsupported`  — generator declined to emit a program.
+2. `NonExact`     — emitted program diverged from `RNodeLoop`
+   (correctness hard no, even if measured speedup looked good).
+3. `CoveredByHandKernel` — candidate's `fcMatchedShape` is
+   `Just _`; §4.B kernels are audit-only in v1 and never
+   automatically replaced.
+4. `NeedsBenchmark` — no measurement for the shape.
+5. `PreferExisting r` — exact but lost to node-loop
+   (`SlowerThanNodeLoop`) or to the best non-generated peer
+   (`SlowerThanBestPeer`). The peer rule is what stops the gate
+   from approving generated rows that beat node-loop but lose
+   to a hand-written region-kernel or `RFused`.
+6. `PreferGenerated` — only verdict that says \"turn it on.\"
 
-- fuse;
-- do not fuse;
-- illegal;
-- needs benchmark data.
+`--fusion-survey` gained a *Phase 7.F generated profitability
+gate* section: per-verdict counts on the header line, a
+`prefer-generated = N (holds/broken)` invariant line, and a
+per-shape table sorted so any `PreferGenerated` row surfaces
+first. Each row carries kinds, gain features, §4.B match,
+occurrence count, verdict tag, generated speedup, peer speedup,
+and the verdict's reason.
 
-Until this gate exists, generated fusion remains opt-in.
+Current corpus signal (live `--fusion-survey`):
+
+    total=28  prefer-generated=0  prefer-existing=10
+    needs-benchmark=7  unsupported=1  non-exact=0
+    covered-by-hand-kernel=10
+
+Snapshot pins on the smaller snapshot corpus:
+
+- `gate total row count`          (12);
+- `gate prefer-generated`         (0 — safety tripwire);
+- `gate non-exact`                (0 — correctness tripwire);
+- `gate unsupported`              (1);
+- `gate needs-benchmark`          (1);
+- `gate covered-by-hand-kernel`   (7).
+
+`prefer-existing` is intentionally not pinned — rows hovering
+near `measuredWinThreshold` (1.05×) flap between
+`PreferExisting` and `PreferGenerated` under bench noise. The
+two zero pins are tripwires: a flip is a real event (new
+positive signal or a correctness regression) and the snapshot
+should fail so a human reviews.
+
+Hard scope for this slice: read-only. No runtime path consumes
+the verdicts, no FFI changes, no §4.B kernel is replaced by a
+generated program, no CLI override knob. The point is to
+formalize the safety rule so the existence of `ExecGenerated` is
+not mistaken for readiness. Decision artifact:
+[notes/2026-05-12-phase-7f-profitability-gate.md](notes/2026-05-12-phase-7f-profitability-gate.md).
+
+Open follow-ups (in roughly the order they unlock value):
+
+- **Generated executor performance work.** Today the gate picks
+  `PreferGenerated` on no row. Either the per-sample interpreter
+  has to get faster (packed instruction stream, branchless tail,
+  fused multiply-add op), or the generator has to handle shapes
+  where the existing kernels are weakest. Without one of those,
+  a runtime turn-on switch has nothing to turn on.
+- **Remaining `NeedsBenchmark` families.** The gate currently
+  reports needs-benchmark for shapes the cost-lab corpus does
+  not measure. Growing the cost-lab corpus to cover those shapes
+  resolves the gap without changing any rule.
+- **Runtime turn-on.** Once at least one `PreferGenerated` row
+  exists and survives multiple snapshot runs, a future slice can
+  wire the verdict into the loader. The wiring needs a separate
+  decision about how the runtime carries verdicts (per-template
+  metadata vs. recomputed) and how a rollback works if a
+  downstream change regresses a row.
+- **Relaxing rule 3 for measured-faster generated.** When a
+  generated row clearly beats its §4.B peer (1.5×+) and the
+  gate has measured it consistently, a future slice may demote
+  `CoveredByHandKernel` to `PreferGenerated` for those shapes.
+  v1 keeps the hand-written kernels untouched.
 
 ---
 
