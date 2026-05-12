@@ -14,6 +14,11 @@ import           System.Environment         (getArgs, getProgName)
 import           System.Exit                (die)
 
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
+import qualified Data.ByteString.Lazy.Char8  as BL
+import           MetaSonic.Authoring.Manifest (AuthoringManifestDoc (..),
+                                                 encodeManifestDoc,
+                                                 manifestFromReport,
+                                                 manifestSchemaVersion)
 import           MetaSonic.Authoring.Report (renderAuthoringReport)
 import           MetaSonic.App.Demos
 import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
@@ -96,6 +101,14 @@ data RunMode
     -- ^ Non-audio reporting mode (--snapshot-check). Runs the
     -- Phase 7.A read-only invariants over the survey corpus and
     -- fusion cost lab, then exits non-zero on drift.
+  | AuthoringManifest
+    -- ^ Non-audio reporting mode (--authoring-manifest). Phase
+    -- 8.H: prints a JSON manifest of the authoring surface
+    -- (templates, named buses, named controls) for each demo
+    -- that opts into 'demoAuthoring'. Targets filter the demo
+    -- list. Demos without authoring metadata are silently
+    -- skipped; the document is always valid JSON, even when
+    -- the resulting demo list is empty.
   deriving (Eq, Show)
 
 data Options = Options
@@ -154,6 +167,8 @@ parseArgs = go defaultOptions
       go opts { optMode = FusionCostLab } xs
     go opts ("--snapshot-check" : xs) =
       go opts { optMode = SnapshotCheck } xs
+    go opts ("--authoring-manifest" : xs) =
+      go opts { optMode = AuthoringManifest } xs
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -228,6 +243,7 @@ usage prog = unlines
   , "  " <> prog <> " --corpus-survey"
   , "  " <> prog <> " --fusion-cost-lab [--summary]"
   , "  " <> prog <> " --snapshot-check"
+  , "  " <> prog <> " --authoring-manifest [DEMO ...]"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --plugin-list"
   , "  " <> prog <> " --osc-listen [PORT]"
@@ -294,6 +310,14 @@ usage prog = unlines
   , "                   the cost-lab row/equivalence/feature checks and"
   , "                   the survey corpus compile/latency/shape checks."
   , "                   No audio, no TUI; demo targets are ignored."
+  , "  --authoring-manifest"
+  , "                   Phase 8.H authoring-surface manifest export."
+  , "                   Prints a single JSON document describing every"
+  , "                   demo that opts into authoring metadata: templates,"
+  , "                   roles, named buses, named controls, ranges, CC"
+  , "                   bindings, and migration keys. Demos without"
+  , "                   authoring metadata are silently skipped; targets"
+  , "                   filter the demo list. No audio, no TUI."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
@@ -391,6 +415,9 @@ main = do
       runFusionCostLab fcoOpts
     SnapshotCheck ->
       runSnapshotCheck
+    AuthoringManifest -> do
+      demos <- resolveSelectedDemos
+      runAuthoringManifest demos
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -400,6 +427,28 @@ main = do
     AudioOnly      -> runDemos "Running selected demos."
     InspectThenRun -> runDemos "Inspecting selected demos before audio."
     InspectOnly    -> runDemos "Inspecting selected demos without audio."
+
+-- Phase 8.H non-audio runner. Walks the selected demo
+-- list, projects every 'demoAuthoring' report into a
+-- manifest entry, wraps them in an
+-- 'AuthoringManifestDoc' with the current schema
+-- version, and writes pretty JSON to stdout. Demos
+-- without authoring metadata are silently skipped so the
+-- command stays script-friendly: a target list that
+-- matches only legacy demos still produces a valid (but
+-- empty) document rather than failing.
+runAuthoringManifest :: [Demo] -> IO ()
+runAuthoringManifest demos = do
+  let manifests =
+        [ manifestFromReport (demoKey d) r
+        | d <- demos
+        , Just r <- [demoAuthoring d]
+        ]
+      doc = AuthoringManifestDoc
+        { docSchemaVersion = manifestSchemaVersion
+        , docDemos         = manifests
+        }
+  BL.putStr (encodeManifestDoc doc)
 
 printMidiDevices :: IO ()
 printMidiDevices = do
@@ -457,7 +506,8 @@ runDemo opts demo
     || optMode opts == SnapshotCheck
     || optMode opts == OscListen
     || optMode opts == MidiList
-    || optMode opts == PluginList =
+    || optMode opts == PluginList
+    || optMode opts == AuthoringManifest =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -526,6 +576,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: MidiList should be handled by main, never reach here"
     PluginList ->
       error "runSingleDemo: PluginList should be handled by main, never reach here"
+    AuthoringManifest ->
+      error "runSingleDemo: AuthoringManifest should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare
