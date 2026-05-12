@@ -20,23 +20,19 @@ module MetaSonic.App.Demos
   , Demo (..)
   , demoTable
     -- * Phase 8.G: authoring metadata reporting
-  , DemoAuthoringMetadata (..)
-  , DemoTemplateMetadata (..)
-  , DemoBusMetadata (..)
-  , DemoNamedControlView (..)
-  , emptyAuthoringMetadata
-  , ensembleMetadata
-  , addNamedControl
   , namedControlGraph
   , namedControlAuthoring
   , sendReturnAuthoring
   ) where
 
-import           Data.List                 (sortBy)
 import           Data.Word                 (Word8)
-import qualified Data.Map.Strict           as M
 
 import qualified MetaSonic.Authoring       as Auth
+import           MetaSonic.Authoring.Report (AuthoringReport,
+                                             addReportedControl,
+                                             emptyAuthoringReport,
+                                             ensembleReport)
+import qualified MetaSonic.Authoring.Report as Report
 import           MetaSonic.Bridge.Source
 
 simpleGraph :: SynthGraph
@@ -356,104 +352,6 @@ data DemoBody
     -- realtime audio bracket.
 
 ------------------------------------------------------------
--- Phase 8.G: authoring metadata reporting
-------------------------------------------------------------
---
--- DemoAuthoringMetadata is an app-level projection of the
--- authoring constructs a demo used: ensemble templates +
--- roles, named buses, and named controls. It is *not*
--- embedded in SynthGraph or TemplateGraph. The reporting
--- layer (--inspect-only, --fusion-survey) reads it; the
--- compiler ignores it.
---
--- Demos opt in by setting 'demoAuthoring = Just dam'. Legacy
--- demos leave it 'Nothing' and the rendering paths short-
--- circuit, so adding the field does not produce noise on
--- pre-existing demos.
-
-data DemoTemplateMetadata = DemoTemplateMetadata
-  { dtmName :: !String
-  , dtmRole :: !Auth.TemplateRole
-  } deriving (Eq, Show)
-
-data DemoBusMetadata = DemoBusMetadata
-  { dbmName  :: !String
-  , dbmIndex :: !Int
-  } deriving (Eq, Show)
-
-data DemoNamedControlView = DemoNamedControlView
-  { dncName        :: !String
-  , dncDefault     :: !Double
-  , dncRange       :: !(Double, Double)
-  , dncSmoothingHz :: !Double
-  , dncCC          :: !(Maybe Word8)
-  , dncKey         :: !MigrationKey
-  , dncSlot        :: !Int
-  } deriving (Eq, Show)
-
-data DemoAuthoringMetadata = DemoAuthoringMetadata
-  { damTemplates :: ![DemoTemplateMetadata]
-  , damBuses     :: ![DemoBusMetadata]
-  , damControls  :: ![DemoNamedControlView]
-  } deriving (Eq, Show)
-
-emptyAuthoringMetadata :: DemoAuthoringMetadata
-emptyAuthoringMetadata = DemoAuthoringMetadata
-  { damTemplates = []
-  , damBuses     = []
-  , damControls  = []
-  }
-
--- | Project an 'AuthoredEnsemble' into demo-layer metadata.
--- Templates and roles come from 'amRoles' in declaration
--- order. Named buses come from 'amBuses', sorted by bus
--- index so the reporting layer's row order is stable
--- regardless of 'Map' iteration.
-ensembleMetadata :: Auth.AuthoredEnsemble -> DemoAuthoringMetadata
-ensembleMetadata ae = DemoAuthoringMetadata
-  { damTemplates =
-      [ DemoTemplateMetadata { dtmName = n, dtmRole = r }
-      | (n, r) <- Auth.amRoles meta
-      ]
-  , damBuses =
-      [ DemoBusMetadata
-          { dbmName  = name
-          , dbmIndex = Auth.unBus b
-          }
-      | (name, b) <- sortBy cmpBus (M.toList (Auth.amBuses meta))
-      ]
-  , damControls = []
-  }
-  where
-    meta = Auth.aeMetadata ae
-    cmpBus (_, b1) (_, b2) =
-      compare (Auth.unBus b1) (Auth.unBus b2)
-
--- | Append one named control's metadata to a
--- 'DemoAuthoringMetadata' record. Demos call this for each
--- 'NamedControl' returned by 'runSynthWith'.
-addNamedControl
-  :: Auth.NamedControl
-  -> DemoAuthoringMetadata
-  -> DemoAuthoringMetadata
-addNamedControl nc dam = dam
-  { damControls = damControls dam <> [view] }
-  where
-    md   = Auth.ncMetadata nc
-    view = DemoNamedControlView
-      { dncName        = Auth.ncmName md
-      , dncDefault     = Auth.ncmDefault md
-      , dncRange       =
-          ( Auth.crMin (Auth.ncmRange md)
-          , Auth.crMax (Auth.ncmRange md)
-          )
-      , dncSmoothingHz = Auth.ncmSmoothingHz md
-      , dncCC          = Auth.ncmCC md
-      , dncKey         = Auth.ncmKey md
-      , dncSlot        = Auth.ncmSlot md
-      }
-
-------------------------------------------------------------
 -- Named-control demo (Phase 8.G)
 ------------------------------------------------------------
 --
@@ -497,25 +395,25 @@ namedControlGraph =
   let (_, g) = runSynthWith namedControlBuild
   in g
 
-namedControlAuthoring :: DemoAuthoringMetadata
+namedControlAuthoring :: AuthoringReport
 namedControlAuthoring =
   let ((cutoff, vol), _) = runSynthWith namedControlBuild
-      base = emptyAuthoringMetadata
-        { damTemplates =
-            [ DemoTemplateMetadata
-                { dtmName = "named-control"
-                , dtmRole = Auth.VoiceTemplate
+      base = emptyAuthoringReport
+        { Report.arTemplates =
+            [ Report.ReportedTemplate
+                { Report.rtName = "named-control"
+                , Report.rtRole = Auth.VoiceTemplate
                 }
             ]
         }
-  in addNamedControl vol (addNamedControl cutoff base)
+  in addReportedControl vol (addReportedControl cutoff base)
 
 ------------------------------------------------------------
 -- send-return ensemble metadata projection (Phase 8.G)
 ------------------------------------------------------------
 
-sendReturnAuthoring :: DemoAuthoringMetadata
-sendReturnAuthoring = ensembleMetadata sendReturnEnsemble
+sendReturnAuthoring :: AuthoringReport
+sendReturnAuthoring = ensembleReport sendReturnEnsemble
 
 ------------------------------------------------------------
 
@@ -523,7 +421,7 @@ data Demo = Demo
   { demoKey       :: String
   , demoLabel     :: String
   , demoBody      :: DemoBody
-  , demoAuthoring :: Maybe DemoAuthoringMetadata
+  , demoAuthoring :: Maybe AuthoringReport
     -- ^ 'Just' for demos that opt in to Phase 8.G metadata
     -- reporting; 'Nothing' for legacy demos.
   }
@@ -542,12 +440,12 @@ demoNoAuth key lbl body = Demo
 -- | Build a demo with Phase 8.G authoring metadata.
 demoWithAuth
   :: String -> String -> DemoBody
-  -> DemoAuthoringMetadata -> Demo
-demoWithAuth key lbl body dam = Demo
+  -> AuthoringReport -> Demo
+demoWithAuth key lbl body r = Demo
   { demoKey       = key
   , demoLabel     = lbl
   , demoBody      = body
-  , demoAuthoring = Just dam
+  , demoAuthoring = Just r
   }
 
 demoTable :: [Demo]

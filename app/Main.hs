@@ -14,6 +14,7 @@ import           System.Environment         (getArgs, getProgName)
 import           System.Exit                (die)
 
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
+import           MetaSonic.Authoring.Report (renderAuthoringReport)
 import           MetaSonic.App.Demos
 import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
                                               OutputFormat (..),
@@ -486,6 +487,7 @@ runSingleDemo opts demo g = do
       putBanner (demoLabel demo)
       _ <- printTraceSummary trace
       printFusionSummaryFor opts g
+      printAuthoringMetadata demo
       putStrLn "\n  Audio skipped (--inspect-only)."
       putStrLn ""
 
@@ -609,6 +611,7 @@ runTemplateDemo opts demo tpls = do
 
       case optMode opts of
         InspectOnly -> do
+          printAuthoringMetadata demo
           putStrLn "\n  Audio skipped (--inspect-only)."
           putStrLn $ "  (The brick inspector is single-graph only; "
                   <> "multi-template demos print a textual summary above.)"
@@ -799,6 +802,15 @@ printTemplateGraph tg = do
       <> "  writes=" <> show (bfWrites fp)
       <> "  live-reads=" <> show (bfReads fp)
       <> "  delayed-reads=" <> show (bfDelayedReads fp)
+
+-- Emit the Phase 8.G authoring metadata block for a demo
+-- that opts in. Silent when 'demoAuthoring demo = Nothing',
+-- so legacy demos keep their existing output unchanged.
+-- The library-side 'renderAuthoringReport' does the pure
+-- formatting; this wrapper just prints the lines.
+printAuthoringMetadata :: Demo -> IO ()
+printAuthoringMetadata =
+  mapM_ putStrLn . renderAuthoringReport . demoAuthoring
 
 printTraceSummary :: CompileTrace -> IO (Maybe RuntimeGraph)
 printTraceSummary ct =

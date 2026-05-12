@@ -43,6 +43,7 @@ library
       MetaSonic.Pattern
       MetaSonic.Pattern.Corpus
       MetaSonic.Authoring
+      MetaSonic.Authoring.Report
       MetaSonic.Visualize.Trace
       MetaSonic.Visualize.TUI
   other-modules:
