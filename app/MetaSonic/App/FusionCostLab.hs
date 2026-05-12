@@ -81,7 +81,8 @@ module MetaSonic.App.FusionCostLab
   ) where
 
 import           Control.Monad              (forM, forM_, replicateM_)
-import           Data.List                  (intercalate, sort, sortOn)
+import           Data.List                  (intercalate, isInfixOf, sort,
+                                             sortOn)
 import qualified Data.Map.Strict            as M
 import           Data.Maybe                 (catMaybes, isNothing, mapMaybe)
 import qualified Data.Set                   as S
@@ -89,7 +90,8 @@ import           Foreign                    (allocaArray, castPtr, peekArray)
 import           Foreign.C.Types            (CFloat (..))
 import           Foreign.Ptr                (Ptr)
 import           GHC.Clock                  (getMonotonicTimeNSec)
-import           System.IO                  (hPutStrLn, stderr)
+import           System.IO                  (Handle, hFlush, hPutStrLn, stderr,
+                                             stdout)
 import           Text.Printf                (printf)
 
 import           MetaSonic.Bridge.Compile
@@ -910,12 +912,16 @@ runFusionCostLab :: FusionCostLabOptions -> IO ()
 runFusionCostLab opts = do
   rows <- collectFusionCostLabRows opts
   case fcoFormat opts of
-    FormatJSONL   -> mapM_ (putStrLn . rowToJSONL) rows
-    FormatSummary -> renderSummary rows
-  -- Phase 7.E step 4: diagnostic-only summary for the generated
-  -- variant. Goes to stderr so it never lands inside a JSONL stream
-  -- a caller is parsing.
-  renderGeneratedDiagnostics rows
+    FormatJSONL -> do
+      mapM_ (putStrLn . rowToJSONL) rows
+      -- Keep machine-readable stdout clean for JSONL consumers.
+      hFlush stdout
+      renderGeneratedDiagnostics stderr rows
+    FormatSummary -> do
+      renderSummary rows
+      -- Summary mode is human-readable stdout; print diagnostics on
+      -- the same stream so captured output stays ordered.
+      renderGeneratedDiagnostics stdout rows
 
 collectFusionCostLabRows :: FusionCostLabOptions -> IO [LabRow]
 collectFusionCostLabRows opts =
@@ -1225,8 +1231,8 @@ renderSummary rows = do
 -- these counts, no profitability gate consumes them. The point
 -- is to make "is the generator wider, is it correct, is it ever
 -- faster" answerable at a glance instead of by reading the JSONL.
-renderGeneratedDiagnostics :: [LabRow] -> IO ()
-renderGeneratedDiagnostics rows = do
+renderGeneratedDiagnostics :: Handle -> [LabRow] -> IO ()
+renderGeneratedDiagnostics handle rows = do
   let generated = [r | r <- rows, lrVariant r == VarGenerated]
   if null generated
     then pure ()
@@ -1243,28 +1249,29 @@ renderGeneratedDiagnostics rows = do
           posDeltas   = length [d | d <- deltaValues, d >= 0]
           negDeltas   = length deltaValues - posDeltas
 
-      hPutStrLn stderr ""
-      hPutStrLn stderr "=== generated variant diagnostics (Phase 7.E) ==="
-      hPutStrLn stderr $ "  considered:  " <> show (length generated)
+      hPutStrLn handle ""
+      hPutStrLn handle "=== generated variant diagnostics (Phase 7.E) ==="
+      hPutStrLn handle $ "  considered:  " <> show (length generated)
                       <> "  emitted: "    <> show (length emitted)
                       <> "  unsupported: " <> show (length unsupported)
-      hPutStrLn stderr $ "  equivalence: exact=" <> show (length emitted - length nonExact)
+      hPutStrLn handle $ "  equivalence: exact=" <> show (length emitted - length nonExact)
                       <> "  non-exact=" <> show (length nonExact)
       unless (null declineReasons) $ do
-        hPutStrLn stderr "  decline reasons:"
+        hPutStrLn handle "  decline reasons:"
         forM_ declineReasons $ \(reason, n) ->
-          hPutStrLn stderr $ "    " <> reason <> ": " <> show n
+          hPutStrLn handle $ "    " <> reason <> ": " <> show n
       unless (null emittedSpeedups) $ do
         let (sMin, sMed, sMax) = minMedMax emittedSpeedups
-        hPutStrLn stderr $ printf
+        hPutStrLn handle $ printf
           "  speedup vs node-loop: min=%.2fx  median=%.2fx  max=%.2fx  win(>=%.2fx)=%d  loss=%d"
           sMin sMed sMax measuredWinThreshold wins loses
       unless (null deltaValues) $ do
         let (dMin, dMed, dMax) = minMedMax deltaValues
-        hPutStrLn stderr $ printf
+        hPutStrLn handle $ printf
           "  delta vs best non-generated (region-kernel/RFused): rows=%d  min=%+.2fx  median=%+.2fx  max=%+.2fx  generated>=best=%d  generated<best=%d"
           (length deltaValues) dMin dMed dMax posDeltas negDeltas
-      hPutStrLn stderr "=== end generated diagnostics ==="
+      hPutStrLn handle "=== end generated diagnostics ==="
+      hFlush handle
   where
     unless cond act = if cond then pure () else act
 
@@ -1288,21 +1295,27 @@ renderGeneratedDiagnostics rows = do
       | "region not found" `isInfixOf` s        = "owned slice's region not found"
       | otherwise                               = s
 
-    isInfixOf needle hay = needle `S.member` S.fromList (substrings hay (length needle))
-
-    substrings s n
-      | length s < n = []
-      | otherwise    = take n s : substrings (drop 1 s) n
-
 minMedMax :: [Double] -> (Double, Double, Double)
+minMedMax [] = (0, 0, 0)
 minMedMax xs =
-  let sorted = sort xs
-      n      = length sorted
-      med
-        | n == 0    = 0
-        | odd n     = sorted !! (n `div` 2)
-        | otherwise = (sorted !! (n `div` 2 - 1) + sorted !! (n `div` 2)) / 2
-  in (head sorted, med, last sorted)
+  case sort xs of
+    [] -> (0, 0, 0)
+    sorted@(lo : rest) ->
+      let n   = length sorted
+          mid = n `div` 2
+          med
+            | odd n     = indexOrZero sorted mid
+            | otherwise =
+                (indexOrZero sorted (mid - 1) + indexOrZero sorted mid) / 2
+      in (lo, med, lastOf lo rest)
+  where
+    indexOrZero (y : _) 0 = y
+    indexOrZero (_ : ys) i
+      | i > 0 = indexOrZero ys (i - 1)
+    indexOrZero _ _ = 0
+
+    lastOf acc []       = acc
+    lastOf _   (y : ys) = lastOf y ys
 
 -- | Speedup delta between the generated row and the better of
 -- region-kernel / RFused on the same (family, member). Returns
