@@ -2777,6 +2777,64 @@ below). Both are larger than 8.G's elaboration-only
 contract; pick based on which the next user actually
 needs.
 
+### [x] Phase 8.H — Authoring Manifest Export v1
+
+`MetaSonic.Authoring.Manifest` ships a JSON view of every
+demo's authoring surface, derived from
+`AuthoringReport`. `manifestFromReport :: String ->
+AuthoringReport -> AuthoringManifest` is a strict
+transcription; an `AuthoringManifestDoc` wraps a
+declaration-order list of those entries with an explicit
+`schemaVersion = 1` field. Explicit (non-derived)
+`ToJSON` / `FromJSON` instances keep wire field names
+under the slice's control; `FromJSON` rejects unsupported
+versions, missing `schemaVersion`, and unknown role
+strings.
+
+A new non-audio CLI mode prints the document:
+
+    metasonic-bridge --authoring-manifest             # all demos
+    metasonic-bridge --authoring-manifest named-control
+    metasonic-bridge --authoring-manifest send-return named-control
+
+Demos without `demoAuthoring` are silently filtered out;
+targeting only legacy demos still produces a valid (but
+empty) document rather than failing. Output is
+pretty-printed JSON on stdout.
+
+What this slice doesn't try to settle:
+
+- No import/reload. `FromJSON` exists only so tests can
+  round-trip; nothing in the runtime reads a manifest at
+  startup. Session reload is a separate slice.
+- No metadata in `SynthGraph` / `TemplateGraph`. The
+  compiler IR stays untouched.
+- No FFI / OSC grammar / runtime ABI changes.
+- Not a graph save format. The manifest captures
+  authoring-surface metadata, not the lowered graph.
+  Anyone who needs the lowered graph back must rebuild
+  it from source.
+
+12 new tests in `authoringManifestTests` pin
+`manifestSchemaVersion = 1`, projection ordering,
+semantic JSON round-trip (every `ManifestControl` field),
+and decoder rejection of unsupported versions / missing
+fields / unknown roles. No new snapshot pins (the demo
+table lives in `app/` and is not reachable from the
+library-side snapshot tool); the unit tests cover the
+same structural facts inline.
+
+See
+[notes/2026-05-12-phase-8h-authoring-manifest.md](notes/2026-05-12-phase-8h-authoring-manifest.md)
+for the full contract.
+
+With 8.H landed, the manifest is a stable input shape for
+the eventual session layer. The next slice can begin
+**session scoping prep**: command/event ADT, OSC
+resolve-state rebuild contract, and the buffer/plugin
+lifecycle report shape. The session runtime itself is
+still gated on the items below.
+
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
 The session layer is the likely product direction after authoring and

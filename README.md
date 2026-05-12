@@ -125,6 +125,7 @@ stack exec -- metasonic-bridge [MODE] [DEMO ...]
 | `--corpus-survey`             | Run the pattern corpus through survey tooling |
 | `--fusion-cost-lab [--summary]` | Measure fusion variants and equivalence     |
 | `--snapshot-check`            | Run survey / cost-lab invariant checks        |
+| `--authoring-manifest`        | Emit JSON manifest of authoring metadata      |
 | `--midi-list`                 | List Q / PortMIDI devices                     |
 | `--plugin-list`               | Print the linked static plugin registry       |
 | `--osc-listen [PORT]`         | Run the OSC-controlled demo graph             |
@@ -168,6 +169,9 @@ stack exec -- metasonic-bridge --fusion-cost-lab --summary
 
 # Run the structural snapshot checks
 stack exec -- metasonic-bridge --snapshot-check
+
+# Emit a JSON manifest of authoring metadata for one demo
+stack exec -- metasonic-bridge --authoring-manifest send-return
 
 # Run the OSC control demo on UDP port 7000
 stack exec -- metasonic-bridge --osc-listen 7000
