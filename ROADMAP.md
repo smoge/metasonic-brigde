@@ -2260,27 +2260,52 @@ construction — exactly what the slice's "fallback is
 byte-equivalent" claim demands.
 
 What the slice does **not** produce: a `PreferGenerated`
-row in the profitability gate. The shapes super-mode wins on
-(`Gain → Out`, `Add → Gain → Out` and friends) are the same
-shapes §4.B's `RSinGainOut` / `RSawGainOut` / `RNoiseGainOut`
-/ etc. claim, so the gate verdict on those rows stays
-`CoveredByHandKernel`. The single `measured-win` row on the
-cost-lab corpus is similarly hand-kernel-covered. The
-generated executor is faster than a generic generator should
-be on its first day, but the rows it wins on already have a
-faster path through §4.B.
+row in the profitability gate. Two threads to keep separate
+here, because the original write-up conflated them:
+
+  1. **The gate does not see super-mode at all.** The
+     `GateMeasurement` machinery in
+     [app/MetaSonic/App/FusionCostLab.hs](app/MetaSonic/App/FusionCostLab.hs)
+     reads `gmGeneratedSpeedup` from the `VarGenerated`
+     (sample-major) row only; `VarGeneratedSuper` rows are
+     never indexed. So every claim of the form "the gate
+     verdict on row X is Y" is really a claim about the
+     sample-major executor, not super-mode. Wiring
+     `VarGeneratedSuper` into the gate is a future slice,
+     not something 7.I shipped.
+
+  2. **Super-mode wins are not all §4.B-covered.** Most of
+     the wins are: `sin-gain-out` lands on `RSinGainOut`,
+     `saw-gain-out` on `RSawGainOut`, etc. But the corpus
+     also contains `sink-chain/pulse-gain-out`, a `PulseOsc
+     → Gain → Out` shape with no `RPulseGainOut` hand kernel
+     in the §4.B family. Super-mode wins on it (locally
+     measured around `1.06–1.10×` against node-loop, run-
+     dependent). The reason that win still should not
+     become `PreferGenerated` is **peer comparison**, not
+     `CoveredByHandKernel`: `RFused` covers the same shape
+     and beats super-mode on it (`gmBestPeerSpeedup` >
+     `gmGeneratedSpeedup`). If the gate ever indexed
+     `VarGeneratedSuper`, that row would still come back as
+     `PreferExisting`, not `PreferGenerated`.
 
 The decision recorded in the 7.I note:
 
-  * Above `1.0×` on recognized rows? **Yes** (`max=2.43×`).
-  * Produces stable non-kernel `PreferGenerated` rows? **No**.
+  * Above `1.0×` on recognized rows? **Yes** (`max` around
+    `2.4×`; one run measured `2.43×`, a fresh rerun
+    measured `2.47×`).
+  * Produces stable non-kernel `PreferGenerated` rows? **No**
+    (analytically — see thread 1 above; the current gate
+    does not actually decide on super-mode rows).
 
 That puts the slice in case 2 of the note's outcome ladder:
 super-mode is a middle path between node-loop and hand
-kernels; it stays read-only. Future slices may extend the
-recognizer set or pin a `PreferGenerated` row on a shape no
-§4.B kernel claims, but neither is justified by this
-slice's evidence alone.
+kernels; it stays read-only. Future slices may either wire
+`VarGeneratedSuper` into `GateMeasurement` (turning the
+analytical claim above into a gate-computed one) or extend
+the recognizer set toward shapes no §4.B kernel claims and
+where `RFused` does not already win. Neither is justified by
+this slice's evidence alone.
 
 Snapshot pins added by this slice (55 total checks, up from
 46):
