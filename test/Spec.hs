@@ -707,6 +707,175 @@ authoringDslTests =
           kindCount KGain   @?= 4  -- envS gains + master gainS
           kindCount KDelay  @?= 2
           kindCount KOut    @?= 2
+
+  ------------------------------------------------------------
+  -- Phase 8.D: routing helpers (balance / spread / send / returnBus)
+  ------------------------------------------------------------
+
+  , testCase "balance center emits two unity KGain nodes" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.balance (Auth.stereo l r) 0.0
+            pure ()
+          amounts = sort
+            [ a
+            | spec <- nodesByKind g KGain
+            , Gain _ (Param a) <- [nsUgen spec]
+            ]
+      length (nodesByKind g KGain) @?= 2
+      amounts @?= [1.0, 1.0]
+
+  , testCase "balance left attenuates right channel only" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.balance (Auth.stereo l r) (-0.4)
+            pure ()
+          amounts = sort
+            [ a
+            | spec <- nodesByKind g KGain
+            , Gain _ (Param a) <- [nsUgen spec]
+            ]
+      length (nodesByKind g KGain) @?= 2
+      amounts @?= sort [1.0, 1.0 - 0.4]
+
+  , testCase "balance right attenuates left channel only" $ do
+      let g = runSynth $ do
+            l <- sinOsc 440.0 0.0
+            r <- sinOsc 660.0 0.0
+            _ <- Auth.balance (Auth.stereo l r) 0.7
+            pure ()
+          amounts = sort
+            [ a
+            | spec <- nodesByKind g KGain
+            , Gain _ (Param a) <- [nsUgen spec]
+            ]
+      length (nodesByKind g KGain) @?= 2
+      amounts @?= sort [1.0 - 0.7, 1.0]
+
+  , testCase "spread [] emits zero KGain and zero KAdd" $ do
+      let g = runSynth $ do
+            _ <- Auth.spread [] 1.0
+            pure ()
+      length (nodesByKind g KGain) @?= 0
+      length (nodesByKind g KAdd)  @?= 0
+
+  , testCase "spread [single] emits two KGain and no KAdd (delegates to pan2)" $ do
+      let g = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            _ <- Auth.spread [Auth.mono s] 1.0
+            pure ()
+      length (nodesByKind g KGain) @?= 2
+      length (nodesByKind g KAdd)  @?= 0
+
+  , testCase "spread of N=3 sources emits 6 KGain and 4 KAdd nodes" $ do
+      let g = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sawOsc 220.0 0.0
+            c <- triOsc 330.0 0.0
+            _ <- Auth.spread [Auth.mono a, Auth.mono b, Auth.mono c] 1.0
+            pure ()
+      -- 3 sources × 2 channels = 6 KGain
+      -- (3 - 1) × 2 channels    = 4 KAdd
+      length (nodesByKind g KGain) @?= 6
+      length (nodesByKind g KAdd)  @?= 4
+
+  , testCase "spread with width=0 collapses every source to center" $ do
+      let g = runSynth $ do
+            a <- sinOsc 440.0 0.0
+            b <- sawOsc 220.0 0.0
+            _ <- Auth.spread [Auth.mono a, Auth.mono b] 0.0
+            pure ()
+          amounts = sort
+            [ a
+            | spec <- nodesByKind g KGain
+            , Gain _ (Param a) <- [nsUgen spec]
+            ]
+          center = sqrt 0.5
+      length (nodesByKind g KGain) @?= 4
+      -- All 4 gains should be the equal-power center coefficient.
+      forM_ amounts $ \a ->
+        assertBool
+          ("expected sqrt 0.5 = " <> show center <> ", got " <> show a)
+          (abs (a - center) < 1e-12)
+
+  , testCase "send lowers to exactly one KBusOut on the named bus" $ do
+      let g = runSynth $ do
+            s <- sinOsc 440.0 0.0
+            Auth.send (Auth.bus 7) (Auth.mono s)
+          busOuts =
+            [ b
+            | spec <- nodesByKind g KBusOut
+            , BusOut b _ <- [nsUgen spec]
+            ]
+      length (nodesByKind g KBusOut) @?= 1
+      busOuts @?= [7]
+
+  , testCase "returnBus lowers to exactly one KBusIn on the named bus" $ do
+      let g = runSynth $ do
+            sent <- Auth.returnBus (Auth.bus 7)
+            Auth.outMono 0 sent
+          busIns =
+            [ b
+            | spec <- nodesByKind g KBusIn
+            , BusIn b <- [nsUgen spec]
+            ]
+      length (nodesByKind g KBusIn) @?= 1
+      busIns @?= [7]
+
+  , testCase "Auth.bus is the same as Bus constructor" $ do
+      -- A trivial structural pin: 'bus' is a smart constructor and
+      -- must not introduce indirection that ever differs from
+      -- 'Bus' itself. This is the smallest possible regression
+      -- guard against someone "improving" the helper later.
+      Auth.unBus (Auth.bus 13) @?= 13
+      Auth.bus 13              @?= Auth.Bus 13
+
+  , testCase "send -> returnBus pair produces the expected template footprint" $ do
+      -- The footprint pin that matters for 8.D: the lifted
+      -- send/return pair must lower into a TemplateGraph whose
+      -- per-template tplFootprint matches what a hand-authored
+      -- 'busOut 7 ... ; busIn 7' pair already produces. We check:
+      --   * voice template writes bus 7, reads nothing live;
+      --   * fx    template reads  bus 7, writes nothing;
+      --   * compileTemplateGraph orders voice before fx (the
+      --     same-bus write/read intersection forces it).
+      let voiceG = runSynth $ do
+            s     <- sinOsc 440.0 0.0
+            amped <- gain s 0.4
+            Auth.send (Auth.bus 7) (Auth.mono amped)
+          fxG = runSynth $ do
+            sent     <- Auth.returnBus (Auth.bus 7)
+            filtered <- Auth.lpfM sent (Param 800.0) (Param 0.7)
+            Auth.outMono 0 filtered
+      tg <- case compileTemplateGraph [("voice", voiceG), ("fx", fxG)] of
+        Left err -> assertFailure err >> error "unreachable"
+        Right t  -> pure t
+      length (tgTemplates tg) @?= 2
+      let templatesByName =
+            [ (tplName t, rfBuses (tplFootprint t))
+            | t <- tgTemplates tg ]
+          voiceFp = lookup "voice" templatesByName
+          fxFp    = lookup "fx"    templatesByName
+      case voiceFp of
+        Just fp -> do
+          -- voice writes the shared send bus 7; no live reads.
+          bfWrites fp @?= S.singleton 7
+          bfReads  fp @?= S.empty
+        Nothing -> assertFailure "voice template missing"
+      case fxFp of
+        Just fp -> do
+          -- fx reads bus 7 (via returnBus) and writes hardware
+          -- bus 0 (via outMono). 'KOut' counts as a bus write
+          -- in the footprint, same as 'KBusOut'.
+          bfWrites fp @?= S.singleton 0
+          bfReads  fp @?= S.singleton 7
+        Nothing -> assertFailure "fx template missing"
+      -- Ordering: writer must precede reader by the §4.E template
+      -- precedence contract.
+      let names = [tplName t | t <- tgTemplates tg]
+      names @?= ["voice", "fx"]
   ]
 
 ------------------------------------------------------------
