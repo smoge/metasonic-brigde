@@ -21,6 +21,25 @@
 #include <thread>
 #include <vector>
 
+static_assert(alignof(int) == 4,
+              "Haskell CMidiDeviceInfo Storable assumes 4-byte int alignment");
+static_assert(sizeof(rt_midi_device_info) == 268,
+              "Haskell CMidiDeviceInfo Storable size must match C ABI");
+static_assert(alignof(rt_midi_device_info) == 4,
+              "Haskell CMidiDeviceInfo Storable alignment must match C ABI");
+static_assert(offsetof(rt_midi_device_info, id) == 0,
+              "rt_midi_device_info.id offset drifted");
+static_assert(offsetof(rt_midi_device_info, num_inputs) == 4,
+              "rt_midi_device_info.num_inputs offset drifted");
+static_assert(offsetof(rt_midi_device_info, num_outputs) == 8,
+              "rt_midi_device_info.num_outputs offset drifted");
+static_assert(offsetof(rt_midi_device_info, name) == 12,
+              "rt_midi_device_info.name offset drifted");
+static_assert(sizeof(rt_midi_device_info{}.name) == RT_MIDI_DEVICE_NAME_MAX,
+              "rt_midi_device_info.name length drifted");
+static_assert(RT_MIDI_DEVICE_NAME_MAX == 256,
+              "Haskell CMidiDeviceInfo bounded name decode assumes 256 bytes");
+
 namespace {
 
 constexpr int kFrames = 1024;
@@ -123,19 +142,6 @@ TEST_CASE("rt_midi_demo: null inputs reject open and surface -1 on accessors") {
     CHECK(rt_midi_demo_pitch_bend_count(nullptr)  == -1);
     CHECK(rt_midi_demo_has_device(nullptr)        == -1);
     rt_midi_demo_close(nullptr);  // must not crash
-}
-
-TEST_CASE("rt_midi_device_info: C ABI layout matches Haskell Storable mirror") {
-    rt_midi_device_info row{};
-
-    CHECK(sizeof(rt_midi_device_info) == 268);
-    CHECK(alignof(rt_midi_device_info) == alignof(int));
-    CHECK(offsetof(rt_midi_device_info, id) == 0);
-    CHECK(offsetof(rt_midi_device_info, num_inputs) == 4);
-    CHECK(offsetof(rt_midi_device_info, num_outputs) == 8);
-    CHECK(offsetof(rt_midi_device_info, name) == 12);
-    CHECK(sizeof(row.name) == RT_MIDI_DEVICE_NAME_MAX);
-    CHECK(RT_MIDI_DEVICE_NAME_MAX == 256);
 }
 
 TEST_CASE("rt_midi_device_list: enumeration ABI is safe without MIDI hardware") {
