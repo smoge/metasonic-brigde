@@ -70,6 +70,7 @@ library:
     - MetaSonic.Session.Runtime
     - MetaSonic.Session.Step
     - MetaSonic.Session.RTGraphAdapter
+    - MetaSonic.Session.Owner
     - MetaSonic.Authoring
     - MetaSonic.Authoring.Report
     - MetaSonic.Authoring.Manifest
