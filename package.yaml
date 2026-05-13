@@ -77,6 +77,7 @@ library:
     - MetaSonic.Session.Host
     - MetaSonic.Session.FanIn
     - MetaSonic.Session.OSCProducer
+    - MetaSonic.Session.OSCListener
     - MetaSonic.Authoring
     - MetaSonic.Authoring.Report
     - MetaSonic.Authoring.Manifest

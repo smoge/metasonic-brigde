@@ -154,6 +154,7 @@ import           MetaSonic.Session.Runner
 import           MetaSonic.Session.Host
 import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.OSCProducer
+import qualified MetaSonic.Session.OSCListener as OSCS
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -205,6 +206,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionLiveHotSwapOrchestrationTests
   , sessionFanInHostTests
   , sessionOSCProducerTests
+  , sessionOSCListenerTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -15022,6 +15024,205 @@ sessionOSCProducerTests =
                          <> show other)
   ]
 
+------------------------------------------------------------
+-- Session OSC listener adapter
+--
+-- This is the UDP wrapper above the OSC producer adapter. It only
+-- enqueues into SessionFanInHost; draining stays caller-driven.
+------------------------------------------------------------
+
+sessionOSCListenerTests :: TestTree
+sessionOSCListenerTests =
+  testGroup "Session OSC listener adapter"
+  [ testCase "bracket cleanup: body return tears down listener" $ do
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host ->
+              OSCS.withSessionOSCListener
+                defaultOSCProducerOptions
+                host
+                (OSCS.defaultListenerConfig 0)
+                (\_info -> pure (42 :: Int))
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right value ->
+          value @?= 42
+
+  , testCase "loopback packet enqueues but does not drain" $ do
+      let expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              1500.0
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host -> do
+              received <- newEmptyMVar
+              let hooks = OSCS.SessionOSCListenerHooks
+                    { OSCS.solhOnProducerResult = putMVar received
+                    , OSCS.solhOnIssue          = \_ -> pure ()
+                    }
+              OSCS.withSessionOSCListenerHooks
+                hooks
+                defaultOSCProducerOptions
+                host
+                (OSCS.defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback
+                      (OSCS.liBoundPort info)
+                      messageBytesV0LpfFloat
+                    mResult <- timeout 1000000 (takeMVar received)
+                    snapshot <- readSessionFanInHost host
+                    pure (mResult, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (OSCProducerEnqueueAttempted command enq), snapshot) -> do
+          command @?= expected
+          queued <- fanInQueuedOrFail enq
+          qscCommand queued @?= expected
+          producerKind (qscProducer queued) @?= ProducerOSC
+          sfisQueueDepth snapshot @?= 1
+          sfisOwnerStatus snapshot @?= SessionOwnerReady
+          ssVoices (sfisOwnerState snapshot) @?= M.empty
+        Right other ->
+          assertFailure ("expected one OSC producer result, got: "
+                         <> show other)
+
+  , testCase "malformed packet surfaces parse issue; listener continues" $ do
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host -> do
+              issues <- newIORef []
+              validDone <- newEmptyMVar
+              let hooks = OSCS.SessionOSCListenerHooks
+                    { OSCS.solhOnProducerResult =
+                        \result -> case result of
+                          OSCProducerEnqueueAttempted {} ->
+                            putMVar validDone ()
+                          OSCProducerDecodeRejected {} ->
+                            pure ()
+                    , OSCS.solhOnIssue =
+                        \issue -> modifyIORef' issues (issue :)
+                    }
+              OSCS.withSessionOSCListenerHooks
+                hooks
+                defaultOSCProducerOptions
+                host
+                (OSCS.defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback (OSCS.liBoundPort info)
+                                    (OBS.pack [0x01, 0x02, 0x03, 0x04])
+                    sendUdpLoopback
+                      (OSCS.liBoundPort info)
+                      messageBytesV0LpfFloat
+                    mDone <- timeout 1000000 (takeMVar validDone)
+                    issueList <- readIORef issues
+                    pure (mDone, issueList)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (), issueList) ->
+          assertBool
+            ("expected parse failure issue, got: " <> show issueList)
+            (any isSessionParseFailure issueList)
+        Right other ->
+          assertFailure ("valid packet was not accepted after malformed one: "
+                         <> show other)
+
+  , testCase "decode rejection reports issue and does not enqueue" $ do
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host -> do
+              issues <- newEmptyMVar
+              let hooks = OSCS.SessionOSCListenerHooks
+                    { OSCS.solhOnProducerResult = \_ -> pure ()
+                    , OSCS.solhOnIssue          = putMVar issues
+                    }
+              OSCS.withSessionOSCListenerHooks
+                hooks
+                defaultOSCProducerOptions
+                host
+                (OSCS.defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback
+                      (OSCS.liBoundPort info)
+                      messageBytesSwapLpfFloat
+                    mIssue <- timeout 1000000 (takeMVar issues)
+                    snapshot <- readSessionFanInHost host
+                    pure (mIssue, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just issue, snapshot) -> do
+          issue
+            @?= OSCS.SoliDecodeFailure
+                  (OSC.DiReservedPathSegment (OBSC.pack "swap"))
+          sfisQueueDepth snapshot @?= 0
+        Right other ->
+          assertFailure ("expected decode issue, got: " <> show other)
+
+  , testCase "queue-full surfaces as listener issue" $ do
+      let opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          prefill =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
+          expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              1500.0
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          opts
+          $ \host -> do
+              _prefillResult <-
+                enqueueSessionFanInCommand
+                  (testProducer ProducerTest "prefill")
+                  prefill
+                  host
+              issues <- newEmptyMVar
+              let hooks = OSCS.SessionOSCListenerHooks
+                    { OSCS.solhOnProducerResult = \_ -> pure ()
+                    , OSCS.solhOnIssue          = putMVar issues
+                    }
+              OSCS.withSessionOSCListenerHooks
+                hooks
+                defaultOSCProducerOptions
+                host
+                (OSCS.defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback
+                      (OSCS.liBoundPort info)
+                      messageBytesV0LpfFloat
+                    mIssue <- timeout 1000000 (takeMVar issues)
+                    snapshot <- readSessionFanInHost host
+                    pure (mIssue, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just issue, snapshot) -> do
+          issue @?= OSCS.SoliEnqueueRejected expected (SeiQueueFull 1)
+          sfisQueueDepth snapshot @?= 1
+        Right other ->
+          assertFailure ("expected queue-full listener issue, got: "
+                         <> show other)
+  ]
+  where
+    isSessionParseFailure (OSCS.SoliParseFailure _) = True
+    isSessionParseFailure _                         = False
+
 compileTemplateGraphOrFail :: [(String, SynthGraph)] -> IO TemplateGraph
 compileTemplateGraphOrFail entries =
   case compileTemplateGraph entries of
@@ -15456,6 +15657,20 @@ messageBytesFx0OutgainInt = OBS.concat
   [ oscString (OBSC.pack "/fx0/outgain/0")
   , oscString (OBSC.pack ",i")
   , intBytes42
+  ]
+
+messageBytesV0LpfFloat :: OBSC.ByteString
+messageBytesV0LpfFloat = OBS.concat
+  [ oscString (OBSC.pack "/v0/lpf/0")
+  , oscString (OBSC.pack ",f")
+  , floatBytes1500
+  ]
+
+messageBytesSwapLpfFloat :: OBSC.ByteString
+messageBytesSwapLpfFloat = OBS.concat
+  [ oscString (OBSC.pack "/swap/lpf/0")
+  , oscString (OBSC.pack ",f")
+  , floatBytes1500
   ]
 
 wireTests :: TestTree
