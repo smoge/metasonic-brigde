@@ -37,24 +37,23 @@ module MetaSonic.Session.PatternProducer
     -- * Operations
   , newPatternProducerState
   , enqueuePatternBlock
+  , isBacklogged
   ) where
 
-import           Control.DeepSeq             (NFData)
-import           Data.Text                   (Text)
-import qualified Data.Text                   as T
-import           GHC.Generics                (Generic)
+import           Control.DeepSeq           (NFData)
+import           Data.Text                 (Text)
+import qualified Data.Text                 as T
+import           GHC.Generics              (Generic)
 
-import           MetaSonic.Pattern           (Pattern, PatternEvent,
-                                              SamplePos (..),
-                                              SampleRange (..),
-                                              expandPattern)
-import           MetaSonic.Session.Command   (SessionCommand,
-                                              fromPatternEvent)
-import           MetaSonic.Session.Queue     (ProducerId (..),
-                                              ProducerKind (ProducerPattern),
-                                              SessionCommandQueue,
-                                              SessionEnqueueResult (..),
-                                              enqueueSessionCommand)
+import           MetaSonic.Pattern         (Pattern, PatternEvent,
+                                            SamplePos (..), SampleRange (..),
+                                            expandPattern)
+import           MetaSonic.Session.Command (SessionCommand, fromPatternEvent)
+import           MetaSonic.Session.Queue   (ProducerId (..),
+                                            ProducerKind (ProducerPattern),
+                                            SessionCommandQueue,
+                                            SessionEnqueueResult (..),
+                                            enqueueSessionCommand)
 
 
 -- | Construction options for the pure Pattern producer bridge.
@@ -83,15 +82,19 @@ defaultPatternProducerOptions = PatternProducerOptions
 -- The constructor stays private so callers cannot fabricate cursor or
 -- backlog combinations.
 data PatternProducerState = PatternProducerState
-  { ppsProducer :: !ProducerId
+  { ppsProducer    :: !ProducerId
   , ppsBlockFrames :: !Int
-  , ppsNextStart :: !SamplePos
-  , ppsBacklog :: ![(SamplePos, PatternEvent)]
+  , ppsNextStart   :: !SamplePos
+  , ppsBacklog     :: ![(SamplePos, PatternEvent)]
     -- ^ Events generated but not yet accepted by the queue, in
     -- Pattern emit order. Bounded by one expanded block; retried
     -- head-first before the next range is generated.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+-- | Check if the producer has events waiting to be retried.
+isBacklogged :: PatternProducerState -> Bool
+isBacklogged = not . null . ppsBacklog
 
 -- | Producer setup failures.
 data PatternProducerIssue
@@ -201,31 +204,19 @@ enqueueEvents
   -> [(SamplePos, PatternEvent)]
   -> (PatternProducerState, SessionCommandQueue, [PatternEnqueueItem])
 enqueueEvents state queue events =
-  go [] queue events
+  let (finalBacklog, finalQueue, items) = go [] queue events
+  in (state { ppsBacklog = finalBacklog }, finalQueue, items)
   where
-    go itemsRev currentQueue [] =
-      ( state { ppsBacklog = [] }
-      , currentQueue
-      , reverse itemsRev
-      )
+    go itemsRev currentQueue [] = ([], currentQueue, reverse itemsRev)
     go itemsRev currentQueue ((samplePos, event) : rest) =
       let command = fromPatternEvent event
-          (queue', enqueueResult) =
-            enqueueSessionCommand (ppsProducer state) command currentQueue
-          item = PatternEnqueueItem
-            { peiSamplePos = samplePos
-            , peiEvent     = event
-            , peiCommand   = command
-            , peiResult    = enqueueResult
-            }
-      in case enqueueResult of
+          (queue', res) = enqueueSessionCommand (ppsProducer state) command currentQueue
+          item = PatternEnqueueItem samplePos event command res
+      in case res of
            SessionEnqueued _ ->
              go (item : itemsRev) queue' rest
            SessionEnqueueRejected {} ->
-             ( state { ppsBacklog = (samplePos, event) : rest }
-             , queue'
-             , reverse (item : itemsRev)
-             )
+             ((samplePos, event) : rest, queue', reverse (item : itemsRev))
 
 addSampleFrames :: Int -> SamplePos -> SamplePos
 addSampleFrames n (SamplePos start) =

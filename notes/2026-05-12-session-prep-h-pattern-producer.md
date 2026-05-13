@@ -162,6 +162,10 @@ Suggested public surface:
       -> SessionCommandQueue
       -> PatternEnqueueOutcome
 
+    isBacklogged
+      :: PatternProducerState
+      -> Bool
+
 The exact names can change during implementation, but the shape should
 stay narrow: a hidden producer state, one block/range enqueue function,
 explicit result rows, and no owner or runtime dependency.
@@ -273,6 +277,11 @@ for caller observability without leaking the hidden state: callers can
 log progress, decide when to stop calling, or pair `perNextStart` with
 the `Pattern`'s known end-of-events sample position to detect
 exhaustion.
+
+`isBacklogged` exposes the one scheduling-relevant bit of hidden
+producer state without exposing backlog contents. A caller-driven runner
+can use it to know whether the next enqueue call will retry existing
+events instead of generating a fresh range.
 
 ## Cursor And Backlog Invariant
 
