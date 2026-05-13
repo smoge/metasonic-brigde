@@ -58,7 +58,7 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             c_rt_graph_realtime_cancel,
                                             c_rt_graph_realtime_reserve,
                                             c_rt_graph_realtime_set_control,
-                                            c_rt_graph_test_swap_generation,
+                                            readSwapGeneration,
                                             c_rt_graph_ensure_bus,
                                             c_rt_graph_instance_alive,
                                             c_rt_graph_instance_count,
@@ -7825,7 +7825,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
         loadRuntimeGraph handle oldRt
         c_rt_graph_process handle (fromIntegral nframes)
 
-        before <- c_rt_graph_test_swap_generation handle
+        before <- readSwapGeneration handle
         before @?= 0
 
         published <- hotSwapRuntimeGraph handle capacity nframes newRt
@@ -7837,7 +7837,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
         early @?= Nothing
 
         c_rt_graph_process handle (fromIntegral nframes)
-        after <- c_rt_graph_test_swap_generation handle
+        after <- readSwapGeneration handle
         after @?= 1
 
         stats <- collectRetiredSwapStats handle
@@ -7975,13 +7975,13 @@ crossCuttingTests = testGroup "End-to-end FFI"
         loadTemplateGraph handle oldTg
         c_rt_graph_process handle (fromIntegral nframes)
 
-        beforeGen <- c_rt_graph_test_swap_generation handle
+        beforeGen <- readSwapGeneration handle
 
         rejected <- hotSwapTemplateGraph handle capacity nframes reorderedTg
         rejected @?= False
 
         -- A rejected publish must not advance the install counter.
-        afterReject <- c_rt_graph_test_swap_generation handle
+        afterReject <- readSwapGeneration handle
         afterReject @?= beforeGen
 
         -- Nothing should be sitting in the retired slot.
@@ -8105,12 +8105,12 @@ crossCuttingTests = testGroup "End-to-end FFI"
       withRTGraph capacity nframes $ \handle -> do
         loadTemplateGraphFused handle oldTg
         c_rt_graph_process handle (fromIntegral nframes)
-        beforeGen <- c_rt_graph_test_swap_generation handle
+        beforeGen <- readSwapGeneration handle
 
         rejected <- hotSwapTemplateGraphFused handle capacity nframes reorderedTg
         rejected @?= False
 
-        afterReject <- c_rt_graph_test_swap_generation handle
+        afterReject <- readSwapGeneration handle
         afterReject @?= beforeGen
         leftover <- collectRetiredSwapStats handle
         leftover @?= Nothing
@@ -8183,7 +8183,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
               drive remaining = do
                 threadDelay 1000
                 c_rt_graph_process handle (fromIntegral nframes)
-                gen <- c_rt_graph_test_swap_generation handle
+                gen <- readSwapGeneration handle
                 if gen > 0
                   then putMVar done True
                   else drive (remaining - 1)
@@ -13121,14 +13121,14 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
                                   rt
                                   (fromIntegral (vbSlotId binding))
                 beforeStatus @?= instanceStatusLive
-                beforeGeneration <- c_rt_graph_test_swap_generation rt
+                beforeGeneration <- readSwapGeneration rt
                 swapped <- stepSessionCommand adapter swapCmd st1
                 case swapped of
                   StepCommitted st2 (Just rebuild) -> do
                     rrrDropped rebuild @?= []
                     ssGraph st2 @?= newGraph
                     M.lookup (VoiceKey "v0") (ssVoices st2) @?= Just binding
-                    afterGeneration <- c_rt_graph_test_swap_generation rt
+                    afterGeneration <- readSwapGeneration rt
                     assertBool
                       "expected preserving swap generation to advance"
                       (afterGeneration > beforeGeneration)
@@ -14638,6 +14638,9 @@ successfulFakeLiveProtocol labelText = LiveHotSwapProtocol
 
 fakeMigrationStats :: Int -> Int -> SwapMigrationStats
 fakeMigrationStats stateCopies lifecycleCopies = SwapMigrationStats
+  -- The live protocol verifier currently inspects only state and
+  -- lifecycle copy counts; the other counters stay explicit so a
+  -- future verifier change has a visible test fixture to revisit.
   { smsCommittedCount = 0
   , smsSkippedCount = 0
   , smsInstanceCopyCount = 0
@@ -16237,7 +16240,7 @@ playBufMonoTests = testGroup "Phase 6.C.3a: PlayBufMono kernel"
         published <- hotSwapTemplateGraph rt capacity nframes tg
         published @?= True
         c_rt_graph_process rt (fromIntegral nframes)
-        gen <- c_rt_graph_test_swap_generation rt
+        gen <- readSwapGeneration rt
         gen @?= 1
 
         -- Render once more — the new world's PlayBufMono kernel
