@@ -2844,9 +2844,13 @@ caller-owned `RTGraph` adapter against the existing realtime ABI:
 voice start, voice stop, control write, and constrained graph install.
 **Session Prep F** adds the first single-threaded Haskell owner around
 that adapter: scoped `RTGraph` lifetime, owner-local `SessionState`,
-ready/diverged status, and a terminal-divergence classifier. It still
-does not add a realtime command queue, producer arbitration layer, or
-uninterrupted hot-swap claim.
+ready/diverged status, and a terminal-divergence classifier. **Session
+Prep G** adds a Haskell-only bounded producer-intent queue above that
+owner: producer identity, per-queue sequence numbers, explicit
+full-queue rejection, and a synchronous drain helper into
+`stepSessionOwner`. It still does not add a thread-safe fan-in wrapper,
+background drain loop, concrete OSC/MIDI/Pattern adapter, realtime
+command queue, or uninterrupted hot-swap claim.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2858,11 +2862,13 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, D, E, and F now supply
-the library-side contracts, a constrained real-runtime adapter, and a
-scoped single-threaded owner. The remaining open work is not "create an
-owner"; it is queueing, producer arbitration, preserving hot-swap, and
-recovery semantics around that owner.
+cost/profitability table. Session Prep A, B, C, D, E, F, and G now
+supply the library-side contracts, a constrained real-runtime adapter,
+a scoped single-threaded owner, and the first pure producer-ingress
+ordering/backpressure layer. The remaining open work is not "create an
+owner" or "define a queue"; it is concrete producer fan-in,
+thread-safe queue ownership, preserving hot-swap, and recovery
+semantics around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2902,6 +2908,14 @@ Session prep artifacts:
   single-threaded and does not enforce serialization at runtime. This
   is still not a queue, producer fan-in layer, or preserving hot-swap
   implementation.
+- [Session Prep G - Producer Queue And Arbitration Contract](notes/2026-05-12-session-prep-g-producer-queue.md)
+  records the first bounded producer-intent queue above
+  `stepSessionOwner`. It attaches producer identity and per-queue
+  sequence numbers, rejects full queues explicitly, preserves FIFO
+  drain order, and stops draining when the owner diverges or is already
+  blocked. This is still not a thread-safe producer fan-in layer,
+  concrete OSC/MIDI/Pattern adapter, background worker, realtime ABI
+  queue, or preserving hot-swap implementation.
 
 Landed prep contracts:
 
@@ -2928,6 +2942,10 @@ Landed prep contracts:
   owner-local state/status, command stepping through the Prep D/E path,
   and terminal divergence classification
   (`MetaSonic.Session.Owner`).
+- [x] Bounded Haskell-side producer queue v1 with producer identity,
+  per-queue sequence numbers, explicit full-queue rejection, FIFO
+  owner draining, and stop-on-divergence behavior
+  (`MetaSonic.Session.Queue`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -2943,11 +2961,19 @@ Landed prep contracts:
   voice start/stop state mutation, control-write non-mutation,
   empty-session hot-swap success, duplicate-template hot-swap
   divergence/blocking, preserving-swap non-terminal rejection, and
-  admission rejection.
+  admission rejection. Prep G queue tests cover default construction,
+  invalid capacity rejection, sequence assignment, rejected-enqueue
+  sequence preservation, full-queue rejection, FIFO ordering across
+  producer identities, control-write drain without owner-state
+  mutation, stop-on-divergence with remaining commands preserved, and
+  already-diverged owner blocking.
 
 Still gated:
 
-- [ ] A realtime command queue and producer-thread arbitration.
+- [ ] Thread-safe producer fan-in, concrete producer adapters, and any
+  background drain loop around the pure producer queue.
+- [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
+  ABI, if a later design proves one is needed.
 - [ ] Uninterrupted graph hot-swap with audio-thread cooperation,
   preserving-voice migration, and recoverable failed-install semantics.
 - [ ] MIDI, OSC, and pattern arbitration.
@@ -2957,11 +2983,12 @@ Still gated:
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
 
-Current decision: treat Prep F as the first runtime ownership boundary,
-not as the full session runtime. Do not promote it into a producer-facing
-session service until queueing, producer arbitration, preserving
-hot-swap, and recovery policies are specified and tested in their own
-slices. The session does not need a generated fusion executor to ship;
+Current decision: treat Prep F/G as the first runtime ownership and
+producer-ingress boundaries, not as the full session runtime. Do not
+promote them into a producer-facing session service until concrete
+producer fan-in, thread-safe queue ownership, preserving hot-swap, and
+recovery policies are specified and tested in their own slices. The
+session does not need a generated fusion executor to ship;
 generated execution remains a read-only diagnostic/performance
 experiment unless later measurements justify automatic turn-on.
 
