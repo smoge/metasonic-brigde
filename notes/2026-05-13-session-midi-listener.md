@@ -36,6 +36,8 @@ can share the same session-facing loop.
 ## Tests
 
 The tests cover bracket cleanup while the decoded source is blocked,
-producer rejection with continued processing of later events,
-queue-full state retention, and composition through a scoped
-`MetaSonic.Session.FanInService` drain worker.
+explicit end-of-input worker exit, producer rejection with continued
+processing of later events, note-on/note-off listener state
+transitions, queue-full state retention, blocked-hook teardown, and
+composition through a scoped `MetaSonic.Session.FanInService` drain
+worker.

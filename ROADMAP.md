@@ -3180,13 +3180,15 @@ Landed prep contracts:
   fanout over active notes, explicit invalid/unmapped rejection,
   queue-full state retention, `ProducerMIDI` enqueue attribution, and
   composition through the scoped fan-in drain service. The MIDI
-  listener tests cover blocked-source bracket cleanup, producer
-  rejection with continued event processing, queue-full state
-  retention, and composition through the scoped fan-in drain service.
-  The UI producer adapter tests cover intent-to-command translation for voice on/off,
-  control write, and hot-swap, non-finite value rejection before
-  enqueue, `ProducerUI` attribution, queue-full surfacing, and
-  composition through the scoped fan-in drain service.
+  listener tests cover blocked-source bracket cleanup, explicit
+  end-of-input worker exit, producer rejection with continued event
+  processing, note-on/note-off state transitions, queue-full state
+  retention, blocked-hook teardown, and composition through the scoped
+  fan-in drain service. The UI producer adapter tests cover
+  intent-to-command translation for voice on/off, control write, and
+  hot-swap, non-finite value rejection before enqueue, `ProducerUI`
+  attribution, queue-full surfacing, and composition through the
+  scoped fan-in drain service.
 
 Recent OSC ingress follow-up: `MetaSonic.OSC.Dispatch.Internal` exposes
 the shared symbolic control-write decoder,
