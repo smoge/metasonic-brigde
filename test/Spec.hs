@@ -12825,7 +12825,7 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
         templateCount @?= 1
         instanceCount @?= 1
 
-  , testCase "adapter constructor installs graph and returns scaffolded adapter" $ do
+  , testCase "adapter constructor installs graph and starts voice through adapter" $ do
       let tg         = patternTemplates droneVibrato
           totalNodes = totalTemplateNodes tg
       withRTGraph (totalNodes + 8) 64 $ \rt -> do
@@ -12842,13 +12842,151 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
 
             outcome <- sraRun adapter
               (PlanVoiceStart (TemplateName "drone") (VoiceKey "v1") [])
-            outcome @?= Left
-              (SriAdapterReason
-                 "RTGraphAdapter plan execution not implemented: PlanVoiceStart")
+            case outcome of
+              Right (RuntimeCommitted (CommitVoiceStarted binding)) -> do
+                vbVoiceKey binding @?= VoiceKey "v1"
+                vbTemplateName binding @?= TemplateName "drone"
+                assertBool ("expected runtime slot, got " <> show (vbSlotId binding))
+                           (vbSlotId binding >= 0)
+              other ->
+                assertFailure ("expected committed voice start, got: " <> show other)
+
+  , testCase "step voice-start success commits reserved slot binding" $ do
+      let tg  = patternTemplates droneVibrato
+          st0 = initialSessionState tg
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0")
+                  [(ControlTag (MigrationKey "lpf") 0, 1200.0)]
+      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
+        result <- stepSessionCommand adapter cmd st0
+        case result of
+          StepCommitted st1 Nothing ->
+            case M.lookup (VoiceKey "v0") (ssVoices st1) of
+              Just binding -> do
+                vbTemplateName binding @?= TemplateName "drone"
+                assertBool ("expected runtime slot, got "
+                            <> show (vbSlotId binding))
+                           (vbSlotId binding >= 0)
+                c_rt_graph_process rt 1
+                status <- c_rt_graph_instance_status
+                            rt
+                            (fromIntegral (vbSlotId binding))
+                status @?= instanceStatusLive
+              Nothing ->
+                assertFailure "expected committed voice binding"
+          other ->
+            assertFailure ("expected StepCommitted, got: " <> show other)
+
+  , testCase "step voice-start with empty pool reports allocation failure" $ do
+      let tg  = patternTemplates droneVibrato
+          st0 = initialSessionState tg
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
+        held <- c_rt_graph_realtime_reserve rt 0
+        assertBool ("expected setup reservation, got " <> show held) (held >= 0)
+        result <- stepSessionCommand adapter cmd st0
+        result @?= StepRuntimeFailed SriVoiceAllocationFailed
+        c_rt_graph_realtime_cancel rt held
+
+  , testCase "step voice-start invalid initial control cancels reservation" $ do
+      let tg      = patternTemplates droneVibrato
+          st0     = initialSessionState tg
+          badTag  = ControlTag (MigrationKey "missing") 0
+          cmd     = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0")
+                      [(badTag, 1.0)]
+          issue   = CtiUnknownNodeTag
+                      (TemplateName "drone")
+                      (MigrationKey "missing")
+      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
+        result <- stepSessionCommand adapter cmd st0
+        result @?= StepRuntimeFailed (SriControlTargetRejected issue)
+        -- defaultRTGraphAdapterOptions prewarms exactly one slot, so
+        -- this reserve can only succeed if the failed start canceled
+        -- its reservation back to Available.
+        slot <- c_rt_graph_realtime_reserve rt 0
+        assertBool ("expected canceled reservation to be reusable, got "
+                    <> show slot)
+                   (slot >= 0)
+        c_rt_graph_realtime_cancel rt slot
+
+  , testCase "step voice-stop queues release and clears session binding" $ do
+      let tg       = patternTemplates droneVibrato
+          st0      = initialSessionState tg
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          stopCmd  = CmdVoiceOff (VoiceKey "v0")
+      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing -> do
+            case M.lookup (VoiceKey "v0") (ssVoices st1) of
+              Nothing ->
+                assertFailure "expected committed voice binding"
+              Just binding -> do
+                c_rt_graph_process rt 1
+                stopped <- stepSessionCommand adapter stopCmd st1
+                case stopped of
+                  StepCommitted st2 Nothing -> do
+                    ssVoices st2 @?= M.empty
+                    -- Voice-stop success means the release was queued;
+                    -- this test intentionally does not assert post-drain
+                    -- runtime slot status.
+                    assertBool ("expected stopped binding slot, got "
+                                <> show (vbSlotId binding))
+                               (vbSlotId binding >= 0)
+                  other ->
+                    assertFailure
+                      ("expected stopped voice commit, got: " <> show other)
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "step control-write to known target is accepted" $ do
+      let tg       = patternTemplates droneVibrato
+          st0      = initialSessionState tg
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          writeCmd = CmdControlWrite
+                       (VoiceKey "v0")
+                       (ControlTag (MigrationKey "lpf") 0)
+                       1800.0
+      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing -> do
+            c_rt_graph_process rt 1
+            written <- stepSessionCommand adapter writeCmd st1
+            written @?= StepControlAccepted
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "step control-write to unknown target is rejected" $ do
+      let tg       = patternTemplates droneVibrato
+          st0      = initialSessionState tg
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          badTag   = ControlTag (MigrationKey "missing") 0
+          writeCmd = CmdControlWrite (VoiceKey "v0") badTag 1800.0
+          issue    = CtiUnknownNodeTag
+                       (TemplateName "drone")
+                       (MigrationKey "missing")
+      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing -> do
+            c_rt_graph_process rt 1
+            written <- stepSessionCommand adapter writeCmd st1
+            written @?= StepRuntimeFailed (SriControlTargetRejected issue)
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
   ]
   where
     totalTemplateNodes tg =
       sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+
+    withInstalledAdapter tg opts action =
+      withRTGraph (totalTemplateNodes tg + 16) 64 $ \rt -> do
+        result <- newRTGraphAdapter rt tg opts
+        case result of
+          Left issue ->
+            assertFailure ("expected RTGraph adapter, got: " <> show issue)
+          Right adapter ->
+            action rt adapter
 
 ------------------------------------------------------------
 -- Phase 6.A.2: pattern corpus

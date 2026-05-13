@@ -45,23 +45,36 @@ import           Control.Monad              (foldM, forM_)
 import           Data.IORef                 (IORef, newIORef, readIORef)
 import qualified Data.Map.Strict            as Map
 import qualified Data.Set                   as Set
-import           Foreign.C.Types            (CInt)
+import           Foreign.C.Types            (CDouble (..), CInt)
 import           Foreign.Ptr                (Ptr)
 import           GHC.Generics               (Generic)
 
 import           MetaSonic.Bridge.FFI       (RTGraph,
                                              c_rt_graph_instance_remove,
+                                             c_rt_graph_instance_set_control,
+                                             c_rt_graph_realtime_activate,
+                                             c_rt_graph_realtime_cancel,
+                                             c_rt_graph_realtime_release,
+                                             c_rt_graph_realtime_reserve,
+                                             c_rt_graph_realtime_set_control,
                                              c_rt_graph_template_instance_add,
                                              c_rt_graph_template_set_polyphony,
                                              loadTemplateGraphWithAutoSpawns)
 import           MetaSonic.Bridge.Templates (BufferFootprint (..),
                                              ResourceFootprint (..),
                                              Template (..), TemplateGraph (..))
-import           MetaSonic.Pattern          (TemplateName (..))
+import           MetaSonic.ControlTarget    (ControlTarget (..),
+                                             resolveControlTarget)
+import           MetaSonic.Pattern          (ControlTag, TemplateName (..),
+                                             Value, VoiceKey)
 import           MetaSonic.Session.Runtime  (SessionRuntimeAdapter (..),
+                                             RealtimeOp (..),
                                              SessionRuntimeIssue (..),
-                                             SessionRuntimeSuccess)
-import           MetaSonic.Session.State    (SessionPlan (..))
+                                             SessionRuntimeSuccess (..))
+import           MetaSonic.Session.Resolve  (VoiceBinding (..))
+import           MetaSonic.Session.State    (SessionCommit (..),
+                                             SessionPlan (..))
+import           MetaSonic.Types            (NodeIndex (..))
 
 
 -- | Construction-time sizing policy for session-mode graph install.
@@ -296,15 +309,124 @@ runRTGraphAdapter
   -> SessionPlan
   -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
 runRTGraphAdapter env plan = do
-  -- Keep the closure tied to installed runtime metadata in this
-  -- scaffold; later slices consume the state for real plan execution.
-  _ <- readIORef (rtaeState env)
-  pure (Left (SriAdapterReason
-    ("RTGraphAdapter plan execution not implemented: " <> sessionPlanLabel plan)))
+  st <- readIORef (rtaeState env)
+  case plan of
+    PlanVoiceStart templateName voiceKey initialControls ->
+      runVoiceStart st templateName voiceKey initialControls
 
-sessionPlanLabel :: SessionPlan -> String
-sessionPlanLabel plan = case plan of
-  PlanVoiceStart {}   -> "PlanVoiceStart"
-  PlanVoiceStop {}    -> "PlanVoiceStop"
-  PlanControlWrite {} -> "PlanControlWrite"
-  PlanHotSwap {}      -> "PlanHotSwap"
+    PlanVoiceStop binding ->
+      runVoiceStop st binding
+
+    PlanControlWrite binding controlTag value ->
+      runControlWrite st binding controlTag value
+
+    PlanHotSwap {} ->
+      pure (Left (SriAdapterReason
+        "RTGraphAdapter hot-swap execution not implemented"))
+
+runVoiceStart
+  :: RTGraphAdapterState
+  -> TemplateName
+  -> VoiceKey
+  -> [(ControlTag, Value)]
+  -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
+runVoiceStart st templateName voiceKey initialControls =
+  case Map.lookup templateName (rtgasTemplateIds st) of
+    Nothing ->
+      pure (Left (SriUnknownRuntimeTemplate templateName))
+    Just templateId -> do
+      slot <- c_rt_graph_realtime_reserve
+                (rtgasRTGraph st)
+                (fromIntegral templateId)
+      if slot < 0
+         then pure (Left SriVoiceAllocationFailed)
+         else do
+           controls <- writeInitialControls st slot templateName initialControls
+           case controls of
+             Left issue -> do
+               c_rt_graph_realtime_cancel (rtgasRTGraph st) slot
+               pure (Left issue)
+             Right () -> do
+               activated <- c_rt_graph_realtime_activate (rtgasRTGraph st) slot
+               if activated == 1
+                  then pure (Right (RuntimeCommitted
+                         (CommitVoiceStarted VoiceBinding
+                           { vbVoiceKey     = voiceKey
+                           , vbSlotId       = fromIntegral slot
+                           , vbTemplateName = templateName
+                           })))
+                  else do
+                    c_rt_graph_realtime_cancel (rtgasRTGraph st) slot
+                    pure (Left (SriRealtimeQueueFull RtOpActivate))
+
+writeInitialControls
+  :: RTGraphAdapterState
+  -> CInt
+  -> TemplateName
+  -> [(ControlTag, Value)]
+  -> IO (Either SessionRuntimeIssue ())
+writeInitialControls st slot templateName =
+  foldM step (Right ())
+  where
+    step (Left issue) _ =
+      pure (Left issue)
+    step (Right ()) (controlTag, value) =
+      case resolveSessionControl st templateName controlTag of
+        Left issue ->
+          pure (Left issue)
+        Right target -> do
+          c_rt_graph_instance_set_control
+            (rtgasRTGraph st)
+            slot
+            (nodeIndexCInt (targetNodeIndex target))
+            (fromIntegral (targetControlSlot target))
+            (CDouble value)
+          pure (Right ())
+
+runVoiceStop
+  :: RTGraphAdapterState
+  -> VoiceBinding
+  -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
+runVoiceStop st binding = do
+  accepted <- c_rt_graph_realtime_release
+                (rtgasRTGraph st)
+                (fromIntegral (vbSlotId binding))
+  if accepted == 1
+     then pure (Right (RuntimeCommitted
+            (CommitVoiceStopped (vbVoiceKey binding))))
+     else pure (Left (SriRealtimeQueueFull RtOpRelease))
+
+runControlWrite
+  :: RTGraphAdapterState
+  -> VoiceBinding
+  -> ControlTag
+  -> Value
+  -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
+runControlWrite st binding controlTag value =
+  case resolveSessionControl st (vbTemplateName binding) controlTag of
+    Left issue ->
+      pure (Left issue)
+    Right target -> do
+      accepted <- c_rt_graph_realtime_set_control
+                    (rtgasRTGraph st)
+                    (fromIntegral (vbSlotId binding))
+                    (nodeIndexCInt (targetNodeIndex target))
+                    (fromIntegral (targetControlSlot target))
+                    (CDouble value)
+      if accepted == 1
+         then pure (Right RuntimeControlWriteAccepted)
+         else pure (Left (SriRealtimeQueueFull RtOpSetControl))
+
+resolveSessionControl
+  :: RTGraphAdapterState
+  -> TemplateName
+  -> ControlTag
+  -> Either SessionRuntimeIssue ControlTarget
+resolveSessionControl st templateName controlTag =
+  case resolveControlTarget (rtgasGraph st) templateName controlTag of
+    Left issue     -> Left (SriControlTargetRejected issue)
+    Right resolved -> Right resolved
+
+nodeIndexCInt :: NodeIndex -> CInt
+nodeIndexCInt (NodeIndex ix) =
+  fromIntegral ix

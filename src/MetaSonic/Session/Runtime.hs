@@ -17,6 +17,9 @@ module MetaSonic.Session.Runtime
   ( -- * Adapter
     SessionRuntimeAdapter (..)
 
+    -- * Runtime operations
+  , RealtimeOp (..)
+
     -- * Outcomes
   , SessionRuntimeSuccess (..)
   , SessionRuntimeIssue (..)
@@ -25,6 +28,8 @@ module MetaSonic.Session.Runtime
 import           Control.DeepSeq          (NFData)
 import           GHC.Generics             (Generic)
 
+import           MetaSonic.ControlTarget  (ControlTargetIssue)
+import           MetaSonic.Pattern        (TemplateName)
 import           MetaSonic.Session.State  (SessionCommit, SessionPlan)
 
 
@@ -53,16 +58,29 @@ data SessionRuntimeSuccess
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
+-- | Realtime ABI operation whose queue interaction failed.
+data RealtimeOp
+  = RtOpReserve
+  | RtOpActivate
+  | RtOpCancel
+  | RtOpRelease
+  | RtOpSetControl
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
 -- | Vocabulary for runtime-side failures reported by an adapter.
 --
 -- Deliberately distinct from 'SessionIssue' (producer-facing
--- admission rejection) and 'SessionCommitIssue' (plan/commit
--- handshake mismatch). The free-form 'SriAdapterReason' is a
--- documented escape hatch for adapter-specific text; structured
--- failure vocabularies belong to later slices once real adapters
--- exist.
+-- admission rejection), 'SessionCommitIssue' (plan/commit
+-- handshake mismatch), and adapter setup/install failures. The
+-- free-form 'SriAdapterReason' is a documented escape hatch for
+-- unexpected adapter-specific text; normal realtime failures should
+-- use the structured constructors.
 data SessionRuntimeIssue
   = SriVoiceAllocationFailed
+  | SriUnknownRuntimeTemplate !TemplateName
+  | SriControlTargetRejected !ControlTargetIssue
+  | SriRealtimeQueueFull !RealtimeOp
   | SriGraphInstallFailed
   | SriControlWriteRejected
   | SriBackendStopped
