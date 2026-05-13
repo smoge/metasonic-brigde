@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <thread>
 #include <vector>
 
@@ -122,6 +123,19 @@ TEST_CASE("rt_midi_demo: null inputs reject open and surface -1 on accessors") {
     CHECK(rt_midi_demo_pitch_bend_count(nullptr)  == -1);
     CHECK(rt_midi_demo_has_device(nullptr)        == -1);
     rt_midi_demo_close(nullptr);  // must not crash
+}
+
+TEST_CASE("rt_midi_device_info: C ABI layout matches Haskell Storable mirror") {
+    rt_midi_device_info row{};
+
+    CHECK(sizeof(rt_midi_device_info) == 268);
+    CHECK(alignof(rt_midi_device_info) == alignof(int));
+    CHECK(offsetof(rt_midi_device_info, id) == 0);
+    CHECK(offsetof(rt_midi_device_info, num_inputs) == 4);
+    CHECK(offsetof(rt_midi_device_info, num_outputs) == 8);
+    CHECK(offsetof(rt_midi_device_info, name) == 12);
+    CHECK(sizeof(row.name) == RT_MIDI_DEVICE_NAME_MAX);
+    CHECK(RT_MIDI_DEVICE_NAME_MAX == 256);
 }
 
 TEST_CASE("rt_midi_device_list: enumeration ABI is safe without MIDI hardware") {

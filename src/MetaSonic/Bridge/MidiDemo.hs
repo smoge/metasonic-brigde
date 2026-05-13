@@ -35,13 +35,13 @@
 module MetaSonic.Bridge.MidiDemo
   ( -- * Opaque handle
     MidiDemo
-    -- * Bindings (Haskell-side mirrors of the C structs in midi_demo.h)
+    -- * Device enumeration (re-exported from MetaSonic.MIDI.Devices)
   , MidiDeviceInfo (..)
+  , midiDeviceList
+    -- * Bindings (Haskell-side mirrors of the C structs in midi_demo.h)
   , VoiceMapping (..)
   , CCMapping (..)
   , PitchBendBinding (..)
-    -- * Device enumeration
-  , midiDeviceList
     -- * Lifecycle
   , openMidiDemo
   , closeMidiDemo

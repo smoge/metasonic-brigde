@@ -14,8 +14,8 @@ module MetaSonic.MIDI.Devices
   , midiDeviceList
   ) where
 
-import           Foreign.C.String       (peekCString)
-import           Foreign.C.Types        (CChar, CInt (..))
+import           Foreign.C.String       (peekCStringLen)
+import           Foreign.C.Types        (CInt (..))
 import           Foreign.Marshal.Array  (allocaArray, peekArray)
 import           Foreign.Ptr            (Ptr, castPtr, nullPtr, plusPtr)
 import           Foreign.Storable       (Storable (..))
@@ -52,7 +52,8 @@ instance Storable CMidiDeviceInfo where
     devId   <- peekByteOff p 0
     inputs  <- peekByteOff p 4
     outputs <- peekByteOff p 8
-    name    <- peekCString (castPtr (p `plusPtr` 12) :: Ptr CChar)
+    name    <- trimNul <$> peekCStringLen
+      (castPtr (p `plusPtr` 12), midiDeviceNameMax)
     pure CMidiDeviceInfo
       { cMidiDeviceId      = devId
       , cMidiDeviceInputs  = inputs
@@ -61,6 +62,13 @@ instance Storable CMidiDeviceInfo where
       }
   poke _ _ =
     error "CMidiDeviceInfo is read-only on the Haskell side"
+
+midiDeviceNameMax :: Int
+midiDeviceNameMax = 256
+
+trimNul :: String -> String
+trimNul =
+  takeWhile (/= '\0')
 
 midiDeviceList :: IO (Either String [MidiDeviceInfo])
 midiDeviceList = do
