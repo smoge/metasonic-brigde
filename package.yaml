@@ -62,6 +62,7 @@ library:
     - MetaSonic.OSC.Listen
     - MetaSonic.Pattern
     - MetaSonic.Pattern.Corpus
+    - MetaSonic.Session.AdapterIssue
     - MetaSonic.Session.Command
     - MetaSonic.Session.Resolve
     - MetaSonic.Session.Report

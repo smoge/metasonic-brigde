@@ -23,6 +23,10 @@ module MetaSonic.Session.Runtime
     -- * Outcomes
   , SessionRuntimeSuccess (..)
   , SessionRuntimeIssue (..)
+
+    -- * Runtime install/setup issues
+  , SessionAdapterSetupIssue (..)
+  , SessionPrewarmIssue (..)
   ) where
 
 import           Control.DeepSeq          (NFData)
@@ -30,6 +34,9 @@ import           GHC.Generics             (Generic)
 
 import           MetaSonic.ControlTarget  (ControlTargetIssue)
 import           MetaSonic.Pattern        (TemplateName)
+import           MetaSonic.Session.AdapterIssue
+                                             (SessionAdapterSetupIssue (..),
+                                             SessionPrewarmIssue (..))
 import           MetaSonic.Session.State  (SessionCommit, SessionPlan)
 
 
@@ -71,17 +78,24 @@ data RealtimeOp
 -- | Vocabulary for runtime-side failures reported by an adapter.
 --
 -- Deliberately distinct from 'SessionIssue' (producer-facing
--- admission rejection), 'SessionCommitIssue' (plan/commit
--- handshake mismatch), and adapter setup/install failures. The
--- free-form 'SriAdapterReason' is a documented escape hatch for
--- unexpected adapter-specific text; normal realtime failures should
--- use the structured constructors.
+-- admission rejection) and 'SessionCommitIssue' (plan/commit
+-- handshake mismatch). Setup/install failures normally surface from
+-- adapter construction, but constrained hot-swap wraps the same
+-- structured setup vocabulary because graph install runs through the
+-- runtime adapter. The free-form 'SriAdapterReason' is a documented
+-- escape hatch for unexpected adapter-specific text; normal realtime
+-- failures should use the structured constructors.
 data SessionRuntimeIssue
   = SriVoiceAllocationFailed
   | SriUnknownRuntimeTemplate !TemplateName
   | SriControlTargetRejected !ControlTargetIssue
   | SriRealtimeQueueFull !RealtimeOp
-  | SriGraphInstallFailed
+  | SriHotSwapWouldPreserveVoices
+    -- ^ Prep E only supports graph installs whose rebuild preview
+    -- leaves no surviving logical voices.
+  | SriHotSwapInstallFailed !SessionAdapterSetupIssue
+    -- ^ A constrained hot-swap reached graph installation but the
+    -- underlying setup/install helper failed.
   | SriControlWriteRejected
   | SriBackendStopped
   | SriAdapterReason !String

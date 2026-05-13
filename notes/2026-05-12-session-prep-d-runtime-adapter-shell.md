@@ -129,7 +129,7 @@ Add a small library module, `MetaSonic.Session.Runtime`:
 
     data SessionRuntimeIssue
       = SriVoiceAllocationFailed
-      | SriGraphInstallFailed
+      | SriHotSwapInstallFailed SessionAdapterSetupIssue
       | SriControlWriteRejected
       | SriBackendStopped
       | SriAdapterReason String

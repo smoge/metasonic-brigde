@@ -396,9 +396,11 @@ Add a small setup issue type:
 
     data SessionAdapterSetupIssue
       = SasiDuplicateTemplateName TemplateName
-      | SasiGraphInstallFailed String
+      | SasiLoaderException String
+      | SasiAutoSpawnTemplateIdMismatch Int Int
+      | SasiAutoSpawnRowCountMismatch Int Int
       | SasiAutoSpawnMissing TemplateName
-      | SasiPrewarmFailed TemplateName RealtimeOp
+      | SasiPrewarmFailed TemplateName SessionPrewarmIssue
 
 Keep the distinction from `SessionIssue` and `SessionCommitIssue`:
 
@@ -406,6 +408,9 @@ Keep the distinction from `SessionIssue` and `SessionCommitIssue`:
 - runtime call failures are `SessionRuntimeIssue`;
 - setup/install failures before an adapter exists are
   `SessionAdapterSetupIssue`;
+- setup/install failures during a constrained hot-swap are wrapped as
+  `SriHotSwapInstallFailed SessionAdapterSetupIssue` so the runtime
+  failure still carries the structured install detail;
 - adapter returns that do not match the admitted plan are
   `SessionCommitIssue` through `StepCommitMismatch`;
 - wrong success-shape bugs remain `StepAdapterProtocolBug`.

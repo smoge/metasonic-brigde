@@ -9,8 +9,8 @@
 -- This module starts the real-runtime side of Session Prep E without
 -- creating a session owner. The functions here operate on a
 -- caller-owned 'RTGraph' handle. The adapter constructor installs
--- graph metadata and returns a 'SessionRuntimeAdapter IO'; plan
--- execution lands in the following Prep E slices.
+-- graph metadata and returns a 'SessionRuntimeAdapter IO' for the
+-- v1 voice/control/constrained-install surface.
 --
 -- See [notes/2026-05-12-session-prep-e-rtgraph-adapter.md].
 
@@ -31,7 +31,7 @@ module MetaSonic.Session.RTGraphAdapter
   , SessionAdapterSetupIssue (..)
   , SessionPrewarmIssue (..)
 
-    -- * Adapter scaffold
+    -- * Adapter
   , newRTGraphAdapter
 
     -- * Session-mode graph install
@@ -42,7 +42,8 @@ import           Control.DeepSeq            (NFData)
 import           Control.Exception          (SomeException, displayException,
                                              try)
 import           Control.Monad              (foldM, forM_)
-import           Data.IORef                 (IORef, newIORef, readIORef)
+import           Data.IORef                 (IORef, newIORef, readIORef,
+                                             writeIORef)
 import qualified Data.Map.Strict            as Map
 import qualified Data.Set                   as Set
 import           Foreign.C.Types            (CDouble (..), CInt)
@@ -65,13 +66,18 @@ import           MetaSonic.Bridge.Templates (BufferFootprint (..),
                                              Template (..), TemplateGraph (..))
 import           MetaSonic.ControlTarget    (ControlTarget (..),
                                              resolveControlTarget)
+import qualified MetaSonic.OSC.Dispatch     as OSC
 import           MetaSonic.Pattern          (ControlTag, TemplateName (..),
-                                             Value, VoiceKey)
+                                             SwapLabel, Value, VoiceKey)
+import           MetaSonic.Session.AdapterIssue
+                                             (SessionAdapterSetupIssue (..),
+                                             SessionPrewarmIssue (..))
 import           MetaSonic.Session.Runtime  (SessionRuntimeAdapter (..),
                                              RealtimeOp (..),
                                              SessionRuntimeIssue (..),
                                              SessionRuntimeSuccess (..))
-import           MetaSonic.Session.Resolve  (VoiceBinding (..))
+import           MetaSonic.Session.Resolve  (ResolveRebuildResult (..),
+                                             VoiceBinding (..))
 import           MetaSonic.Session.State    (SessionCommit (..),
                                              SessionPlan (..))
 import           MetaSonic.Types            (NodeIndex (..))
@@ -111,46 +117,23 @@ data RTGraphAdapterState = RTGraphAdapterState
   , rtgasRTGraph          :: !(Ptr RTGraph)
   } deriving stock (Eq, Show)
 
-data SessionPrewarmIssue
-  = SpiInstanceAddFailed !Int
-    -- ^ One-based prewarm attempt whose
-    -- 'rt_graph_template_instance_add' call returned -1.
-  deriving stock    (Eq, Show, Generic)
-  deriving anyclass (NFData)
-
--- | Setup/install failures before an adapter exists.
-data SessionAdapterSetupIssue
-  = SasiDuplicateTemplateName !TemplateName
-  | SasiLoaderException !String
-    -- ^ Exception text from the underlying graph loader.
-  | SasiAutoSpawnTemplateIdMismatch !Int !Int
-    -- ^ Expected template id, actual template id returned by the
-    -- instrumented loader.
-  | SasiAutoSpawnRowCountMismatch !Int !Int
-    -- ^ Expected row count, actual row count returned by the
-    -- instrumented loader.
-  | SasiAutoSpawnMissing !TemplateName
-  | SasiPrewarmFailed !TemplateName !SessionPrewarmIssue
-  deriving stock    (Eq, Show, Generic)
-  deriving anyclass (NFData)
-
 -- | Private mutable metadata captured by the IO adapter.
 --
 -- This is not a session owner. The pure 'SessionState' remains the
--- caller-visible source of truth; the IORef only lets future plan
--- execution slices update runtime lookup metadata after a constrained
--- graph install.
-newtype RTGraphAdapterEnv = RTGraphAdapterEnv
-  { rtaeState :: IORef RTGraphAdapterState
+-- caller-visible source of truth; the IORef only tracks runtime
+-- lookup metadata after constrained graph installs.
+data RTGraphAdapterEnv = RTGraphAdapterEnv
+  { rtaeState   :: !(IORef RTGraphAdapterState)
+  , rtaeOptions :: !RTGraphAdapterOptions
   }
 
 -- | Install a graph in session mode and return an adapter shell for
 -- 'MetaSonic.Session.Step.stepSessionCommand'.
 --
--- Prep E lands this constructor before plan execution. Until the
--- voice/control execution slice fills in the cases, running the
--- adapter returns 'SriAdapterReason' rather than mutating runtime or
--- session state.
+-- The returned adapter supports voice start, voice stop, control
+-- writes, and constrained graph installs. It is still not a session
+-- owner and it still relies on the caller to serialize producer calls
+-- per the realtime ABI's single-producer contract.
 newRTGraphAdapter
   :: Ptr RTGraph
   -> TemplateGraph
@@ -164,7 +147,10 @@ newRTGraphAdapter rt tg opts = do
     Right st -> do
       ref <- newIORef st
       pure (Right (SessionRuntimeAdapter
-        (runRTGraphAdapter (RTGraphAdapterEnv ref))))
+        (runRTGraphAdapter RTGraphAdapterEnv
+          { rtaeState   = ref
+          , rtaeOptions = opts
+          })))
 
 -- | Install a 'TemplateGraph' in session mode.
 --
@@ -320,9 +306,8 @@ runRTGraphAdapter env plan = do
     PlanControlWrite binding controlTag value ->
       runControlWrite st binding controlTag value
 
-    PlanHotSwap {} ->
-      pure (Left (SriAdapterReason
-        "RTGraphAdapter hot-swap execution not implemented"))
+    PlanHotSwap label graph preview ->
+      runHotSwap env st label graph preview
 
 runVoiceStart
   :: RTGraphAdapterState
@@ -416,6 +401,33 @@ runControlWrite st binding controlTag value =
       if accepted == 1
          then pure (Right RuntimeControlWriteAccepted)
          else pure (Left (SriRealtimeQueueFull RtOpSetControl))
+
+runHotSwap
+  :: RTGraphAdapterEnv
+  -> RTGraphAdapterState
+  -> SwapLabel
+  -> TemplateGraph
+  -> ResolveRebuildResult
+  -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
+-- If 'installSessionGraph' fails after the loader's clear path, the
+-- runtime may be in an indeterminate state while the caller-visible
+-- 'SessionState' still claims the old graph. Recovery semantics are
+-- deferred to a later runtime-owner slice; for Prep E, the adapter
+-- should be treated as unsafe to reuse after this failure.
+runHotSwap env current label graph preview
+  | not (Map.null (OSC.resolveStateVoices (rrrState preview))) =
+      pure (Left SriHotSwapWouldPreserveVoices)
+  | otherwise = do
+      installed <- installSessionGraph
+                     (rtgasRTGraph current)
+                     graph
+                     (rtaeOptions env)
+      case installed of
+        Left issue ->
+          pure (Left (SriHotSwapInstallFailed issue))
+        Right st' -> do
+          writeIORef (rtaeState env) st'
+          pure (Right (RuntimeCommitted (CommitGraphInstalled label graph)))
 
 resolveSessionControl
   :: RTGraphAdapterState

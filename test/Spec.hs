@@ -12974,6 +12974,103 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
             written @?= StepRuntimeFailed (SriControlTargetRejected issue)
           other ->
             assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "step hot-swap of empty session installs new graph" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          st0      = initialSessionState oldGraph
+          swapCmd  = CmdHotSwap (SwapLabel "to-stab") newGraph
+          startCmd = CmdVoiceOn (TemplateName "stab") (VoiceKey "s0") []
+      withInstalledAdapter oldGraph defaultRTGraphAdapterOptions $ \_rt adapter -> do
+        -- The runtime side is exercised indirectly through the
+        -- post-swap voice start; no direct FFI probe is needed here.
+        swapped <- stepSessionCommand adapter swapCmd st0
+        case swapped of
+          StepCommitted st1 (Just rebuild) -> do
+            ssGraph st1 @?= newGraph
+            ssVoices st1 @?= M.empty
+            rrrDropped rebuild @?= []
+            started <- stepSessionCommand adapter startCmd st1
+            case started of
+              StepCommitted st2 Nothing ->
+                assertBool
+                  "expected stab voice after adapter metadata update"
+                  (M.member (VoiceKey "s0") (ssVoices st2))
+              other ->
+                assertFailure ("expected post-swap voice start, got: " <> show other)
+          other ->
+            assertFailure ("expected empty-session hot-swap commit, got: "
+                           <> show other)
+
+  , testCase "step hot-swap install failure preserves structured setup issue" $ do
+      let oldGraph = patternTemplates droneVibrato
+          base     = patternTemplates arpeggioSendReturn
+          newGraph = case tgTemplates base of
+            (a : b : rest) ->
+              base { tgTemplates =
+                       a { tplName = "dup" }
+                     : b { tplName = "dup" }
+                     : rest
+                   }
+            _ ->
+              error "arpeggioSendReturn must have >=2 templates for this test"
+          st0     = initialSessionState oldGraph
+          swapCmd = CmdHotSwap (SwapLabel "bad-graph") newGraph
+      withInstalledAdapter oldGraph defaultRTGraphAdapterOptions $ \_rt adapter -> do
+        swapped <- stepSessionCommand adapter swapCmd st0
+        swapped @?= StepRuntimeFailed
+          (SriHotSwapInstallFailed
+            (SasiDuplicateTemplateName (TemplateName "dup")))
+
+  , testCase "step hot-swap that drops active voices installs and reports drops" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          st0      = initialSessionState oldGraph
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          swapCmd  = CmdHotSwap (SwapLabel "drop-drone") newGraph
+          expected = [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
+      withInstalledAdapter oldGraph defaultRTGraphAdapterOptions $ \_rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing -> do
+            swapped <- stepSessionCommand adapter swapCmd st1
+            case swapped of
+              StepCommitted st2 (Just rebuild) -> do
+                ssGraph st2 @?= newGraph
+                ssVoices st2 @?= M.empty
+                rrrDropped rebuild @?= expected
+              other ->
+                assertFailure ("expected dropping hot-swap commit, got: "
+                               <> show other)
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "step hot-swap that would preserve active voice is rejected" $ do
+      let graph    = patternTemplates droneVibrato
+          st0      = initialSessionState graph
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          swapCmd  = CmdHotSwap (SwapLabel "preserve-drone") graph
+      withInstalledAdapter graph defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing ->
+            case M.lookup (VoiceKey "v0") (ssVoices st1) of
+              Nothing ->
+                assertFailure "expected committed voice binding"
+              Just binding -> do
+                c_rt_graph_process rt 1
+                before <- c_rt_graph_instance_status
+                            rt
+                            (fromIntegral (vbSlotId binding))
+                before @?= instanceStatusLive
+                swapped <- stepSessionCommand adapter swapCmd st1
+                swapped @?= StepRuntimeFailed SriHotSwapWouldPreserveVoices
+                afterStatus <- c_rt_graph_instance_status
+                                 rt
+                                 (fromIntegral (vbSlotId binding))
+                afterStatus @?= instanceStatusLive
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
   ]
   where
     totalTemplateNodes tg =
