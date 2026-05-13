@@ -71,6 +71,7 @@ library:
     - MetaSonic.Session.Step
     - MetaSonic.Session.RTGraphAdapter
     - MetaSonic.Session.Owner
+    - MetaSonic.Session.Queue
     - MetaSonic.Authoring
     - MetaSonic.Authoring.Report
     - MetaSonic.Authoring.Manifest

@@ -2,7 +2,7 @@
 
 Date: 2026-05-12
 
-Status: draft decision artifact for review. This slice scopes the first
+Status: accepted decision artifact. This slice scopes the first
 producer-ingress contract in front of the Prep F single-threaded
 runtime owner. It is still not a concrete OSC, MIDI, Pattern, or UI
 adapter, and it is not an audio-thread queue.
