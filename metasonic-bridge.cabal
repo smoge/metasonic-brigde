@@ -49,6 +49,7 @@ library
       MetaSonic.Session.State
       MetaSonic.Session.Runtime
       MetaSonic.Session.Step
+      MetaSonic.Session.RTGraphAdapter
       MetaSonic.Authoring
       MetaSonic.Authoring.Report
       MetaSonic.Authoring.Manifest

@@ -29,6 +29,7 @@ module MetaSonic.Bridge.FFI
   , loadRuntimeGraphFused
   , -- * Loading a compiled template graph (multi-template, §2.D.3)
     loadTemplateGraph
+  , loadTemplateGraphWithAutoSpawns
   , loadTemplateGraphFused
   , -- * Phase 5.3 hot-swap producer helpers
     hotSwapRuntimeGraph
@@ -2244,7 +2245,16 @@ synchronous, non-blocking).
 --
 -- See Note [loadTemplateGraph protocol].
 loadTemplateGraph :: Ptr RTGraph -> TemplateGraph -> IO ()
-loadTemplateGraph g tg = do
+loadTemplateGraph g tg =
+  M.void (loadTemplateGraphWithAutoSpawns g tg)
+
+-- | Instrumented sibling of 'loadTemplateGraph'. The load protocol is
+-- identical, but the function returns the exact slot ids produced by
+-- the loader-created auto-spawns. Rows are @(template_id, slot_id)@.
+-- Session-mode installers use this to remove those slots without
+-- assuming any slot-id formula.
+loadTemplateGraphWithAutoSpawns :: Ptr RTGraph -> TemplateGraph -> IO [(Int, Int)]
+loadTemplateGraphWithAutoSpawns g tg = do
   -- §4.E.2b / §4.E.2.C0a / §5.4.B: compute the scheduled region list,
   -- layered schedule, and template identity token for every template
   -- /before/ touching the C++ handle. If any template's metadata is
@@ -2255,7 +2265,7 @@ loadTemplateGraph g tg = do
   -- Multi-template loading spawns its own instances per template
   -- below, so remove it first to start with a clean slate.
   c_rt_graph_instance_remove g 0
-  forM_ (zip [0 ..] scheduledByTpl) $
+  forM (zip [0 ..] scheduledByTpl) $
     \(i, (tpl, identityBytes, scheduled, steps)) -> do
     cTid <- if i == (0 :: Int)
               then pure 0           -- auto-created template 0
@@ -2274,7 +2284,8 @@ loadTemplateGraph g tg = do
     -- ensemble case works without explicit instance spawning. For
     -- polyphony, callers spawn additional instances afterwards via
     -- c_rt_graph_template_instance_add.
-    M.void $ c_rt_graph_template_instance_add g cTid
+    slot <- c_rt_graph_template_instance_add g cTid
+    pure (fromIntegral cTid, fromIntegral slot)
   where
     scheduleOrFail
       :: Template

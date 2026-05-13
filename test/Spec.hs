@@ -54,6 +54,8 @@ import           MetaSonic.Bridge.FFI      (RTGraph,
                                             HotSwapWaitResult (..),
                                             PluginRegistryEntry (..),
                                             SwapMigrationStats (..),
+                                            c_rt_graph_realtime_cancel,
+                                            c_rt_graph_realtime_reserve,
                                             c_rt_graph_realtime_set_control,
                                             c_rt_graph_test_swap_generation,
                                             c_rt_graph_ensure_bus,
@@ -142,6 +144,7 @@ import           MetaSonic.Session.Report
 import           MetaSonic.Session.Runtime
 import           MetaSonic.Session.State
 import           MetaSonic.Session.Step
+import           MetaSonic.Session.RTGraphAdapter
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -183,6 +186,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionStateTests
   , sessionStepTests
   , controlTargetTests
+  , sessionRTGraphAdapterTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -12738,6 +12742,92 @@ controlTargetTests = testGroup "Session Prep E: control target resolver"
                  (-1)
                  2)
   ]
+
+sessionRTGraphAdapterTests :: TestTree
+sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
+  [ testCase "session install removes auto-spawn and leaves a reservable slot" $ do
+      let tg         = patternTemplates droneVibrato
+          totalNodes = totalTemplateNodes tg
+      withRTGraph (totalNodes + 8) 64 $ \rt -> do
+        result <- installSessionGraph rt tg defaultRTGraphAdapterOptions
+        case result of
+          Left issue ->
+            assertFailure ("expected session graph install, got: " <> show issue)
+          Right st -> do
+            rtgasTemplateIds st
+              @?= M.fromList [(TemplateName "drone", 0)]
+            rtgasPrewarmCounts st
+              @?= M.fromList [(TemplateName "drone", 1)]
+            case M.lookup (TemplateName "drone") (rtgasAutoSpawnedSlots st) of
+              Nothing ->
+                assertFailure "expected recorded auto-spawn slot for drone"
+              Just autoSlot -> do
+                status <- c_rt_graph_instance_status rt (fromIntegral autoSlot)
+                status @?= (-1)
+
+            count <- c_rt_graph_instance_count rt
+            statuses <- forM [0 .. count - 1] $ \slot ->
+              c_rt_graph_instance_status rt slot
+            assertBool
+              ("expected no live logical voices after install, got statuses "
+               <> show statuses)
+              (all (== (-1)) statuses)
+
+            slot <- c_rt_graph_realtime_reserve rt 0
+            assertBool ("expected reserve to claim prewarmed slot, got "
+                        <> show slot)
+                       (slot >= 0)
+            c_rt_graph_realtime_cancel rt slot
+
+  , testCase "configured prewarm count is claimed through realtime reserve" $ do
+      let tg         = patternTemplates droneVibrato
+          totalNodes = totalTemplateNodes tg
+          opts       = defaultRTGraphAdapterOptions
+            { raoPerTemplatePolyphony =
+                M.singleton (TemplateName "drone") 3
+            }
+      withRTGraph (totalNodes + 16) 64 $ \rt -> do
+        result <- installSessionGraph rt tg opts
+        case result of
+          Left issue ->
+            assertFailure ("expected session graph install, got: " <> show issue)
+          Right st -> do
+            rtgasPrewarmCounts st
+              @?= M.fromList [(TemplateName "drone", 3)]
+            slots <- forM [1 .. 3 :: Int] $ \_ ->
+              c_rt_graph_realtime_reserve rt 0
+            assertBool ("expected three successful reservations, got "
+                        <> show slots)
+                       (all (>= 0) slots)
+            fourth <- c_rt_graph_realtime_reserve rt 0
+            fourth @?= (-1)
+            forM_ slots (c_rt_graph_realtime_cancel rt)
+
+  , testCase "duplicate template names are rejected before install" $ do
+      let base = patternTemplates arpeggioSendReturn
+          duplicated = case tgTemplates base of
+            (a : b : rest) ->
+              base { tgTemplates =
+                       a { tplName = "dup" }
+                     : b { tplName = "dup" }
+                     : rest
+                   }
+            _ ->
+              error "arpeggioSendReturn must have >=2 templates for this test"
+      withRTGraph 16 64 $ \rt -> do
+        result <- installSessionGraph
+                    rt
+                    duplicated
+                    defaultRTGraphAdapterOptions
+        result @?= Left (SasiDuplicateTemplateName (TemplateName "dup"))
+        templateCount <- c_rt_graph_template_count rt
+        instanceCount <- c_rt_graph_instance_count rt
+        templateCount @?= 1
+        instanceCount @?= 1
+  ]
+  where
+    totalTemplateNodes tg =
+      sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
 
 ------------------------------------------------------------
 -- Phase 6.A.2: pattern corpus
