@@ -100,9 +100,9 @@ data SessionRuntimeIssue
     -- ^ The runtime rejected a prepared hot-swap publish before
     -- ownership transferred to the audio/runtime side.
   | SriHotSwapRequiresStoppedAudio
-    -- ^ The adapter's scripted preserving hot-swap path needs the
-    -- offline process entry point, so it is rejected while realtime
-    -- audio owns the same callback path.
+    -- ^ A preserving hot-swap adapter exposed only a scripted
+    -- stopped-audio path and rejected execution while realtime audio
+    -- owned the same callback path.
   | SriControlWriteRejected
   | SriBackendStopped
   | SriAdapterReason !String

@@ -83,10 +83,10 @@ The prepared-swap ABI already required matching `max_frames`; using
 the target's actual values also avoids moving a next-world state with a
 different instance pool size.
 
-`rt_graph_audio_running` gates the scripted path: if realtime audio is
-active, the adapter rejects with `SriHotSwapRequiresStoppedAudio`
-instead of calling the offline process entry point concurrently with
-the callback.
+`rt_graph_audio_running` originally gated Prep N's scripted path so it
+could reject instead of calling the offline process entry point
+concurrently with the callback. Prep O supersedes that rejection with a
+live-audio publish/wait/collect path.
 
 ## Caveat
 
@@ -96,12 +96,14 @@ building the migration source and again to force the published swap to
 install before commit. Zero frames still drives the runtime control
 queue / RCU swap state machine without rendering audio.
 
-That is correct for the current caller-driven session owner/host path.
-The adapter now rejects this scripted path while `rt_graph_audio_running`
-is true. A future live-audio/background producer service should not
-call the offline process entry concurrently with the audio callback.
-It should publish, wait for the audio thread to advance the swap
-generation, collect the retired swap, then commit.
+That was correct for Prep N's caller-driven session owner/host path.
+Prep O extends the adapter with the live-audio split: while
+`rt_graph_audio_running` is true, the adapter publishes the prepared
+swap, waits for the audio thread to advance the swap generation,
+collects retired migration stats, and commits only after verifying
+them. Future background producer services should keep using that
+generation-wait path rather than calling the offline process entry
+concurrently with the audio callback.
 
 ## Tests
 

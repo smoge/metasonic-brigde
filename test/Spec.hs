@@ -135,7 +135,8 @@ import qualified Network.Socket                  as OSCN
 import qualified Network.Socket.ByteString       as OSCNSB
 import           Data.IORef                      (modifyIORef',
                                                   newIORef,
-                                                  readIORef)
+                                                  readIORef,
+                                                  writeIORef)
 import           System.Timeout                  (timeout)
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
@@ -151,6 +152,7 @@ import           MetaSonic.Session.Queue
 import           MetaSonic.Session.PatternProducer
 import           MetaSonic.Session.Runner
 import           MetaSonic.Session.Host
+import           MetaSonic.Session.FanIn
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -199,6 +201,8 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionRunnerTests
   , sessionHostTests
   , sessionPreservingHotSwapSpecTests
+  , sessionLiveHotSwapOrchestrationTests
+  , sessionFanInHostTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -14446,6 +14450,253 @@ sessionPreservingHotSwapSpecTests =
           assertFailure ("expected modeled preserving hot-swap commit, got: "
                          <> show other)
   ]
+
+------------------------------------------------------------
+-- Session Prep O: live-audio preserving hot-swap orchestration
+--
+-- These tests do not start PortAudio. They pin the session-visible
+-- failure policy by modeling the live publish/wait/collect/verify
+-- stages with mock 'SessionRuntimeAdapter' results.
+------------------------------------------------------------
+
+sessionLiveHotSwapOrchestrationTests :: TestTree
+sessionLiveHotSwapOrchestrationTests =
+  testGroup "Session Prep O: live preserving hot-swap orchestration"
+  [ testCase "publish rejection is a retryable runtime failure" $ do
+      (st0, cmd, swapLabel, newGraph) <-
+        liveHotSwapFixture "live-publish-rejected"
+      (result, observedPlan) <-
+        runMockLiveHotSwap st0 cmd SriHotSwapPublishRejected
+      result @?= StepRuntimeFailed SriHotSwapPublishRejected
+      assertObservedPreservingPlan observedPlan swapLabel newGraph
+
+  , testCase "install timeout maps to terminal install failure wrapper" $ do
+      assertMockLiveInstallFailure
+        "live-install-timeout"
+        "preserving hot-swap install timed out"
+
+  , testCase "retired-missing maps to terminal install failure wrapper" $ do
+      assertMockLiveInstallFailure
+        "live-retired-missing"
+        "preserving hot-swap installed but retired swap was missing"
+
+  , testCase "incomplete migration maps to terminal install failure wrapper" $ do
+      assertMockLiveInstallFailure
+        "live-incomplete-migration"
+        "preserving hot-swap migration was incomplete"
+  ]
+
+liveHotSwapFixture
+  :: String
+  -> IO (SessionState, SessionCommand, SwapLabel, TemplateGraph)
+liveHotSwapFixture labelText = do
+  newGraph <- compileTemplateGraphOrFail hotSwapEditAfterTemplates
+  let oldGraph = patternTemplates hotSwapEdit
+      binding  = VoiceBinding (VoiceKey "vLive") 3 (TemplateName "drone")
+      st0      = applySessionCommit
+                   (CommitVoiceStarted binding)
+                   (initialSessionState oldGraph)
+      label    = SwapLabel labelText
+      cmd      = CmdHotSwap label newGraph
+  pure (st0, cmd, label, newGraph)
+
+runMockLiveHotSwap
+  :: SessionState
+  -> SessionCommand
+  -> SessionRuntimeIssue
+  -> IO (SessionStepResult, Maybe SessionPlan)
+runMockLiveHotSwap st cmd issue = do
+  observedPlanRef <- newIORef Nothing
+  let adapter = SessionRuntimeAdapter $ \plan -> do
+        writeIORef observedPlanRef (Just plan)
+        pure (Left issue)
+  result <- stepSessionCommand adapter cmd st
+  observedPlan <- readIORef observedPlanRef
+  pure (result, observedPlan)
+
+assertMockLiveInstallFailure :: String -> String -> Assertion
+assertMockLiveInstallFailure labelText message = do
+  (st0, cmd, swapLabel, newGraph) <- liveHotSwapFixture labelText
+  let issue = SriHotSwapInstallFailed (SasiLoaderException message)
+  (result, observedPlan) <- runMockLiveHotSwap st0 cmd issue
+  result @?= StepRuntimeFailed issue
+  assertObservedPreservingPlan observedPlan swapLabel newGraph
+
+assertObservedPreservingPlan
+  :: Maybe SessionPlan
+  -> SwapLabel
+  -> TemplateGraph
+  -> Assertion
+assertObservedPreservingPlan observedPlan expectedLabel expectedGraph =
+  case observedPlan of
+    Just (PlanHotSwap label graph rebuild) -> do
+      label @?= expectedLabel
+      graph @?= expectedGraph
+      rrrDropped rebuild @?= []
+    other ->
+      assertFailure ("expected preserving PlanHotSwap, got: " <> show other)
+
+------------------------------------------------------------
+-- Session Prep P: generic producer fan-in host
+--
+-- This is the first shared command-ingress host for concrete OSC,
+-- MIDI, UI, Pattern, or future background producers. It remains
+-- caller-driven: producers enqueue commands, and a caller or later
+-- worker decides when to drain.
+------------------------------------------------------------
+
+sessionFanInHostTests :: TestTree
+sessionFanInHostTests =
+  testGroup "Session Prep P: producer fan-in host"
+  [ testCase "drain preserves FIFO across OSC and MIDI producers" $ do
+      let graph = patternTemplates droneVibrato
+          oscProducer = testProducer ProducerOSC "osc"
+          midiProducer = testProducer ProducerMIDI "midi"
+          startCmd =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          writeCmd =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              650.0
+      result <- withSessionFanInHost graph defaultSessionFanInOptions $
+        \host -> do
+          enq0 <- enqueueSessionFanInCommand oscProducer startCmd host
+          enq1 <- enqueueSessionFanInCommand midiProducer writeCmd host
+          drained <- drainSessionFanInHost host
+          snapshot <- readSessionFanInHost host
+          pure (enq0, enq1, drained, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (enq0, enq1, drained, snapshot) -> do
+          q0 <- fanInQueuedOrFail enq0
+          q1 <- fanInQueuedOrFail enq1
+          qscSequence q0 @?= CommandSequence 0
+          qscSequence q1 @?= CommandSequence 1
+          map (qscProducer . sdiQueued) (sdrItems (sfidrDrain drained))
+            @?= [oscProducer, midiProducer]
+          case map sdiResult (sdrItems (sfidrDrain drained)) of
+            [ SessionOwnerStep (StepCommitted _ Nothing)
+              , SessionOwnerStep StepControlAccepted
+              ] ->
+                pure ()
+            other ->
+              assertFailure
+                ("expected voice start then control write, got: " <> show other)
+          sfidrQueueDepth drained @?= 0
+          sfisQueueDepth snapshot @?= 0
+          sfisOwnerStatus snapshot @?= SessionOwnerReady
+          assertBool
+            "expected v0 in fan-in owner state after drain"
+            (M.member (VoiceKey "v0") (ssVoices (sfisOwnerState snapshot)))
+
+  , testCase "bounded queue rejects excess producer command" $ do
+      let opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          graph = patternTemplates droneVibrato
+          producer = testProducer ProducerUI "ui"
+          cmd0 = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          cmd1 = CmdVoiceOn (TemplateName "drone") (VoiceKey "v1") []
+      result <- withSessionFanInHost graph opts $ \host -> do
+        enq0 <- enqueueSessionFanInCommand producer cmd0 host
+        enq1 <- enqueueSessionFanInCommand producer cmd1 host
+        snapshot <- readSessionFanInHost host
+        pure (enq0, enq1, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (enq0, enq1, snapshot) -> do
+          _queued <- fanInQueuedOrFail enq0
+          sfierResult enq1
+            @?= SessionEnqueueRejected producer cmd1 (SeiQueueFull 1)
+          sfierQueueDepth enq1 @?= 1
+          sfisQueueDepth snapshot @?= 1
+          sfisOwnerStatus snapshot @?= SessionOwnerReady
+
+  , testCase "concurrent producer enqueues serialize sequence numbers" $ do
+      let graph = patternTemplates droneVibrato
+          opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 4
+            }
+      result <- withSessionFanInHost graph opts $ \host -> do
+        done <- newEmptyMVar
+        let worker producer voiceKey =
+              enqueueSessionFanInCommand
+                producer
+                (CmdVoiceOn (TemplateName "drone") voiceKey [])
+                host
+                >>= putMVar done
+        _ <- forkIO (worker (testProducer ProducerOSC "osc") (VoiceKey "v0"))
+        _ <- forkIO (worker (testProducer ProducerMIDI "midi") (VoiceKey "v1"))
+        mEnq0 <- timeout 1000000 (takeMVar done)
+        mEnq1 <- timeout 1000000 (takeMVar done)
+        snapshot <- readSessionFanInHost host
+        pure (mEnq0, mEnq1, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just enq0, Just enq1, snapshot) -> do
+          let results = [sfierResult enq0, sfierResult enq1]
+              queued =
+                [ queuedCommand
+                | SessionEnqueued queuedCommand <- results
+                ]
+          length queued @?= 2
+          sort (map qscSequence queued)
+            @?= [CommandSequence 0, CommandSequence 1]
+          sort (map (producerKind . qscProducer) queued)
+            @?= [ProducerOSC, ProducerMIDI]
+          sfisQueueDepth snapshot @?= 2
+        Right other ->
+          assertFailure ("timed out waiting for fan-in enqueues: "
+                         <> show other)
+
+  , testCase "drain divergence leaves unprocessed tail queued" $ do
+      let oldGraph = patternTemplates droneVibrato
+          badGraph =
+            duplicateFirstTwoTemplates (patternTemplates arpeggioSendReturn)
+          producer = testProducer ProducerUI "ui"
+          issue = SasiDuplicateTemplateName (TemplateName "dup")
+          reason = SodHotSwapInstallFailed issue
+          badCmd = CmdHotSwap (SwapLabel "bad-graph") badGraph
+          laterCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      result <- withSessionFanInHost oldGraph defaultSessionFanInOptions $
+        \host -> do
+          enq0 <- enqueueSessionFanInCommand producer badCmd host
+          _enq1 <- enqueueSessionFanInCommand producer laterCmd host
+          drained <- drainSessionFanInHost host
+          snapshot <- readSessionFanInHost host
+          pure (enq0, drained, snapshot)
+      case result of
+        Left setupIssue ->
+          assertFailure ("expected fan-in host, got: " <> show setupIssue)
+        Right (enq0, drained, snapshot) -> do
+          queued0 <- fanInQueuedOrFail enq0
+          sdrItems (sfidrDrain drained) @?=
+            [ SessionDrainItem
+                queued0
+                (SessionOwnerDivergedNow
+                  (StepRuntimeFailed (SriHotSwapInstallFailed issue))
+                  reason)
+            ]
+          sdrRemaining (sfidrDrain drained) @?= 1
+          sdrStopped (sfidrDrain drained) @?= Just reason
+          sfidrQueueDepth drained @?= 1
+          sfisQueueDepth snapshot @?= 1
+          sfisOwnerStatus snapshot @?= SessionOwnerDiverged reason
+  ]
+
+fanInQueuedOrFail
+  :: SessionFanInEnqueueResult
+  -> IO QueuedSessionCommand
+fanInQueuedOrFail result =
+  case sfierResult result of
+    SessionEnqueued queued ->
+      pure queued
+    other ->
+      assertFailure ("expected fan-in enqueue success, got: " <> show other)
 
 compileTemplateGraphOrFail :: [(String, SynthGraph)] -> IO TemplateGraph
 compileTemplateGraphOrFail entries =

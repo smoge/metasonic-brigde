@@ -159,10 +159,12 @@ The v1 options shape should be explicit:
     data RTGraphAdapterOptions = RTGraphAdapterOptions
       { raoPerTemplatePolyphony :: Map TemplateName Int
       , raoDefaultPolyphony     :: Int
+      , raoHotSwapInstallTimeoutMs :: Int
       }
 
 `defaultRTGraphAdapterOptions` should use a conservative
-`raoDefaultPolyphony = 1`. Per-template entries override the default.
+`raoDefaultPolyphony = 1` and a finite live-audio preserving hot-swap
+install timeout. Per-template entries override the default polyphony.
 
 `RTGraphAdapterState` is runtime metadata, not session state. It should
 include at least:

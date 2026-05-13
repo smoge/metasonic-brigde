@@ -43,6 +43,7 @@ module MetaSonic.Session.Queue
   , newSessionCommandQueue
   , enqueueSessionCommand
   , drainSessionCommandQueue
+  , queuedCommandCount
   ) where
 
 import           Control.DeepSeq           (NFData)
@@ -171,6 +172,11 @@ newSessionCommandQueue opts
         , scqNextSequence = CommandSequence 0
         , scqPending      = []
         }
+
+-- | Number of commands currently waiting in the queue.
+queuedCommandCount :: SessionCommandQueue -> Int
+queuedCommandCount =
+  length . scqPending
 
 -- | Enqueue one producer command.
 --

@@ -56,6 +56,7 @@ library
       MetaSonic.Session.PatternProducer
       MetaSonic.Session.Runner
       MetaSonic.Session.Host
+      MetaSonic.Session.FanIn
       MetaSonic.Authoring
       MetaSonic.Authoring.Report
       MetaSonic.Authoring.Manifest

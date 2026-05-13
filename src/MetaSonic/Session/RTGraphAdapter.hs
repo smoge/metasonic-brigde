@@ -58,6 +58,9 @@ import           GHC.Generics               (Generic)
 import           MetaSonic.Bridge.Compile   (RuntimeGraph (..),
                                              RuntimeNode (..))
 import           MetaSonic.Bridge.FFI       (RTGraph, RTGraphSwap,
+                                             SwapGeneration,
+                                             SwapMigrationStats (..),
+                                             collectRetiredSwapStats,
                                              c_rt_graph_audio_running,
                                              c_rt_graph_cancel_swap,
                                              c_rt_graph_capacity,
@@ -73,10 +76,12 @@ import           MetaSonic.Bridge.FFI       (RTGraph, RTGraphSwap,
                                              c_rt_graph_realtime_release,
                                              c_rt_graph_realtime_reserve,
                                              c_rt_graph_realtime_set_control,
+                                             c_rt_graph_test_swap_generation,
                                              c_rt_graph_swap_migration_lifecycle_copy_count,
                                              c_rt_graph_swap_migration_state_copy_count,
                                              c_rt_graph_template_instance_add,
                                              c_rt_graph_template_set_polyphony,
+                                             waitForSwapGeneration,
                                              loadTemplateGraphWithAutoSpawns,
                                              withRTGraph)
 import           MetaSonic.Bridge.Templates (BufferFootprint (..),
@@ -108,6 +113,10 @@ import           MetaSonic.Types            (NodeIndex (..), NodeKind (..))
 data RTGraphAdapterOptions = RTGraphAdapterOptions
   { raoPerTemplatePolyphony :: !(Map.Map TemplateName Int)
   , raoDefaultPolyphony     :: !Int
+  , raoHotSwapInstallTimeoutMs :: !Int
+    -- ^ Timeout, in milliseconds, for a live-audio preserving
+    -- hot-swap after publish succeeds. Negative waits indefinitely;
+    -- zero performs one non-blocking generation check.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -115,6 +124,7 @@ defaultRTGraphAdapterOptions :: RTGraphAdapterOptions
 defaultRTGraphAdapterOptions = RTGraphAdapterOptions
   { raoPerTemplatePolyphony = Map.empty
   , raoDefaultPolyphony     = 1
+  , raoHotSwapInstallTimeoutMs = 1000
   }
 
 -- | Private runtime metadata produced by 'installSessionGraph'.
@@ -799,46 +809,66 @@ installPreservingHotSwap
   -> PreservingHotSwapPlan
   -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
 installPreservingHotSwap rt opts graph plan = do
-  stopped <- requireStoppedAudio rt
-  case stopped of
+  audioRunning <- c_rt_graph_audio_running rt
+  if audioRunning == 0
+     then installScriptedPreservingHotSwap rt opts graph plan
+     else installLivePreservingHotSwap rt opts graph plan
+
+installScriptedPreservingHotSwap
+  :: Ptr RTGraph
+  -> RTGraphAdapterOptions
+  -> TemplateGraph
+  -> PreservingHotSwapPlan
+  -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
+installScriptedPreservingHotSwap rt opts graph plan = do
+  -- Drain queued realtime voice/control commands before freezing the
+  -- old world as the migration source.
+  driveScriptedPreservingStep rt
+  withPreparedPreservingBuilder rt opts graph plan $ \builder _ ->
+    publishAndVerifyScriptedPreservingSwap rt builder plan
+
+installLivePreservingHotSwap
+  :: Ptr RTGraph
+  -> RTGraphAdapterOptions
+  -> TemplateGraph
+  -> PreservingHotSwapPlan
+  -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
+installLivePreservingHotSwap rt opts graph plan =
+  withPreparedPreservingBuilder rt opts graph plan $ \builder _ ->
+    publishAndVerifyLivePreservingSwap
+      rt
+      builder
+      plan
+      (raoHotSwapInstallTimeoutMs opts)
+
+withPreparedPreservingBuilder
+  :: Ptr RTGraph
+  -> RTGraphAdapterOptions
+  -> TemplateGraph
+  -> PreservingHotSwapPlan
+  -> (Ptr RTGraph -> PreservingBuilderMeta -> IO (Either SessionRuntimeIssue ()))
+  -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
+withPreparedPreservingBuilder rt opts graph plan action = do
+  sizing <- preservingBuilderSizing rt
+  case sizing of
     Left issue ->
       pure (Left issue)
-    Right () -> do
-      -- Drain queued realtime voice/control commands before freezing
-      -- the old world as the migration source.
-      driveScriptedPreservingStep rt
-      sizing <- preservingBuilderSizing rt
-      case sizing of
-        Left issue ->
-          pure (Left issue)
-        Right (capacity, maxFrames) ->
-          withRTGraph (fromIntegral capacity) (fromIntegral maxFrames) $
-            \builder -> do
-              prepared <- preparePreservingBuilder
-                            builder
-                            opts
-                            graph
-                            (phspBindings plan)
-              case prepared of
-                Left issue ->
-                  pure (Left issue)
-                Right meta -> do
-                  installed <- publishAndVerifyPreservingSwap rt builder plan
-                  pure $ case installed of
-                    Left issue -> Left issue
-                    Right ()   -> Right meta
-
--- | Snapshot guard for the scripted preserving path.
---
--- This is not a lock; callers still own session/audio lifecycle
--- serialization around start/stop and hot-swap.
-requireStoppedAudio :: Ptr RTGraph -> IO (Either SessionRuntimeIssue ())
-requireStoppedAudio rt = do
-  audioRunning <- c_rt_graph_audio_running rt
-  pure $
-    if audioRunning == 0
-       then Right ()
-       else Left SriHotSwapRequiresStoppedAudio
+    Right (capacity, maxFrames) ->
+      withRTGraph (fromIntegral capacity) (fromIntegral maxFrames) $
+        \builder -> do
+          prepared <- preparePreservingBuilder
+                        builder
+                        opts
+                        graph
+                        (phspBindings plan)
+          case prepared of
+            Left issue ->
+              pure (Left issue)
+            Right meta -> do
+              installed <- action builder meta
+              pure $ case installed of
+                Left issue -> Left issue
+                Right ()   -> Right meta
 
 preservingBuilderSizing
   :: Ptr RTGraph
@@ -853,12 +883,12 @@ preservingBuilderSizing rt = do
                 "invalid RTGraph sizing for preserving hot-swap"))
        else Right (capacity, maxFrames)
 
-publishAndVerifyPreservingSwap
+publishAndVerifyScriptedPreservingSwap
   :: Ptr RTGraph
   -> Ptr RTGraph
   -> PreservingHotSwapPlan
   -> IO (Either SessionRuntimeIssue ())
-publishAndVerifyPreservingSwap rt builder plan = do
+publishAndVerifyScriptedPreservingSwap rt builder plan = do
   acquired <- acquirePreservingSwap rt builder
   case acquired of
     Left issue ->
@@ -875,6 +905,46 @@ publishAndVerifyPreservingSwap rt builder plan = do
               pure (Left issue)
             Right retired ->
               verifyPreservingMigration rt retired plan
+
+publishAndVerifyLivePreservingSwap
+  :: Ptr RTGraph
+  -> Ptr RTGraph
+  -> PreservingHotSwapPlan
+  -> Int
+  -> IO (Either SessionRuntimeIssue ())
+publishAndVerifyLivePreservingSwap rt builder plan timeoutMs = do
+  priorGeneration <- readCurrentSwapGeneration rt
+  acquired <- acquirePreservingSwap rt builder
+  case acquired of
+    Left issue ->
+      pure (Left issue)
+    Right swap -> do
+      published <- publishPreservingSwap rt swap
+      case published of
+        Left issue ->
+          pure (Left issue)
+        Right () -> do
+          installed <- waitForSwapGeneration rt priorGeneration timeoutMs
+          if not installed
+             then
+               -- Publish transferred ownership to the runtime. On
+               -- timeout there is no local swap pointer to cancel; the
+               -- owner must diverge rather than continue with stale
+               -- session state.
+               pure (Left (hotSwapInstallFailed
+                 "preserving hot-swap install timed out"))
+             else do
+               stats <- collectRetiredSwapStats rt
+               pure $ case stats of
+                 Nothing ->
+                   Left (hotSwapInstallFailed
+                     "preserving hot-swap installed but retired swap was missing")
+                 Just migrationStats ->
+                   verifyPreservingMigrationStats migrationStats plan
+
+readCurrentSwapGeneration :: Ptr RTGraph -> IO SwapGeneration
+readCurrentSwapGeneration rt =
+  fromIntegral <$> c_rt_graph_test_swap_generation rt
 
 acquirePreservingSwap
   :: Ptr RTGraph
@@ -926,15 +996,38 @@ verifyPreservingMigration rt retired plan = do
   stateCopies <- c_rt_graph_swap_migration_state_copy_count retired
   lifecycleCopies <- c_rt_graph_swap_migration_lifecycle_copy_count retired
   c_rt_graph_cancel_swap rt retired
-  let copiedEnough =
-        fromIntegral lifecycleCopies >= length (phspBindings plan)
-        && fromIntegral stateCopies >= phspExpectedStateCopyCount plan
-  pure $
-    if copiedEnough
-       then Right ()
-       else Left (SriHotSwapInstallFailed
-              (SasiLoaderException
-                "preserving hot-swap migration was incomplete"))
+  pure $ verifyPreservingMigrationCounts
+    (fromIntegral stateCopies)
+    (fromIntegral lifecycleCopies)
+    plan
+
+verifyPreservingMigrationStats
+  :: SwapMigrationStats
+  -> PreservingHotSwapPlan
+  -> Either SessionRuntimeIssue ()
+verifyPreservingMigrationStats stats =
+  verifyPreservingMigrationCounts
+    (smsStateCopyCount stats)
+    (smsLifecycleCopyCount stats)
+
+verifyPreservingMigrationCounts
+  :: Int
+  -> Int
+  -> PreservingHotSwapPlan
+  -> Either SessionRuntimeIssue ()
+verifyPreservingMigrationCounts stateCopies lifecycleCopies plan =
+  if copiedEnough
+     then Right ()
+     else Left (hotSwapInstallFailed
+            "preserving hot-swap migration was incomplete")
+  where
+    copiedEnough =
+      lifecycleCopies >= length (phspBindings plan)
+      && stateCopies >= phspExpectedStateCopyCount plan
+
+hotSwapInstallFailed :: String -> SessionRuntimeIssue
+hotSwapInstallFailed =
+  SriHotSwapInstallFailed . SasiLoaderException
 
 driveScriptedPreservingStep :: Ptr RTGraph -> IO ()
 driveScriptedPreservingStep rt =

@@ -2860,11 +2860,14 @@ thread-safe Pattern host shell around that runner: a scoped owner plus
 Pattern producer and queue state serialized by an `MVar`. These slices
 still do not add a background drain loop, concrete OSC/MIDI/UI
 adapters, realtime command queue, or uninterrupted hot-swap claim.
-**Session Prep K/L/M/N** then records the preserving-hot-swap decision,
-pins its stale-queue/session-state edge cases in tests, gathers the
-runtime evidence for migration over respawn, and lands the first narrow
-runtime-migration-backed preserving implementation for supported
-oscillator/filter voices.
+**Session Prep K/L/M/N/O/P** then records the preserving-hot-swap
+decision, pins its stale-queue/session-state edge cases in tests,
+gathers the runtime evidence for migration over respawn, lands the
+first narrow runtime-migration-backed preserving implementation for
+supported oscillator/filter voices, and extends that path to
+audio-running installs with generation-wait / retired-stat
+verification. Prep P then adds the generic serialized command fan-in
+host that concrete OSC/MIDI/UI producers can target.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2877,20 +2880,21 @@ lifecycle reporting.
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
 cost/profitability table. Session Prep A, B, C, D, E, F, G, H, I, J, K,
-L, M, and N now supply the library-side contracts, a constrained
+L, M, N, O, and P now supply the library-side contracts, a constrained
 real-runtime adapter, a scoped single-threaded owner, the first pure
 producer-ingress ordering/backpressure layer, one concrete Pattern
 producer bridge, a caller-driven scripted Pattern runner, a serialized
 Pattern host, a preserving-hot-swap decision gate, semantics tests, and
-strategy evidence plus a supported preserving hot-swap path. The
-remaining open work is not
+strategy evidence plus a supported stopped-audio preserving hot-swap
+path with live-audio generation-wait orchestration, and a generic
+serialized fan-in host. The remaining open work is not
 "create an owner", "define a queue", "turn Pattern events into queued
 commands", "compose one Pattern runner step", "serialize one Pattern
 host", "decide preserving hot-swap semantics", or "choose the first
-preserving implementation strategy"; it is concrete OSC/MIDI/UI
-producer adapters, cross-producer arbitration, live-audio/background
-hot-swap orchestration, unsupported respawn/reset policy, and recovery
-mechanisms around that owner.
+preserving implementation strategy", or "create a generic fan-in host";
+it is concrete OSC/MIDI/UI producer adapters, arbitration beyond FIFO,
+background drain/lifecycle ownership, unsupported respawn/reset policy,
+and recovery mechanisms around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2989,6 +2993,20 @@ Session prep artifacts:
   step, inspect migration counters, and then commit the existing
   `CommitGraphInstalled` shape. Unsupported stateful graphs still
   reject non-terminally rather than silently resetting live voices.
+- [Session Prep O - Live-Audio Preserving Hot-Swap Orchestration](notes/2026-05-13-session-prep-o-live-audio-preserving-hot-swap.md)
+  implements the audio-running version of Prep N's
+  preserving swap: publish the prepared next world, wait for the audio
+  callback to advance swap generation, collect retired migration stats,
+  verify counters, and commit only after proof. It also fixes the
+  failure policy: publish rejection is retryable, while post-publish
+  timeout, retired-missing, and incomplete migration are terminal owner
+  divergence until a repair protocol exists.
+- [Session Prep P - Producer Fan-In Host](notes/2026-05-13-session-prep-p-producer-fan-in-host.md)
+  implements the first generic serialized command-ingress host above
+  Prep F/G. It owns a scoped `SessionOwner` and one bounded
+  `SessionCommandQueue` behind an `MVar`, exposing enqueue, drain, and
+  snapshot operations for already-formed `SessionCommand`s from OSC,
+  MIDI, UI, Pattern, or future background producers.
 
 Landed prep contracts:
 
@@ -3039,6 +3057,17 @@ Landed prep contracts:
 - [x] Preserving hot-swap strategy evidence selecting a narrow
   runtime-migration-backed first implementation and deferring
   session-level respawn to unsupported/reset-policy cases.
+- [x] Live-audio preserving hot-swap orchestration contract defining
+  publish/wait/collect/verify/commit sequencing and post-publish
+  failure classification.
+- [x] Live-audio preserving hot-swap implementation in the real
+  `RTGraph` session adapter, using `raoHotSwapInstallTimeoutMs` plus
+  generation wait / retired-stat collection when audio is running and
+  preserving the stopped-audio scripted path for offline owners.
+- [x] Generic serialized producer fan-in host for already-formed
+  `SessionCommand`s, with hidden owner/queue state, locked enqueue,
+  locked drain, queue-depth snapshots, and FIFO semantics inherited
+  from `MetaSonic.Session.Queue` (`MetaSonic.Session.FanIn`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -3076,19 +3105,23 @@ Landed prep contracts:
   swaps, dropped voices, and post-swap control-target failure.
   Prep N extends the real-adapter coverage with a supported
   `hotSwapEdit` migration that preserves the same binding and validates
-  post-swap control resolution against the new graph.
+  post-swap control resolution against the new graph. Prep O
+  mock-adapter tests cover the live preserving hot-swap failure policy:
+  publish rejection, post-publish timeout, retired-missing, and
+  incomplete migration. Prep P tests cover FIFO drain across OSC/MIDI
+  producer identities, queue-full rejection through the host,
+  concurrent enqueue serialization, and divergence leaving the
+  unprocessed tail queued.
 
 Still gated:
 
-- [ ] Concrete OSC/MIDI/UI producer adapters, cross-producer
-  arbitration beyond the single hosted Pattern producer, and any
-  background drain loop around the producer queue.
+- [ ] Concrete OSC/MIDI/UI producer adapters that translate protocol
+  input into `SessionCommand`s for `MetaSonic.Session.FanIn`.
+- [ ] Arbitration beyond FIFO producer order, producer-specific
+  throttling/coalescing, and any background drain loop around the
+  fan-in host.
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
-- [ ] Live-audio preserving hot-swap orchestration that publishes,
-  waits for the audio thread to advance swap generation, collects
-  retired migration stats, and commits without calling the offline
-  process entry concurrently with audio.
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
 - [ ] MIDI, OSC, UI, and Pattern coexistence/arbitration policy.
@@ -3101,10 +3134,10 @@ Still gated:
 Current decision: treat Prep F/G/H/I as the first runtime ownership,
 producer-ingress, and scripted-runner boundaries, not as the full session
 runtime. Do not promote them into a producer-facing session service until
-concrete producer fan-in, thread-safe queue ownership, OSC/MIDI/UI
-ingress, cross-producer arbitration, live-audio hot-swap orchestration,
-unsupported respawn/reset policy, and recovery policies are specified
-and tested in their own slices. The
+concrete OSC/MIDI/UI ingress, arbitration beyond FIFO, unsupported
+respawn/reset policy, background-service ownership of the live-audio
+hot-swap path, and recovery policies are specified and tested in their
+own slices. The
 session does not need a generated fusion executor to ship;
 generated execution remains a read-only diagnostic/performance
 experiment unless later measurements justify automatic turn-on.
