@@ -239,15 +239,22 @@ The landed pieces are deliberately small:
 - `MetaSonic.Session.State` admits commands, returns plans, and applies
   checked commits only after a runtime adapter reports success.
 - `MetaSonic.Session.RTGraphAdapter` and `MetaSonic.Session.Owner` provide a
-  caller-scoped, single-threaded owner around a real `RTGraph`.
+  caller-scoped, single-threaded owner around a real `RTGraph`, including
+  supported preserving hot-swap for eligible oscillator/filter voices.
 - `MetaSonic.Session.Queue` is a bounded Haskell-side producer-intent FIFO.
 - `MetaSonic.Session.PatternProducer` expands one `Pattern` range at a time,
   converts `PatternEvent` values through `fromPatternEvent`, and retains a
   bounded backlog when the queue is full.
+- `MetaSonic.Session.Runner` and `MetaSonic.Session.Host` compose the Pattern
+  producer, queue, and owner into caller-driven and thread-safe Pattern
+  stepping helpers.
+- `MetaSonic.Session.FanIn` provides the generic serialized command-ingress
+  host for already-formed `SessionCommand`s from future concrete producers.
 
-What is still intentionally absent: thread-safe producer fan-in, background
-drain loops, concrete OSC/MIDI/UI producers, cross-producer arbitration,
-preserving hot-swap, and recovery after terminal runtime divergence.
+What is still intentionally absent: concrete OSC/MIDI/UI producer adapters,
+arbitration beyond FIFO, background drain/lifecycle ownership, unsupported
+respawn/reset policy for preserving swaps, manifest reload/resource allocation,
+and recovery after terminal runtime divergence.
 
 ---
 
