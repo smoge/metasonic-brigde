@@ -2842,8 +2842,11 @@ mock shell so the orchestrator's behavior is pinned before any
 real runtime adapter ships. **Session Prep E** adds the first
 caller-owned `RTGraph` adapter against the existing realtime ABI:
 voice start, voice stop, control write, and constrained graph install.
-It still does not create a runtime session owner, realtime command
-queue, producer arbitration layer, or uninterrupted hot-swap claim.
+**Session Prep F** adds the first single-threaded Haskell owner around
+that adapter: scoped `RTGraph` lifetime, owner-local `SessionState`,
+ready/diverged status, and a terminal-divergence classifier. It still
+does not add a realtime command queue, producer arbitration layer, or
+uninterrupted hot-swap claim.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2855,9 +2858,11 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, D, and E supply the
-library-side contracts plus a constrained real-runtime adapter the
-future session owner will consume, without creating that owner yet.
+cost/profitability table. Session Prep A, B, C, D, E, and F now supply
+the library-side contracts, a constrained real-runtime adapter, and a
+scoped single-threaded owner. The remaining open work is not "create an
+owner"; it is queueing, producer arbitration, preserving hot-swap, and
+recovery semantics around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2890,6 +2895,13 @@ Session prep artifacts:
   empty-session or drop-all swaps may install, but swaps that would
   preserve live voices are rejected. This is still not the runtime
   session layer.
+- [Session Prep F - Single-Threaded Runtime Owner](notes/2026-05-12-session-prep-f-runtime-owner.md)
+  records the first scoped Haskell owner for a real `RTGraph` adapter.
+  It exposes `withSessionOwner`, `stepSessionOwner`, owner state/status
+  readers, and a terminal-divergence policy. The owner is explicitly
+  single-threaded and does not enforce serialization at runtime. This
+  is still not a queue, producer fan-in layer, or preserving hot-swap
+  implementation.
 
 Landed prep contracts:
 
@@ -2912,6 +2924,10 @@ Landed prep contracts:
 - [x] Caller-owned `RTGraph` adapter v1 for voice start, voice stop,
   control write, and constrained graph install
   (`MetaSonic.Session.RTGraphAdapter`).
+- [x] Single-threaded runtime owner v1 with scoped `RTGraph` lifetime,
+  owner-local state/status, command stepping through the Prep D/E path,
+  and terminal divergence classification
+  (`MetaSonic.Session.Owner`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -2923,11 +2939,14 @@ Landed prep contracts:
   hot-swap, drop-all hot-swap, preserving-swap rejection, and
   structured install failure, plus a `PatternEvent`-to-real-`RTGraph`
   round-trip through `fromPatternEvent` and `stepSessionCommand`.
+  Prep F owner tests additionally cover construction, setup failure,
+  voice start/stop state mutation, control-write non-mutation,
+  empty-session hot-swap success, duplicate-template hot-swap
+  divergence/blocking, preserving-swap non-terminal rejection, and
+  admission rejection.
 
 Still gated:
 
-- [ ] A runtime session owner that owns the `RTGraph`, adapter state,
-  lifecycle, and teardown/recovery policy.
 - [ ] A realtime command queue and producer-thread arbitration.
 - [ ] Uninterrupted graph hot-swap with audio-thread cooperation,
   preserving-voice migration, and recoverable failed-install semantics.
@@ -2935,13 +2954,16 @@ Still gated:
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
+- [ ] Long-running owner supervision, teardown beyond the scoped
+  bracket, and repair/recovery after terminal divergence.
 
-Current decision: do not promote the Prep E adapter into a full session
-runtime until ownership, queueing, producer arbitration, and hot-swap
-recovery policies are specified and tested in their own slice. The
-session does not need a generated fusion executor to ship; generated
-execution remains a read-only diagnostic/performance experiment unless
-later measurements justify automatic turn-on.
+Current decision: treat Prep F as the first runtime ownership boundary,
+not as the full session runtime. Do not promote it into a producer-facing
+session service until queueing, producer arbitration, preserving
+hot-swap, and recovery policies are specified and tested in their own
+slices. The session does not need a generated fusion executor to ship;
+generated execution remains a read-only diagnostic/performance
+experiment unless later measurements justify automatic turn-on.
 
 ---
 
