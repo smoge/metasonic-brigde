@@ -1,7 +1,6 @@
 {-# LANGUAGE DeriveAnyClass     #-}
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- Module      : MetaSonic.Session.OSCListener
@@ -35,17 +34,14 @@ module MetaSonic.Session.OSCListener
   , withSessionOSCListenerHooks
   ) where
 
-import           Control.Concurrent              (forkIO, killThread)
 import           Control.DeepSeq                 (NFData)
-import           Control.Exception               (IOException, bracket, try)
 import           GHC.Generics                    (Generic)
-import qualified Network.Socket                  as N
-import qualified Network.Socket.ByteString       as NSB
 
 import           MetaSonic.OSC.Dispatch.Internal (DispatchIssue)
 import           MetaSonic.OSC.Listen            (ListenerConfig (..),
                                                   ListenerInfo (..),
-                                                  defaultListenerConfig)
+                                                  defaultListenerConfig,
+                                                  withListenerLoop)
 import           MetaSonic.OSC.Wire              (parseMessage)
 import           MetaSonic.Session.Command       (SessionCommand)
 import           MetaSonic.Session.FanIn         (SessionFanInEnqueueResult (..),
@@ -110,60 +106,8 @@ withSessionOSCListenerHooks
   -> (ListenerInfo -> IO a)
   -> IO a
 withSessionOSCListenerHooks hooks producerOpts host cfg body =
-  bracket (openSessionListenerSocket cfg) closeSessionListenerSocket $
-    \(sock, info) ->
-      bracket
-        (forkIO (sessionListenerLoop sock hooks producerOpts host cfg))
-        killThread
-        (\_ -> body info)
-
-openSessionListenerSocket :: ListenerConfig -> IO (N.Socket, ListenerInfo)
-openSessionListenerSocket cfg = do
-  let hints = N.defaultHints
-        { N.addrSocketType = N.Datagram
-        , N.addrFamily     = N.AF_INET
-        , N.addrFlags      = [N.AI_PASSIVE]
-        }
-  addrs <- N.getAddrInfo (Just hints) (Just (lcBindHost cfg))
-                         (Just (show (lcPort cfg)))
-  case addrs of
-    [] ->
-      ioError (userError "session OSC listener: no bind address available")
-    (addr : _) -> do
-      sock <- N.socket (N.addrFamily addr)
-                       (N.addrSocketType addr)
-                       (N.addrProtocol addr)
-      N.bind sock (N.addrAddress addr)
-      bound <- N.getSocketName sock
-      let port = case bound of
-            N.SockAddrInet p _      -> fromIntegral p
-            N.SockAddrInet6 p _ _ _ -> fromIntegral p
-            _                       -> -1
-      pure (sock, ListenerInfo { liBoundPort = port })
-
-closeSessionListenerSocket :: (N.Socket, ListenerInfo) -> IO ()
-closeSessionListenerSocket (sock, _) =
-  N.close sock
-
-sessionListenerLoop
-  :: N.Socket
-  -> SessionOSCListenerHooks
-  -> OSCProducerOptions
-  -> SessionFanInHost
-  -> ListenerConfig
-  -> IO ()
-sessionListenerLoop sock hooks producerOpts host cfg = loop
+  withListenerLoop cfg processPacket body
   where
-    maxBytes = lcMaxDatagram cfg
-
-    loop = do
-      result <- try (NSB.recvFrom sock maxBytes)
-      case result of
-        Left (_ :: IOException) ->
-          pure ()
-        Right (bytes, _from) ->
-          processPacket bytes >> loop
-
     processPacket bytes =
       case parseMessage bytes of
         Left err ->

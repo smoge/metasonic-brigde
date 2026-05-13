@@ -15789,6 +15789,37 @@ dispatchTests = testGroup "dispatch against arpeggio-send-return/fx"
         Left issue ->
           assertFailure ("expected symbolic control write, got: " <> show issue)
 
+  , testCase "symbolic control decoder rejects malformed messages directly" $ do
+      let cases =
+            [ ( "reserved voice"
+              , OSC.OscMessage (OBSC.pack "/swap/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+              , OSC.DiReservedPathSegment (OBSC.pack "swap")
+              )
+            , ( "invalid node tag"
+              , OSC.OscMessage (OBSC.pack "/fx0/bad name/0")
+                                [OSC.OscArgFloat 1.0]
+              , OSC.DiIdentifierProfile (OBSC.pack "bad name")
+              )
+            , ( "non-integer slot"
+              , OSC.OscMessage (OBSC.pack "/fx0/lpf/cutoff")
+                                [OSC.OscArgFloat 1.0]
+              , OSC.DiSlotNotInteger (OBSC.pack "cutoff")
+              )
+            , ( "zero args"
+              , OSC.OscMessage (OBSC.pack "/fx0/lpf/0") []
+              , OSC.DiUnsupportedArgShape 0
+              )
+            ]
+      forM_ cases $ \(label, msg, expected) ->
+        case OSCI.decodeSymbolicControlWrite msg of
+          Left issue ->
+            issue @?= expected
+          Right write ->
+            assertFailure
+              (label <> ": expected symbolic decode rejection, got "
+               <> show write)
+
   , testCase "unknown voice key surfaces as DiUnknownVoice" $ do
       let msg = OSC.OscMessage (OBSC.pack "/no-such/lpf/0")
                                 [OSC.OscArgFloat 1.0]

@@ -35,6 +35,9 @@ module MetaSonic.OSC.Listen
     -- * Bracketed listener
   , withOscListener
   , withOscListenerHooks
+    -- * Shared UDP listener substrate
+  , withListenerSocket
+  , withListenerLoop
     -- * CLI helpers
   , parseListenerPort
   ) where
@@ -42,6 +45,7 @@ module MetaSonic.OSC.Listen
 import           Control.Concurrent             (forkIO, killThread)
 import           Control.DeepSeq                (NFData)
 import           Control.Exception              (IOException, bracket, try)
+import           Data.ByteString                (ByteString)
 import           Data.Char                      (isDigit)
 import           Data.IORef                     (IORef, readIORef)
 import           Foreign.C.Types                (CDouble (..))
@@ -194,9 +198,42 @@ withOscListenerHooks
   -> (ListenerInfo -> IO a)
   -> IO a
 withOscListenerHooks hooks rsRef cfg body =
-  bracket (openListenerSocket cfg) closeListenerSocket $ \(sock, info) ->
+  withListenerLoop cfg processPacket body
+  where
+    processPacket bytes = case parseMessage bytes of
+      Left err  -> lhOnIssue hooks (LiParseFailure err)
+      Right msg -> do
+        rs <- readIORef rsRef
+        case dispatch rs msg of
+          Left issue -> lhOnIssue hooks (LiDispatchFailure issue)
+          Right (DAControlWrite slotId nodeIx ctrlSlot val) -> do
+            ok <- lhSetControl hooks slotId nodeIx ctrlSlot val
+            if ok
+              then pure ()
+              else lhOnIssue hooks (LiQueueFull slotId nodeIx ctrlSlot)
+
+-- | Bind the configured UDP socket for callers that need to share
+-- the same socket setup and cleanup policy without using the default
+-- OSC packet loop.
+withListenerSocket
+  :: ListenerConfig
+  -> ((N.Socket, ListenerInfo) -> IO a)
+  -> IO a
+withListenerSocket cfg =
+  bracket (openListenerSocket cfg) closeListenerSocket
+
+-- | Shared bracketed UDP packet loop. It owns one socket and listener
+-- thread for the body lifetime, then kills the thread and closes the
+-- socket during bracket cleanup.
+withListenerLoop
+  :: ListenerConfig
+  -> (ByteString -> IO ())
+  -> (ListenerInfo -> IO a)
+  -> IO a
+withListenerLoop cfg processPacket body =
+  withListenerSocket cfg $ \(sock, info) ->
     bracket
-      (forkIO (listenerLoop sock hooks rsRef cfg))
+      (forkIO (listenerLoop sock cfg processPacket))
       killThread
       (\_ -> body info)
 
@@ -234,11 +271,10 @@ closeListenerSocket (sock, _) = N.close sock
 -- to propagate so the bracket teardown works.
 listenerLoop
   :: N.Socket
-  -> ListenerHooks
-  -> IORef ResolveState
   -> ListenerConfig
+  -> (ByteString -> IO ())
   -> IO ()
-listenerLoop sock hooks rsRef cfg = loop
+listenerLoop sock cfg processPacket = loop
   where
     maxBytes = lcMaxDatagram cfg
 
@@ -247,15 +283,3 @@ listenerLoop sock hooks rsRef cfg = loop
       case result of
         Left (_ :: IOException) -> pure ()
         Right (bytes, _from)    -> processPacket bytes >> loop
-
-    processPacket bytes = case parseMessage bytes of
-      Left err  -> lhOnIssue hooks (LiParseFailure err)
-      Right msg -> do
-        rs <- readIORef rsRef
-        case dispatch rs msg of
-          Left issue -> lhOnIssue hooks (LiDispatchFailure issue)
-          Right (DAControlWrite slotId nodeIx ctrlSlot val) -> do
-            ok <- lhSetControl hooks slotId nodeIx ctrlSlot val
-            if ok
-              then pure ()
-              else lhOnIssue hooks (LiQueueFull slotId nodeIx ctrlSlot)
