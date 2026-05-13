@@ -1169,8 +1169,8 @@ struct RegionSpec {
 //   Control idx_a = node index,    idx_b = control slot
 //   Scratch idx_a = scratch index, idx_b unused
 enum class FusionSrcTag : int {
-  Const   = 0,
-  Input   = 1,
+  Const = 0,
+  Input = 1,
   Control = 2,
   Scratch = 3,
 };
@@ -1196,13 +1196,13 @@ struct FusionSourceSpec {
 enum class FusionOpKind : int {
   LoadConst = 0,
   LoadInput = 1,
-  Add       = 2,
-  Mul       = 3,
+  Add = 2,
+  Mul = 3,
   SinkWrite = 4,
 };
 
 enum class FusionSinkPolicy : int {
-  Overwrite  = 0,
+  Overwrite = 0,
   Accumulate = 1,
 };
 
@@ -3654,6 +3654,7 @@ void set_osc_initial_phase(NodeInstanceState &node, double value) noexcept {
   // phase_iterator::set(freq, sps) updates the frequency step and intentionally
   // leaves accumulated phase alone. Initial oscillator phase needs the inverse:
   // update phase while preserving the current frequency step.
+  // set_phase is provided by our q_lib submodule patch for that exact operation.
   iter->set_phase(q::frac_to_phase(frac));
 }
 
@@ -6879,10 +6880,10 @@ static void process_fusion_program(
     const FusionProgramSpec &program,
     int nframes,
     int writer_slot,
-    BusWriteMode mode) noexcept {
+    BusWriteMode mode
+) noexcept {
   constexpr int kMaxScratchSlots = 64;
-  if (program.scratch_slots < 0
-      || program.scratch_slots > kMaxScratchSlots) {
+  if (program.scratch_slots < 0 || program.scratch_slots > kMaxScratchSlots) {
     return;
   }
   float scratch[kMaxScratchSlots]{};
@@ -6899,73 +6900,69 @@ static void process_fusion_program(
     for (const FusionOpSpec &op : program.ops) {
       auto read_source = [&](const FusionSourceSpec &src) -> float {
         switch (src.tag) {
-          case FusionSrcTag::Const:
-            return static_cast<float>(src.const_value);
-          case FusionSrcTag::Input: {
-            if (src.idx_a < 0
-                || src.idx_a >= static_cast<int>(inst.nodes.size()))
-              return 0.0f;
-            const auto &n = inst.nodes[src.idx_a];
-            if (src.idx_b < 0
-                || src.idx_b >= static_cast<int>(n.outputs.size()))
-              return 0.0f;
-            if (sample
-                >= static_cast<int>(n.outputs[src.idx_b].size()))
-              return 0.0f;
-            return n.outputs[src.idx_b][sample];
-          }
-          case FusionSrcTag::Control: {
-            if (src.idx_a < 0
-                || src.idx_a >= static_cast<int>(inst.nodes.size()))
-              return 0.0f;
-            const auto &n = inst.nodes[src.idx_a];
-            if (src.idx_b < 0
-                || src.idx_b >= static_cast<int>(n.controls.size()))
-              return 0.0f;
-            return static_cast<float>(n.controls[src.idx_b]);
-          }
-          case FusionSrcTag::Scratch:
-            if (src.idx_a < 0 || src.idx_a >= program.scratch_slots)
-              return 0.0f;
-            return scratch[src.idx_a];
+        case FusionSrcTag::Const:
+          return static_cast<float>(src.const_value);
+        case FusionSrcTag::Input: {
+          if (src.idx_a < 0 || src.idx_a >= static_cast<int>(inst.nodes.size()))
+            return 0.0f;
+          const auto &n = inst.nodes[src.idx_a];
+          if (src.idx_b < 0 || src.idx_b >= static_cast<int>(n.outputs.size()))
+            return 0.0f;
+          if (sample >= static_cast<int>(n.outputs[src.idx_b].size()))
+            return 0.0f;
+          return n.outputs[src.idx_b][sample];
         }
-        return 0.0f;  // unreachable; clang -Wreturn-type
+        case FusionSrcTag::Control: {
+          if (src.idx_a < 0 || src.idx_a >= static_cast<int>(inst.nodes.size()))
+            return 0.0f;
+          const auto &n = inst.nodes[src.idx_a];
+          if (src.idx_b < 0 || src.idx_b >= static_cast<int>(n.controls.size()))
+            return 0.0f;
+          return static_cast<float>(n.controls[src.idx_b]);
+        }
+        case FusionSrcTag::Scratch:
+          if (src.idx_a < 0 || src.idx_a >= program.scratch_slots)
+            return 0.0f;
+          return scratch[src.idx_a];
+        }
+        return 0.0f; // unreachable; clang -Wreturn-type
       };
 
       // Scratch-destination ops bounds-check; sink-write checks
       // its own dst (bus index) separately.
-      const bool scratch_dst_ok =
-          op.kind == FusionOpKind::SinkWrite
-          || (op.dst >= 0 && op.dst < program.scratch_slots);
-      if (!scratch_dst_ok) continue;
+      const bool scratch_dst_ok = op.kind == FusionOpKind::SinkWrite ||
+                                  (op.dst >= 0 && op.dst < program.scratch_slots);
+      if (!scratch_dst_ok)
+        continue;
 
       switch (op.kind) {
-        case FusionOpKind::LoadConst:
-          scratch[op.dst] = static_cast<float>(op.const_value);
-          break;
-        case FusionOpKind::LoadInput:
-          scratch[op.dst] = read_source(op.src1);
-          break;
-        case FusionOpKind::Add:
-          scratch[op.dst] =
-              read_source(op.src1) + read_source(op.src2);
-          break;
-        case FusionOpKind::Mul:
-          scratch[op.dst] =
-              read_source(op.src1) * read_source(op.src2);
-          break;
-        case FusionOpKind::SinkWrite: {
-          const float value = read_source(op.src1);
-          if (!sink.has_value() || sink_bus != op.dst) {
-            if (sink.has_value()) sink->flush_to(inst);
-            sink.emplace(SinkAccumulator::open(
-                g, inst, static_cast<double>(op.dst), writer_slot,
-                nframes, mode));
-            sink_bus = op.dst;
-          }
-          sink->push(static_cast<std::size_t>(sample), value);
-          break;
+      case FusionOpKind::LoadConst:
+        scratch[op.dst] = static_cast<float>(op.const_value);
+        break;
+      case FusionOpKind::LoadInput:
+        scratch[op.dst] = read_source(op.src1);
+        break;
+      case FusionOpKind::Add:
+        scratch[op.dst] = read_source(op.src1) + read_source(op.src2);
+        break;
+      case FusionOpKind::Mul:
+        scratch[op.dst] = read_source(op.src1) * read_source(op.src2);
+        break;
+      case FusionOpKind::SinkWrite: {
+        const float value = read_source(op.src1);
+        if (!sink.has_value() || sink_bus != op.dst) {
+          if (sink.has_value())
+            sink->flush_to(inst);
+          sink.emplace(
+              SinkAccumulator::open(
+                  g, inst, static_cast<double>(op.dst), writer_slot, nframes, mode
+              )
+          );
+          sink_bus = op.dst;
         }
+        sink->push(static_cast<std::size_t>(sample), value);
+        break;
+      }
       }
     }
   }
@@ -6994,94 +6991,89 @@ static void process_fusion_program_block(
     const FusionProgramSpec &program,
     int nframes,
     int writer_slot,
-    BusWriteMode mode) noexcept {
+    BusWriteMode mode
+) noexcept {
   constexpr int kMaxScratchSlots = 64;
-  constexpr int kMaxBlockFrames  = 256;
-  if (program.scratch_slots < 0
-      || program.scratch_slots > kMaxScratchSlots
-      || nframes < 0
-      || nframes > kMaxBlockFrames) {
+  constexpr int kMaxBlockFrames = 256;
+  if (program.scratch_slots < 0 || program.scratch_slots > kMaxScratchSlots ||
+      nframes < 0 || nframes > kMaxBlockFrames) {
     return;
   }
   float scratch[kMaxScratchSlots][kMaxBlockFrames]{};
 
   auto read_source_at = [&](const FusionSourceSpec &src, int sample) -> float {
     switch (src.tag) {
-      case FusionSrcTag::Const:
-        return static_cast<float>(src.const_value);
-      case FusionSrcTag::Input: {
-        if (src.idx_a < 0
-            || src.idx_a >= static_cast<int>(inst.nodes.size()))
-          return 0.0f;
-        const auto &n = inst.nodes[src.idx_a];
-        if (src.idx_b < 0
-            || src.idx_b >= static_cast<int>(n.outputs.size()))
-          return 0.0f;
-        if (sample
-            >= static_cast<int>(n.outputs[src.idx_b].size()))
-          return 0.0f;
-        return n.outputs[src.idx_b][sample];
-      }
-      case FusionSrcTag::Control: {
-        if (src.idx_a < 0
-            || src.idx_a >= static_cast<int>(inst.nodes.size()))
-          return 0.0f;
-        const auto &n = inst.nodes[src.idx_a];
-        if (src.idx_b < 0
-            || src.idx_b >= static_cast<int>(n.controls.size()))
-          return 0.0f;
-        return static_cast<float>(n.controls[src.idx_b]);
-      }
-      case FusionSrcTag::Scratch:
-        if (src.idx_a < 0 || src.idx_a >= program.scratch_slots)
-          return 0.0f;
-        return scratch[src.idx_a][sample];
+    case FusionSrcTag::Const:
+      return static_cast<float>(src.const_value);
+    case FusionSrcTag::Input: {
+      if (src.idx_a < 0 || src.idx_a >= static_cast<int>(inst.nodes.size()))
+        return 0.0f;
+      const auto &n = inst.nodes[src.idx_a];
+      if (src.idx_b < 0 || src.idx_b >= static_cast<int>(n.outputs.size()))
+        return 0.0f;
+      if (sample >= static_cast<int>(n.outputs[src.idx_b].size()))
+        return 0.0f;
+      return n.outputs[src.idx_b][sample];
     }
-    return 0.0f;  // unreachable; clang -Wreturn-type
+    case FusionSrcTag::Control: {
+      if (src.idx_a < 0 || src.idx_a >= static_cast<int>(inst.nodes.size()))
+        return 0.0f;
+      const auto &n = inst.nodes[src.idx_a];
+      if (src.idx_b < 0 || src.idx_b >= static_cast<int>(n.controls.size()))
+        return 0.0f;
+      return static_cast<float>(n.controls[src.idx_b]);
+    }
+    case FusionSrcTag::Scratch:
+      if (src.idx_a < 0 || src.idx_a >= program.scratch_slots)
+        return 0.0f;
+      return scratch[src.idx_a][sample];
+    }
+    return 0.0f; // unreachable; clang -Wreturn-type
   };
 
   std::optional<SinkAccumulator> sink;
   int sink_bus = -1;
 
   for (const FusionOpSpec &op : program.ops) {
-    const bool scratch_dst_ok =
-        op.kind == FusionOpKind::SinkWrite
-        || (op.dst >= 0 && op.dst < program.scratch_slots);
-    if (!scratch_dst_ok) continue;
+    const bool scratch_dst_ok = op.kind == FusionOpKind::SinkWrite ||
+                                (op.dst >= 0 && op.dst < program.scratch_slots);
+    if (!scratch_dst_ok)
+      continue;
 
     switch (op.kind) {
-      case FusionOpKind::LoadConst: {
-        const float v = static_cast<float>(op.const_value);
-        for (int s = 0; s < nframes; ++s) scratch[op.dst][s] = v;
-        break;
+    case FusionOpKind::LoadConst: {
+      const float v = static_cast<float>(op.const_value);
+      for (int s = 0; s < nframes; ++s)
+        scratch[op.dst][s] = v;
+      break;
+    }
+    case FusionOpKind::LoadInput:
+      for (int s = 0; s < nframes; ++s)
+        scratch[op.dst][s] = read_source_at(op.src1, s);
+      break;
+    case FusionOpKind::Add:
+      for (int s = 0; s < nframes; ++s)
+        scratch[op.dst][s] = read_source_at(op.src1, s) + read_source_at(op.src2, s);
+      break;
+    case FusionOpKind::Mul:
+      for (int s = 0; s < nframes; ++s)
+        scratch[op.dst][s] = read_source_at(op.src1, s) * read_source_at(op.src2, s);
+      break;
+    case FusionOpKind::SinkWrite: {
+      if (!sink.has_value() || sink_bus != op.dst) {
+        if (sink.has_value())
+          sink->flush_to(inst);
+        sink.emplace(
+            SinkAccumulator::open(
+                g, inst, static_cast<double>(op.dst), writer_slot, nframes, mode
+            )
+        );
+        sink_bus = op.dst;
       }
-      case FusionOpKind::LoadInput:
-        for (int s = 0; s < nframes; ++s)
-          scratch[op.dst][s] = read_source_at(op.src1, s);
-        break;
-      case FusionOpKind::Add:
-        for (int s = 0; s < nframes; ++s)
-          scratch[op.dst][s] =
-              read_source_at(op.src1, s) + read_source_at(op.src2, s);
-        break;
-      case FusionOpKind::Mul:
-        for (int s = 0; s < nframes; ++s)
-          scratch[op.dst][s] =
-              read_source_at(op.src1, s) * read_source_at(op.src2, s);
-        break;
-      case FusionOpKind::SinkWrite: {
-        if (!sink.has_value() || sink_bus != op.dst) {
-          if (sink.has_value()) sink->flush_to(inst);
-          sink.emplace(SinkAccumulator::open(
-              g, inst, static_cast<double>(op.dst), writer_slot,
-              nframes, mode));
-          sink_bus = op.dst;
-        }
-        for (int s = 0; s < nframes; ++s)
-          sink->push(static_cast<std::size_t>(s),
-                     read_source_at(op.src1, s));
-        break;
-      }
+      for (int s = 0; s < nframes; ++s)
+        sink->push(static_cast<std::size_t>(s), read_source_at(op.src1, s));
+      break;
+    }
     }
   }
 
@@ -7100,11 +7092,11 @@ static void process_fusion_program_block(
 // influences classification.
 enum class FusionSuperKind : int {
   NotRecognized = 0,
-  GainOut       = 1,  // OpMul s0 a b ; OpSinkWrite bus (SrcScratch s0)
-                      // where a, b are not SrcScratch.
-  AddGainOut    = 2,  // OpAdd s0 a b ; OpMul s1 (SrcScratch s0) c ;
-                      // OpSinkWrite bus (SrcScratch s1) where a, b, c
-                      // are not SrcScratch.
+  GainOut = 1,    // OpMul s0 a b ; OpSinkWrite bus (SrcScratch s0)
+                  // where a, b are not SrcScratch.
+  AddGainOut = 2, // OpAdd s0 a b ; OpMul s1 (SrcScratch s0) c ;
+                  // OpSinkWrite bus (SrcScratch s1) where a, b, c
+                  // are not SrcScratch.
 };
 
 // True iff @src is anything but a scratch read. The super executor
@@ -7115,19 +7107,16 @@ static bool is_extractable_operand(const FusionSourceSpec &src) noexcept {
   return src.tag != FusionSrcTag::Scratch;
 }
 
-static FusionSuperKind classify_fusion_super(
-    const FusionProgramSpec &program) noexcept {
+static FusionSuperKind classify_fusion_super(const FusionProgramSpec &program) noexcept {
   // GainOut: two ops, scratch slot 0, multiply-into-scratch then
   // sink-from-scratch. Mul operands must be inline-extractable.
   if (program.ops.size() == 2 && program.scratch_slots == 1) {
-    const FusionOpSpec &mul  = program.ops[0];
+    const FusionOpSpec &mul = program.ops[0];
     const FusionOpSpec &sink = program.ops[1];
-    if (mul.kind == FusionOpKind::Mul && mul.dst == 0
-        && is_extractable_operand(mul.src1)
-        && is_extractable_operand(mul.src2)
-        && sink.kind == FusionOpKind::SinkWrite
-        && sink.src1.tag == FusionSrcTag::Scratch
-        && sink.src1.idx_a == 0) {
+    if (mul.kind == FusionOpKind::Mul && mul.dst == 0 &&
+        is_extractable_operand(mul.src1) && is_extractable_operand(mul.src2) &&
+        sink.kind == FusionOpKind::SinkWrite && sink.src1.tag == FusionSrcTag::Scratch &&
+        sink.src1.idx_a == 0) {
       return FusionSuperKind::GainOut;
     }
   }
@@ -7136,19 +7125,15 @@ static FusionSuperKind classify_fusion_super(
   // mul's second operand must be inline-extractable; only the mul's
   // first operand is allowed (and required) to be SrcScratch[0].
   if (program.ops.size() == 3 && program.scratch_slots == 2) {
-    const FusionOpSpec &add  = program.ops[0];
-    const FusionOpSpec &mul  = program.ops[1];
+    const FusionOpSpec &add = program.ops[0];
+    const FusionOpSpec &mul = program.ops[1];
     const FusionOpSpec &sink = program.ops[2];
-    if (add.kind == FusionOpKind::Add && add.dst == 0
-        && is_extractable_operand(add.src1)
-        && is_extractable_operand(add.src2)
-        && mul.kind == FusionOpKind::Mul && mul.dst == 1
-        && mul.src1.tag == FusionSrcTag::Scratch
-        && mul.src1.idx_a == 0
-        && is_extractable_operand(mul.src2)
-        && sink.kind == FusionOpKind::SinkWrite
-        && sink.src1.tag == FusionSrcTag::Scratch
-        && sink.src1.idx_a == 1) {
+    if (add.kind == FusionOpKind::Add && add.dst == 0 &&
+        is_extractable_operand(add.src1) && is_extractable_operand(add.src2) &&
+        mul.kind == FusionOpKind::Mul && mul.dst == 1 &&
+        mul.src1.tag == FusionSrcTag::Scratch && mul.src1.idx_a == 0 &&
+        is_extractable_operand(mul.src2) && sink.kind == FusionOpKind::SinkWrite &&
+        sink.src1.tag == FusionSrcTag::Scratch && sink.src1.idx_a == 1) {
       return FusionSuperKind::AddGainOut;
     }
   }
@@ -7166,85 +7151,80 @@ static void process_fusion_program_super(
     const FusionProgramSpec &program,
     int nframes,
     int writer_slot,
-    BusWriteMode mode) noexcept {
+    BusWriteMode mode
+) noexcept {
   const FusionSuperKind kind = classify_fusion_super(program);
 
   auto read_source = [&](const FusionSourceSpec &src, int sample) -> float {
     switch (src.tag) {
-      case FusionSrcTag::Const:
-        return static_cast<float>(src.const_value);
-      case FusionSrcTag::Input: {
-        if (src.idx_a < 0
-            || src.idx_a >= static_cast<int>(inst.nodes.size()))
-          return 0.0f;
-        const auto &n = inst.nodes[src.idx_a];
-        if (src.idx_b < 0
-            || src.idx_b >= static_cast<int>(n.outputs.size()))
-          return 0.0f;
-        if (sample
-            >= static_cast<int>(n.outputs[src.idx_b].size()))
-          return 0.0f;
-        return n.outputs[src.idx_b][sample];
-      }
-      case FusionSrcTag::Control: {
-        if (src.idx_a < 0
-            || src.idx_a >= static_cast<int>(inst.nodes.size()))
-          return 0.0f;
-        const auto &n = inst.nodes[src.idx_a];
-        if (src.idx_b < 0
-            || src.idx_b >= static_cast<int>(n.controls.size()))
-          return 0.0f;
-        return static_cast<float>(n.controls[src.idx_b]);
-      }
-      case FusionSrcTag::Scratch:
-        // Unreachable for recognized super kernels by construction:
-        // 'classify_fusion_super' rejects any program whose
-        // inline-extracted operands are SrcScratch, and the only
-        // SrcScratch read the recognized shapes do carry (the
-        // AddGainOut mul.src1) is handled directly in the kernel
-        // body without going through 'read_source'. The fallback
-        // path uses 'process_fusion_program_block' and never enters
-        // this lambda.
+    case FusionSrcTag::Const:
+      return static_cast<float>(src.const_value);
+    case FusionSrcTag::Input: {
+      if (src.idx_a < 0 || src.idx_a >= static_cast<int>(inst.nodes.size()))
         return 0.0f;
+      const auto &n = inst.nodes[src.idx_a];
+      if (src.idx_b < 0 || src.idx_b >= static_cast<int>(n.outputs.size()))
+        return 0.0f;
+      if (sample >= static_cast<int>(n.outputs[src.idx_b].size()))
+        return 0.0f;
+      return n.outputs[src.idx_b][sample];
+    }
+    case FusionSrcTag::Control: {
+      if (src.idx_a < 0 || src.idx_a >= static_cast<int>(inst.nodes.size()))
+        return 0.0f;
+      const auto &n = inst.nodes[src.idx_a];
+      if (src.idx_b < 0 || src.idx_b >= static_cast<int>(n.controls.size()))
+        return 0.0f;
+      return static_cast<float>(n.controls[src.idx_b]);
+    }
+    case FusionSrcTag::Scratch:
+      // Unreachable for recognized super kernels by construction:
+      // 'classify_fusion_super' rejects any program whose
+      // inline-extracted operands are SrcScratch, and the only
+      // SrcScratch read the recognized shapes do carry (the
+      // AddGainOut mul.src1) is handled directly in the kernel
+      // body without going through 'read_source'. The fallback
+      // path uses 'process_fusion_program_block' and never enters
+      // this lambda.
+      return 0.0f;
     }
     return 0.0f;
   };
 
   switch (kind) {
-    case FusionSuperKind::GainOut: {
-      const FusionOpSpec &mul  = program.ops[0];
-      const FusionOpSpec &sink = program.ops[1];
-      SinkAccumulator acc = SinkAccumulator::open(
-          g, inst, static_cast<double>(sink.dst), writer_slot,
-          nframes, mode);
-      for (int s = 0; s < nframes; ++s) {
-        const float v = read_source(mul.src1, s) * read_source(mul.src2, s);
-        acc.push(static_cast<std::size_t>(s), v);
-      }
-      acc.flush_to(inst);
-      return;
+  case FusionSuperKind::GainOut: {
+    const FusionOpSpec &mul = program.ops[0];
+    const FusionOpSpec &sink = program.ops[1];
+    SinkAccumulator acc = SinkAccumulator::open(
+        g, inst, static_cast<double>(sink.dst), writer_slot, nframes, mode
+    );
+    for (int s = 0; s < nframes; ++s) {
+      const float v = read_source(mul.src1, s) * read_source(mul.src2, s);
+      acc.push(static_cast<std::size_t>(s), v);
     }
-    case FusionSuperKind::AddGainOut: {
-      const FusionOpSpec &add  = program.ops[0];
-      const FusionOpSpec &mul  = program.ops[1];
-      const FusionOpSpec &sink = program.ops[2];
-      SinkAccumulator acc = SinkAccumulator::open(
-          g, inst, static_cast<double>(sink.dst), writer_slot,
-          nframes, mode);
-      for (int s = 0; s < nframes; ++s) {
-        const float a   = read_source(add.src1, s);
-        const float b   = read_source(add.src2, s);
-        const float c   = read_source(mul.src2, s);
-        const float out = (a + b) * c;
-        acc.push(static_cast<std::size_t>(s), out);
-      }
-      acc.flush_to(inst);
-      return;
+    acc.flush_to(inst);
+    return;
+  }
+  case FusionSuperKind::AddGainOut: {
+    const FusionOpSpec &add = program.ops[0];
+    const FusionOpSpec &mul = program.ops[1];
+    const FusionOpSpec &sink = program.ops[2];
+    SinkAccumulator acc = SinkAccumulator::open(
+        g, inst, static_cast<double>(sink.dst), writer_slot, nframes, mode
+    );
+    for (int s = 0; s < nframes; ++s) {
+      const float a = read_source(add.src1, s);
+      const float b = read_source(add.src2, s);
+      const float c = read_source(mul.src2, s);
+      const float out = (a + b) * c;
+      acc.push(static_cast<std::size_t>(s), out);
     }
-    case FusionSuperKind::NotRecognized:
-      process_fusion_program_block(
-          g, inst, program, nframes, writer_slot, mode);
-      return;
+    acc.flush_to(inst);
+    return;
+  }
+  case FusionSuperKind::NotRecognized:
+    process_fusion_program_block(g, inst, program, nframes, writer_slot, mode);
+    return;
   }
 }
 
@@ -7267,25 +7247,24 @@ static void process_region(
   // per-node loop. Invalid ids (program table empty, id out of
   // range) silent-fall-through to the kernel/per-node paths,
   // matching the construction-side silent-no-op policy.
-  if (r.generated_program_id >= 0
-      && r.generated_program_id
-             < static_cast<int>(def.fusion_programs.size())) {
+  if (r.generated_program_id >= 0 &&
+      r.generated_program_id < static_cast<int>(def.fusion_programs.size())) {
     const int writer_slot = ctx.bus_writes.reserve_writer_slot();
-    const FusionProgramSpec &prog =
-        def.fusion_programs[r.generated_program_id];
+    const FusionProgramSpec &prog = def.fusion_programs[r.generated_program_id];
     // Phase 7.H / 7.I: per-region selector picks between the
     // sample-major executor (0, default), the block-major executor
     // (1), and the super-mode recognizer-with-fallback executor (2).
     // Any future executor is a new value here.
     if (r.generated_executor == 2) {
       process_fusion_program_super(
-          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
+          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode
+      );
     } else if (r.generated_executor == 1) {
       process_fusion_program_block(
-          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
+          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode
+      );
     } else {
-      process_fusion_program(
-          g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
+      process_fusion_program(g, inst, prog, nframes, writer_slot, ctx.bus_writes.mode);
     }
     fold_recent_writer_slot_if_needed(g, ctx, writer_slot, nframes);
     return;
@@ -8868,6 +8847,12 @@ RTGraph *rt_graph_create(int capacity, int max_frames) {
   return g;
 }
 
+int rt_graph_capacity(const RTGraph *g) { return g ? g->capacity : 0; }
+
+int rt_graph_max_frames(const RTGraph *g) { return g ? g->max_frames : 0; }
+
+int rt_graph_audio_running(const RTGraph *g) { return (g && g->audio) ? 1 : 0; }
+
 // Destroy the graph and any active audio stream.
 void rt_graph_destroy(RTGraph *g) {
   if (!g) {
@@ -9916,12 +9901,14 @@ namespace {
 // Validate a (template, program) handle and return the program
 // spec (or nullptr). Templates are resolved via the file-scope
 // 'template_at' helper that wraps the world(g).defs lookup.
-FusionProgramSpec *resolve_program(RTGraph *g, int template_id,
-                                   int program_id) {
-  if (!g) return nullptr;
+FusionProgramSpec *resolve_program(RTGraph *g, int template_id, int program_id) {
+  if (!g)
+    return nullptr;
   MetaDef *def = template_at(*g, template_id);
-  if (!def) return nullptr;
-  if (program_id < 0) return nullptr;
+  if (!def)
+    return nullptr;
+  if (program_id < 0)
+    return nullptr;
   if (program_id >= static_cast<int>(def->fusion_programs.size()))
     return nullptr;
   return &def->fusion_programs[program_id];
@@ -9930,14 +9917,24 @@ FusionProgramSpec *resolve_program(RTGraph *g, int template_id,
 // Decode a FusionSrcTag and write a FusionSourceSpec. Returns false
 // if the tag is out of range; in that case the caller must reject
 // the whole op rather than store a malformed source.
-bool decode_fusion_source(int tag, double const_value, int idx_a,
-                          int idx_b, FusionSourceSpec &out) {
+bool decode_fusion_source(
+    int tag, double const_value, int idx_a, int idx_b, FusionSourceSpec &out
+) {
   switch (tag) {
-    case 0: out.tag = FusionSrcTag::Const;   break;
-    case 1: out.tag = FusionSrcTag::Input;   break;
-    case 2: out.tag = FusionSrcTag::Control; break;
-    case 3: out.tag = FusionSrcTag::Scratch; break;
-    default: return false;
+  case 0:
+    out.tag = FusionSrcTag::Const;
+    break;
+  case 1:
+    out.tag = FusionSrcTag::Input;
+    break;
+  case 2:
+    out.tag = FusionSrcTag::Control;
+    break;
+  case 3:
+    out.tag = FusionSrcTag::Scratch;
+    break;
+  default:
+    return false;
   }
   out.const_value = const_value;
   out.idx_a = idx_a;
@@ -9951,11 +9948,12 @@ bool scratch_in_range(const FusionProgramSpec &prog, int dst) {
 
 } // namespace
 
-int rt_graph_template_add_fusion_program(
-    RTGraph *g, int template_id, int scratch_slots) {
+int rt_graph_template_add_fusion_program(RTGraph *g, int template_id, int scratch_slots) {
   MetaDef *def = g ? template_at(*g, template_id) : nullptr;
-  if (!def) return -1;
-  if (scratch_slots < 0) return -1;
+  if (!def)
+    return -1;
+  if (scratch_slots < 0)
+    return -1;
   FusionProgramSpec spec;
   spec.scratch_slots = scratch_slots;
   def->fusion_programs.push_back(std::move(spec));
@@ -9963,11 +9961,13 @@ int rt_graph_template_add_fusion_program(
 }
 
 void rt_graph_template_program_load_const(
-    RTGraph *g, int template_id, int program_id,
-    int scratch_dst, double value) {
+    RTGraph *g, int template_id, int program_id, int scratch_dst, double value
+) {
   FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
-  if (!prog) return;
-  if (!scratch_in_range(*prog, scratch_dst)) return;
+  if (!prog)
+    return;
+  if (!scratch_in_range(*prog, scratch_dst))
+    return;
   FusionOpSpec op;
   op.kind = FusionOpKind::LoadConst;
   op.dst = scratch_dst;
@@ -9976,16 +9976,25 @@ void rt_graph_template_program_load_const(
 }
 
 void rt_graph_template_program_load_input(
-    RTGraph *g, int template_id, int program_id,
-    int scratch_dst, int node_index, int port_index) {
+    RTGraph *g,
+    int template_id,
+    int program_id,
+    int scratch_dst,
+    int node_index,
+    int port_index
+) {
   MetaDef *def = g ? template_at(*g, template_id) : nullptr;
-  if (!def) return;
+  if (!def)
+    return;
   FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
-  if (!prog) return;
-  if (!scratch_in_range(*prog, scratch_dst)) return;
+  if (!prog)
+    return;
+  if (!scratch_in_range(*prog, scratch_dst))
+    return;
   if (node_index < 0 || node_index >= static_cast<int>(def->nodes.size()))
     return;
-  if (port_index < 0) return;
+  if (port_index < 0)
+    return;
   FusionOpSpec op;
   op.kind = FusionOpKind::LoadInput;
   op.dst = scratch_dst;
@@ -9998,77 +10007,145 @@ void rt_graph_template_program_load_input(
 // Shared body for OpAdd / OpMul. Tags both sources, validates them,
 // and pushes the op.
 static void append_arith_op(
-    RTGraph *g, int template_id, int program_id,
-    FusionOpKind kind, int scratch_dst,
-    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
-    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b) {
+    RTGraph *g,
+    int template_id,
+    int program_id,
+    FusionOpKind kind,
+    int scratch_dst,
+    int src1_tag,
+    double src1_const,
+    int src1_idx_a,
+    int src1_idx_b,
+    int src2_tag,
+    double src2_const,
+    int src2_idx_a,
+    int src2_idx_b
+) {
   FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
-  if (!prog) return;
-  if (!scratch_in_range(*prog, scratch_dst)) return;
+  if (!prog)
+    return;
+  if (!scratch_in_range(*prog, scratch_dst))
+    return;
   FusionOpSpec op;
   op.kind = kind;
   op.dst = scratch_dst;
-  if (!decode_fusion_source(src1_tag, src1_const, src1_idx_a, src1_idx_b,
-                            op.src1)) return;
-  if (!decode_fusion_source(src2_tag, src2_const, src2_idx_a, src2_idx_b,
-                            op.src2)) return;
+  if (!decode_fusion_source(src1_tag, src1_const, src1_idx_a, src1_idx_b, op.src1))
+    return;
+  if (!decode_fusion_source(src2_tag, src2_const, src2_idx_a, src2_idx_b, op.src2))
+    return;
   prog->ops.push_back(op);
 }
 
 void rt_graph_template_program_add(
-    RTGraph *g, int template_id, int program_id,
+    RTGraph *g,
+    int template_id,
+    int program_id,
     int scratch_dst,
-    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
-    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b) {
-  append_arith_op(g, template_id, program_id,
-                  FusionOpKind::Add, scratch_dst,
-                  src1_tag, src1_const, src1_idx_a, src1_idx_b,
-                  src2_tag, src2_const, src2_idx_a, src2_idx_b);
+    int src1_tag,
+    double src1_const,
+    int src1_idx_a,
+    int src1_idx_b,
+    int src2_tag,
+    double src2_const,
+    int src2_idx_a,
+    int src2_idx_b
+) {
+  append_arith_op(
+      g,
+      template_id,
+      program_id,
+      FusionOpKind::Add,
+      scratch_dst,
+      src1_tag,
+      src1_const,
+      src1_idx_a,
+      src1_idx_b,
+      src2_tag,
+      src2_const,
+      src2_idx_a,
+      src2_idx_b
+  );
 }
 
 void rt_graph_template_program_mul(
-    RTGraph *g, int template_id, int program_id,
+    RTGraph *g,
+    int template_id,
+    int program_id,
     int scratch_dst,
-    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
-    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b) {
-  append_arith_op(g, template_id, program_id,
-                  FusionOpKind::Mul, scratch_dst,
-                  src1_tag, src1_const, src1_idx_a, src1_idx_b,
-                  src2_tag, src2_const, src2_idx_a, src2_idx_b);
+    int src1_tag,
+    double src1_const,
+    int src1_idx_a,
+    int src1_idx_b,
+    int src2_tag,
+    double src2_const,
+    int src2_idx_a,
+    int src2_idx_b
+) {
+  append_arith_op(
+      g,
+      template_id,
+      program_id,
+      FusionOpKind::Mul,
+      scratch_dst,
+      src1_tag,
+      src1_const,
+      src1_idx_a,
+      src1_idx_b,
+      src2_tag,
+      src2_const,
+      src2_idx_a,
+      src2_idx_b
+  );
 }
 
 void rt_graph_template_program_sink_write(
-    RTGraph *g, int template_id, int program_id,
+    RTGraph *g,
+    int template_id,
+    int program_id,
     int bus_index,
-    int src_tag, double src_const, int src_idx_a, int src_idx_b,
-    int sink_policy) {
+    int src_tag,
+    double src_const,
+    int src_idx_a,
+    int src_idx_b,
+    int sink_policy
+) {
   FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
-  if (!prog) return;
-  if (bus_index < 0) return;
+  if (!prog)
+    return;
+  if (bus_index < 0)
+    return;
   FusionSinkPolicy policy;
   switch (sink_policy) {
-    case 0: policy = FusionSinkPolicy::Overwrite;  break;
-    case 1: policy = FusionSinkPolicy::Accumulate; break;
-    default: return;
+  case 0:
+    policy = FusionSinkPolicy::Overwrite;
+    break;
+  case 1:
+    policy = FusionSinkPolicy::Accumulate;
+    break;
+  default:
+    return;
   }
   FusionOpSpec op;
   op.kind = FusionOpKind::SinkWrite;
   op.dst = bus_index;
-  if (!decode_fusion_source(src_tag, src_const, src_idx_a, src_idx_b,
-                            op.src1)) return;
+  if (!decode_fusion_source(src_tag, src_const, src_idx_a, src_idx_b, op.src1))
+    return;
   op.sink_policy = policy;
   prog->ops.push_back(op);
 }
 
 void rt_graph_template_add_region_generated(
-    RTGraph *g, int template_id,
-    int rate, int first_node, int node_count,
-    int program_id) {
+    RTGraph *g, int template_id, int rate, int first_node, int node_count, int program_id
+) {
   MetaDef *def = g ? template_at(*g, template_id) : nullptr;
-  if (!def) return;
-  if (program_id < 0) return;
-  if (program_id >= static_cast<int>(def->fusion_programs.size())) return;
-  if (first_node < 0 || node_count <= 0) return;
+  if (!def)
+    return;
+  if (program_id < 0)
+    return;
+  if (program_id >= static_cast<int>(def->fusion_programs.size()))
+    return;
+  if (first_node < 0 || node_count <= 0)
+    return;
   if (static_cast<size_t>(first_node) + static_cast<size_t>(node_count) >
       def->nodes.size())
     return;
@@ -10078,19 +10155,22 @@ void rt_graph_template_add_region_generated(
   spec.node_count = node_count;
   spec.kernel = RegionKernel::NodeLoop;
   spec.generated_program_id = program_id;
-  spec.generated_executor   = 0;
+  spec.generated_executor = 0;
   def->regions.push_back(spec);
 }
 
 void rt_graph_template_add_region_generated_block(
-    RTGraph *g, int template_id,
-    int rate, int first_node, int node_count,
-    int program_id) {
+    RTGraph *g, int template_id, int rate, int first_node, int node_count, int program_id
+) {
   MetaDef *def = g ? template_at(*g, template_id) : nullptr;
-  if (!def) return;
-  if (program_id < 0) return;
-  if (program_id >= static_cast<int>(def->fusion_programs.size())) return;
-  if (first_node < 0 || node_count <= 0) return;
+  if (!def)
+    return;
+  if (program_id < 0)
+    return;
+  if (program_id >= static_cast<int>(def->fusion_programs.size()))
+    return;
+  if (first_node < 0 || node_count <= 0)
+    return;
   if (static_cast<size_t>(first_node) + static_cast<size_t>(node_count) >
       def->nodes.size())
     return;
@@ -10100,19 +10180,22 @@ void rt_graph_template_add_region_generated_block(
   spec.node_count = node_count;
   spec.kernel = RegionKernel::NodeLoop;
   spec.generated_program_id = program_id;
-  spec.generated_executor   = 1;
+  spec.generated_executor = 1;
   def->regions.push_back(spec);
 }
 
 void rt_graph_template_add_region_generated_super(
-    RTGraph *g, int template_id,
-    int rate, int first_node, int node_count,
-    int program_id) {
+    RTGraph *g, int template_id, int rate, int first_node, int node_count, int program_id
+) {
   MetaDef *def = g ? template_at(*g, template_id) : nullptr;
-  if (!def) return;
-  if (program_id < 0) return;
-  if (program_id >= static_cast<int>(def->fusion_programs.size())) return;
-  if (first_node < 0 || node_count <= 0) return;
+  if (!def)
+    return;
+  if (program_id < 0)
+    return;
+  if (program_id >= static_cast<int>(def->fusion_programs.size()))
+    return;
+  if (first_node < 0 || node_count <= 0)
+    return;
   if (static_cast<size_t>(first_node) + static_cast<size_t>(node_count) >
       def->nodes.size())
     return;
@@ -10122,7 +10205,7 @@ void rt_graph_template_add_region_generated_super(
   spec.node_count = node_count;
   spec.kernel = RegionKernel::NodeLoop;
   spec.generated_program_id = program_id;
-  spec.generated_executor   = 2;
+  spec.generated_executor = 2;
   def->regions.push_back(spec);
 }
 
@@ -10132,40 +10215,48 @@ void rt_graph_template_add_region_generated_super(
 // -1 for missing template/program. The cost-lab uses this at load
 // time to compute recognized vs fallback counts without polling any
 // runtime counter.
-int rt_graph_test_fusion_program_super_kind(
-    RTGraph *g, int template_id, int program_id) {
+int rt_graph_test_fusion_program_super_kind(RTGraph *g, int template_id, int program_id) {
   FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
-  if (!prog) return -1;
+  if (!prog)
+    return -1;
   return static_cast<int>(classify_fusion_super(*prog));
 }
 
-int rt_graph_test_template_fusion_program_count(
-    RTGraph *g, int template_id) {
+int rt_graph_test_template_fusion_program_count(RTGraph *g, int template_id) {
   MetaDef *def = g ? template_at(*g, template_id) : nullptr;
-  if (!def) return -1;
+  if (!def)
+    return -1;
   return static_cast<int>(def->fusion_programs.size());
 }
 
 int rt_graph_test_template_fusion_program_op_count(
-    RTGraph *g, int template_id, int program_id) {
+    RTGraph *g, int template_id, int program_id
+) {
   FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
-  if (!prog) return -1;
+  if (!prog)
+    return -1;
   return static_cast<int>(prog->ops.size());
 }
 
 int rt_graph_test_template_fusion_program_scratch_slots(
-    RTGraph *g, int template_id, int program_id) {
+    RTGraph *g, int template_id, int program_id
+) {
   FusionProgramSpec *prog = resolve_program(g, template_id, program_id);
-  if (!prog) return -1;
+  if (!prog)
+    return -1;
   return prog->scratch_slots;
 }
 
 int rt_graph_test_template_region_generated_program(
-    RTGraph *g, int template_id, int region_index) {
+    RTGraph *g, int template_id, int region_index
+) {
   MetaDef *def = g ? template_at(*g, template_id) : nullptr;
-  if (!def) return -1;
-  if (region_index < 0) return -1;
-  if (region_index >= static_cast<int>(def->regions.size())) return -1;
+  if (!def)
+    return -1;
+  if (region_index < 0)
+    return -1;
+  if (region_index >= static_cast<int>(def->regions.size()))
+    return -1;
   return def->regions[region_index].generated_program_id;
 }
 

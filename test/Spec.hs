@@ -13066,7 +13066,7 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
           other ->
             assertFailure ("expected start commit, got: " <> show other)
 
-  , testCase "step hot-swap that would preserve active voice is rejected" $ do
+  , testCase "step unsupported preserving hot-swap is rejected" $ do
       let graph    = patternTemplates droneVibrato
           st0      = initialSessionState graph
           startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
@@ -13090,6 +13090,54 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
                                  rt
                                  (fromIntegral (vbSlotId binding))
                 afterStatus @?= instanceStatusLive
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "step preserving hot-swap migrates supported active voice" $ do
+      newGraph <- compileTemplateGraphOrFail hotSwapEditAfterTemplates
+      let oldGraph = patternTemplates hotSwapEdit
+          st0      = initialSessionState oldGraph
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0")
+                       [(ControlTag (MigrationKey "lpf") 0, 1500.0)]
+          swapCmd  = CmdHotSwap (SwapLabel "edit-cutoff") newGraph
+          writeCmd = CmdControlWrite
+                       (VoiceKey "v0")
+                       (ControlTag (MigrationKey "lpf") 0)
+                       3300.0
+      withInstalledAdapter oldGraph defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing ->
+            case M.lookup (VoiceKey "v0") (ssVoices st1) of
+              Nothing ->
+                assertFailure "expected committed voice binding"
+              Just binding -> do
+                c_rt_graph_process rt 1
+                beforeStatus <- c_rt_graph_instance_status
+                                  rt
+                                  (fromIntegral (vbSlotId binding))
+                beforeStatus @?= instanceStatusLive
+                beforeGeneration <- c_rt_graph_test_swap_generation rt
+                swapped <- stepSessionCommand adapter swapCmd st1
+                case swapped of
+                  StepCommitted st2 (Just rebuild) -> do
+                    rrrDropped rebuild @?= []
+                    ssGraph st2 @?= newGraph
+                    M.lookup (VoiceKey "v0") (ssVoices st2) @?= Just binding
+                    afterGeneration <- c_rt_graph_test_swap_generation rt
+                    assertBool
+                      "expected preserving swap generation to advance"
+                      (afterGeneration > beforeGeneration)
+                    afterStatus <- c_rt_graph_instance_status
+                                     rt
+                                     (fromIntegral (vbSlotId binding))
+                    afterStatus @?= instanceStatusLive
+                    written <- stepSessionCommand adapter writeCmd st2
+                    written @?= StepControlAccepted
+                  other ->
+                    assertFailure
+                      ("expected preserving hot-swap commit, got: "
+                       <> show other)
           other ->
             assertFailure ("expected start commit, got: " <> show other)
   ]
@@ -13256,7 +13304,7 @@ sessionOwnerTests = testGroup "Session Prep F: runtime owner"
           assertFailure ("expected owner hot-swap then voice-start, got: "
                          <> show other)
 
-  , testCase "owner preserving hot-swap rejection is non-terminal" $ do
+  , testCase "owner unsupported preserving hot-swap rejection is non-terminal" $ do
       let graph    = patternTemplates droneVibrato
           startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
           swapCmd  = CmdHotSwap (SwapLabel "preserve") graph
@@ -14135,11 +14183,11 @@ itemSequence item = case peiResult item of
 -- Session Prep L: preserving hot-swap semantics tests
 --
 -- Prep K is a decision gate, not an implementation. These tests pin
--- the execution-time semantics that the later preserving
--- implementation must preserve. The real RTGraph adapter remains
--- constrained: preserving swaps still reject. The one preserved-voice
--- missing-control case therefore uses a mock adapter to model the
--- future successful preserve path without changing runtime behavior.
+-- the execution-time semantics that preserving implementations must
+-- preserve. Unsupported preserving shapes still reject in the real
+-- RTGraph adapter; the one preserved-voice missing-control case uses
+-- a mock adapter to model a successful preserve path with a stripped
+-- post-swap control surface.
 ------------------------------------------------------------
 
 sessionPreservingHotSwapSpecTests :: TestTree

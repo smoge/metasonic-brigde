@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveAnyClass     #-}
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE LambdaCase         #-}
 
 -- |
 -- Module      : MetaSonic.Session.RTGraphAdapter
@@ -39,28 +40,45 @@ module MetaSonic.Session.RTGraphAdapter
   ) where
 
 import           Control.DeepSeq            (NFData)
+import           Control.Applicative        ((<|>))
 import           Control.Exception          (SomeException, displayException,
                                              try)
-import           Control.Monad              (foldM, forM_)
+import           Control.Monad              (foldM, forM_, when)
+import qualified Data.ByteString.Char8      as BSC
+import           Data.List                  (find)
 import           Data.IORef                 (IORef, newIORef, readIORef,
                                              writeIORef)
 import qualified Data.Map.Strict            as Map
+import           Data.Maybe                 (listToMaybe)
 import qualified Data.Set                   as Set
 import           Foreign.C.Types            (CDouble (..), CInt)
-import           Foreign.Ptr                (Ptr)
+import           Foreign.Ptr                (Ptr, nullPtr)
 import           GHC.Generics               (Generic)
 
+import           MetaSonic.Bridge.Compile   (RuntimeGraph (..),
+                                             RuntimeNode (..))
 import           MetaSonic.Bridge.FFI       (RTGraph,
+                                             c_rt_graph_audio_running,
+                                             c_rt_graph_cancel_swap,
+                                             c_rt_graph_capacity,
+                                             c_rt_graph_collect_retired_swap,
                                              c_rt_graph_instance_remove,
                                              c_rt_graph_instance_set_control,
+                                             c_rt_graph_max_frames,
+                                             c_rt_graph_prepare_swap_from_graph,
+                                             c_rt_graph_process,
+                                             c_rt_graph_publish_swap,
                                              c_rt_graph_realtime_activate,
                                              c_rt_graph_realtime_cancel,
                                              c_rt_graph_realtime_release,
                                              c_rt_graph_realtime_reserve,
                                              c_rt_graph_realtime_set_control,
+                                             c_rt_graph_swap_migration_lifecycle_copy_count,
+                                             c_rt_graph_swap_migration_state_copy_count,
                                              c_rt_graph_template_instance_add,
                                              c_rt_graph_template_set_polyphony,
-                                             loadTemplateGraphWithAutoSpawns)
+                                             loadTemplateGraphWithAutoSpawns,
+                                             withRTGraph)
 import           MetaSonic.Bridge.Templates (BufferFootprint (..),
                                              ResourceFootprint (..),
                                              Template (..), TemplateGraph (..))
@@ -68,7 +86,7 @@ import           MetaSonic.ControlTarget    (ControlTarget (..),
                                              resolveControlTarget)
 import qualified MetaSonic.OSC.Dispatch     as OSC
 import           MetaSonic.Pattern          (ControlTag, TemplateName (..),
-                                             SwapLabel, Value, VoiceKey)
+                                             SwapLabel, Value, VoiceKey (..))
 import           MetaSonic.Session.AdapterIssue
                                              (SessionAdapterSetupIssue (..),
                                              SessionPrewarmIssue (..))
@@ -80,7 +98,7 @@ import           MetaSonic.Session.Resolve  (ResolveRebuildResult (..),
                                              VoiceBinding (..))
 import           MetaSonic.Session.State    (SessionCommit (..),
                                              SessionPlan (..))
-import           MetaSonic.Types            (NodeIndex (..))
+import           MetaSonic.Types            (NodeIndex (..), NodeKind (..))
 
 
 -- | Construction-time sizing policy for session-mode graph install.
@@ -125,6 +143,17 @@ data RTGraphAdapterState = RTGraphAdapterState
 data RTGraphAdapterEnv = RTGraphAdapterEnv
   { rtaeState   :: !(IORef RTGraphAdapterState)
   , rtaeOptions :: !RTGraphAdapterOptions
+  }
+
+data PreservingHotSwapPlan = PreservingHotSwapPlan
+  { phspBindings                :: ![VoiceBinding]
+  , phspExpectedStateCopyCount  :: !Int
+  }
+
+data PreservingBuilderMeta = PreservingBuilderMeta
+  { pbmTemplateIds      :: !(Map.Map TemplateName Int)
+  , pbmPrewarmCounts    :: !(Map.Map TemplateName Int)
+  , pbmAutoSpawnedSlots :: !(Map.Map TemplateName Int)
   }
 
 -- | Install a graph in session mode and return an adapter shell for
@@ -253,26 +282,31 @@ prewarmTemplates rt opts =
           count = configuredPrewarmCount opts tpl
           cTid  = fromIntegral tid
       c_rt_graph_template_set_polyphony rt cTid (fromIntegral count)
-      result <- prewarmOne name cTid count
+      result <- prewarmOne rt name cTid count
       pure $ case result of
         Left issue -> Left issue
         Right ()   -> Right (Map.insert name count acc)
 
-    prewarmOne :: TemplateName -> CInt -> Int -> IO (Either SessionAdapterSetupIssue ())
-    prewarmOne name cTid count =
-      go 1 []
-      where
-        go attempt slots
-          | attempt > count = do
-              forM_ slots (c_rt_graph_instance_remove rt)
-              pure (Right ())
-          | otherwise = do
-              slot <- c_rt_graph_template_instance_add rt cTid
-              if slot < 0
-                 then do
-                   forM_ slots (c_rt_graph_instance_remove rt)
-                   pure (Left (SasiPrewarmFailed name (SpiInstanceAddFailed attempt)))
-                 else go (attempt + 1) (slot : slots)
+prewarmOne
+  :: Ptr RTGraph
+  -> TemplateName
+  -> CInt
+  -> Int
+  -> IO (Either SessionAdapterSetupIssue ())
+prewarmOne rt name cTid count =
+  go 1 []
+  where
+    go attempt slots
+      | attempt > count = do
+          forM_ slots (c_rt_graph_instance_remove rt)
+          pure (Right ())
+      | otherwise = do
+          slot <- c_rt_graph_template_instance_add rt cTid
+          if slot < 0
+             then do
+               forM_ slots (c_rt_graph_instance_remove rt)
+               pure (Left (SasiPrewarmFailed name (SpiInstanceAddFailed attempt)))
+             else go (attempt + 1) (slot : slots)
 
 configuredPrewarmCount :: RTGraphAdapterOptions -> Template -> Int
 configuredPrewarmCount opts tpl
@@ -289,6 +323,300 @@ configuredPrewarmCount opts tpl
 templateWritesBuffer :: Template -> Bool
 templateWritesBuffer tpl =
   not (Set.null (bfBufWrites (rfBuffers (tplFootprint tpl))))
+
+preservingHotSwapPlan
+  :: RTGraphAdapterState
+  -> TemplateGraph
+  -> ResolveRebuildResult
+  -> Either SessionRuntimeIssue PreservingHotSwapPlan
+preservingHotSwapPlan current graph preview = do
+  newTemplateIds <-
+    either (Left . SriHotSwapInstallFailed . SasiDuplicateTemplateName) Right
+      (templateIdMap graph)
+  let bindings = preservedVoiceBindings preview
+      slots = map vbSlotId bindings
+  when (any (< 0) slots) $
+    Left SriHotSwapWouldPreserveVoices
+  when (Set.size (Set.fromList slots) /= length slots) $
+    Left SriHotSwapWouldPreserveVoices
+
+  statefulByTemplate <- traverse (preservedTemplateStatefulCount newTemplateIds)
+    (Set.toList (Set.fromList (map vbTemplateName bindings)))
+  let statefulCounts = Map.fromList statefulByTemplate
+      expectedCopies =
+        sum
+          [ Map.findWithDefault 0 (vbTemplateName binding) statefulCounts
+          | binding <- bindings
+          ]
+  pure PreservingHotSwapPlan
+    { phspBindings               = bindings
+    , phspExpectedStateCopyCount = expectedCopies
+    }
+  where
+    oldTemplateIds = rtgasTemplateIds current
+
+    preservedTemplateStatefulCount newTemplateIds name = do
+      oldTid <- lookupTemplateId name oldTemplateIds
+      newTid <- lookupTemplateId name newTemplateIds
+      when (oldTid /= newTid) $
+        Left SriHotSwapWouldPreserveVoices
+      oldTpl <- lookupTemplate name (rtgasGraph current)
+      newTpl <- lookupTemplate name graph
+      count <- validatePreservingTemplate name oldTpl newTpl
+      pure (name, count)
+
+    lookupTemplateId name ids =
+      maybe (Left SriHotSwapWouldPreserveVoices) Right
+        (Map.lookup name ids)
+
+preservedVoiceBindings :: ResolveRebuildResult -> [VoiceBinding]
+preservedVoiceBindings preview =
+  [ VoiceBinding
+      { vbVoiceKey     = VoiceKey (BSC.unpack voiceKey)
+      , vbSlotId       = slot
+      , vbTemplateName = TemplateName (BSC.unpack templateName)
+      }
+  | (voiceKey, (slot, templateName)) <-
+      Map.toAscList (OSC.resolveStateVoices (rrrState preview))
+  ]
+
+lookupTemplate
+  :: TemplateName
+  -> TemplateGraph
+  -> Either SessionRuntimeIssue Template
+lookupTemplate (TemplateName rawName) graph =
+  maybe (Left SriHotSwapWouldPreserveVoices) Right $
+    find ((== rawName) . tplName) (tgTemplates graph)
+
+validatePreservingTemplate
+  :: TemplateName
+  -> Template
+  -> Template
+  -> Either SessionRuntimeIssue Int
+validatePreservingTemplate _name oldTpl newTpl =
+  length <$> traverse validateStatefulNode statefulNodes
+  where
+    oldNodesByKey = Map.fromList
+      [ (key, node)
+      | node <- rgNodes (tplGraph oldTpl)
+      , Just key <- [rnMigrationKey node]
+      ]
+
+    newNodes = rgNodes (tplGraph newTpl)
+    statefulNodes = filter (nodeKindNeedsStateCopy . rnKind) newNodes
+
+    validateStatefulNode node
+      | not (nodeKindSupportsPreservingHotSwap (rnKind node)) =
+          Left SriHotSwapWouldPreserveVoices
+      | otherwise =
+          case rnMigrationKey node of
+            Nothing ->
+              Left SriHotSwapWouldPreserveVoices
+            Just key ->
+              case Map.lookup key oldNodesByKey of
+                Nothing ->
+                  Left SriHotSwapWouldPreserveVoices
+                Just oldNode
+                  | rnKind oldNode /= rnKind node ->
+                      Left SriHotSwapWouldPreserveVoices
+                  | length (rnControls oldNode) /= length (rnControls node) ->
+                      Left SriHotSwapWouldPreserveVoices
+                  | otherwise ->
+                      Right node
+
+nodeKindSupportsPreservingHotSwap :: NodeKind -> Bool
+nodeKindSupportsPreservingHotSwap kind =
+  case preservingHotSwapNodeClass kind of
+    PreserveUnsupported -> False
+    PreserveStateless   -> True
+    PreserveStateful    -> True
+
+nodeKindNeedsStateCopy :: NodeKind -> Bool
+nodeKindNeedsStateCopy kind =
+  case preservingHotSwapNodeClass kind of
+    PreserveUnsupported -> True
+    PreserveStateless   -> False
+    PreserveStateful    -> True
+
+data PreservingHotSwapNodeClass
+  = PreserveUnsupported
+  | PreserveStateless
+  | PreserveStateful
+  deriving stock (Eq, Show)
+
+-- | Single preserving-swap classification table.
+--
+-- Keeping support and state-copy expectation derived from this one
+-- table avoids the drift where a kind is admitted but omitted from
+-- the post-swap migration-counter check.
+preservingHotSwapNodeClass :: NodeKind -> PreservingHotSwapNodeClass
+preservingHotSwapNodeClass = \case
+  KEnv             -> PreserveUnsupported
+  KDelay           -> PreserveUnsupported
+  KSmooth          -> PreserveUnsupported
+  KPlayBufMono     -> PreserveUnsupported
+  KRecordBufMono   -> PreserveUnsupported
+  KSpectralFreeze  -> PreserveUnsupported
+  KStaticPlugin    -> PreserveUnsupported
+  KSinOsc          -> PreserveStateful
+  KOut             -> PreserveStateless
+  KGain            -> PreserveStateless
+  KSawOsc          -> PreserveStateful
+  KNoiseGen        -> PreserveStateful
+  KLPF             -> PreserveStateful
+  KAdd             -> PreserveStateless
+  KBusOut          -> PreserveStateless
+  KBusIn           -> PreserveStateless
+  KBusInDelayed    -> PreserveStateless
+  KPulseOsc        -> PreserveStateful
+  KTriOsc          -> PreserveStateful
+  KHPF             -> PreserveStateful
+  KBPF             -> PreserveStateful
+  KNotch           -> PreserveStateful
+
+preparePreservingBuilder
+  :: Ptr RTGraph
+  -> RTGraphAdapterOptions
+  -> TemplateGraph
+  -> [VoiceBinding]
+  -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
+preparePreservingBuilder builder opts graph bindings =
+  case templateIdMap graph of
+    Left duplicate ->
+      pure (Left (SriHotSwapInstallFailed
+        (SasiDuplicateTemplateName duplicate)))
+    Right ids -> do
+      loaded <- try (loadTemplateGraphWithAutoSpawns builder graph)
+      case loaded of
+        Left err ->
+          pure (Left (SriHotSwapInstallFailed
+            (SasiLoaderException (displayException (err :: SomeException)))))
+        Right autoRows ->
+          case autoSpawnRows graph autoRows of
+            Left issue ->
+              pure (Left (SriHotSwapInstallFailed issue))
+            Right rows -> do
+              forM_ rows $ \(_, _, slot) ->
+                c_rt_graph_instance_remove builder (fromIntegral slot)
+              seeded <- seedPreservedSlots builder opts graph ids bindings
+              case seeded of
+                Left issue ->
+                  pure (Left issue)
+                Right activeCounts -> do
+                  prewarmed <-
+                    prewarmTemplatesAfterPreserve
+                      builder opts (tgTemplates graph) activeCounts
+                  pure $ case prewarmed of
+                    Left issue ->
+                      Left (SriHotSwapInstallFailed issue)
+                    Right counts ->
+                      Right PreservingBuilderMeta
+                        { pbmTemplateIds      = ids
+                        , pbmPrewarmCounts    = counts
+                        , pbmAutoSpawnedSlots =
+                            Map.fromList
+                              [ (name, slot) | (name, _, slot) <- rows ]
+                        }
+
+seedPreservedSlots
+  :: Ptr RTGraph
+  -> RTGraphAdapterOptions
+  -> TemplateGraph
+  -> Map.Map TemplateName Int
+  -> [VoiceBinding]
+  -> IO (Either SessionRuntimeIssue (Map.Map TemplateName Int))
+seedPreservedSlots _builder _opts _graph _ids [] =
+  pure (Right Map.empty)
+seedPreservedSlots builder opts graph ids bindings =
+  case listToMaybe (filter (not . templateWritesBuffer) templates)
+       <|> listToMaybe templates of
+    Nothing ->
+      pure (Left SriHotSwapWouldPreserveVoices)
+    Just fillerTpl -> do
+      -- The C ABI currently allocates the lowest available slot. We
+      -- create short-lived filler instances so each preserved binding
+      -- lands on its existing slot id, then check every returned slot
+      -- against that monotonic-allocation assumption. Filler instances
+      -- are removed before the builder can be published, so even a
+      -- buffer-writing fallback template never runs.
+      let activeCounts = Map.fromListWith (+)
+            [ (vbTemplateName binding, 1 :: Int)
+            | binding <- bindings
+            ]
+          desiredBySlot = Map.fromList
+            [ (vbSlotId binding, binding)
+            | binding <- bindings
+            ]
+          maxSlot = maximum (map vbSlotId bindings)
+          fillerName = TemplateName (tplName fillerTpl)
+      forM_ (zip ([0 ..] :: [Int]) templates) $ \(tid, tpl) -> do
+        let name = TemplateName (tplName tpl)
+            base =
+              max (configuredPrewarmCount opts tpl)
+                  (Map.findWithDefault 0 name activeCounts)
+            count =
+              if name == fillerName
+                 then max base (maxSlot + 1)
+                 else base
+        c_rt_graph_template_set_polyphony
+          builder
+          (fromIntegral tid)
+          (fromIntegral count)
+      seeded <- seedSlots desiredBySlot fillerName maxSlot []
+      case seeded of
+        Left issue ->
+          pure (Left issue)
+        Right dummySlots -> do
+          forM_ dummySlots (c_rt_graph_instance_remove builder)
+          pure (Right activeCounts)
+  where
+    templates = tgTemplates graph
+
+    seedSlots desiredBySlot fillerName maxSlot dummySlots =
+      go 0 dummySlots
+      where
+        go slotIndex acc
+          | slotIndex > maxSlot =
+              pure (Right acc)
+          | otherwise = do
+              let (templateName, keepLive) =
+                    case Map.lookup slotIndex desiredBySlot of
+                      Just binding -> (vbTemplateName binding, True)
+                      Nothing      -> (fillerName, False)
+              case Map.lookup templateName ids of
+                Nothing ->
+                  pure (Left SriHotSwapWouldPreserveVoices)
+                Just templateId -> do
+                  slot <- c_rt_graph_template_instance_add
+                            builder
+                            (fromIntegral templateId)
+                  if slot < 0 || fromIntegral slot /= slotIndex
+                     then pure (Left SriHotSwapWouldPreserveVoices)
+                     else go (slotIndex + 1)
+                            (if keepLive then acc else slot : acc)
+
+prewarmTemplatesAfterPreserve
+  :: Ptr RTGraph
+  -> RTGraphAdapterOptions
+  -> [Template]
+  -> Map.Map TemplateName Int
+  -> IO (Either SessionAdapterSetupIssue (Map.Map TemplateName Int))
+prewarmTemplatesAfterPreserve rt opts templates activeCounts =
+  foldM step (Right Map.empty) (zip ([0 ..] :: [Int]) templates)
+  where
+    step (Left issue) _ =
+      pure (Left issue)
+    step (Right acc) (tid, tpl) = do
+      let name = TemplateName (tplName tpl)
+          active = Map.findWithDefault 0 name activeCounts
+          count = max (configuredPrewarmCount opts tpl) active
+          extra = max 0 (count - active)
+          cTid = fromIntegral tid
+      c_rt_graph_template_set_polyphony rt cTid (fromIntegral count)
+      result <- prewarmOne rt name cTid extra
+      pure $ case result of
+        Left issue -> Left issue
+        Right ()   -> Right (Map.insert name count acc)
 
 runRTGraphAdapter
   :: RTGraphAdapterEnv
@@ -415,8 +743,12 @@ runHotSwap
 -- deferred to a later runtime-owner slice; for Prep E, the adapter
 -- should be treated as unsafe to reuse after this failure.
 runHotSwap env current label graph preview
-  | not (Map.null (OSC.resolveStateVoices (rrrState preview))) =
-      pure (Left SriHotSwapWouldPreserveVoices)
+  | not (null preservedBindings) =
+      case preservingHotSwapPlan current graph preview of
+        Left issue ->
+          pure (Left issue)
+        Right plan ->
+          runPreservingHotSwap env current label graph plan
   | otherwise = do
       installed <- installSessionGraph
                      (rtgasRTGraph current)
@@ -428,6 +760,103 @@ runHotSwap env current label graph preview
         Right st' -> do
           writeIORef (rtaeState env) st'
           pure (Right (RuntimeCommitted (CommitGraphInstalled label graph)))
+  where
+    preservedBindings = preservedVoiceBindings preview
+
+runPreservingHotSwap
+  :: RTGraphAdapterEnv
+  -> RTGraphAdapterState
+  -> SwapLabel
+  -> TemplateGraph
+  -> PreservingHotSwapPlan
+  -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
+runPreservingHotSwap env current label graph plan = do
+  audioRunning <- c_rt_graph_audio_running rt
+  if audioRunning /= 0
+     then pure (Left SriHotSwapRequiresStoppedAudio)
+     else do
+       -- Apply already-queued voice/control realtime commands before
+       -- building the migration source. Zero frames still drive the
+       -- runtime's control-queue/RCU state machine without rendering
+       -- audio. This scripted path is only valid while the audio
+       -- callback is stopped; live integrations should publish and
+       -- wait for the audio thread to advance the swap generation.
+       c_rt_graph_process rt 0
+       capacity <- c_rt_graph_capacity rt
+       maxFrames <- c_rt_graph_max_frames rt
+       if capacity <= 0 || maxFrames < 0
+          then pure (Left (SriHotSwapInstallFailed
+                 (SasiLoaderException
+                   "invalid RTGraph sizing for preserving hot-swap")))
+          else
+            withRTGraph (fromIntegral capacity) (fromIntegral maxFrames) $
+              \builder -> do
+               prepared <- preparePreservingBuilder
+                             builder
+                             (rtaeOptions env)
+                             graph
+                             (phspBindings plan)
+               case prepared of
+                 Left issue ->
+                   pure (Left issue)
+                 Right meta -> do
+                   swap <- c_rt_graph_prepare_swap_from_graph rt builder
+                   if swap == nullPtr
+                      then pure (Left SriHotSwapWouldPreserveVoices)
+                      else do
+                        published <- c_rt_graph_publish_swap rt swap
+                        if published /= 1
+                           then do
+                             c_rt_graph_cancel_swap rt swap
+                             pure (Left SriHotSwapPublishRejected)
+                           else do
+                             -- Drive the published swap to installation
+                             -- synchronously in the stopped-audio path.
+                             c_rt_graph_process rt 0
+                             retired <- c_rt_graph_collect_retired_swap rt
+                             if retired == nullPtr
+                                then
+                                  -- publish_swap transferred ownership
+                                  -- to the runtime pending slot. There
+                                  -- is no safe local swap pointer to
+                                  -- cancel here; graph reset/destroy
+                                  -- will reclaim any still-pending swap.
+                                  pure (Left (SriHotSwapInstallFailed
+                                         (SasiLoaderException
+                                           "preserving hot-swap did not retire installed swap")))
+                                else do
+                                  stateCopies <-
+                                    c_rt_graph_swap_migration_state_copy_count
+                                      retired
+                                  lifecycleCopies <-
+                                    c_rt_graph_swap_migration_lifecycle_copy_count
+                                      retired
+                                  c_rt_graph_cancel_swap rt retired
+                                  let copiedEnough =
+                                        fromIntegral lifecycleCopies
+                                          >= length (phspBindings plan)
+                                        && fromIntegral stateCopies
+                                          >= phspExpectedStateCopyCount plan
+                                  if not copiedEnough
+                                     then pure (Left (SriHotSwapInstallFailed
+                                            (SasiLoaderException
+                                              "preserving hot-swap migration was incomplete")))
+                                     else do
+                                       let st' = RTGraphAdapterState
+                                             { rtgasGraph            = graph
+                                             , rtgasTemplateIds      =
+                                                 pbmTemplateIds meta
+                                             , rtgasPrewarmCounts    =
+                                                 pbmPrewarmCounts meta
+                                             , rtgasAutoSpawnedSlots =
+                                                 pbmAutoSpawnedSlots meta
+                                             , rtgasRTGraph          = rt
+                                             }
+                                       writeIORef (rtaeState env) st'
+                                       pure (Right (RuntimeCommitted
+                                         (CommitGraphInstalled label graph)))
+  where
+    rt = rtgasRTGraph current
 
 resolveSessionControl
   :: RTGraphAdapterState

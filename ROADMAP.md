@@ -2860,6 +2860,11 @@ thread-safe Pattern host shell around that runner: a scoped owner plus
 Pattern producer and queue state serialized by an `MVar`. These slices
 still do not add a background drain loop, concrete OSC/MIDI/UI
 adapters, realtime command queue, or uninterrupted hot-swap claim.
+**Session Prep K/L/M/N** then records the preserving-hot-swap decision,
+pins its stale-queue/session-state edge cases in tests, gathers the
+runtime evidence for migration over respawn, and lands the first narrow
+runtime-migration-backed preserving implementation for supported
+oscillator/filter voices.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2871,17 +2876,21 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, D, E, F, G, H, I, J, and
-K now supply the library-side contracts, a constrained real-runtime
-adapter, a scoped single-threaded owner, the first pure producer-ingress
-ordering/backpressure layer, one concrete Pattern producer bridge, a
-caller-driven scripted Pattern runner, a serialized Pattern host, and a
-preserving-hot-swap decision gate. The remaining open work is not
+cost/profitability table. Session Prep A, B, C, D, E, F, G, H, I, J, K,
+L, M, and N now supply the library-side contracts, a constrained
+real-runtime adapter, a scoped single-threaded owner, the first pure
+producer-ingress ordering/backpressure layer, one concrete Pattern
+producer bridge, a caller-driven scripted Pattern runner, a serialized
+Pattern host, a preserving-hot-swap decision gate, semantics tests, and
+strategy evidence plus a supported preserving hot-swap path. The
+remaining open work is not
 "create an owner", "define a queue", "turn Pattern events into queued
 commands", "compose one Pattern runner step", "serialize one Pattern
-host", or "decide preserving hot-swap semantics"; it is concrete
-OSC/MIDI/UI producer adapters, cross-producer arbitration, preserving
-hot-swap implementation, and recovery mechanisms around that owner.
+host", "decide preserving hot-swap semantics", or "choose the first
+preserving implementation strategy"; it is concrete OSC/MIDI/UI
+producer adapters, cross-producer arbitration, live-audio/background
+hot-swap orchestration, unsupported respawn/reset policy, and recovery
+mechanisms around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2959,6 +2968,27 @@ Session prep artifacts:
   runtime choice between slot/state migration and session-level respawn
   to a later implementation slice. The first implementation slice after
   this decision should keep the Prep K lineage explicit.
+- Session Prep L - Preserving Hot-Swap Semantics Tests
+  (`test/Spec.hs`) pins the Prep K stale-queue/session-state edge cases:
+  execution-time hot-swap preview after earlier queued work, second
+  hot-swap preview after a first swap commits, stale voice-off after a
+  dropped voice, and explicit missing-control failure after a modeled
+  preserving swap.
+- [Session Prep M - Preserving Hot-Swap Strategy Evidence](notes/2026-05-13-session-prep-m-preserving-hot-swap-strategy-evidence.md)
+  records the runtime/FFI evidence for choosing a narrow
+  runtime-migration-backed preserving hot-swap implementation first.
+  The existing prepare/publish/collect substrate, slot/template-id
+  migration counters, and node-state support make runtime migration the
+  smaller first implementation than session respawn for supported
+  oscillator/filter graphs.
+- [Session Prep N - Preserving Hot-Swap Runtime Migration](notes/2026-05-13-session-prep-n-preserving-hot-swap-runtime-migration.md)
+  implements that first narrow runtime-migration path in the real
+  `RTGraph` session adapter. Supported preserving swaps build an
+  offline next world with matching live slots, publish through the
+  prepared-swap ABI, force scripted install with a zero-frame process
+  step, inspect migration counters, and then commit the existing
+  `CommitGraphInstalled` shape. Unsupported stateful graphs still
+  reject non-terminally rather than silently resetting live voices.
 
 Landed prep contracts:
 
@@ -3002,6 +3032,13 @@ Landed prep contracts:
 - [x] Preserving hot-swap decision gate covering execution-time preview
   rebuild, stale queued command interpretation, runtime migration vs.
   session respawn choices, and failed-install divergence.
+- [x] Preserving hot-swap semantics tests for queued hot-swap preview
+  timing, stale post-swap voice-off behavior, second-swap state
+  rebuild, and explicit post-swap missing-control failure
+  (`test/Spec.hs`).
+- [x] Preserving hot-swap strategy evidence selecting a narrow
+  runtime-migration-backed first implementation and deferring
+  session-level respawn to unsupported/reset-policy cases.
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -3010,9 +3047,10 @@ Landed prep contracts:
   install/prewarm, voice, control, and constrained hot-swap behavior.
   The Prep E IO-side step-test target is covered by the accumulated
   real-adapter tests across voice start/stop, control write, empty
-  hot-swap, drop-all hot-swap, preserving-swap rejection, and
-  structured install failure, plus a `PatternEvent`-to-real-`RTGraph`
-  round-trip through `fromPatternEvent` and `stepSessionCommand`.
+  hot-swap, drop-all hot-swap, unsupported preserving-swap rejection,
+  supported preserving-swap migration, and structured install failure,
+  plus a `PatternEvent`-to-real-`RTGraph` round-trip through
+  `fromPatternEvent` and `stepSessionCommand`.
   Prep F owner tests additionally cover construction, setup failure,
   voice start/stop state mutation, control-write non-mutation,
   empty-session hot-swap success, duplicate-template hot-swap
@@ -3033,7 +3071,12 @@ Landed prep contracts:
   propagation, and no cursor advancement during backlog recovery. Prep
   J host tests cover setup failure attribution, hosted voice commit,
   backlog carry across repeated hosted calls, and concurrent callers
-  serializing whole Pattern steps.
+  serializing whole Pattern steps. Prep L tests cover preserving
+  hot-swap execution-time semantics across queued starts, chained
+  swaps, dropped voices, and post-swap control-target failure.
+  Prep N extends the real-adapter coverage with a supported
+  `hotSwapEdit` migration that preserves the same binding and validates
+  post-swap control resolution against the new graph.
 
 Still gated:
 
@@ -3042,9 +3085,12 @@ Still gated:
   background drain loop around the producer queue.
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
-- [ ] Preserving graph hot-swap implementation with audio-thread
-  cooperation, either runtime slot/state migration or session-level
-  respawn bindings, and recoverable failed-install semantics.
+- [ ] Live-audio preserving hot-swap orchestration that publishes,
+  waits for the audio thread to advance swap generation, collects
+  retired migration stats, and commits without calling the offline
+  process entry concurrently with audio.
+- [ ] Session-level respawn/replacement-binding policy for preserving
+  swaps that cannot use runtime state migration.
 - [ ] MIDI, OSC, UI, and Pattern coexistence/arbitration policy.
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
@@ -3056,8 +3102,9 @@ Current decision: treat Prep F/G/H/I as the first runtime ownership,
 producer-ingress, and scripted-runner boundaries, not as the full session
 runtime. Do not promote them into a producer-facing session service until
 concrete producer fan-in, thread-safe queue ownership, OSC/MIDI/UI
-ingress, cross-producer arbitration, preserving hot-swap, and recovery
-policies are specified and tested in their own slices. The
+ingress, cross-producer arbitration, live-audio hot-swap orchestration,
+unsupported respawn/reset policy, and recovery policies are specified
+and tested in their own slices. The
 session does not need a generated fusion executor to ship;
 generated execution remains a read-only diagnostic/performance
 experiment unless later measurements justify automatic turn-on.

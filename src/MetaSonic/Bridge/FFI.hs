@@ -24,6 +24,9 @@ module MetaSonic.Bridge.FFI
   , HotSwapWaitResult (..)
   , -- * Lifecycle
     withRTGraph
+  , c_rt_graph_capacity
+  , c_rt_graph_max_frames
+  , c_rt_graph_audio_running
   , -- * Loading a compiled graph (single-template, legacy)
     loadRuntimeGraph
   , loadRuntimeGraphFused
@@ -566,6 +569,15 @@ foreign import ccall unsafe "rt_graph_connect"
 
 foreign import ccall unsafe "rt_graph_process"
   c_rt_graph_process :: Ptr RTGraph -> CInt -> IO ()
+
+foreign import ccall unsafe "rt_graph_capacity"
+  c_rt_graph_capacity :: Ptr RTGraph -> IO CInt
+
+foreign import ccall unsafe "rt_graph_max_frames"
+  c_rt_graph_max_frames :: Ptr RTGraph -> IO CInt
+
+foreign import ccall unsafe "rt_graph_audio_running"
+  c_rt_graph_audio_running :: Ptr RTGraph -> IO CInt
 
 foreign import ccall safe "rt_graph_start_audio"
   c_rt_graph_start_audio :: Ptr RTGraph -> CInt -> CInt -> IO CInt

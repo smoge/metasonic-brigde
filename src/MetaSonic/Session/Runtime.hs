@@ -91,11 +91,18 @@ data SessionRuntimeIssue
   | SriControlTargetRejected !ControlTargetIssue
   | SriRealtimeQueueFull !RealtimeOp
   | SriHotSwapWouldPreserveVoices
-    -- ^ Prep E only supports graph installs whose rebuild preview
-    -- leaves no surviving logical voices.
+    -- ^ A preserving hot-swap was requested, but the adapter cannot
+    -- safely preserve that graph/voice shape.
   | SriHotSwapInstallFailed !SessionAdapterSetupIssue
     -- ^ A constrained hot-swap reached graph installation but the
     -- underlying setup/install helper failed.
+  | SriHotSwapPublishRejected
+    -- ^ The runtime rejected a prepared hot-swap publish before
+    -- ownership transferred to the audio/runtime side.
+  | SriHotSwapRequiresStoppedAudio
+    -- ^ The adapter's scripted preserving hot-swap path needs the
+    -- offline process entry point, so it is rejected while realtime
+    -- audio owns the same callback path.
   | SriControlWriteRejected
   | SriBackendStopped
   | SriAdapterReason !String

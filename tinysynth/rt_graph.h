@@ -63,6 +63,19 @@ typedef struct RTGraphSwap RTGraphSwap;
 // so concurrency does not arise.
 RTGraph *rt_graph_create(int capacity, int max_frames);
 
+// [T:introspection] Return the construction capacity / max frame
+// sizing of a handle. These are immutable after rt_graph_create and
+// let off-audio builders match a target handle before preparing a
+// hot-swap next world.
+int rt_graph_capacity(const RTGraph *g);
+int rt_graph_max_frames(const RTGraph *g);
+
+// [T:introspection] Return whether this handle currently owns a
+// realtime audio stream. Intended as a session-side guard for helpers
+// that use the offline process entry point and therefore must not run
+// concurrently with the audio callback.
+int rt_graph_audio_running(const RTGraph *g);
+
 // [T:alloc-reset] Stop audio (joining the audio thread) and free the
 // graph. Caller must ensure no other thread holds g.
 void rt_graph_destroy(RTGraph *g);
