@@ -15276,6 +15276,8 @@ testMIDIProducerOptions = defaultMIDIProducerOptions
 
 testMIDIPlayableOptions :: MIDIProducerOptions
 testMIDIPlayableOptions = testMIDIProducerOptions
+  -- Keep service/listener composition tests focused on voice lifecycle:
+  -- droneVibrato does not expose the synthetic freq/gate/velocity tags.
   { mpoFrequencyControl = Nothing
   , mpoGateControl      = Nothing
   , mpoVelocityControl  = Nothing

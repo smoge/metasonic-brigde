@@ -63,7 +63,11 @@ import           MetaSonic.Session.Queue        (SessionEnqueueIssue,
 --
 -- Returning 'Nothing' means the source reached end-of-input and the
 -- listener worker should exit normally. A blocking source is interrupted
--- by the bracket finalizer via 'killThread'.
+-- by the bracket finalizer via 'killThread'. Source implementations
+-- should not throw synchronous exceptions for ordinary device/read
+-- failures; if 'mlsReadEvent' does throw, the worker terminates without
+-- listener-hook notification and the last readable state remains as
+-- post-mortem diagnostic state.
 newtype MIDIListenerSource = MIDIListenerSource
   { mlsReadEvent :: IO (Maybe MIDIProducerEvent)
   }
