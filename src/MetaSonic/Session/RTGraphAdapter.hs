@@ -804,6 +804,8 @@ installPreservingHotSwap rt opts graph plan = do
     Left issue ->
       pure (Left issue)
     Right () -> do
+      -- Drain queued realtime voice/control commands before freezing
+      -- the old world as the migration source.
       driveScriptedPreservingStep rt
       sizing <- preservingBuilderSizing rt
       case sizing of
@@ -826,6 +828,10 @@ installPreservingHotSwap rt opts graph plan = do
                     Left issue -> Left issue
                     Right ()   -> Right meta
 
+-- | Snapshot guard for the scripted preserving path.
+--
+-- This is not a lock; callers still own session/audio lifecycle
+-- serialization around start/stop and hot-swap.
 requireStoppedAudio :: Ptr RTGraph -> IO (Either SessionRuntimeIssue ())
 requireStoppedAudio rt = do
   audioRunning <- c_rt_graph_audio_running rt
@@ -897,6 +903,7 @@ forceInstallPreservingSwap
   :: Ptr RTGraph
   -> IO (Either SessionRuntimeIssue (Ptr RTGraphSwap))
 forceInstallPreservingSwap rt = do
+  -- Drive the published swap through the stopped-audio callback path.
   driveScriptedPreservingStep rt
   retired <- c_rt_graph_collect_retired_swap rt
   pure $
