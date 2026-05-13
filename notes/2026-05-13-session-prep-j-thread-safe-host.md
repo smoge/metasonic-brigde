@@ -103,6 +103,14 @@ runner steps. They cannot race `PatternProducerState`, cannot interleave
 queue updates, and cannot call the hidden `SessionOwner` outside the
 host lock.
 
+The host lock is a serialization boundary, not a transaction boundary.
+`modifyMVar` restores the previous producer/queue state if an exception
+escapes, but it cannot roll back C-runtime side effects or owner `IORef`
+writes already performed by `stepSessionOwner` during the drain. Prep J
+therefore inherits Prep F's exception/divergence surface: callers should
+treat an interrupted hosted step as a reason to inspect owner status or
+rebuild the scoped host, not as an automatically rolled-back operation.
+
 The returned report remains the Prep I report. Backlog is still visible
 through `prsEnqueue` and `isBacklogged (prsState r)`. The host snapshot
 adds a lock-protected read side for callers that want current backlog,

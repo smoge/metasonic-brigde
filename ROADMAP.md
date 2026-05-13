@@ -2871,17 +2871,17 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, D, E, F, G, H, I, and J
-now supply the library-side contracts, a constrained real-runtime
+cost/profitability table. Session Prep A, B, C, D, E, F, G, H, I, J, and
+K now supply the library-side contracts, a constrained real-runtime
 adapter, a scoped single-threaded owner, the first pure producer-ingress
-ordering/backpressure layer, one concrete Pattern producer bridge, and a
-caller-driven scripted Pattern runner plus a serialized Pattern host.
-The remaining open work is not
+ordering/backpressure layer, one concrete Pattern producer bridge, a
+caller-driven scripted Pattern runner, a serialized Pattern host, and a
+preserving-hot-swap decision gate. The remaining open work is not
 "create an owner", "define a queue", "turn Pattern events into queued
-commands", "compose one Pattern runner step", or "serialize one Pattern
-host"; it is concrete OSC/MIDI/UI producer adapters, cross-producer
-arbitration, preserving hot-swap, and recovery semantics around that
-owner.
+commands", "compose one Pattern runner step", "serialize one Pattern
+host", or "decide preserving hot-swap semantics"; it is concrete
+OSC/MIDI/UI producer adapters, cross-producer arbitration, preserving
+hot-swap implementation, and recovery mechanisms around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2951,6 +2951,13 @@ Session prep artifacts:
   This is still not a background worker, live clock, OSC/MIDI/UI
   adapter, generic producer service, or preserving hot-swap
   implementation.
+- [Session Prep K - Preserving Hot-Swap Decision](notes/2026-05-13-session-prep-k-preserving-hot-swap-decision.md)
+  records the policy gate for preserving hot-swap before broadening
+  producer fan-in. It keeps the current real-adapter rejection in place,
+  requires execution-time preview rebuilds, defines how stale queued
+  commands should be interpreted after a successful swap, and leaves the
+  runtime choice between slot/state migration and session-level respawn
+  to a later implementation slice.
 
 Landed prep contracts:
 
@@ -2991,6 +2998,9 @@ Landed prep contracts:
 - [x] Thread-safe Pattern session host v1 with scoped owner lifetime,
   internal Pattern producer/queue state, serialized hosted steps, and a
   lock-protected snapshot (`MetaSonic.Session.Host`).
+- [x] Preserving hot-swap decision gate covering execution-time preview
+  rebuild, stale queued command interpretation, runtime migration vs.
+  session respawn choices, and failed-install divergence.
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -3031,8 +3041,9 @@ Still gated:
   background drain loop around the producer queue.
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
-- [ ] Uninterrupted graph hot-swap with audio-thread cooperation,
-  preserving-voice migration, and recoverable failed-install semantics.
+- [ ] Preserving graph hot-swap implementation with audio-thread
+  cooperation, either runtime slot/state migration or session-level
+  respawn bindings, and recoverable failed-install semantics.
 - [ ] MIDI, OSC, UI, and Pattern coexistence/arbitration policy.
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
