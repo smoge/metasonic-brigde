@@ -153,6 +153,7 @@ import           MetaSonic.Session.PatternProducer
 import           MetaSonic.Session.Runner
 import           MetaSonic.Session.Host
 import           MetaSonic.Session.FanIn
+import           MetaSonic.Session.OSCProducer
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -203,6 +204,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionPreservingHotSwapSpecTests
   , sessionLiveHotSwapOrchestrationTests
   , sessionFanInHostTests
+  , sessionOSCProducerTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -14857,6 +14859,168 @@ fanInQueuedOrFail result =
       pure queued
     other ->
       assertFailure ("expected fan-in enqueue success, got: " <> show other)
+
+------------------------------------------------------------
+-- Session OSC producer adapter
+--
+-- The adapter is intentionally narrow: it reuses the OSC dispatch
+-- symbolic decoder, converts only control writes to SessionCommand,
+-- and submits them to the generic fan-in host as ProducerOSC.
+------------------------------------------------------------
+
+sessionOSCProducerTests :: TestTree
+sessionOSCProducerTests =
+  testGroup "Session OSC producer adapter"
+  [ testCase "decodes symbolic OSC control write to session command" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/v0/lpf/1")
+                                [OSC.OscArgFloat 1800.0]
+      decodeOSCSessionCommand msg
+        @?= Right
+              (CmdControlWrite
+                (VoiceKey "v0")
+                (ControlTag (MigrationKey "lpf") 1)
+                1800.0)
+
+  , testCase "valid control write enqueues under ProducerOSC" $ do
+      let graph = patternTemplates droneVibrato
+          opts = defaultOSCProducerOptions
+          producer = oscProducerId opts
+          msg = OSC.OscMessage (OBSC.pack "/v0/lpf/0")
+                                [OSC.OscArgInt 700]
+          expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              700.0
+      result <- withSessionFanInHost graph defaultSessionFanInOptions $
+        \host -> do
+          enq <- enqueueOSCControlWrite opts msg host
+          snapshot <- readSessionFanInHost host
+          pure (enq, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (OSCProducerEnqueueAttempted command enq, snapshot) -> do
+          command @?= expected
+          queued <- fanInQueuedOrFail enq
+          qscProducer queued @?= producer
+          qscCommand queued @?= expected
+          sfierQueueDepth enq @?= 1
+          sfisQueueDepth snapshot @?= 1
+        Right other ->
+          assertFailure ("expected OSC enqueue attempt, got: " <> show other)
+
+  , testCase "reserved and invalid identifiers are rejected" $ do
+      let cases =
+            [ ( "reserved voice"
+              , OSC.OscMessage (OBSC.pack "/swap/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+              , OSC.DiReservedPathSegment (OBSC.pack "swap")
+              )
+            , ( "invalid voice"
+              , OSC.OscMessage (OBSC.pack "/bad name/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+              , OSC.DiIdentifierProfile (OBSC.pack "bad name")
+              )
+            , ( "invalid node tag"
+              , OSC.OscMessage (OBSC.pack "/v0/bad name/0")
+                                [OSC.OscArgFloat 1.0]
+              , OSC.DiIdentifierProfile (OBSC.pack "bad name")
+              )
+            ]
+      forM_ cases $ \(label, msg, expected) ->
+        case decodeOSCSessionCommand msg of
+          Left issue ->
+            issue @?= expected
+          Right command ->
+            assertFailure
+              (label <> ": expected decode rejection, got "
+               <> show command)
+
+  , testCase "bad slots and argument shapes are rejected" $ do
+      let cases =
+            [ ( "non-integer slot"
+              , OSC.OscMessage (OBSC.pack "/v0/lpf/cutoff")
+                                [OSC.OscArgFloat 1.0]
+              , OSC.DiSlotNotInteger (OBSC.pack "cutoff")
+              )
+            , ( "zero args"
+              , OSC.OscMessage (OBSC.pack "/v0/lpf/0") []
+              , OSC.DiUnsupportedArgShape 0
+              )
+            , ( "two args"
+              , OSC.OscMessage (OBSC.pack "/v0/lpf/0")
+                                [OSC.OscArgFloat 1.0, OSC.OscArgInt 2]
+              , OSC.DiUnsupportedArgShape 2
+              )
+            ]
+      forM_ cases $ \(label, msg, expected) ->
+        case decodeOSCSessionCommand msg of
+          Left issue ->
+            issue @?= expected
+          Right command ->
+            assertFailure
+              (label <> ": expected decode rejection, got "
+               <> show command)
+
+  , testCase "decode rejection does not enqueue" $ do
+      let graph = patternTemplates droneVibrato
+          msg = OSC.OscMessage (OBSC.pack "/swap/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+      result <- withSessionFanInHost graph defaultSessionFanInOptions $
+        \host -> do
+          enq <- enqueueOSCControlWrite defaultOSCProducerOptions msg host
+          snapshot <- readSessionFanInHost host
+          pure (enq, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (enq, snapshot) -> do
+          enq @?= OSCProducerDecodeRejected
+                    (OSC.DiReservedPathSegment (OBSC.pack "swap"))
+          sfisQueueDepth snapshot @?= 0
+
+  , testCase "queue-full surfaces through fan-in enqueue result" $ do
+      let graph = patternTemplates droneVibrato
+          opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          producer = oscProducerId defaultOSCProducerOptions
+          msg0 = OSC.OscMessage (OBSC.pack "/v0/lpf/0")
+                                 [OSC.OscArgFloat 800.0]
+          msg1 = OSC.OscMessage (OBSC.pack "/v1/lpf/0")
+                                 [OSC.OscArgFloat 900.0]
+          cmd1 =
+            CmdControlWrite
+              (VoiceKey "v1")
+              (ControlTag (MigrationKey "lpf") 0)
+              900.0
+      result <- withSessionFanInHost graph opts $ \host -> do
+        enq0 <- enqueueOSCControlWrite defaultOSCProducerOptions msg0 host
+        enq1 <- enqueueOSCControlWrite defaultOSCProducerOptions msg1 host
+        snapshot <- readSessionFanInHost host
+        pure (enq0, enq1, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (OSCProducerEnqueueAttempted _ first, second, snapshot) -> do
+          _queued <- fanInQueuedOrFail first
+          second
+            @?= OSCProducerEnqueueAttempted
+                  cmd1
+                  SessionFanInEnqueueResult
+                    { sfierResult =
+                        SessionEnqueueRejected
+                          producer
+                          cmd1
+                          (SeiQueueFull 1)
+                    , sfierQueueDepth = 1
+                    }
+          sfisQueueDepth snapshot @?= 1
+        Right other ->
+          assertFailure ("expected queue-full OSC enqueue, got: "
+                         <> show other)
+  ]
 
 compileTemplateGraphOrFail :: [(String, SynthGraph)] -> IO TemplateGraph
 compileTemplateGraphOrFail entries =
