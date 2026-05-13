@@ -422,11 +422,11 @@ Recommended commit shape:
    - every `PatternEvent` constructor maps through `fromPatternEvent`;
    - full queue stops at the first rejected event;
    - rejected event plus remaining generated events become backlog;
-   - next call retries backlog before generating a new range —
-     structurally verified by asserting that `perNextStart` advanced
-     exactly once when the original range was generated, does not
-     advance again during backlog retry, and that no newly generated
-     range appears in the retry call's `perItems`;
+  - next call retries backlog before generating a new range —
+    structurally verified by asserting that `perNextStart` is identical
+    between a partial-rejection call and the immediately following
+    backlog-retry call, `perBacklogged` decreases on the retry, and no
+    newly generated range appears in the retry call's `perItems`;
    - rejected/backlogged events do not consume queue sequence numbers;
    - producer identity is `ProducerPattern` and preserves the
      configured producer name;

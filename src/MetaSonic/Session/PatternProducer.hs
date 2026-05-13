@@ -6,11 +6,11 @@
 -- Module      : MetaSonic.Session.PatternProducer
 -- Description : Pattern-to-session producer bridge vocabulary.
 --
--- This module starts Session Prep H by defining the type surface for a
--- pure Pattern producer bridge. The bridge sits above
+-- This module defines Session Prep H's pure Pattern producer bridge.
+-- The bridge sits above
 -- 'MetaSonic.Session.Queue' and turns 'MetaSonic.Pattern.PatternEvent'
 -- values into queued 'MetaSonic.Session.Command.SessionCommand'
--- values in later slices.
+-- values.
 --
 -- This module is Haskell-only. It does not own a 'SessionOwner', does
 -- not drain queues, does not create threads, and does not define a
@@ -21,6 +21,7 @@
 module MetaSonic.Session.PatternProducer
   ( -- * Options
     PatternProducerOptions (..)
+  , defaultPatternProducerOptions
 
     -- * Producer state
   , PatternProducerState
@@ -32,24 +33,34 @@ module MetaSonic.Session.PatternProducer
   , PatternEnqueueItem (..)
   , PatternEnqueueResult (..)
   , PatternEnqueueOutcome (..)
+
+    -- * Operations
+  , newPatternProducerState
+  , enqueuePatternBlock
   ) where
 
 import           Control.DeepSeq             (NFData)
 import           Data.Text                   (Text)
+import qualified Data.Text                   as T
 import           GHC.Generics                (Generic)
 
-import           MetaSonic.Pattern           (PatternEvent, SamplePos)
-import           MetaSonic.Session.Command   (SessionCommand)
-import           MetaSonic.Session.Queue     (ProducerId,
+import           MetaSonic.Pattern           (Pattern, PatternEvent,
+                                              SamplePos (..),
+                                              SampleRange (..),
+                                              expandPattern)
+import           MetaSonic.Session.Command   (SessionCommand,
+                                              fromPatternEvent)
+import           MetaSonic.Session.Queue     (ProducerId (..),
+                                              ProducerKind (ProducerPattern),
                                               SessionCommandQueue,
-                                              SessionEnqueueResult)
+                                              SessionEnqueueResult (..),
+                                              enqueueSessionCommand)
 
 
 -- | Construction options for the pure Pattern producer bridge.
 --
--- The default value lands with the construction slice. Production
--- callers with a real timing model should choose 'ppoBlockFrames'
--- explicitly.
+-- Production callers with a real timing model should choose
+-- 'ppoBlockFrames' explicitly.
 data PatternProducerOptions = PatternProducerOptions
   { ppoProducerName :: !Text
     -- ^ Free-form diagnostic producer name. The default will be
@@ -60,11 +71,17 @@ data PatternProducerOptions = PatternProducerOptions
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
+-- | Conservative test/demo defaults for Pattern producer ingress.
+defaultPatternProducerOptions :: PatternProducerOptions
+defaultPatternProducerOptions = PatternProducerOptions
+  { ppoProducerName = T.pack "pattern"
+  , ppoBlockFrames  = 64
+  }
+
 -- | Hidden pure producer state.
 --
 -- The constructor stays private so callers cannot fabricate cursor or
--- backlog combinations. Construction and enqueue operations land in
--- later Prep H slices.
+-- backlog combinations.
 data PatternProducerState = PatternProducerState
   { ppsProducer :: !ProducerId
   , ppsBlockFrames :: !Int
@@ -115,3 +132,101 @@ data PatternEnqueueOutcome = PatternEnqueueOutcome
   , peoResult :: !PatternEnqueueResult
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+-- | Construct an initial Pattern producer state.
+newPatternProducerState
+  :: PatternProducerOptions
+  -> Either PatternProducerIssue PatternProducerState
+newPatternProducerState opts
+  | ppoBlockFrames opts <= 0 =
+      Left (PpiInvalidBlockFrames (ppoBlockFrames opts))
+  | otherwise =
+      Right PatternProducerState
+        { ppsProducer =
+            ProducerId ProducerPattern (ppoProducerName opts)
+        , ppsBlockFrames =
+            ppoBlockFrames opts
+        , ppsNextStart =
+            SamplePos 0
+        , ppsBacklog =
+            []
+        }
+
+-- | Enqueue one Pattern block, or retry one pending backlog.
+--
+-- Calls that start with backlog retry only that backlog. They do not
+-- generate a new Pattern range in the same call, even if the backlog
+-- fully drains.
+enqueuePatternBlock
+  :: Pattern
+  -> PatternProducerState
+  -> SessionCommandQueue
+  -> PatternEnqueueOutcome
+enqueuePatternBlock pat state queue =
+  let (events, stateWithCursor) = eventsForCall pat state
+      (state', queue', items) =
+        enqueueEvents stateWithCursor queue events
+      result = PatternEnqueueResult
+        { perItems      = items
+        , perBacklogged = length (ppsBacklog state')
+        , perNextStart  = ppsNextStart state'
+        }
+  in PatternEnqueueOutcome
+       { peoState  = state'
+       , peoQueue  = queue'
+       , peoResult = result
+       }
+
+eventsForCall
+  :: Pattern
+  -> PatternProducerState
+  -> ([(SamplePos, PatternEvent)], PatternProducerState)
+eventsForCall pat state =
+  case ppsBacklog state of
+    [] ->
+      let start = ppsNextStart state
+          end = addSampleFrames (ppsBlockFrames state) start
+          events = expandPattern pat (SampleRange start end)
+          -- The cursor advances once when the range is generated, not
+          -- when every event is accepted. A partial enqueue rejection
+          -- leaves backlog inside this consumed range; retry calls must
+          -- not roll the cursor back.
+      in (events, state { ppsNextStart = end })
+    backlog ->
+      (backlog, state)
+
+enqueueEvents
+  :: PatternProducerState
+  -> SessionCommandQueue
+  -> [(SamplePos, PatternEvent)]
+  -> (PatternProducerState, SessionCommandQueue, [PatternEnqueueItem])
+enqueueEvents state queue events =
+  go [] queue events
+  where
+    go itemsRev currentQueue [] =
+      ( state { ppsBacklog = [] }
+      , currentQueue
+      , reverse itemsRev
+      )
+    go itemsRev currentQueue ((samplePos, event) : rest) =
+      let command = fromPatternEvent event
+          (queue', enqueueResult) =
+            enqueueSessionCommand (ppsProducer state) command currentQueue
+          item = PatternEnqueueItem
+            { peiSamplePos = samplePos
+            , peiEvent     = event
+            , peiCommand   = command
+            , peiResult    = enqueueResult
+            }
+      in case enqueueResult of
+           SessionEnqueued _ ->
+             go (item : itemsRev) queue' rest
+           SessionEnqueueRejected {} ->
+             ( state { ppsBacklog = (samplePos, event) : rest }
+             , queue'
+             , reverse (item : itemsRev)
+             )
+
+addSampleFrames :: Int -> SamplePos -> SamplePos
+addSampleFrames n (SamplePos start) =
+  SamplePos (start + n)
