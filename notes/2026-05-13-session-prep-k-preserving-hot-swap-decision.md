@@ -6,6 +6,10 @@ Status: decision artifact. This slice does not implement preserving
 hot-swap, add a background drain loop, add concrete OSC/MIDI/UI
 producer bridges, or change the realtime C ABI.
 
+The first implementation slice that follows this decision should make
+its relationship to Prep K explicit, whether it lands as Prep L or under
+another phase label.
+
 ## Decision
 
 Keep the current runtime adapter behavior for now:
@@ -78,6 +82,26 @@ That implies:
 This is one reason the public command layer uses symbolic `VoiceKey`
 and template labels rather than exposing runtime slot ids to producers.
 
+One concrete execution trace should be pinned by tests before the
+preserving implementation lands:
+
+1. The current graph has live voices `vLead` and `vPad`.
+2. A queued `PEHotSwap swapA graphA` targets a graph where `vLead` can
+   be preserved, `vPad` is dropped, and the preserved `vLead` template
+   no longer exposes an old control tag such as `cutoff`.
+3. A later queued `PEControlWrite vLead cutoff value` is interpreted
+   against `graphA` and the post-swap binding table. It must not be
+   silently ignored. With today's split, this would admit by `VoiceKey`
+   and fail as a non-terminal runtime/control-target rejection; a later
+   design may move that validation into pure admission, but it must
+   still be an explicit command failure rather than owner divergence.
+4. A later queued `PEVoiceOff vPad` is rejected against the post-swap
+   `SessionState` as a stale voice, with no runtime adapter call and no
+   owner divergence.
+5. A later queued `PEHotSwap swapB graphB` rebuilds its preview against
+   `graphA` and the post-`swapA` session state, not against the state
+   that existed when `swapB` was originally enqueued.
+
 ## Preservation Strategies
 
 There are two plausible implementation paths.
@@ -104,6 +128,34 @@ Under this path, preserving hot-swap is really a controlled stop,
 install, and respawn operation. It may be audible. The commit vocabulary
 would need to carry the replacement bindings returned by runtime
 execution.
+
+That is a mandatory surface change for this strategy: today's
+`CommitGraphInstalled label graph` carries no replacement bindings.
+Session respawn would either need to extend that constructor or add a
+new graph-installed commit that includes the replacement
+`VoiceBinding`s. Runtime migration does not require that payload if the
+existing bindings and slot identities remain valid.
+
+## Strategy Selection Questions
+
+The next preserving-hot-swap slice should answer these before choosing
+runtime migration or session respawn:
+
+- Does the runtime already need a per-block prepare/publish install
+  boundary for another feature, such as manifest reload or generated
+  schedule replacement? If yes, runtime migration may share that
+  boundary instead of inventing a hot-swap-only mechanism.
+- Does the current C ABI expose enough slot lifetime information to
+  prove that a preserved logical voice still maps to the same valid
+  runtime slot after install?
+- Which q_lib and runtime node states are worth migrating, and which
+  can accept an audible reset to defaults?
+- What is the measured cost and audible behavior of respawning from
+  defaults compared with migrating state for the common Pattern-driven
+  cases?
+- Can failed install be made prepare-only until publish, or can it
+  partially mutate the active runtime? If partial mutation remains
+  possible, owner divergence must remain the recovery policy.
 
 ## Failure And Recovery
 

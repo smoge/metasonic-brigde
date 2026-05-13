@@ -2957,7 +2957,8 @@ Session prep artifacts:
   requires execution-time preview rebuilds, defines how stale queued
   commands should be interpreted after a successful swap, and leaves the
   runtime choice between slot/state migration and session-level respawn
-  to a later implementation slice.
+  to a later implementation slice. The first implementation slice after
+  this decision should keep the Prep K lineage explicit.
 
 Landed prep contracts:
 
