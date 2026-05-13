@@ -156,6 +156,7 @@ import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.FanInService
 import           MetaSonic.Session.MIDIProducer
 import qualified MetaSonic.Session.MIDIListener as MIDIS
+import qualified MetaSonic.Session.MIDIPortMIDI as MIDIPM
 import           MetaSonic.Session.OSCProducer
 import qualified MetaSonic.Session.OSCListener as OSCS
 import           MetaSonic.Session.UIProducer
@@ -212,6 +213,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionFanInServiceTests
   , sessionMIDIProducerTests
   , sessionMIDIListenerTests
+  , sessionMIDIPortMIDISourceTests
   , sessionUIProducerTests
   , sessionOSCProducerTests
   , sessionOSCListenerTests
@@ -15650,6 +15652,68 @@ sessionMIDIListenerTests =
 midiMVarSource :: MVar (Maybe MIDIProducerEvent) -> MIDIS.MIDIListenerSource
 midiMVarSource events =
   MIDIS.MIDIListenerSource (takeMVar events)
+
+------------------------------------------------------------
+-- Session MIDI PortMIDI source
+--
+-- This is the hardware-backed source boundary for the decoded MIDI
+-- listener. Tests use an invalid device id so they stay deterministic
+-- on no-controller and headless CI hosts.
+------------------------------------------------------------
+
+sessionMIDIPortMIDISourceTests :: TestTree
+sessionMIDIPortMIDISourceTests =
+  testGroup "Session MIDI PortMIDI source"
+  [ testCase "invalid device opens an idle closeable source" $ do
+      result <-
+        MIDIPM.withPortMIDISource invalidPortMIDIOptions $ \case
+          Nothing ->
+            pure (Left "source open returned Nothing")
+          Just source -> do
+            hasDevice <- MIDIPM.portMIDISourceHasDevice source
+            mEvent <- MIDIPM.pollPortMIDISourceEvent source
+            pure (Right (hasDevice, mEvent))
+      case result of
+        Left err ->
+          assertFailure err
+        Right (hasDevice, mEvent) -> do
+          hasDevice @?= False
+          mEvent @?= Nothing
+
+  , testCase "idle PortMIDI source composes with MIDI listener teardown" $ do
+      result <- timeout 1000000 $
+        MIDIPM.withPortMIDISource invalidPortMIDIOptions $ \case
+          Nothing ->
+            pure (Left "source open returned Nothing")
+          Just source ->
+            Right <$>
+              withSessionFanInHost
+                (patternTemplates droneVibrato)
+                defaultSessionFanInOptions
+                (\host ->
+                   MIDIS.withSessionMIDIListener
+                     testMIDIProducerOptions
+                     initialMIDIProducerState
+                     (MIDIPM.portMIDIListenerSource invalidPortMIDIOptions
+                                                    source)
+                     host
+                     $ \_listener -> pure (42 :: Int))
+      case result of
+        Nothing ->
+          assertFailure "PortMIDI listener teardown hung on idle source"
+        Just (Left err) ->
+          assertFailure err
+        Just (Right (Left issue)) ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Just (Right (Right value)) ->
+          value @?= 42
+  ]
+
+invalidPortMIDIOptions :: MIDIPM.PortMIDISourceOptions
+invalidPortMIDIOptions = MIDIPM.defaultPortMIDISourceOptions
+  { MIDIPM.pmsoDeviceId      = Just 2147483647
+  , MIDIPM.pmsoPollDelayUsec = 1000
+  }
 
 ------------------------------------------------------------
 -- Session UI producer adapter

@@ -79,6 +79,7 @@ library:
     - MetaSonic.Session.FanInService
     - MetaSonic.Session.MIDIProducer
     - MetaSonic.Session.MIDIListener
+    - MetaSonic.Session.MIDIPortMIDI
     - MetaSonic.Session.OSCProducer
     - MetaSonic.Session.OSCListener
     - MetaSonic.Session.UIProducer
@@ -95,6 +96,7 @@ library:
     - tinysynth/voice_allocator.cpp
     - tinysynth/midi_voice_processor.cpp
     - tinysynth/midi_demo.cpp
+    - tinysynth/session_midi_source.cpp
     # Local replacements for vendor's q_io midi_device.cpp +
     # midi_stream.cpp; see file headers and CMakeLists.txt comment.
     - tinysynth/q_midi_device.cpp

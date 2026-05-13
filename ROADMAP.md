@@ -2873,7 +2873,7 @@ slices add a shared symbolic control-write decoder, a
 `MetaSonic.Session.OSCProducer` adapter, and a session-backed UDP
 listener over the shared OSC listener socket loop. The session layer
 still does not ask the OSC listener itself to drain, add a GUI toolkit
-binding, add manifest-driven reload, add a live PortMIDI device owner,
+binding, add manifest-driven reload, add full PortMIDI supervision,
 add a realtime command queue, or make an uninterrupted hot-swap
 claim. A follow-up
 `MetaSonic.Session.FanInService` slice adds the first scoped background
@@ -2881,7 +2881,9 @@ drain worker around the fan-in host. A later
 `MetaSonic.Session.MIDIProducer` slice adds a Haskell-only adapter for
 already-decoded MIDI note-on/off and CC events. A later
 `MetaSonic.Session.MIDIListener` slice adds a decoded-source worker
-around that adapter, but still does not own PortMIDI devices. A later
+around that adapter. A later `MetaSonic.Session.MIDIPortMIDI` slice
+adds the first Q / PortMIDI-backed decoded source, but still does not
+define broader MIDI policy or long-running supervision. A later
 `MetaSonic.Session.UIProducer` slice adds a Haskell-only adapter for
 already-decoded UI intents.
 
@@ -2914,11 +2916,11 @@ host", "decide preserving hot-swap semantics", or "choose the first
 preserving implementation strategy", "create a generic fan-in host", or
 "land the first OSC control-write producer/listener path", or "add a
 minimal scoped fan-in drain worker", "add a first MIDI note/CC producer
-adapter", "add a decoded-source MIDI listener", or "add a first UI
-intent producer adapter"; it is GUI toolkit integration,
-manifest-driven session reload/resource policy, live PortMIDI device
-ownership and broader MIDI behavior beyond note/CC command
-translation, any broader OSC behavior beyond symbolic
+adapter", "add a decoded-source MIDI listener", "add a small
+PortMIDI-backed decoded source", or "add a first UI intent producer
+adapter"; it is GUI toolkit integration, manifest-driven session
+reload/resource policy, broader MIDI behavior beyond note/CC command
+translation and the small source wrapper, any broader OSC behavior beyond symbolic
 control writes, arbitration beyond FIFO, long-running supervision
 beyond the scoped service, unsupported respawn/reset policy, and
 recovery mechanisms around that owner.
@@ -3053,9 +3055,11 @@ Session prep artifacts:
   records the first session-backed decoded MIDI event listener. It
   owns a bracketed worker over an injected event source, feeds
   `MetaSonic.Session.MIDIProducer`, and keeps listener-local MIDI
-  state observable for tests/callers. This is still not PortMIDI
-  device ownership, pitch-bend/channel policy, MIDI clock, or
-  arbitration beyond FIFO.
+  state observable for tests/callers. The later
+  [Session MIDI PortMIDI Source](notes/2026-05-13-session-midi-portmidi-source.md)
+  binds Q / PortMIDI input behind that decoded-source boundary. This
+  is still not pitch-bend/channel policy, MIDI clock, or arbitration
+  beyond FIFO.
 - [Session UI Producer Adapter](notes/2026-05-13-session-ui-producer-adapter.md)
   records the first Haskell-only UI adapter above the generic fan-in
   host. It consumes already-decoded UI intents, translates them to
@@ -3184,7 +3188,9 @@ Landed prep contracts:
   end-of-input worker exit, producer rejection with continued event
   processing, note-on/note-off state transitions, queue-full state
   retention, blocked-hook teardown, and composition through the scoped
-  fan-in drain service. The UI producer adapter tests cover
+  fan-in drain service. The PortMIDI source tests cover deterministic
+  invalid-device idle-open behavior and composition with listener
+  teardown without requiring MIDI hardware. The UI producer adapter tests cover
   intent-to-command translation for voice on/off, control write, and
   hot-swap, non-finite value rejection before enqueue, `ProducerUI`
   attribution, queue-full surfacing, and composition through the
@@ -3206,8 +3212,10 @@ with `ProducerMIDI` attribution. It can target a plain
 `SessionFanInHost` or a scoped `SessionFanInService`.
 `MetaSonic.Session.MIDIListener` brackets a worker over an injected
 decoded-event source and feeds that producer while keeping listener
-state observable. This path still does not open PortMIDI devices,
-define pitch-bend/channel policy, or add arbitration beyond FIFO.
+state observable. `MetaSonic.Session.MIDIPortMIDI` adds the first Q /
+PortMIDI-backed source behind that boundary. This path still does not
+define pitch-bend/channel policy, MIDI clock behavior, or arbitration
+beyond FIFO.
 
 Recent UI ingress follow-up: `MetaSonic.Session.UIProducer` translates
 already-decoded UI intents into `CmdVoiceOn`, `CmdVoiceOff`,
@@ -3220,8 +3228,8 @@ beyond FIFO.
 Still gated:
 
 - [ ] GUI toolkit bindings, manifest-driven session reload/resource
-  policy, live PortMIDI device ownership, broader MIDI behavior
-  beyond the landed note/CC adapter, and broader OSC producer scope
+  policy, broader MIDI behavior beyond the landed note/CC adapter and
+  small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
   throttling/coalescing, and drain scheduling beyond the scoped
@@ -3246,11 +3254,12 @@ implementation, live-audio install orchestration, generic serialized
 fan-in, a session-backed OSC control-write ingress path, a scoped
 wake-on-enqueue background drain worker, producer-local MIDI note/CC
 command translation, a decoded-source MIDI listener, and
-already-decoded UI intent translation. Do not
+the first Q / PortMIDI-backed decoded source, and already-decoded UI
+intent translation. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration, manifest-driven session reload/resource policy,
-live PortMIDI device ownership, broader MIDI policy beyond note/CC
-translation, broader OSC scope beyond symbolic control writes,
+broader MIDI policy beyond note/CC translation and source polling,
+broader OSC scope beyond symbolic control writes,
 arbitration beyond FIFO, unsupported respawn/reset policy,
 long-running ownership of the live-audio hot-swap path, and recovery
 policies are specified and tested in their own slices. The session does

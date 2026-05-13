@@ -7,8 +7,9 @@ The listener consumes already-decoded `MIDIProducerEvent` values from
 an injected source. It owns a bracketed worker thread, keeps
 producer-local MIDI note state inside the listener, and enqueues
 translated commands into a `SessionFanInHost`. The source boundary is
-deliberately hardware-free so tests and future PortMIDI/Q integration
-can share the same session-facing loop.
+deliberately separated from hardware ownership. The later
+[Session MIDI PortMIDI Source](2026-05-13-session-midi-portmidi-source.md)
+binds Q / PortMIDI input behind the same session-facing loop.
 
 ## Landed Scope
 
@@ -25,7 +26,10 @@ can share the same session-facing loop.
 
 ## Still Out Of Scope
 
-- Opening, polling, or bracketing PortMIDI devices.
+- Opening, polling, or bracketing PortMIDI devices at this listener
+  slice. The later
+  [Session MIDI PortMIDI Source](2026-05-13-session-midi-portmidi-source.md)
+  covers the small Q / PortMIDI source wrapper.
 - Pitch bend, aftertouch, MIDI clock, channel masks, or sustain-pedal
   semantics.
 - Release-phase CC fanout or producer-owned smoothing/coalescing.

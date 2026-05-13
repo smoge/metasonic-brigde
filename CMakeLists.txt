@@ -12,6 +12,7 @@ add_library(tinysynth_rt STATIC
     tinysynth/voice_allocator.cpp
     tinysynth/midi_voice_processor.cpp
     tinysynth/midi_demo.cpp
+    tinysynth/session_midi_source.cpp
     # Local replacements for vendor/q/q_io/src/{midi_device,midi_stream}.cpp
     # — see file headers for the patch rationale. Vendor copies are
     # NOT linked in to avoid an ODR collision on midi_device::list /
