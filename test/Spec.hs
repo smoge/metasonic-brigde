@@ -31,7 +31,7 @@ import qualified Data.Set                  as S
 import qualified Data.Text                 as T
 import           Data.List                 (find, isInfixOf, isPrefixOf, nub,
                                             sort, sortBy)
-import           Control.Concurrent        (forkIO, newEmptyMVar, putMVar,
+import           Control.Concurrent        (MVar, forkIO, newEmptyMVar, putMVar,
                                             takeMVar, threadDelay)
 import           Control.Exception         (SomeException, displayException,
                                             evaluate, try)
@@ -155,6 +155,7 @@ import           MetaSonic.Session.Host
 import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.FanInService
 import           MetaSonic.Session.MIDIProducer
+import qualified MetaSonic.Session.MIDIListener as MIDIS
 import           MetaSonic.Session.OSCProducer
 import qualified MetaSonic.Session.OSCListener as OSCS
 import           MetaSonic.Session.UIProducer
@@ -210,6 +211,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionFanInHostTests
   , sessionFanInServiceTests
   , sessionMIDIProducerTests
+  , sessionMIDIListenerTests
   , sessionUIProducerTests
   , sessionOSCProducerTests
   , sessionOSCListenerTests
@@ -15294,6 +15296,210 @@ midiVelocityTag =
 midiLevelTag :: ControlTag
 midiLevelTag =
   ControlTag (MigrationKey "lpf") 0
+
+------------------------------------------------------------
+-- Session MIDI listener adapter
+--
+-- This is the decoded-event worker above the MIDI producer adapter.
+-- It only enqueues into SessionFanInHost; live PortMIDI device
+-- ownership remains outside this module.
+------------------------------------------------------------
+
+sessionMIDIListenerTests :: TestTree
+sessionMIDIListenerTests =
+  testGroup "Session MIDI listener adapter"
+  [ testCase "bracket cleanup: body return tears down blocked source" $ do
+      entered <- newEmptyMVar
+      events <- newEmptyMVar
+      let source = MIDIS.MIDIListenerSource $ do
+            putMVar entered ()
+            takeMVar events
+      result <- timeout 1000000 $
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host ->
+              MIDIS.withSessionMIDIListener
+                testMIDIProducerOptions
+                initialMIDIProducerState
+                source
+                host
+                $ \_listener ->
+                    timeout 1000000 (takeMVar entered)
+      case result of
+        Nothing ->
+          assertFailure "MIDI listener teardown hung on blocked source"
+        Just (Left issue) ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Just (Right (Just ())) ->
+          pure ()
+        Just (Right Nothing) ->
+          assertFailure "timed out waiting for MIDI source read"
+
+  , testCase "producer rejection reports issue and listener continues" $ do
+      events <- newEmptyMVar
+      issues <- newEmptyMVar
+      validResult <- newEmptyMVar
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult =
+                \case
+                  result@MIDIProducerEnqueueAttempted {} ->
+                    putMVar validResult result
+                  MIDIProducerRejected {} ->
+                    pure ()
+            , MIDIS.smlhOnIssue =
+                putMVar issues
+            }
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host ->
+              MIDIS.withSessionMIDIListenerHooks
+                hooks
+                testMIDIProducerOptions
+                initialMIDIProducerState
+                source
+                host
+                $ \listener -> do
+                    putMVar events (Just (MIDIProducerNoteOn 16 60 1))
+                    mIssue <- timeout 1000000 (takeMVar issues)
+                    putMVar events (Just (MIDIProducerNoteOn 0 69 127))
+                    mResult <- timeout 1000000 (takeMVar validResult)
+                    state <- MIDIS.readSessionMIDIListenerState listener
+                    snapshot <- readSessionFanInHost host
+                    pure (mIssue, mResult, state, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just issue, Just (MIDIProducerEnqueueAttempted batch [enq]),
+               state, snapshot) -> do
+          issue @?= MIDIS.SmliProducerRejected (MpiInvalidChannel 16)
+          queued <- fanInQueuedOrFail enq
+          mpcbCommands batch @?= [qscCommand queued]
+          mpsActiveNotes state
+            @?= M.singleton (0, 69) (VoiceKey "m0-69")
+          sfisQueueDepth snapshot @?= 1
+        Right other ->
+          assertFailure ("expected rejection then valid MIDI enqueue, got: "
+                         <> show other)
+
+  , testCase "queue-full rejection does not advance listener state" $ do
+      let fanInOpts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          prefill =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
+      events <- newEmptyMVar
+      issues <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult = putMVar producerResults
+            , MIDIS.smlhOnIssue          = putMVar issues
+            }
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          fanInOpts
+          $ \host -> do
+              _prefill <-
+                enqueueSessionFanInCommand
+                  (testProducer ProducerTest "prefill")
+                  prefill
+                  host
+              MIDIS.withSessionMIDIListenerHooks
+                hooks
+                testMIDIProducerOptions
+                initialMIDIProducerState
+                source
+                host
+                $ \listener -> do
+                    putMVar events (Just (MIDIProducerNoteOn 0 69 127))
+                    mResult <- timeout 1000000 (takeMVar producerResults)
+                    mIssue <- timeout 1000000 (takeMVar issues)
+                    state <- MIDIS.readSessionMIDIListenerState listener
+                    pure (mResult, mIssue, state)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (MIDIProducerEnqueueAttempted batch [enq]),
+               Just issue, state) -> do
+          mpcbState batch @?= initialMIDIProducerState
+          mpsActiveNotes state @?= M.empty
+          case mpcbCommands batch of
+            [command] -> do
+              sfierResult enq
+                @?= SessionEnqueueRejected
+                      (midiProducerId testMIDIProducerOptions)
+                      command
+                      (SeiQueueFull 1)
+              issue @?= MIDIS.SmliEnqueueRejected command (SeiQueueFull 1)
+            other ->
+              assertFailure ("expected one MIDI command, got: " <> show other)
+        Right other ->
+          assertFailure ("expected queue-full listener result, got: "
+                         <> show other)
+
+  , testCase "service host wakes worker for listener note-on" $ do
+      events <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      drainedVar <- newEmptyMVar
+      let source = midiMVarSource events
+          listenerHooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult = putMVar producerResults
+            , MIDIS.smlhOnIssue          = \_ -> pure ()
+            }
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          (patternTemplates droneVibrato)
+          defaultSessionFanInServiceOptions
+          $ \service ->
+              MIDIS.withSessionMIDIListenerHooks
+                listenerHooks
+                testMIDIPlayableOptions
+                initialMIDIProducerState
+                source
+                (sessionFanInServiceHost service)
+                $ \listener -> do
+                    putMVar events (Just (MIDIProducerNoteOn 0 69 100))
+                    mProducer <- timeout 1000000 (takeMVar producerResults)
+                    mDrain <- timeout 1000000 (takeMVar drainedVar)
+                    state <- MIDIS.readSessionMIDIListenerState listener
+                    snapshot <- readSessionFanInService service
+                    pure (mProducer, mDrain, state, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (Just (MIDIProducerEnqueueAttempted _ [enq]),
+               Just drained, state, snapshot) -> do
+          queued <- fanInQueuedOrFail enq
+          map sdiQueued (sdrItems (sfidrDrain drained)) @?= [queued]
+          case map sdiResult (sdrItems (sfidrDrain drained)) of
+            [SessionOwnerStep (StepCommitted _ Nothing)] ->
+              pure ()
+            other ->
+              assertFailure
+                ("expected listener note-on to commit through service, got: "
+                 <> show other)
+          mpsActiveNotes state
+            @?= M.singleton (0, 69) (VoiceKey "m0-69")
+          sfisQueueDepth snapshot @?= 0
+          assertBool
+            "expected MIDI listener voice after service drain"
+            (M.member (VoiceKey "m0-69") (ssVoices (sfisOwnerState snapshot)))
+        Right other ->
+          assertFailure ("expected MIDI listener service enqueue, got: "
+                         <> show other)
+  ]
+
+midiMVarSource :: MVar (Maybe MIDIProducerEvent) -> MIDIS.MIDIListenerSource
+midiMVarSource events =
+  MIDIS.MIDIListenerSource (takeMVar events)
 
 ------------------------------------------------------------
 -- Session UI producer adapter

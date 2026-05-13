@@ -264,16 +264,20 @@ The landed pieces are deliberately small:
   note-off, and control-change events into session commands with `ProducerMIDI`
   identity, including per-note producer state and configurable note/CC
   mappings.
+- `MetaSonic.Session.MIDIListener` brackets a worker around an injected
+  decoded MIDI event source and feeds `MetaSonic.Session.MIDIProducer`. It is
+  testable without hardware and still does not own PortMIDI devices.
 - `MetaSonic.Session.UIProducer` translates already-decoded UI intents into
   session commands with `ProducerUI` identity, rejecting non-finite UI control
   values before they enter the fan-in queue.
 
 What is still intentionally absent: GUI toolkit bindings, manifest-driven
 session reload/resource allocation, live PortMIDI listener/device ownership for
-the session path, broader MIDI behavior beyond note/CC command translation,
-broader OSC behavior beyond symbolic control writes, arbitration beyond FIFO,
-long-running supervision beyond the scoped fan-in service, unsupported
-respawn/reset policy for preserving swaps, and recovery after terminal runtime
+the session path, broader MIDI behavior beyond note/CC command translation and
+the decoded-source listener, broader OSC behavior beyond symbolic control
+writes, arbitration beyond FIFO, long-running supervision beyond the scoped
+fan-in service, unsupported respawn/reset policy for preserving swaps, and
+recovery after terminal runtime
 divergence.
 
 ---

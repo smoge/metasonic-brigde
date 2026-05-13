@@ -28,7 +28,11 @@ existing FIFO fan-in queue.
 ## Still Out Of Scope
 
 - Opening, polling, or bracketing PortMIDI devices.
-- A session-backed live MIDI listener thread.
+- At this producer-adapter slice, a session-backed MIDI listener
+  thread. The later
+  [Session MIDI Listener](2026-05-13-session-midi-listener.md) covers
+  the decoded-source worker; PortMIDI device ownership remains out of
+  scope.
 - Pitch bend, aftertouch, MIDI clock, channel masks, or sustain-pedal
   semantics.
 - Release-phase CC fanout or producer-owned smoothing/coalescing.

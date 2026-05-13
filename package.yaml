@@ -78,6 +78,7 @@ library:
     - MetaSonic.Session.FanIn
     - MetaSonic.Session.FanInService
     - MetaSonic.Session.MIDIProducer
+    - MetaSonic.Session.MIDIListener
     - MetaSonic.Session.OSCProducer
     - MetaSonic.Session.OSCListener
     - MetaSonic.Session.UIProducer
