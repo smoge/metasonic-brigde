@@ -40,14 +40,16 @@ module MetaSonic.Session.FanInService
   , readSessionFanInService
   ) where
 
-import           Control.Concurrent        (MVar, forkIO, newEmptyMVar,
-                                            putMVar, takeMVar, tryPutMVar)
+import           Control.Concurrent        (MVar, forkIO, killThread,
+                                            newEmptyMVar, putMVar, takeMVar,
+                                            tryPutMVar)
 import           Control.DeepSeq           (NFData)
 import           Control.Exception         (finally)
 import           Control.Monad             (unless, void, when)
 import           Data.IORef                (IORef, newIORef, readIORef,
                                             writeIORef)
 import           GHC.Generics              (Generic)
+import           System.Timeout            (timeout)
 
 import           MetaSonic.Bridge.Templates (TemplateGraph)
 import           MetaSonic.Session.Command  (SessionCommand)
@@ -129,9 +131,11 @@ withSessionFanInService =
 
 -- | Allocate a scoped fan-in service with explicit lifecycle hooks.
 --
--- The worker shuts down when the callback exits. Shutdown waits for an
--- in-flight drain to finish, then releases the underlying fan-in host
--- and owner bracket.
+-- The worker shuts down when the callback exits. Shutdown first asks
+-- the worker to exit cooperatively, then kills it if a service hook or
+-- drain path blocks past a short grace period. The underlying fan-in
+-- host and owner bracket are released only after the worker finalizer
+-- reports completion.
 withSessionFanInServiceHooks
   :: SessionFanInServiceHooks
   -> TemplateGraph
@@ -153,14 +157,20 @@ withSessionFanInServiceHooks hooks graph opts action = do
       graph
       (sfsoFanInOptions opts)
       $ \host -> do
-          _worker <- forkIO (serviceLoop hooks closing wake done host)
+          worker <- forkIO (serviceLoop hooks closing wake done host)
           let service = SessionFanInService
                 { sfsvcHost = host
                 }
               stop = do
                 writeIORef closing True
                 signalWorker
-                takeMVar done
+                mDone <- timeout serviceShutdownGraceUsec (takeMVar done)
+                case mDone of
+                  Just () ->
+                    pure ()
+                  Nothing -> do
+                    killThread worker
+                    takeMVar done
           action service `finally` stop
   case result of
     Left issue ->
@@ -207,3 +217,7 @@ serviceLoop hooks closing wake done host =
             when (sfidrQueueDepth drained > 0) $
               void (tryPutMVar wake ())
             loop
+
+serviceShutdownGraceUsec :: Int
+serviceShutdownGraceUsec =
+  50000

@@ -9,7 +9,9 @@ starts one worker thread inside the same bracket. Each wake drains the
 existing FIFO host with `drainSessionFanInHost`. Successful drains are
 reported through hooks. A drain that stops because the owner diverged is
 also reported, and the worker exits instead of retrying, repairing, or
-respawning the session.
+respawning the session. On bracket teardown, the service first signals
+the worker to exit cooperatively, then kills the worker if a drain or
+service hook blocks past a short grace period.
 
 ## Landed Scope
 
@@ -22,9 +24,12 @@ respawning the session.
 - Existing concrete producers can still target a `SessionFanInHost`.
   When they are given the service-owned host, successful enqueues wake
   the background drain worker.
+- Teardown retains the worker thread id, waits briefly for cooperative
+  exit, and uses `killThread` if the worker is still blocked.
 - Tests cover bracket cleanup, wake-on-enqueue draining, OSC producer
   composition through the service-owned host, and divergence reporting
-  with worker exit.
+  with worker exit. A regression test pins teardown returning even when
+  a drain hook blocks.
 
 ## Still Out Of Scope
 

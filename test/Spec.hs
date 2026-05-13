@@ -14893,6 +14893,38 @@ sessionFanInServiceTests =
           sfisQueueDepth snapshot @?= 0
           sfisOwnerStatus snapshot @?= SessionOwnerReady
 
+  , testCase "bracket cleanup kills worker when drain hook blocks" $ do
+      let graph = patternTemplates droneVibrato
+          producer = testProducer ProducerUI "ui"
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      hookEntered <- newEmptyMVar
+      neverRelease <- newEmptyMVar
+      result <- timeout 1000000 $
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain =
+                \_drained -> do
+                  putMVar hookEntered ()
+                  takeMVar neverRelease
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq <- enqueueSessionFanInServiceCommand producer cmd service
+              mEntered <- timeout 1000000 (takeMVar hookEntered)
+              pure (enq, mEntered)
+      case result of
+        Nothing ->
+          assertFailure
+            "service teardown hung while drain hook was blocked"
+        Just (Left issue) ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Just (Right (enq, Just ())) -> do
+          _queued <- fanInQueuedOrFail enq
+          pure ()
+        Just (Right (_enq, Nothing)) ->
+          assertFailure "timed out waiting for blocking drain hook"
+
   , testCase "successful enqueue wakes background drain worker" $ do
       let graph = patternTemplates droneVibrato
           producer = testProducer ProducerUI "ui"

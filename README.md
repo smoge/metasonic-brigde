@@ -252,7 +252,8 @@ The landed pieces are deliberately small:
   host for already-formed `SessionCommand`s from concrete producers.
 - `MetaSonic.Session.FanInService` adds a scoped background worker around that
   host. Successful enqueues wake one FIFO drain; stopped drains are reported,
-  and owner divergence terminates the worker instead of repairing the session.
+  owner divergence terminates the worker instead of repairing the session, and
+  teardown kills the worker if a service hook blocks during shutdown.
 - `MetaSonic.Session.OSCProducer` translates symbolic OSC control writes of
   the form `/<voice>/<tag>/<slot>` plus one numeric argument into
   `SessionCommand`s and submits them through `MetaSonic.Session.FanIn`.

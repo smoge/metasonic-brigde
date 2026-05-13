@@ -3034,7 +3034,8 @@ Session prep artifacts:
 - [Session Fan-In Drain Service](notes/2026-05-13-session-fan-in-drain-service.md)
   records the first scoped background worker around the generic fan-in
   host. Successful enqueues wake one FIFO drain; stopped drains are
-  reported and owner divergence terminates the worker. This is still not
+  reported, owner divergence terminates the worker, and teardown has a
+  bounded kill fallback if a service hook blocks. This is still not
   producer arbitration beyond FIFO, GUI toolkit integration, live MIDI
   listener ownership, broad OSC policy, long-running supervision, or
   divergence repair.
@@ -3160,7 +3161,10 @@ Landed prep contracts:
   incomplete migration. Prep P tests cover FIFO drain across OSC/MIDI
   producer identities, queue-full rejection through the host,
   concurrent enqueue serialization, and divergence leaving the
-  unprocessed tail queued. The MIDI producer adapter tests cover
+  unprocessed tail queued. Fan-in service tests cover bracket cleanup,
+  wake-on-enqueue draining, OSC producer composition, divergence
+  reporting with worker exit, and blocked-hook teardown via kill
+  fallback. The MIDI producer adapter tests cover
   note-on/off translation, note-on velocity-zero release semantics,
   configured frequency/gate/velocity initial controls, deterministic CC
   fanout over active notes, explicit invalid/unmapped rejection,
