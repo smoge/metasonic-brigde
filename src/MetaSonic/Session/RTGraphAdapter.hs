@@ -8,8 +8,9 @@
 --
 -- This module starts the real-runtime side of Session Prep E without
 -- creating a session owner. The functions here operate on a
--- caller-owned 'RTGraph' handle and prepare it for the future
--- 'SessionRuntimeAdapter IO' constructor.
+-- caller-owned 'RTGraph' handle. The adapter constructor installs
+-- graph metadata and returns a 'SessionRuntimeAdapter IO'; plan
+-- execution lands in the following Prep E slices.
 --
 -- See [notes/2026-05-12-session-prep-e-rtgraph-adapter.md].
 
@@ -30,6 +31,9 @@ module MetaSonic.Session.RTGraphAdapter
   , SessionAdapterSetupIssue (..)
   , SessionPrewarmIssue (..)
 
+    -- * Adapter scaffold
+  , newRTGraphAdapter
+
     -- * Session-mode graph install
   , installSessionGraph
   ) where
@@ -38,6 +42,7 @@ import           Control.DeepSeq            (NFData)
 import           Control.Exception          (SomeException, displayException,
                                              try)
 import           Control.Monad              (foldM, forM_)
+import           Data.IORef                 (IORef, newIORef, readIORef)
 import qualified Data.Map.Strict            as Map
 import qualified Data.Set                   as Set
 import           Foreign.C.Types            (CInt)
@@ -53,6 +58,10 @@ import           MetaSonic.Bridge.Templates (BufferFootprint (..),
                                              ResourceFootprint (..),
                                              Template (..), TemplateGraph (..))
 import           MetaSonic.Pattern          (TemplateName (..))
+import           MetaSonic.Session.Runtime  (SessionRuntimeAdapter (..),
+                                             SessionRuntimeIssue (..),
+                                             SessionRuntimeSuccess)
+import           MetaSonic.Session.State    (SessionPlan (..))
 
 
 -- | Construction-time sizing policy for session-mode graph install.
@@ -111,6 +120,38 @@ data SessionAdapterSetupIssue
   | SasiPrewarmFailed !TemplateName !SessionPrewarmIssue
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
+
+-- | Private mutable metadata captured by the IO adapter.
+--
+-- This is not a session owner. The pure 'SessionState' remains the
+-- caller-visible source of truth; the IORef only lets future plan
+-- execution slices update runtime lookup metadata after a constrained
+-- graph install.
+newtype RTGraphAdapterEnv = RTGraphAdapterEnv
+  { rtaeState :: IORef RTGraphAdapterState
+  }
+
+-- | Install a graph in session mode and return an adapter shell for
+-- 'MetaSonic.Session.Step.stepSessionCommand'.
+--
+-- Prep E lands this constructor before plan execution. Until the
+-- voice/control execution slice fills in the cases, running the
+-- adapter returns 'SriAdapterReason' rather than mutating runtime or
+-- session state.
+newRTGraphAdapter
+  :: Ptr RTGraph
+  -> TemplateGraph
+  -> RTGraphAdapterOptions
+  -> IO (Either SessionAdapterSetupIssue (SessionRuntimeAdapter IO))
+newRTGraphAdapter rt tg opts = do
+  installed <- installSessionGraph rt tg opts
+  case installed of
+    Left issue ->
+      pure (Left issue)
+    Right st -> do
+      ref <- newIORef st
+      pure (Right (SessionRuntimeAdapter
+        (runRTGraphAdapter (RTGraphAdapterEnv ref))))
 
 -- | Install a 'TemplateGraph' in session mode.
 --
@@ -249,3 +290,21 @@ configuredPrewarmCount opts tpl
 templateWritesBuffer :: Template -> Bool
 templateWritesBuffer tpl =
   not (Set.null (bfBufWrites (rfBuffers (tplFootprint tpl))))
+
+runRTGraphAdapter
+  :: RTGraphAdapterEnv
+  -> SessionPlan
+  -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
+runRTGraphAdapter env plan = do
+  -- Keep the closure tied to installed runtime metadata in this
+  -- scaffold; later slices consume the state for real plan execution.
+  _ <- readIORef (rtaeState env)
+  pure (Left (SriAdapterReason
+    ("RTGraphAdapter plan execution not implemented: " <> sessionPlanLabel plan)))
+
+sessionPlanLabel :: SessionPlan -> String
+sessionPlanLabel plan = case plan of
+  PlanVoiceStart {}   -> "PlanVoiceStart"
+  PlanVoiceStop {}    -> "PlanVoiceStop"
+  PlanControlWrite {} -> "PlanControlWrite"
+  PlanHotSwap {}      -> "PlanHotSwap"

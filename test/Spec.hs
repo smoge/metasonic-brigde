@@ -12824,6 +12824,27 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
         instanceCount <- c_rt_graph_instance_count rt
         templateCount @?= 1
         instanceCount @?= 1
+
+  , testCase "adapter constructor installs graph and returns scaffolded adapter" $ do
+      let tg         = patternTemplates droneVibrato
+          totalNodes = totalTemplateNodes tg
+      withRTGraph (totalNodes + 8) 64 $ \rt -> do
+        result <- newRTGraphAdapter rt tg defaultRTGraphAdapterOptions
+        case result of
+          Left issue ->
+            assertFailure ("expected RTGraph adapter, got: " <> show issue)
+          Right adapter -> do
+            slot <- c_rt_graph_realtime_reserve rt 0
+            assertBool ("expected constructor to prewarm reservable slot, got "
+                        <> show slot)
+                       (slot >= 0)
+            c_rt_graph_realtime_cancel rt slot
+
+            outcome <- sraRun adapter
+              (PlanVoiceStart (TemplateName "drone") (VoiceKey "v1") [])
+            outcome @?= Left
+              (SriAdapterReason
+                 "RTGraphAdapter plan execution not implemented: PlanVoiceStart")
   ]
   where
     totalTemplateNodes tg =
