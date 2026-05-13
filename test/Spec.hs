@@ -12595,6 +12595,22 @@ sessionStepTests = testGroup "Session Prep D: runtime adapter shell"
         @?= SessionAdmitted cmd
               (PlanControlWrite binding (ControlTag (MigrationKey "lpf") 0) 1800.0)
 
+  , testCase "commit-shaped success on control-write is a commit mismatch" $ do
+      let graph   = patternTemplates droneVibrato
+          binding = VoiceBinding (VoiceKey "v0") 17 (TemplateName "drone")
+          st0     = applySessionCommit
+                      (CommitVoiceStarted binding)
+                      (initialSessionState graph)
+          commit  = CommitVoiceStopped (VoiceKey "v0")
+          adapter = constantAdapter (Right (RuntimeCommitted commit))
+          cmd     = CmdControlWrite
+                      (VoiceKey "v0")
+                      (ControlTag (MigrationKey "lpf") 0)
+                      1800.0
+      result <- stepSessionCommand adapter cmd st0
+      result @?= StepCommitMismatch SciControlPlanHasNoStateCommit
+      ssVoices (applySessionCommit commit st0) @?= M.empty
+
   , testCase "hot-swap success returns commit-time ResolveRebuildResult" $ do
       let oldGraph = patternTemplates droneVibrato
           newGraph = patternTemplates polyphonicStab
