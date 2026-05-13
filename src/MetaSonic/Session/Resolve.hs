@@ -6,10 +6,10 @@
 -- Module      : MetaSonic.Session.Resolve
 -- Description : Pure OSC resolve-state rebuild for session hot-swap prep.
 --
--- This module defines the pure recovery step for a future session
--- hot-swap policy. After a new 'TemplateGraph' has installed
--- successfully, the OSC address space can be rebuilt from the voices
--- that survived the swap.
+-- This module defines the pure recovery step for session hot-swap
+-- policy. After a new 'TemplateGraph' has installed successfully, the
+-- OSC address space can be rebuilt from the voices that survived the
+-- swap.
 --
 -- The rebuild policy is intentionally narrow:
 --
@@ -48,8 +48,8 @@ import           MetaSonic.Pattern          (TemplateName (..), VoiceKey (..))
 
 -- | A voice binding the session wants to preserve across a graph
 -- hot-swap. The binding is symbolic at the edge ('VoiceKey' and
--- 'TemplateName') plus the runtime voice slot assigned by the future
--- session owner.
+-- 'TemplateName') plus the runtime voice slot assigned by the session
+-- owner.
 data VoiceBinding = VoiceBinding
   { vbVoiceKey     :: !VoiceKey
     -- ^ Symbolic identifier used by OSC, Pattern, and other producers.

@@ -6,10 +6,11 @@
 -- Module      : MetaSonic.Session.Runtime
 -- Description : Narrow adapter vocabulary for the Session Prep D shell.
 --
--- This module defines the injected adapter contract a future runtime
--- owner will satisfy. It does not own an 'RTGraph', does not call
--- FFI, does not assume a queue, and does not depend on a C++ session
--- object. Mock adapters live entirely in test code.
+-- This module defines the injected adapter contract consumed by
+-- 'MetaSonic.Session.Step'. It does not own an 'RTGraph', does not
+-- call FFI, does not assume a queue, and does not depend on a C++
+-- session object. Mock adapters live in tests; the real adapter lives
+-- in 'MetaSonic.Session.RTGraphAdapter'.
 --
 -- See [notes/2026-05-12-session-prep-d-runtime-adapter-shell.md].
 

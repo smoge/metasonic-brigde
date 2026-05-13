@@ -2923,10 +2923,10 @@ Session prep artifacts:
   records the first real adapter over a caller-owned `RTGraph`.
   It reuses `loadTemplateGraphWithAutoSpawns` and the existing
   `rt_graph_realtime_*` ABI, supports voice start/stop and symbolic
-  control writes, and implements only constrained graph installs:
-  empty-session or drop-all swaps may install, but swaps that would
-  preserve live voices are rejected. This is still not the runtime
-  session layer.
+  control writes, and at that slice implemented only constrained graph
+  installs: empty-session or drop-all swaps could install, while swaps
+  that would preserve live voices were rejected until Prep N/O. This is
+  still not the runtime session layer.
 - [Session Prep F - Single-Threaded Runtime Owner](notes/2026-05-12-session-prep-f-runtime-owner.md)
   records the first scoped Haskell owner for a real `RTGraph` adapter.
   It exposes `withSessionOwner`, `stepSessionOwner`, owner state/status
@@ -2966,12 +2966,12 @@ Session prep artifacts:
   implementation.
 - [Session Prep K - Preserving Hot-Swap Decision](notes/2026-05-13-session-prep-k-preserving-hot-swap-decision.md)
   records the policy gate for preserving hot-swap before broadening
-  producer fan-in. It keeps the current real-adapter rejection in place,
-  requires execution-time preview rebuilds, defines how stale queued
-  commands should be interpreted after a successful swap, and leaves the
-  runtime choice between slot/state migration and session-level respawn
-  to a later implementation slice. The first implementation slice after
-  this decision should keep the Prep K lineage explicit.
+  producer fan-in. It kept the then-current real-adapter rejection in
+  place, required execution-time preview rebuilds, defined how stale
+  queued commands should be interpreted after a successful swap, and
+  left the runtime choice between slot/state migration and
+  session-level respawn to a later implementation slice. Prep N/O are
+  the follow-up implementation lineage.
 - Session Prep L - Preserving Hot-Swap Semantics Tests
   (`test/Spec.hs`) pins the Prep K stale-queue/session-state edge cases:
   execution-time hot-swap preview after earlier queued work, second
@@ -3057,6 +3057,10 @@ Landed prep contracts:
 - [x] Preserving hot-swap strategy evidence selecting a narrow
   runtime-migration-backed first implementation and deferring
   session-level respawn to unsupported/reset-policy cases.
+- [x] Supported preserving hot-swap runtime migration in the real
+  `RTGraph` session adapter for eligible oscillator/filter voices,
+  preserving surviving `VoiceKey`/slot bindings and rejecting
+  unsupported stateful shapes non-terminally.
 - [x] Live-audio preserving hot-swap orchestration contract defining
   publish/wait/collect/verify/commit sequencing and post-publish
   failure classification.
@@ -3131,14 +3135,16 @@ Still gated:
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
 
-Current decision: treat Prep F/G/H/I as the first runtime ownership,
-producer-ingress, and scripted-runner boundaries, not as the full session
-runtime. Do not promote them into a producer-facing session service until
-concrete OSC/MIDI/UI ingress, arbitration beyond FIFO, unsupported
+Current decision: treat Prep F through Prep P as the current
+library-side session substrate: scoped owner, producer queue, Pattern
+bridge/runner/host, preserving-hot-swap policy and implementation,
+live-audio install orchestration, and generic serialized fan-in. Do not
+promote this into a full producer-facing session service until concrete
+OSC/MIDI/UI ingress, arbitration beyond FIFO, unsupported
 respawn/reset policy, background-service ownership of the live-audio
 hot-swap path, and recovery policies are specified and tested in their
-own slices. The
-session does not need a generated fusion executor to ship;
+own slices. The session does not need a generated fusion executor to
+ship;
 generated execution remains a read-only diagnostic/performance
 experiment unless later measurements justify automatic turn-on.
 

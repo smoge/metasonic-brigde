@@ -8,12 +8,15 @@
 -- Description : Session-mode helpers for a caller-owned RTGraph.
 --
 -- This module starts the real-runtime side of Session Prep E without
--- creating a session owner. The functions here operate on a
+-- creating a session owner, and now also hosts the Prep N/O supported
+-- preserving hot-swap path. The functions here operate on a
 -- caller-owned 'RTGraph' handle. The adapter constructor installs
 -- graph metadata and returns a 'SessionRuntimeAdapter IO' for the
--- v1 voice/control/constrained-install surface.
+-- voice/control/install surface.
 --
--- See [notes/2026-05-12-session-prep-e-rtgraph-adapter.md].
+-- See [notes/2026-05-12-session-prep-e-rtgraph-adapter.md],
+-- [notes/2026-05-13-session-prep-n-preserving-hot-swap-runtime-migration.md],
+-- and [notes/2026-05-13-session-prep-o-live-audio-preserving-hot-swap.md].
 
 module MetaSonic.Session.RTGraphAdapter
   ( -- * Options
@@ -196,9 +199,10 @@ data PreservingBuilderMeta = PreservingBuilderMeta
 -- 'MetaSonic.Session.Step.stepSessionCommand'.
 --
 -- The returned adapter supports voice start, voice stop, control
--- writes, and constrained graph installs. It is still not a session
--- owner and it still relies on the caller to serialize producer calls
--- per the realtime ABI's single-producer contract.
+-- writes, dropping/empty graph installs, and supported preserving
+-- hot-swaps. It is still not a session owner and it still relies on
+-- the caller to serialize producer calls per the realtime ABI's
+-- single-producer contract.
 newRTGraphAdapter
   :: Ptr RTGraph
   -> TemplateGraph
@@ -775,9 +779,8 @@ runHotSwap
   -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
 -- If 'installSessionGraph' fails after the loader's clear path, the
 -- runtime may be in an indeterminate state while the caller-visible
--- 'SessionState' still claims the old graph. Recovery semantics are
--- deferred to a later runtime-owner slice; for Prep E, the adapter
--- should be treated as unsafe to reuse after this failure.
+-- 'SessionState' still claims the old graph. The owner treats this as
+-- terminal divergence; this adapter does not attempt in-place repair.
 runHotSwap env current label graph preview
   | not (null preservedBindings) =
       case preservingHotSwapPlan current graph preview of

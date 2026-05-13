@@ -214,7 +214,7 @@ Session Prep A is not allowed to add:
 
 Add a small library module, tentatively
 `MetaSonic.Session.Command`, that defines the high-level command
-vocabulary consumed by a future session owner.
+vocabulary consumed by later session-owner code.
 
 The v1 command surface should be producer-neutral:
 
@@ -304,7 +304,7 @@ duplicating validation. A likely shape is:
 4. accumulate dropped bindings in declaration order.
 
 The helper does not install graphs. It only computes the resolve state
-a future session owner should swap in after install succeeds.
+a session owner should swap in after install succeeds.
 
 ## Contract 3: Lifecycle Reports
 
@@ -339,7 +339,7 @@ Readers may use existing FFI diagnostics:
 
 This is not a resource allocator, not a buffer slot inventory, and not a
 plugin loading API. It is only the producer-facing state snapshot that a
-future session can render or log outside the audio thread.
+session owner can render or log outside the audio thread.
 
 If the current FFI surface cannot expose one field without a new ABI
 entry, prefer narrowing the v1 report over adding C++ API in this prep

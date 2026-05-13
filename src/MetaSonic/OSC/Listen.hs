@@ -13,11 +13,11 @@
 -- a supplied 'RTGraph' handle and 'IORef' 'ResolveState'. No CLI,
 -- no audio-thread substrate, no new realtime ABI.
 --
--- Single-producer assumption: the listener is the sole writer to
--- the runtime's realtime control queue from this surface. Mixing
--- OSC with another producer (a future 6.A pattern driver) is out
--- of v1 scope (mirrors §5.3's single-producer / single-collector
--- limitation).
+-- Standalone-listener assumption: this module writes directly to the
+-- runtime's realtime control queue from one OSC listener. Mixing OSC
+-- with Pattern, MIDI, or UI producers belongs above this surface, via
+-- the session command/fan-in modules; this listener intentionally has
+-- no arbitration policy or background session ownership.
 --
 -- See the §6.B design note for scope and architecture decisions.
 

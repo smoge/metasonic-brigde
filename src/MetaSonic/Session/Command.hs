@@ -6,10 +6,10 @@
 -- Module      : MetaSonic.Session.Command
 -- Description : Intent-based vocabulary for session orchestration.
 --
--- This module defines a structural contract for the future session
--- layer. It is the narrow waist between input producers such as
--- patterns, OSC, MIDI, and future authoring/UI actions, and the later
--- execution layer that validates and applies those requests.
+-- This module defines the structural contract for the session layer.
+-- It is the narrow waist between input producers such as patterns,
+-- OSC, MIDI, and authoring/UI actions, and the execution modules that
+-- validate and apply those requests.
 --
 -- === Architectural scope
 --
@@ -46,13 +46,12 @@ import           MetaSonic.Pattern          (ControlTag, PatternEvent (..),
                                              VoiceKey)
 
 
--- | Producer-agnostic command vocabulary for a future session owner.
+-- | Producer-agnostic command vocabulary for session owners.
 --
 -- While these constructors intentionally mirror 'PatternEvent', they
 -- serve a different architectural purpose. 'PatternEvent' represents
 -- one producer's output; 'SessionCommand' is the normalized request
--- format that the session layer can validate before eventual
--- execution.
+-- format that the session layer validates before execution.
 data SessionCommand
   = CmdVoiceOn      !TemplateName !VoiceKey ![(ControlTag, Value)]
     -- ^ Request instantiation of one named-template voice with
@@ -63,16 +62,16 @@ data SessionCommand
     -- ^ Request a symbolic control write against a live voice.
   | CmdHotSwap      !SwapLabel !TemplateGraph
     -- ^ Request installation of a precompiled replacement template
-    -- graph. Install timing and safety policy belong to the future
-    -- session owner, not this vocabulary module.
+    -- graph. Install timing and safety policy belong to the session
+    -- state/owner/adapter layers, not this vocabulary module.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
 -- | High-level diagnostic reasons for command rejection.
 --
 -- This set is intentionally minimal. Detailed runtime, allocation,
--- driver, and install failures belong to the later session-execution
--- slice.
+-- driver, and install failures belong to runtime/adapter result types
+-- rather than this producer-facing ADT.
 data SessionIssue
   = SiUnknownTemplate !TemplateName
   | SiInvalidVoiceKey !VoiceKey

@@ -14,7 +14,8 @@
 --
 -- It is still caller-driven. It does not create a background worker,
 -- does not define a realtime clock, does not add concrete OSC/MIDI/UI
--- adapters, and does not implement preserving hot-swap recovery.
+-- adapters, and does not define its own hot-swap recovery policy; it
+-- inherits owner/adapter behavior.
 --
 -- See [notes/2026-05-13-session-prep-j-thread-safe-host.md].
 

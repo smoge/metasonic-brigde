@@ -267,8 +267,8 @@ Stopping on divergence is important. Once the owner is terminally
 diverged, later commands must not keep producing repeated runtime calls
 or misleading failure reports. The caller can inspect `sdrStopped` and
 decide whether to discard the remaining commands, report them as
-blocked, or preserve them for a future owner after explicit recovery
-work exists.
+blocked, or preserve them for a later owner after explicit recovery work
+exists.
 
 The drain is unbounded in v1. A future concrete producer-loop slice can
 add a bounded drain helper, for example a max-items parameter, without

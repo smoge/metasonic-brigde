@@ -14,7 +14,7 @@ Add a Haskell-only plan/commit handshake on top of Session Prep B:
 1. `admitSessionCommand` remains the only command admission entry
    point. It returns either a rejected command or an admitted
    `SessionPlan`.
-2. Runtime work remains outside this layer. A future session owner may
+2. Runtime work remains outside this layer. A later session owner may
    allocate voices, stop voices, install graphs, or write controls
    after reading the plan.
 3. Successful runtime work must come back as a `SessionCommit`.
@@ -27,10 +27,10 @@ Add a Haskell-only plan/commit handshake on top of Session Prep B:
    C++ session object, no realtime queue, no manifest reload, no MIDI
    or OSC producer arbitration, and no runtime allocation.
 
-The goal is to prevent a future runtime shell from accidentally
-feeding a successful runtime fact into the wrong admitted plan. Prep B
-made admission and commit separate. Prep C makes their relationship
-explicit and testable.
+The goal is to prevent a runtime shell from accidentally feeding a
+successful runtime fact into the wrong admitted plan. Prep B made
+admission and commit separate. Prep C makes their relationship explicit
+and testable.
 
 ## Recap: What Prep A And B Already Landed
 
@@ -84,12 +84,12 @@ Session Prep B added pure admission and commit state:
 
 Prep B deliberately leaves one gap open: `applySessionCommit` can apply
 any `SessionCommit` to any `SessionState`. That is useful as a small
-primitive, but it is too permissive for the future runtime shell. Prep C
-fills that gap without creating the shell.
+primitive, but it is too permissive for a runtime shell. Prep C fills
+that gap without creating the shell.
 
 ## Why This Comes Next
 
-The future session owner will likely follow this shape:
+The session owner follows this shape:
 
 1. receive a `SessionCommand` from Pattern, OSC, MIDI, or a UI;
 2. call `admitSessionCommand`;
@@ -194,7 +194,7 @@ The commit matches when:
 - `vbTemplateName binding == planned TemplateName`.
 
 The runtime slot in `VoiceBinding` is intentionally not predicted by
-the plan. Prep B leaves slot allocation to the future runtime owner.
+the plan. Prep B leaves slot allocation to the runtime owner.
 Therefore any `vbSlotId` is accepted as long as the voice key and
 template match.
 
@@ -234,8 +234,8 @@ Expected commit:
     none
 
 Prep B intentionally has no `CommitControlWritten`: symbolic control
-writes have no state to mutate at this layer. A future runtime shell
-can report acknowledgements directly from the plan or a later execution
+writes have no state to mutate at this layer. A runtime shell can
+report acknowledgements directly from the plan or a later execution
 result vocabulary.
 
 Well-behaved runtime shells should not call `applyPlannedCommit` for

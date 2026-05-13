@@ -12,12 +12,12 @@ another phase label.
 
 ## Decision
 
-Keep the current runtime adapter behavior for now:
+Keep the then-current runtime adapter behavior for this decision slice:
 
 - empty-session graph installs may proceed;
 - swaps that drop all active voices may proceed;
-- swaps that would preserve live voices remain rejected by the real
-  `RTGraph` adapter until a later implementation slice chooses a
+- swaps that would preserve live voices were to remain rejected by the
+  real `RTGraph` adapter until a later implementation slice chose a
   concrete preservation strategy.
 
 The next implementation work must not treat queued `PEHotSwap` as just
@@ -28,7 +28,7 @@ preserving hot-swap needs a policy for stale queued commands, resolve
 state, live voice bindings, DSP state, and failed installs before more
 producer fan-in or background draining is added.
 
-## Current Ground Truth
+## Prep K Ground Truth
 
 The pure session layer can preview and commit a hot-swap against
 `SessionState`. Its resolve rebuild keeps symbolic voice bindings whose
@@ -40,8 +40,8 @@ and rebuilds runtime graph state. If pure session state claimed a voice
 survived while the runtime had actually cleared that slot, callers would
 observe a false live binding.
 
-For that reason, the real adapter rejects preserving swaps today. This
-is a deliberate correctness boundary, not a missing queue feature.
+For that reason, the Prep K real-adapter rejection was a deliberate
+correctness boundary, not a missing queue feature.
 
 ## Execution-Time Semantics
 
@@ -91,10 +91,11 @@ preserving implementation lands:
    no longer exposes an old control tag such as `cutoff`.
 3. A later queued `PEControlWrite vLead cutoff value` is interpreted
    against `graphA` and the post-swap binding table. It must not be
-   silently ignored. With today's split, this would admit by `VoiceKey`
-   and fail as a non-terminal runtime/control-target rejection; a later
-   design may move that validation into pure admission, but it must
-   still be an explicit command failure rather than owner divergence.
+  silently ignored. With the Prep K split, this would admit by
+  `VoiceKey` and fail as a non-terminal runtime/control-target
+  rejection; a later design may move that validation into pure
+  admission, but it must still be an explicit command failure rather
+  than owner divergence.
 4. A later queued `PEVoiceOff vPad` is rejected against the post-swap
    `SessionState` as a stale voice, with no runtime adapter call and no
    owner divergence.
@@ -129,8 +130,9 @@ install, and respawn operation. It may be audible. The commit vocabulary
 would need to carry the replacement bindings returned by runtime
 execution.
 
-That is a mandatory surface change for this strategy: today's
-`CommitGraphInstalled label graph` carries no replacement bindings.
+That is a mandatory surface change for this strategy: the
+`CommitGraphInstalled label graph` shape carries no replacement
+bindings.
 Session respawn would either need to extend that constructor or add a
 new graph-installed commit that includes the replacement
 `VoiceBinding`s. Runtime migration does not require that payload if the
@@ -177,8 +179,8 @@ installation transactional.
   existing queue shape, but should not force preserving hot-swap policy.
 - Background drain loops and thread-safe fan-in beyond the Pattern host
   remain deferred until preserving swap execution semantics are tested.
-- The current rejection of preserving hot-swap by the real adapter
-  remains correct for v1.
+- The then-current rejection of preserving hot-swap by the real adapter
+  remained correct for the Prep K boundary.
 - The next preserving-hot-swap implementation slice should start with
   tests for execution-time preview rebuild, stale queued commands, and
   failed-install divergence before adding runtime migration or respawn

@@ -122,14 +122,14 @@ semantic bug.
 
 ## Session Adapter Gap
 
-The current `MetaSonic.Session.RTGraphAdapter` hot-swap path does not
-use the live-swap substrate. `runHotSwap` calls `installSessionGraph`,
-and `installSessionGraph` uses the loader's clear/rebuild path, removes
-loader-created auto-spawned instances, then prewarms future realtime
-reservation slots.
+Before Prep N, the `MetaSonic.Session.RTGraphAdapter` hot-swap path did
+not use the live-swap substrate. `runHotSwap` called
+`installSessionGraph`, and `installSessionGraph` used the loader's
+clear/rebuild path, removed loader-created auto-spawned instances, then
+prewarmed future realtime reservation slots.
 
-That is why Prep E correctly rejects preserving swaps today: the
-session adapter has no path that prepares a next world with active
+That is why Prep E correctly rejected preserving swaps before Prep N:
+the session adapter had no path that prepared a next world with active
 slots matching the preserved `VoiceBinding` values.
 
 The implementation gap is therefore not "invent hot-swap." It is:

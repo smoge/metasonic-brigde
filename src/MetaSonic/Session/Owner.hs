@@ -6,10 +6,11 @@
 -- Module      : MetaSonic.Session.Owner
 -- Description : Single-threaded runtime owner for session commands.
 --
--- This module starts Session Prep F by defining the owner vocabulary
--- and the first single-threaded owner operations. It owns a scoped
--- runtime handle through 'withSessionOwner' and composes the Prep D/E
--- step path without adding producer fan-in or a realtime queue.
+-- This module defines the Session Prep F owner vocabulary and
+-- single-threaded owner operations. It owns a scoped runtime handle
+-- through 'withSessionOwner' and composes the Prep D/E step path. The
+-- owner itself does not add producer fan-in or a realtime queue; later
+-- modules wrap it when they need those boundaries.
 --
 -- The 'SessionOwner' constructor is intentionally hidden. Callers must
 -- not fabricate owner values or manage the underlying runtime pieces

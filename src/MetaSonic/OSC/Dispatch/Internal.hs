@@ -66,9 +66,10 @@ import           MetaSonic.Types            (NodeIndex)
 -- them, and hot-swaps the ensemble.
 --
 -- Constructor is hidden so the IO layer is forced through the
--- update helpers — they are the natural place to enforce the
--- OSC-safe identifier profile and the §5.4.C re-resolution
--- discipline once a hot-swap lands.
+-- update helpers. They enforce the OSC-safe identifier profile for
+-- direct table edits. Session graph installs should rebuild the OSC
+-- table through 'MetaSonic.Session.Resolve.rebuildResolveState' so
+-- stale voice bindings are diagnosed at commit time.
 data ResolveState = ResolveState
   { _rsTemplate :: !TemplateGraph
   , _rsVoices   :: !(M.Map ByteString (Int, ByteString))
@@ -132,11 +133,12 @@ dropVoice :: ByteString -> ResolveState -> ResolveState
 dropVoice key rs =
   rs { _rsVoices = M.delete key (_rsVoices rs) }
 
--- | Replace the active 'TemplateGraph'. The IO layer calls this
--- on hot-swap (§5.3 helpers). Voices in the table remain by key,
--- but a subsequent dispatch may surface 'DiMissingTemplateForVoice'
--- if the new ensemble does not carry the voice's template name —
--- mirroring §6.A's @HotSwapTemplateLost@ behavior.
+-- | Low-level replacement helper for the active 'TemplateGraph'.
+-- Existing voice bindings remain by key, so a subsequent dispatch may
+-- surface 'DiMissingTemplateForVoice' if the new ensemble does not
+-- carry a voice's template name. Session hot-swap code should prefer
+-- 'MetaSonic.Session.Resolve.rebuildResolveState' when it wants stale
+-- bindings dropped and reported during the commit.
 installTemplateGraph :: TemplateGraph -> ResolveState -> ResolveState
 installTemplateGraph tg rs = rs { _rsTemplate = tg }
 

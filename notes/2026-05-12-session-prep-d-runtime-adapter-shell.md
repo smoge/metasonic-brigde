@@ -4,7 +4,7 @@ Date: 2026-05-12
 
 Status: decision artifact for the next non-runtime session-prep slice.
 This still does not introduce a runtime session owner. It defines the
-narrow adapter vocabulary a future owner will inject, and a pure
+narrow adapter vocabulary a later owner will inject, and a pure
 single-step orchestrator that pins how admission, runtime work, and the
 plan/commit handshake compose.
 

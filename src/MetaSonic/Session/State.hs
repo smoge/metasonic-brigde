@@ -7,7 +7,7 @@
 -- Description : Pure session admission and commit state.
 --
 -- This module is the Session Prep B boundary between producer intent
--- and later runtime execution. Admission is read-only: it validates a
+-- and runtime execution. Admission is read-only: it validates a
 -- 'SessionCommand' and returns a 'SessionPlan'. State changes only
 -- when the caller applies a 'SessionCommit' after the corresponding
 -- runtime action has succeeded.
@@ -56,8 +56,8 @@ import           MetaSonic.Session.Resolve  (ResolveRebuildIssue (..),
                                              rebuildResolveState)
 
 
--- | Pure session-visible state. This mirrors facts a future session
--- owner can reason about; it is not runtime ownership.
+-- | Pure session-visible state. This mirrors facts the session owner
+-- can reason about; it is not runtime ownership.
 data SessionState = SessionState
   { ssGraph   :: !TemplateGraph
   , ssVoices  :: !(M.Map VoiceKey VoiceBinding)
@@ -75,7 +75,7 @@ initialSessionState tg = SessionState
   , ssResolve = emptyResolveState tg
   }
 
--- | Work a future runtime shell may attempt after admission.
+-- | Work a runtime adapter may attempt after admission.
 data SessionPlan
   = PlanVoiceStart !TemplateName !VoiceKey ![(ControlTag, Value)]
   | PlanVoiceStop !VoiceBinding

@@ -2,8 +2,8 @@
 -- Module      : MetaSonic.Session.Report
 -- Description : Read-only session lifecycle reports.
 --
--- This module provides producer-facing snapshots for the future
--- session layer. It reads facts the runtime already exposes through
+-- This module provides producer-facing snapshots for the session
+-- layer. It reads facts the runtime already exposes through
 -- diagnostics counters and static metadata; it does not allocate
 -- buffers, load plugins, install graphs, or mutate runtime state.
 --
@@ -32,8 +32,8 @@ import           MetaSonic.Bridge.FFI     (PluginRegistryEntry, RTGraph,
                                            pluginRegistryEntries)
 
 
--- | Buffer counters visible to a future session owner. This is a
--- snapshot, not a buffer-slot inventory and not an allocation API.
+-- | Buffer counters visible to a session owner. This is a snapshot,
+-- not a buffer-slot inventory and not an allocation API.
 data BufferLifecycleReport = BufferLifecycleReport
   { blrReadCount         :: !Word64
   , blrInvalidReadCount  :: !Word64
@@ -41,9 +41,9 @@ data BufferLifecycleReport = BufferLifecycleReport
   , blrInvalidWriteCount :: !Word64
   } deriving (Eq, Show)
 
--- | Static plugin metadata and dispatch counters visible to a future
--- session owner. This is read-only registry/counter data; runtime
--- nodes still use integer plugin ids.
+-- | Static plugin metadata and dispatch counters visible to a session
+-- owner. This is read-only registry/counter data; runtime nodes still
+-- use integer plugin ids.
 data PluginLifecycleReport = PluginLifecycleReport
   { plrRegistered       :: ![PluginRegistryEntry]
   , plrCallCount        :: !Word64

@@ -7,8 +7,9 @@
 -- Description : Producer-ingress queue vocabulary for session owners.
 --
 -- This module defines Session Prep G's bounded producer queue. It sits
--- above 'MetaSonic.Session.Owner' and below future concrete Pattern,
--- OSC, MIDI, or UI producer adapters.
+-- above 'MetaSonic.Session.Owner' and below the concrete Pattern
+-- bridge, the generic fan-in host, and future OSC/MIDI/UI producer
+-- adapters.
 --
 -- The queue modeled here is a Haskell-side producer-intent queue. It
 -- is not the C++ realtime ABI queue, is not audio-thread visible, and

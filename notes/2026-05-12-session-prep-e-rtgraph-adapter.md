@@ -103,7 +103,7 @@ The realtime producer ABI already provides:
 
 That group is single-producer. It is safe while audio runs only when a
 single Haskell producer owns the calls. Prep E's adapter is that single
-producer for tests and for the future owner that injects it.
+producer for tests and for the owner that injects it.
 
 The reserve path does not grow the instance pool. The caller must
 prewarm available slots during construction or graph install. The
@@ -356,9 +356,9 @@ Both are outside Prep E.
 
 The adapter relies on the plan's preview because Prep D's
 `stepSessionCommand` runs admission and adapter execution against the
-same `SessionState`. A future queued or multi-step orchestrator would
-need the adapter or owner to recompute this policy against the current
-state at execution time.
+same `SessionState`. Later queued or multi-step orchestrators need the
+adapter or owner to recompute this policy against the current state at
+execution time.
 
 ## Runtime Issue Surface
 
@@ -454,7 +454,8 @@ Landed commit shape:
    `PlanVoiceStop`, and `PlanControlWrite` against the existing realtime
    ABI, including rollback on failed activation.
 6. **Constrained graph install.** Implement `PlanHotSwap` only for
-   empty/all-dropped voice cases; reject preserving swaps for now.
+   empty/all-dropped voice cases; leave preserving swaps rejected for
+   this slice.
 7. **IO-side step tests.** Drive the adapter through
    `stepSessionCommand` with `withRTGraph`. Pin at least:
    - voice-start success returns `StepCommitted` with the reserved slot
@@ -486,10 +487,11 @@ Steps 1-8 are now landed. Step 7 is covered by the accumulated
 voice start/stop, allocation failure, initial-control rollback,
 control write, empty-session hot-swap, drop-all hot-swap,
 preserving-swap rejection, structured install failure, and the
-`fromPatternEvent -> stepSessionCommand -> RTGraph` path. Step 8 is
-reflected in `ROADMAP.md`: the caller-owned RTGraph adapter is landed,
-while runtime ownership, realtime queueing, producer arbitration,
-preserving hot-swap, and recovery semantics remain gated.
+`fromPatternEvent -> stepSessionCommand -> RTGraph` path. Step 8 was
+reflected in `ROADMAP.md` for the Prep E slice: the caller-owned
+RTGraph adapter landed, while runtime ownership, realtime queueing,
+producer arbitration, preserving hot-swap, and recovery semantics
+remained gated until later prep slices.
 
 ## Verification
 

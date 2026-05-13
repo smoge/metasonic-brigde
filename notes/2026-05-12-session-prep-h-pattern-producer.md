@@ -326,12 +326,13 @@ alignment, lookahead, latency, and end-of-pattern behavior.
 
 `PEHotSwap` maps through `fromPatternEvent` to `CmdHotSwap`.
 
-Prep H should not add special hot-swap handling. The runtime policy is
-still owned by Prep E/F:
+Prep H should not add special hot-swap handling. At the Prep H slice,
+runtime policy was still owned by Prep E/F:
 
 - empty-session and drop-all constrained installs can commit;
-- swaps that would preserve live voices are rejected by the real
-  adapter as non-terminal runtime failures;
+- swaps that would preserve live voices were rejected by the real
+  adapter as non-terminal runtime failures until the later preserving
+  path landed;
 - failed installs can make the owner diverge.
 
 Pattern producer backlog must treat `PEHotSwap` like any other event:

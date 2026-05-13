@@ -141,7 +141,7 @@ detail should log the full admission result.
 
 ## Planned Actions
 
-Plans describe work the future runtime shell may attempt:
+Plans describe work a runtime shell may attempt:
 
     data SessionPlan
       = PlanVoiceStart TemplateName VoiceKey [(ControlTag, Value)]
