@@ -2857,9 +2857,10 @@ submission, and bounded backlog retry on full-queue rejection.
 enqueues one Pattern block or backlog retry, then drains once into a
 caller-owned `SessionOwner`. **Session Prep J** adds the first
 thread-safe Pattern host shell around that runner: a scoped owner plus
-Pattern producer and queue state serialized by an `MVar`. These slices
-still do not add a background drain loop, concrete OSC/MIDI/UI
-adapters, realtime command queue, or uninterrupted hot-swap claim.
+Pattern producer and queue state serialized by an `MVar`. At that
+point, these slices still did not add a background drain loop, concrete
+OSC/MIDI/UI adapters, realtime command queue, or uninterrupted
+hot-swap claim.
 **Session Prep K/L/M/N/O/P** then records the preserving-hot-swap
 decision, pins its stale-queue/session-state edge cases in tests,
 gathers the runtime evidence for migration over respawn, lands the
@@ -2867,7 +2868,14 @@ first narrow runtime-migration-backed preserving implementation for
 supported oscillator/filter voices, and extends that path to
 audio-running installs with generation-wait / retired-stat
 verification. Prep P then adds the generic serialized command fan-in
-host that concrete OSC/MIDI/UI producers can target.
+host that concrete producers can target. Follow-up OSC session-ingress
+slices add a shared symbolic control-write decoder, a
+`MetaSonic.Session.OSCProducer` adapter, and a session-backed UDP
+listener over the shared OSC listener socket loop. The session layer
+still does not ask the OSC listener itself to drain, add MIDI/UI
+adapters, add a realtime command queue, or make an uninterrupted
+hot-swap claim. A follow-up `MetaSonic.Session.FanInService` slice adds
+the first scoped background drain worker around the fan-in host.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2886,15 +2894,20 @@ producer-ingress ordering/backpressure layer, one concrete Pattern
 producer bridge, a caller-driven scripted Pattern runner, a serialized
 Pattern host, a preserving-hot-swap decision gate, semantics tests, and
 strategy evidence plus a supported stopped-audio preserving hot-swap
-path with live-audio generation-wait orchestration, and a generic
-serialized fan-in host. The remaining open work is not
+path with live-audio generation-wait orchestration, a generic
+serialized fan-in host, and symbolic OSC control-write ingress through
+that fan-in path, plus a minimal scoped background drain service around
+the fan-in host. The remaining open work is not
 "create an owner", "define a queue", "turn Pattern events into queued
 commands", "compose one Pattern runner step", "serialize one Pattern
 host", "decide preserving hot-swap semantics", or "choose the first
-preserving implementation strategy", or "create a generic fan-in host";
-it is concrete OSC/MIDI/UI producer adapters, arbitration beyond FIFO,
-background drain/lifecycle ownership, unsupported respawn/reset policy,
-and recovery mechanisms around that owner.
+preserving implementation strategy", "create a generic fan-in host", or
+"land the first OSC control-write producer/listener path", or "add a
+minimal scoped fan-in drain worker"; it is
+MIDI/UI producer adapters, any broader OSC behavior beyond symbolic
+control writes, arbitration beyond FIFO, long-running supervision
+beyond the scoped service, unsupported respawn/reset policy, and
+recovery mechanisms around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -3007,6 +3020,12 @@ Session prep artifacts:
   `SessionCommandQueue` behind an `MVar`, exposing enqueue, drain, and
   snapshot operations for already-formed `SessionCommand`s from OSC,
   MIDI, UI, Pattern, or future background producers.
+- [Session Fan-In Drain Service](notes/2026-05-13-session-fan-in-drain-service.md)
+  records the first scoped background worker around the generic fan-in
+  host. Successful enqueues wake one FIFO drain; stopped drains are
+  reported and owner divergence terminates the worker. This is still not
+  producer arbitration beyond FIFO, MIDI/UI translation, broad OSC
+  policy, long-running supervision, or divergence repair.
 
 Landed prep contracts:
 
@@ -3117,13 +3136,23 @@ Landed prep contracts:
   concurrent enqueue serialization, and divergence leaving the
   unprocessed tail queued.
 
+Recent OSC ingress follow-up: `MetaSonic.OSC.Dispatch.Internal` exposes
+the shared symbolic control-write decoder,
+`MetaSonic.Session.OSCProducer` translates one decoded control write
+into `CmdControlWrite` and submits it through the fan-in host, and
+`MetaSonic.Session.OSCListener` brackets a UDP listener on top of that
+producer using the shared OSC listener loop. This path only parses and
+enqueues; it does not by itself drain the host, resolve controls
+against a live runtime, or write the realtime control queue.
+
 Still gated:
 
-- [ ] Concrete OSC/MIDI/UI producer adapters that translate protocol
-  input into `SessionCommand`s for `MetaSonic.Session.FanIn`.
+- [ ] MIDI/UI producer adapters, plus any broader OSC producer scope
+  beyond the landed symbolic control-write path, that translate
+  protocol input into `SessionCommand`s for `MetaSonic.Session.FanIn`.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
-  throttling/coalescing, and any background drain loop around the
-  fan-in host.
+  throttling/coalescing, and drain scheduling beyond the scoped
+  wake-on-enqueue fan-in service.
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
@@ -3135,16 +3164,19 @@ Still gated:
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
 
-Current decision: treat Prep F through Prep P as the current
+Current decision: treat Prep F through Prep P, the OSC control-write
+ingress follow-up, and the minimal fan-in drain service as the current
 library-side session substrate: scoped owner, producer queue, Pattern
 bridge/runner/host, preserving-hot-swap policy and implementation,
-live-audio install orchestration, and generic serialized fan-in. Do not
+live-audio install orchestration, generic serialized fan-in, and a
+session-backed OSC control-write ingress path, plus a scoped
+wake-on-enqueue background drain worker. Do not
 promote this into a full producer-facing session service until concrete
-OSC/MIDI/UI ingress, arbitration beyond FIFO, unsupported
-respawn/reset policy, background-service ownership of the live-audio
-hot-swap path, and recovery policies are specified and tested in their
-own slices. The session does not need a generated fusion executor to
-ship;
+MIDI/UI ingress, broader OSC scope beyond symbolic control writes,
+arbitration beyond FIFO, unsupported respawn/reset policy,
+long-running ownership of the live-audio hot-swap path, and recovery
+policies are specified and tested in their own slices. The session does
+not need a generated fusion executor to ship;
 generated execution remains a read-only diagnostic/performance
 experiment unless later measurements justify automatic turn-on.
 

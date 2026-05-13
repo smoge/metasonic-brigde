@@ -25,6 +25,8 @@ module MetaSonic.Session.FanIn
     -- * Options
   , SessionFanInOptions (..)
   , defaultSessionFanInOptions
+  , SessionFanInHostHooks (..)
+  , defaultSessionFanInHostHooks
 
     -- * Setup issues
   , SessionFanInSetupIssue (..)
@@ -36,6 +38,7 @@ module MetaSonic.Session.FanIn
 
     -- * Scoped host
   , withSessionFanInHost
+  , withSessionFanInHostHooks
   , enqueueSessionFanInCommand
   , drainSessionFanInHost
   , readSessionFanInHost
@@ -59,7 +62,7 @@ import           MetaSonic.Session.Owner         (SessionOwner,
 import           MetaSonic.Session.Queue         (ProducerId,
                                                   SessionCommandQueue,
                                                   SessionDrainResult,
-                                                  SessionEnqueueResult,
+                                                  SessionEnqueueResult (..),
                                                   SessionQueueOptions,
                                                   SessionQueueSetupIssue,
                                                   defaultSessionQueueOptions,
@@ -77,6 +80,7 @@ import           MetaSonic.Session.State         (SessionState)
 data SessionFanInHost = SessionFanInHost
   { sfihOwner :: !SessionOwner
   , sfihQueue :: !(MVar SessionCommandQueue)
+  , sfihHooks :: !SessionFanInHostHooks
   }
 
 -- | Construction options for the generic fan-in host.
@@ -91,6 +95,21 @@ defaultSessionFanInOptions :: SessionFanInOptions
 defaultSessionFanInOptions = SessionFanInOptions
   { sfioQueueOptions = defaultSessionQueueOptions
   , sfioOwnerOptions = defaultSessionOwnerOptions
+  }
+
+-- | Optional host hooks.
+--
+-- The default hook preserves Prep P's caller-driven behavior. A later
+-- service can install a wakeup hook without changing producer APIs.
+data SessionFanInHostHooks = SessionFanInHostHooks
+  { sfihhOnEnqueued :: !(IO ())
+    -- ^ Called after a command is successfully queued.
+  }
+
+-- | Caller-driven fan-in host hooks.
+defaultSessionFanInHostHooks :: SessionFanInHostHooks
+defaultSessionFanInHostHooks = SessionFanInHostHooks
+  { sfihhOnEnqueued = pure ()
   }
 
 -- | Host construction failures from any owned subcomponent.
@@ -130,7 +149,17 @@ withSessionFanInHost
   -> SessionFanInOptions
   -> (SessionFanInHost -> IO a)
   -> IO (Either SessionFanInSetupIssue a)
-withSessionFanInHost graph opts action =
+withSessionFanInHost =
+  withSessionFanInHostHooks defaultSessionFanInHostHooks
+
+-- | Allocate a scoped fan-in host with explicit hooks.
+withSessionFanInHostHooks
+  :: SessionFanInHostHooks
+  -> TemplateGraph
+  -> SessionFanInOptions
+  -> (SessionFanInHost -> IO a)
+  -> IO (Either SessionFanInSetupIssue a)
+withSessionFanInHostHooks hooks graph opts action =
   case newSessionCommandQueue (sfioQueueOptions opts) of
     Left issue ->
       pure (Left (SfisiQueue issue))
@@ -141,6 +170,7 @@ withSessionFanInHost graph opts action =
           action SessionFanInHost
             { sfihOwner = owner
             , sfihQueue = queueVar
+            , sfihHooks = hooks
             }
       case ownerResult of
         Left issue ->
@@ -154,18 +184,24 @@ enqueueSessionFanInCommand
   -> SessionCommand
   -> SessionFanInHost
   -> IO SessionFanInEnqueueResult
-enqueueSessionFanInCommand producer cmd host =
-  modifyMVar (sfihQueue host) $ \queue -> do
-    let (queue', result) = enqueueSessionCommand producer cmd queue
+enqueueSessionFanInCommand producer cmd host = do
+  result <- modifyMVar (sfihQueue host) $ \queue -> do
+    let (queue', enqueueResult) = enqueueSessionCommand producer cmd queue
     pure
       ( queue'
       , SessionFanInEnqueueResult
           { sfierResult =
-              result
+              enqueueResult
           , sfierQueueDepth =
               queuedCommandCount queue'
           }
       )
+  case sfierResult result of
+    SessionEnqueued {} ->
+      sfihhOnEnqueued (sfihHooks host)
+    SessionEnqueueRejected {} ->
+      pure ()
+  pure result
 
 -- | Drain queued commands through the owned session owner.
 --

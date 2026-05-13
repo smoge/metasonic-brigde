@@ -153,6 +153,7 @@ import           MetaSonic.Session.PatternProducer
 import           MetaSonic.Session.Runner
 import           MetaSonic.Session.Host
 import           MetaSonic.Session.FanIn
+import           MetaSonic.Session.FanInService
 import           MetaSonic.Session.OSCProducer
 import qualified MetaSonic.Session.OSCListener as OSCS
 import qualified MetaSonic.Authoring         as Auth
@@ -205,6 +206,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionPreservingHotSwapSpecTests
   , sessionLiveHotSwapOrchestrationTests
   , sessionFanInHostTests
+  , sessionFanInServiceTests
   , sessionOSCProducerTests
   , sessionOSCListenerTests
   , patternCorpusTests
@@ -14861,6 +14863,165 @@ fanInQueuedOrFail result =
       pure queued
     other ->
       assertFailure ("expected fan-in enqueue success, got: " <> show other)
+
+------------------------------------------------------------
+-- Session fan-in drain service
+--
+-- This is the first minimal background lifecycle wrapper around the
+-- generic fan-in host. It wakes on successful enqueue, drains the
+-- existing FIFO host, reports stopped drains, and exits on owner
+-- divergence. It does not add MIDI policy or producer arbitration.
+------------------------------------------------------------
+
+sessionFanInServiceTests :: TestTree
+sessionFanInServiceTests =
+  testGroup "Session fan-in drain service"
+  [ testCase "bracket cleanup: body return tears down worker" $ do
+      result <-
+        withSessionFanInService
+          (patternTemplates droneVibrato)
+          defaultSessionFanInServiceOptions
+          $ \service -> readSessionFanInService service
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right snapshot -> do
+          sfisQueueDepth snapshot @?= 0
+          sfisOwnerStatus snapshot @?= SessionOwnerReady
+
+  , testCase "successful enqueue wakes background drain worker" $ do
+      let graph = patternTemplates droneVibrato
+          producer = testProducer ProducerUI "ui"
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq <- enqueueSessionFanInServiceCommand producer cmd service
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (enq, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (enq, Just drained, snapshot) -> do
+          queued <- fanInQueuedOrFail enq
+          case sdrItems (sfidrDrain drained) of
+            [SessionDrainItem drainedQueued
+              (SessionOwnerStep (StepCommitted _ Nothing))] ->
+                drainedQueued @?= queued
+            other ->
+              assertFailure
+                ("expected one committed background drain, got: "
+                 <> show other)
+          sdrRemaining (sfidrDrain drained) @?= 0
+          sdrStopped (sfidrDrain drained) @?= Nothing
+          sfidrQueueDepth drained @?= 0
+          sfisQueueDepth snapshot @?= 0
+          assertBool
+            "expected v0 in service owner state after background drain"
+            (M.member (VoiceKey "v0") (ssVoices (sfisOwnerState snapshot)))
+        Right (_enq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for service drain"
+
+  , testCase "service host wakes worker for OSC producer enqueue" $ do
+      let graph = patternTemplates droneVibrato
+          msg = OSC.OscMessage (OBSC.pack "/v0/lpf/0")
+                                [OSC.OscArgFloat 900.0]
+          expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              900.0
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq <-
+                enqueueOSCControlWrite
+                  defaultOSCProducerOptions
+                  msg
+                  (sessionFanInServiceHost service)
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (enq, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (OSCProducerEnqueueAttempted command enq, Just drained, snapshot) -> do
+          command @?= expected
+          queued <- fanInQueuedOrFail enq
+          qscCommand queued @?= expected
+          producerKind (qscProducer queued) @?= ProducerOSC
+          case map sdiResult (sdrItems (sfidrDrain drained)) of
+            [SessionOwnerStep (StepRejected (SiStaleVoice (VoiceKey "v0")))] ->
+              pure ()
+            other ->
+              assertFailure
+                ("expected stale OSC control-write drain, got: " <> show other)
+          sfidrQueueDepth drained @?= 0
+          sfisQueueDepth snapshot @?= 0
+        Right (_enq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for OSC service drain"
+        Right other ->
+          assertFailure ("expected OSC enqueue through service, got: "
+                         <> show other)
+
+  , testCase "divergent drain reports issue and stops worker" $ do
+      let oldGraph = patternTemplates droneVibrato
+          badGraph =
+            duplicateFirstTwoTemplates (patternTemplates arpeggioSendReturn)
+          producer = testProducer ProducerUI "ui"
+          setupIssue = SasiDuplicateTemplateName (TemplateName "dup")
+          divergedReason = SodHotSwapInstallFailed setupIssue
+          badCmd = CmdHotSwap (SwapLabel "bad-graph") badGraph
+          laterCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      issueVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnIssue = putMVar issueVar
+            }
+          oldGraph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq0 <- enqueueSessionFanInServiceCommand producer badCmd service
+              mIssue <- timeout 1000000 (takeMVar issueVar)
+              enq1 <- enqueueSessionFanInServiceCommand producer laterCmd service
+              snapshot <- readSessionFanInService service
+              pure (enq0, mIssue, enq1, snapshot)
+      case result of
+        Left serviceIssue ->
+          assertFailure ("expected fan-in service, got: " <> show serviceIssue)
+        Right (enq0, Just (SfsiiDrainStopped stopped), enq1, snapshot) -> do
+          queued0 <- fanInQueuedOrFail enq0
+          queued1 <- fanInQueuedOrFail enq1
+          sdrItems (sfidrDrain stopped) @?=
+            [ SessionDrainItem
+                queued0
+                (SessionOwnerDivergedNow
+                  (StepRuntimeFailed (SriHotSwapInstallFailed setupIssue))
+                  divergedReason)
+            ]
+          sdrRemaining (sfidrDrain stopped) @?= 0
+          sdrStopped (sfidrDrain stopped) @?= Just divergedReason
+          sfidrQueueDepth stopped @?= 0
+          qscSequence queued1 @?= CommandSequence 1
+          sfisQueueDepth snapshot @?= 1
+          sfisOwnerStatus snapshot @?= SessionOwnerDiverged divergedReason
+        Right (_enq0, Nothing, _enq1, _snapshot) ->
+          assertFailure "timed out waiting for service stopped-drain issue"
+  ]
 
 ------------------------------------------------------------
 -- Session OSC producer adapter

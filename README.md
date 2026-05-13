@@ -249,12 +249,22 @@ The landed pieces are deliberately small:
   producer, queue, and owner into caller-driven and thread-safe Pattern
   stepping helpers.
 - `MetaSonic.Session.FanIn` provides the generic serialized command-ingress
-  host for already-formed `SessionCommand`s from future concrete producers.
+  host for already-formed `SessionCommand`s from concrete producers.
+- `MetaSonic.Session.FanInService` adds a scoped background worker around that
+  host. Successful enqueues wake one FIFO drain; stopped drains are reported,
+  and owner divergence terminates the worker instead of repairing the session.
+- `MetaSonic.Session.OSCProducer` translates symbolic OSC control writes of
+  the form `/<voice>/<tag>/<slot>` plus one numeric argument into
+  `SessionCommand`s and submits them through `MetaSonic.Session.FanIn`.
+- `MetaSonic.Session.OSCListener` brackets a UDP OSC listener on top of that
+  producer. It only parses and enqueues; draining is owned by the caller or by
+  a composed `MetaSonic.Session.FanInService`.
 
-What is still intentionally absent: concrete OSC/MIDI/UI producer adapters,
-arbitration beyond FIFO, background drain/lifecycle ownership, unsupported
-respawn/reset policy for preserving swaps, manifest reload/resource allocation,
-and recovery after terminal runtime divergence.
+What is still intentionally absent: MIDI/UI producer adapters, broader OSC
+behavior beyond symbolic control writes, arbitration beyond FIFO, long-running
+supervision beyond the scoped fan-in service, unsupported respawn/reset policy
+for preserving swaps, manifest reload/resource allocation, and recovery after
+terminal runtime divergence.
 
 ---
 

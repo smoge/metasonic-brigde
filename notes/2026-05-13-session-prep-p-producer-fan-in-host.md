@@ -2,10 +2,10 @@
 
 Date: 2026-05-13
 
-Status: implemented generic command fan-in host. This slice does not
-add concrete OSC/MIDI/UI protocol adapters, does not spawn a background
-worker, does not define wall-clock scheduling, and does not add a new
-audio-thread queue.
+Status: implemented generic command fan-in host. At Prep P, this slice
+did not add concrete OSC/MIDI/UI protocol adapters, did not spawn a
+background worker, did not define wall-clock scheduling, and did not
+add a new audio-thread queue.
 
 Prep G defined the bounded FIFO producer queue. Prep J proved a
 serialized host shape for Pattern by hiding one owner plus producer and
@@ -66,9 +66,11 @@ sequence reached by `stepSessionOwner`.
 Because the same lock also gates producer enqueue, producers can see
 high enqueue latency while a slow drain runs. The worst v1 case is a
 preserving hot-swap waiting up to `raoHotSwapInstallTimeoutMs` for the
-audio thread to install the published swap. A later background drain
-service or producer-side worker is the path to bounding enqueue
-latency.
+audio thread to install the published swap. At Prep P, a later
+background drain service or producer-side worker was the path to
+bounding enqueue latency. The first scoped version of that follow-up is
+recorded in
+[Session Fan-In Drain Service](2026-05-13-session-fan-in-drain-service.md).
 
 `readSessionFanInHost` takes the lock and returns queue depth, owner
 state, and owner status. The raw queue and raw owner stay hidden.
@@ -89,7 +91,7 @@ A later slice can decide whether to route Pattern through the generic
 fan-in host or keep the Pattern-specific host for caller-driven demos.
 Prep P does not force that consolidation.
 
-## Out Of Scope
+## Prep P Out Of Scope
 
 - OSC path parsing to `SessionCommand`.
 - MIDI note/CC translation to `SessionCommand`.
