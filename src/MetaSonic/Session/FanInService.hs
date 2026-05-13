@@ -133,9 +133,11 @@ withSessionFanInService =
 --
 -- The worker shuts down when the callback exits. Shutdown first asks
 -- the worker to exit cooperatively, then kills it if a service hook or
--- drain path blocks past a short grace period. The underlying fan-in
--- host and owner bracket are released only after the worker finalizer
--- reports completion.
+-- drain path blocks past a fixed 50 ms grace period. The grace period
+-- is deliberately not configurable until a real hook needs policy
+-- control; blocked teardown is worse than force-killing this service
+-- worker. The underlying fan-in host and owner bracket are released
+-- only after the worker finalizer reports completion.
 withSessionFanInServiceHooks
   :: SessionFanInServiceHooks
   -> TemplateGraph
@@ -219,5 +221,8 @@ serviceLoop hooks closing wake done host =
             loop
 
 serviceShutdownGraceUsec :: Int
+-- Keep this fixed until slow shutdown hooks become a real use case.
+-- The value is long enough for normal no-op/reporting hooks and short
+-- enough that a blocked hook cannot hang bracket teardown in practice.
 serviceShutdownGraceUsec =
   50000
