@@ -12876,6 +12876,31 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
           other ->
             assertFailure ("expected StepCommitted, got: " <> show other)
 
+  , testCase "fromPatternEvent voice-on drives real RTGraph adapter" $ do
+      let tg  = patternTemplates droneVibrato
+          st0 = initialSessionState tg
+          ev  = PEVoiceOn
+                  (TemplateName "drone")
+                  (VoiceKey "pv0")
+                  [(ControlTag (MigrationKey "lpf") 0, 900.0)]
+          cmd = fromPatternEvent ev
+      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
+        result <- stepSessionCommand adapter cmd st0
+        case result of
+          StepCommitted st1 Nothing ->
+            case M.lookup (VoiceKey "pv0") (ssVoices st1) of
+              Just binding -> do
+                c_rt_graph_process rt 1
+                status <- c_rt_graph_instance_status
+                            rt
+                            (fromIntegral (vbSlotId binding))
+                status @?= instanceStatusLive
+              Nothing ->
+                assertFailure "expected committed PatternEvent voice binding"
+          other ->
+            assertFailure
+              ("expected PatternEvent-backed RTGraph commit, got: " <> show other)
+
   , testCase "step voice-start with empty pool reports allocation failure" $ do
       let tg  = patternTemplates droneVibrato
           st0 = initialSessionState tg

@@ -433,7 +433,7 @@ Session Prep E must not add:
 
 ## Implementation Series
 
-Recommended commit shape:
+Landed commit shape:
 
 1. **Decision note.** Land this note after review.
 2. **Control target resolver.** Add the pure symbolic-control resolver
@@ -478,6 +478,16 @@ Recommended commit shape:
 8. **Roadmap sync.** Mark only the first real adapter and constrained
    install behavior as landed. Keep full runtime session ownership
    gated.
+
+Steps 1-8 are now landed. Step 7 is covered by the accumulated
+`Session Prep E: RTGraph session install` tests: install/prewarm,
+voice start/stop, allocation failure, initial-control rollback,
+control write, empty-session hot-swap, drop-all hot-swap,
+preserving-swap rejection, structured install failure, and the
+`fromPatternEvent -> stepSessionCommand -> RTGraph` path. Step 8 is
+reflected in `ROADMAP.md`: the caller-owned RTGraph adapter is landed,
+while runtime ownership, realtime queueing, producer arbitration,
+preserving hot-swap, and recovery semantics remain gated.
 
 ## Verification
 

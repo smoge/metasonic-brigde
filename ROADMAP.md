@@ -2921,7 +2921,8 @@ Landed prep contracts:
   The Prep E IO-side step-test target is covered by the accumulated
   real-adapter tests across voice start/stop, control write, empty
   hot-swap, drop-all hot-swap, preserving-swap rejection, and
-  structured install failure.
+  structured install failure, plus a `PatternEvent`-to-real-`RTGraph`
+  round-trip through `fromPatternEvent` and `stepSessionCommand`.
 
 Still gated:
 
