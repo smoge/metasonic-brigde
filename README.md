@@ -127,6 +127,7 @@ stack exec -- metasonic-bridge [MODE] [DEMO ...]
 | `--snapshot-check`            | Run survey / cost-lab invariant checks        |
 | `--authoring-manifest`        | Emit JSON manifest of authoring metadata      |
 | `--midi-list`                 | List Q / PortMIDI devices                     |
+| `--session-midi-smoke [SECONDS]` | Probe session MIDI ingress without audio   |
 | `--plugin-list`               | Print the linked static plugin registry       |
 | `--osc-listen [PORT]`         | Run the OSC-controlled demo graph             |
 
@@ -134,7 +135,8 @@ Useful modifiers:
 
 - `--fused` selects the fused-input loader path for applicable demo modes.
 - `--summary` switches `--fusion-cost-lab` from JSONL to a readable table.
-- `--midi-device N` selects the PortMIDI input for the `midi-poly` demo.
+- `--midi-device N` selects the PortMIDI input for `midi-poly` and
+  `--session-midi-smoke`.
 
 ### Demo targets
 
@@ -175,6 +177,9 @@ stack exec -- metasonic-bridge --authoring-manifest send-return
 
 # Run the OSC control demo on UDP port 7000
 stack exec -- metasonic-bridge --osc-listen 7000
+
+# Probe the session MIDI ingress path for 10 seconds
+stack exec -- metasonic-bridge --midi-device 2 --session-midi-smoke 10
 ```
 
 ### Compilation inspector (TUI)
@@ -270,6 +275,9 @@ The landed pieces are deliberately small:
 - `MetaSonic.Session.MIDIPortMIDI` adapts a Q / PortMIDI input device into
   that decoded source shape. It opens an idle closeable source on no-device
   hosts and still leaves MIDI policy to `MetaSonic.Session.MIDIProducer`.
+  The CLI also exposes `--session-midi-smoke [SECONDS]` as a repeatable
+  manual probe for the PortMIDI source, decoded listener, producer, fan-in
+  service, and drain path.
 - `MetaSonic.Session.UIProducer` translates already-decoded UI intents into
   session commands with `ProducerUI` identity, rejecting non-finite UI control
   values before they enter the fan-in queue.

@@ -26,6 +26,7 @@ import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
                                               runFusionCostLab)
 import qualified MetaSonic.App.FusionCostLab as FCL
 import           MetaSonic.App.Osc          (runOscListen)
+import           MetaSonic.App.SessionMidiSmoke (runSessionMidiSmoke)
 import           MetaSonic.App.SnapshotCheck (runSnapshotCheck)
 import           MetaSonic.OSC.Listen       (parseListenerPort)
 import           MetaSonic.App.Survey       (printFusionSummary,
@@ -85,6 +86,11 @@ data RunMode
     -- ^ Non-audio reporting mode (--midi-list). Enumerates the
     -- current Q / PortMIDI device table and exits. The printed ids
     -- are the values accepted by --midi-device.
+  | SessionMidiSmoke
+    -- ^ Manual non-audio smoke mode (--session-midi-smoke [SECONDS]).
+    -- Opens the session-backed PortMIDI source, runs it through the
+    -- decoded MIDI listener and fan-in service, and reports producer /
+    -- drain activity. Targets are ignored.
   | PluginList
     -- ^ Non-audio reporting mode (--plugin-list). Enumerates the
     -- build-linked static plugin registry that KStaticPlugin resolves
@@ -123,11 +129,13 @@ data Options = Options
   , optOscPort :: Int
     -- ^ UDP port for --osc-listen. Default 7000.
   , optMidiDevice :: Maybe Int
-    -- ^ Optional PortMIDI device id for midi-poly.
+    -- ^ Optional PortMIDI device id for MIDI-backed commands.
   , optFCLSummary :: Bool
     -- ^ When True, --fusion-cost-lab prints a per-row table
     -- instead of JSONL. Toggled by --summary alongside
     -- --fusion-cost-lab.
+  , optSessionMidiSmokeSeconds :: Int
+    -- ^ Manual smoke-test duration for --session-midi-smoke.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
@@ -138,6 +146,7 @@ defaultOptions = Options
   , optOscPort = 7000
   , optMidiDevice = Nothing
   , optFCLSummary = False
+  , optSessionMidiSmokeSeconds = 10
   }
 
 parseArgs :: [String] -> Either String Options
@@ -173,6 +182,13 @@ parseArgs = go defaultOptions
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
       go opts { optMode = MidiList } xs
+    go opts ("--session-midi-smoke" : xs) =
+      case takeSessionMidiSmokeSeconds xs of
+        Left err              -> Left err
+        Right (seconds, rest) ->
+          go opts { optMode = SessionMidiSmoke
+                  , optSessionMidiSmokeSeconds = seconds
+                  } rest
     go opts ("--plugin-list" : xs) =
       go opts { optMode = PluginList } xs
     go opts ("--midi-device" : s : xs) =
@@ -201,6 +217,16 @@ parseArgs = go defaultOptions
       , length s <= 9 = Just (read s)
       | otherwise     = Nothing
 
+    parseSessionMidiSmokeSeconds :: String -> Maybe Int
+    parseSessionMidiSmokeSeconds s
+      | not (null s)
+      , all isDigit s
+      , length s <= 4
+      , let n = read s
+      , n >= 1
+      , n <= 3600 = Just n
+      | otherwise = Nothing
+
     -- Consume an optional positional integer port after
     -- --osc-listen. The next token, if present and not a flag,
     -- MUST be a valid port — silently falling back to the
@@ -215,6 +241,22 @@ parseArgs = go defaultOptions
           Nothing -> Left $
             "Invalid port for --osc-listen: " <> s
             <> " (expected integer in [1, 65535])"
+
+    -- Consume an optional positive integer duration after
+    -- --session-midi-smoke. The next token, if present and not a flag,
+    -- must be a valid smoke window so typos fail loudly.
+    takeSessionMidiSmokeSeconds :: [String] -> Either String (Int, [String])
+    takeSessionMidiSmokeSeconds [] =
+      Right (optSessionMidiSmokeSeconds defaultOptions, [])
+    takeSessionMidiSmokeSeconds (s : rest)
+      | "--" `prefixOf` s =
+          Right (optSessionMidiSmokeSeconds defaultOptions, s : rest)
+      | otherwise =
+          case parseSessionMidiSmokeSeconds s of
+            Just n  -> Right (n, rest)
+            Nothing -> Left $
+              "Invalid duration for --session-midi-smoke: " <> s
+              <> " (expected integer seconds in [1, 3600])"
 
 resolveTargets :: [String] -> Either String [Demo]
 resolveTargets [] = Right demoTable
@@ -245,6 +287,7 @@ usage prog = unlines
   , "  " <> prog <> " --snapshot-check"
   , "  " <> prog <> " --authoring-manifest [DEMO ...]"
   , "  " <> prog <> " --midi-list"
+  , "  " <> prog <> " --session-midi-smoke [SECONDS]"
   , "  " <> prog <> " --plugin-list"
   , "  " <> prog <> " --osc-listen [PORT]"
   , ""
@@ -322,9 +365,18 @@ usage prog = unlines
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
   , "                   with inputs can be passed to --midi-device."
-  , "  --midi-device N  Select PortMIDI device id N for the midi-poly"
-  , "                   demo. Use --midi-list to discover ids. Ignored"
-  , "                   by non-MIDI demos."
+  , "  --midi-device N  Select PortMIDI device id N for midi-poly or"
+  , "                   --session-midi-smoke. Use --midi-list to discover"
+  , "                   ids. Ignored by non-MIDI modes."
+  , "  --session-midi-smoke [SECONDS]"
+  , "                   Manual non-audio probe for the session MIDI ingress"
+  , "                   path. Opens the Q / PortMIDI source, feeds decoded"
+  , "                   note-on, note-off, and CC 7 events through"
+  , "                   MetaSonic.Session.MIDIListener and FanInService,"
+  , "                   prints producer/drain activity, then exits non-zero"
+  , "                   if no supported events or no drained session commands"
+  , "                   were observed. Default window is 10 seconds; demo"
+  , "                   targets are ignored."
   , "  --plugin-list    Print the build-linked static plugin registry"
   , "                   used by KStaticPlugin and exit. No audio, no TUI."
   , "  --osc-listen [PORT]"
@@ -349,6 +401,8 @@ usage prog = unlines
   , "  " <> prog <> " send-return            # multi-template demo"
   , "  " <> prog <> " --fused chain          # same audio, fused load"
   , "  " <> prog <> " --fused send-return    # multi-template fused"
+  , "  " <> prog <> " --midi-list"
+  , "  " <> prog <> " --midi-device 2 --session-midi-smoke 10"
   ]
 
 --------------------------------------------------------------------------------
@@ -422,6 +476,10 @@ main = do
       runOscListen (optOscPort opts)
     MidiList ->
       printMidiDevices
+    SessionMidiSmoke ->
+      runSessionMidiSmoke
+        (optMidiDevice opts)
+        (optSessionMidiSmokeSeconds opts)
     PluginList ->
       printPlugins
     AudioOnly      -> runDemos "Running selected demos."
@@ -506,6 +564,7 @@ runDemo opts demo
     || optMode opts == SnapshotCheck
     || optMode opts == OscListen
     || optMode opts == MidiList
+    || optMode opts == SessionMidiSmoke
     || optMode opts == PluginList
     || optMode opts == AuthoringManifest =
       error "runDemo: reporting modes should be handled by main, never reach here"
@@ -574,6 +633,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: OscListen should be handled by main, never reach here"
     MidiList ->
       error "runSingleDemo: MidiList should be handled by main, never reach here"
+    SessionMidiSmoke ->
+      error "runSingleDemo: SessionMidiSmoke should be handled by main, never reach here"
     PluginList ->
       error "runSingleDemo: PluginList should be handled by main, never reach here"
     AuthoringManifest ->

@@ -37,6 +37,12 @@ midi-poly:
 midi-poly-device device:
     stack exec -- metasonic-bridge --midi-device {{device}} midi-poly
 
+session-midi-smoke seconds="10":
+    stack exec -- metasonic-bridge --session-midi-smoke {{seconds}}
+
+session-midi-smoke-device device seconds="10":
+    stack exec -- metasonic-bridge --midi-device {{device}} --session-midi-smoke {{seconds}}
+
 osc-listen port="7000":
     stack exec -- metasonic-bridge --osc-listen {{port}}
 

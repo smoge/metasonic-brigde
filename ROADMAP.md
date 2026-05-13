@@ -2883,7 +2883,10 @@ already-decoded MIDI note-on/off and CC events. A later
 `MetaSonic.Session.MIDIListener` slice adds a decoded-source worker
 around that adapter. A later `MetaSonic.Session.MIDIPortMIDI` slice
 adds the first Q / PortMIDI-backed decoded source, but still does not
-define broader MIDI policy or long-running supervision. A later
+define broader MIDI policy or long-running supervision. A follow-up
+CLI slice adds `--session-midi-smoke [SECONDS]` as a repeatable
+manual probe for that session MIDI ingress path, without starting
+audio or replacing the older `midi-poly` live-runtime demo. A later
 `MetaSonic.Session.UIProducer` slice adds a Haskell-only adapter for
 already-decoded UI intents.
 
@@ -3213,9 +3216,11 @@ with `ProducerMIDI` attribution. It can target a plain
 `MetaSonic.Session.MIDIListener` brackets a worker over an injected
 decoded-event source and feeds that producer while keeping listener
 state observable. `MetaSonic.Session.MIDIPortMIDI` adds the first Q /
-PortMIDI-backed source behind that boundary. This path still does not
-define pitch-bend/channel policy, MIDI clock behavior, or arbitration
-beyond FIFO.
+PortMIDI-backed source behind that boundary. `--session-midi-smoke
+[SECONDS]` now offers a manual live-device probe over the source,
+listener, producer, fan-in service, and drain path. This path still
+does not define pitch-bend/channel policy, MIDI clock behavior, or
+arbitration beyond FIFO.
 
 Recent UI ingress follow-up: `MetaSonic.Session.UIProducer` translates
 already-decoded UI intents into `CmdVoiceOn`, `CmdVoiceOff`,
@@ -3254,8 +3259,8 @@ implementation, live-audio install orchestration, generic serialized
 fan-in, a session-backed OSC control-write ingress path, a scoped
 wake-on-enqueue background drain worker, producer-local MIDI note/CC
 command translation, a decoded-source MIDI listener, and
-the first Q / PortMIDI-backed decoded source, and already-decoded UI
-intent translation. Do not
+the first Q / PortMIDI-backed decoded source with a manual CLI smoke
+probe, and already-decoded UI intent translation. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration, manifest-driven session reload/resource policy,
 broader MIDI policy beyond note/CC translation and source polling,
