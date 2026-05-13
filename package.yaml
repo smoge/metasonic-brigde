@@ -80,6 +80,7 @@ library:
     - MetaSonic.Session.MIDIProducer
     - MetaSonic.Session.OSCProducer
     - MetaSonic.Session.OSCListener
+    - MetaSonic.Session.UIProducer
     - MetaSonic.Authoring
     - MetaSonic.Authoring.Report
     - MetaSonic.Authoring.Manifest

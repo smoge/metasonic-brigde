@@ -7,7 +7,8 @@ did not add concrete OSC/MIDI/UI protocol adapters, did not spawn a
 background worker, did not define wall-clock scheduling, and did not
 add a new audio-thread queue. Later follow-ups added the OSC
 control-write producer/listener path, the scoped fan-in drain service,
-and the first already-decoded MIDI note/CC producer adapter.
+the first already-decoded MIDI note/CC producer adapter, and the first
+already-decoded UI intent producer adapter.
 
 Prep G defined the bounded FIFO producer queue. Prep J proved a
 serialized host shape for Pattern by hiding one owner plus producer and
@@ -101,7 +102,8 @@ Prep P does not force that consolidation.
 - At this slice, MIDI note/CC translation to `SessionCommand`; later
   covered for already-decoded note-on/off and CC events by
   `MetaSonic.Session.MIDIProducer`.
-- UI command adapters.
+- At this slice, UI command adapters; later covered for already-decoded
+  UI intents by `MetaSonic.Session.UIProducer`.
 - Background drain loops or lifecycle supervision.
 - Cross-producer arbitration beyond the existing FIFO queue order.
 - Producer-specific throttling, coalescing, or authorization.

@@ -157,6 +157,7 @@ import           MetaSonic.Session.FanInService
 import           MetaSonic.Session.MIDIProducer
 import           MetaSonic.Session.OSCProducer
 import qualified MetaSonic.Session.OSCListener as OSCS
+import           MetaSonic.Session.UIProducer
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -209,6 +210,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionFanInHostTests
   , sessionFanInServiceTests
   , sessionMIDIProducerTests
+  , sessionUIProducerTests
   , sessionOSCProducerTests
   , sessionOSCListenerTests
   , patternCorpusTests
@@ -15260,6 +15262,185 @@ midiVelocityTag =
 midiLevelTag :: ControlTag
 midiLevelTag =
   ControlTag (MigrationKey "lpf") 0
+
+------------------------------------------------------------
+-- Session UI producer adapter
+--
+-- This adapter is Haskell-only and consumes already-decoded UI
+-- intents. It is not a GUI toolkit binding, manifest reload path, or
+-- authorization layer.
+------------------------------------------------------------
+
+sessionUIProducerTests :: TestTree
+sessionUIProducerTests =
+  testGroup "Session UI producer adapter"
+  [ testCase "decodes UI intents to session commands" $ do
+      let start =
+            UIVoiceOn
+              (TemplateName "drone")
+              (VoiceKey "u0")
+              [(midiLevelTag, 0.5)]
+          write =
+            UIControlWrite (VoiceKey "u0") midiLevelTag 0.75
+          stop =
+            UIVoiceOff (VoiceKey "u0")
+          swap =
+            UIHotSwap
+              (SwapLabel "ui-swap")
+              (patternTemplates droneVibrato)
+      decodeUISessionCommand start
+        @?= Right (CmdVoiceOn
+                    (TemplateName "drone")
+                    (VoiceKey "u0")
+                    [(midiLevelTag, 0.5)])
+      decodeUISessionCommand write
+        @?= Right (CmdControlWrite (VoiceKey "u0") midiLevelTag 0.75)
+      decodeUISessionCommand stop
+        @?= Right (CmdVoiceOff (VoiceKey "u0"))
+      decodeUISessionCommand swap
+        @?= Right (CmdHotSwap
+                    (SwapLabel "ui-swap")
+                    (patternTemplates droneVibrato))
+
+  , testCase "rejects non-finite UI values before enqueue" $ do
+      let infinity = 1.0 / 0.0
+      decodeUISessionCommand
+        (UIControlWrite (VoiceKey "u0") midiLevelTag infinity)
+        @?= Left (UpiNonFiniteControlValue midiLevelTag infinity)
+      decodeUISessionCommand
+        (UIVoiceOn
+          (TemplateName "drone")
+          (VoiceKey "u0")
+          [(midiLevelTag, infinity)])
+        @?= Left (UpiNonFiniteInitialControl midiLevelTag infinity)
+
+  , testCase "successful enqueue attributes command to ProducerUI" $ do
+      let opts = testUIProducerOptions
+          intent =
+            UIVoiceOn (TemplateName "drone") (VoiceKey "u0") []
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  defaultSessionFanInOptions
+                  $ \host -> do
+                    enq <- enqueueUIProducerIntent opts intent host
+                    snapshot <- readSessionFanInHost host
+                    pure (enq, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (UIProducerEnqueueAttempted command enq, snapshot) -> do
+          queued <- fanInQueuedOrFail enq
+          command @?= CmdVoiceOn (TemplateName "drone") (VoiceKey "u0") []
+          producerKind (qscProducer queued) @?= ProducerUI
+          producerName (qscProducer queued) @?= upoProducerName opts
+          qscCommand queued @?= command
+          sfierQueueDepth enq @?= 1
+          sfisQueueDepth snapshot @?= 1
+        Right other ->
+          assertFailure ("expected UI enqueue attempt, got: " <> show other)
+
+  , testCase "decode rejection does not enqueue" $ do
+      let infinity = 1.0 / 0.0
+          intent = UIControlWrite (VoiceKey "u0") midiLevelTag infinity
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  defaultSessionFanInOptions
+                  $ \host -> do
+                    enq <- enqueueUIProducerIntent
+                             testUIProducerOptions
+                             intent
+                             host
+                    snapshot <- readSessionFanInHost host
+                    pure (enq, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (UIProducerRejected issue, snapshot) -> do
+          issue @?= UpiNonFiniteControlValue midiLevelTag infinity
+          sfisQueueDepth snapshot @?= 0
+        Right other ->
+          assertFailure ("expected UI rejection, got: " <> show other)
+
+  , testCase "queue-full surfaces through UI enqueue result" $ do
+      let opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          prefill =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
+          intent =
+            UIVoiceOn (TemplateName "drone") (VoiceKey "u0") []
+          expected =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "u0") []
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  opts
+                  $ \host -> do
+                    _prefill <-
+                      enqueueSessionFanInCommand
+                        (testProducer ProducerTest "prefill")
+                        prefill
+                        host
+                    enqueueUIProducerIntent
+                      testUIProducerOptions
+                      intent
+                      host
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (UIProducerEnqueueAttempted command enq) -> do
+          command @?= expected
+          sfierResult enq
+            @?= SessionEnqueueRejected
+                  (uiProducerId testUIProducerOptions)
+                  expected
+                  (SeiQueueFull 1)
+        Right other ->
+          assertFailure ("expected queue-full UI enqueue, got: " <> show other)
+
+  , testCase "service host wakes worker for UI voice-on" $ do
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          (patternTemplates droneVibrato)
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq <- enqueueUIProducerIntent
+                       testUIProducerOptions
+                       (UIVoiceOn (TemplateName "drone") (VoiceKey "u0") [])
+                       (sessionFanInServiceHost service)
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (enq, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (UIProducerEnqueueAttempted _ enq, Just drained, snapshot) -> do
+          queued <- fanInQueuedOrFail enq
+          map sdiQueued (sdrItems (sfidrDrain drained)) @?= [queued]
+          case map sdiResult (sdrItems (sfidrDrain drained)) of
+            [SessionOwnerStep (StepCommitted _ Nothing)] ->
+              pure ()
+            other ->
+              assertFailure
+                ("expected UI voice-on to commit through service, got: "
+                 <> show other)
+          sfisQueueDepth snapshot @?= 0
+          assertBool
+            "expected UI voice after service drain"
+            (M.member (VoiceKey "u0") (ssVoices (sfisOwnerState snapshot)))
+        Right (_enq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for UI service drain"
+        Right other ->
+          assertFailure ("expected UI service enqueue, got: " <> show other)
+  ]
+
+testUIProducerOptions :: UIProducerOptions
+testUIProducerOptions = defaultUIProducerOptions
+  { upoProducerName = T.pack "ui-test"
+  }
 
 ------------------------------------------------------------
 -- Session OSC producer adapter
