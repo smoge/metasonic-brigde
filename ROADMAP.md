@@ -2855,9 +2855,11 @@ submission, and bounded backlog retry on full-queue rejection.
 **Session Prep I** promotes the producer/queue/owner composition into
 `MetaSonic.Session.Runner`: one caller-driven `stepPatternSession` call
 enqueues one Pattern block or backlog retry, then drains once into a
-caller-owned `SessionOwner`. These slices still do not add a thread-safe
-fan-in wrapper, background drain loop, concrete OSC/MIDI/UI adapters,
-realtime command queue, or uninterrupted hot-swap claim.
+caller-owned `SessionOwner`. **Session Prep J** adds the first
+thread-safe Pattern host shell around that runner: a scoped owner plus
+Pattern producer and queue state serialized by an `MVar`. These slices
+still do not add a background drain loop, concrete OSC/MIDI/UI
+adapters, realtime command queue, or uninterrupted hot-swap claim.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2869,15 +2871,17 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, D, E, F, G, H, and I
+cost/profitability table. Session Prep A, B, C, D, E, F, G, H, I, and J
 now supply the library-side contracts, a constrained real-runtime
 adapter, a scoped single-threaded owner, the first pure producer-ingress
 ordering/backpressure layer, one concrete Pattern producer bridge, and a
-caller-driven scripted Pattern runner. The remaining open work is not
+caller-driven scripted Pattern runner plus a serialized Pattern host.
+The remaining open work is not
 "create an owner", "define a queue", "turn Pattern events into queued
-commands", or "compose one Pattern runner step"; it is thread-safe queue
-ownership, OSC/MIDI/UI producer adapters, cross-producer arbitration,
-preserving hot-swap, and recovery semantics around that owner.
+commands", "compose one Pattern runner step", or "serialize one Pattern
+host"; it is concrete OSC/MIDI/UI producer adapters, cross-producer
+arbitration, preserving hot-swap, and recovery semantics around that
+owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2940,6 +2944,13 @@ Session prep artifacts:
   carry-forward state. This is still not a live clock, background
   worker, thread-safe fan-in layer, OSC/MIDI/UI adapter, or preserving
   hot-swap implementation.
+- [Session Prep J - Thread-Safe Pattern Host](notes/2026-05-13-session-prep-j-thread-safe-host.md)
+  records the first serialized host boundary above Prep F/G/H/I. It
+  owns the `SessionOwner` bracket, hides Pattern producer and queue
+  state behind an `MVar`, and exposes synchronous step/snapshot calls.
+  This is still not a background worker, live clock, OSC/MIDI/UI
+  adapter, generic producer service, or preserving hot-swap
+  implementation.
 
 Landed prep contracts:
 
@@ -2977,6 +2988,9 @@ Landed prep contracts:
 - [x] Caller-driven scripted Pattern runner v1 with one enqueue step,
   one owner drain step, and explicit carry-forward producer/queue state
   (`MetaSonic.Session.Runner`).
+- [x] Thread-safe Pattern session host v1 with scoped owner lifetime,
+  internal Pattern producer/queue state, serialized hosted steps, and a
+  lock-protected snapshot (`MetaSonic.Session.Host`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -3005,13 +3019,16 @@ Landed prep contracts:
   across rejected backlog, and a Pattern producer -> queue -> owner
   integration smoke. Prep I runner tests cover one-block voice commit,
   repeated backlog drain across runner steps, owner divergence/blocking
-  propagation, and no cursor advancement during backlog recovery.
+  propagation, and no cursor advancement during backlog recovery. Prep
+  J host tests cover setup failure attribution, hosted voice commit,
+  backlog carry across repeated hosted calls, and concurrent callers
+  serializing whole Pattern steps.
 
 Still gated:
 
-- [ ] Thread-safe producer fan-in, concrete OSC/MIDI/UI producer
-  adapters, cross-producer arbitration, and any background drain loop
-  around the pure producer queue.
+- [ ] Concrete OSC/MIDI/UI producer adapters, cross-producer
+  arbitration beyond the single hosted Pattern producer, and any
+  background drain loop around the producer queue.
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
 - [ ] Uninterrupted graph hot-swap with audio-thread cooperation,
