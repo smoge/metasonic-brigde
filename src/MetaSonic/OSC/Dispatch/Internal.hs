@@ -30,6 +30,8 @@ module MetaSonic.OSC.Dispatch.Internal
     -- * Dispatch outputs
   , DispatchAction (..)
   , DispatchIssue (..)
+  , SymbolicControlWrite (..)
+  , decodeSymbolicControlWrite
   , dispatch
     -- * OSC-safe identifier profile
   , isOscSafeIdentifier
@@ -51,7 +53,8 @@ import           MetaSonic.ControlTarget    (ControlTarget (..),
                                              resolveControlTarget)
 import           MetaSonic.OSC.Wire         (OscArg (..), OscMessage (..))
 import           MetaSonic.Pattern          (ControlTag (..),
-                                             TemplateName (..))
+                                             TemplateName (..), Value,
+                                             VoiceKey (..))
 import           MetaSonic.Types            (NodeIndex)
 
 ----------------------------------------------------------------------
@@ -164,6 +167,18 @@ data DispatchAction = DAControlWrite
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
+-- | A decoded symbolic OSC control write, before any runtime
+-- 'ResolveState' lookup. This is the shared parser shape for
+-- producer/session adapters that need to accept the same
+-- @/<voice>/<tag>/<slot>@ + numeric-value grammar as 'dispatch'
+-- without resolving to runtime slot and node indices.
+data SymbolicControlWrite = SymbolicControlWrite
+  { scwVoiceKey   :: !VoiceKey
+  , scwControlTag :: !ControlTag
+  , scwValue      :: !Value
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
 -- | Everything a v1 dispatch can refuse. Modeled on §6.A's
 -- 'DriverIssue' so the IO layer's log lines look familiar.
 data DispatchIssue
@@ -232,20 +247,8 @@ reservedOscPathSegments =
 -- 'DiInvalidAddressFormat'.
 dispatch :: ResolveState -> OscMessage -> Either DispatchIssue DispatchAction
 dispatch rs msg = do
-  segments              <- splitAddress (oscAddr msg)
-  (voiceKey, nodeTag, slotStr) <-
-    case segments of
-      [v, n, s] -> Right (v, n, s)
-      _         -> Left (DiInvalidAddressFormat (oscAddr msg))
-
-  when' (voiceKey `elem` reservedOscPathSegments)
-        (DiReservedPathSegment voiceKey)
-  when' (not (isOscSafeIdentifier voiceKey))
-        (DiIdentifierProfile voiceKey)
-  when' (not (isOscSafeIdentifier nodeTag))
-        (DiIdentifierProfile nodeTag)
-
-  slot <- parseSlotInteger slotStr
+  DecodedControlAddress voiceKey nodeTag controlTag <-
+    decodeControlAddress (oscAddr msg)
 
   (slotId, tname) <-
     case M.lookup voiceKey (_rsVoices rs) of
@@ -256,15 +259,11 @@ dispatch rs msg = do
     case resolveControlTarget
            (_rsTemplate rs)
            (TemplateName (BSC.unpack tname))
-           (ControlTag (MigrationKey (BSC.unpack nodeTag)) slot) of
+           controlTag of
       Right x    -> Right x
       Left issue -> Left (toDispatchIssue voiceKey nodeTag tname issue)
 
-  value <-
-    case oscArgs msg of
-      [OscArgFloat f] -> Right (realToFrac f)
-      [OscArgInt   i] -> Right (fromIntegral (i :: Int32))
-      other           -> Left (DiUnsupportedArgShape (length other))
+  value <- decodeControlValue (oscArgs msg)
 
   Right DAControlWrite
     { daSlotId     = slotId
@@ -273,10 +272,6 @@ dispatch rs msg = do
     , daValue      = value
     }
   where
-    when' :: Bool -> DispatchIssue -> Either DispatchIssue ()
-    when' True  issue = Left issue
-    when' False _     = Right ()
-
     toDispatchIssue
       :: ByteString -> ByteString -> ByteString -> ControlTargetIssue
       -> DispatchIssue
@@ -287,6 +282,61 @@ dispatch rs msg = do
         DiUnknownNodeTag voiceKey nodeTag
       CtiInvalidControlSlot _ _ requested available ->
         DiInvalidControlSlot voiceKey nodeTag requested available
+
+-- | Decode the v1 symbolic OSC control-write grammar without
+-- consulting runtime state. This intentionally stops at the
+-- producer-facing identifiers: later session code can turn the result
+-- into a 'MetaSonic.Session.Command.CmdControlWrite', while the
+-- legacy OSC dispatcher resolves the same address through
+-- 'ResolveState' before enqueueing the realtime write.
+decodeSymbolicControlWrite
+  :: OscMessage -> Either DispatchIssue SymbolicControlWrite
+decodeSymbolicControlWrite msg = do
+  DecodedControlAddress voiceKey _ controlTag <-
+    decodeControlAddress (oscAddr msg)
+  value <- decodeControlValue (oscArgs msg)
+  Right SymbolicControlWrite
+    { scwVoiceKey   = VoiceKey (BSC.unpack voiceKey)
+    , scwControlTag = controlTag
+    , scwValue      = value
+    }
+
+data DecodedControlAddress =
+  DecodedControlAddress !ByteString !ByteString !ControlTag
+  deriving stock (Eq, Show)
+
+decodeControlAddress
+  :: ByteString -> Either DispatchIssue DecodedControlAddress
+decodeControlAddress addr = do
+  segments <- splitAddress addr
+  (voiceKey, nodeTag, slotStr) <-
+    case segments of
+      [v, n, s] -> Right (v, n, s)
+      _         -> Left (DiInvalidAddressFormat addr)
+
+  when' (voiceKey `elem` reservedOscPathSegments)
+        (DiReservedPathSegment voiceKey)
+  when' (not (isOscSafeIdentifier voiceKey))
+        (DiIdentifierProfile voiceKey)
+  when' (not (isOscSafeIdentifier nodeTag))
+        (DiIdentifierProfile nodeTag)
+
+  slot <- parseSlotInteger slotStr
+  Right $
+    DecodedControlAddress
+      voiceKey
+      nodeTag
+      (ControlTag (MigrationKey (BSC.unpack nodeTag)) slot)
+  where
+    when' :: Bool -> DispatchIssue -> Either DispatchIssue ()
+    when' True  issue = Left issue
+    when' False _     = Right ()
+
+decodeControlValue :: [OscArg] -> Either DispatchIssue Value
+decodeControlValue args = case args of
+  [OscArgFloat f] -> Right (realToFrac f)
+  [OscArgInt   i] -> Right (fromIntegral (i :: Int32))
+  other           -> Left (DiUnsupportedArgShape (length other))
 
 splitAddress :: ByteString -> Either DispatchIssue [ByteString]
 splitAddress addr = case BSC.uncons addr of

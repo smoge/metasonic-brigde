@@ -15398,6 +15398,18 @@ dispatchTests = testGroup "dispatch against arpeggio-send-return/fx"
         Right da -> OSC.daValue da @?= 1.0
         Left  i  -> assertFailure ("expected success, got: " <> show i)
 
+  , testCase "symbolic control decoder extracts producer-facing target" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/1")
+                                [OSC.OscArgInt 42]
+      case OSCI.decodeSymbolicControlWrite msg of
+        Right write -> do
+          OSCI.scwVoiceKey write @?= VoiceKey "fx0"
+          OSCI.scwControlTag write
+            @?= ControlTag (MigrationKey "lpf") 1
+          OSCI.scwValue write @?= 42.0
+        Left issue ->
+          assertFailure ("expected symbolic control write, got: " <> show issue)
+
   , testCase "unknown voice key surfaces as DiUnknownVoice" $ do
       let msg = OSC.OscMessage (OBSC.pack "/no-such/lpf/0")
                                 [OSC.OscArgFloat 1.0]
@@ -15444,6 +15456,11 @@ dispatchTests = testGroup "dispatch against arpeggio-send-return/fx"
       let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/0") []
       OSC.dispatch arpeggioFxResolveState msg
         @?= Left (OSC.DiUnsupportedArgShape 0)
+
+  , testCase "dispatch still resolves before checking argument shape" $ do
+      let msg = OSC.OscMessage (OBSC.pack "/no-such/lpf/0") []
+      OSC.dispatch arpeggioFxResolveState msg
+        @?= Left (OSC.DiUnknownVoice (OBSC.pack "no-such"))
 
   , testCase "two arguments surface as DiUnsupportedArgShape" $ do
       let msg = OSC.OscMessage (OBSC.pack "/fx0/lpf/0")
