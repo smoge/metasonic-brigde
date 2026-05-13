@@ -63,6 +63,13 @@ drain result plus the remaining queue depth. The lock covers the whole
 drain, including any preserving hot-swap publish/wait/collect/commit
 sequence reached by `stepSessionOwner`.
 
+Because the same lock also gates producer enqueue, producers can see
+high enqueue latency while a slow drain runs. The worst v1 case is a
+preserving hot-swap waiting up to `raoHotSwapInstallTimeoutMs` for the
+audio thread to install the published swap. A later background drain
+service or producer-side worker is the path to bounding enqueue
+latency.
+
 `readSessionFanInHost` takes the lock and returns queue depth, owner
 state, and owner status. The raw queue and raw owner stay hidden.
 

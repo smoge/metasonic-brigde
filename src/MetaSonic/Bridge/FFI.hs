@@ -40,6 +40,7 @@ module MetaSonic.Bridge.FFI
   , hotSwapTemplateGraph
   , hotSwapTemplateGraphFused
   , collectRetiredSwapStats
+  , readSwapGeneration
   , waitForSwapGeneration
   , hotSwapRuntimeGraphAndWait
   , hotSwapRuntimeGraphFusedAndWait
@@ -614,6 +615,9 @@ foreign import ccall unsafe "rt_graph_publish_swap"
 -- be disposed with c_rt_graph_cancel_swap.
 foreign import ccall unsafe "rt_graph_collect_retired_swap"
   c_rt_graph_collect_retired_swap :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
+
+foreign import ccall unsafe "rt_graph_swap_generation"
+  c_rt_graph_swap_generation :: Ptr RTGraph -> IO CInt
 
 foreign import ccall unsafe "rt_graph_test_swap_generation"
   c_rt_graph_test_swap_generation :: Ptr RTGraph -> IO CInt
@@ -1474,9 +1478,15 @@ collectRetiredSwapStats target = do
         , smsLifecycleCopyCount = fromIntegral lifecycles
         }
 
+-- | Read the production install-generation counter.
+--
+-- This is the stable Haskell surface used by live hot-swap producers.
+-- The adjacent @c_rt_graph_test_swap_generation@ binding remains
+-- exported for older low-level tests that assert the same counter
+-- directly.
 readSwapGeneration :: Ptr RTGraph -> IO SwapGeneration
 readSwapGeneration target =
-  fromIntegral <$> c_rt_graph_test_swap_generation target
+  fromIntegral <$> c_rt_graph_swap_generation target
 
 -- | Poll until the target's swap generation is greater than
 -- @priorGeneration@. A negative timeout waits indefinitely; zero

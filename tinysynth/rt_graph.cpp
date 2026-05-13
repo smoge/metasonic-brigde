@@ -9486,8 +9486,12 @@ RTGraphSwap *rt_graph_collect_retired_swap(RTGraph *g) {
   return retired;
 }
 
-int rt_graph_test_swap_generation(const RTGraph *g) {
+int rt_graph_swap_generation(const RTGraph *g) {
   return g ? g->swap_generation_observed.load(std::memory_order_acquire) : 0;
+}
+
+int rt_graph_test_swap_generation(const RTGraph *g) {
+  return rt_graph_swap_generation(g);
 }
 
 int rt_graph_test_swap_pending(const RTGraph *g) {

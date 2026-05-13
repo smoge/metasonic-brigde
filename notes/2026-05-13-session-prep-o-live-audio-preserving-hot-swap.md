@@ -112,12 +112,14 @@ steps for one target handle. This does not solve generic OSC/MIDI/UI
 fan-in. Those producers still need a separate arbitration policy before
 they can submit graph swaps concurrently.
 
-Realtime voice/control commands published before the audio callback
-installs the swap drain against the old world. Commands published after
-the session observes generation advance and commits target the new
-world. The session-side queue/host should hold the session step lock
-across publish, wait, collect, verification, and commit, so no later
-session command is admitted against ambiguous graph state.
+The live path relies on the audio callback applying pending realtime
+voice/control commands before it observes a published swap. Commands
+published before that callback installs the swap drain against the old
+world. Commands published after the session observes generation advance
+and commits target the new world. The session-side queue/host should
+hold the session step lock across publish, wait, collect, verification,
+and commit, so no later session command is admitted against ambiguous
+graph state.
 
 ## Reuse From Prep N
 
@@ -139,7 +141,8 @@ The only behavioral split is the install driver:
 
 The library tests model the live orchestration failure policy without
 starting PortAudio. `Session Prep O: live preserving hot-swap
-orchestration` uses a mock `SessionRuntimeAdapter` to cover:
+orchestration` uses a mock `SessionRuntimeAdapter` to cover the
+session-visible policy:
 
 - publish rejection returning non-terminal retryable failure;
 - install timeout after publish mapping through the terminal
@@ -148,9 +151,15 @@ orchestration` uses a mock `SessionRuntimeAdapter` to cover:
   terminal wrapper;
 - incomplete migration counters mapping through the terminal wrapper.
 
+The same test group also drives `runLiveHotSwapProtocol` with
+deterministic fake publish/wait/collect callbacks. That pins the
+producer-side ordering of generation capture, acquire, publish, wait,
+collect, and migration verification without depending on real audio
+hardware.
+
 Hardware-backed PortAudio tests should stay optional. The library tests
-can keep modeling the live path with a mock adapter or a deterministic
-fake wait/collect layer before adding any device-dependent coverage.
+can keep extending the deterministic fake layer before adding any
+device-dependent coverage.
 
 ## Out Of Scope
 

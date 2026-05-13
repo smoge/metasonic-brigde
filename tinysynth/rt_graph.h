@@ -1285,12 +1285,16 @@ int rt_graph_publish_swap(RTGraph *g, RTGraphSwap *swap);
 // fails so the one-deep retire slot cannot be overwritten.
 RTGraphSwap *rt_graph_collect_retired_swap(RTGraph *g);
 
-// [T:read-only] Phase 5.1.A test surface: atomic count of swaps the
-// audio thread has installed since graph construction (or
-// rt_graph_clear). Pinned by tests to assert "the install actually
-// happened at a block boundary." Returns 0 on null g, or 0 immediately
-// after rt_graph_clear. Producers may poll it after publish to know
-// when new-world commands are allowed.
+// [T:read-only] Production-stable atomic count of swaps the audio
+// thread has installed since graph construction (or rt_graph_clear).
+// Returns 0 on null g, or 0 immediately after rt_graph_clear.
+// Producers may poll it after publish to know when new-world commands
+// are allowed.
+int rt_graph_swap_generation(const RTGraph *g);
+
+// [T:read-only] Phase 5.1.A compatibility test surface for the same
+// counter exposed by rt_graph_swap_generation. Pinned by older tests to
+// assert "the install actually happened at a block boundary."
 int rt_graph_test_swap_generation(const RTGraph *g);
 
 // [T:read-only] Phase 5.1.A test surface: returns 1 if a swap is

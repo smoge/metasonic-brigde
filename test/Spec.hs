@@ -14455,8 +14455,9 @@ sessionPreservingHotSwapSpecTests =
 -- Session Prep O: live-audio preserving hot-swap orchestration
 --
 -- These tests do not start PortAudio. They pin the session-visible
--- failure policy by modeling the live publish/wait/collect/verify
--- stages with mock 'SessionRuntimeAdapter' results.
+-- failure policy with mock 'SessionRuntimeAdapter' results and pin
+-- the producer-side live install protocol with deterministic fake
+-- publish/wait/collect callbacks.
 ------------------------------------------------------------
 
 sessionLiveHotSwapOrchestrationTests :: TestTree
@@ -14484,6 +14485,80 @@ sessionLiveHotSwapOrchestrationTests =
       assertMockLiveInstallFailure
         "live-incomplete-migration"
         "preserving hot-swap migration was incomplete"
+
+  , testCase "deterministic live protocol orders publish wait collect verify" $ do
+      eventsRef <- newIORef []
+      let record event =
+            modifyIORef' eventsRef (<> [event])
+          expectations =
+            PreservingHotSwapExpectations
+              { phsePreservedBindingCount = 2
+              , phseExpectedStateCopyCount = 3
+              }
+          protocol = LiveHotSwapProtocol
+            { lhpReadGeneration = do
+                record "read-generation"
+                pure 11
+            , lhpAcquireSwap = do
+                record "acquire"
+                pure (Right "swap")
+            , lhpPublishSwap = \swap -> do
+                swap @?= "swap"
+                record "publish"
+                pure (Right ())
+            , lhpWaitForGeneration = \priorGeneration timeoutMs -> do
+                priorGeneration @?= 11
+                timeoutMs @?= 250
+                record "wait"
+                pure True
+            , lhpCollectRetiredStats = do
+                record "collect"
+                pure (Just (fakeMigrationStats 3 2))
+            }
+      result <- runLiveHotSwapProtocol protocol expectations 250
+      result @?= Right ()
+      events <- readIORef eventsRef
+      events
+        @?= [ "read-generation"
+            , "acquire"
+            , "publish"
+            , "wait"
+            , "collect"
+            ]
+
+  , testCase "deterministic live protocol maps post-publish failures" $ do
+      let expectations =
+            PreservingHotSwapExpectations
+              { phsePreservedBindingCount = 2
+              , phseExpectedStateCopyCount = 3
+              }
+      assertLiveProtocolFailure
+        expectations
+        "timeout"
+        (\protocol -> protocol
+          { lhpWaitForGeneration = \_ _ -> pure False
+          })
+        (SriHotSwapInstallFailed
+          (SasiLoaderException "preserving hot-swap install timed out"))
+      assertLiveProtocolFailure
+        expectations
+        "retired-missing"
+        (\protocol -> protocol
+          { lhpCollectRetiredStats = pure Nothing
+          })
+        (SriHotSwapInstallFailed
+          (SasiLoaderException
+            "preserving hot-swap installed but retired swap was missing"))
+      assertLiveProtocolFailure
+        expectations
+        "incomplete-migration"
+        (\protocol -> protocol
+          { lhpCollectRetiredStats =
+              pure (Just (fakeMigrationStats 2 2))
+          })
+        (SriHotSwapInstallFailed
+          (SasiLoaderException
+            "preserving hot-swap migration was incomplete"))
   ]
 
 liveHotSwapFixture
@@ -14535,6 +14610,40 @@ assertObservedPreservingPlan observedPlan expectedLabel expectedGraph =
       rrrDropped rebuild @?= []
     other ->
       assertFailure ("expected preserving PlanHotSwap, got: " <> show other)
+
+assertLiveProtocolFailure
+  :: PreservingHotSwapExpectations
+  -> String
+  -> (LiveHotSwapProtocol IO String -> LiveHotSwapProtocol IO String)
+  -> SessionRuntimeIssue
+  -> Assertion
+assertLiveProtocolFailure expectations labelText patch expectedIssue = do
+  let protocol = patch (successfulFakeLiveProtocol labelText)
+  result <- runLiveHotSwapProtocol protocol expectations 250
+  result @?= Left expectedIssue
+
+successfulFakeLiveProtocol :: String -> LiveHotSwapProtocol IO String
+successfulFakeLiveProtocol labelText = LiveHotSwapProtocol
+  { lhpReadGeneration =
+      pure 11
+  , lhpAcquireSwap =
+      pure (Right ("swap-" <> labelText))
+  , lhpPublishSwap =
+      const (pure (Right ()))
+  , lhpWaitForGeneration =
+      \_ _ -> pure True
+  , lhpCollectRetiredStats =
+      pure (Just (fakeMigrationStats 3 2))
+  }
+
+fakeMigrationStats :: Int -> Int -> SwapMigrationStats
+fakeMigrationStats stateCopies lifecycleCopies = SwapMigrationStats
+  { smsCommittedCount = 0
+  , smsSkippedCount = 0
+  , smsInstanceCopyCount = 0
+  , smsStateCopyCount = stateCopies
+  , smsLifecycleCopyCount = lifecycleCopies
+  }
 
 ------------------------------------------------------------
 -- Session Prep P: generic producer fan-in host
@@ -14652,6 +14761,54 @@ sessionFanInHostTests =
         Right other ->
           assertFailure ("timed out waiting for fan-in enqueues: "
                          <> show other)
+
+  , testCase "many concurrent producer enqueues keep contiguous sequences" $ do
+      let workerCount = 32
+          graph = patternTemplates droneVibrato
+          opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions workerCount
+            }
+          producerFor i =
+            testProducer
+              (if even i then ProducerOSC else ProducerMIDI)
+              ("producer-" <> show i)
+          commandFor i =
+            CmdVoiceOn
+              (TemplateName "drone")
+              (VoiceKey ("v" <> show i))
+              []
+      result <- withSessionFanInHost graph opts $ \host -> do
+        done <- newEmptyMVar
+        let worker i =
+              enqueueSessionFanInCommand
+                (producerFor i)
+                (commandFor i)
+                host
+                >>= putMVar done
+        forM_ [0 .. workerCount - 1] $ \i ->
+          forkIO (worker i)
+        enqueues <- forM [0 .. workerCount - 1] $ \_ ->
+          timeout 2000000 (takeMVar done)
+        snapshot <- readSessionFanInHost host
+        pure (enqueues, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (mEnqueues, snapshot) ->
+          case sequence mEnqueues of
+            Nothing ->
+              assertFailure "timed out waiting for fan-in enqueue workers"
+            Just enqueues -> do
+              let queued =
+                    [ queuedCommand
+                    | SessionEnqueued queuedCommand <-
+                        map sfierResult enqueues
+                    ]
+              length queued @?= workerCount
+              sort (map qscSequence queued)
+                @?= map (CommandSequence . fromIntegral)
+                      [0 .. workerCount - 1]
+              sfisQueueDepth snapshot @?= workerCount
 
   , testCase "drain divergence leaves unprocessed tail queued" $ do
       let oldGraph = patternTemplates droneVibrato

@@ -28,6 +28,11 @@ module MetaSonic.Session.RTGraphAdapter
   , rtgasAutoSpawnedSlots
   , rtgasRTGraph
 
+    -- * Live hot-swap protocol
+  , PreservingHotSwapExpectations (..)
+  , LiveHotSwapProtocol (..)
+  , runLiveHotSwapProtocol
+
     -- * Setup failures
   , SessionAdapterSetupIssue (..)
   , SessionPrewarmIssue (..)
@@ -60,6 +65,7 @@ import           MetaSonic.Bridge.Compile   (RuntimeGraph (..),
 import           MetaSonic.Bridge.FFI       (RTGraph, RTGraphSwap,
                                              SwapGeneration,
                                              SwapMigrationStats (..),
+                                             TimeoutMs,
                                              collectRetiredSwapStats,
                                              c_rt_graph_audio_running,
                                              c_rt_graph_cancel_swap,
@@ -76,11 +82,11 @@ import           MetaSonic.Bridge.FFI       (RTGraph, RTGraphSwap,
                                              c_rt_graph_realtime_release,
                                              c_rt_graph_realtime_reserve,
                                              c_rt_graph_realtime_set_control,
-                                             c_rt_graph_test_swap_generation,
                                              c_rt_graph_swap_migration_lifecycle_copy_count,
                                              c_rt_graph_swap_migration_state_copy_count,
                                              c_rt_graph_template_instance_add,
                                              c_rt_graph_template_set_polyphony,
+                                             readSwapGeneration,
                                              waitForSwapGeneration,
                                              loadTemplateGraphWithAutoSpawns,
                                              withRTGraph)
@@ -158,6 +164,26 @@ data RTGraphAdapterEnv = RTGraphAdapterEnv
 data PreservingHotSwapPlan = PreservingHotSwapPlan
   { phspBindings                :: ![VoiceBinding]
   , phspExpectedStateCopyCount  :: !Int
+  }
+
+-- | Verification thresholds for one preserving hot-swap install.
+data PreservingHotSwapExpectations = PreservingHotSwapExpectations
+  { phsePreservedBindingCount   :: !Int
+  , phseExpectedStateCopyCount  :: !Int
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Injectable live hot-swap install protocol.
+--
+-- The concrete RTGraph adapter wires these callbacks to the C runtime.
+-- Tests can provide a deterministic fake to pin the producer-side
+-- ordering without starting PortAudio.
+data LiveHotSwapProtocol m swap = LiveHotSwapProtocol
+  { lhpReadGeneration       :: m SwapGeneration
+  , lhpAcquireSwap          :: m (Either SessionRuntimeIssue swap)
+  , lhpPublishSwap          :: swap -> m (Either SessionRuntimeIssue ())
+  , lhpWaitForGeneration    :: SwapGeneration -> TimeoutMs -> m Bool
+  , lhpCollectRetiredStats  :: m (Maybe SwapMigrationStats)
   }
 
 data PreservingBuilderMeta = PreservingBuilderMeta
@@ -824,7 +850,7 @@ installScriptedPreservingHotSwap rt opts graph plan = do
   -- Drain queued realtime voice/control commands before freezing the
   -- old world as the migration source.
   driveScriptedPreservingStep rt
-  withPreparedPreservingBuilder rt opts graph plan $ \builder _ ->
+  withPreparedPreservingBuilder rt opts graph plan $ \builder ->
     publishAndVerifyScriptedPreservingSwap rt builder plan
 
 installLivePreservingHotSwap
@@ -834,7 +860,7 @@ installLivePreservingHotSwap
   -> PreservingHotSwapPlan
   -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
 installLivePreservingHotSwap rt opts graph plan =
-  withPreparedPreservingBuilder rt opts graph plan $ \builder _ ->
+  withPreparedPreservingBuilder rt opts graph plan $ \builder ->
     publishAndVerifyLivePreservingSwap
       rt
       builder
@@ -846,7 +872,7 @@ withPreparedPreservingBuilder
   -> RTGraphAdapterOptions
   -> TemplateGraph
   -> PreservingHotSwapPlan
-  -> (Ptr RTGraph -> PreservingBuilderMeta -> IO (Either SessionRuntimeIssue ()))
+  -> (Ptr RTGraph -> IO (Either SessionRuntimeIssue ()))
   -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
 withPreparedPreservingBuilder rt opts graph plan action = do
   sizing <- preservingBuilderSizing rt
@@ -865,7 +891,7 @@ withPreparedPreservingBuilder rt opts graph plan action = do
             Left issue ->
               pure (Left issue)
             Right meta -> do
-              installed <- action builder meta
+              installed <- action builder
               pure $ case installed of
                 Left issue -> Left issue
                 Right ()   -> Right meta
@@ -912,19 +938,43 @@ publishAndVerifyLivePreservingSwap
   -> PreservingHotSwapPlan
   -> Int
   -> IO (Either SessionRuntimeIssue ())
-publishAndVerifyLivePreservingSwap rt builder plan timeoutMs = do
-  priorGeneration <- readCurrentSwapGeneration rt
-  acquired <- acquirePreservingSwap rt builder
+publishAndVerifyLivePreservingSwap rt builder plan timeoutMs =
+  runLiveHotSwapProtocol
+    LiveHotSwapProtocol
+      { lhpReadGeneration =
+          readSwapGeneration rt
+      , lhpAcquireSwap =
+          acquirePreservingSwap rt builder
+      , lhpPublishSwap =
+          publishPreservingSwap rt
+      , lhpWaitForGeneration =
+          waitForSwapGeneration rt
+      , lhpCollectRetiredStats =
+          collectRetiredSwapStats rt
+      }
+    (preservingHotSwapExpectations plan)
+    timeoutMs
+
+runLiveHotSwapProtocol
+  :: Monad m
+  => LiveHotSwapProtocol m swap
+  -> PreservingHotSwapExpectations
+  -> TimeoutMs
+  -> m (Either SessionRuntimeIssue ())
+runLiveHotSwapProtocol protocol expectations timeoutMs = do
+  priorGeneration <- lhpReadGeneration protocol
+  acquired <- lhpAcquireSwap protocol
   case acquired of
     Left issue ->
       pure (Left issue)
     Right swap -> do
-      published <- publishPreservingSwap rt swap
+      published <- lhpPublishSwap protocol swap
       case published of
         Left issue ->
           pure (Left issue)
         Right () -> do
-          installed <- waitForSwapGeneration rt priorGeneration timeoutMs
+          installed <-
+            lhpWaitForGeneration protocol priorGeneration timeoutMs
           if not installed
              then
                -- Publish transferred ownership to the runtime. On
@@ -934,17 +984,15 @@ publishAndVerifyLivePreservingSwap rt builder plan timeoutMs = do
                pure (Left (hotSwapInstallFailed
                  "preserving hot-swap install timed out"))
              else do
-               stats <- collectRetiredSwapStats rt
+               stats <- lhpCollectRetiredStats protocol
                pure $ case stats of
                  Nothing ->
                    Left (hotSwapInstallFailed
                      "preserving hot-swap installed but retired swap was missing")
                  Just migrationStats ->
-                   verifyPreservingMigrationStats migrationStats plan
-
-readCurrentSwapGeneration :: Ptr RTGraph -> IO SwapGeneration
-readCurrentSwapGeneration rt =
-  fromIntegral <$> c_rt_graph_test_swap_generation rt
+                   verifyPreservingMigrationStatsWithExpectations
+                     migrationStats
+                     expectations
 
 acquirePreservingSwap
   :: Ptr RTGraph
@@ -999,13 +1047,13 @@ verifyPreservingMigration rt retired plan = do
   pure $ verifyPreservingMigrationCounts
     (fromIntegral stateCopies)
     (fromIntegral lifecycleCopies)
-    plan
+    (preservingHotSwapExpectations plan)
 
-verifyPreservingMigrationStats
+verifyPreservingMigrationStatsWithExpectations
   :: SwapMigrationStats
-  -> PreservingHotSwapPlan
+  -> PreservingHotSwapExpectations
   -> Either SessionRuntimeIssue ()
-verifyPreservingMigrationStats stats =
+verifyPreservingMigrationStatsWithExpectations stats =
   verifyPreservingMigrationCounts
     (smsStateCopyCount stats)
     (smsLifecycleCopyCount stats)
@@ -1013,17 +1061,28 @@ verifyPreservingMigrationStats stats =
 verifyPreservingMigrationCounts
   :: Int
   -> Int
-  -> PreservingHotSwapPlan
+  -> PreservingHotSwapExpectations
   -> Either SessionRuntimeIssue ()
-verifyPreservingMigrationCounts stateCopies lifecycleCopies plan =
+verifyPreservingMigrationCounts stateCopies lifecycleCopies expectations =
   if copiedEnough
      then Right ()
      else Left (hotSwapInstallFailed
             "preserving hot-swap migration was incomplete")
   where
     copiedEnough =
-      lifecycleCopies >= length (phspBindings plan)
-      && stateCopies >= phspExpectedStateCopyCount plan
+      lifecycleCopies >= phsePreservedBindingCount expectations
+      && stateCopies >= phseExpectedStateCopyCount expectations
+
+preservingHotSwapExpectations
+  :: PreservingHotSwapPlan
+  -> PreservingHotSwapExpectations
+preservingHotSwapExpectations plan =
+  PreservingHotSwapExpectations
+    { phsePreservedBindingCount =
+        length (phspBindings plan)
+    , phseExpectedStateCopyCount =
+        phspExpectedStateCopyCount plan
+    }
 
 hotSwapInstallFailed :: String -> SessionRuntimeIssue
 hotSwapInstallFailed =
