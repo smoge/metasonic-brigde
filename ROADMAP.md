@@ -2851,10 +2851,13 @@ full-queue rejection, and a synchronous drain helper into
 `stepSessionOwner`. **Session Prep H** adds the first concrete
 Haskell-only producer bridge for `Pattern`: deterministic block/range
 expansion, `PatternEvent` to `SessionCommand` conversion, queue
-submission, and bounded backlog retry on full-queue rejection. These
-slices still do not add a thread-safe fan-in wrapper, background drain
-loop, concrete OSC/MIDI/UI adapters, realtime command queue, or
-uninterrupted hot-swap claim.
+submission, and bounded backlog retry on full-queue rejection.
+**Session Prep I** promotes the producer/queue/owner composition into
+`MetaSonic.Session.Runner`: one caller-driven `stepPatternSession` call
+enqueues one Pattern block or backlog retry, then drains once into a
+caller-owned `SessionOwner`. These slices still do not add a thread-safe
+fan-in wrapper, background drain loop, concrete OSC/MIDI/UI adapters,
+realtime command queue, or uninterrupted hot-swap claim.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2866,12 +2869,13 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, D, E, F, G, and H now
-supply the library-side contracts, a constrained real-runtime adapter,
-a scoped single-threaded owner, and the first pure producer-ingress
-ordering/backpressure layer plus one concrete Pattern producer bridge.
-The remaining open work is not "create an owner", "define a queue", or
-"turn Pattern events into queued commands"; it is thread-safe queue
+cost/profitability table. Session Prep A, B, C, D, E, F, G, H, and I
+now supply the library-side contracts, a constrained real-runtime
+adapter, a scoped single-threaded owner, the first pure producer-ingress
+ordering/backpressure layer, one concrete Pattern producer bridge, and a
+caller-driven scripted Pattern runner. The remaining open work is not
+"create an owner", "define a queue", "turn Pattern events into queued
+commands", or "compose one Pattern runner step"; it is thread-safe queue
 ownership, OSC/MIDI/UI producer adapters, cross-producer arbitration,
 preserving hot-swap, and recovery semantics around that owner.
 
@@ -2929,6 +2933,13 @@ Session prep artifacts:
   retains rejected events for retry. This is still not a live clock,
   background worker, thread-safe fan-in layer, OSC/MIDI/UI adapter, or
   preserving hot-swap implementation.
+- [Session Prep I - Scripted Pattern Runner](notes/2026-05-13-session-prep-i-scripted-runner.md)
+  records the first caller-driven runner boundary above Prep F/G/H. It
+  composes one Pattern producer enqueue with one queue drain into a
+  caller-owned `SessionOwner`, returning both reports and the
+  carry-forward state. This is still not a live clock, background
+  worker, thread-safe fan-in layer, OSC/MIDI/UI adapter, or preserving
+  hot-swap implementation.
 
 Landed prep contracts:
 
@@ -2963,6 +2974,9 @@ Landed prep contracts:
   block/range expansion, `PatternEvent` to `SessionCommand`
   conversion, bounded backlog retry, and producer queue submission
   (`MetaSonic.Session.PatternProducer`).
+- [x] Caller-driven scripted Pattern runner v1 with one enqueue step,
+  one owner drain step, and explicit carry-forward producer/queue state
+  (`MetaSonic.Session.Runner`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -2989,7 +3003,9 @@ Landed prep contracts:
   `PatternEvent` constructors, full-queue stop/backlog retention,
   backlog retry without cursor advancement, sequence preservation
   across rejected backlog, and a Pattern producer -> queue -> owner
-  integration smoke.
+  integration smoke. Prep I runner tests cover one-block voice commit,
+  repeated backlog drain across runner steps, owner divergence/blocking
+  propagation, and no cursor advancement during backlog recovery.
 
 Still gated:
 
@@ -3007,12 +3023,12 @@ Still gated:
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
 
-Current decision: treat Prep F/G/H as the first runtime ownership and
-producer-ingress boundaries, not as the full session runtime. Do not
-promote them into a producer-facing session service until concrete
-producer fan-in, thread-safe queue ownership, OSC/MIDI/UI ingress,
-cross-producer arbitration, preserving hot-swap, and recovery policies
-are specified and tested in their own slices. The
+Current decision: treat Prep F/G/H/I as the first runtime ownership,
+producer-ingress, and scripted-runner boundaries, not as the full session
+runtime. Do not promote them into a producer-facing session service until
+concrete producer fan-in, thread-safe queue ownership, OSC/MIDI/UI
+ingress, cross-producer arbitration, preserving hot-swap, and recovery
+policies are specified and tested in their own slices. The
 session does not need a generated fusion executor to ship;
 generated execution remains a read-only diagnostic/performance
 experiment unless later measurements justify automatic turn-on.

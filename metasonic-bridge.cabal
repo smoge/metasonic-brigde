@@ -54,6 +54,7 @@ library
       MetaSonic.Session.Owner
       MetaSonic.Session.Queue
       MetaSonic.Session.PatternProducer
+      MetaSonic.Session.Runner
       MetaSonic.Authoring
       MetaSonic.Authoring.Report
       MetaSonic.Authoring.Manifest
