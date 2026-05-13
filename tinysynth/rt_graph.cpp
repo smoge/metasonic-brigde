@@ -3651,12 +3651,10 @@ void set_osc_initial_phase(NodeInstanceState &node, double value) noexcept {
   const double frac = std::isfinite(value) ? value - std::floor(value) : 0.0;
 
   // Note [Phase setting semantics]
-  // q::phase_iterator has no public API for setting _phase independently of _step.
-  // phase_iterator::set(freq, sps) updates only _step.
-  // operator=(phase) also sets _step, not _phase — a counterintuitive trap.
-  //
-  // Let's keep this direct field access here so a Q API change breaks in one place...
-  iter->_phase = q::frac_to_phase(frac);
+  // phase_iterator::set(freq, sps) updates the frequency step and intentionally
+  // leaves accumulated phase alone. Initial oscillator phase needs the inverse:
+  // update phase while preserving the current frequency step.
+  iter->set_phase(q::frac_to_phase(frac));
 }
 
 /* Note [SinOsc processing semantics]
