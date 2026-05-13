@@ -51,6 +51,7 @@
 
 #include "rt_graph.h"
 
+#include <cstddef>
 #include <cstdint>
 
 #define RT_MIDI_DEVICE_NAME_MAX 256
@@ -188,4 +189,69 @@ int rt_midi_demo_has_device(const rt_midi_demo *h);
 
 #ifdef __cplusplus
 } // extern "C"
+#endif
+
+#ifdef __cplusplus
+// Compile-time pins for the Haskell Storable mirrors in
+// MetaSonic.Bridge.MidiDemo and MetaSonic.MIDI.Devices.
+static_assert(alignof(int) == 4,
+              "Haskell CMidiDeviceInfo Storable assumes 4-byte int alignment");
+static_assert(alignof(float) == 4,
+              "Haskell MIDI Storable mirrors assume 4-byte float alignment");
+static_assert(sizeof(rt_midi_voice_mapping) == 24,
+              "Haskell CVoiceMapping Storable size must match C ABI");
+static_assert(alignof(rt_midi_voice_mapping) == 4,
+              "Haskell CVoiceMapping Storable alignment must match C ABI");
+static_assert(offsetof(rt_midi_voice_mapping, freq_node_index) == 0,
+              "rt_midi_voice_mapping.freq_node_index offset drifted");
+static_assert(offsetof(rt_midi_voice_mapping, freq_control_index) == 4,
+              "rt_midi_voice_mapping.freq_control_index offset drifted");
+static_assert(offsetof(rt_midi_voice_mapping, gate_node_index) == 8,
+              "rt_midi_voice_mapping.gate_node_index offset drifted");
+static_assert(offsetof(rt_midi_voice_mapping, gate_control_index) == 12,
+              "rt_midi_voice_mapping.gate_control_index offset drifted");
+static_assert(offsetof(rt_midi_voice_mapping, vel_node_index) == 16,
+              "rt_midi_voice_mapping.vel_node_index offset drifted");
+static_assert(offsetof(rt_midi_voice_mapping, vel_control_index) == 20,
+              "rt_midi_voice_mapping.vel_control_index offset drifted");
+static_assert(sizeof(rt_midi_cc_mapping) == 20,
+              "Haskell CCcMapping Storable size must match C ABI");
+static_assert(alignof(rt_midi_cc_mapping) == 4,
+              "Haskell CCcMapping Storable alignment must match C ABI");
+static_assert(offsetof(rt_midi_cc_mapping, cc_number) == 0,
+              "rt_midi_cc_mapping.cc_number offset drifted");
+static_assert(offsetof(rt_midi_cc_mapping, node_index) == 4,
+              "rt_midi_cc_mapping.node_index offset drifted");
+static_assert(offsetof(rt_midi_cc_mapping, control_index) == 8,
+              "rt_midi_cc_mapping.control_index offset drifted");
+static_assert(offsetof(rt_midi_cc_mapping, min_value) == 12,
+              "rt_midi_cc_mapping.min_value offset drifted");
+static_assert(offsetof(rt_midi_cc_mapping, max_value) == 16,
+              "rt_midi_cc_mapping.max_value offset drifted");
+static_assert(sizeof(rt_midi_pitch_bend_binding) == 12,
+              "Haskell CPitchBendBinding Storable size must match C ABI");
+static_assert(alignof(rt_midi_pitch_bend_binding) == 4,
+              "Haskell CPitchBendBinding Storable alignment must match C ABI");
+static_assert(offsetof(rt_midi_pitch_bend_binding, node_index) == 0,
+              "rt_midi_pitch_bend_binding.node_index offset drifted");
+static_assert(offsetof(rt_midi_pitch_bend_binding, control_index) == 4,
+              "rt_midi_pitch_bend_binding.control_index offset drifted");
+static_assert(offsetof(rt_midi_pitch_bend_binding, semitone_range) == 8,
+              "rt_midi_pitch_bend_binding.semitone_range offset drifted");
+static_assert(sizeof(rt_midi_device_info) == 268,
+              "Haskell CMidiDeviceInfo Storable size must match C ABI");
+static_assert(alignof(rt_midi_device_info) == 4,
+              "Haskell CMidiDeviceInfo Storable alignment must match C ABI");
+static_assert(offsetof(rt_midi_device_info, id) == 0,
+              "rt_midi_device_info.id offset drifted");
+static_assert(offsetof(rt_midi_device_info, num_inputs) == 4,
+              "rt_midi_device_info.num_inputs offset drifted");
+static_assert(offsetof(rt_midi_device_info, num_outputs) == 8,
+              "rt_midi_device_info.num_outputs offset drifted");
+static_assert(offsetof(rt_midi_device_info, name) == 12,
+              "rt_midi_device_info.name offset drifted");
+static_assert(sizeof(rt_midi_device_info{}.name) == RT_MIDI_DEVICE_NAME_MAX,
+              "rt_midi_device_info.name length drifted");
+static_assert(RT_MIDI_DEVICE_NAME_MAX == 256,
+              "Haskell CMidiDeviceInfo bounded name decode assumes 256 bytes");
 #endif
