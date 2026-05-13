@@ -154,6 +154,7 @@ import           MetaSonic.Session.Runner
 import           MetaSonic.Session.Host
 import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.FanInService
+import           MetaSonic.Session.MIDIProducer
 import           MetaSonic.Session.OSCProducer
 import qualified MetaSonic.Session.OSCListener as OSCS
 import qualified MetaSonic.Authoring         as Auth
@@ -207,6 +208,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionLiveHotSwapOrchestrationTests
   , sessionFanInHostTests
   , sessionFanInServiceTests
+  , sessionMIDIProducerTests
   , sessionOSCProducerTests
   , sessionOSCListenerTests
   , patternCorpusTests
@@ -15022,6 +15024,242 @@ sessionFanInServiceTests =
         Right (_enq0, Nothing, _enq1, _snapshot) ->
           assertFailure "timed out waiting for service stopped-drain issue"
   ]
+
+------------------------------------------------------------
+-- Session MIDI producer adapter
+--
+-- This adapter is Haskell-only and consumes already-decoded MIDI
+-- events. Live PortMIDI device ownership remains in the existing
+-- Bridge.MidiDemo path.
+------------------------------------------------------------
+
+sessionMIDIProducerTests :: TestTree
+sessionMIDIProducerTests =
+  testGroup "Session MIDI producer adapter"
+  [ testCase "note-on translates to voice start with configured controls" $ do
+      let opts = testMIDIProducerOptions
+          event = MIDIProducerNoteOn 0 69 64
+      case decodeMIDISessionCommands opts initialMIDIProducerState event of
+        Left issue ->
+          assertFailure ("expected MIDI note-on translation, got: "
+                         <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdVoiceOn
+                (TemplateName "drone")
+                (VoiceKey "m0-69")
+                [ (midiFreqTag, 440.0)
+                , (midiGateTag, 1.0)
+                , (midiVelocityTag, 64.0 / 127.0)
+                ]
+            ]
+          mpsActiveNotes (mpcbState batch)
+            @?= M.singleton (0, 69) (VoiceKey "m0-69")
+
+  , testCase "note-on velocity zero is treated as note-off" $ do
+      let active = MIDIProducerState
+            { mpsActiveNotes = M.singleton (2, 60) (VoiceKey "m2-60")
+            }
+          event = MIDIProducerNoteOn 2 60 0
+      decodeMIDISessionCommands testMIDIProducerOptions active event
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = [CmdVoiceOff (VoiceKey "m2-60")]
+              , mpcbState = initialMIDIProducerState
+              }
+
+  , testCase "duplicate and stale notes are rejected before enqueue" $ do
+      let opts = testMIDIProducerOptions
+          active = MIDIProducerState
+            { mpsActiveNotes = M.singleton (0, 69) (VoiceKey "m0-69")
+            }
+      decodeMIDISessionCommands opts active (MIDIProducerNoteOn 0 69 127)
+        @?= Left (MpiNoteAlreadyActive 0 69)
+      decodeMIDISessionCommands opts initialMIDIProducerState
+                                  (MIDIProducerNoteOff 0 69 0)
+        @?= Left (MpiNoteNotActive 0 69)
+
+  , testCase "CC maps to deterministic control writes for active notes" $ do
+      let active = MIDIProducerState
+            { mpsActiveNotes = M.fromList
+                [ ((0, 72), VoiceKey "m0-72")
+                , ((0, 60), VoiceKey "m0-60")
+                ]
+            }
+          event = MIDIProducerControlChange 0 7 64
+          expectedValue = 64.0 / 127.0
+      case decodeMIDISessionCommands testMIDIProducerOptions active event of
+        Left issue ->
+          assertFailure ("expected MIDI CC translation, got: " <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdControlWrite (VoiceKey "m0-60") midiLevelTag expectedValue
+            , CmdControlWrite (VoiceKey "m0-72") midiLevelTag expectedValue
+            ]
+          mpcbState batch @?= active
+
+  , testCase "invalid data bytes and unmapped CCs reject explicitly" $ do
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerNoteOn 16 60 1)
+        @?= Left (MpiInvalidChannel 16)
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerNoteOn 0 128 1)
+        @?= Left (MpiInvalidDataByte (T.pack "note") 128)
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerControlChange 0 74 64)
+        @?= Left (MpiUnmappedControl 74)
+
+  , testCase "successful enqueue advances MIDI state under ProducerMIDI" $ do
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  defaultSessionFanInOptions
+                  $ \host -> do
+                    enq <- enqueueMIDIProducerEvent
+                             testMIDIProducerOptions
+                             initialMIDIProducerState
+                             (MIDIProducerNoteOn 0 69 127)
+                             host
+                    snapshot <- readSessionFanInHost host
+                    pure (enq, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (MIDIProducerEnqueueAttempted batch [enq], snapshot) -> do
+          mpsActiveNotes (mpcbState batch)
+            @?= M.singleton (0, 69) (VoiceKey "m0-69")
+          queued <- fanInQueuedOrFail enq
+          producerKind (qscProducer queued) @?= ProducerMIDI
+          mpcbCommands batch @?= [qscCommand queued]
+          sfierQueueDepth enq @?= 1
+          sfisQueueDepth snapshot @?= 1
+        Right other ->
+          assertFailure ("expected MIDI enqueue attempt, got: "
+                         <> show other)
+
+  , testCase "queue-full does not advance note state" $ do
+      let opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          prefill =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  opts
+                  $ \host -> do
+                    _prefill <-
+                      enqueueSessionFanInCommand
+                        (testProducer ProducerTest "prefill")
+                        prefill
+                        host
+                    enqueueMIDIProducerEvent
+                      testMIDIProducerOptions
+                      initialMIDIProducerState
+                      (MIDIProducerNoteOn 0 69 127)
+                      host
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (MIDIProducerEnqueueAttempted batch [enq]) -> do
+          mpcbState batch @?= initialMIDIProducerState
+          case mpcbCommands batch of
+            [command] ->
+              sfierResult enq
+                @?= SessionEnqueueRejected
+                      (midiProducerId testMIDIProducerOptions)
+                      command
+                      (SeiQueueFull 1)
+            other ->
+              assertFailure ("expected one MIDI command, got: " <> show other)
+        Right other ->
+          assertFailure ("expected queue-full MIDI enqueue, got: "
+                         <> show other)
+
+  , testCase "service host wakes worker for MIDI note-on" $ do
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          (patternTemplates droneVibrato)
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq <- enqueueMIDIProducerEvent
+                       testMIDIPlayableOptions
+                       initialMIDIProducerState
+                       (MIDIProducerNoteOn 0 69 100)
+                       (sessionFanInServiceHost service)
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (enq, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (MIDIProducerEnqueueAttempted _ [enq], Just drained, snapshot) -> do
+          queued <- fanInQueuedOrFail enq
+          map sdiQueued (sdrItems (sfidrDrain drained)) @?= [queued]
+          case map sdiResult (sdrItems (sfidrDrain drained)) of
+            [SessionOwnerStep (StepCommitted _ Nothing)] ->
+              pure ()
+            other ->
+              assertFailure
+                ("expected MIDI note-on to commit through service, got: "
+                 <> show other)
+          sfisQueueDepth snapshot @?= 0
+          assertBool
+            "expected MIDI voice after service drain"
+            (M.member (VoiceKey "m0-69") (ssVoices (sfisOwnerState snapshot)))
+        Right (_enq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for MIDI service drain"
+        Right other ->
+          assertFailure ("expected MIDI service enqueue, got: " <> show other)
+  ]
+
+testMIDIProducerOptions :: MIDIProducerOptions
+testMIDIProducerOptions = defaultMIDIProducerOptions
+  { mpoTemplateName =
+      TemplateName "drone"
+  , mpoFrequencyControl =
+      Just midiFreqTag
+  , mpoGateControl =
+      Just midiGateTag
+  , mpoVelocityControl =
+      Just midiVelocityTag
+  , mpoCCMappings =
+      M.singleton 7 MIDIControlMapping
+        { mcmTarget = midiLevelTag
+        , mcmMin    = 0.0
+        , mcmMax    = 1.0
+        }
+  }
+
+testMIDIPlayableOptions :: MIDIProducerOptions
+testMIDIPlayableOptions = testMIDIProducerOptions
+  { mpoFrequencyControl = Nothing
+  , mpoGateControl      = Nothing
+  , mpoVelocityControl  = Nothing
+  }
+
+midiFreqTag :: ControlTag
+midiFreqTag =
+  ControlTag (MigrationKey "carrier") 0
+
+midiGateTag :: ControlTag
+midiGateTag =
+  ControlTag (MigrationKey "envelope") 0
+
+midiVelocityTag :: ControlTag
+midiVelocityTag =
+  ControlTag (MigrationKey "velocity") 0
+
+midiLevelTag :: ControlTag
+midiLevelTag =
+  ControlTag (MigrationKey "lpf") 0
 
 ------------------------------------------------------------
 -- Session OSC producer adapter

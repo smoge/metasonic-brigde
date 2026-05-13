@@ -259,12 +259,17 @@ The landed pieces are deliberately small:
 - `MetaSonic.Session.OSCListener` brackets a UDP OSC listener on top of that
   producer. It only parses and enqueues; draining is owned by the caller or by
   a composed `MetaSonic.Session.FanInService`.
+- `MetaSonic.Session.MIDIProducer` translates already-decoded MIDI note-on,
+  note-off, and control-change events into session commands with `ProducerMIDI`
+  identity, including per-note producer state and configurable note/CC
+  mappings.
 
-What is still intentionally absent: MIDI/UI producer adapters, broader OSC
-behavior beyond symbolic control writes, arbitration beyond FIFO, long-running
-supervision beyond the scoped fan-in service, unsupported respawn/reset policy
-for preserving swaps, manifest reload/resource allocation, and recovery after
-terminal runtime divergence.
+What is still intentionally absent: UI producer adapters, live PortMIDI
+listener/device ownership for the session path, broader MIDI behavior beyond
+note/CC command translation, broader OSC behavior beyond symbolic control
+writes, arbitration beyond FIFO, long-running supervision beyond the scoped
+fan-in service, unsupported respawn/reset policy for preserving swaps, manifest
+reload/resource allocation, and recovery after terminal runtime divergence.
 
 ---
 

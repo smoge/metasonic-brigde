@@ -5,7 +5,9 @@ Date: 2026-05-13
 Status: implemented generic command fan-in host. At Prep P, this slice
 did not add concrete OSC/MIDI/UI protocol adapters, did not spawn a
 background worker, did not define wall-clock scheduling, and did not
-add a new audio-thread queue.
+add a new audio-thread queue. Later follow-ups added the OSC
+control-write producer/listener path, the scoped fan-in drain service,
+and the first already-decoded MIDI note/CC producer adapter.
 
 Prep G defined the bounded FIFO producer queue. Prep J proved a
 serialized host shape for Pattern by hiding one owner plus producer and
@@ -93,8 +95,12 @@ Prep P does not force that consolidation.
 
 ## Prep P Out Of Scope
 
-- OSC path parsing to `SessionCommand`.
-- MIDI note/CC translation to `SessionCommand`.
+- At this slice, OSC path parsing to `SessionCommand`; later covered
+  for symbolic control writes by `MetaSonic.Session.OSCProducer` and
+  `MetaSonic.Session.OSCListener`.
+- At this slice, MIDI note/CC translation to `SessionCommand`; later
+  covered for already-decoded note-on/off and CC events by
+  `MetaSonic.Session.MIDIProducer`.
 - UI command adapters.
 - Background drain loops or lifecycle supervision.
 - Cross-producer arbitration beyond the existing FIFO queue order.

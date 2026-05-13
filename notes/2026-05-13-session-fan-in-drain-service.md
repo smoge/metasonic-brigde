@@ -28,7 +28,11 @@ respawning the session.
 
 ## Still Out Of Scope
 
-- MIDI/UI producer translation.
+- At this slice, MIDI/UI producer translation. The later
+  [Session MIDI Producer Adapter](2026-05-13-session-midi-producer-adapter.md)
+  covers already-decoded MIDI note/CC command translation, but live
+  PortMIDI listener/device ownership and UI producers remain out of
+  scope.
 - OSC behavior beyond the landed symbolic control-write path.
 - Arbitration beyond FIFO producer order.
 - Producer-specific throttling or coalescing.
