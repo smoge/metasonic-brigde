@@ -37,6 +37,7 @@ library:
   source-dirs: src
   exposed-modules:
     - MetaSonic.Types
+    - MetaSonic.ControlTarget
     - MetaSonic.Bridge.Source
     - MetaSonic.Bridge.Validate
     - MetaSonic.Bridge.IR

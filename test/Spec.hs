@@ -122,6 +122,7 @@ import           MetaSonic.Bridge.Planner
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Bridge.Validate
+import           MetaSonic.ControlTarget
 import qualified MetaSonic.OSC.Dispatch          as OSC
 import qualified MetaSonic.OSC.Dispatch.Internal as OSCI
 import qualified MetaSonic.OSC.Listen            as OSC
@@ -181,6 +182,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionReportTests
   , sessionStateTests
   , sessionStepTests
+  , controlTargetTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -12657,6 +12659,84 @@ sessionStepTests = testGroup "Session Prep D: runtime adapter shell"
           ssVoices st1 @?= M.fromList [(VoiceKey "v0", binding)]
         other ->
           assertFailure ("expected StepCommitted via pattern event, got: " <> show other)
+  ]
+
+------------------------------------------------------------
+-- Session Prep E: shared control-target resolver
+--
+-- The real RTGraph adapter will use the same symbolic
+-- @(TemplateName, ControlTag)@ lookup as OSC dispatch. These tests
+-- pin the pure resolver before adapter code starts depending on it.
+------------------------------------------------------------
+
+controlTargetTests :: TestTree
+controlTargetTests = testGroup "Session Prep E: control target resolver"
+  [ testCase "known target resolves to runtime node and control slot" $ do
+      let tg      = patternTemplates droneVibrato
+          target  = ControlTag (MigrationKey "lpf") 1
+          lpfHits =
+            [ rnIndex n
+            | tpl <- tgTemplates tg
+            , tplName tpl == "drone"
+            , n <- rgNodes (tplGraph tpl)
+            , rnMigrationKey n == Just (MigrationKey "lpf")
+            ]
+      case resolveControlTarget tg (TemplateName "drone") target of
+        Right resolved -> do
+          targetControlSlot resolved @?= 1
+          assertBool
+            ("expected lpf runtime target, got "
+              <> show (targetNodeIndex resolved)
+              <> " from candidates "
+              <> show lpfHits)
+            (targetNodeIndex resolved `elem` lpfHits)
+        Left issue ->
+          assertFailure ("expected resolved control target, got: " <> show issue)
+
+  , testCase "missing template is reported structurally" $ do
+      let tg = patternTemplates droneVibrato
+      resolveControlTarget
+        tg
+        (TemplateName "missing")
+        (ControlTag (MigrationKey "lpf") 0)
+        @?= Left (CtiMissingTemplate (TemplateName "missing"))
+
+  , testCase "missing node tag is reported structurally" $ do
+      let tg = patternTemplates droneVibrato
+      resolveControlTarget
+        tg
+        (TemplateName "drone")
+        (ControlTag (MigrationKey "no-such-tag") 0)
+        @?= Left
+              (CtiUnknownNodeTag
+                 (TemplateName "drone")
+                 (MigrationKey "no-such-tag"))
+
+  , testCase "invalid control slot reports requested and available counts" $ do
+      let tg = patternTemplates droneVibrato
+      resolveControlTarget
+        tg
+        (TemplateName "drone")
+        (ControlTag (MigrationKey "lpf") 99)
+        @?= Left
+              (CtiInvalidControlSlot
+                 (TemplateName "drone")
+                 (MigrationKey "lpf")
+                 99
+                 2)
+
+  , testCase "negative control slot reports requested and available counts" $ do
+      let tg = patternTemplates droneVibrato
+      resolveControlTarget
+        tg
+        (TemplateName "drone")
+        (ControlTag (MigrationKey "lpf") (-1))
+        @?= Left
+              (CtiInvalidControlSlot
+                 (TemplateName "drone")
+                 (MigrationKey "lpf")
+                 (-1)
+                 2)
   ]
 
 ------------------------------------------------------------

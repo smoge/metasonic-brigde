@@ -44,10 +44,14 @@ import           Data.Int                   (Int32)
 import qualified Data.Map.Strict            as M
 import           GHC.Generics               (Generic)
 
-import           MetaSonic.Bridge.Compile   (RuntimeNode (..), rgNodes)
 import           MetaSonic.Bridge.Source    (MigrationKey (..))
-import           MetaSonic.Bridge.Templates (Template (..), TemplateGraph (..))
+import           MetaSonic.Bridge.Templates (TemplateGraph (..))
+import           MetaSonic.ControlTarget    (ControlTarget (..),
+                                             ControlTargetIssue (..),
+                                             resolveControlTarget)
 import           MetaSonic.OSC.Wire         (OscArg (..), OscMessage (..))
+import           MetaSonic.Pattern          (ControlTag (..),
+                                             TemplateName (..))
 import           MetaSonic.Types            (NodeIndex)
 
 ----------------------------------------------------------------------
@@ -246,19 +250,13 @@ dispatch rs msg = do
       Just x  -> Right x
       Nothing -> Left (DiUnknownVoice voiceKey)
 
-  tpl <-
-    case findTemplate tname (_rsTemplate rs) of
-      Just t  -> Right t
-      Nothing -> Left (DiMissingTemplateForVoice voiceKey tname)
-
-  node <-
-    case findNodeByTag (BSC.unpack nodeTag) tpl of
-      Just n  -> Right n
-      Nothing -> Left (DiUnknownNodeTag voiceKey nodeTag)
-
-  let controlCount = length (rnControls node)
-  when' (slot < 0 || slot >= controlCount)
-        (DiInvalidControlSlot voiceKey nodeTag slot controlCount)
+  target <-
+    case resolveControlTarget
+           (_rsTemplate rs)
+           (TemplateName (BSC.unpack tname))
+           (ControlTag (MigrationKey (BSC.unpack nodeTag)) slot) of
+      Right x    -> Right x
+      Left issue -> Left (toDispatchIssue voiceKey nodeTag tname issue)
 
   value <-
     case oscArgs msg of
@@ -268,14 +266,25 @@ dispatch rs msg = do
 
   Right DAControlWrite
     { daSlotId     = slotId
-    , daNodeIndex  = rnIndex node
-    , daControlIdx = slot
+    , daNodeIndex  = targetNodeIndex target
+    , daControlIdx = targetControlSlot target
     , daValue      = value
     }
   where
     when' :: Bool -> DispatchIssue -> Either DispatchIssue ()
     when' True  issue = Left issue
     when' False _     = Right ()
+
+    toDispatchIssue
+      :: ByteString -> ByteString -> ByteString -> ControlTargetIssue
+      -> DispatchIssue
+    toDispatchIssue voiceKey nodeTag tname issue = case issue of
+      CtiMissingTemplate _ ->
+        DiMissingTemplateForVoice voiceKey tname
+      CtiUnknownNodeTag {} ->
+        DiUnknownNodeTag voiceKey nodeTag
+      CtiInvalidControlSlot _ _ requested available ->
+        DiInvalidControlSlot voiceKey nodeTag requested available
 
 splitAddress :: ByteString -> Either DispatchIssue [ByteString]
 splitAddress addr = case BSC.uncons addr of
@@ -297,17 +306,3 @@ parseSlotInteger bs
       _                                       -> Left (DiSlotNotInteger bs)
   where
     isAsciiDigit c = c >= '0' && c <= '9'
-
-findTemplate :: ByteString -> TemplateGraph -> Maybe Template
-findTemplate name tg =
-  case [ t | t <- tgTemplates tg, BSC.pack (tplName t) == name ] of
-    (t : _) -> Just t
-    []      -> Nothing
-
-findNodeByTag :: String -> Template -> Maybe RuntimeNode
-findNodeByTag tag tpl =
-  case [ n | n <- rgNodes (tplGraph tpl)
-           , rnMigrationKey n == Just (MigrationKey tag)
-       ] of
-    (n : _) -> Just n
-    []      -> Nothing
