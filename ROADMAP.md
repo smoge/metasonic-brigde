@@ -2839,8 +2839,11 @@ a checked plan/commit handshake so successful runtime facts
 cannot be applied to the wrong admitted plan. **Session Prep D**
 adds an injected runtime adapter contract and a single-step
 mock shell so the orchestrator's behavior is pinned before any
-real runtime adapter ships. The session runtime itself is still
-gated on the items below.
+real runtime adapter ships. **Session Prep E** adds the first
+caller-owned `RTGraph` adapter against the existing realtime ABI:
+voice start, voice stop, control write, and constrained graph install.
+It still does not create a runtime session owner, realtime command
+queue, producer arbitration layer, or uninterrupted hot-swap claim.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2852,9 +2855,9 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, and D supply the
-library-side contracts the future session owner will consume, without
-creating that owner yet.
+cost/profitability table. Session Prep A, B, C, D, and E supply the
+library-side contracts plus a constrained real-runtime adapter the
+future session owner will consume, without creating that owner yet.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2878,8 +2881,15 @@ Session prep artifacts:
   the plan/commit handshake. The orchestrator's failure classes —
   admission rejection, runtime failure, commit mismatch, and adapter
   protocol bug — stay structurally distinct. This is still not the
-  runtime session layer; the first real adapter belongs to a later
-  slice.
+  runtime session layer.
+- [Session Prep E - RTGraph Runtime Adapter](notes/2026-05-12-session-prep-e-rtgraph-adapter.md)
+  records the first real adapter over a caller-owned `RTGraph`.
+  It reuses `loadTemplateGraphWithAutoSpawns` and the existing
+  `rt_graph_realtime_*` ABI, supports voice start/stop and symbolic
+  control writes, and implements only constrained graph installs:
+  empty-session or drop-all swaps may install, but swaps that would
+  preserve live voices are rejected. This is still not the runtime
+  session layer.
 
 Landed prep contracts:
 
@@ -2897,29 +2907,40 @@ Landed prep contracts:
   (`MetaSonic.Session.Runtime`).
 - [x] Single-step orchestrator that composes admission, adapter, and
   handshake (`MetaSonic.Session.Step`).
+- [x] Shared structured setup/install issue vocabulary for real
+  adapters (`MetaSonic.Session.AdapterIssue`).
+- [x] Caller-owned `RTGraph` adapter v1 for voice start, voice stop,
+  control write, and constrained graph install
+  (`MetaSonic.Session.RTGraphAdapter`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
-  behavior, and the mock-adapter step shell across all four failure
-  classes and both success cases.
+  behavior, the mock-adapter step shell across all four failure
+  classes and both success cases, and the real RTGraph adapter's
+  install/prewarm, voice, control, and constrained hot-swap behavior.
+  The Prep E IO-side step-test target is covered by the accumulated
+  real-adapter tests across voice start/stop, control write, empty
+  hot-swap, drop-all hot-swap, preserving-swap rejection, and
+  structured install failure.
 
 Still gated:
 
-- [ ] A real runtime adapter that drives the existing Haskell load
-  path (`loadTemplateGraph`, `rt_graph_realtime_*`).
+- [ ] A runtime session owner that owns the `RTGraph`, adapter state,
+  lifecycle, and teardown/recovery policy.
 - [ ] A realtime command queue and producer-thread arbitration.
-- [ ] Graph install / hot-swap execution policy with audio-thread
-  cooperation.
+- [ ] Uninterrupted graph hot-swap with audio-thread cooperation,
+  preserving-voice migration, and recoverable failed-install semantics.
 - [ ] MIDI, OSC, and pattern arbitration.
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 
-Current decision: do not start session runtime code until those
-ownership and execution policies are specified and tested in their own
-slice. The session does not need a generated fusion executor to ship;
-generated execution remains a read-only diagnostic/performance
-experiment unless later measurements justify automatic turn-on.
+Current decision: do not promote the Prep E adapter into a full session
+runtime until ownership, queueing, producer arbitration, and hot-swap
+recovery policies are specified and tested in their own slice. The
+session does not need a generated fusion executor to ship; generated
+execution remains a read-only diagnostic/performance experiment unless
+later measurements justify automatic turn-on.
 
 ---
 
