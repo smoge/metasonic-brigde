@@ -210,6 +210,8 @@ ownerDivergence result = case result of
     Just (SodAdapterProtocolBug message)
   -- New runtime failures default to non-terminal here. Promote a
   -- constructor explicitly when it represents a state/runtime sync
-  -- hazard for the owner.
+  -- hazard for the owner. In particular, hot-swap publish backpressure
+  -- and stopped-audio requirements are retryable without rebuilding
+  -- owner state.
   _ ->
     Nothing

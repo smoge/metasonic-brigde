@@ -57,7 +57,7 @@ import           GHC.Generics               (Generic)
 
 import           MetaSonic.Bridge.Compile   (RuntimeGraph (..),
                                              RuntimeNode (..))
-import           MetaSonic.Bridge.FFI       (RTGraph,
+import           MetaSonic.Bridge.FFI       (RTGraph, RTGraphSwap,
                                              c_rt_graph_audio_running,
                                              c_rt_graph_cancel_swap,
                                              c_rt_graph_capacity,
@@ -771,92 +771,172 @@ runPreservingHotSwap
   -> PreservingHotSwapPlan
   -> IO (Either SessionRuntimeIssue SessionRuntimeSuccess)
 runPreservingHotSwap env current label graph plan = do
-  audioRunning <- c_rt_graph_audio_running rt
-  if audioRunning /= 0
-     then pure (Left SriHotSwapRequiresStoppedAudio)
-     else do
-       -- Apply already-queued voice/control realtime commands before
-       -- building the migration source. Zero frames still drive the
-       -- runtime's control-queue/RCU state machine without rendering
-       -- audio. This scripted path is only valid while the audio
-       -- callback is stopped; live integrations should publish and
-       -- wait for the audio thread to advance the swap generation.
-       c_rt_graph_process rt 0
-       capacity <- c_rt_graph_capacity rt
-       maxFrames <- c_rt_graph_max_frames rt
-       if capacity <= 0 || maxFrames < 0
-          then pure (Left (SriHotSwapInstallFailed
-                 (SasiLoaderException
-                   "invalid RTGraph sizing for preserving hot-swap")))
-          else
-            withRTGraph (fromIntegral capacity) (fromIntegral maxFrames) $
-              \builder -> do
-               prepared <- preparePreservingBuilder
-                             builder
-                             (rtaeOptions env)
-                             graph
-                             (phspBindings plan)
-               case prepared of
-                 Left issue ->
-                   pure (Left issue)
-                 Right meta -> do
-                   swap <- c_rt_graph_prepare_swap_from_graph rt builder
-                   if swap == nullPtr
-                      then pure (Left SriHotSwapWouldPreserveVoices)
-                      else do
-                        published <- c_rt_graph_publish_swap rt swap
-                        if published /= 1
-                           then do
-                             c_rt_graph_cancel_swap rt swap
-                             pure (Left SriHotSwapPublishRejected)
-                           else do
-                             -- Drive the published swap to installation
-                             -- synchronously in the stopped-audio path.
-                             c_rt_graph_process rt 0
-                             retired <- c_rt_graph_collect_retired_swap rt
-                             if retired == nullPtr
-                                then
-                                  -- publish_swap transferred ownership
-                                  -- to the runtime pending slot. There
-                                  -- is no safe local swap pointer to
-                                  -- cancel here; graph reset/destroy
-                                  -- will reclaim any still-pending swap.
-                                  pure (Left (SriHotSwapInstallFailed
-                                         (SasiLoaderException
-                                           "preserving hot-swap did not retire installed swap")))
-                                else do
-                                  stateCopies <-
-                                    c_rt_graph_swap_migration_state_copy_count
-                                      retired
-                                  lifecycleCopies <-
-                                    c_rt_graph_swap_migration_lifecycle_copy_count
-                                      retired
-                                  c_rt_graph_cancel_swap rt retired
-                                  let copiedEnough =
-                                        fromIntegral lifecycleCopies
-                                          >= length (phspBindings plan)
-                                        && fromIntegral stateCopies
-                                          >= phspExpectedStateCopyCount plan
-                                  if not copiedEnough
-                                     then pure (Left (SriHotSwapInstallFailed
-                                            (SasiLoaderException
-                                              "preserving hot-swap migration was incomplete")))
-                                     else do
-                                       let st' = RTGraphAdapterState
-                                             { rtgasGraph            = graph
-                                             , rtgasTemplateIds      =
-                                                 pbmTemplateIds meta
-                                             , rtgasPrewarmCounts    =
-                                                 pbmPrewarmCounts meta
-                                             , rtgasAutoSpawnedSlots =
-                                                 pbmAutoSpawnedSlots meta
-                                             , rtgasRTGraph          = rt
-                                             }
-                                       writeIORef (rtaeState env) st'
-                                       pure (Right (RuntimeCommitted
-                                         (CommitGraphInstalled label graph)))
+  installed <- installPreservingHotSwap
+                 rt
+                 (rtaeOptions env)
+                 graph
+                 plan
+  case installed of
+    Left issue ->
+      pure (Left issue)
+    Right meta -> do
+      let st' = RTGraphAdapterState
+            { rtgasGraph            = graph
+            , rtgasTemplateIds      = pbmTemplateIds meta
+            , rtgasPrewarmCounts    = pbmPrewarmCounts meta
+            , rtgasAutoSpawnedSlots = pbmAutoSpawnedSlots meta
+            , rtgasRTGraph          = rt
+            }
+      writeIORef (rtaeState env) st'
+      pure (Right (RuntimeCommitted (CommitGraphInstalled label graph)))
   where
     rt = rtgasRTGraph current
+
+installPreservingHotSwap
+  :: Ptr RTGraph
+  -> RTGraphAdapterOptions
+  -> TemplateGraph
+  -> PreservingHotSwapPlan
+  -> IO (Either SessionRuntimeIssue PreservingBuilderMeta)
+installPreservingHotSwap rt opts graph plan = do
+  stopped <- requireStoppedAudio rt
+  case stopped of
+    Left issue ->
+      pure (Left issue)
+    Right () -> do
+      driveScriptedPreservingStep rt
+      sizing <- preservingBuilderSizing rt
+      case sizing of
+        Left issue ->
+          pure (Left issue)
+        Right (capacity, maxFrames) ->
+          withRTGraph (fromIntegral capacity) (fromIntegral maxFrames) $
+            \builder -> do
+              prepared <- preparePreservingBuilder
+                            builder
+                            opts
+                            graph
+                            (phspBindings plan)
+              case prepared of
+                Left issue ->
+                  pure (Left issue)
+                Right meta -> do
+                  installed <- publishAndVerifyPreservingSwap rt builder plan
+                  pure $ case installed of
+                    Left issue -> Left issue
+                    Right ()   -> Right meta
+
+requireStoppedAudio :: Ptr RTGraph -> IO (Either SessionRuntimeIssue ())
+requireStoppedAudio rt = do
+  audioRunning <- c_rt_graph_audio_running rt
+  pure $
+    if audioRunning == 0
+       then Right ()
+       else Left SriHotSwapRequiresStoppedAudio
+
+preservingBuilderSizing
+  :: Ptr RTGraph
+  -> IO (Either SessionRuntimeIssue (CInt, CInt))
+preservingBuilderSizing rt = do
+  capacity <- c_rt_graph_capacity rt
+  maxFrames <- c_rt_graph_max_frames rt
+  pure $
+    if capacity <= 0 || maxFrames < 0
+       then Left (SriHotSwapInstallFailed
+              (SasiLoaderException
+                "invalid RTGraph sizing for preserving hot-swap"))
+       else Right (capacity, maxFrames)
+
+publishAndVerifyPreservingSwap
+  :: Ptr RTGraph
+  -> Ptr RTGraph
+  -> PreservingHotSwapPlan
+  -> IO (Either SessionRuntimeIssue ())
+publishAndVerifyPreservingSwap rt builder plan = do
+  acquired <- acquirePreservingSwap rt builder
+  case acquired of
+    Left issue ->
+      pure (Left issue)
+    Right swap -> do
+      published <- publishPreservingSwap rt swap
+      case published of
+        Left issue ->
+          pure (Left issue)
+        Right () -> do
+          installed <- forceInstallPreservingSwap rt
+          case installed of
+            Left issue ->
+              pure (Left issue)
+            Right retired ->
+              verifyPreservingMigration rt retired plan
+
+acquirePreservingSwap
+  :: Ptr RTGraph
+  -> Ptr RTGraph
+  -> IO (Either SessionRuntimeIssue (Ptr RTGraphSwap))
+acquirePreservingSwap rt builder = do
+  swap <- c_rt_graph_prepare_swap_from_graph rt builder
+  pure $
+    if swap == nullPtr
+       then Left SriHotSwapWouldPreserveVoices
+       else Right swap
+
+publishPreservingSwap
+  :: Ptr RTGraph
+  -> Ptr RTGraphSwap
+  -> IO (Either SessionRuntimeIssue ())
+publishPreservingSwap rt swap = do
+  published <- c_rt_graph_publish_swap rt swap
+  if published == 1
+     then pure (Right ())
+     else do
+       c_rt_graph_cancel_swap rt swap
+       pure (Left SriHotSwapPublishRejected)
+
+forceInstallPreservingSwap
+  :: Ptr RTGraph
+  -> IO (Either SessionRuntimeIssue (Ptr RTGraphSwap))
+forceInstallPreservingSwap rt = do
+  driveScriptedPreservingStep rt
+  retired <- c_rt_graph_collect_retired_swap rt
+  pure $
+    if retired == nullPtr
+       then
+         -- publish_swap transferred ownership to the runtime pending
+         -- slot. There is no safe local swap pointer to cancel here;
+         -- graph reset/destroy will reclaim any still-pending swap.
+         Left (SriHotSwapInstallFailed
+           (SasiLoaderException
+             "preserving hot-swap did not retire installed swap"))
+       else Right retired
+
+verifyPreservingMigration
+  :: Ptr RTGraph
+  -> Ptr RTGraphSwap
+  -> PreservingHotSwapPlan
+  -> IO (Either SessionRuntimeIssue ())
+verifyPreservingMigration rt retired plan = do
+  stateCopies <- c_rt_graph_swap_migration_state_copy_count retired
+  lifecycleCopies <- c_rt_graph_swap_migration_lifecycle_copy_count retired
+  c_rt_graph_cancel_swap rt retired
+  let copiedEnough =
+        fromIntegral lifecycleCopies >= length (phspBindings plan)
+        && fromIntegral stateCopies >= phspExpectedStateCopyCount plan
+  pure $
+    if copiedEnough
+       then Right ()
+       else Left (SriHotSwapInstallFailed
+              (SasiLoaderException
+                "preserving hot-swap migration was incomplete"))
+
+driveScriptedPreservingStep :: Ptr RTGraph -> IO ()
+driveScriptedPreservingStep rt =
+  -- Zero frames still drive the runtime's control-queue/RCU state
+  -- machine without rendering audio. This scripted path is only valid
+  -- while the audio callback is stopped; live integrations should
+  -- publish and wait for the audio thread to advance the swap
+  -- generation.
+  c_rt_graph_process rt 0
 
 resolveSessionControl
   :: RTGraphAdapterState

@@ -73,7 +73,9 @@ int rt_graph_max_frames(const RTGraph *g);
 // [T:introspection] Return whether this handle currently owns a
 // realtime audio stream. Intended as a session-side guard for helpers
 // that use the offline process entry point and therefore must not run
-// concurrently with the audio callback.
+// concurrently with the audio callback. This is a read-only guard
+// hint, not a synchronization primitive for racing start/stop against
+// graph mutation.
 int rt_graph_audio_running(const RTGraph *g);
 
 // [T:alloc-reset] Stop audio (joining the audio thread) and free the

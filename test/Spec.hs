@@ -13140,6 +13140,66 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
                        <> show other)
           other ->
             assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "step preserving hot-swap migrates two supported active voices" $ do
+      newGraph <- compileTemplateGraphOrFail hotSwapEditAfterTemplates
+      let oldGraph = patternTemplates hotSwapEdit
+          opts     = defaultRTGraphAdapterOptions
+            { raoDefaultPolyphony = 2
+            }
+          st0      = initialSessionState oldGraph
+          v0       = VoiceKey "v0"
+          v1       = VoiceKey "v1"
+          start key cutoff =
+            CmdVoiceOn (TemplateName "drone") key
+              [(ControlTag (MigrationKey "lpf") 0, cutoff)]
+          swapCmd  = CmdHotSwap (SwapLabel "edit-two") newGraph
+      withInstalledAdapter oldGraph opts $ \rt adapter -> do
+        started0 <- stepSessionCommand adapter (start v0 1200.0) st0
+        case started0 of
+          StepCommitted st1 Nothing -> do
+            started1 <- stepSessionCommand adapter (start v1 1800.0) st1
+            case started1 of
+              StepCommitted st2 Nothing -> do
+                case (M.lookup v0 (ssVoices st2), M.lookup v1 (ssVoices st2)) of
+                  (Just binding0, Just binding1) -> do
+                    c_rt_graph_process rt 1
+                    before0 <- c_rt_graph_instance_status
+                                 rt
+                                 (fromIntegral (vbSlotId binding0))
+                    before1 <- c_rt_graph_instance_status
+                                 rt
+                                 (fromIntegral (vbSlotId binding1))
+                    before0 @?= instanceStatusLive
+                    before1 @?= instanceStatusLive
+                    swapped <- stepSessionCommand adapter swapCmd st2
+                    case swapped of
+                      StepCommitted st3 (Just rebuild) -> do
+                        rrrDropped rebuild @?= []
+                        ssGraph st3 @?= newGraph
+                        M.lookup v0 (ssVoices st3) @?= Just binding0
+                        M.lookup v1 (ssVoices st3) @?= Just binding1
+                        after0 <- c_rt_graph_instance_status
+                                    rt
+                                    (fromIntegral (vbSlotId binding0))
+                        after1 <- c_rt_graph_instance_status
+                                    rt
+                                    (fromIntegral (vbSlotId binding1))
+                        after0 @?= instanceStatusLive
+                        after1 @?= instanceStatusLive
+                      other ->
+                        assertFailure
+                          ("expected two-voice preserving hot-swap commit, got: "
+                           <> show other)
+                  other ->
+                    assertFailure
+                      ("expected two committed voice bindings, got: "
+                       <> show other)
+              other ->
+                assertFailure
+                  ("expected second start commit, got: " <> show other)
+          other ->
+            assertFailure ("expected first start commit, got: " <> show other)
   ]
   where
     totalTemplateNodes tg =
