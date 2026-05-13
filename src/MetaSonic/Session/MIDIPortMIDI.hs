@@ -1,3 +1,4 @@
+{-# LANGUAGE CApiFFI          #-}
 {-# LANGUAGE DeriveAnyClass     #-}
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -10,6 +11,9 @@
 -- consumed by 'MetaSonic.Session.MIDIListener'. It owns only a small
 -- polling handle; the session listener owns the worker thread and the
 -- MIDI producer owns note/CC translation policy.
+--
+-- A 'PortMIDISource' handle is single-consumer: poll it from one owner
+-- thread, and close it only after that owner has stopped polling.
 --
 -- The source decodes MIDI 1.0 note-on, note-off, and control-change
 -- messages. Other messages are consumed and ignored. Pitch bend,
@@ -26,6 +30,7 @@ module MetaSonic.Session.MIDIPortMIDI
   , portMIDISourceHasDevice
   , pollPortMIDISourceEvent
   , portMIDIListenerSource
+  , portMIDISourceEventKindTags
   ) where
 
 import           Control.Concurrent             (threadDelay)
@@ -79,7 +84,8 @@ openPortMIDISource opts = do
              else Just (PortMIDISource h)
 
 -- | Close a PortMIDI/Q source handle. After return the handle is
--- invalid.
+-- invalid. The caller must stop the single polling owner before
+-- closing.
 closePortMIDISource :: PortMIDISource -> IO ()
 closePortMIDISource (PortMIDISource h) =
   c_rt_session_midi_source_close h
@@ -153,17 +159,43 @@ fromCDataByte :: CInt -> Word8
 fromCDataByte =
   fromIntegral
 
+-- | Diagnostic view of the C ABI event tags used by the decoder.
+-- Exposed so tests can pin the header-derived agreement contract.
+portMIDISourceEventKindTags :: (Int, Int, Int, Int)
+portMIDISourceEventKindTags =
+  ( fromIntegral rtSessionMIDIEventNone
+  , fromIntegral rtSessionMIDIEventNoteOn
+  , fromIntegral rtSessionMIDIEventNoteOff
+  , fromIntegral rtSessionMIDIEventControlChange
+  )
+
+rtSessionMIDIEventNone :: CInt
+rtSessionMIDIEventNone =
+  c_RT_SESSION_MIDI_EVENT_NONE
+
 rtSessionMIDIEventNoteOn :: CInt
 rtSessionMIDIEventNoteOn =
-  1
+  c_RT_SESSION_MIDI_EVENT_NOTE_ON
 
 rtSessionMIDIEventNoteOff :: CInt
 rtSessionMIDIEventNoteOff =
-  2
+  c_RT_SESSION_MIDI_EVENT_NOTE_OFF
 
 rtSessionMIDIEventControlChange :: CInt
 rtSessionMIDIEventControlChange =
-  3
+  c_RT_SESSION_MIDI_EVENT_CONTROL_CHANGE
+
+foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_NONE"
+  c_RT_SESSION_MIDI_EVENT_NONE :: CInt
+
+foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_NOTE_ON"
+  c_RT_SESSION_MIDI_EVENT_NOTE_ON :: CInt
+
+foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_NOTE_OFF"
+  c_RT_SESSION_MIDI_EVENT_NOTE_OFF :: CInt
+
+foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_CONTROL_CHANGE"
+  c_RT_SESSION_MIDI_EVENT_CONTROL_CHANGE :: CInt
 
 foreign import ccall safe "rt_session_midi_source_open"
   c_rt_session_midi_source_open :: CInt -> IO (Ptr CPortMIDISource)

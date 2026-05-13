@@ -9,10 +9,11 @@
 // policy, or control mapping lives here. Haskell owns the worker via
 // MetaSonic.Session.MIDIListener and polls this handle from that
 // worker.
+//
+// Threading: a source handle is single-consumer. Poll it from one
+// owner thread and do not close it while another thread is polling.
 
 #pragma once
-
-#include <cstdint>
 
 #ifdef __cplusplus
 extern "C" {

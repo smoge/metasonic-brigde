@@ -15664,7 +15664,10 @@ midiMVarSource events =
 sessionMIDIPortMIDISourceTests :: TestTree
 sessionMIDIPortMIDISourceTests =
   testGroup "Session MIDI PortMIDI source"
-  [ testCase "invalid device opens an idle closeable source" $ do
+  [ testCase "event tags match the C ABI header contract" $
+      MIDIPM.portMIDISourceEventKindTags @?= (0, 1, 2, 3)
+
+  , testCase "invalid device opens an idle closeable source" $ do
       result <-
         MIDIPM.withPortMIDISource invalidPortMIDIOptions $ \case
           Nothing ->
