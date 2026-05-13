@@ -13572,11 +13572,15 @@ sessionPatternProducerTests = testGroup "Session Prep H: Pattern producer"
       producer <- patternProducerOrFail
         (defaultPatternProducerOptions { ppoBlockFrames = 8 })
       queue0 <- queueOrFail (SessionQueueOptions 1)
-      retryQueue <- queueOrFail (SessionQueueOptions 8)
+      partialRetryQueue <- queueOrFail (SessionQueueOptions 1)
+      finalRetryQueue <- queueOrFail (SessionQueueOptions 8)
       let events = missingVoiceEvents 3
           pat = droneVibrato { patternEvents = staticEvents events }
           outcome1 = enqueuePatternBlock pat producer queue0
-          outcome2 = enqueuePatternBlock pat (peoState outcome1) retryQueue
+          outcome2 =
+            enqueuePatternBlock pat (peoState outcome1) partialRetryQueue
+          outcome3 =
+            enqueuePatternBlock pat (peoState outcome2) finalRetryQueue
       assertBool
         "new Pattern producer should start without backlog"
         (not (isBacklogged producer))
@@ -13584,10 +13588,14 @@ sessionPatternProducerTests = testGroup "Session Prep H: Pattern producer"
         "partial enqueue rejection should leave producer backlogged"
         (isBacklogged (peoState outcome1))
       assertBool
-        "successful retry should clear producer backlog"
-        (not (isBacklogged (peoState outcome2)))
+        "partial retry should keep producer backlogged"
+        (isBacklogged (peoState outcome2))
+      assertBool
+        "successful final retry should clear producer backlog"
+        (not (isBacklogged (peoState outcome3)))
       perBacklogged (peoResult outcome1) @?= 2
-      perBacklogged (peoResult outcome2) @?= 0
+      perBacklogged (peoResult outcome2) @?= 1
+      perBacklogged (peoResult outcome3) @?= 0
 
   , testCase "empty block advances cursor and enqueues nothing" $ do
       producer <- patternProducerOrFail

@@ -210,8 +210,14 @@ enqueueEvents state queue events =
     go itemsRev currentQueue [] = ([], currentQueue, reverse itemsRev)
     go itemsRev currentQueue ((samplePos, event) : rest) =
       let command = fromPatternEvent event
-          (queue', res) = enqueueSessionCommand (ppsProducer state) command currentQueue
-          item = PatternEnqueueItem samplePos event command res
+          (queue', res) =
+            enqueueSessionCommand (ppsProducer state) command currentQueue
+          item = PatternEnqueueItem
+            { peiSamplePos = samplePos
+            , peiEvent     = event
+            , peiCommand   = command
+            , peiResult    = res
+            }
       in case res of
            SessionEnqueued _ ->
              go (item : itemsRev) queue' rest
