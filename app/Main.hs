@@ -37,12 +37,13 @@ import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.MidiDemo  (CCMapping (..),
-                                             MidiDeviceInfo (..),
                                              PitchBendBinding (..),
                                              VoiceMapping (..),
-                                             midiDeviceList, withMidiDemo)
+                                             withMidiDemo)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
+import           MetaSonic.MIDI.Devices     (MidiDeviceInfo (..),
+                                             midiDeviceList)
 import           MetaSonic.Types            (NodeIndex (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
@@ -531,7 +532,8 @@ printMidiDevices = do
           <> "  " <> usable
           <> "  name=\"" <> midiDeviceName d <> "\""
       putStrLn ""
-      putStrLn "Use an input-capable id with: --midi-device N midi-poly"
+      putStrLn "Use an input-capable id with --midi-device N for midi-poly"
+      putStrLn "or --session-midi-smoke."
 
 printPlugins :: IO ()
 printPlugins = do

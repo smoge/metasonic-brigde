@@ -275,6 +275,8 @@ The landed pieces are deliberately small:
 - `MetaSonic.Session.MIDIListener` brackets a worker around an injected
   decoded MIDI event source and feeds `MetaSonic.Session.MIDIProducer`. It is
   testable without hardware and still does not own PortMIDI devices.
+- `MetaSonic.MIDI.Devices` centralizes Q / PortMIDI device enumeration for
+  both the legacy live MIDI demo and the session MIDI smoke command.
 - `MetaSonic.Session.MIDIPortMIDI` adapts a Q / PortMIDI input device into
   that decoded source shape. It opens an idle closeable source on no-device
   hosts and still leaves MIDI policy to `MetaSonic.Session.MIDIProducer`.

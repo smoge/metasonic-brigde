@@ -30,7 +30,10 @@ machine.
 
 The current command now enumerates the Q / PortMIDI device table and
 auto-selects the first row whose `inputs > 0` when `--midi-device` is
-omitted.
+omitted. The enumeration wrapper lives in `MetaSonic.MIDI.Devices`,
+which is shared by this smoke command and the legacy `midi-poly`
+runner instead of coupling the smoke path to
+`MetaSonic.Bridge.MidiDemo`.
 
 ## Correct Manual Flow
 

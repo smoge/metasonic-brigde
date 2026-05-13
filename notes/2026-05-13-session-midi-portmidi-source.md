@@ -18,6 +18,9 @@ runtime realtime queue.
 - `MetaSonic.Session.MIDIPortMIDI` wraps that ABI with
   `withPortMIDISource`, `pollPortMIDISourceEvent`, and
   `portMIDIListenerSource`.
+- `MetaSonic.MIDI.Devices` is the neutral Haskell wrapper for
+  Q / PortMIDI device enumeration. The legacy live MIDI demo and the
+  session MIDI smoke command both consume it.
 - The CLI exposes `--session-midi-smoke [SECONDS]`, a non-audio manual
   probe that wires this source through `MetaSonic.Session.MIDIListener`,
   `MetaSonic.Session.MIDIProducer`, and `MetaSonic.Session.FanInService`,

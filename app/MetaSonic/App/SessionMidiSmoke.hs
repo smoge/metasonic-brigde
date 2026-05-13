@@ -30,7 +30,7 @@ import           MetaSonic.Bridge.Source        (MigrationKey (..),
                                                  gain, out, runSynth, sinOsc,
                                                  tagged)
 import           MetaSonic.Bridge.Templates     (compileTemplateGraph)
-import           MetaSonic.Bridge.MidiDemo      (MidiDeviceInfo (..),
+import           MetaSonic.MIDI.Devices         (MidiDeviceInfo (..),
                                                  midiDeviceList)
 import           MetaSonic.Pattern              (ControlTag (..),
                                                  TemplateName (..))
@@ -91,7 +91,8 @@ runSessionMidiSmoke midiDevice seconds = do
       hasDevice <- MIDIPM.portMIDISourceHasDevice source
       unless hasDevice $
         dieAfterFlush
-          ("No input-capable MIDI device opened. Use --midi-list and "
+          ("Selected MIDI device id=" <> show (smdDeviceId selectedDevice)
+           <> " did not open as input-capable. Use --midi-list and "
            <> "--midi-device N to select a real input.")
 
       producerEvents <- newIORef (0 :: Int)
