@@ -374,9 +374,10 @@ usage prog = unlines
   , "                   note-on, note-off, and CC 7 events through"
   , "                   MetaSonic.Session.MIDIListener and FanInService,"
   , "                   prints producer/drain activity, then exits non-zero"
-  , "                   if no supported events or no drained session commands"
-  , "                   were observed. Default window is 10 seconds; demo"
-  , "                   targets are ignored."
+  , "                   if no input device, no supported events, or no drained"
+  , "                   session commands were observed. When --midi-device is"
+  , "                   omitted, the first input-capable device is selected."
+  , "                   Default window is 10 seconds; demo targets are ignored."
   , "  --plugin-list    Print the build-linked static plugin registry"
   , "                   used by KStaticPlugin and exit. No audio, no TUI."
   , "  --osc-listen [PORT]"
@@ -402,6 +403,7 @@ usage prog = unlines
   , "  " <> prog <> " --fused chain          # same audio, fused load"
   , "  " <> prog <> " --fused send-return    # multi-template fused"
   , "  " <> prog <> " --midi-list"
+  , "  " <> prog <> " --session-midi-smoke 10"
   , "  " <> prog <> " --midi-device 2 --session-midi-smoke 10"
   ]
 

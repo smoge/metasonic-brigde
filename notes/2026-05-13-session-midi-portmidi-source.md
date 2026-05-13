@@ -21,7 +21,8 @@ runtime realtime queue.
 - The CLI exposes `--session-midi-smoke [SECONDS]`, a non-audio manual
   probe that wires this source through `MetaSonic.Session.MIDIListener`,
   `MetaSonic.Session.MIDIProducer`, and `MetaSonic.Session.FanInService`,
-  then prints producer/drain activity.
+  then prints producer/drain activity. With no explicit `--midi-device`,
+  it auto-selects the first input-capable Q / PortMIDI device.
 - Missing, output-only, invalid, or failed-open device ids produce a
   valid idle source whose `portMIDISourceHasDevice` result is `False`.
   This keeps no-controller and headless hosts closeable.
@@ -48,6 +49,7 @@ Manual live-device coverage is intentionally outside automated CI:
 
 ```sh
 stack exec -- metasonic-bridge --midi-list
+stack exec -- metasonic-bridge --session-midi-smoke 10
 stack exec -- metasonic-bridge --midi-device <input-id> --session-midi-smoke 10
 ```
 

@@ -4,9 +4,10 @@ This note records the operational path for the session MIDI smoke
 command added after the `MetaSonic.Session.MIDIPortMIDI` source slice.
 It is a manual live-device probe, not a deterministic CI test.
 
-## Symptom
+## Historical Symptom
 
-Running the default smoke command can fail like this:
+Before the auto-selection follow-up, running the default smoke command
+could fail like this:
 
 ```sh
 just session-midi-smoke 10
@@ -23,13 +24,29 @@ Session MIDI smoke.
 No input-capable MIDI device opened. Use --midi-list and --midi-device N to select a real input.
 ```
 
-This means the smoke command itself ran correctly, but Q / PortMIDI's
+That meant the smoke command itself ran correctly, but Q / PortMIDI's
 default device id `0` was not an input-capable MIDI device on that
 machine.
 
+The current command now enumerates the Q / PortMIDI device table and
+auto-selects the first row whose `inputs > 0` when `--midi-device` is
+omitted.
+
 ## Correct Manual Flow
 
-List the devices first:
+The default smoke command is now the first thing to try:
+
+```sh
+just session-midi-smoke 10
+```
+
+It prints the auto-selected device as:
+
+```text
+device: auto id=<id> name="<device-name>"
+```
+
+For explicit selection, list the devices first:
 
 ```sh
 just midi-list
@@ -59,10 +76,8 @@ below the session layer: Q / PortMIDI is not seeing an input-capable
 device from the host MIDI backend. On Linux, check the ALSA sequencer
 setup and any virtual MIDI bridge used to expose the controller.
 
-## Ergonomic Follow-Up
+## Explicit Selection Still Matters
 
-The current default `just session-midi-smoke 10` tries Q's canonical
-default id `0`. A future usability improvement would be to auto-select
-the first input-capable device when `--midi-device` is omitted. That
-would keep explicit selection available while making the default smoke
-command useful on hosts where id `0` is missing or output-only.
+Auto-selection intentionally picks the first input-capable row. Use
+`just session-midi-smoke-device <id> 10` when multiple controllers are
+visible and the first one is not the device under test.

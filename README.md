@@ -136,7 +136,7 @@ Useful modifiers:
 - `--fused` selects the fused-input loader path for applicable demo modes.
 - `--summary` switches `--fusion-cost-lab` from JSONL to a readable table.
 - `--midi-device N` selects the PortMIDI input for `midi-poly` and
-  `--session-midi-smoke`.
+  overrides the auto-selected input for `--session-midi-smoke`.
 
 ### Demo targets
 
@@ -179,6 +179,9 @@ stack exec -- metasonic-bridge --authoring-manifest send-return
 stack exec -- metasonic-bridge --osc-listen 7000
 
 # Probe the session MIDI ingress path for 10 seconds
+stack exec -- metasonic-bridge --session-midi-smoke 10
+
+# Probe a specific input-capable MIDI device
 stack exec -- metasonic-bridge --midi-device 2 --session-midi-smoke 10
 ```
 
@@ -277,7 +280,8 @@ The landed pieces are deliberately small:
   hosts and still leaves MIDI policy to `MetaSonic.Session.MIDIProducer`.
   The CLI also exposes `--session-midi-smoke [SECONDS]` as a repeatable
   manual probe for the PortMIDI source, decoded listener, producer, fan-in
-  service, and drain path.
+  service, and drain path. When `--midi-device` is omitted, the smoke command
+  auto-selects the first input-capable Q / PortMIDI device.
 - `MetaSonic.Session.UIProducer` translates already-decoded UI intents into
   session commands with `ProducerUI` identity, rejecting non-finite UI control
   values before they enter the fan-in queue.

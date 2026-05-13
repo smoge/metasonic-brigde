@@ -15,7 +15,8 @@ module MetaSonic.App.SessionMidiSmoke
   ) where
 
 import           Control.Concurrent             (threadDelay)
-import           Control.Monad                  (when)
+import           Control.Monad                  (unless, when)
+import           Data.List                      (find)
 import qualified Data.Map.Strict                as M
 import           Data.IORef                     (newIORef, modifyIORef',
                                                  readIORef)
@@ -29,11 +30,14 @@ import           MetaSonic.Bridge.Source        (MigrationKey (..),
                                                  gain, out, runSynth, sinOsc,
                                                  tagged)
 import           MetaSonic.Bridge.Templates     (compileTemplateGraph)
+import           MetaSonic.Bridge.MidiDemo      (MidiDeviceInfo (..),
+                                                 midiDeviceList)
 import           MetaSonic.Pattern              (ControlTag (..),
                                                  TemplateName (..))
-import           MetaSonic.Session.FanIn        (SessionFanInDrainResult (..),
-                                                 SessionFanInEnqueueResult (..),
-                                                 SessionFanInSnapshot (..))
+import           MetaSonic.Session.FanIn        (sfidrDrain,
+                                                 sfidrQueueDepth,
+                                                 sfierResult,
+                                                 sfisQueueDepth)
 import           MetaSonic.Session.FanInService (SessionFanInServiceHooks (..),
                                                  defaultSessionFanInServiceHooks,
                                                  defaultSessionFanInServiceOptions,
@@ -42,14 +46,19 @@ import           MetaSonic.Session.FanInService (SessionFanInServiceHooks (..),
                                                  withSessionFanInServiceHooks)
 import qualified MetaSonic.Session.MIDIListener as MIDIS
 import           MetaSonic.Session.MIDIProducer (MIDIControlMapping (..),
-                                                 MIDIProducerCommandBatch (..),
                                                  MIDIProducerEnqueueResult (..),
                                                  MIDIProducerOptions (..),
-                                                 MIDIProducerState (..),
                                                  defaultMIDIProducerOptions,
-                                                 initialMIDIProducerState)
+                                                 initialMIDIProducerState,
+                                                 mpcbCommands,
+                                                 mpsActiveNotes)
 import qualified MetaSonic.Session.MIDIPortMIDI as MIDIPM
-import           MetaSonic.Session.Queue        (SessionDrainResult (..))
+import           MetaSonic.Session.Queue        (sdrItems, sdrStopped)
+
+data SmokeMIDIDevice = SmokeMIDIDevice
+  { smdDeviceId :: !Int
+  , smdLabel    :: !String
+  } deriving (Eq, Show)
 
 -- | Run a bounded manual smoke test over the session MIDI ingress
 -- stack. The command exits non-zero when no input device opens or
@@ -60,15 +69,17 @@ runSessionMidiSmoke midiDevice seconds = do
     Right tg  -> pure tg
     Left err  -> die $ "Session MIDI smoke graph failed to compile: " <> err
 
+  selectedDevice <- resolveSmokeMIDIDevice midiDevice
+
   let sourceOpts = MIDIPM.defaultPortMIDISourceOptions
-        { MIDIPM.pmsoDeviceId = midiDevice
+        { MIDIPM.pmsoDeviceId = Just (smdDeviceId selectedDevice)
         }
 
   putStrLn "Session MIDI smoke."
   putStrLn ""
   putStrLn "  path: PortMIDI/Q -> Session.MIDIListener -> FanInService"
   putStrLn "  graph: tagged carrier/envelope/velocity/level voice template"
-  putStrLn $ "  device: " <> maybe "default (Q id 0)" show midiDevice
+  putStrLn $ "  device: " <> smdLabel selectedDevice
   putStrLn $ "  window: " <> show seconds <> " second(s)"
   putStrLn ""
   hFlush stdout
@@ -78,11 +89,10 @@ runSessionMidiSmoke midiDevice seconds = do
       die "Failed to allocate PortMIDI session source."
     Just source -> do
       hasDevice <- MIDIPM.portMIDISourceHasDevice source
-      when (not hasDevice) $
-        hFlush stdout >>
-          die
-            ("No input-capable MIDI device opened. Use --midi-list and "
-             <> "--midi-device N to select a real input.")
+      unless hasDevice $
+        dieAfterFlush
+          ("No input-capable MIDI device opened. Use --midi-list and "
+           <> "--midi-device N to select a real input.")
 
       producerEvents <- newIORef (0 :: Int)
       listenerIssues <- newIORef (0 :: Int)
@@ -140,7 +150,8 @@ runSessionMidiSmoke midiDevice seconds = do
 
       case result of
         Left issue ->
-          die $ "Session fan-in service setup failed: " <> show issue
+          dieAfterFlush $
+            "Session fan-in service setup failed: " <> show issue
         Right (observed, issues, drained, listenerState, snapshot) -> do
           putStrLn ""
           putStrLn $
@@ -152,10 +163,38 @@ runSessionMidiSmoke midiDevice seconds = do
             <> show (M.size (mpsActiveNotes listenerState))
             <> " queue_depth=" <> show (sfisQueueDepth snapshot)
           when (observed == 0) $
-            die "No supported MIDI note/CC events observed during smoke window."
+            dieAfterFlush
+              "No supported MIDI note/CC events observed during smoke window."
           when (drained == 0) $
-            die "No session commands drained during smoke window."
+            dieAfterFlush
+              "No session commands drained during smoke window."
           putStrLn "Session MIDI smoke complete."
+
+resolveSmokeMIDIDevice :: Maybe Int -> IO SmokeMIDIDevice
+resolveSmokeMIDIDevice (Just devId) =
+  pure SmokeMIDIDevice
+    { smdDeviceId = devId
+    , smdLabel    = show devId <> " (explicit)"
+    }
+resolveSmokeMIDIDevice Nothing = do
+  result <- midiDeviceList
+  case result of
+    Left err ->
+      die $
+        err <> ". Use --midi-list and --midi-device N to select a real input."
+    Right devices ->
+      case find ((> 0) . midiDeviceInputs) devices of
+        Nothing ->
+          die $
+            "No input-capable MIDI device reported by Q / PortMIDI. "
+            <> "Use --midi-list to inspect the device table."
+        Just dev ->
+          pure SmokeMIDIDevice
+            { smdDeviceId = midiDeviceId dev
+            , smdLabel =
+                "auto id=" <> show (midiDeviceId dev)
+                <> " name=\"" <> midiDeviceName dev <> "\""
+            }
 
 sessionMidiSmokeGraph :: SynthGraph
 sessionMidiSmokeGraph = runSynth $ do
@@ -194,3 +233,7 @@ summarizeProducerResult result = case result of
   MIDIProducerEnqueueAttempted batch enqueues ->
     "commands=" <> show (length (mpcbCommands batch))
     <> " enqueues=" <> show (map sfierResult enqueues)
+
+dieAfterFlush :: String -> IO a
+dieAfterFlush msg =
+  hFlush stdout >> die msg
