@@ -148,6 +148,7 @@ import           MetaSonic.Session.Step
 import           MetaSonic.Session.RTGraphAdapter
 import           MetaSonic.Session.Owner
 import           MetaSonic.Session.Queue
+import           MetaSonic.Session.PatternProducer
 import qualified MetaSonic.Authoring         as Auth
 import           MetaSonic.Authoring.Manifest (AuthoringManifest (..),
                                                AuthoringManifestDoc (..),
@@ -192,6 +193,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionRTGraphAdapterTests
   , sessionOwnerTests
   , sessionQueueTests
+  , sessionPatternProducerTests
   , patternCorpusTests
   , oscWireAndDispatchTests
   , oscListenerTests
@@ -13529,6 +13531,256 @@ enqueueOrFail producer cmd queue =
       pure (queue', queued)
     (_queue', other) ->
       assertFailure ("expected enqueue success, got: " <> show other)
+
+------------------------------------------------------------
+-- Session Prep H: Pattern producer bridge
+------------------------------------------------------------
+
+sessionPatternProducerTests :: TestTree
+sessionPatternProducerTests = testGroup "Session Prep H: Pattern producer"
+  [ testCase "default options construct Pattern producer identity" $ do
+      assertBool
+        "expected positive default block size"
+        (ppoBlockFrames defaultPatternProducerOptions > 0)
+      producer <- patternProducerOrFail defaultPatternProducerOptions
+      queue0 <- queueOrFail (SessionQueueOptions 2)
+      let outcome = enqueuePatternBlock droneVibrato producer queue0
+          result = peoResult outcome
+      perNextStart result @?= SamplePos (ppoBlockFrames defaultPatternProducerOptions)
+      case perItems result of
+        [item] ->
+          case peiResult item of
+            SessionEnqueued queued ->
+              qscProducer queued
+                @?= ProducerId ProducerPattern (T.pack "pattern")
+            other ->
+              assertFailure ("expected default producer enqueue, got: "
+                             <> show other)
+        other ->
+          assertFailure ("expected one default producer item, got: "
+                         <> show other)
+
+  , testCase "invalid block sizes reject at construction" $ do
+      newPatternProducerState
+        (defaultPatternProducerOptions { ppoBlockFrames = 0 })
+        @?= Left (PpiInvalidBlockFrames 0)
+      newPatternProducerState
+        (defaultPatternProducerOptions { ppoBlockFrames = (-8) })
+        @?= Left (PpiInvalidBlockFrames (-8))
+
+  , testCase "empty block advances cursor and enqueues nothing" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions { ppoBlockFrames = 16 })
+      queue0 <- queueOrFail (SessionQueueOptions 2)
+      let emptyPattern = droneVibrato
+            { patternEvents = staticEvents [] }
+          outcome = enqueuePatternBlock emptyPattern producer queue0
+          result = peoResult outcome
+      perItems result @?= []
+      perBacklogged result @?= 0
+      perNextStart result @?= SamplePos 16
+
+  , testCase "first droneVibrato block enqueues expected VoiceOn command" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions
+          { ppoProducerName = T.pack "composer"
+          , ppoBlockFrames  = 64
+          })
+      queue0 <- queueOrFail (SessionQueueOptions 4)
+      expectedEvent <- case listToMaybe droneVibratoEvents of
+        Just event ->
+          pure event
+        Nothing ->
+          assertFailure "expected droneVibratoEvents to contain a first event"
+      let outcome = enqueuePatternBlock droneVibrato producer queue0
+      case perItems (peoResult outcome) of
+        [item] -> do
+          peiSamplePos item @?= fst expectedEvent
+          peiEvent item @?= snd expectedEvent
+          peiCommand item @?= fromPatternEvent (snd expectedEvent)
+          case peiResult item of
+            SessionEnqueued queued -> do
+              qscSequence queued @?= CommandSequence 0
+              qscProducer queued
+                @?= ProducerId ProducerPattern (T.pack "composer")
+            other ->
+              assertFailure ("expected queued VoiceOn, got: " <> show other)
+        other ->
+          assertFailure ("expected one droneVibrato item, got: " <> show other)
+
+  , testCase "same-sample Pattern events preserve emit order" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions { ppoBlockFrames = 1 })
+      queue0 <- queueOrFail (SessionQueueOptions 4)
+      let expected = take 2 arpeggioSendReturnEvents
+          outcome = enqueuePatternBlock arpeggioSendReturn producer queue0
+          items = perItems (peoResult outcome)
+      map peiEvent items @?= map snd expected
+      map peiSamplePos items @?= map fst expected
+      mapMaybe itemSequence items @?= [CommandSequence 0, CommandSequence 1]
+
+  , testCase "every PatternEvent constructor maps through fromPatternEvent" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions { ppoBlockFrames = 8 })
+      queue0 <- queueOrFail (SessionQueueOptions 8)
+      let events =
+            [ ( SamplePos 0
+              , PEVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+              )
+            , ( SamplePos 1
+              , PEControlWrite
+                  (VoiceKey "v0")
+                  (ControlTag (MigrationKey "lpf") 0)
+                  1200.0
+              )
+            , ( SamplePos 2
+              , PEVoiceOff (VoiceKey "v0")
+              )
+            , ( SamplePos 3
+              , PEHotSwap
+                  (SwapLabel "edit")
+                  (patternTemplates polyphonicStab)
+              )
+            ]
+          pat = droneVibrato { patternEvents = staticEvents events }
+          outcome = enqueuePatternBlock pat producer queue0
+          items = perItems (peoResult outcome)
+      map peiEvent items @?= map snd events
+      map peiCommand items @?= map (fromPatternEvent . snd) events
+      perBacklogged (peoResult outcome) @?= 0
+
+  , testCase "full queue stops at first rejection and retains tail backlog" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions { ppoBlockFrames = 8 })
+      queue0 <- queueOrFail (SessionQueueOptions 1)
+      retryQueue <- queueOrFail (SessionQueueOptions 8)
+      let events = missingVoiceEvents 4
+          pat = droneVibrato { patternEvents = staticEvents events }
+          outcome1 = enqueuePatternBlock pat producer queue0
+          result1 = peoResult outcome1
+      map peiEvent (perItems result1) @?= map snd (take 2 events)
+      perBacklogged result1 @?= 3
+      case map peiResult (perItems result1) of
+        [SessionEnqueued _, SessionEnqueueRejected {}] ->
+          pure ()
+        other ->
+          assertFailure ("expected enqueue then rejection, got: "
+                         <> show other)
+
+      let outcome2 = enqueuePatternBlock pat (peoState outcome1) retryQueue
+          result2 = peoResult outcome2
+      perNextStart result2 @?= perNextStart result1
+      perBacklogged result2 @?= 0
+      map peiEvent (perItems result2) @?= map snd (drop 1 events)
+
+  , testCase "rejected backlog does not consume queue sequence numbers" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions { ppoBlockFrames = 8 })
+      queue0 <- queueOrFail (SessionQueueOptions 2)
+      let events = missingVoiceEvents 3
+          pat = droneVibrato { patternEvents = staticEvents events }
+          outcome1 = enqueuePatternBlock pat producer queue0
+          result1 = peoResult outcome1
+      mapMaybe itemSequence (perItems result1)
+        @?= [CommandSequence 0, CommandSequence 1]
+      perBacklogged result1 @?= 1
+
+      drained <- withSessionOwner
+                   (patternTemplates droneVibrato)
+                   defaultSessionOwnerOptions
+                   (\owner -> drainSessionCommandQueue owner (peoQueue outcome1))
+      drainedQueue <- case drained of
+        Left setupIssue ->
+          assertFailure ("expected session owner, got: " <> show setupIssue)
+        Right (queue1, drain) -> do
+          sdrRemaining drain @?= 0
+          sdrStopped drain @?= Nothing
+          pure queue1
+
+      let outcome2 = enqueuePatternBlock pat (peoState outcome1) drainedQueue
+          result2 = peoResult outcome2
+      perNextStart result2 @?= perNextStart result1
+      perBacklogged result2 @?= 0
+      map peiEvent (perItems result2) @?= [snd (events !! 2)]
+      mapMaybe itemSequence (perItems result2) @?= [CommandSequence 2]
+
+  , testCase "retry call does not generate a fresh range after backlog drains" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions { ppoBlockFrames = 8 })
+      queue0 <- queueOrFail (SessionQueueOptions 2)
+      retryQueue <- queueOrFail (SessionQueueOptions 8)
+      nextQueue <- queueOrFail (SessionQueueOptions 8)
+      let events =
+            missingVoiceEventsAt [0, 1, 2, 8]
+          pat = droneVibrato { patternEvents = staticEvents events }
+          outcome1 = enqueuePatternBlock pat producer queue0
+          outcome2 = enqueuePatternBlock pat (peoState outcome1) retryQueue
+          outcome3 = enqueuePatternBlock pat (peoState outcome2) nextQueue
+      perBacklogged (peoResult outcome1) @?= 1
+      perNextStart (peoResult outcome2)
+        @?= perNextStart (peoResult outcome1)
+      map peiSamplePos (perItems (peoResult outcome2))
+        @?= [SamplePos 2]
+      perBacklogged (peoResult outcome2) @?= 0
+      perNextStart (peoResult outcome3) @?= SamplePos 16
+      map peiSamplePos (perItems (peoResult outcome3))
+        @?= [SamplePos 8]
+
+  , testCase "producer enqueue drains through owner and commits a real voice" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions { ppoBlockFrames = 64 })
+      queue0 <- queueOrFail (SessionQueueOptions 4)
+      let outcome = enqueuePatternBlock droneVibrato producer queue0
+      result <- withSessionOwner
+                  (patternTemplates droneVibrato)
+                  defaultSessionOwnerOptions
+                  $ \owner -> do
+                    drained <- drainSessionCommandQueue owner (peoQueue outcome)
+                    st <- sessionOwnerState owner
+                    pure (drained, st)
+      case result of
+        Left setupIssue ->
+          assertFailure ("expected session owner, got: " <> show setupIssue)
+        Right ((_queue1, drain), st) -> do
+          sdrRemaining drain @?= 0
+          sdrStopped drain @?= Nothing
+          case map sdiResult (sdrItems drain) of
+            [SessionOwnerStep (StepCommitted _ Nothing)] ->
+              pure ()
+            other ->
+              assertFailure ("expected committed Pattern producer voice, got: "
+                             <> show other)
+          assertBool
+            ("expected v0 voice after drain, got " <> show (ssVoices st))
+            (M.member (VoiceKey "v0") (ssVoices st))
+  ]
+
+patternProducerOrFail :: PatternProducerOptions -> IO PatternProducerState
+patternProducerOrFail opts =
+  case newPatternProducerState opts of
+    Left issue ->
+      assertFailure ("expected Pattern producer state, got: " <> show issue)
+    Right state ->
+      pure state
+
+itemSequence :: PatternEnqueueItem -> Maybe CommandSequence
+itemSequence item = case peiResult item of
+  SessionEnqueued queued ->
+    Just (qscSequence queued)
+  SessionEnqueueRejected {} ->
+    Nothing
+
+missingVoiceEvents :: Int -> [(SamplePos, PatternEvent)]
+missingVoiceEvents n =
+  missingVoiceEventsAt [0 .. n - 1]
+
+missingVoiceEventsAt :: [Int] -> [(SamplePos, PatternEvent)]
+missingVoiceEventsAt positions =
+  [ ( SamplePos pos
+    , PEVoiceOn (TemplateName "missing") (VoiceKey ("v" <> show pos)) []
+    )
+  | pos <- positions
+  ]
 
 ------------------------------------------------------------
 -- Phase 6.A.2: pattern corpus

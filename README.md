@@ -227,6 +227,30 @@ loading still belong to the existing compiler pipeline.
 
 ---
 
+## Session preparation APIs
+
+The repository also carries the current Haskell-side session scaffolding under
+`MetaSonic.Session.*`. This is library code, not a background service.
+
+The landed pieces are deliberately small:
+
+- `MetaSonic.Session.Command` normalizes producer intents into
+  `SessionCommand` values.
+- `MetaSonic.Session.State` admits commands, returns plans, and applies
+  checked commits only after a runtime adapter reports success.
+- `MetaSonic.Session.RTGraphAdapter` and `MetaSonic.Session.Owner` provide a
+  caller-scoped, single-threaded owner around a real `RTGraph`.
+- `MetaSonic.Session.Queue` is a bounded Haskell-side producer-intent FIFO.
+- `MetaSonic.Session.PatternProducer` expands one `Pattern` range at a time,
+  converts `PatternEvent` values through `fromPatternEvent`, and retains a
+  bounded backlog when the queue is full.
+
+What is still intentionally absent: thread-safe producer fan-in, background
+drain loops, concrete OSC/MIDI/UI producers, cross-producer arbitration,
+preserving hot-swap, and recovery after terminal runtime divergence.
+
+---
+
 ## Low-level SynthGraph syntax
 
 The lower-level graph builder remains available directly. It looks like this

@@ -2848,9 +2848,13 @@ ready/diverged status, and a terminal-divergence classifier. **Session
 Prep G** adds a Haskell-only bounded producer-intent queue above that
 owner: producer identity, per-queue sequence numbers, explicit
 full-queue rejection, and a synchronous drain helper into
-`stepSessionOwner`. It still does not add a thread-safe fan-in wrapper,
-background drain loop, concrete OSC/MIDI/Pattern adapter, realtime
-command queue, or uninterrupted hot-swap claim.
+`stepSessionOwner`. **Session Prep H** adds the first concrete
+Haskell-only producer bridge for `Pattern`: deterministic block/range
+expansion, `PatternEvent` to `SessionCommand` conversion, queue
+submission, and bounded backlog retry on full-queue rejection. These
+slices still do not add a thread-safe fan-in wrapper, background drain
+loop, concrete OSC/MIDI/UI adapters, realtime command queue, or
+uninterrupted hot-swap claim.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2862,13 +2866,14 @@ lifecycle reporting.
 
 The original planner/cost precondition is now satisfied: Phase 7 has
 capability metadata, survey-only planner output, and a first
-cost/profitability table. Session Prep A, B, C, D, E, F, and G now
+cost/profitability table. Session Prep A, B, C, D, E, F, G, and H now
 supply the library-side contracts, a constrained real-runtime adapter,
 a scoped single-threaded owner, and the first pure producer-ingress
-ordering/backpressure layer. The remaining open work is not "create an
-owner" or "define a queue"; it is concrete producer fan-in,
-thread-safe queue ownership, preserving hot-swap, and recovery
-semantics around that owner.
+ordering/backpressure layer plus one concrete Pattern producer bridge.
+The remaining open work is not "create an owner", "define a queue", or
+"turn Pattern events into queued commands"; it is thread-safe queue
+ownership, OSC/MIDI/UI producer adapters, cross-producer arbitration,
+preserving hot-swap, and recovery semantics around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -2916,6 +2921,14 @@ Session prep artifacts:
   blocked. This is still not a thread-safe producer fan-in layer,
   concrete OSC/MIDI/Pattern adapter, background worker, realtime ABI
   queue, or preserving hot-swap implementation.
+- [Session Prep H - Pattern Producer Bridge](notes/2026-05-12-session-prep-h-pattern-producer.md)
+  records the first concrete Haskell-only producer bridge above the
+  Prep G queue. It expands one deterministic `Pattern` block/range or
+  retries one pending backlog, converts `PatternEvent` values through
+  `fromPatternEvent`, submits them with `ProducerPattern` identity, and
+  retains rejected events for retry. This is still not a live clock,
+  background worker, thread-safe fan-in layer, OSC/MIDI/UI adapter, or
+  preserving hot-swap implementation.
 
 Landed prep contracts:
 
@@ -2946,6 +2959,10 @@ Landed prep contracts:
   per-queue sequence numbers, explicit full-queue rejection, FIFO
   owner draining, and stop-on-divergence behavior
   (`MetaSonic.Session.Queue`).
+- [x] Haskell-side Pattern producer bridge v1 with deterministic
+  block/range expansion, `PatternEvent` to `SessionCommand`
+  conversion, bounded backlog retry, and producer queue submission
+  (`MetaSonic.Session.PatternProducer`).
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -2966,28 +2983,36 @@ Landed prep contracts:
   sequence preservation, full-queue rejection, FIFO ordering across
   producer identities, control-write drain without owner-state
   mutation, stop-on-divergence with remaining commands preserved, and
-  already-diverged owner blocking.
+  already-diverged owner blocking. Prep H Pattern producer tests cover
+  default construction, invalid block size rejection, empty blocks,
+  first-block `PEVoiceOn` translation, same-sample ordering, all
+  `PatternEvent` constructors, full-queue stop/backlog retention,
+  backlog retry without cursor advancement, sequence preservation
+  across rejected backlog, and a Pattern producer -> queue -> owner
+  integration smoke.
 
 Still gated:
 
-- [ ] Thread-safe producer fan-in, concrete producer adapters, and any
-  background drain loop around the pure producer queue.
+- [ ] Thread-safe producer fan-in, concrete OSC/MIDI/UI producer
+  adapters, cross-producer arbitration, and any background drain loop
+  around the pure producer queue.
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
 - [ ] Uninterrupted graph hot-swap with audio-thread cooperation,
   preserving-voice migration, and recoverable failed-install semantics.
-- [ ] MIDI, OSC, and pattern arbitration.
+- [ ] MIDI, OSC, UI, and Pattern coexistence/arbitration policy.
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
 
-Current decision: treat Prep F/G as the first runtime ownership and
+Current decision: treat Prep F/G/H as the first runtime ownership and
 producer-ingress boundaries, not as the full session runtime. Do not
 promote them into a producer-facing session service until concrete
-producer fan-in, thread-safe queue ownership, preserving hot-swap, and
-recovery policies are specified and tested in their own slices. The
+producer fan-in, thread-safe queue ownership, OSC/MIDI/UI ingress,
+cross-producer arbitration, preserving hot-swap, and recovery policies
+are specified and tested in their own slices. The
 session does not need a generated fusion executor to ship;
 generated execution remains a read-only diagnostic/performance
 experiment unless later measurements justify automatic turn-on.
