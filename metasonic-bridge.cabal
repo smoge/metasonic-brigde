@@ -130,6 +130,7 @@ executable metasonic-bridge
       MetaSonic.App.Osc
       MetaSonic.App.ProfitabilityGate
       MetaSonic.App.SessionMidiSmoke
+      MetaSonic.App.SessionOscArbitrationSmoke
       MetaSonic.App.SnapshotCheck
       MetaSonic.App.Survey
       MetaSonic.App.SwapBench
