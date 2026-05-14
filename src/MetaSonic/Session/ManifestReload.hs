@@ -18,6 +18,7 @@ module MetaSonic.Session.ManifestReload
     -- * Request
   , ManifestReloadRequest (..)
   , ManifestResourcePolicy (..)
+  , defaultManifestResourcePolicy
 
     -- * Plan
   , ManifestReloadPlan (..)
@@ -75,6 +76,18 @@ data ManifestResourcePolicy = ManifestResourcePolicy
   , mrpFxPolyphony       :: !Int
   , mrpTemplateOverrides :: !(M.Map TemplateName Int)
   } deriving (Eq, Show, Generic)
+
+-- | Conservative static resource policy.
+--
+-- The planner expands this into explicit per-template polyphony entries
+-- in 'RTGraphAdapterOptions'. Runtime sizing knobs such as builder capacity,
+-- max frames, and hot-swap timeout remain downstream owner configuration.
+defaultManifestResourcePolicy :: ManifestResourcePolicy
+defaultManifestResourcePolicy = ManifestResourcePolicy
+  { mrpVoicePolyphony    = 1
+  , mrpFxPolyphony       = 1
+  , mrpTemplateOverrides = M.empty
+  }
 
 -- | A validated pure plan that a later runtime integration can turn into
 -- owner options plus a hot-swap command.

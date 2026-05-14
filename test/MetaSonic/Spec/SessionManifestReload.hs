@@ -69,7 +69,7 @@ sessionManifestReloadTests =
             }
       planManifestReload
         (AuthoringManifestDoc manifestSchemaVersion [requested])
-        validCatalog
+        [validCatalogEntry { mrcManifest = validManifest }]
         validRequest
         @?= Left (MriDuplicateTemplateName (TemplateName "voice"))
 
@@ -159,6 +159,37 @@ sessionManifestReloadTests =
           , (TemplateName "fx", 2)
           ]
 
+  , testCase "per-template polyphony map is order-insensitive and applies overrides" $ do
+      let policy = ManifestResourcePolicy
+            { mrpVoicePolyphony    = 8
+            , mrpFxPolyphony       = 2
+            , mrpTemplateOverrides =
+                M.fromList
+                  [ (TemplateName "voice", 12)
+                  , (TemplateName "fx", 3)
+                  ]
+            }
+          request = validRequest { mrrResourcePolicy = policy }
+          reversedManifest = validManifest
+            { mfTemplates = reverse (mfTemplates validManifest) }
+          reversedDoc =
+            AuthoringManifestDoc manifestSchemaVersion [reversedManifest]
+          reversedCatalog =
+            [ validCatalogEntry { mrcManifest = reversedManifest } ]
+      planA <- planOrFail validDoc validCatalog request
+      planB <- planOrFail reversedDoc reversedCatalog request
+      let polyA =
+            raoPerTemplatePolyphony (mrlpAdapterOptions planA)
+          polyB =
+            raoPerTemplatePolyphony (mrlpAdapterOptions planB)
+          expected =
+            [ (TemplateName "fx", 3)
+            , (TemplateName "voice", 12)
+            ]
+      M.toAscList polyA @?= expected
+      M.toAscList polyB @?= expected
+      polyA @?= polyB
+
   , testCase "non-positive voice polyphony rejects" $ do
       let policy = validPolicy { mrpVoicePolyphony = 0 }
           request = validRequest { mrrResourcePolicy = policy }
@@ -199,10 +230,8 @@ validRequest = ManifestReloadRequest
   }
 
 validPolicy :: ManifestResourcePolicy
-validPolicy = ManifestResourcePolicy
-  { mrpVoicePolyphony    = 4
-  , mrpFxPolyphony       = 1
-  , mrpTemplateOverrides = M.empty
+validPolicy = defaultManifestResourcePolicy
+  { mrpVoicePolyphony = 4
   }
 
 validDoc :: AuthoringManifestDoc
