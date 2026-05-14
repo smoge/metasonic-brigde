@@ -50,6 +50,7 @@ module MetaSonic.Session.Arbitration
   , ArbitrationIssue (..)
   , ArbitrationDecision (..)
   , arbitrateSessionCommand
+  , recordAcceptedSessionCommand
   ) where
 
 import           Control.DeepSeq           (NFData)
@@ -226,6 +227,24 @@ arbitrateSessionCommand policy producer command =
       ArbitrationAllowed
     Just target ->
       arbitrateControlTarget policy producer command target
+
+-- | Update pure policy state after a command has been accepted.
+--
+-- This is intentionally separate from 'arbitrateSessionCommand'. A
+-- gateway should call it only after the downstream enqueue has
+-- succeeded, so queue-full or other enqueue rejections do not claim
+-- ownership for commands that never reached fan-in.
+recordAcceptedSessionCommand
+  :: ArbitrationPolicy
+  -> ProducerId
+  -> SessionCommand
+  -> ArbitrationPolicy
+recordAcceptedSessionCommand policy producer command =
+  case (policy, sessionCommandControlTarget command) of
+    (ProducerPriority priorities owners, Just target) ->
+      ProducerPriority priorities (setControlOwner target producer owners)
+    _ ->
+      policy
 
 arbitrateControlTarget
   :: ArbitrationPolicy

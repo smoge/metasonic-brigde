@@ -3094,8 +3094,9 @@ Session prep artifacts:
   records the cross-producer ownership boundary for Pattern, OSC, MIDI,
   and UI writes that target the same symbolic control. It keeps
   arbitration before fan-in, preserves strict FIFO for accepted
-  commands, and leaves implementation gated on an explicit policy
-  surface with diagnostics.
+  commands, and documents the landed pure policy plus optional gateway.
+  Concrete producer/listener wiring remains gated on explicit
+  non-`FifoOnly` configuration and diagnostics.
 
 Landed prep contracts:
 
@@ -3230,7 +3231,11 @@ Landed prep contracts:
   translation for voice on/off, control write, and
   hot-swap, non-finite value rejection before enqueue, `ProducerUI`
   attribution, queue-full surfacing, and composition through the
-  scoped fan-in drain service.
+  scoped fan-in drain service. The session arbitration tests cover
+  FIFO-only behavior, priority winners and losers, unowned and
+  equal-priority targets, target claims, lifecycle/hot-swap bypass,
+  opt-in gateway enqueue behavior, pre-fan-in rejection, accepted-owner
+  updates, and no owner update when fan-in rejects.
 
 Recent OSC ingress follow-up: `MetaSonic.OSC.Dispatch.Internal` exposes
 the shared symbolic control-write decoder,
@@ -3276,6 +3281,15 @@ attribution. It can target a plain `SessionFanInHost` or a scoped
 reload an authoring manifest, authorize commands, or add arbitration
 beyond FIFO.
 
+Recent arbitration follow-up: `MetaSonic.Session.Arbitration` provides
+the pure policy surface for `FifoOnly`, producer-priority, and
+target-claim decisions, while `MetaSonic.Session.ArbitrationGateway`
+wraps fan-in enqueue as an opt-in boundary. The gateway defaults to
+`FifoOnly`, rejects policy-denied writes before fan-in, and updates
+priority ownership only after an accepted enqueue. Existing live
+producer/listener paths are not routed through it unless a caller
+explicitly chooses that wrapper.
+
 Still gated:
 
 - [ ] GUI toolkit bindings, manifest-driven session reload/resource
@@ -3283,11 +3297,11 @@ Still gated:
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
-- [ ] Arbitration beyond FIFO producer order, producer-specific
-  throttling/coalescing beyond the landed MIDI listener-local control
-  coalescer, MVar flush-lock optimization for the landed MIDI coalescer
-  without contention evidence, and drain scheduling beyond the scoped
-  wake-on-enqueue fan-in service. The design constraints are recorded in
+- [ ] Producer-specific throttling/coalescing beyond the landed MIDI
+  listener-local control coalescer, MVar flush-lock optimization for
+  the landed MIDI coalescer without contention evidence, and drain
+  scheduling beyond the scoped wake-on-enqueue fan-in service. The
+  design constraints are recorded in
   [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
   and
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
@@ -3295,8 +3309,8 @@ Still gated:
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
-- [ ] MIDI, OSC, UI, and Pattern coexistence/arbitration
-  implementation. The policy boundary is recorded in
+- [ ] MIDI, OSC, UI, and Pattern live coexistence/arbitration wiring
+  beyond the landed opt-in gateway. The policy boundary is recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and

@@ -1,9 +1,11 @@
 # Session Producer Coexistence And Arbitration
 
-Status: design contract only. This note records the next arbitration
-boundary after MIDI listener-local coalescing. It does not change
-`MetaSonic.Session.Queue`, `MetaSonic.Session.FanIn`, or any concrete
-producer behavior.
+Status: pure policy and optional gateway landed. This note records the
+arbitration boundary after MIDI listener-local coalescing. It does not
+change `MetaSonic.Session.Queue` or `MetaSonic.Session.FanIn`; concrete
+producer/listener paths keep FIFO behavior unless a caller explicitly
+routes them through `MetaSonic.Session.ArbitrationGateway` with a
+non-`FifoOnly` policy.
 
 The session layer now has multiple producers that can address the same
 symbolic control target:
@@ -14,12 +16,12 @@ symbolic control target:
   `ProducerMIDI`;
 - UI intents through `ProducerUI`.
 
-Today, coexistence is strict FIFO at fan-in. If two producers write the
-same `(VoiceKey, ControlTag)`, the owner receives both commands in the
-observed enqueue order. That is deterministic and testable, but it is
-not a musical ownership policy. A remote OSC slider, a MIDI controller,
-an automation pattern, and a UI widget may represent different user
-intents even when they write the same logical target.
+By default, coexistence is strict FIFO at fan-in. If two producers write
+the same `(VoiceKey, ControlTag)`, the owner receives both commands in
+the observed enqueue order. That is deterministic and testable, but it
+is not a musical ownership policy. A remote OSC slider, a MIDI
+controller, an automation pattern, and a UI widget may represent
+different user intents even when they write the same logical target.
 
 ## Current Contract
 
@@ -31,6 +33,12 @@ intents even when they write the same logical target.
   for commands that producers actually submit.
 - `Session.FanIn` serializes enqueue, drain, and snapshot access. It
   does not inspect command targets for ownership.
+- `Session.Arbitration` is pure policy state. `FifoOnly` preserves the
+  baseline, `ProducerPriority` updates owner state only after accepted
+  enqueues, and `TargetClaim` blocks claimed control targets.
+- `Session.ArbitrationGateway` is an optional wrapper above fan-in. Its
+  default policy is `FifoOnly`; policy rejections happen before enqueue
+  and do not consume queue capacity or command sequence numbers.
 - The landed MIDI coalescer is listener-local. It can merge repeated
   MIDI-origin `CmdControlWrite`s before enqueue, but it cannot merge,
   reorder, or drop another producer's commands.
@@ -123,21 +131,19 @@ Possible policy modes:
   class owns a control target, and policy rejects writes outside that
   declaration.
 
-The first implementation should be pure and testable before it is wired
-to any live producer. A plausible data model is:
+The first implementation is pure and testable before it is wired to any
+live producer. The landed data model is:
 
 ```text
-data ControlAuthority =
+data ArbitrationPolicy =
     FifoOnly
-  | ProducerPriority [ProducerKind]
-  | TargetClaim ClaimTable
-  | TouchOverride TouchTable
-  | ManifestOwnership ManifestTable
+  | ProducerPriority [ProducerKind] ControlOwnerTable
+  | TargetClaim TargetClaimTable
 ```
 
-The exact names are not fixed by this note. The fixed part is the
-boundary: policy decides before enqueue, and accepted fan-in commands
-remain strict FIFO.
+The gateway decides before enqueue, and accepted fan-in commands remain
+strict FIFO. `TouchOverride` and manifest-owned policies are still future
+extensions rather than constructors in the landed module.
 
 ## Observability
 
@@ -178,23 +184,28 @@ above fan-in, using a small pure policy function or wrapper:
   unsupported-policy issues rather than silently dropping or collapsing
   commands.
 - Rejected commands do not consume queue capacity or sequence numbers.
+- A fan-in rejection after policy acceptance does not update priority
+  owner state.
 
 ## Implementation Sequence
 
-1. Keep this note as the contract for the next design step.
-2. Add a pure arbitration-policy module with no fan-in changes.
+1. Keep this note as the contract for the design boundary.
+2. Add a pure arbitration-policy module with no fan-in changes. Done:
+   `MetaSonic.Session.Arbitration`.
 3. Add tests for same-target cross-producer writes, rejected writes,
-   unclaimed targets, and unchanged FIFO behavior.
-4. Wire the policy as an optional wrapper around producer enqueue paths
-   only after the pure policy surface is stable.
-5. Add smoke diagnostics if a live policy is enabled by configuration.
+   unclaimed targets, and unchanged FIFO behavior. Done in `test/Spec.hs`.
+4. Add an optional wrapper around producer enqueue paths while defaulting
+   to `FifoOnly`. Done: `MetaSonic.Session.ArbitrationGateway`.
+5. Wire concrete MIDI, OSC, UI, or Pattern producer/listener paths only
+   when configuration can explicitly enable a non-FIFO policy.
+6. Add smoke diagnostics if a live policy is enabled by configuration.
 
 ## Open Questions
 
 - Which component owns policy configuration: session options, authoring
   manifest, or a higher UI/runtime supervisor?
-- Which gateway site is v1's surface: per-producer gateways with shared
-  policy state, a session policy wrapper, or a higher orchestration layer?
+- Which configured producer/listener entrypoint should own the optional
+  gateway when a live non-FIFO policy is enabled?
 - Should a default non-FIFO policy ever exist, or should all arbitration
   be opt-in?
 - Should multi-policy composition, such as target-claim precedence with
