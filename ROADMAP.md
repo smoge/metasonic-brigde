@@ -3210,8 +3210,11 @@ Landed prep contracts:
   listener tests cover blocked-source bracket cleanup, explicit
   end-of-input worker exit, producer rejection with continued event
   processing, note-on/note-off and all-notes-off state
-  transitions, queue-full state retention, blocked-hook teardown, and
-  composition through the scoped fan-in drain service. The PortMIDI
+  transitions, queue-full state retention, listener-local pitch-bend
+  coalescing at an all-notes-off fence, visible fence drops when a
+  coalesced flush rejects, timed control flush, pending-control flush
+  on listener teardown, blocked-hook teardown, and composition through
+  the scoped fan-in drain service. The PortMIDI
   source tests cover event-tag agreement, deterministic invalid-device
   idle-open behavior, and composition with listener teardown without requiring MIDI
   hardware. The UI producer adapter tests cover intent-to-command

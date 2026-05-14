@@ -185,8 +185,11 @@ defaultSessionMIDIListenerHooks = SessionMIDIListenerHooks
 -- A producer result with a non-empty control-write batch and an empty
 -- enqueue-result list means those writes were deferred to the local
 -- coalescer; they are reported again with concrete enqueue results
--- when a later flush submits them. EOF and teardown flushes only report
--- enqueue issues; they do not call 'smlhOnProducerResult'.
+-- when a later flush submits them. During that window,
+-- 'readSessionMIDIListenerState' reflects listener-local target state
+-- that fan-in and the runtime may not have received yet. EOF and
+-- teardown flushes only report enqueue issues; they do not call
+-- 'smlhOnProducerResult'.
 --
 -- If a fence-triggered flush is rejected, the fence commands are not
 -- enqueued and 'SmliFenceDroppedForFlushFailure' is reported.

@@ -32,9 +32,11 @@ binds Q / PortMIDI input behind the same session-facing loop.
 - A producer result with a non-empty control-write batch and an empty
   enqueue-result list means the batch was deferred into the local
   coalescer. The concrete enqueue results appear when a later fence,
-  timed flush, EOF, or teardown flush submits the pending writes. EOF
-  and teardown flushes report enqueue issues but do not call
-  `smlhOnProducerResult`.
+  timed flush, EOF, or teardown flush submits the pending writes.
+  During that window, `readSessionMIDIListenerState` reflects
+  listener-local target state that fan-in and the runtime may not have
+  received yet. EOF and teardown flushes report enqueue issues but do
+  not call `smlhOnProducerResult`.
 - If a fence needs to flush pending controls and that flush hits
   queue-full, the fence's own commands are not enqueued. The listener
   reports `SmliFenceDroppedForFlushFailure`, preserves the pending
