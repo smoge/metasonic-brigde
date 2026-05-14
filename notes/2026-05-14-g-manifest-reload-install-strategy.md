@@ -2,16 +2,15 @@
 
 Date: 2026-05-14
 
-Status: design note for review. This note follows
-`2026-05-14-f-manifest-session-reload-policy.md` and assumes the pure
-`MetaSonic.Session.ManifestReload` planner has already produced a
-validated `ManifestReloadPlan`.
+Status: implemented for the v1 construction-time helper and owner/RTGraph
+smoke coverage. This note remains the install-strategy design record for the
+first runtime-facing manifest slice.
 
 ## Decision
 
-The first runtime-facing manifest slice should be construction-time only.
+The first runtime-facing manifest slice is construction-time only.
 
-V1 should use a `ManifestReloadPlan` to construct a new session owner with:
+V1 uses a `ManifestReloadPlan` to construct a new session owner with:
 
 - `mrlpTemplateGraph` as the owner graph;
 - `mrlpAdapterOptions` installed through `SessionOwnerOptions`;
@@ -38,8 +37,9 @@ TemplateGraph
   -> stepSessionOwner
 ```
 
-The manifest plan can feed that path directly. This proves the planner output
-is consumable by the runtime owner without choosing live-reload semantics.
+The manifest plan feeds that path directly. The landed smoke test proves the
+planner output is consumable by the runtime owner without choosing live-reload
+semantics.
 
 By contrast, true reload of an existing owner has different correctness
 contracts depending on strategy:
@@ -92,12 +92,12 @@ constructManifestSessionFromPlan
   -> IO (Either SessionAdapterSetupIssue a)
 ```
 
-The helper should live at the runtime boundary, for example in a sibling module
-such as `MetaSonic.Session.ManifestReload.Construct`. Keep
+The helper lives at the runtime boundary in the sibling module
+`MetaSonic.Session.ManifestReload.Construct`. Keep
 `MetaSonic.Session.ManifestReload` IO-free so the planner and projection
 helpers remain cheap pure tests.
 
-Implementation sketch:
+Current implementation:
 
 ```haskell
 constructManifestSessionFromPlan plan baseOwnerOptions action =
@@ -161,19 +161,17 @@ from the manifest plan. That is different from construction-time v1 because it
 must define what happens to external producers, queued commands, active voices,
 audio device ownership, and user-visible failure.
 
-## Test Plan
+## Implemented Smoke Coverage
 
-The next implementation slice should add one owner/RTGraph smoke test after
-the construction helper lands:
+The construction helper and smoke coverage have landed:
 
 1. Build a valid `ManifestReloadPlan`.
 2. Derive owner options with `manifestSessionOwnerOptions`.
 3. Construct an owner with the plan's `mrlpTemplateGraph`.
-4. Step one ordinary session command, such as `CmdVoiceOn`, and observe a
-   committed owner state.
+4. Step one ordinary `CmdVoiceOn` and observe a committed owner state.
 
 That test proves planner output can cross the existing owner/adapter boundary.
-It should not start a live audio stream, depend on PortAudio, or claim reload
+It does not start a live audio stream, depend on PortAudio, or claim reload
 semantics.
 
 The existing pure tests should continue to cover:
@@ -190,7 +188,7 @@ infrastructure rather than v1-only code.
 
 ## Review Checklist
 
-Before implementing the construction helper, check:
+The landed helper and any future edits should continue to satisfy:
 
 - The helper name does not imply live reload.
 - The helper constructs a fresh owner from `mrlpTemplateGraph`.

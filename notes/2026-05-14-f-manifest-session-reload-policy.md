@@ -2,11 +2,15 @@
 
 Date: 2026-05-14
 
-Design note for the next session. This is not an implementation artifact.
+Status: implemented for the pure planner and v1 construction-time session
+setup. This note remains the design record for
+`MetaSonic.Session.ManifestReload`; runtime install strategy is covered by
+`2026-05-14-g-manifest-reload-install-strategy.md`.
 
-It defines the boundary for a future pure planner that can validate an authoring
-manifest, choose a caller-supplied graph/catalog entry, and derive session
-resource policy before any runtime owner, hot-swap, or FFI path is touched.
+It defines the boundary for a pure planner that validates an authoring
+manifest, chooses a caller-supplied graph/catalog entry, and derives session
+resource policy before any live-owner reload, hot-swap protocol, or FFI path is
+touched.
 
 ## Decision
 
@@ -40,21 +44,22 @@ The repo already has:
   `TemplateGraph`;
 - producer fan-in and optional arbitration.
 
-The missing piece is the contract between authoring metadata and session runtime
-policy. Jumping directly to a `--load-manifest` or `withManifestSession` API
-would mix three questions:
+The planner slice now provides the contract between authoring metadata and
+session runtime policy. Jumping directly to a `--load-manifest` or
+`withManifestSession` API would still mix three questions:
 
 - Which graph should this manifest refer to?
 - What resource policy should the session apply?
 - How should a live owner install or hot-swap that graph?
 
-The first slice should answer only the first two questions, purely.
+The implemented planner answers only the first two questions, purely.
 
 ## Non-Goals
 
 - No manifest import CLI.
-- No runtime owner changes.
-- No `RTGraph` allocation or `withSessionOwner` wrapper.
+- No runtime owner changes inside the pure planner.
+- No `RTGraph` allocation or `withSessionOwner` wrapper inside the pure
+  planner.
 - No C++ runtime, FFI, OSC, or MIDI changes.
 - No attempt to infer or rebuild a graph from JSON.
 - No session file format.
@@ -63,13 +68,13 @@ The first slice should answer only the first two questions, purely.
 
 ## Planner Shape
 
-A future module can live at:
+The planner module lives at:
 
 ```haskell
 MetaSonic.Session.ManifestReload
 ```
 
-The module should expose a small pure API:
+The module exposes a small pure API:
 
 ```haskell
 planManifestReload
@@ -79,7 +84,7 @@ planManifestReload
   -> Either ManifestReloadIssue ManifestReloadPlan
 ```
 
-Suggested data model:
+Current data model:
 
 ```haskell
 data ManifestReloadCatalogEntry = ManifestReloadCatalogEntry
@@ -115,13 +120,13 @@ data ManifestReloadPlan = ManifestReloadPlan
 `FifoOnly`: a manifest can expose controls to a UI, OSC, MIDI, or later
 policy layer without claiming ownership of those controls.
 
-Names can change during implementation, but the separation should not:
+The implementation preserves the intended separation:
 
 - `ManifestReloadCatalogEntry` supplies the real graph.
 - `AuthoringManifestDoc` supplies the external/user-facing selection.
 - `ManifestResourcePolicy` supplies session allocation policy.
-- `ManifestReloadPlan` is the value a later runtime integration can turn into
-  `CmdHotSwap` plus owner/adapter options.
+- `ManifestReloadPlan` is the value runtime integration turns into
+  `CmdHotSwap` and/or owner/adapter options.
 
 ## Catalog Responsibility
 
@@ -151,7 +156,7 @@ source, or a different catalog, the planner rejects before runtime.
 
 ## Validation Rules
 
-The first pure tests should pin these rules:
+The pure planner tests pin these rules:
 
 - `docSchemaVersion` must equal `manifestSchemaVersion` for manually
   constructed docs. JSON decoding already rejects unsupported versions, but the
@@ -178,7 +183,7 @@ The first pure tests should pin these rules:
   becomes necessary, add a targeted `MriInvalidControlSlot` issue before
   runtime integration.
 
-The first implementation can compare `AuthoringManifest` values exactly for the
+The current implementation compares `AuthoringManifest` values exactly for the
 requested demo. If diagnostics become too coarse, add field-specific issue
 constructors later. Do not loosen validation silently.
 
@@ -222,7 +227,7 @@ The manifest gives each template a role:
 - `"fx"` templates use `mrpFxPolyphony`;
 - explicit `mrpTemplateOverrides` win over role defaults.
 
-The planner should produce deterministic `RTGraphAdapterOptions`:
+The planner produces deterministic `RTGraphAdapterOptions`:
 
 - every template in the manifest gets one per-template polyphony entry;
 - overrides are applied by `TemplateName`;
@@ -244,8 +249,8 @@ questions. The manifest reload planner is a static planning pass.
 The plan should carry the manifest controls forward without assigning producer
 ownership yet.
 
-The first projection is intentionally close to the manifest row, but converts
-the raw migration-key string and slot into the existing typed `ControlTag`:
+The projection is intentionally close to the manifest row, but converts the raw
+migration-key string and slot into the existing typed `ControlTag`:
 
 ```haskell
 data ManifestControlSurface = ManifestControlSurface
@@ -276,32 +281,33 @@ that policy source, but the reload planner should not silently claim targets.
 For now the plan carries `FifoOnly`; accepted writes under that policy do not
 record owner claims.
 
-## Runtime Integration Later
+## Runtime Integration
 
-After the pure planner lands, a later slice can add a small integration layer:
+The strategy-independent projections have landed:
 
 ```text
 ManifestReloadPlan
   -> SessionOwnerOptions / RTGraphAdapterOptions
   -> CmdHotSwap swapLabel templateGraph
-  -> stepSessionOwner
 ```
 
-That layer should decide whether reload is:
+The construction-time helper now uses the plan to build a fresh owner through
+`MetaSonic.Session.ManifestReload.Construct`. It does not step `CmdHotSwap` or
+claim live reload semantics.
+
+Future product/runtime layers must still decide whether a reload entrypoint is:
 
 - construction-time only;
 - a stopped-audio clear/rebuild install;
 - a preserving hot-swap through the existing live protocol;
 - or a higher-level host operation that tears down and rebuilds the owner.
 
-Those choices should remain out of the first planner slice. The plan value must
-be useful to any of them.
+Those choices remain out of the planner. The plan value must stay useful to
+any of them.
 
-## Test Plan For The Next Slice
+## Implemented Test Coverage
 
-Add `test/MetaSonic/Spec/SessionManifestReload.hs` and keep the tests pure.
-
-Minimum useful coverage:
+`test/MetaSonic/Spec/SessionManifestReload.hs` now covers:
 
 - valid manifest + matching catalog yields a plan with the catalog graph;
 - unknown requested manifest demo rejects;
@@ -314,13 +320,20 @@ Minimum useful coverage:
 - voice/fx role defaults produce expected `raoPerTemplatePolyphony`;
 - template override wins over role default;
 - non-positive role defaults or overrides reject;
-- control metadata survives into the plan.
+- control metadata survives into the plan;
+- `manifestReloadCommand` projects a plan to `CmdHotSwap`;
+- `manifestSessionOwnerOptions` replaces adapter options while preserving
+  owner sizing;
+- `constructManifestSessionFromPlan` brackets a fresh owner from a plan;
+- a manifest-built owner can commit an ordinary `CmdVoiceOn` through the real
+  owner/RTGraph adapter path.
 
-No `RTGraph`, no `withSessionOwner`, no FFI smoke test in this slice.
+The runtime-facing tests are intentionally construction-time smoke tests. They
+do not start live audio or claim reload semantics.
 
 ## Review Checklist
 
-Before implementing runtime integration, the design should still satisfy:
+For future runtime or CLI integration, the design should still satisfy:
 
 - The manifest does not reconstruct a graph.
 - The catalog is caller-supplied.
