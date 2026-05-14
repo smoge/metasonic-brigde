@@ -3085,7 +3085,10 @@ Session prep artifacts:
   records the pre-implementation policy boundary for high-rate control
   traffic. It keeps the shared queue strict FIFO, makes coalescing
   producer-local, treats every non-control-write command as a fence, and
-  leaves implementation gated on measurement.
+  leaves implementation gated on realistic-rate measurement. The
+  current deterministic pressure probe is a regression test for
+  strict-FIFO saturation under MIDI pitch-bend fanout before any
+  coalescer exists.
 
 Landed prep contracts:
 

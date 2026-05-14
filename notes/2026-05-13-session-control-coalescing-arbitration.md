@@ -154,6 +154,17 @@ does not fill, the right outcome is to keep this note as the policy
 record and defer implementation. If it does fill, the measurement gives
 the coalescer a concrete throughput target and a regression benchmark.
 
+Current deterministic coverage is separate from that realistic-rate
+gate. `Session MIDI producer adapter / pressure probe: high-rate
+pitch-bend fills strict FIFO queue` seeds 16 active MIDI notes, sends
+nine pitch-bend events through a 128-slot fan-in queue, and observes
+144 control-write attempts, 128 `SessionEnqueued` results, 16
+`SeiQueueFull 128` rejections, and 128 drained FIFO items. This is a
+contract regression for the current no-coalescing saturation behavior,
+not a real-hardware throughput claim or a substitute for the
+implementation-gating measurement. A later coalescer must keep this
+probe passing or replace it with a documented contract change.
+
 ## Open Questions
 
 - Exact flush cadence: decoded-event boundary, timed tick, fence only,

@@ -15684,6 +15684,123 @@ sessionMIDIProducerTests =
             ("expected partial all-notes-off enqueue failure, got: "
              <> show other)
 
+  , testCase "pressure probe: high-rate pitch-bend fills strict FIFO queue" $ do
+      let queueCapacity = 128
+          activeNotes =
+            M.fromList
+              [ ((0, note), midiVoiceKey 0 note)
+              | note <- [48..63]
+              ]
+          initialState =
+            testMIDIProducerState activeNotes
+          -- Keep every value non-center so mpsPitchBends stays populated.
+          pitchValues =
+            [9000..9008]
+          -- The final 9008 event rolls back when all of its writes reject.
+          acceptedState =
+            initialState { mpsPitchBends = M.singleton 0 9007 }
+          opts =
+            defaultSessionFanInOptions
+              { sfioQueueOptions = SessionQueueOptions queueCapacity
+              }
+          resultState = \case
+            MIDIProducerRejected _ st ->
+              st
+            MIDIProducerEnqueueAttempted batch _ ->
+              mpcbState batch
+          resultEnqueues = \case
+            MIDIProducerRejected {} ->
+              []
+            MIDIProducerEnqueueAttempted _ enqueues ->
+              enqueues
+          resultBatch = \case
+            MIDIProducerRejected {} ->
+              Nothing
+            MIDIProducerEnqueueAttempted batch _ ->
+              Just batch
+          isControlWrite cmd = case cmd of
+            CmdControlWrite _ _ _ ->
+              True
+            _ ->
+              False
+          enqueuePressure st [] _host =
+            pure (st, [])
+          enqueuePressure st (value : values) host = do
+            enq <- enqueueMIDIProducerEvent
+                     testMIDIProducerOptions
+                     st
+                     (MIDIProducerPitchBend 0 value)
+                     host
+            (stFinal, rest) <- enqueuePressure (resultState enq) values host
+            pure (stFinal, enq : rest)
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          opts
+          $ \host -> do
+              -- This is a fan-in pressure probe; queue saturation happens
+              -- before owner drain, so the active-note seed is producer-side.
+              (finalState, pressureResults) <-
+                enqueuePressure initialState pitchValues host
+              snapshotBeforeDrain <- readSessionFanInHost host
+              drained <- drainSessionFanInHost host
+              snapshotAfterDrain <- readSessionFanInHost host
+              pure
+                ( finalState
+                , pressureResults
+                , snapshotBeforeDrain
+                , drained
+                , snapshotAfterDrain
+                )
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right ( finalState
+              , pressureResults
+              , snapshotBeforeDrain
+              , drained
+              , snapshotAfterDrain
+              ) -> do
+          let batches =
+                mapMaybe resultBatch pressureResults
+              enqueueResults =
+                concatMap resultEnqueues pressureResults
+              enqueued =
+                [ queued
+                | SessionFanInEnqueueResult
+                    { sfierResult = SessionEnqueued queued } <- enqueueResults
+                ]
+              rejectedIssues =
+                [ issue
+                | SessionFanInEnqueueResult
+                    { sfierResult =
+                        SessionEnqueueRejected _ _ issue
+                    } <- enqueueResults
+                ]
+              drainedItems =
+                sdrItems (sfidrDrain drained)
+          length batches @?= length pitchValues
+          map (length . mpcbCommands) batches
+            @?= replicate (length pitchValues) 16
+          length enqueueResults @?= 144
+          length enqueued @?= queueCapacity
+          rejectedIssues @?= replicate 16 (SeiQueueFull queueCapacity)
+          map sfierQueueDepth (take queueCapacity enqueueResults)
+            @?= [1..queueCapacity]
+          map sfierQueueDepth (drop queueCapacity enqueueResults)
+            @?= replicate 16 queueCapacity
+          finalState @?= acceptedState
+          sfisQueueDepth snapshotBeforeDrain @?= queueCapacity
+          assertBool
+            "expected only control writes to enter the pressure queue"
+            (all (isControlWrite . qscCommand) enqueued)
+          map sdiQueued drainedItems @?= enqueued
+          length drainedItems @?= queueCapacity
+          sdrRemaining (sfidrDrain drained) @?= 0
+          sdrStopped (sfidrDrain drained) @?= Nothing
+          sfidrQueueDepth drained @?= 0
+          sfisQueueDepth snapshotAfterDrain @?= 0
+
   , testCase "service host wakes worker for MIDI note-on" $ do
       drainedVar <- newEmptyMVar
       result <-
