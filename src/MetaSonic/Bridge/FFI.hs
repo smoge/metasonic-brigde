@@ -181,7 +181,6 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              FreeLayer (..),
                                              FusedInput (..),
                                              RegionExec (..),
-                                             RegionKernel (..),
                                              RuntimeGraph (..),
                                              RuntimeInput (..),
                                              RuntimeNode (..),
@@ -190,7 +189,6 @@ import           MetaSonic.Bridge.Compile   (AffineStep (..),
                                              ScheduleStep (..),
                                              kernelTag,
                                              layeredRegionSchedule,
-                                             rrKernel,
                                              scheduledRuntimeRegions)
 import           MetaSonic.Bridge.Compile.FusionProgram
                                             (FusionOp (..),
@@ -1978,6 +1976,166 @@ wireFusedScale g cTid dstNode dstPort fused = case fused of
     stepCtl  (AffScale _ c) = c
     stepCtl  (AffBias  _ c) = c
 
+type PrevalidatedTemplate =
+  (Template, Maybe String, [RuntimeRegion], [ScheduleStep])
+
+prevalidateRuntimeGraph
+  :: String -> RuntimeGraph -> IO ([RuntimeRegion], [ScheduleStep])
+prevalidateRuntimeGraph loaderName rg = do
+  -- §4.E.2b: route the region overlay through 'regionSchedule'.
+  -- Compute the schedule /before/ touching the C++ handle so a
+  -- broken regionDependencies / region-list invariant cannot
+  -- leave the runtime in a half-cleared state.
+  scheduled <- case scheduledRuntimeRegions rg of
+    Right rs -> pure rs
+    Left err -> fail $ loaderName <> ": " <> err
+  -- §4.E.2.C0a: also derive the layered schedule up-front so the
+  -- pre-clear validation gate covers the metadata path.
+  steps <- case layeredRegionSchedule rg of
+    Right ss -> pure ss
+    Left err -> fail $ loaderName <> ": " <> err
+  case validateGeneratedPrograms rg of
+    Right () -> pure ()
+    Left err -> fail $ loaderName <> ": " <> err
+  pure (scheduled, steps)
+
+prevalidateTemplate :: String -> Template -> IO PrevalidatedTemplate
+prevalidateTemplate loaderName tpl = do
+  identityBytes <- templateIdentityBytesFromName loaderName (tplName tpl)
+  (scheduled, steps) <- prevalidateRuntimeGraph
+    (loaderName <> ": template " <> show (tplName tpl))
+    (tplGraph tpl)
+  pure (tpl, identityBytes, scheduled, steps)
+
+ensureBuses :: Ptr RTGraph -> RuntimeGraph -> IO ()
+ensureBuses g rg =
+  forM_ (rgNodes rg) $ \node ->
+    case busIndexOf node of
+      Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
+      Nothing  -> pure ()
+
+addNodesSingle :: Ptr RTGraph -> RuntimeGraph -> IO ()
+addNodesSingle g rg =
+  forM_ (rgNodes rg) $ \node -> do
+    c_rt_graph_add_node g
+      (cNodeIndex (rnIndex node))
+      (kindTag    (rnKind  node))
+    setMigrationKeyForNode g 0 node
+    forM_ (zip [0 ..] (rnControls node)) $ \(i, v) ->
+      c_rt_graph_set_control g
+        (cNodeIndex    (rnIndex node))
+        (cControlIndex (ControlIndex i))
+        (CDouble v)
+
+addNodesTemplate :: Ptr RTGraph -> CInt -> RuntimeGraph -> IO ()
+addNodesTemplate g cTid rg =
+  forM_ (rgNodes rg) $ \node -> do
+    c_rt_graph_template_add_node g cTid
+      (cNodeIndex (rnIndex node))
+      (kindTag    (rnKind  node))
+    setMigrationKeyForNode g cTid node
+    forM_ (zip [0 ..] (rnControls node)) $ \(ci, v) ->
+      c_rt_graph_template_set_default g cTid
+        (cNodeIndex    (rnIndex node))
+        (cControlIndex (ControlIndex ci))
+        (CDouble v)
+
+strictFusedInputError :: String -> String -> String -> String
+strictFusedInputError loaderName fusedLoader graphType =
+  -- Strict unfused loaders reject RFused inputs rather than silently
+  -- dropping them: doing so would leave the consumer's port unwired,
+  -- miswiring the runtime graph in a way that produces wrong audio
+  -- with no obvious failure.
+  loaderName <> ": RFused input requires the fused loader; use "
+  <> fusedLoader <> " or pass an unfused " <> graphType <> "."
+
+wireNormalSingle :: String -> Ptr RTGraph -> RuntimeGraph -> IO ()
+wireNormalSingle loaderName g rg =
+  forM_ (rgNodes rg) $ \node ->
+    forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+      case inp of
+        RFrom src srcPort ->
+          c_rt_graph_connect g
+            (cNodeIndex src)
+            (cPortIndex srcPort)
+            (cNodeIndex (rnIndex node))
+            (cPortIndex (PortIndex i))
+        RConst _ ->
+          pure ()
+        RFused _ ->
+          fail $ strictFusedInputError
+            loaderName "loadRuntimeGraphFused" "RuntimeGraph"
+
+wireNormalTemplate :: String -> Ptr RTGraph -> CInt -> RuntimeGraph -> IO ()
+wireNormalTemplate loaderName g cTid rg =
+  forM_ (rgNodes rg) $ \node ->
+    forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+      case inp of
+        RFrom src srcPort ->
+          c_rt_graph_template_connect g cTid
+            (cNodeIndex src)
+            (cPortIndex srcPort)
+            (cNodeIndex (rnIndex node))
+            (cPortIndex (PortIndex i))
+        RConst _ ->
+          pure ()
+        RFused _ ->
+          fail $ strictFusedInputError
+            loaderName "loadTemplateGraphFused" "TemplateGraph"
+
+wireNormalLenientSingle :: Ptr RTGraph -> RuntimeGraph -> IO ()
+wireNormalLenientSingle g rg =
+  forM_ (rgNodes rg) $ \node ->
+    forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+      case inp of
+        RFrom src srcPort ->
+          c_rt_graph_connect g
+            (cNodeIndex src)
+            (cPortIndex srcPort)
+            (cNodeIndex (rnIndex node))
+            (cPortIndex (PortIndex i))
+        RConst _ -> pure ()
+        RFused _ -> pure ()
+
+wireNormalLenientTemplate :: Ptr RTGraph -> CInt -> RuntimeGraph -> IO ()
+wireNormalLenientTemplate g cTid rg =
+  forM_ (rgNodes rg) $ \node ->
+    forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+      case inp of
+        RFrom src srcPort ->
+          c_rt_graph_template_connect g cTid
+            (cNodeIndex src)
+            (cPortIndex srcPort)
+            (cNodeIndex (rnIndex node))
+            (cPortIndex (PortIndex i))
+        RConst _ -> pure ()
+        RFused _ -> pure ()
+
+wireFusedSingle :: Ptr RTGraph -> RuntimeGraph -> IO ()
+wireFusedSingle g = wireFusedTemplate g 0
+
+wireFusedTemplate :: Ptr RTGraph -> CInt -> RuntimeGraph -> IO ()
+wireFusedTemplate g cTid rg =
+  forM_ (rgNodes rg) $ \node ->
+    forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
+      case inp of
+        RFused fused ->
+          wireFusedScale g cTid
+            (cNodeIndex (rnIndex node))
+            (cPortIndex (PortIndex i))
+            fused
+        _ -> pure ()
+
+markElidedSingle :: Ptr RTGraph -> RuntimeGraph -> IO ()
+markElidedSingle g = markElidedTemplate g 0
+
+markElidedTemplate :: Ptr RTGraph -> CInt -> RuntimeGraph -> IO ()
+markElidedTemplate g cTid rg =
+  forM_ (rgNodes rg) $ \node ->
+    when (rnElided node) $
+      c_rt_graph_template_set_node_elided g cTid
+        (cNodeIndex (rnIndex node))
+
 -- | Transfer a compiled 'RuntimeGraph' to the C++ runtime.
 -- Validates the region schedule first, then clears any existing
 -- graph state, adds nodes, wires connections, and registers
@@ -1994,101 +2152,15 @@ wireFusedScale g cTid dstNode dstPort fused = case fused of
 -- See Note [FFI boundary design].
 loadRuntimeGraph :: Ptr RTGraph -> RuntimeGraph -> IO ()
 loadRuntimeGraph g rg = do
-  -- §4.E.2b: route the region overlay through 'regionSchedule'.
-  -- Compute the schedule /before/ touching the C++ handle so a
-  -- broken regionDependencies / region-list invariant cannot
-  -- leave the runtime in a half-cleared state.
-  scheduled <- case scheduledRuntimeRegions rg of
-    Right rs -> pure rs
-    Left err -> fail $ "loadRuntimeGraph: " <> err
-  -- §4.E.2.C0a: also derive the layered schedule up-front so the
-  -- pre-clear validation gate covers the metadata path. Both calls
-  -- run 'regionSchedule' internally, so a Left here is impossible
-  -- after the previous bind succeeded; the case is left in for
-  -- coverage rather than for live failure.
-  steps <- case layeredRegionSchedule rg of
-    Right ss -> pure ss
-    Left err -> fail $ "loadRuntimeGraph: " <> err
-  case validateGeneratedPrograms rg of
-    Right ()  -> pure ()
-    Left err  -> fail $ "loadRuntimeGraph: " <> err
+  (scheduled, steps) <- prevalidateRuntimeGraph "loadRuntimeGraph" rg
   c_rt_graph_clear g
-  -- §6.C.5: writer templates are monophonic at the loader boundary.
-  -- The Haskell clamp is declarative; the runtime in rt_graph.cpp
-  -- holds the same invariant against direct-C-ABI callers.
   clampWriterPolyphonyRG g 0 rg
-  -- Pass 0: size the shared bus pool to cover every bus this graph
-  -- references. Construction-only; must run before audio starts.
-  -- See Note [Explicit bus-pool sizing] in rt_graph.cpp.
-  mapM_ ensureBusForNode (rgNodes rg)
-  -- Pass 1: add nodes and set control values.
-  -- See Note [Two-pass loading].
-  mapM_ addNode (rgNodes rg)
-  -- Pass 2: wire connections (all nodes now exist).
-  mapM_ wireNode (rgNodes rg)
-  -- Pass 2.5 (§7.D): push the generated-fusion program table so
-  -- regions referencing 'FusionProgramId' can resolve at
-  -- registration time. Empty for every graph 'compileRuntimeGraph'
-  -- produces today; the equivalence test loads programs into a
-  -- hand-built 'RuntimeGraph'.
+  ensureBuses g rg
+  addNodesSingle g rg
+  wireNormalSingle "loadRuntimeGraph" g rg
   loadFusionProgramsTo g 0 (rgFusionPrograms rg)
-  -- Pass 3: register the region overlay on template 0 in
-  -- /scheduled/ order (today this is identical to rrIndex order;
-  -- the planner is the identity when 'compileRuntimeGraph'
-  -- produces a topologically valid rrIndex sequence). The C++
-  -- side iterates regions in process_instance in registration
-  -- order. See Note [Region fallback] in rt_graph.cpp.
-  mapM_ (addRegion 0) scheduled
-  -- Pass 4 (§4.E.2.C0a): ship the layered-schedule view as
-  -- per-step ordinal lists over the same scheduled order. Default
-  -- execution ignores it; the C0c test executor consumes it when
-  -- explicitly enabled. Must run after the region pass so the
-  -- runtime can range-check each ordinal.
+  mapM_ (addRegionTo g 0) scheduled
   addScheduleStepsTo g 0 scheduled steps
-  where
-    addNode :: RuntimeNode -> IO ()
-    addNode node = do
-      c_rt_graph_add_node g
-        (cNodeIndex (rnIndex node))
-        (kindTag    (rnKind  node))
-      setMigrationKeyForNode g 0 node
-      forM_ (zip [0 ..] (rnControls node)) $ \(i, v) ->
-        c_rt_graph_set_control g
-          (cNodeIndex    (rnIndex node))
-          (cControlIndex (ControlIndex i))
-          (CDouble v)
-
-    ensureBusForNode :: RuntimeNode -> IO ()
-    ensureBusForNode node =
-      case busIndexOf node of
-        Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
-        Nothing  -> pure ()
-
-    wireNode :: RuntimeNode -> IO ()
-    wireNode node =
-      forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
-        case inp of
-          RFrom src srcPort ->
-            c_rt_graph_connect g
-              (cNodeIndex src)
-              (cPortIndex srcPort)
-              (cNodeIndex (rnIndex node))
-              (cPortIndex (PortIndex i))
-          RConst _ ->
-            pure ()
-          RFused _ ->
-            -- 'fuseRuntimeGraph' is the only source of RFused. The
-            -- unfused single-template loader rejects it explicitly:
-            -- silently dropping the fused input would leave the
-            -- consumer's port unwired, miswiring the runtime graph
-            -- in a way that produces wrong audio with no obvious
-            -- failure. Use 'loadRuntimeGraphFused' for fused graphs.
-            fail "loadRuntimeGraph: RFused input requires the fused \
-                 \loader; use loadRuntimeGraphFused or pass an \
-                 \unfused RuntimeGraph."
-
-    addRegion :: CInt -> RuntimeRegion -> IO ()
-    addRegion = addRegionTo g
 
 {- Note [loadRuntimeGraphFused protocol]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2126,94 +2198,19 @@ right slot count.
 -- See Note [loadRuntimeGraphFused protocol].
 loadRuntimeGraphFused :: Ptr RTGraph -> RuntimeGraph -> IO ()
 loadRuntimeGraphFused g rg = do
-  -- §4.E.2b: same scheduled-regions pre-validation as the unfused
-  -- loader. Compute before touching the C++ handle.
-  scheduled <- case scheduledRuntimeRegions rg of
-    Right rs -> pure rs
-    Left err -> fail $ "loadRuntimeGraphFused: " <> err
-  steps <- case layeredRegionSchedule rg of
-    Right ss -> pure ss
-    Left err -> fail $ "loadRuntimeGraphFused: " <> err
-  case validateGeneratedPrograms rg of
-    Right ()  -> pure ()
-    Left err  -> fail $ "loadRuntimeGraphFused: " <> err
+  (scheduled, steps) <- prevalidateRuntimeGraph "loadRuntimeGraphFused" rg
   c_rt_graph_clear g
-  -- §6.C.5: same writer-monophonic clamp as the unfused loader.
   clampWriterPolyphonyRG g 0 rg
-  mapM_ ensureBusForNode (rgNodes rg)
-  mapM_ addNode (rgNodes rg)
-  -- Pass 2: regular RFrom wiring. RFused / RConst are no-ops here;
-  -- the fused inputs land in pass 2b instead of failing.
-  mapM_ wireNode (rgNodes rg)
-  -- Pass 2b: register fused-input overrides. Each RFused input
-  -- becomes one fused-* connect call on template 0; the constructor
-  -- of the carried 'FusedInput' selects the matching ABI entry
-  -- (single-scale, scale chain, or affine). See 'wireFusedScale'.
-  mapM_ wireFusedNode (rgNodes rg)
-  -- Pass 2c: mark elided nodes so dispatch skips them. Must run
-  -- after fused inputs are registered (the resolver redirects via
-  -- the fused override regardless of the elided bit, but a node
-  -- left elided without a fused override on every consumer would
-  -- still be skipped and produce silence).
-  mapM_ markElided (rgNodes rg)
-  -- Pass 2d (§7.D): push the generated-fusion program table. Same
-  -- contract as the unfused loader: empty for every graph produced
-  -- by 'compileRuntimeGraph' / 'fuseRuntimeGraph'; the equivalence
-  -- test loads programs into a hand-built 'RuntimeGraph'.
+  ensureBuses g rg
+  addNodesSingle g rg
+  wireNormalLenientSingle g rg
+  -- Pass 2b: register fused-input overrides.
+  wireFusedSingle g rg
+  -- Pass 2c: mark elided nodes so dispatch skips them.
+  markElidedSingle g rg
   loadFusionProgramsTo g 0 (rgFusionPrograms rg)
-  -- Pass 3: region overlay in scheduled order (same contract as
-  -- the unfused loader).
   mapM_ (addRegionTo g 0) scheduled
-  -- Pass 4 (§4.E.2.C0a): same metadata pass as the unfused loader.
   addScheduleStepsTo g 0 scheduled steps
-  where
-    addNode :: RuntimeNode -> IO ()
-    addNode node = do
-      c_rt_graph_add_node g
-        (cNodeIndex (rnIndex node))
-        (kindTag    (rnKind  node))
-      setMigrationKeyForNode g 0 node
-      forM_ (zip [0 ..] (rnControls node)) $ \(i, v) ->
-        c_rt_graph_set_control g
-          (cNodeIndex    (rnIndex node))
-          (cControlIndex (ControlIndex i))
-          (CDouble v)
-
-    ensureBusForNode :: RuntimeNode -> IO ()
-    ensureBusForNode node =
-      case busIndexOf node of
-        Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
-        Nothing  -> pure ()
-
-    wireNode :: RuntimeNode -> IO ()
-    wireNode node =
-      forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
-        case inp of
-          RFrom src srcPort ->
-            c_rt_graph_connect g
-              (cNodeIndex src)
-              (cPortIndex srcPort)
-              (cNodeIndex (rnIndex node))
-              (cPortIndex (PortIndex i))
-          RConst _ -> pure ()
-          RFused _ -> pure ()  -- handled in wireFusedNode
-
-    wireFusedNode :: RuntimeNode -> IO ()
-    wireFusedNode node =
-      forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
-        case inp of
-          RFused fused ->
-            wireFusedScale g 0
-              (cNodeIndex (rnIndex node))
-              (cPortIndex (PortIndex i))
-              fused
-          _ -> pure ()
-
-    markElided :: RuntimeNode -> IO ()
-    markElided node =
-      when (rnElided node) $
-        c_rt_graph_template_set_node_elided g 0
-          (cNodeIndex (rnIndex node))
 
 {- Note [loadTemplateGraph protocol]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2277,11 +2274,8 @@ loadTemplateGraph g tg =
 -- assuming any slot-id formula.
 loadTemplateGraphWithAutoSpawns :: Ptr RTGraph -> TemplateGraph -> IO [(Int, Int)]
 loadTemplateGraphWithAutoSpawns g tg = do
-  -- §4.E.2b / §4.E.2.C0a / §5.4.B: compute the scheduled region list,
-  -- layered schedule, and template identity token for every template
-  -- /before/ touching the C++ handle. If any template's metadata is
-  -- malformed we fail fast and leave the existing graph alone.
-  scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
+  scheduledByTpl <- traverse (prevalidateTemplate "loadTemplateGraph")
+    (tgTemplates tg)
   c_rt_graph_clear g
   -- The clear left an auto-created instance 0 for legacy callers.
   -- Multi-template loading spawns its own instances per template
@@ -2292,6 +2286,7 @@ loadTemplateGraphWithAutoSpawns g tg = do
     cTid <- if i == (0 :: Int)
               then pure 0           -- auto-created template 0
               else c_rt_graph_template_add g
+    let rg = tplGraph tpl
     -- Phase 5.4.B: ship the template name as the runtime's identity
     -- token so swap prepare can reject reorders that would migrate
     -- live state across semantically-different templates.
@@ -2301,93 +2296,18 @@ loadTemplateGraphWithAutoSpawns g tg = do
     -- runtime by spawning a second live instance of the same writer
     -- against the same frozen buffer id.
     clampWriterPolyphony g cTid tpl
-    populateTemplate cTid (tplGraph tpl) scheduled steps
+    ensureBuses g rg
+    addNodesTemplate g cTid rg
+    wireNormalTemplate "loadTemplateGraph" g cTid rg
+    loadFusionProgramsTo g cTid (rgFusionPrograms rg)
+    mapM_ (addRegionTo g cTid) scheduled
+    addScheduleStepsTo g cTid scheduled steps
     -- Spawn one instance per template so the typical single-voice
     -- ensemble case works without explicit instance spawning. For
     -- polyphony, callers spawn additional instances afterwards via
     -- c_rt_graph_template_instance_add.
     slot <- c_rt_graph_template_instance_add g cTid
     pure (fromIntegral cTid, fromIntegral slot)
-  where
-    scheduleOrFail
-      :: Template
-      -> IO (Template, Maybe String, [RuntimeRegion], [ScheduleStep])
-    scheduleOrFail tpl = do
-      let rg = tplGraph tpl
-      identityBytes <- templateIdentityBytesFromName
-        "loadTemplateGraph" (tplName tpl)
-      rs <- case scheduledRuntimeRegions rg of
-        Right rs  -> pure rs
-        Left err  -> fail $
-          "loadTemplateGraph: template "
-          <> show (tplName tpl) <> ": " <> err
-      ss <- case layeredRegionSchedule rg of
-        Right ss  -> pure ss
-        Left err  -> fail $
-          "loadTemplateGraph: template "
-          <> show (tplName tpl) <> ": " <> err
-      case validateGeneratedPrograms rg of
-        Right () -> pure ()
-        Left err -> fail $
-          "loadTemplateGraph: template "
-          <> show (tplName tpl) <> ": " <> err
-      pure (tpl, identityBytes, rs, ss)
-
-    populateTemplate
-      :: CInt -> RuntimeGraph
-      -> [RuntimeRegion] -> [ScheduleStep]
-      -> IO ()
-    populateTemplate cTid rg scheduled steps = do
-      -- Pass 0: ensure every referenced bus exists on the shared
-      -- pool before any control write. Construction-only; same
-      -- contract as in loadRuntimeGraph. See Note [Explicit
-      -- bus-pool sizing] in rt_graph.cpp.
-      forM_ (rgNodes rg) $ \node ->
-        case busIndexOf node of
-          Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
-          Nothing  -> pure ()
-      -- Pass 1: nodes + per-spec control defaults.
-      forM_ (rgNodes rg) $ \node -> do
-        c_rt_graph_template_add_node g cTid
-          (cNodeIndex (rnIndex node))
-          (kindTag    (rnKind  node))
-        setMigrationKeyForNode g cTid node
-        forM_ (zip [0 ..] (rnControls node)) $ \(ci, v) ->
-          c_rt_graph_template_set_default g cTid
-            (cNodeIndex    (rnIndex node))
-            (cControlIndex (ControlIndex ci))
-            (CDouble v)
-      -- Pass 2: wire connections (all nodes now exist).
-      forM_ (rgNodes rg) $ \node ->
-        forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
-          case inp of
-            RFrom src srcPort ->
-              c_rt_graph_template_connect g cTid
-                (cNodeIndex src)
-                (cPortIndex srcPort)
-                (cNodeIndex (rnIndex node))
-                (cPortIndex (PortIndex i))
-            RConst _ ->
-              pure ()
-            RFused _ ->
-              -- See the matching note in 'loadRuntimeGraph': fail
-              -- fast rather than miswire. Use 'loadTemplateGraphFused'
-              -- to ship fused inputs across the FFI.
-              fail "loadTemplateGraph: RFused input requires the \
-                   \fused loader; use loadTemplateGraphFused or \
-                   \pass an unfused TemplateGraph."
-      -- Pass 2.5 (§7.D): generated-fusion program table for this
-      -- template. Same contract as the single-template loader.
-      loadFusionProgramsTo g cTid (rgFusionPrograms rg)
-      -- Pass 3: register the region overlay in scheduled order
-      -- (today identical to rrIndex order; see the matching note
-      -- in 'loadRuntimeGraph'). See Note [Region fallback] in
-      -- rt_graph.cpp.
-      mapM_ (addRegionTo g cTid) scheduled
-      -- Pass 4 (§4.E.2.C0a): layered-schedule metadata. Default
-      -- execution ignores it; the C0c test executor consumes it
-      -- when explicitly enabled.
-      addScheduleStepsTo g cTid scheduled steps
 
 -- | Fused-aware multi-template loader. Sibling of 'loadTemplateGraph'
 -- that handles 'RFused' inputs and 'rnElided' nodes via the fused-*
@@ -2408,10 +2328,8 @@ loadTemplateGraphWithAutoSpawns g tg = do
 -- Note [loadRuntimeGraphFused protocol] for the rationale on order.
 loadTemplateGraphFused :: Ptr RTGraph -> TemplateGraph -> IO ()
 loadTemplateGraphFused g tg = do
-  -- §4.E.2b / §4.E.2.C0a / §5.4.B: pre-validate every
-  -- template's schedule and identity, then derive its layered view;
-  -- same fail-fast contract as 'loadTemplateGraph'.
-  scheduledByTpl <- traverse scheduleOrFail (tgTemplates tg)
+  scheduledByTpl <- traverse (prevalidateTemplate "loadTemplateGraphFused")
+    (tgTemplates tg)
   c_rt_graph_clear g
   c_rt_graph_instance_remove g 0
   forM_ (zip [0 ..] scheduledByTpl) $
@@ -2419,88 +2337,24 @@ loadTemplateGraphFused g tg = do
     cTid <- if i == (0 :: Int)
               then pure 0
               else c_rt_graph_template_add g
+    let rg = tplGraph tpl
     -- Phase 5.4.B: same identity wiring as the non-fused loader so
     -- fused and unfused multi-template paths reject reorders the
     -- same way.
     setTemplateIdentityBytes g cTid (tplName tpl) identityBytes
     -- §6.C.5: same writer-monophonic clamp as the non-fused loader.
     clampWriterPolyphony g cTid tpl
-    populateTemplate cTid (tplGraph tpl) scheduled steps
+    ensureBuses g rg
+    addNodesTemplate g cTid rg
+    wireNormalLenientTemplate g cTid rg
+    -- Pass 3b: register template-aware fused-input overrides.
+    wireFusedTemplate g cTid rg
+    -- Pass 3c: mark elided nodes before spawning instances.
+    markElidedTemplate g cTid rg
+    loadFusionProgramsTo g cTid (rgFusionPrograms rg)
+    mapM_ (addRegionTo g cTid) scheduled
+    addScheduleStepsTo g cTid scheduled steps
     M.void $ c_rt_graph_template_instance_add g cTid
-  where
-    scheduleOrFail
-      :: Template
-      -> IO (Template, Maybe String, [RuntimeRegion], [ScheduleStep])
-    scheduleOrFail tpl = do
-      let rg = tplGraph tpl
-      identityBytes <- templateIdentityBytesFromName
-        "loadTemplateGraphFused" (tplName tpl)
-      rs <- case scheduledRuntimeRegions rg of
-        Right rs  -> pure rs
-        Left err  -> fail $
-          "loadTemplateGraphFused: template "
-          <> show (tplName tpl) <> ": " <> err
-      ss <- case layeredRegionSchedule rg of
-        Right ss  -> pure ss
-        Left err  -> fail $
-          "loadTemplateGraphFused: template "
-          <> show (tplName tpl) <> ": " <> err
-      case validateGeneratedPrograms rg of
-        Right () -> pure ()
-        Left err -> fail $
-          "loadTemplateGraphFused: template "
-          <> show (tplName tpl) <> ": " <> err
-      pure (tpl, identityBytes, rs, ss)
-
-    populateTemplate
-      :: CInt -> RuntimeGraph
-      -> [RuntimeRegion] -> [ScheduleStep]
-      -> IO ()
-    populateTemplate cTid rg scheduled steps = do
-      forM_ (rgNodes rg) $ \node ->
-        case busIndexOf node of
-          Just bus -> c_rt_graph_ensure_bus g (fromIntegral bus)
-          Nothing  -> pure ()
-      forM_ (rgNodes rg) $ \node -> do
-        c_rt_graph_template_add_node g cTid
-          (cNodeIndex (rnIndex node))
-          (kindTag    (rnKind  node))
-        setMigrationKeyForNode g cTid node
-        forM_ (zip [0 ..] (rnControls node)) $ \(ci, v) ->
-          c_rt_graph_template_set_default g cTid
-            (cNodeIndex    (rnIndex node))
-            (cControlIndex (ControlIndex ci))
-            (CDouble v)
-      forM_ (rgNodes rg) $ \node ->
-        forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
-          case inp of
-            RFrom src srcPort ->
-              c_rt_graph_template_connect g cTid
-                (cNodeIndex src)
-                (cPortIndex srcPort)
-                (cNodeIndex (rnIndex node))
-                (cPortIndex (PortIndex i))
-            RConst _ -> pure ()
-            RFused _ -> pure ()  -- handled in the fused-input pass
-      forM_ (rgNodes rg) $ \node ->
-        forM_ (zip [0 ..] (rnInputs node)) $ \(i, inp) ->
-          case inp of
-            RFused fused ->
-              wireFusedScale g cTid
-                (cNodeIndex (rnIndex node))
-                (cPortIndex (PortIndex i))
-                fused
-            _ -> pure ()
-      forM_ (rgNodes rg) $ \node ->
-        when (rnElided node) $
-          c_rt_graph_template_set_node_elided g cTid
-            (cNodeIndex (rnIndex node))
-      -- Pass 2d (§7.D): generated-fusion program table for this
-      -- template. Same contract as the single-template loaders.
-      loadFusionProgramsTo g cTid (rgFusionPrograms rg)
-      mapM_ (addRegionTo g cTid) scheduled
-      -- Pass 4 (§4.E.2.C0a): layered-schedule metadata.
-      addScheduleStepsTo g cTid scheduled steps
 
 {- Note [Realtime audio lifecycle]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
