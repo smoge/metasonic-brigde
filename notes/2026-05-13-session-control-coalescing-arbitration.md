@@ -2,7 +2,9 @@
 
 Status: MIDI listener-local coalescing landed. The shared queue and
 fan-in service remain strict FIFO; OSC, UI, and Pattern coalescing are
-still design-only.
+still design-only. Cross-producer ownership and takeover policy is
+tracked separately in
+[Session Producer Coexistence And Arbitration](2026-05-14-session-producer-coexistence-arbitration.md).
 
 The session fan-in path now has real high-rate control producers:
 OSC symbolic control writes, MIDI CC, MIDI pitch-bend, UI control
@@ -212,4 +214,6 @@ FIFO or fence semantics.
 - Whether Pattern automation eventually needs an explicit
   authoring-level "continuous control" marker before it can opt in.
 - Whether a later owner-aware policy should arbitrate across producers
-  only after an explicit priority table exists.
+  only after the
+  [Session Producer Coexistence And Arbitration](2026-05-14-session-producer-coexistence-arbitration.md)
+  contract is implemented with explicit configuration and diagnostics.

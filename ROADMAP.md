@@ -2721,7 +2721,9 @@ What this slice doesn't try to settle:
   runner both write to the same slot today; arbitration
   is the session layer's problem. The later
   [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
-  note records the first bounded design constraints for that problem.
+  note records the producer-local coalescing boundary, and
+  [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md)
+  records the cross-producer policy boundary.
 
 See
 [notes/2026-05-12-phase-8f-named-controls.md](notes/2026-05-12-phase-8f-named-controls.md)
@@ -3088,6 +3090,12 @@ Session prep artifacts:
   every non-control-write command as a fence, and documents the first
   MIDI listener-local coalescer. OSC, UI, and Pattern coalescing remain
   gated on measurement.
+- [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md)
+  records the cross-producer ownership boundary for Pattern, OSC, MIDI,
+  and UI writes that target the same symbolic control. It keeps
+  arbitration before fan-in, preserves strict FIFO for accepted
+  commands, and leaves implementation gated on an explicit policy
+  surface with diagnostics.
 
 Landed prep contracts:
 
@@ -3280,12 +3288,16 @@ Still gated:
   coalescer, MVar flush-lock optimization for the landed MIDI coalescer
   without contention evidence, and drain scheduling beyond the scoped
   wake-on-enqueue fan-in service. The design constraints are recorded in
-  [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md).
+  [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
+  and
+  [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
-- [ ] MIDI, OSC, UI, and Pattern coexistence/arbitration policy.
+- [ ] MIDI, OSC, UI, and Pattern coexistence/arbitration
+  implementation. The policy boundary is recorded in
+  [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
