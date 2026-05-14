@@ -3291,9 +3291,11 @@ priority ownership only after an accepted enqueue.
 gateway for callers that explicitly choose its arbitrated enqueue path;
 the raw service enqueue path remains FIFO. Service-owned policy
 rejections report `SfsiiArbitrationRejected` separately from fan-in
-queue pressure and drain-stop issues. Existing live producer/listener
-paths are not routed through arbitration unless a caller explicitly
-chooses that wrapper/path.
+queue pressure and drain-stop issues. `MetaSonic.Session.OSCProducer`
+now exposes an explicit arbitrated service enqueue helper for symbolic
+control writes; its existing host-based enqueue path remains FIFO.
+Existing live listener paths are not routed through arbitration unless a
+caller explicitly chooses that wrapper/path.
 
 Still gated:
 
@@ -3314,9 +3316,10 @@ Still gated:
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
-- [ ] MIDI, OSC, UI, and Pattern live coexistence/arbitration wiring
-  beyond the landed opt-in gateway and service-owned arbitrated enqueue
-  path. The policy boundary is recorded in
+- [ ] MIDI, OSC listener, UI, and Pattern live coexistence/arbitration
+  wiring beyond the landed opt-in gateway, service-owned arbitrated
+  enqueue path, and explicit OSC producer helper. The policy boundary is
+  recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and

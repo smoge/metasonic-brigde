@@ -1,9 +1,10 @@
 # Session Producer Coexistence And Arbitration
 
-Status: pure policy, optional gateway, service-owned opt-in gateway, and
-service-level rejection observability landed. This note records the
-arbitration boundary after MIDI listener-local coalescing. It does not
-change `MetaSonic.Session.Queue` or `MetaSonic.Session.FanIn`; concrete
+Status: pure policy, optional gateway, service-owned opt-in gateway,
+service-level rejection observability, and the explicit OSC producer
+service path landed. This note records the arbitration boundary after
+MIDI listener-local coalescing. It does not change
+`MetaSonic.Session.Queue` or `MetaSonic.Session.FanIn`; concrete
 producer/listener paths keep FIFO behavior unless a caller explicitly
 routes them through `MetaSonic.Session.ArbitrationGateway` or the
 arbitrated `MetaSonic.Session.FanInService` enqueue path with a
@@ -47,6 +48,9 @@ different user intents even when they write the same logical target.
   FIFO. Policy rejections from that service-owned path are reported as
   `SfsiiArbitrationRejected`, separate from drain-stop and fan-in
   backpressure issues.
+- `Session.OSCProducer` has an explicit arbitrated service enqueue
+  helper for symbolic control writes. The existing host-based OSC
+  enqueue path remains the default FIFO behavior.
 - The landed MIDI coalescer is listener-local. It can merge repeated
   MIDI-origin `CmdControlWrite`s before enqueue, but it cannot merge,
   reorder, or drop another producer's commands.
@@ -198,6 +202,9 @@ above fan-in, using a small pure policy function or wrapper:
   owner state.
 - A service-owned gateway rejection reports `SfsiiArbitrationRejected`
   without waking the drain worker.
+- The explicit OSC service path defaults to FIFO behavior and reports
+  service-owned policy rejection when a non-`FifoOnly` gateway is
+  configured.
 
 ## Implementation Sequence
 
@@ -214,15 +221,19 @@ above fan-in, using a small pure policy function or wrapper:
 6. Report service-owned gateway policy rejections as service issues
    separate from queue-full and drain-stop issues. Done:
    `SfsiiArbitrationRejected`.
-7. Wire concrete MIDI, OSC, UI, or Pattern producer/listener paths only
-   when configuration can explicitly enable a non-FIFO policy.
-8. Add smoke diagnostics if a live policy is enabled by configuration.
+7. Wire one concrete producer path through the service-owned gateway
+   while keeping default behavior FIFO. Done:
+   `enqueueArbitratedOSCControlWrite`.
+8. Wire additional MIDI, OSC listener, UI, or Pattern producer/listener
+   paths only when configuration can explicitly enable a non-FIFO
+   policy.
+9. Add smoke diagnostics if a live policy is enabled by configuration.
 
 ## Open Questions
 
 - Which component owns policy configuration: session options, authoring
   manifest, or a higher UI/runtime supervisor?
-- Which concrete producer/listener path should first route through the
+- Which additional producer/listener path should next route through the
   service-owned gateway when a live non-FIFO policy is enabled?
 - Should a default non-FIFO policy ever exist, or should all arbitration
   be opt-in?

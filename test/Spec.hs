@@ -17489,6 +17489,159 @@ sessionOSCProducerTests =
         Right other ->
           assertFailure ("expected OSC enqueue attempt, got: " <> show other)
 
+  , testCase "arbitrated service path defaults to FIFO behavior" $ do
+      let graph = patternTemplates droneVibrato
+          opts = defaultOSCProducerOptions
+          producer = oscProducerId opts
+          msg = OSC.OscMessage (OBSC.pack "/v0/lpf/0")
+                                [OSC.OscArgFloat 1200.0]
+          expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              1200.0
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq <- enqueueArbitratedOSCControlWrite opts msg service
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (enq, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right
+          ( OSCProducerArbitratedEnqueueAttempted command gatewayResult
+          , Just drained
+          , snapshot
+          ) -> do
+            command @?= expected
+            queued <- gatewayQueuedOrFail gatewayResult
+            qscProducer queued @?= producer
+            qscCommand queued @?= expected
+            case map sdiResult (sdrItems (sfidrDrain drained)) of
+              [SessionOwnerStep (StepRejected (SiStaleVoice (VoiceKey "v0")))] ->
+                pure ()
+              other ->
+                assertFailure
+                  ("expected stale OSC control-write drain, got: "
+                   <> show other)
+            sfidrQueueDepth drained @?= 0
+            sfisQueueDepth snapshot @?= 0
+        Right (_enq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for arbitrated OSC service drain"
+        Right other ->
+          assertFailure
+            ("expected arbitrated OSC enqueue through service, got: "
+             <> show other)
+
+  , testCase "arbitrated service path reports policy rejection" $ do
+      let graph = patternTemplates droneVibrato
+          opts = defaultOSCProducerOptions
+          producer = oscProducerId opts
+          claimant = testProducer ProducerUI "ui"
+          target =
+            ControlArbitrationTarget
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+          msg = OSC.OscMessage (OBSC.pack "/v0/lpf/0")
+                                [OSC.OscArgFloat 1200.0]
+          expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              1200.0
+          serviceOpts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy =
+                      TargetClaim
+                        (claimControlTarget target claimant emptyTargetClaimTable)
+                  }
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = producer
+            , aiCommand   = expected
+            , aiTarget    = Just target
+            , aiReason    = ArrTargetClaimedBy claimant
+            , aiRetryable = False
+            }
+      drainedVar <- newEmptyMVar
+      issueVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            , sfshOnIssue = putMVar issueVar
+            }
+          graph
+          serviceOpts
+          $ \service -> do
+              rejected <- enqueueArbitratedOSCControlWrite opts msg service
+              mIssue <- timeout 1000000 (takeMVar issueVar)
+              mDrain <- timeout 100000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (rejected, mIssue, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right
+          ( OSCProducerArbitratedEnqueueAttempted command rejected
+          , Just reported
+          , Nothing
+          , snapshot
+          ) -> do
+            command @?= expected
+            rejected @?= SagArbitrationRejected expectedIssue
+            reported @?= SfsiiArbitrationRejected expectedIssue
+            sfisQueueDepth snapshot @?= 0
+        Right (_rejected, Nothing, _mDrain, _snapshot) ->
+          assertFailure "timed out waiting for OSC arbitration issue"
+        Right (_rejected, Just _reported, Just extraDrain, _snapshot) ->
+          assertFailure
+            ("OSC policy rejection unexpectedly woke service drain: "
+             <> show extraDrain)
+
+  , testCase "arbitrated service path decode rejection does not report issue" $ do
+      let graph = patternTemplates droneVibrato
+          msg = OSC.OscMessage (OBSC.pack "/swap/lpf/0")
+                                [OSC.OscArgFloat 1.0]
+      issueVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnIssue = putMVar issueVar
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              rejected <-
+                enqueueArbitratedOSCControlWrite
+                  defaultOSCProducerOptions
+                  msg
+                  service
+              mIssue <- timeout 100000 (takeMVar issueVar)
+              snapshot <- readSessionFanInService service
+              pure (rejected, mIssue, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (rejected, Nothing, snapshot) -> do
+          rejected @?=
+            OSCProducerArbitratedDecodeRejected
+              (OSC.DiReservedPathSegment (OBSC.pack "swap"))
+          sfisQueueDepth snapshot @?= 0
+        Right (_rejected, Just issue, _snapshot) ->
+          assertFailure
+            ("OSC decode rejection unexpectedly reported service issue: "
+             <> show issue)
+
   , testCase "reserved and invalid identifiers are rejected" $ do
       let cases =
             [ ( "reserved voice"

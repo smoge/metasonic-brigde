@@ -92,6 +92,10 @@ data SessionFanInService = SessionFanInService
 --
 -- Enqueues through this host wake the service worker because the
 -- service installs a host enqueue hook at construction.
+-- If this service was configured with an arbitration gateway, callers
+-- that need consistent policy enforcement should prefer
+-- 'enqueueArbitratedSessionFanInServiceCommand'. Using the returned
+-- host directly bypasses the configured gateway.
 sessionFanInServiceHost :: SessionFanInService -> SessionFanInHost
 sessionFanInServiceHost =
   sfsvcHost
