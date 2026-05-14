@@ -2,13 +2,14 @@
 
 Date: 2026-05-14
 
-Status: implementation record for the four cleanup commits made after
+Status: implementation record for the five cleanup commits made after
 the session/live-control note work:
 
 - `daa94e9` - `Split Haskell test suite`
 - `d95faa4` - `Deduplicate FFI graph loaders`
 - `ab8057b` - `Factor biquad DSP helpers`
 - `9ecf1a2` - `Extract fusion cost model vocabulary`
+- `4b76ffa` - `Factor phase oscillator processing`
 
 These were intentionally not feature slices. They were maintenance
 passes over areas that had grown too large, repeated too much protocol
@@ -17,17 +18,19 @@ The goal was lower local complexity without changing runtime semantics.
 
 ## Summary
 
-The cleanup reduced four different kinds of drag:
+The cleanup reduced five different kinds of drag:
 
 - test-suite navigation: `test/Spec.hs` was split into focused modules;
 - FFI loader duplication: repeated graph-load passes were extracted into
   small protocol-preserving helpers;
 - C++ DSP repetition: LPF/HPF/BPF/Notch now share the same biquad state,
   migration, and processing skeleton;
+- C++ oscillator repetition: Sin/Saw/Tri now share the same phase-drive
+  skeleton while keeping waveshape-specific notes and dispatch wrappers;
 - Phase 7 app tooling coupling: cost-model vocabulary moved out of the
   benchmark runner into a small shared module.
 
-The most important constraint across all four passes was preserving the
+The most important constraint across all five passes was preserving the
 audit trail. Several review follow-ups restored or kept comments that
 explain why the code is strict, what C ABI path a helper uses, and which
 Phase 7 executor a diagnostic variant represents.
@@ -190,7 +193,83 @@ Mechanical result:
 - The hot-swap migration path now has one helper for the whole filter
   family.
 
-## 4. Fusion Cost-Model Vocabulary Extraction
+## 4. C++ Phase Oscillator Helper Factoring
+
+Commit: `4b76ffa` (`Factor phase oscillator processing`)
+
+After the biquad pass, the other obvious C++ template family was the
+plain phase oscillators:
+
+- `process_sinosc`;
+- `process_sawosc`;
+- `process_triosc`.
+
+Each one had the same processing skeleton:
+
+- resolve the output span;
+- resolve optional audio-rate frequency input from port 0;
+- fetch `OscState`;
+- if the frequency input is connected, sanitize and apply frequency per
+  sample;
+- otherwise, sanitize the block-latched `controls[0]` frequency once;
+- advance the persistent `q::phase_iterator` and write one waveshape
+  sample per frame.
+
+The pass made that skeleton explicit in one shared driver:
+
+```cpp
+template <class WaveFn, class Body>
+static inline void drive_oscillator(...);
+```
+
+The public node processors now call:
+
+```cpp
+template <class Spec>
+static void process_phase_oscillator(...);
+```
+
+with small specs for the only things that differ:
+
+- `SinOscSpec` calls `q::sin`;
+- `SawOscSpec` calls `q::saw`;
+- `TriOscSpec` calls `q::triangle`;
+- each spec preserves its old kind-specific assertion text.
+
+The existing hand-written fused region kernels already had an
+oscillator driver for their sink/body callback shape. This pass moved
+that helper up next to the plain oscillator processing and made both
+fused and unfused paths share the same frequency sanitation and phase
+increment policy.
+
+Review follow-ups tightened the result:
+
+- the per-kernel notes were trimmed so `Note [Phase oscillator driver]`
+  owns the shared phase/state/frequency/phase-port contract;
+- the `SinOsc`, `SawOsc`, and `TriOsc` notes now keep only the
+  waveshape-specific rationale;
+- `process_phase_oscillator` passes `Spec::sample` directly to the
+  driver instead of wrapping it in a lambda.
+
+The pass deliberately kept the tiny `process_sinosc` /
+`process_sawosc` / `process_triosc` trampolines. They are called from
+only one switch arm each, but the named functions are useful note
+anchors, grep targets for fused-kernel comments that mirror the plain
+processors, and consistent with every other kernel in the file.
+
+It also deliberately left `PulseOsc` out. Pulse shares the frequency
+drive shape, but its width modulation, `PulseOscState`, and
+`q::pulse_osc` state make it different enough that folding it into the
+plain phase-oscillator helper would obscure more than it removed.
+
+Mechanical result:
+
+- `tinysynth/rt_graph.cpp` dropped 15 net lines in this pass.
+- The plain phase oscillator loops now have one implementation.
+- The fused region kernels stayed shape-specific while sharing the
+  oscillator drive helper.
+
+## 5. Fusion Cost-Model Vocabulary Extraction
 
 Commit: `9ecf1a2` (`Extract fusion cost model vocabulary`)
 
@@ -260,9 +339,12 @@ Verification was run during the passes rather than deferred to the end:
 - After the FusionCostModel extraction:
   - `just stack-test` passed (`928/928`);
   - `stack exec -- metasonic-bridge --snapshot-check` passed (`61/61`).
+- After the C++ phase oscillator factoring:
+  - `just cpp-test-offline` passed (`312/312`);
+  - `just stack-test` passed (`928/928`).
 
-For the documentation pass that produced this note, only
-`git diff --check` is needed.
+For documentation-only updates to this note, only `git diff --check` is
+needed.
 
 ## What Stayed Out Of Scope
 
@@ -273,8 +355,10 @@ commits:
   remove roughly 1.6kLOC of MIDI producer/listener scaffolding from the
   core session spec file, but it was not needed for the first test-suite
   split.
-- Fused C++ region kernels remain explicit. Their contracts are too
-  shape-specific for the plain biquad helper pass.
+- Fused C++ region kernels remain explicit except for the shared phase
+  oscillator driver. Their contracts are too shape-specific for the
+  plain biquad or phase-oscillator helper passes to become a full fused
+  kernel framework.
 - `FusionCostLab` still owns row collection and cost-lab indexes. Moving
   those into the vocabulary module would have made the new module less
   clean, not more.
@@ -283,13 +367,14 @@ commits:
 
 ## Net Effect
 
-The four passes did not change the compiler/runtime architecture. They
+The five passes did not change the compiler/runtime architecture. They
 made existing boundaries easier to read:
 
 - specs are organized by test domain;
 - FFI graph loading is expressed as named protocol passes;
 - q biquad-family DSP state and processing share one implementation
   skeleton;
+- Sin/Saw/Tri phase oscillators share one frequency-drive skeleton;
 - Phase 7 cost-model vocabulary no longer lives inside the benchmark
   runner.
 
