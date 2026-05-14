@@ -9,7 +9,7 @@
 -- reconstruct graphs from JSON, allocate an RTGraph, step a session owner,
 -- or choose a live hot-swap protocol.
 --
--- See [notes/2026-05-14-manifest-session-reload-policy.md].
+-- See [notes/2026-05-14-f-manifest-session-reload-policy.md].
 
 module MetaSonic.Session.ManifestReload
   ( -- * Catalog

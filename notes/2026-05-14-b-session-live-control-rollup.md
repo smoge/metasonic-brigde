@@ -111,7 +111,7 @@ contention evidence exists.
 
 The detailed coexistence contract lives in:
 
-- [Session Producer Coexistence And Arbitration](2026-05-14-session-producer-coexistence-arbitration.md)
+- [Session Producer Coexistence And Arbitration](2026-05-14-a-session-producer-coexistence-arbitration.md)
 
 ## Concrete Arbitrated Paths
 

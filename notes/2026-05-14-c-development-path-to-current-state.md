@@ -31,10 +31,10 @@ Primary source material for this note:
   - current generated-fusion decision.
 - [Phase 8.H authoring manifest](2026-05-12-phase-8h-authoring-manifest.md)
   - current authoring export boundary.
-- [Session live-control rollup](2026-05-14-session-live-control-rollup.md),
+- [Session live-control rollup](2026-05-14-b-session-live-control-rollup.md),
   [coalescing note](2026-05-13-session-control-coalescing-arbitration.md),
   and
-  [producer arbitration note](2026-05-14-session-producer-coexistence-arbitration.md)
+  [producer arbitration note](2026-05-14-a-session-producer-coexistence-arbitration.md)
   - current session/live-control state.
 
 ## Core Thesis

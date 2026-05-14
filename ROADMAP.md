@@ -2722,7 +2722,7 @@ What this slice doesn't try to settle:
   is the session layer's problem. The later
   [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
   note records the producer-local coalescing boundary, and
-  [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md)
+  [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md)
   records the cross-producer policy boundary.
 
 See
@@ -3090,7 +3090,7 @@ Session prep artifacts:
   every non-control-write command as a fence, and documents the first
   MIDI listener-local coalescer. OSC, UI, and Pattern coalescing remain
   gated on measurement.
-- [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md)
+- [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md)
   records the cross-producer ownership boundary for Pattern, OSC, MIDI,
   and UI writes that target the same symbolic control. It keeps
   arbitration before fan-in, preserves strict FIFO for accepted
@@ -3323,7 +3323,7 @@ Still gated:
   design constraints are recorded in
   [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
   and
-  [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
+  [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md).
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
@@ -3332,7 +3332,7 @@ Still gated:
   the landed opt-in gateway, service-owned arbitrated enqueue path,
   explicit OSC producer helper, opt-in OSC listener path, and explicit
   UI and Pattern producer helpers. The policy boundary is recorded in
-  [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
+  [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md).
 - [ ] Arbitration policy mutation API and voice-lifecycle ownership
   clearing. These remain use-case gated; do not implement them ahead of
   a concrete live policy owner, release signal, or hot-swap/voice-key

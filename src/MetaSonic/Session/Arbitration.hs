@@ -23,7 +23,7 @@
 -- policies must add explicit issue reporting instead of silently
 -- dropping or collapsing commands.
 --
--- See [notes/2026-05-14-session-producer-coexistence-arbitration.md].
+-- See [notes/2026-05-14-a-session-producer-coexistence-arbitration.md].
 
 module MetaSonic.Session.Arbitration
   ( -- * Targets
