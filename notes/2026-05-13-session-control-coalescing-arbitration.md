@@ -165,6 +165,25 @@ not a real-hardware throughput claim or a substitute for the
 implementation-gating measurement. A later coalescer must keep this
 probe passing or replace it with a documented contract change.
 
+That saturation probe does show queue pressure under its no-drain burst
+setup, so those counts are the current target for a producer-local
+coalescing experiment if realistic-rate measurement also justifies the
+complexity:
+
+- Input burst: nine pitch-bend events across 16 active voices.
+- Current strict-FIFO output: 144 generated writes, 128 queued writes,
+  16 queue-full rejections.
+- Expected producer-local coalescing target for the same burst, with a
+  cross-event flush window: 16 flushed writes, one latest value per
+  `(VoiceKey, ControlTag)`, and `coalesced_count == 128`.
+
+If the later realistic-rate measurement does not produce queue
+pressure, defer implementation and leave this note as the policy record
+plus saturation regression. If it does produce queue pressure, use the
+measured stream and the saturation target above to choose the smallest
+flush cadence that reduces queue submissions without weakening fan-in
+FIFO or fence semantics.
+
 ## Open Questions
 
 - Exact flush cadence: decoded-event boundary, timed tick, fence only,
