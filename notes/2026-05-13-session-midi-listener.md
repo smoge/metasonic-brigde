@@ -56,6 +56,9 @@ binds Q / PortMIDI input behind the same session-facing loop.
   covers the small Q / PortMIDI source wrapper.
 - Aftertouch, MIDI clock, or channel remapping/splits.
 - Release-phase CC fanout or coalescing outside the MIDI listener.
+- Two-phase flush locking for the listener-local coalescer. The
+  current single-`MVar` flush path stays in place until smoke output or
+  a dedicated benchmark shows lock contention or pending buildup.
 - Arbitration beyond FIFO producer order.
 - Long-running supervision beyond the scoped listener and fan-in
   service brackets.

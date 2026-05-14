@@ -3277,8 +3277,9 @@ Still gated:
   beyond the landed symbolic control-write path.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
   throttling/coalescing beyond the landed MIDI listener-local control
-  coalescer, and drain scheduling beyond the scoped wake-on-enqueue
-  fan-in service. The design constraints are recorded in
+  coalescer, MVar flush-lock optimization for the landed MIDI coalescer
+  without contention evidence, and drain scheduling beyond the scoped
+  wake-on-enqueue fan-in service. The design constraints are recorded in
   [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md).
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.

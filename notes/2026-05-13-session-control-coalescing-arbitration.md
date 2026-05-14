@@ -110,6 +110,14 @@ Deterministic tests can disable the timed flush and force the whole
 burst to drain at a later fence. Other producers should choose their
 cadence from measurement without changing the shared FIFO contract.
 
+The MIDI listener currently holds its listener-state `MVar` while a
+pending-control flush submits each command to fan-in. That keeps the
+implementation simple and correct, and the smoke-facing diagnostics now
+make pressure visible through queue depth, pending count, accepted flush
+count, and dropped-fence count. Do not split flush into a two-phase
+snapshot/enqueue/update path unless manual smoke or a dedicated
+contention benchmark shows this critical section matters.
+
 ## Observability
 
 Coalescing must not hide backpressure. Keep producer-local and queue
@@ -197,6 +205,8 @@ FIFO or fence semantics.
 
 - Whether non-MIDI producers should use the MIDI listener's hybrid
   fence/EOF/teardown/timed cadence or a source-specific cadence.
+- Whether the MIDI listener's flush path needs a two-phase MVar
+  optimization after real contention evidence exists.
 - Whether UI sliders should opt into the same producer-local policy as
   MIDI CC/pitch-bend.
 - Whether Pattern automation eventually needs an explicit
