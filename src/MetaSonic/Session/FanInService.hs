@@ -115,6 +115,11 @@ defaultSessionFanInServiceOptions = SessionFanInServiceOptions
   }
 
 -- | Service lifecycle hooks.
+--
+-- 'sfshOnIssue' may run concurrently from the drain worker
+-- ('SfsiiDrainStopped') and from callers of the arbitrated enqueue path
+-- ('SfsiiArbitrationRejected'), so hook implementations that share
+-- mutable state must synchronize their own updates.
 data SessionFanInServiceHooks = SessionFanInServiceHooks
   { sfshOnDrain :: !(SessionFanInDrainResult -> IO ())
   , sfshOnIssue :: !(SessionFanInServiceIssue -> IO ())
