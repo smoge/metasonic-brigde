@@ -22,6 +22,7 @@ import           MetaSonic.Session.Owner
 import           MetaSonic.Session.Queue         (ProducerKind (..))
 import           MetaSonic.Session.RTGraphAdapter
 import           MetaSonic.Session.State
+import           MetaSonic.Session.Step          (SessionStepResult (..))
 
 
 sessionManifestReloadTests :: TestTree
@@ -304,6 +305,31 @@ sessionManifestReloadTests =
               status <- sessionOwnerStatus owner
               pure (ssGraph state, status)
       result @?= Right (validTemplateGraph, SessionOwnerReady)
+
+  , testCase "manifest-built owner commits a real voice start" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      result <-
+        constructManifestSessionFromPlan
+          plan
+          defaultSessionOwnerOptions
+          $ \owner -> do
+              let cmd = CmdVoiceOn (TemplateName "voice") (VoiceKey "v0") []
+              stepped <- stepSessionOwner owner cmd
+              state <- sessionOwnerState owner
+              status <- sessionOwnerStatus owner
+              pure (stepped, state, status)
+      case result of
+        Left issue ->
+          assertFailure ("expected manifest-built owner, got: " <> show issue)
+        Right (SessionOwnerStep (StepCommitted _ Nothing), state, status) -> do
+          assertBool
+            "expected manifest-built owner state to contain started voice"
+            (M.member (VoiceKey "v0") (ssVoices state))
+          status @?= SessionOwnerReady
+        Right other ->
+          assertFailure
+            ("expected manifest-built owner voice-start commit, got: "
+             <> show other)
   ]
 
 validRequest :: ManifestReloadRequest
