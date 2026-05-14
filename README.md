@@ -286,7 +286,9 @@ The landed pieces are deliberately small:
   The CLI also exposes `--session-midi-smoke [SECONDS]` as a repeatable
   manual probe for the PortMIDI source, decoded listener, producer, fan-in
   service, and drain path. When `--midi-device` is omitted, the smoke command
-  auto-selects the first input-capable Q / PortMIDI device.
+  auto-selects the first input-capable Q / PortMIDI device, reports
+  listener-local coalescing counters, and separates dropped-fence reports from
+  generic listener issues.
 - `MetaSonic.Session.UIProducer` translates already-decoded UI intents into
   session commands with `ProducerUI` identity, rejecting non-finite UI control
   values before they enter the fan-in queue.

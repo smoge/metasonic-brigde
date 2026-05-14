@@ -2889,10 +2889,11 @@ adds the first Q / PortMIDI-backed decoded source, but still does not
 define broader MIDI policy or long-running supervision. A follow-up
 CLI slice adds `--session-midi-smoke [SECONDS]` as a repeatable
 manual probe for that session MIDI ingress path, auto-selecting the
-first input-capable device when `--midi-device` is omitted, without
-starting audio or replacing the older `midi-poly` live-runtime demo. A later
-`MetaSonic.Session.UIProducer` slice adds a Haskell-only adapter for
-already-decoded UI intents.
+first input-capable device when `--midi-device` is omitted and
+reporting listener coalescing / dropped-fence diagnostics, without
+starting audio or replacing the older `midi-poly` live-runtime demo. A
+later `MetaSonic.Session.UIProducer` slice adds a Haskell-only adapter
+for already-decoded UI intents.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -3251,11 +3252,13 @@ state observable. `MetaSonic.Session.MIDIPortMIDI` adds the first Q /
 PortMIDI-backed source behind that boundary. `--session-midi-smoke
 [SECONDS]` now offers a manual live-device probe over the source,
 listener, producer, fan-in service, and drain path, with first-input
-auto-selection when `--midi-device` is omitted. The PortMIDI source maps
-MIDI CC 123 into channel-scoped all-notes-off, leaves CC 64 available
-for producer-local sustain, and decodes pitch-bend into the same
-producer path. This path still does not define channel
-remapping/splits, MIDI clock behavior, or arbitration beyond FIFO.
+auto-selection when `--midi-device` is omitted, plus listener
+coalescing and dropped-fence counters in the exit summary. The
+PortMIDI source maps MIDI CC 123 into channel-scoped all-notes-off,
+leaves CC 64 available for producer-local sustain, and decodes
+pitch-bend into the same producer path. This path still does not define
+channel remapping/splits, MIDI clock behavior, or arbitration beyond
+FIFO.
 
 Recent UI ingress follow-up: `MetaSonic.Session.UIProducer` translates
 already-decoded UI intents into `CmdVoiceOn`, `CmdVoiceOff`,

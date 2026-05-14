@@ -24,8 +24,10 @@ Haskell session listener own the worker thread. It does not touch
 - The CLI exposes `--session-midi-smoke [SECONDS]`, a non-audio manual
   probe that wires this source through `MetaSonic.Session.MIDIListener`,
   `MetaSonic.Session.MIDIProducer`, and `MetaSonic.Session.FanInService`,
-  then prints producer/drain activity. With no explicit `--midi-device`,
-  it auto-selects the first input-capable Q / PortMIDI device.
+  then prints producer/drain activity, listener-local coalescing
+  counters, generic listener issue count, and dropped-fence count. With
+  no explicit `--midi-device`, it auto-selects the first input-capable
+  Q / PortMIDI device.
 - Missing, output-only, invalid, or failed-open device ids produce a
   valid idle source whose `portMIDISourceHasDevice` result is `False`.
   This keeps no-controller and headless hosts closeable.
@@ -61,4 +63,7 @@ stack exec -- metasonic-bridge --midi-device <input-id> --session-midi-smoke 10
 
 The smoke command exits non-zero if it cannot open an input-capable
 device or if no supported note/CC/sustain/pitch-bend/all-notes-off events
-produce drained session commands during the selected time window.
+produce drained session commands during the selected time window. The
+exit summary includes coalesced writes, fan-in accepted flushes,
+barrier-triggered flushes, pending coalesced writes after listener
+teardown, and any dropped-fence reports caused by flush rejection.

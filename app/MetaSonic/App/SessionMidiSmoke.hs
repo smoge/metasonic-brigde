@@ -99,6 +99,7 @@ runSessionMidiSmoke midiDevice seconds = do
 
       producerEvents <- newIORef (0 :: Int)
       listenerIssues <- newIORef (0 :: Int)
+      droppedFences  <- newIORef (0 :: Int)
       drainedItems   <- newIORef (0 :: Int)
 
       let serviceHooks =
@@ -121,8 +122,15 @@ runSessionMidiSmoke midiDevice seconds = do
                   modifyIORef' producerEvents (+ 1)
                   putStrLn ("  producer: " <> summarizeProducerResult result)
               , MIDIS.smlhOnIssue = \issue -> do
-                  modifyIORef' listenerIssues (+ 1)
-                  hPutStrLn stderr ("  listener issue: " <> show issue)
+                  case issue of
+                    MIDIS.SmliFenceDroppedForFlushFailure event rejected -> do
+                      modifyIORef' droppedFences (+ 1)
+                      hPutStrLn stderr $
+                        "  listener dropped fence: event=" <> show event
+                        <> " flush_rejections=" <> show rejected
+                    _ -> do
+                      modifyIORef' listenerIssues (+ 1)
+                      hPutStrLn stderr ("  listener issue: " <> show issue)
               }
 
       result <-
@@ -130,8 +138,9 @@ runSessionMidiSmoke midiDevice seconds = do
           serviceHooks
           graph
           defaultSessionFanInServiceOptions
-          $ \service ->
-              MIDIS.withSessionMIDIListenerHooks
+          $ \service -> do
+              (observed, issues, dropped, listener) <-
+                MIDIS.withSessionMIDIListenerHooks
                 listenerHooks
                 sessionMidiSmokeProducerOptions
                 initialMIDIProducerState
@@ -142,31 +151,59 @@ runSessionMidiSmoke midiDevice seconds = do
                       "  Send note-on, note-off, CC 7, sustain, "
                       <> "and pitch-bend now."
                     threadDelay (seconds * 1000000)
-                    -- Let the wake-on-enqueue drain worker report a
-                    -- final event that landed at the end of the
-                    -- smoke window.
+                    -- Let the wake-on-enqueue drain worker report an
+                    -- event that landed at the end of the smoke
+                    -- window before listener teardown flushes any
+                    -- remaining coalesced controls.
                     threadDelay 50000
-                    listenerState <- MIDIS.readSessionMIDIListenerState listener
-                    snapshot <- readSessionFanInService service
                     observed <- readIORef producerEvents
                     issues <- readIORef listenerIssues
-                    drained <- readIORef drainedItems
-                    pure (observed, issues, drained, listenerState, snapshot)
+                    dropped <- readIORef droppedFences
+                    pure (observed, issues, dropped, listener)
+              -- Listener teardown may flush pending coalesced controls;
+              -- give the service worker a short window to drain them
+              -- before reporting final smoke counters.
+              threadDelay 50000
+              listenerState <- MIDIS.readSessionMIDIListenerState listener
+              coalescingStats <-
+                MIDIS.readSessionMIDIListenerCoalescingStats listener
+              snapshot <- readSessionFanInService service
+              drained <- readIORef drainedItems
+              pure
+                ( observed
+                , issues
+                , dropped
+                , drained
+                , listenerState
+                , coalescingStats
+                , snapshot
+                )
 
       case result of
         Left issue ->
           dieAfterFlush $
             "Session fan-in service setup failed: " <> show issue
-        Right (observed, issues, drained, listenerState, snapshot) -> do
+        Right (observed, issues, dropped, drained, listenerState,
+               coalescingStats, snapshot) -> do
           putStrLn ""
           putStrLn $
             "  observed_events=" <> show observed
             <> " listener_issues=" <> show issues
+            <> " dropped_fences=" <> show dropped
             <> " drained_items=" <> show drained
           putStrLn $
             "  active_midi_notes="
             <> show (M.size (mpsActiveNotes listenerState))
             <> " queue_depth=" <> show (sfisQueueDepth snapshot)
+          putStrLn $
+            "  listener_coalescing: coalesced="
+            <> show (MIDIS.smlcsCoalescedCount coalescingStats)
+            <> " flushed_accepted="
+            <> show (MIDIS.smlcsFlushedCount coalescingStats)
+            <> " barrier_flushes="
+            <> show (MIDIS.smlcsBarrierFlushCount coalescingStats)
+            <> " pending="
+            <> show (MIDIS.smlcsPendingCount coalescingStats)
           when (observed == 0) $
             dieAfterFlush $
               "No supported MIDI note/CC/sustain/pitch-bend/all-notes-off events "
