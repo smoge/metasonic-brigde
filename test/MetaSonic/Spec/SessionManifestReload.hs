@@ -6,12 +6,18 @@ import qualified Data.Map.Strict                 as M
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
+import           MetaSonic.Spec.SessionShared    (testProducer)
 import           MetaSonic.Authoring.Manifest
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
-import           MetaSonic.Pattern               (SwapLabel (..),
+import           MetaSonic.Pattern               (ControlTag (..),
+                                                  SwapLabel (..),
+                                                  VoiceKey (..),
                                                   TemplateName (..))
+import           MetaSonic.Session.Arbitration
 import           MetaSonic.Session.ManifestReload
+import           MetaSonic.Session.Command
+import           MetaSonic.Session.Queue         (ProducerKind (..))
 import           MetaSonic.Session.RTGraphAdapter
 
 
@@ -217,9 +223,53 @@ sessionManifestReloadTests =
               (MriInvalidResourcePolicy
                 (MrpiTemplateOverrideNonPositive (TemplateName "fx") 0))
 
-  , testCase "control metadata survives into the plan" $ do
+  , testCase "control surface projects typed target metadata" $ do
       plan <- planOrFail validDoc validCatalog validRequest
-      mrlpControlSurface plan @?= mfControls validManifest
+      mrlpControlSurface plan @?=
+        [ ManifestControlSurface
+            { mcsDisplayName = "cutoff"
+            , mcsControlTag  = ControlTag (MigrationKey "cutoff") 1
+            , mcsDefault     = 1200.0
+            , mcsRangeMin    = 200.0
+            , mcsRangeMax    = 8000.0
+            , mcsSmoothingHz = 20.0
+            , mcsCC          = Just 74
+            }
+        , ManifestControlSurface
+            { mcsDisplayName = "resonance"
+            , mcsControlTag  = ControlTag (MigrationKey "resonance") 2
+            , mcsDefault     = 0.8
+            , mcsRangeMin    = 0.1
+            , mcsRangeMax    = 4.0
+            , mcsSmoothingHz = 15.0
+            , mcsCC          = Nothing
+            }
+        ]
+
+  , testCase "reload plan defaults to FIFO arbitration without ownership claims" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      case mrlpControlSurface plan of
+        surface : _ -> do
+          let target = mcsControlTag surface
+              command = CmdControlWrite (VoiceKey "v0") target 1800.0
+              oscProducer = testProducer ProducerOSC "osc"
+              midiProducer = testProducer ProducerMIDI "midi"
+              afterOscWrite =
+                recordAcceptedSessionCommand
+                  (mrlpArbitrationPolicy plan)
+                  oscProducer
+                  command
+          mrlpArbitrationPolicy plan @?= FifoOnly
+          arbitrateSessionCommand
+            (mrlpArbitrationPolicy plan)
+            oscProducer
+            command
+            @?= ArbitrationAllowed
+          afterOscWrite @?= FifoOnly
+          arbitrateSessionCommand afterOscWrite midiProducer command
+            @?= ArbitrationAllowed
+        [] ->
+          assertFailure "expected at least one projected control"
   ]
 
 validRequest :: ManifestReloadRequest
@@ -268,6 +318,16 @@ validManifest = AuthoringManifest
           , mcCC          = Just 74
           , mcKey         = "cutoff"
           , mcSlot        = 1
+          }
+      , ManifestControl
+          { mcName        = "resonance"
+          , mcDefault     = 0.8
+          , mcRangeMin    = 0.1
+          , mcRangeMax    = 4.0
+          , mcSmoothingHz = 15.0
+          , mcCC          = Nothing
+          , mcKey         = "resonance"
+          , mcSlot        = 2
           }
       ]
   }

@@ -101,17 +101,19 @@ data ManifestResourcePolicy = ManifestResourcePolicy
   }
 
 data ManifestReloadPlan = ManifestReloadPlan
-  { mrlpDemoKey          :: !String
-  , mrlpSwapLabel        :: !SwapLabel
-  , mrlpTemplateGraph    :: !TemplateGraph
-  , mrlpAdapterOptions   :: !RTGraphAdapterOptions
-  , mrlpControlSurface   :: ![ManifestControl]
+  { mrlpDemoKey           :: !String
+  , mrlpSwapLabel         :: !SwapLabel
+  , mrlpTemplateGraph     :: !TemplateGraph
+  , mrlpAdapterOptions    :: !RTGraphAdapterOptions
+  , mrlpControlSurface    :: ![ManifestControlSurface]
+  , mrlpArbitrationPolicy :: !ArbitrationPolicy
   }
 ```
 
-`mrlpControlSurface` is shown as `[ManifestControl]` because that is the minimal
-first implementation; see [Control Surface](#control-surface) for the optional
-projection if raw manifest controls become awkward for downstream callers.
+`mrlpControlSurface` is the typed projection described in
+[Control Surface](#control-surface). `mrlpArbitrationPolicy` defaults to
+`FifoOnly`: a manifest can expose controls to a UI, OSC, MIDI, or later
+policy layer without claiming ownership of those controls.
 
 Names can change during implementation, but the separation should not:
 
@@ -171,6 +173,10 @@ The first pure tests should pin these rules:
   reconstruction or graph rewriting.
 - Manifest controls preserve their metadata into the plan's control surface:
   name, default, range, smoothing, CC binding, migration key, and slot.
+- The first planner projects manifest `mcKey` and `mcSlot` directly into the
+  existing `ControlTag` shape. It does not yet validate `mcSlot >= 0`; if that
+  becomes necessary, add a targeted `MriInvalidControlSlot` issue before
+  runtime integration.
 
 The first implementation can compare `AuthoringManifest` values exactly for the
 requested demo. If diagnostics become too coarse, add field-specific issue
@@ -238,29 +244,37 @@ questions. The manifest reload planner is a static planning pass.
 The plan should carry the manifest controls forward without assigning producer
 ownership yet.
 
-Useful first projection:
+The first projection is intentionally close to the manifest row, but converts
+the raw migration-key string and slot into the existing typed `ControlTag`:
 
 ```haskell
 data ManifestControlSurface = ManifestControlSurface
-  { mcsName        :: !String
+  { mcsDisplayName :: !String
+  , mcsControlTag  :: !ControlTag
   , mcsDefault     :: !Double
   , mcsRangeMin    :: !Double
   , mcsRangeMax    :: !Double
   , mcsSmoothingHz :: !Double
   , mcsCC          :: !(Maybe Word8)
-  , mcsKey         :: !String
-  , mcsSlot        :: !Int
   }
 ```
 
-This may simply be `[ManifestControl]` at first. The important boundary is that
-control metadata is visible to a later UI, OSC, MIDI, or arbitration policy
-without mutating the queue or owner defaults.
+`mcsControlTag` carries the `MigrationKey` plus control slot needed by
+session commands. The important boundary is that control metadata is visible to
+a later UI, OSC, MIDI, or arbitration policy without mutating the queue or owner
+defaults.
+
+Because the projection emits `ControlTag`, this planner is the update point if
+`ControlTag` later grows a more structured target identity. That coupling is
+intentional for now: downstream session code can consume the plan without
+rebuilding tags from raw strings and slots.
 
 Do not implement `ManifestOwnership` in the first pass. The current producer
 arbitration design keeps FIFO as the default and requires an explicit policy
 owner before rejecting another producer's writes. A manifest can later become
 that policy source, but the reload planner should not silently claim targets.
+For now the plan carries `FifoOnly`; accepted writes under that policy do not
+record owner claims.
 
 ## Runtime Integration Later
 

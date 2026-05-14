@@ -19,6 +19,7 @@ module MetaSonic.Session.ManifestReload
   , ManifestReloadRequest (..)
   , ManifestResourcePolicy (..)
   , defaultManifestResourcePolicy
+  , ManifestControlSurface (..)
 
     -- * Plan
   , ManifestReloadPlan (..)
@@ -35,16 +36,20 @@ import qualified Data.Map.Strict                as M
 import qualified Data.Set                       as S
 import           Data.Bifunctor                 (first)
 import           Data.Foldable                  (traverse_)
+import           Data.Word                      (Word8)
 import           GHC.Generics                   (Generic)
 
 import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
                                                  AuthoringManifestDoc (..),
-                                                 ManifestControl,
+                                                 ManifestControl (..),
                                                  ManifestTemplate (..),
                                                  manifestSchemaVersion)
+import           MetaSonic.Bridge.Source        (MigrationKey (..))
 import           MetaSonic.Bridge.Templates     (Template (..),
                                                  TemplateGraph (..))
-import           MetaSonic.Pattern              (SwapLabel, TemplateName (..))
+import           MetaSonic.Pattern              (ControlTag (..), SwapLabel,
+                                                 TemplateName (..))
+import           MetaSonic.Session.Arbitration  (ArbitrationPolicy (..))
 import           MetaSonic.Session.RTGraphAdapter
                                                 (RTGraphAdapterOptions (..),
                                                  defaultRTGraphAdapterOptions)
@@ -89,14 +94,32 @@ defaultManifestResourcePolicy = ManifestResourcePolicy
   , mrpTemplateOverrides = M.empty
   }
 
+-- | Session-facing projection of one authoring manifest control.
+--
+-- The projection keeps control metadata useful to UI, OSC, MIDI, or
+-- later arbitration code without giving the manifest ownership over
+-- any producer target.
+data ManifestControlSurface = ManifestControlSurface
+  { mcsDisplayName :: !String
+  , mcsControlTag  :: !ControlTag
+  , mcsDefault     :: !Double
+  , mcsRangeMin    :: !Double
+  , mcsRangeMax    :: !Double
+  , mcsSmoothingHz :: !Double
+  , mcsCC          :: !(Maybe Word8)
+  } deriving (Eq, Show, Generic)
+
 -- | A validated pure plan that a later runtime integration can turn into
 -- owner options plus a hot-swap command.
 data ManifestReloadPlan = ManifestReloadPlan
-  { mrlpDemoKey        :: !String
-  , mrlpSwapLabel      :: !SwapLabel
-  , mrlpTemplateGraph  :: !TemplateGraph
-  , mrlpAdapterOptions :: !RTGraphAdapterOptions
-  , mrlpControlSurface :: ![ManifestControl]
+  { mrlpDemoKey           :: !String
+  , mrlpSwapLabel         :: !SwapLabel
+  , mrlpTemplateGraph     :: !TemplateGraph
+  , mrlpAdapterOptions    :: !RTGraphAdapterOptions
+  , mrlpControlSurface    :: ![ManifestControlSurface]
+  , mrlpArbitrationPolicy :: !ArbitrationPolicy
+    -- ^ Default to 'FifoOnly'. A manifest describes controls but does
+    -- not claim producer ownership without an explicit policy owner.
   } deriving (Eq, Show, Generic)
 
 data ManifestReloadIssue
@@ -156,14 +179,31 @@ planManifestReload doc catalog req
            adapterOptions <-
              adapterOptionsFor requestedManifest (mrrResourcePolicy req)
            pure ManifestReloadPlan
-             { mrlpDemoKey        = requestedKey
-             , mrlpSwapLabel      = mrrSwapLabel req
-             , mrlpTemplateGraph  = mrcTemplateGraph catalogEntry
-             , mrlpAdapterOptions = adapterOptions
-             , mrlpControlSurface = mfControls requestedManifest
+             { mrlpDemoKey           = requestedKey
+             , mrlpSwapLabel         = mrrSwapLabel req
+             , mrlpTemplateGraph     = mrcTemplateGraph catalogEntry
+             , mrlpAdapterOptions    = adapterOptions
+             , mrlpControlSurface    =
+                 controlSurfaceFor requestedManifest
+             , mrlpArbitrationPolicy = FifoOnly
              }
   where
     requestedKey = mrrDemoKey req
+
+controlSurfaceFor :: AuthoringManifest -> [ManifestControlSurface]
+controlSurfaceFor manifest =
+  map manifestControlSurface (mfControls manifest)
+
+manifestControlSurface :: ManifestControl -> ManifestControlSurface
+manifestControlSurface c = ManifestControlSurface
+  { mcsDisplayName = mcName c
+  , mcsControlTag  = ControlTag (MigrationKey (mcKey c)) (mcSlot c)
+  , mcsDefault     = mcDefault c
+  , mcsRangeMin    = mcRangeMin c
+  , mcsRangeMax    = mcRangeMax c
+  , mcsSmoothingHz = mcSmoothingHz c
+  , mcsCC          = mcCC c
+  }
 
 validateManifestTemplates
   :: AuthoringManifest
