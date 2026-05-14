@@ -570,42 +570,28 @@ struct NoiseGenState {
   q::white_noise_gen noise;
 };
 
-// LPF holds a q::lowpass biquad and the last-applied freq/q so the filter is
-// _only_ reconfigured when a parameter changes (block-rate). last_freq/last_q
-// are initialized to -1 so the first process call reconfigures with the node's
-// controls.
-struct LPFState {
-  q::lowpass filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
+// LPF / HPF / BPF / Notch are q::biquad siblings. They share the
+// same runtime discipline: keep one persistent filter object per
+// node/instance, reconfigure coefficients only when block-latched
+// freq/q changes, and preserve the biquad delay history across that
+// reconfiguration.
+// Filter must be a q::biquad alternative: constructible/configurable
+// from (q::frequency, sample_rate, q), and callable as filter(float).
+template <class Filter>
+struct BiquadFilterState {
+  Filter filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
   double last_freq = -1.0;
   double last_q = -1.0;
 };
 
-// HPF / BPF / Notch share LPF's reconfigure-on-change pattern and only
-// differ in the underlying biquad alternative. The audio I/O contract
-// is identical (3 inputs [signal, freq, q], 2 controls [freq_default,
-// q_default], 1 output). Each carries last_freq / last_q so the
-// kernel only re-derives biquad coefficients when a control changes.
-struct HPFState {
-  q::highpass filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
-  double last_freq = -1.0;
-  double last_q = -1.0;
-};
-
-struct BPFState {
-  // bandpass_cpg: constant-peak-gain — peak amplitude stays roughly
-  // constant as Q changes, which is the musical / wah-style behavior.
-  // (bandpass_csg, the constant-skirt-gain variant, is sharper but
-  // its peak gain scales with Q.)
-  q::bandpass_cpg filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
-  double last_freq = -1.0;
-  double last_q = -1.0;
-};
-
-struct NotchState {
-  q::notch filter{q::frequency{1000.0}, kDefaultSampleRate, 0.707};
-  double last_freq = -1.0;
-  double last_q = -1.0;
-};
+using LPFState = BiquadFilterState<q::lowpass>;
+using HPFState = BiquadFilterState<q::highpass>;
+// bandpass_cpg: constant-peak-gain — peak amplitude stays roughly
+// constant as Q changes, which is the musical / wah-style behavior.
+// (bandpass_csg, the constant-skirt-gain variant, is sharper but
+// its peak gain scales with Q.)
+using BPFState = BiquadFilterState<q::bandpass_cpg>;
+using NotchState = BiquadFilterState<q::notch>;
 
 /* Note [Envelope state]
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2988,6 +2974,20 @@ enum class StateMigrationResult {
   Copied,
 };
 
+template <class State>
+[[nodiscard]] static StateMigrationResult copy_biquad_filter_state(
+    const NodeInstanceState &old_node, NodeInstanceState &new_node
+) noexcept {
+  const auto *src = std::get_if<State>(&old_node.state);
+  auto *dst = std::get_if<State>(&new_node.state);
+  if (!src || !dst)
+    return StateMigrationResult::Unsupported;
+  dst->filter = src->filter;
+  dst->last_freq = src->last_freq;
+  dst->last_q = src->last_q;
+  return StateMigrationResult::Copied;
+}
+
 [[nodiscard]] static StateMigrationResult copy_supported_dsp_state(
     NodeKind kind, const NodeInstanceState &old_node, NodeInstanceState &new_node
 ) noexcept {
@@ -3024,47 +3024,19 @@ enum class StateMigrationResult {
   }
 
   case NodeKind::LPF: {
-    const auto *src = std::get_if<LPFState>(&old_node.state);
-    auto *dst = std::get_if<LPFState>(&new_node.state);
-    if (!src || !dst)
-      return StateMigrationResult::Unsupported;
-    dst->filter = src->filter;
-    dst->last_freq = src->last_freq;
-    dst->last_q = src->last_q;
-    return StateMigrationResult::Copied;
+    return copy_biquad_filter_state<LPFState>(old_node, new_node);
   }
 
   case NodeKind::HPF: {
-    const auto *src = std::get_if<HPFState>(&old_node.state);
-    auto *dst = std::get_if<HPFState>(&new_node.state);
-    if (!src || !dst)
-      return StateMigrationResult::Unsupported;
-    dst->filter = src->filter;
-    dst->last_freq = src->last_freq;
-    dst->last_q = src->last_q;
-    return StateMigrationResult::Copied;
+    return copy_biquad_filter_state<HPFState>(old_node, new_node);
   }
 
   case NodeKind::BPF: {
-    const auto *src = std::get_if<BPFState>(&old_node.state);
-    auto *dst = std::get_if<BPFState>(&new_node.state);
-    if (!src || !dst)
-      return StateMigrationResult::Unsupported;
-    dst->filter = src->filter;
-    dst->last_freq = src->last_freq;
-    dst->last_q = src->last_q;
-    return StateMigrationResult::Copied;
+    return copy_biquad_filter_state<BPFState>(old_node, new_node);
   }
 
   case NodeKind::Notch: {
-    const auto *src = std::get_if<NotchState>(&old_node.state);
-    auto *dst = std::get_if<NotchState>(&new_node.state);
-    if (!src || !dst)
-      return StateMigrationResult::Unsupported;
-    dst->filter = src->filter;
-    dst->last_freq = src->last_freq;
-    dst->last_q = src->last_q;
-    return StateMigrationResult::Copied;
+    return copy_biquad_filter_state<NotchState>(old_node, new_node);
   }
 
   case NodeKind::Out:
@@ -3883,21 +3855,75 @@ static void process_noisegen(
   }
 }
 
-/* Note [LPF processing semantics]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/* Note [Biquad filter processing semantics]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-LPF uses q::lowpass, a biquad IIR low-pass filter (Audio-EQ Cookbook).
+LPF / HPF / BPF / Notch are q::biquad siblings with the same runtime
+I/O contract: 3 audio inputs [signal, freq, q], 2 controls
+[freq_default, q_default], and 1 output. They differ only in the
+underlying q::biquad alternative:
 
-Cutoff frequency and q are block-latched: read once per block from an input port
-if connected, otherwise from the control defaults. The filter should be
-reconfigured via biquad::config when parameters change, but reconfiguration updates
-the five coefficients without resetting the delay state, so there is no
-discontinuity beyond the filter's own transient.
+  * LPF   uses q::lowpass.
+  * HPF   uses q::highpass.
+  * BPF   uses q::bandpass_cpg (constant-peak-gain — peak amplitude
+          is roughly Q-independent, the musical / wah variant).
+  * Notch uses q::notch (band-reject).
 
-If the signal input is unconnected, output is silence.
+Cutoff frequency and q are block-latched: read once per block from
+an input port if connected, otherwise from the control defaults. The
+filter is reconfigured via biquad::config when parameters change, but
+reconfiguration updates the coefficients without resetting delay
+history, so there is no discontinuity beyond the filter's own
+transient.
+
+If the signal input is unconnected, output is silence. An upstream
+Smooth can turn control jumps into block-to-block glides, but this
+kernel still observes only one cutoff value per block. True
+within-block filter sweeps would need a sample-accurate biquad update
+path.
 */
 
-static void process_lpf(
+template <class State>
+struct BiquadFilterStateAccess;
+
+template <>
+struct BiquadFilterStateAccess<LPFState> {
+  static LPFState *get(NodeState &state) noexcept {
+    auto *st = std::get_if<LPFState>(&state);
+    assert(st && "LPF node has non-LPF state");
+    return st;
+  }
+};
+
+template <>
+struct BiquadFilterStateAccess<HPFState> {
+  static HPFState *get(NodeState &state) noexcept {
+    auto *st = std::get_if<HPFState>(&state);
+    assert(st && "HPF node has non-HPF state");
+    return st;
+  }
+};
+
+template <>
+struct BiquadFilterStateAccess<BPFState> {
+  static BPFState *get(NodeState &state) noexcept {
+    auto *st = std::get_if<BPFState>(&state);
+    assert(st && "BPF node has non-BPF state");
+    return st;
+  }
+};
+
+template <>
+struct BiquadFilterStateAccess<NotchState> {
+  static NotchState *get(NodeState &state) noexcept {
+    auto *st = std::get_if<NotchState>(&state);
+    assert(st && "Notch node has non-Notch state");
+    return st;
+  }
+};
+
+template <class State>
+static void process_biquad_filter(
     const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
 ) noexcept {
   auto &node = inst.nodes[node_idx];
@@ -3930,179 +3956,46 @@ static void process_lpf(
       kQFallback
   );
 
-  auto *lpf = std::get_if<LPFState>(&node.state);
-  assert(lpf && "LPF node has non-LPF state");
-  if (!lpf) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-
-  if (freq != lpf->last_freq || q_val != lpf->last_q) {
-    lpf->filter.config(q::frequency{freq}, g.sample_rate, q_val);
-    lpf->last_freq = freq;
-    lpf->last_q = q_val;
-  }
-
-  for (int i = 0; i < nframes; ++i) {
-    const std::size_t fi = static_cast<std::size_t>(i);
-    out[fi] = lpf->filter(sig_in[fi]);
-  }
-}
-
-/* Note [HPF / BPF / Notch processing semantics]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-These three are biquad siblings of LPF: same I/O contract (3 audio
-inputs [signal, freq, q], 2 controls [freq_default, q_default]),
-same block-latched freq/q (read at sample 0 each block), same
-reconfigure-on-change discipline. They differ only in the underlying
-q::biquad alternative:
-
-  * HPF   uses q::highpass.
-  * BPF   uses q::bandpass_cpg (constant-peak-gain — peak amplitude
-          is roughly Q-independent, the musical / wah variant).
-  * Notch uses q::notch (band-reject).
-
-Cutoff and q are read once at the start of each block. An upstream
-Smooth can turn control jumps into block-to-block glides, but this
-kernel still observes only one cutoff value per block. True
-within-block filter sweeps would need a sample-accurate biquad update
-path.
-*/
-
-static void process_hpf(
-    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
-) noexcept {
-  auto &node = inst.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-  if (sig_in.empty()) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const auto q_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
-  // Sanitize freq + q -- see process_lpf comment + Note
-  // [Pathological-input sanitation].
-  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
-  const double freq = sanitize_finite_clamp(
-      !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
-      0.0,
-      max_freq,
-      kFreqFallbackHz
-  );
-  const double q_val = sanitize_finite_clamp(
-      !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
-      kQMin,
-      kQMax,
-      kQFallback
-  );
-
-  auto *st = std::get_if<HPFState>(&node.state);
-  assert(st && "HPF node has non-HPF state");
+  auto *st = BiquadFilterStateAccess<State>::get(node.state);
   if (!st) {
     std::fill(out.begin(), out.end(), 0.0f);
     return;
   }
+
   if (freq != st->last_freq || q_val != st->last_q) {
     st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
     st->last_freq = freq;
     st->last_q = q_val;
   }
+
   for (int i = 0; i < nframes; ++i) {
     const std::size_t fi = static_cast<std::size_t>(i);
     out[fi] = st->filter(sig_in[fi]);
   }
+}
+
+static void process_lpf(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
+  process_biquad_filter<LPFState>(g, inst, node_idx, nframes);
+}
+
+static void process_hpf(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
+  process_biquad_filter<HPFState>(g, inst, node_idx, nframes);
 }
 
 static void process_bpf(
     const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
 ) noexcept {
-  auto &node = inst.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-  if (sig_in.empty()) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const auto q_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
-  // Sanitize freq + q -- see process_lpf comment + Note
-  // [Pathological-input sanitation].
-  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
-  const double freq = sanitize_finite_clamp(
-      !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
-      0.0,
-      max_freq,
-      kFreqFallbackHz
-  );
-  const double q_val = sanitize_finite_clamp(
-      !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
-      kQMin,
-      kQMax,
-      kQFallback
-  );
-
-  auto *st = std::get_if<BPFState>(&node.state);
-  assert(st && "BPF node has non-BPF state");
-  if (!st) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-  if (freq != st->last_freq || q_val != st->last_q) {
-    st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
-    st->last_freq = freq;
-    st->last_q = q_val;
-  }
-  for (int i = 0; i < nframes; ++i) {
-    const std::size_t fi = static_cast<std::size_t>(i);
-    out[fi] = st->filter(sig_in[fi]);
-  }
+  process_biquad_filter<BPFState>(g, inst, node_idx, nframes);
 }
 
 static void process_notch(
     const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
 ) noexcept {
-  auto &node = inst.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-  if (sig_in.empty()) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
-  const auto q_in = resolve_input(g, inst, node_idx, PortIndex{2}, nframes);
-  // Sanitize freq + q -- see process_lpf comment + Note
-  // [Pathological-input sanitation].
-  const double max_freq = 0.49 * static_cast<double>(g.sample_rate);
-  const double freq = sanitize_finite_clamp(
-      !freq_in.empty() ? static_cast<double>(freq_in[0]) : node.controls[0],
-      0.0,
-      max_freq,
-      kFreqFallbackHz
-  );
-  const double q_val = sanitize_finite_clamp(
-      !q_in.empty() ? static_cast<double>(q_in[0]) : node.controls[1],
-      kQMin,
-      kQMax,
-      kQFallback
-  );
-
-  auto *st = std::get_if<NotchState>(&node.state);
-  assert(st && "Notch node has non-Notch state");
-  if (!st) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-  if (freq != st->last_freq || q_val != st->last_q) {
-    st->filter.config(q::frequency{freq}, g.sample_rate, q_val);
-    st->last_freq = freq;
-    st->last_q = q_val;
-  }
-  for (int i = 0; i < nframes; ++i) {
-    const std::size_t fi = static_cast<std::size_t>(i);
-    out[fi] = st->filter(sig_in[fi]);
-  }
+  process_biquad_filter<NotchState>(g, inst, node_idx, nframes);
 }
 
 /* Note [TriOsc processing semantics]
