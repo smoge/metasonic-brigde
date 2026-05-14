@@ -17,6 +17,12 @@
 -- gateway but do not configure policy keep the existing producer
 -- behavior. Rejections are reported before enqueue and do not consume
 -- queue capacity or command sequence numbers.
+--
+-- Policy is set at construction. The gateway updates
+-- 'ProducerPriority' ownership internally after accepted enqueues, but
+-- explicit claim/release operations currently require constructing a
+-- new gateway. A later API can expose policy mutation when a concrete
+-- caller needs it.
 
 module MetaSonic.Session.ArbitrationGateway
   ( -- * Gateway
@@ -94,6 +100,10 @@ newSessionArbitrationGateway opts = do
     { sagPolicy = policyVar
     }
 
+-- | Allocate a gateway for the duration of an action.
+--
+-- The gateway has no release step today; the @with*@ shape leaves room
+-- for future resource-backed policy state without changing callers.
 withSessionArbitrationGateway
   :: SessionArbitrationGatewayOptions
   -> (SessionArbitrationGateway -> IO a)
@@ -113,7 +123,9 @@ readSessionArbitrationGatewayPolicy gateway =
 -- The gateway lock spans the policy decision and downstream enqueue so
 -- accepted ownership updates follow the same order as admitted fan-in
 -- commands. If fan-in rejects the command, policy state is left
--- unchanged.
+-- unchanged. The single-MVar path intentionally stays in place until
+-- smoke output or a dedicated contention benchmark shows that splitting
+-- policy snapshot, enqueue, and update is necessary.
 enqueueArbitratedSessionFanInCommand
   :: SessionArbitrationGateway
   -> ProducerId

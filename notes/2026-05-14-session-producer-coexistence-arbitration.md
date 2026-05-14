@@ -211,7 +211,13 @@ above fan-in, using a small pure policy function or wrapper:
 - Should multi-policy composition, such as target-claim precedence with
   priority fallback, be modeled as a new constructor or a policy
   combinator?
+- Should the gateway expose explicit policy mutation for claim release,
+  claim replacement, or owner clearing, or should those wait for a
+  configured live policy owner?
 - What release signal ends a MIDI or UI `TouchOverride` claim?
+- Should voice lifecycle commands clear ownership entries keyed on the
+  released voice, or should ownership survive deterministic voice-key
+  reuse?
 - Does hot-swap clear claims, preserve claims by symbolic target, or
   require an explicit migration policy?
 - How should Pattern automation mark continuous-control lanes that are

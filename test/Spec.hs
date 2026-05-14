@@ -13949,6 +13949,54 @@ sessionArbitrationGatewayTests =
             sfisQueueDepth snapshotAfterReject @?= 1
             assertPriorityOwner policyAfterOsc target oscProducer
             assertPriorityOwner policyAfterReject target oscProducer
+
+  , testCase "target-claim gateway rejects only the claimed target before fan-in" $ do
+      let graph = patternTemplates droneVibrato
+          claimant = testProducer ProducerUI "ui"
+          blocked  = testProducer ProducerMIDI "midi"
+          target =
+            ControlArbitrationTarget (VoiceKey "v0") midiLevelTag
+          claimedCommand =
+            CmdControlWrite (VoiceKey "v0") midiLevelTag 0.25
+          otherCommand =
+            CmdControlWrite (VoiceKey "v0") midiFreqTag 440.0
+          gatewayOpts = defaultSessionArbitrationGatewayOptions
+            { sagoInitialPolicy =
+                TargetClaim
+                  (claimControlTarget target claimant emptyTargetClaimTable)
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = blocked
+            , aiCommand   = claimedCommand
+            , aiTarget    = Just target
+            , aiReason    = ArrTargetClaimedBy claimant
+            , aiRetryable = False
+            }
+      result <-
+        withSessionFanInHost graph defaultSessionFanInOptions $ \host ->
+          withSessionArbitrationGateway gatewayOpts $ \gateway -> do
+            claimantEnq <- enqueueArbitratedSessionFanInCommand
+                             gateway claimant claimedCommand host
+            rejected <- enqueueArbitratedSessionFanInCommand
+                          gateway blocked claimedCommand host
+            otherEnq <- enqueueArbitratedSessionFanInCommand
+                          gateway blocked otherCommand host
+            snapshot <- readSessionFanInHost host
+            pure (claimantEnq, rejected, otherEnq, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (claimantEnq, rejected, otherEnq, snapshot) -> do
+          q0 <- gatewayQueuedOrFail claimantEnq
+          q1 <- gatewayQueuedOrFail otherEnq
+          qscSequence q0 @?= CommandSequence 0
+          qscSequence q1 @?= CommandSequence 1
+          qscProducer q0 @?= claimant
+          qscProducer q1 @?= blocked
+          qscCommand q0 @?= claimedCommand
+          qscCommand q1 @?= otherCommand
+          rejected @?= SagArbitrationRejected expectedIssue
+          sfisQueueDepth snapshot @?= 2
   ]
 
 ------------------------------------------------------------
