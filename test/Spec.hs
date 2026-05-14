@@ -15161,6 +15161,14 @@ sessionMIDIProducerTests =
             , CmdControlWrite (VoiceKey "m0-72") midiFreqTag (expected 72)
             ]
           mpcbState batch @?= active
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerPitchBend 0 8192)
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = []
+              , mpcbState = initialMIDIProducerState
+              }
 
   , testCase "channel filter admits allow-listed channels" $ do
       let opts = testMIDIProducerOptions

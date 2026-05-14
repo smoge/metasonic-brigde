@@ -42,6 +42,8 @@ against OSC beyond the existing FIFO fan-in queue.
   scope.
 - Aftertouch, MIDI clock, channel remapping/splits, or sustain-pedal
   semantics.
+- Per-channel bend state replay on note-on; new notes start un-bent
+  until the next pitch-bend event.
 - Release-phase CC fanout or producer-owned smoothing/coalescing.
 - Arbitration beyond FIFO producer order.
 - Long-running supervision beyond the scoped fan-in service.
