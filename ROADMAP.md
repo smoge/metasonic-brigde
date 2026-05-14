@@ -2719,7 +2719,9 @@ What this slice doesn't try to settle:
 - Session-level arbitration between MIDI and OSC writes
   targeting the same control. The dispatcher and live-MIDI
   runner both write to the same slot today; arbitration
-  is the session layer's problem.
+  is the session layer's problem. The later
+  [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
+  note records the first bounded design constraints for that problem.
 
 See
 [notes/2026-05-12-phase-8f-named-controls.md](notes/2026-05-12-phase-8f-named-controls.md)
@@ -3079,6 +3081,12 @@ Session prep artifacts:
   control values before enqueue. This is still not a GUI toolkit
   binding, manifest reload/import, authorization, or arbitration beyond
   FIFO.
+- [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
+  records the pre-implementation policy boundary for high-rate control
+  traffic. It keeps voice lifecycle and hot-swap commands
+  non-coalescible, identifies repeated same-producer control writes as
+  the first possible coalescing candidate, and leaves queue behavior
+  unchanged.
 
 Landed prep contracts:
 
@@ -3262,8 +3270,10 @@ Still gated:
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
-  throttling/coalescing, and drain scheduling beyond the scoped
-  wake-on-enqueue fan-in service.
+  throttling/coalescing implementation, and drain scheduling beyond the
+  scoped wake-on-enqueue fan-in service. The design constraints are
+  recorded in
+  [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md).
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
@@ -3293,7 +3303,8 @@ toolkit integration, manifest-driven session reload/resource policy,
 broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
 translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,
-arbitration beyond FIFO, unsupported respawn/reset policy,
+arbitration/coalescing implementation beyond the documented design
+constraints, unsupported respawn/reset policy,
 long-running ownership of the live-audio hot-swap path, and recovery
 policies are specified and tested in their own slices. The session does
 not need a generated fusion executor to ship;
