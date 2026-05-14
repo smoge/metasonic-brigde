@@ -3635,43 +3635,63 @@ void set_osc_initial_phase(NodeInstanceState &node, double value) noexcept {
 SinOsc uses q::phase_iterator for phase accumulation and q::sin as
 sample-computing function.
 
-  * q::phase uses a 1.31 fixed-point format (uint32). The uint32 range maps to
-    one cycle (0–2pi), overflow wraps phase naturally with no fmod or
-    conditional branch.
+q::sin is a lookup-table sine that carries no mutable state. The
+shared phase/state/frequency/phase-port contract lives in
+Note [Phase oscillator driver].
+*/
 
-  * phase_iterator::set updates the per-sample increment (_step) from a
-    frequency, leaving the accumulated phase (_phase) untouched. We exploit
-    that for both the constant and modulated paths.
+/* Note [Phase oscillator driver]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+SinOsc / SawOsc / TriOsc share the same runtime discipline: one
+persistent q::phase_iterator in OscState, audio-rate frequency when
+port 0 is wired, otherwise a block-latched controls[0] fallback, and
+an initial-only phase port handled at graph load. They differ only in
+the q_lib waveshape function and the assertion text used if a node ever
+holds the wrong state variant.
 
-  * q::sin is a lookup-table sine that carries no mutable state.
+q::phase uses a 1.31 fixed-point format (uint32). The uint32 range maps
+to one cycle (0–2pi), and overflow wraps phase naturally with no fmod
+or conditional branch. phase_iterator::set updates the per-sample
+increment (_step) from a frequency, leaving the accumulated phase
+(_phase) untouched. The shared driver exploits that for both the
+constant and modulated paths.
 
-When port 0 (frequency) is wired to another node's output, the kernel
+When port 0 (frequency) is wired to another node's output, the driver
 runs sample-accurately: phase_iter.set() is called every sample with
-the modulator's value, then phase is advanced and the sine is read.
-This is the FM path. When port 0 is unconnected, the kernel sets the
-phase increment once per block from the control default — same cost as
-before.
+the modulator's value, then phase is advanced and the waveshape is
+read. When port 0 is unconnected, the driver sets the phase increment
+once per block from the control default.
 
 The phase port (port 1) is currently consumed only as an initial-phase
 control via set_osc_initial_phase at graph load. Wiring an audio source
 to port 1 has no effect today; phase modulation (PM) needs a separate
 runtime path that adds to _phase per sample.
+
+The shared driver is also used by the hand-written region kernels so
+the fused and unfused oscillator paths keep the same frequency sanitation
+and phase-increment update policy.
 */
 
-static void process_sinosc(
-    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+// Drives an oscillator across `nframes` samples, picking the per-sample
+// audio-rate freq update vs the block-rate fallback, and invoking
+// `body(fi, sample)` for each sample.
+//
+//   freq_in              : resolve_input(...) on the oscillator's
+//                          freq port. May be empty (control-rate).
+//   freq_control_default : fallback freq from controls[0] when
+//                          freq_in is empty.
+//   wave_fn              : q::sin / q::saw / q::triangle — any callable
+//                          taking q::phase_iterator and returning float.
+template <class WaveFn, class Body>
+static inline void drive_oscillator(
+    RTGraph const &g,
+    OscState &osc,
+    std::span<const float> freq_in,
+    double freq_control_default,
+    int nframes,
+    WaveFn wave_fn,
+    Body body
 ) noexcept {
-  auto &node = inst.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-
-  auto *osc = std::get_if<OscState>(&node.state);
-  assert(osc && "SinOsc node has non-oscillator state");
-  if (!osc) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-
   if (!freq_in.empty()) {
     // Sample-accurate FM: update the phase increment per sample.
     // Sanitize NaN/Inf -> 0 Hz (DC); finite negative + above-Nyquist
@@ -3681,17 +3701,87 @@ static void process_sinosc(
     for (int i = 0; i < nframes; ++i) {
       const std::size_t fi = static_cast<std::size_t>(i);
       const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
-      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-      out[fi] = q::sin(osc->phase_iter++);
+      osc.phase_iter.set(q::frequency{freq}, g.sample_rate);
+      const float sample = wave_fn(osc.phase_iter++);
+      body(fi, sample);
     }
   } else {
     // Constant frequency: set the increment once per block.
-    const double freq = sanitize_finite(node.controls[0], 0.0);
-    osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
+    const double freq = sanitize_finite(freq_control_default, 0.0);
+    osc.phase_iter.set(q::frequency{freq}, g.sample_rate);
     for (int i = 0; i < nframes; ++i) {
-      out[static_cast<std::size_t>(i)] = q::sin(osc->phase_iter++);
+      const std::size_t fi = static_cast<std::size_t>(i);
+      const float sample = wave_fn(osc.phase_iter++);
+      body(fi, sample);
     }
   }
+}
+
+struct SinOscSpec {
+  static OscState *state(NodeState &state) noexcept {
+    auto *osc = std::get_if<OscState>(&state);
+    assert(osc && "SinOsc node has non-oscillator state");
+    return osc;
+  }
+
+  static float sample(q::phase_iterator phase) noexcept {
+    return q::sin(phase);
+  }
+};
+
+struct SawOscSpec {
+  static OscState *state(NodeState &state) noexcept {
+    auto *osc = std::get_if<OscState>(&state);
+    assert(osc && "SawOsc node has non-oscillator state");
+    return osc;
+  }
+
+  static float sample(q::phase_iterator phase) noexcept {
+    return q::saw(phase);
+  }
+};
+
+struct TriOscSpec {
+  static OscState *state(NodeState &state) noexcept {
+    auto *osc = std::get_if<OscState>(&state);
+    assert(osc && "TriOsc node has non-oscillator state");
+    return osc;
+  }
+
+  static float sample(q::phase_iterator phase) noexcept {
+    return q::triangle(phase);
+  }
+};
+
+template <class Spec>
+static void process_phase_oscillator(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+
+  auto *osc = Spec::state(node.state);
+  if (!osc) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  drive_oscillator(
+      g,
+      *osc,
+      freq_in,
+      node.controls[0],
+      nframes,
+      Spec::sample,
+      [&out](std::size_t fi, float sample) noexcept { out[fi] = sample; }
+  );
+}
+
+static void process_sinosc(
+    const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
+  process_phase_oscillator<SinOscSpec>(g, inst, node_idx, nframes);
 }
 
 /* Note [SawOsc processing semantics]
@@ -3702,45 +3792,12 @@ and q::saw computes the sample using poly-BLEP antialiasing. The phase_iterator
 supplies both the current phase and the per-sample step (dt) for the BLEP
 correction term, so updating freq via phase_iter.set() also refreshes dt for
 the BLEP — no separate bookkeeping needed.
-
-Frequency follows the same rule as SinOsc: when port 0 is wired, the kernel
-updates phase_iter per sample (sample-accurate FM); otherwise the increment
-is set once per block from the control default.
-
-Phase port (port 1) is initial-only, same as SinOsc.
 */
 
 static void process_sawosc(
     const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
 ) noexcept {
-  auto &node = inst.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-
-  auto *osc = std::get_if<OscState>(&node.state);
-  assert(osc && "SawOsc node has non-oscillator state");
-  if (!osc) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-
-  if (!freq_in.empty()) {
-    // Sample-accurate FM. Sanitize per sample; see process_sinosc for
-    // the policy rationale.
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
-      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-      out[fi] = q::saw(osc->phase_iter++);
-    }
-  } else {
-    // Constant frequency: set the increment once per block.
-    const double freq = sanitize_finite(node.controls[0], 0.0);
-    osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-    for (int i = 0; i < nframes; ++i) {
-      out[static_cast<std::size_t>(i)] = q::saw(osc->phase_iter++);
-    }
-  }
+  process_phase_oscillator<SawOscSpec>(g, inst, node_idx, nframes);
 }
 
 /* Note [PulseOsc processing semantics]
@@ -4001,40 +4058,16 @@ static void process_notch(
 /* Note [TriOsc processing semantics]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Same shape as SinOsc/SawOsc: q::phase_iterator + a stateless
-waveshape. q::triangle is a free constant of triangle_osc. Phase
-port (port 1) is initial-only, same convention as SinOsc/SawOsc.
+TriOsc's waveshape is q::triangle, a free constant of q_lib's
+triangle_osc. The phase_iterator supplied by the shared driver carries
+both phase and per-sample step (dt), which q::triangle uses for its
+band-limiting correction at the rising and falling edges.
 */
 
 static void process_triosc(
     const RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
 ) noexcept {
-  auto &node = inst.nodes[node_idx];
-  auto out = output_span(node, PortIndex{0}, nframes);
-  const auto freq_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
-
-  auto *osc = std::get_if<OscState>(&node.state);
-  assert(osc && "TriOsc node has non-oscillator state");
-  if (!osc) {
-    std::fill(out.begin(), out.end(), 0.0f);
-    return;
-  }
-
-  if (!freq_in.empty()) {
-    // Sample-accurate FM. Sanitize per sample, see process_sinosc.
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
-      osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-      out[fi] = q::triangle(osc->phase_iter++);
-    }
-  } else {
-    const double freq = sanitize_finite(node.controls[0], 0.0);
-    osc->phase_iter.set(q::frequency{freq}, g.sample_rate);
-    for (int i = 0; i < nframes; ++i) {
-      out[static_cast<std::size_t>(i)] = q::triangle(osc->phase_iter++);
-    }
-  }
+  process_phase_oscillator<TriOscSpec>(g, inst, node_idx, nframes);
 }
 
 /* Note [Gain processing semantics]
@@ -5465,7 +5498,7 @@ vs runtime ordering" in CLAUDE.md.
 
 /* Note [Region kernel helpers]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Two narrow helpers shared across the §4.B region kernels.
+Two narrow helpers used by the §4.B region kernels.
 Intentionally not a "kernel envelope" or a full DSL: they capture
 exactly the boilerplate that was duplicated character-for-character
 across kernels, and leave every kernel-specific detail (the DSP
@@ -5481,15 +5514,11 @@ call) hand-written and visible in the kernel body.
     sink-terminal kernels (SinGainOut, SawLpfGainOut). The
     buffer-terminal SawLpfGain doesn't touch this.
 
-  * 'drive_oscillator' — the "audio-rate freq input vs control
-    fallback" branch every oscillator kernel does. Resolves the
-    freq-port span at the call site, picks the per-sample vs
-    block-rate phase increment update, and invokes a per-sample
-    body callback @body(fi, sample)@ where @sample@ is the
-    oscillator output for sample @fi@. The oscillator function
-    ('q::sin', 'q::saw') is passed as a function object; both are
-    'constexpr' instances of 'sin_osc' / 'saw_osc' in q_lib so
-    the template instantiation costs nothing at runtime.
+  * 'drive_oscillator' — the shared phase-oscillator driver defined
+    near process_sinosc. Region kernels pass their already-resolved
+    freq-port span and a sink/body callback, so the fused path observes
+    the same audio-rate freq input vs control fallback policy as the
+    plain SinOsc / SawOsc / TriOsc processors.
 
 The LPF block-rate freq/q latch deliberately stays inline in the
 saw-bearing kernels: it's filter-specific stateful DSP and
@@ -5552,50 +5581,6 @@ struct SinkAccumulator {
       inst.block_sink_peak = peak;
   }
 };
-
-// Drives an oscillator across `nframes` samples, picking the
-// per-sample audio-rate freq update vs the block-rate fallback,
-// and invoking `body(fi, sample)` for each sample.
-//
-//   freq_in              : resolve_input(...) on the oscillator's
-//                          freq port. May be empty (control-rate).
-//   freq_control_default : fallback freq from controls[0] when
-//                          freq_in is empty.
-//   wave_fn              : q::sin / q::saw — any callable taking
-//                          q::phase_iterator and returning float.
-//
-// Mirrors the shape of process_sinosc / process_sawosc; the
-// per-node kernels still hand-write it because they're outside
-// §4.B's scope, but the same idiom is visible in all three
-// region kernels via this helper.
-template <class WaveFn, class Body>
-static inline void drive_oscillator(
-    RTGraph const &g,
-    OscState &osc,
-    std::span<const float> freq_in,
-    double freq_control_default,
-    int nframes,
-    WaveFn wave_fn,
-    Body body
-) noexcept {
-  if (!freq_in.empty()) {
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const double freq = sanitize_finite(static_cast<double>(freq_in[fi]), 0.0);
-      osc.phase_iter.set(q::frequency{freq}, g.sample_rate);
-      const float sample = wave_fn(osc.phase_iter++);
-      body(fi, sample);
-    }
-  } else {
-    const double freq = sanitize_finite(freq_control_default, 0.0);
-    osc.phase_iter.set(q::frequency{freq}, g.sample_rate);
-    for (int i = 0; i < nframes; ++i) {
-      const std::size_t fi = static_cast<std::size_t>(i);
-      const float sample = wave_fn(osc.phase_iter++);
-      body(fi, sample);
-    }
-  }
-}
 
 /* Note [Region kernel: SawLpfGain]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
