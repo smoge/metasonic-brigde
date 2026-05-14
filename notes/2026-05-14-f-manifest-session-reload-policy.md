@@ -5,7 +5,9 @@ Date: 2026-05-14
 Status: implemented for the pure planner, diagnostic external JSON input, and
 v1 construction-time session setup. This note remains the design record for
 `MetaSonic.Session.ManifestReload`; runtime install strategy is covered by
-`2026-05-14-g-manifest-reload-install-strategy.md`.
+`2026-05-14-g-manifest-reload-install-strategy.md`, and the app-visible
+construction smoke is covered by
+`2026-05-14-h-manifest-session-construction-smoke.md`.
 
 It defines the boundary for a pure planner that validates an authoring
 manifest, chooses a caller-supplied graph/catalog entry, and derives session
@@ -301,12 +303,15 @@ The diagnostic external input path has also landed:
 
 ```text
 metasonic-bridge --manifest-reload-plan-file MANIFEST.json DEMO
+metasonic-bridge --manifest-session-smoke MANIFEST.json DEMO
 ```
 
-It reads `MANIFEST.json` as an `AuthoringManifestDoc`, validates the selected
-demo against the built-in authored-demo catalog, and prints the same plan as
-`--manifest-reload-plan`. It deliberately stops before owner allocation,
-command enqueue, or any install/reload strategy.
+Both commands read `MANIFEST.json` as an `AuthoringManifestDoc` and validate the
+selected demo against the built-in authored-demo catalog.
+`--manifest-reload-plan-file` prints the same plan as
+`--manifest-reload-plan`. `--manifest-session-smoke` then constructs a fresh
+owner from that plan and prints status. Both commands deliberately avoid audio
+startup, command enqueue, `CmdHotSwap` execution, and live reload semantics.
 
 Future product/runtime layers must still decide whether a reload entrypoint is:
 
@@ -342,6 +347,8 @@ any of them.
   owner/RTGraph adapter path.
 - external manifest JSON exported by `--authoring-manifest` can decode and
   plan against the built-in authored-demo catalog.
+- external manifest JSON can construct a fresh ready owner through the
+  app-visible construction smoke path.
 
 The runtime-facing tests are intentionally construction-time smoke tests. They
 do not start live audio or claim reload semantics.

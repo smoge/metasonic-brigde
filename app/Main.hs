@@ -54,9 +54,16 @@ import           MetaSonic.Pattern          (ControlTag (..),
                                              SwapLabel (..),
                                              TemplateName (..))
 import qualified MetaSonic.Session.ManifestReload as MR
+import           MetaSonic.Session.ManifestReload.Construct
+                                            (constructManifestSessionFromPlan)
 import           MetaSonic.Session.Command  (SessionCommand (..))
+import           MetaSonic.Session.Owner    (SessionOwnerStatus,
+                                             defaultSessionOwnerOptions,
+                                             sessionOwnerState,
+                                             sessionOwnerStatus)
 import           MetaSonic.Session.RTGraphAdapter
                                             (RTGraphAdapterOptions (..))
+import           MetaSonic.Session.State    (SessionState (..))
 import           MetaSonic.Types            (NodeIndex (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
@@ -150,14 +157,22 @@ data RunMode
     -- static plan/control/resource projection. It does not allocate an
     -- RTGraph, start audio, enqueue a command, or claim live reload
     -- semantics.
+  | ManifestSessionSmoke
+    -- ^ Non-audio construction smoke
+    -- (--manifest-session-smoke MANIFEST.json DEMO). Reads an
+    -- external authoring manifest document, validates the selected demo
+    -- against the built-in authored-demo catalog, constructs a fresh
+    -- SessionOwner from the resulting plan, prints status, and exits.
+    -- It does not start audio, step CmdHotSwap, or claim live reload
+    -- semantics.
   deriving (Eq, Show)
 
 data Options = Options
   { optMode    :: RunMode
   , optTargets :: [String]
   , optManifestReloadFile :: Maybe FilePath
-    -- ^ External authoring manifest JSON path for
-    -- --manifest-reload-plan-file.
+    -- ^ External authoring manifest JSON path for manifest reload
+    -- diagnostic / construction-smoke modes.
   , optFused   :: Bool
     -- ^ When True, demos load through 'loadRuntimeGraphFused' /
     -- 'loadTemplateGraphFused' on a 'compileRuntimeGraphFused'-
@@ -234,6 +249,15 @@ parseArgs = go defaultOptions
                   } xs
     go _ ("--manifest-reload-plan-file" : []) =
       Left "Missing manifest JSON file for --manifest-reload-plan-file"
+    go opts ("--manifest-session-smoke" : path : xs)
+      | null path || "--" `prefixOf` path =
+          Left "Missing manifest JSON file for --manifest-session-smoke"
+      | otherwise =
+          go opts { optMode = ManifestSessionSmoke
+                  , optManifestReloadFile = Just path
+                  } xs
+    go _ ("--manifest-session-smoke" : []) =
+      Left "Missing manifest JSON file for --manifest-session-smoke"
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -372,6 +396,7 @@ usage prog = unlines
   , "  " <> prog <> " --authoring-manifest [DEMO ...]"
   , "  " <> prog <> " --manifest-reload-plan DEMO"
   , "  " <> prog <> " --manifest-reload-plan-file MANIFEST.json DEMO"
+  , "  " <> prog <> " --manifest-session-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
   , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
@@ -466,6 +491,13 @@ usage prog = unlines
   , "                   diagnostic as --manifest-reload-plan. No audio,"
   , "                   no RTGraph allocation, no command enqueue, no live"
   , "                   reload."
+  , "  --manifest-session-smoke MANIFEST.json DEMO"
+  , "                   Construction-time manifest session smoke. Reads"
+  , "                   MANIFEST.json, validates DEMO against the built-in"
+  , "                   authored-demo reload catalog, constructs a fresh"
+  , "                   SessionOwner from the plan, prints owner status and"
+  , "                   graph/resource summary, then exits. No audio, no"
+  , "                   CmdHotSwap execution, no live reload."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
@@ -525,6 +557,7 @@ usage prog = unlines
   , "  " <> prog <> " --session-osc-arbitration-smoke 10"
   , "  " <> prog <> " --manifest-reload-plan send-return"
   , "  " <> prog <> " --manifest-reload-plan-file manifest.json send-return"
+  , "  " <> prog <> " --manifest-session-smoke manifest.json send-return"
   ]
 
 --------------------------------------------------------------------------------
@@ -612,6 +645,17 @@ main = do
           "--manifest-reload-plan-file MANIFEST.json DEMO_KEY"
           opts
       runManifestReloadFileDiagnostic manifestPath demo
+    ManifestSessionSmoke -> do
+      manifestPath <- maybe
+        (die "Missing manifest JSON file for --manifest-session-smoke")
+        pure
+        (optManifestReloadFile opts)
+      demo <- either die pure $
+        resolveManifestReloadDiagnosticTarget
+          "--manifest-session-smoke"
+          "--manifest-session-smoke MANIFEST.json DEMO_KEY"
+          opts
+      runManifestSessionSmoke manifestPath demo
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -719,6 +763,25 @@ runManifestReloadFileDiagnostic path demo = do
   catalog <- either die pure (demoManifestReloadCatalog demoTable)
   runManifestReloadDiagnosticWithDoc doc catalog demo
 
+runManifestSessionSmoke :: FilePath -> Demo -> IO ()
+runManifestSessionSmoke path demo = do
+  doc <- readManifestReloadDoc path
+  catalog <- either die pure (demoManifestReloadCatalog demoTable)
+  plan <- planManifestReloadOrDie doc catalog demo
+  result <-
+    constructManifestSessionFromPlan
+      plan
+      defaultSessionOwnerOptions
+      $ \owner -> do
+          state <- sessionOwnerState owner
+          status <- sessionOwnerStatus owner
+          pure (state, status)
+  case result of
+    Left issue ->
+      die $ "Manifest session construction failed: " <> show issue
+    Right (state, status) ->
+      printManifestSessionSmoke plan state status
+
 readManifestReloadDoc :: FilePath -> IO AuthoringManifestDoc
 readManifestReloadDoc path = do
   readResult <- try (BL.readFile path)
@@ -739,6 +802,15 @@ runManifestReloadDiagnosticWithDoc
   -> Demo
   -> IO ()
 runManifestReloadDiagnosticWithDoc doc catalog demo = do
+  plan <- planManifestReloadOrDie doc catalog demo
+  printManifestReloadPlan plan
+
+planManifestReloadOrDie
+  :: AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> Demo
+  -> IO MR.ManifestReloadPlan
+planManifestReloadOrDie doc catalog demo = do
   let request = MR.ManifestReloadRequest
         { MR.mrrDemoKey        = demoKey demo
         , MR.mrrSwapLabel      = SwapLabel ("manifest:" <> demoKey demo)
@@ -748,7 +820,7 @@ runManifestReloadDiagnosticWithDoc doc catalog demo = do
     Left issue ->
       die $ "Manifest reload planning failed: " <> show issue
     Right plan ->
-      printManifestReloadPlan plan
+      pure plan
 
 printManifestReloadPlan :: MR.ManifestReloadPlan -> IO ()
 printManifestReloadPlan plan = do
@@ -761,6 +833,27 @@ printManifestReloadPlan plan = do
   putStrLn $ "  arbitration policy: "
           <> show (MR.mrlpArbitrationPolicy plan)
   printManifestReloadCommand (MR.manifestReloadCommand plan)
+
+printManifestSessionSmoke
+  :: MR.ManifestReloadPlan
+  -> SessionState
+  -> SessionOwnerStatus
+  -> IO ()
+printManifestSessionSmoke plan state status = do
+  putStrLn "Manifest session construction smoke"
+  putStrLn $ "  demo: " <> MR.mrlpDemoKey plan
+  putStrLn $ "  swap label: " <> swapLabelText (MR.mrlpSwapLabel plan)
+  printManifestReloadTemplates (MR.mrlpTemplateGraph plan)
+  printManifestReloadResources (MR.mrlpAdapterOptions plan)
+  putStrLn $ "  owner status: " <> show status
+  putStrLn $
+    "  graph installed: "
+    <> if ssGraph state == MR.mrlpTemplateGraph plan
+          then "yes"
+          else "no"
+  putStrLn $ "  active voices: " <> show (M.size (ssVoices state))
+  putStrLn "  audio started: no"
+  putStrLn "  command projection: not executed"
 
 printManifestReloadTemplates :: TemplateGraph -> IO ()
 printManifestReloadTemplates graph = do
@@ -900,7 +993,8 @@ runDemo opts demo
     || optMode opts == PluginList
     || optMode opts == AuthoringManifest
     || optMode opts == ManifestReloadDiagnostic
-    || optMode opts == ManifestReloadFileDiagnostic =
+    || optMode opts == ManifestReloadFileDiagnostic
+    || optMode opts == ManifestSessionSmoke =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -979,6 +1073,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: ManifestReloadDiagnostic should be handled by main, never reach here"
     ManifestReloadFileDiagnostic ->
       error "runSingleDemo: ManifestReloadFileDiagnostic should be handled by main, never reach here"
+    ManifestSessionSmoke ->
+      error "runSingleDemo: ManifestSessionSmoke should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare

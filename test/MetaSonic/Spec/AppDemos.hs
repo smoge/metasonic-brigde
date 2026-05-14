@@ -10,6 +10,13 @@ import           MetaSonic.Bridge.Templates       (Template (..),
                                                    TemplateGraph (..))
 import           MetaSonic.Pattern                (SwapLabel (..))
 import           MetaSonic.Session.ManifestReload
+import           MetaSonic.Session.ManifestReload.Construct
+                                                   (constructManifestSessionFromPlan)
+import           MetaSonic.Session.Owner          (SessionOwnerStatus (..),
+                                                   defaultSessionOwnerOptions,
+                                                   sessionOwnerState,
+                                                   sessionOwnerStatus)
+import           MetaSonic.Session.State          (SessionState (..))
 
 
 appDemoCatalogTests :: TestTree
@@ -90,6 +97,43 @@ appDemoCatalogTests =
         Right plan -> do
           mrlpDemoKey plan @?= "send-return"
           mrlpTemplateGraph plan @?= mrcTemplateGraph sendReturn
+
+  , testCase "external manifest JSON constructs fresh owner through built-in catalog" $ do
+      catalog <- catalogOrFail demoTable
+      sendReturn <- entryOrFail "send-return" catalog
+      let exportedDoc =
+            AuthoringManifestDoc
+              manifestSchemaVersion
+              [mrcManifest sendReturn]
+          request = ManifestReloadRequest
+            { mrrDemoKey        = "send-return"
+            , mrrSwapLabel      = SwapLabel "external-session-smoke"
+            , mrrResourcePolicy = defaultManifestResourcePolicy
+            }
+      decodedDoc <-
+        case decodeManifestDoc (encodeManifestDoc exportedDoc) of
+          Left err  -> assertFailure ("expected decoded manifest: " <> err)
+          Right doc -> pure doc
+      plan <-
+        case planManifestReload decodedDoc catalog request of
+          Left issue ->
+            assertFailure ("expected external manifest reload plan, got: " <> show issue)
+          Right p ->
+            pure p
+      result <-
+        constructManifestSessionFromPlan
+          plan
+          defaultSessionOwnerOptions
+          $ \owner -> do
+              state <- sessionOwnerState owner
+              status <- sessionOwnerStatus owner
+              pure (state, status)
+      case result of
+        Left issue ->
+          assertFailure ("expected constructed owner, got: " <> show issue)
+        Right (state, status) -> do
+          ssGraph state @?= mrcTemplateGraph sendReturn
+          status @?= SessionOwnerReady
   ]
 
 catalogOrFail :: [Demo] -> IO [ManifestReloadCatalogEntry]

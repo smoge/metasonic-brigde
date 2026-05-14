@@ -128,6 +128,7 @@ stack exec -- metasonic-bridge [MODE] [DEMO ...]
 | `--authoring-manifest`        | Emit JSON manifest of authoring metadata      |
 | `--manifest-reload-plan DEMO` | Diagnose manifest reload planning             |
 | `--manifest-reload-plan-file MANIFEST.json DEMO` | Diagnose external manifest planning |
+| `--manifest-session-smoke MANIFEST.json DEMO` | Construct a fresh owner from a manifest |
 | `--midi-list`                 | List Q / PortMIDI devices                     |
 | `--session-midi-smoke [SECONDS]` | Probe session MIDI ingress without audio   |
 | `--plugin-list`               | Print the linked static plugin registry       |
@@ -182,6 +183,9 @@ stack exec -- metasonic-bridge --manifest-reload-plan send-return
 
 # Validate an external manifest JSON file against the built-in catalog
 stack exec -- metasonic-bridge --manifest-reload-plan-file manifest.json send-return
+
+# Construct a fresh non-audio session owner from an external manifest
+stack exec -- metasonic-bridge --manifest-session-smoke manifest.json send-return
 
 # Run the OSC control demo on UDP port 7000
 stack exec -- metasonic-bridge --osc-listen 7000
@@ -305,11 +309,14 @@ The landed pieces are deliberately small:
   control metadata, and emits a `CmdHotSwap` value for later install
   strategies. The CLI exposes `--manifest-reload-plan DEMO` for the built-in
   manifest document and `--manifest-reload-plan-file MANIFEST.json DEMO` for
-  diagnostic external JSON validation. Both are non-audio planning paths.
+  diagnostic external JSON validation. `--manifest-session-smoke
+  MANIFEST.json DEMO` then uses that plan to construct a fresh non-audio
+  `SessionOwner` and report status. These paths do not start audio, enqueue
+  producer commands, or execute `CmdHotSwap`.
 
 What is still intentionally absent: GUI toolkit bindings, live or
 host-level manifest-driven session reload/resource allocation beyond the
-diagnostic planning CLI, broader MIDI behavior beyond the landed
+diagnostic planning and construction-smoke CLI, broader MIDI behavior beyond the landed
 MIDI ingress surface (note/CC/sustain/pitch-bend/all-notes-off command
 translation, producer-local channel filtering, and the small
 PortMIDI-backed decoded source), broader OSC behavior beyond symbolic

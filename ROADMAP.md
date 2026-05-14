@@ -2861,7 +2861,10 @@ helper does not reload an existing owner, import an external
 manifest, step `CmdHotSwap`, migrate voices, interrupt audio,
 or choose a failure-recovery policy. In short:
 diagnostic external manifest input plus construction-time v1 are
-landed; stopped-audio/live reload policy remains gated.
+landed. `--manifest-session-smoke MANIFEST.json DEMO` now wires those
+together in the app: external JSON -> built-in catalog plan -> fresh
+`SessionOwner` construction/status summary. Stopped-audio/live reload
+policy remains gated.
 
 **Session Prep A** was the first non-runtime session-scoping
 slice: command/event vocabulary, OSC resolve-state rebuild, and
@@ -2927,8 +2930,10 @@ for already-decoded UI intents. The manifest-reload
 diagnostic/construction-time v1 described above lands after those ingress slices:
 the pure planner, app-owned catalog adapter, construction helper,
 tests, `--manifest-reload-plan`, and
-`--manifest-reload-plan-file` exist, while live owner reload and
-host-level reload/resource recovery policy remain future work.
+`--manifest-reload-plan-file` exist. The follow-up
+`--manifest-session-smoke` mode constructs a fresh owner from that plan
+without audio or `CmdHotSwap`; live owner reload and host-level
+reload/resource recovery policy remain future work.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2989,6 +2994,12 @@ Session prep artifacts:
   proves that path with owner/RTGraph smoke coverage; stopped-audio
   reload, preserving live hot-swap, host teardown/rebuild, and failure
   recovery remain separate future strategies.
+- [Manifest Session Construction Smoke](notes/2026-05-14-h-manifest-session-construction-smoke.md)
+  records the app-visible construction smoke. It reads an external
+  manifest JSON document, validates it through the built-in authored-demo
+  catalog, constructs a fresh `SessionOwner` from the resulting plan,
+  prints status, and exits without audio, producer drain, or `CmdHotSwap`
+  execution.
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-n-session-prep-a-contract.md)
   records the Haskell-only command/event vocabulary, pure OSC
   resolve-state rebuild helper, and read-only buffer/plugin lifecycle
@@ -3214,7 +3225,8 @@ Landed prep contracts:
   `MetaSonic.Session.ManifestReload` planner, app-owned demo catalog
   adapter, `constructManifestSessionFromPlan`,
   `--manifest-reload-plan DEMO`, `--manifest-reload-plan-file
-  MANIFEST.json DEMO`, and focused smoke coverage proving a
+  MANIFEST.json DEMO`, `--manifest-session-smoke MANIFEST.json DEMO`,
+  and focused smoke coverage proving a
   manifest-built owner can commit an ordinary voice start through the
   real owner/RTGraph path.
 - [x] Focused library tests pin the command adapter, resolve rebuild
@@ -3375,9 +3387,11 @@ external authoring manifest document before running the same planner and
 printer against the built-in catalog.
 `MetaSonic.Session.ManifestReload.Construct` adds only
 `constructManifestSessionFromPlan`, a construction-time helper for a
-fresh owner. This is not stopped-audio reload of an existing owner,
-preserving live hot-swap, or host-level resource policy or
-failure-recovery policy.
+fresh owner. `--manifest-session-smoke MANIFEST.json DEMO` now exposes
+that construction-time boundary in the CLI, reporting owner status and
+graph/resource facts after constructing a fresh non-audio owner. This
+is not stopped-audio reload of an existing owner, preserving live
+hot-swap, or host-level resource policy or failure-recovery policy.
 
 Still gated:
 
@@ -3411,7 +3425,8 @@ Still gated:
   reuse decision.
 - [ ] Stopped-audio/live manifest reload strategy and host-level resource
   allocation/recovery policy beyond the landed diagnostic planner,
-  external JSON validation CLI, and construction-time owner helper.
+  external JSON validation CLI, construction-time owner helper, and
+  construction-smoke CLI.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

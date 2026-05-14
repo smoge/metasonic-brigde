@@ -4,7 +4,8 @@ Date: 2026-05-14
 
 Status: implemented for the v1 construction-time helper and owner/RTGraph
 smoke coverage. This note remains the install-strategy design record for the
-first runtime-facing manifest slice.
+first runtime-facing manifest slice. The app-visible construction smoke is
+covered by `2026-05-14-h-manifest-session-construction-smoke.md`.
 
 ## Decision
 
@@ -174,6 +175,16 @@ The construction helper and smoke coverage have landed:
 That test proves planner output can cross the existing owner/adapter boundary.
 It does not start a live audio stream, depend on PortAudio, or claim reload
 semantics.
+
+The CLI now exposes the same construction-time boundary with:
+
+```text
+metasonic-bridge --manifest-session-smoke MANIFEST.json DEMO
+```
+
+That command reads an external manifest, plans against the built-in
+authored-demo catalog, constructs a fresh owner, prints status, and exits. It
+does not step `CmdHotSwap`, start audio, or reload an existing owner.
 
 The existing pure tests should continue to cover:
 
