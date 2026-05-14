@@ -2879,7 +2879,7 @@ claim. A follow-up
 `MetaSonic.Session.FanInService` slice adds the first scoped background
 drain worker around the fan-in host. A later
 `MetaSonic.Session.MIDIProducer` slice adds a Haskell-only adapter for
-already-decoded MIDI note-on/off, CC, and all-notes-off/reset events. A later
+already-decoded MIDI note-on/off, CC, and all-notes-off events. A later
 `MetaSonic.Session.MIDIListener` slice adds a decoded-source worker
 around that adapter. A later `MetaSonic.Session.MIDIPortMIDI` slice
 adds the first Q / PortMIDI-backed decoded source, but still does not
@@ -3187,12 +3187,12 @@ Landed prep contracts:
   note-on/off translation, note-on velocity-zero release semantics,
   configured frequency/gate/velocity initial controls, deterministic CC
   fanout over active notes, explicit invalid/unmapped rejection,
-  all-notes-off/reset translation, queue-full state retention,
+  all-notes-off translation, queue-full state retention,
   `ProducerMIDI` enqueue attribution, and composition through the
   scoped fan-in drain service. The MIDI
   listener tests cover blocked-source bracket cleanup, explicit
   end-of-input worker exit, producer rejection with continued event
-  processing, note-on/note-off and all-notes-off/reset state
+  processing, note-on/note-off and all-notes-off state
   transitions, queue-full state retention, blocked-hook teardown, and
   composition through the scoped fan-in drain service. The PortMIDI
   source tests cover deterministic invalid-device idle-open behavior
@@ -3214,7 +3214,7 @@ against a live runtime, or write the realtime control queue.
 
 Recent MIDI ingress follow-up: `MetaSonic.Session.MIDIProducer`
 translates already-decoded MIDI note-on, note-off, control-change, and
-all-notes-off/reset events into `CmdVoiceOn`, `CmdVoiceOff`, and
+all-notes-off events into `CmdVoiceOn`, `CmdVoiceOff`, and
 `CmdControlWrite` values with `ProducerMIDI` attribution. It can target
 a plain `SessionFanInHost` or a scoped `SessionFanInService`.
 `MetaSonic.Session.MIDIListener` brackets a worker over an injected

@@ -15308,6 +15308,61 @@ sessionMIDIProducerTests =
           assertFailure ("expected queue-full all-notes-off enqueue, got: "
                          <> show other)
 
+  , testCase "partial all-notes-off enqueue failure keeps producer state" $ do
+      let opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 3
+            }
+          active = MIDIProducerState
+            { mpsActiveNotes = M.fromList
+                [ ((1, 65), VoiceKey "m1-65")
+                , ((0, 72), VoiceKey "m0-72")
+                , ((0, 60), VoiceKey "m0-60")
+                ]
+            }
+          prefill =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  opts
+                  $ \host -> do
+                    _prefill <-
+                      enqueueSessionFanInCommand
+                        (testProducer ProducerTest "prefill")
+                        prefill
+                        host
+                    enq <- enqueueMIDIProducerEvent
+                             testMIDIProducerOptions
+                             active
+                             (MIDIProducerAllNotesOff Nothing)
+                             host
+                    snapshot <- readSessionFanInHost host
+                    pure (enq, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (MIDIProducerEnqueueAttempted batch [enq0, enq1, enq2],
+               snapshot) -> do
+          mpcbState batch @?= active
+          mpcbCommands batch @?=
+            [ CmdVoiceOff (VoiceKey "m0-60")
+            , CmdVoiceOff (VoiceKey "m0-72")
+            , CmdVoiceOff (VoiceKey "m1-65")
+            ]
+          q0 <- fanInQueuedOrFail enq0
+          q1 <- fanInQueuedOrFail enq1
+          qscCommand q0 @?= CmdVoiceOff (VoiceKey "m0-60")
+          qscCommand q1 @?= CmdVoiceOff (VoiceKey "m0-72")
+          sfierResult enq2
+            @?= SessionEnqueueRejected
+                  (midiProducerId testMIDIProducerOptions)
+                  (CmdVoiceOff (VoiceKey "m1-65"))
+                  (SeiQueueFull 3)
+          sfisQueueDepth snapshot @?= 3
+        Right other ->
+          assertFailure
+            ("expected partial all-notes-off enqueue failure, got: "
+             <> show other)
+
   , testCase "service host wakes worker for MIDI note-on" $ do
       drainedVar <- newEmptyMVar
       result <-
@@ -15591,7 +15646,7 @@ sessionMIDIListenerTests =
           assertFailure ("expected note-on/note-off listener results, got: "
                          <> show other)
 
-  , testCase "listener state follows all-notes-off reset" $ do
+  , testCase "listener state follows all-notes-off" $ do
       events <- newEmptyMVar
       producerResults <- newEmptyMVar
       let source = midiMVarSource events
@@ -15614,17 +15669,18 @@ sessionMIDIListenerTests =
                     putMVar events (Just (MIDIProducerNoteOn 0 69 100))
                     mOn <- timeout 1000000 (takeMVar producerResults)
                     putMVar events (Just (MIDIProducerAllNotesOff Nothing))
-                    mReset <- timeout 1000000 (takeMVar producerResults)
-                    stateAfterReset <-
+                    mAllNotesOff <- timeout 1000000
+                                      (takeMVar producerResults)
+                    stateAfterAllNotesOff <-
                       MIDIS.readSessionMIDIListenerState listener
                     snapshot <- readSessionFanInHost host
-                    pure (mOn, mReset, stateAfterReset, snapshot)
+                    pure (mOn, mAllNotesOff, stateAfterAllNotesOff, snapshot)
       case result of
         Left issue ->
           assertFailure ("expected fan-in host, got: " <> show issue)
         Right (Just (MIDIProducerEnqueueAttempted _ [onEnq]),
-               Just (MIDIProducerEnqueueAttempted resetBatch [offEnq]),
-               stateAfterReset,
+               Just (MIDIProducerEnqueueAttempted offBatch [offEnq]),
+               stateAfterAllNotesOff,
                snapshot) -> do
           onQueued <- fanInQueuedOrFail onEnq
           offQueued <- fanInQueuedOrFail offEnq
@@ -15636,13 +15692,14 @@ sessionMIDIListenerTests =
                   , (midiGateTag, 1.0)
                   , (midiVelocityTag, 100.0 / 127.0)
                   ]
-          mpcbCommands resetBatch @?= [CmdVoiceOff (VoiceKey "m0-69")]
+          mpcbCommands offBatch @?= [CmdVoiceOff (VoiceKey "m0-69")]
           qscCommand offQueued @?= CmdVoiceOff (VoiceKey "m0-69")
-          mpsActiveNotes stateAfterReset @?= M.empty
+          mpsActiveNotes stateAfterAllNotesOff @?= M.empty
           sfisQueueDepth snapshot @?= 2
         Right other ->
-          assertFailure ("expected note-on/reset listener results, got: "
-                         <> show other)
+          assertFailure
+            ("expected note-on/all-notes-off listener results, got: "
+             <> show other)
 
   , testCase "queue-full rejection does not advance listener state" $ do
       let fanInOpts = defaultSessionFanInOptions

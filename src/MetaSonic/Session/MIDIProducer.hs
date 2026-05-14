@@ -8,7 +8,7 @@
 --
 -- This module defines a narrow, protocol-neutral MIDI producer above
 -- 'MetaSonic.Session.FanIn'. It translates decoded MIDI note, CC, and
--- all-notes-off/reset events into symbolic 'SessionCommand's, then
+-- all-notes-off events into symbolic 'SessionCommand's, then
 -- submits them as 'ProducerMIDI'.
 --
 -- It deliberately does not open PortMIDI devices, own a listener

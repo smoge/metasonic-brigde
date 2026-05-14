@@ -269,7 +269,7 @@ The landed pieces are deliberately small:
   producer. It only parses and enqueues; draining is owned by the caller or by
   a composed `MetaSonic.Session.FanInService`.
 - `MetaSonic.Session.MIDIProducer` translates already-decoded MIDI note-on,
-  note-off, control-change, and all-notes-off/reset events into session
+  note-off, control-change, and all-notes-off events into session
   commands with `ProducerMIDI` identity, including per-note producer state,
   configurable note/CC mappings, and deterministic producer-local voice stops.
 - `MetaSonic.Session.MIDIListener` brackets a worker around an injected

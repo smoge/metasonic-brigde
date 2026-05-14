@@ -11,7 +11,7 @@ the existing FIFO fan-in queue.
 ## Landed Scope
 
 - `MetaSonic.Session.MIDIProducer` defines decoded note-on, note-off,
-  control-change, and all-notes-off/reset events for the session path.
+  control-change, and all-notes-off events for the session path.
 - `decodeMIDISessionCommands` translates note-on into `CmdVoiceOn`,
   note-off into `CmdVoiceOff`, velocity-zero note-on into note-off, and
   mapped CC into deterministic `CmdControlWrite` fanout over active
@@ -45,7 +45,7 @@ the existing FIFO fan-in queue.
 
 The tests cover note-on/off translation, velocity-zero release,
 configured initial controls, deterministic CC fanout, invalid data and
-unmapped-CC rejection, deterministic all-notes-off/reset translation,
+unmapped-CC rejection, deterministic all-notes-off translation,
 successful `ProducerMIDI` enqueue attribution, queue-full state
-retention for note starts and resets, and composition through a scoped
+retention for note starts and all-notes-off, and composition through a scoped
 `MetaSonic.Session.FanInService` drain worker.
