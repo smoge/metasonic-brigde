@@ -229,6 +229,25 @@ above fan-in, using a small pure policy function or wrapper:
    policy.
 9. Add smoke diagnostics if a live policy is enabled by configuration.
 
+## Deferred Work
+
+The following items are recorded as use-case-gated questions, not the
+next implementation step:
+
+- Gateway policy mutation API. Claim release, claim replacement, and
+  owner clearing should wait for a concrete live policy owner that needs
+  mutation after gateway construction.
+- Gateway lock-span two-phase split. `SessionArbitrationGateway`
+  currently holds its policy `MVar` across policy decision, fan-in
+  enqueue, and policy update so accepted ownership updates follow the
+  same order as admitted fan-in commands. Splitting into
+  snapshot/enqueue/update phases stays deferred until smoke output or a
+  dedicated contention benchmark shows caller-visible lock wait.
+- Voice-lifecycle ownership clearing. `CmdVoiceOff` does not clear
+  `ProducerPriority` owner entries today; changing that should wait for
+  a concrete policy decision about deterministic `VoiceKey` reuse,
+  release semantics, and hot-swap behavior.
+
 ## Open Questions
 
 - Which component owns policy configuration: session options, authoring

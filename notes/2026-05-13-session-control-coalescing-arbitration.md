@@ -203,6 +203,18 @@ measured stream and the saturation target above to choose the smallest
 flush cadence that reduces queue submissions without weakening fan-in
 FIFO or fence semantics.
 
+## Deferred Work
+
+The following items are explicitly not the next implementation step:
+
+- Queue-level coalescing stays deferred. Coalescing remains
+  producer-local; `Session.Queue` and `Session.FanIn` keep strict FIFO
+  semantics for commands that are actually submitted.
+- MIDI listener two-phase MVar flush locking stays deferred until smoke
+  output or a dedicated contention benchmark shows caller-visible lock
+  wait or pending buildup that the current single-MVar path cannot
+  handle.
+
 ## Open Questions
 
 - Whether non-MIDI producers should use the MIDI listener's hybrid

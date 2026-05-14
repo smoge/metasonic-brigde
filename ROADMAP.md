@@ -3306,8 +3306,9 @@ Still gated:
   beyond the landed symbolic control-write path.
 - [ ] Producer-specific throttling/coalescing beyond the landed MIDI
   listener-local control coalescer, MVar flush-lock optimization for
-  the landed MIDI coalescer without contention evidence, and drain
-  scheduling beyond the scoped wake-on-enqueue fan-in service. The
+  the landed MIDI coalescer without contention evidence, queue-level
+  coalescing, and drain scheduling beyond the scoped wake-on-enqueue
+  fan-in service. The
   design constraints are recorded in
   [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
   and
@@ -3321,6 +3322,10 @@ Still gated:
   enqueue path, and explicit OSC producer helper. The policy boundary is
   recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
+- [ ] Arbitration policy mutation API and voice-lifecycle ownership
+  clearing. These remain use-case gated; do not implement them ahead of
+  a concrete live policy owner, release signal, or hot-swap/voice-key
+  reuse decision.
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
