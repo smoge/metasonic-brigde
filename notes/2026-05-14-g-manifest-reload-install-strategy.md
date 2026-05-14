@@ -125,7 +125,8 @@ V1 construction-time install must not implement:
 - failure recovery for partial installs;
 - concurrent-session install or multi-producer install arbitration;
 - background queue drain or producer lifecycle ownership;
-- CLI manifest import or app-level catalog selection.
+- CLI manifest import that installs or reloads a runtime owner;
+- app-level catalog selection beyond the built-in diagnostic catalog.
 
 These are not rejected as future features. They are separate strategies with
 different contracts.

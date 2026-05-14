@@ -67,6 +67,29 @@ appDemoCatalogTests =
           assertFailure ("expected manifest reload plan, got: " <> show issue)
         Right plan ->
           mrlpTemplateGraph plan @?= mrcTemplateGraph sendReturn
+
+  , testCase "external manifest JSON plans through built-in catalog" $ do
+      catalog <- catalogOrFail demoTable
+      sendReturn <- entryOrFail "send-return" catalog
+      let exportedDoc =
+            AuthoringManifestDoc
+              manifestSchemaVersion
+              [mrcManifest sendReturn]
+          request = ManifestReloadRequest
+            { mrrDemoKey        = "send-return"
+            , mrrSwapLabel      = SwapLabel "external-json"
+            , mrrResourcePolicy = defaultManifestResourcePolicy
+            }
+      decodedDoc <-
+        case decodeManifestDoc (encodeManifestDoc exportedDoc) of
+          Left err  -> assertFailure ("expected decoded manifest: " <> err)
+          Right doc -> pure doc
+      case planManifestReload decodedDoc catalog request of
+        Left issue ->
+          assertFailure ("expected external manifest reload plan, got: " <> show issue)
+        Right plan -> do
+          mrlpDemoKey plan @?= "send-return"
+          mrlpTemplateGraph plan @?= mrcTemplateGraph sendReturn
   ]
 
 catalogOrFail :: [Demo] -> IO [ManifestReloadCatalogEntry]

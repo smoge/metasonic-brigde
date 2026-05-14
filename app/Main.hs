@@ -4,7 +4,8 @@
 module Main where
 
 import           Control.DeepSeq            (force)
-import           Control.Exception          (evaluate, finally)
+import           Control.Exception          (IOException, evaluate, finally,
+                                             try)
 import           Control.Monad              (forM_, replicateM)
 import           Data.Bifunctor             (first)
 import           Data.Char                  (isDigit, toLower)
@@ -18,6 +19,7 @@ import           System.Exit                (die)
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
 import qualified Data.ByteString.Lazy.Char8  as BL
 import           MetaSonic.Authoring.Manifest (AuthoringManifestDoc (..),
+                                                 decodeManifestDoc,
                                                  encodeManifestDoc,
                                                  manifestFromReport,
                                                  manifestSchemaVersion)
@@ -140,11 +142,22 @@ data RunMode
     -- static plan/control/resource projection. It does not allocate
     -- an RTGraph, start audio, enqueue a command, or claim live
     -- reload semantics.
+  | ManifestReloadFileDiagnostic
+    -- ^ Non-audio diagnostic mode
+    -- (--manifest-reload-plan-file MANIFEST.json DEMO). Reads an
+    -- external authoring manifest document, validates the selected demo
+    -- against the built-in authored-demo catalog, and prints the same
+    -- static plan/control/resource projection. It does not allocate an
+    -- RTGraph, start audio, enqueue a command, or claim live reload
+    -- semantics.
   deriving (Eq, Show)
 
 data Options = Options
   { optMode    :: RunMode
   , optTargets :: [String]
+  , optManifestReloadFile :: Maybe FilePath
+    -- ^ External authoring manifest JSON path for
+    -- --manifest-reload-plan-file.
   , optFused   :: Bool
     -- ^ When True, demos load through 'loadRuntimeGraphFused' /
     -- 'loadTemplateGraphFused' on a 'compileRuntimeGraphFused'-
@@ -171,6 +184,7 @@ defaultOptions :: Options
 defaultOptions = Options
   { optMode    = AudioOnly
   , optTargets = []
+  , optManifestReloadFile = Nothing
   , optFused   = False
   , optOscPort = 7000
   , optMidiDevice = Nothing
@@ -211,6 +225,15 @@ parseArgs = go defaultOptions
       go opts { optMode = AuthoringManifest } xs
     go opts ("--manifest-reload-plan" : xs) =
       go opts { optMode = ManifestReloadDiagnostic } xs
+    go opts ("--manifest-reload-plan-file" : path : xs)
+      | null path || "--" `prefixOf` path =
+          Left "Missing manifest JSON file for --manifest-reload-plan-file"
+      | otherwise =
+          go opts { optMode = ManifestReloadFileDiagnostic
+                  , optManifestReloadFile = Just path
+                  } xs
+    go _ ("--manifest-reload-plan-file" : []) =
+      Left "Missing manifest JSON file for --manifest-reload-plan-file"
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -348,6 +371,7 @@ usage prog = unlines
   , "  " <> prog <> " --snapshot-check"
   , "  " <> prog <> " --authoring-manifest [DEMO ...]"
   , "  " <> prog <> " --manifest-reload-plan DEMO"
+  , "  " <> prog <> " --manifest-reload-plan-file MANIFEST.json DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
   , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
@@ -433,6 +457,15 @@ usage prog = unlines
   , "                   polyphony, control surface, arbitration policy, and"
   , "                   CmdHotSwap projection. No audio, no RTGraph"
   , "                   allocation, no live reload."
+  , "  --manifest-reload-plan-file MANIFEST.json DEMO"
+  , "                   Diagnostic-only external manifest planning path."
+  , "                   Reads MANIFEST.json as an AuthoringManifestDoc,"
+  , "                   validates the selected DEMO against the built-in"
+  , "                   authored-demo reload catalog, then prints the same"
+  , "                   template/resource/control/arbitration/CmdHotSwap"
+  , "                   diagnostic as --manifest-reload-plan. No audio,"
+  , "                   no RTGraph allocation, no command enqueue, no live"
+  , "                   reload."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
@@ -491,6 +524,7 @@ usage prog = unlines
   , "  " <> prog <> " --midi-device 2 --session-midi-smoke 10"
   , "  " <> prog <> " --session-osc-arbitration-smoke 10"
   , "  " <> prog <> " --manifest-reload-plan send-return"
+  , "  " <> prog <> " --manifest-reload-plan-file manifest.json send-return"
   ]
 
 --------------------------------------------------------------------------------
@@ -561,8 +595,23 @@ main = do
       demos <- resolveSelectedDemos
       runAuthoringManifest demos
     ManifestReloadDiagnostic -> do
-      demo <- either die pure (resolveManifestReloadDiagnosticTarget opts)
+      demo <- either die pure $
+        resolveManifestReloadDiagnosticTarget
+          "--manifest-reload-plan"
+          "--manifest-reload-plan DEMO_KEY"
+          opts
       runManifestReloadDiagnostic demo
+    ManifestReloadFileDiagnostic -> do
+      manifestPath <- maybe
+        (die "Missing manifest JSON file for --manifest-reload-plan-file")
+        pure
+        (optManifestReloadFile opts)
+      demo <- either die pure $
+        resolveManifestReloadDiagnosticTarget
+          "--manifest-reload-plan-file"
+          "--manifest-reload-plan-file MANIFEST.json DEMO_KEY"
+          opts
+      runManifestReloadFileDiagnostic manifestPath demo
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -609,8 +658,12 @@ runAuthoringManifest demos = do
 -- app-owned catalog, expected manifest document, pure reload plan, and
 -- runtime projection. It deliberately stops before allocating an RTGraph
 -- or installing the projected command.
-resolveManifestReloadDiagnosticTarget :: Options -> Either String Demo
-resolveManifestReloadDiagnosticTarget opts =
+resolveManifestReloadDiagnosticTarget
+  :: String
+  -> String
+  -> Options
+  -> Either String Demo
+resolveManifestReloadDiagnosticTarget flagName usageShape opts =
   case optTargets opts of
     [target] -> do
       demo <- first formatResolveError (resolveTargets [target]) >>= oneDemo
@@ -620,17 +673,17 @@ resolveManifestReloadDiagnosticTarget opts =
         Nothing ->
           Left $
             "Demo '" <> demoKey demo <> "' has no authoring metadata; "
-            <> "--manifest-reload-plan requires an authored demo."
+            <> flagName <> " requires an authored demo."
             <> "\nAuthored demos: "
             <> intercalate ", " authoredDemoKeys
     [] ->
       Left $
-        "Specify exactly one demo: --manifest-reload-plan DEMO_KEY"
+        "Specify exactly one demo: " <> usageShape
         <> "\nAuthored demos: "
         <> intercalate ", " authoredDemoKeys
     targets ->
       Left $
-        "Specify exactly one demo for --manifest-reload-plan; got "
+        "Specify exactly one demo for " <> flagName <> "; got "
         <> show (length targets)
         <> ": "
         <> intercalate ", " targets
@@ -646,8 +699,7 @@ resolveManifestReloadDiagnosticTarget opts =
     oneDemo demos =
       Left $
         "Internal error: target resolution produced "
-        <> show (length demos)
-        <> " demos for --manifest-reload-plan."
+        <> show (length demos) <> " demos for " <> flagName <> "."
 
     formatResolveError err =
       err <> "\nAuthored demos: " <> intercalate ", " authoredDemoKeys
@@ -659,7 +711,35 @@ runManifestReloadDiagnostic demo = do
         { docSchemaVersion = manifestSchemaVersion
         , docDemos         = map MR.mrcManifest catalog
         }
-      request = MR.ManifestReloadRequest
+  runManifestReloadDiagnosticWithDoc doc catalog demo
+
+runManifestReloadFileDiagnostic :: FilePath -> Demo -> IO ()
+runManifestReloadFileDiagnostic path demo = do
+  doc <- readManifestReloadDoc path
+  catalog <- either die pure (demoManifestReloadCatalog demoTable)
+  runManifestReloadDiagnosticWithDoc doc catalog demo
+
+readManifestReloadDoc :: FilePath -> IO AuthoringManifestDoc
+readManifestReloadDoc path = do
+  readResult <- try (BL.readFile path)
+  bytes <- case (readResult :: Either IOException BL.ByteString) of
+    Left err ->
+      die $ "Failed to read manifest file '" <> path <> "': " <> show err
+    Right bs ->
+      pure bs
+  case decodeManifestDoc bytes of
+    Left err ->
+      die $ "Failed to decode manifest file '" <> path <> "': " <> err
+    Right doc ->
+      pure doc
+
+runManifestReloadDiagnosticWithDoc
+  :: AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> Demo
+  -> IO ()
+runManifestReloadDiagnosticWithDoc doc catalog demo = do
+  let request = MR.ManifestReloadRequest
         { MR.mrrDemoKey        = demoKey demo
         , MR.mrrSwapLabel      = SwapLabel ("manifest:" <> demoKey demo)
         , MR.mrrResourcePolicy = MR.defaultManifestResourcePolicy
@@ -819,7 +899,8 @@ runDemo opts demo
     || optMode opts == SessionOscArbitrationSmoke
     || optMode opts == PluginList
     || optMode opts == AuthoringManifest
-    || optMode opts == ManifestReloadDiagnostic =
+    || optMode opts == ManifestReloadDiagnostic
+    || optMode opts == ManifestReloadFileDiagnostic =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -896,6 +977,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: AuthoringManifest should be handled by main, never reach here"
     ManifestReloadDiagnostic ->
       error "runSingleDemo: ManifestReloadDiagnostic should be handled by main, never reach here"
+    ManifestReloadFileDiagnostic ->
+      error "runSingleDemo: ManifestReloadFileDiagnostic should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare

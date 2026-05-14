@@ -2,8 +2,8 @@
 
 Date: 2026-05-14
 
-Status: implemented for the pure planner and v1 construction-time session
-setup. This note remains the design record for
+Status: implemented for the pure planner, diagnostic external JSON input, and
+v1 construction-time session setup. This note remains the design record for
 `MetaSonic.Session.ManifestReload`; runtime install strategy is covered by
 `2026-05-14-g-manifest-reload-install-strategy.md`.
 
@@ -56,7 +56,9 @@ The implemented planner answers only the first two questions, purely.
 
 ## Non-Goals
 
-- No manifest import CLI.
+- No manifest import CLI that installs, reloads, or owns a session. The
+  external-manifest CLI path is diagnostic only: it decodes JSON, plans, and
+  prints the plan without touching a runtime owner.
 - No runtime owner changes inside the pure planner.
 - No `RTGraph` allocation or `withSessionOwner` wrapper inside the pure
   planner.
@@ -295,6 +297,17 @@ The construction-time helper now uses the plan to build a fresh owner through
 `MetaSonic.Session.ManifestReload.Construct`. It does not step `CmdHotSwap` or
 claim live reload semantics.
 
+The diagnostic external input path has also landed:
+
+```text
+metasonic-bridge --manifest-reload-plan-file MANIFEST.json DEMO
+```
+
+It reads `MANIFEST.json` as an `AuthoringManifestDoc`, validates the selected
+demo against the built-in authored-demo catalog, and prints the same plan as
+`--manifest-reload-plan`. It deliberately stops before owner allocation,
+command enqueue, or any install/reload strategy.
+
 Future product/runtime layers must still decide whether a reload entrypoint is:
 
 - construction-time only;
@@ -327,6 +340,8 @@ any of them.
 - `constructManifestSessionFromPlan` brackets a fresh owner from a plan;
 - a manifest-built owner can commit an ordinary `CmdVoiceOn` through the real
   owner/RTGraph adapter path.
+- external manifest JSON exported by `--authoring-manifest` can decode and
+  plan against the built-in authored-demo catalog.
 
 The runtime-facing tests are intentionally construction-time smoke tests. They
 do not start live audio or claim reload semantics.
@@ -340,5 +355,6 @@ For future runtime or CLI integration, the design should still satisfy:
 - The planner is pure and deterministic.
 - Resource-policy rejection happens before runtime.
 - FIFO producer behavior remains unchanged by default.
+- External manifest CLI input remains diagnostic-only.
 - The plan contains enough information for a later owner/hot-swap adapter but
   does not choose that runtime path itself.

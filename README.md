@@ -126,6 +126,8 @@ stack exec -- metasonic-bridge [MODE] [DEMO ...]
 | `--fusion-cost-lab [--summary]` | Measure fusion variants and equivalence     |
 | `--snapshot-check`            | Run survey / cost-lab invariant checks        |
 | `--authoring-manifest`        | Emit JSON manifest of authoring metadata      |
+| `--manifest-reload-plan DEMO` | Diagnose manifest reload planning             |
+| `--manifest-reload-plan-file MANIFEST.json DEMO` | Diagnose external manifest planning |
 | `--midi-list`                 | List Q / PortMIDI devices                     |
 | `--session-midi-smoke [SECONDS]` | Probe session MIDI ingress without audio   |
 | `--plugin-list`               | Print the linked static plugin registry       |
@@ -174,6 +176,12 @@ stack exec -- metasonic-bridge --snapshot-check
 
 # Emit a JSON manifest of authoring metadata for one demo
 stack exec -- metasonic-bridge --authoring-manifest send-return
+
+# Print the built-in diagnostic reload plan for an authored demo
+stack exec -- metasonic-bridge --manifest-reload-plan send-return
+
+# Validate an external manifest JSON file against the built-in catalog
+stack exec -- metasonic-bridge --manifest-reload-plan-file manifest.json send-return
 
 # Run the OSC control demo on UDP port 7000
 stack exec -- metasonic-bridge --osc-listen 7000
@@ -292,9 +300,16 @@ The landed pieces are deliberately small:
 - `MetaSonic.Session.UIProducer` translates already-decoded UI intents into
   session commands with `ProducerUI` identity, rejecting non-finite UI control
   values before they enter the fan-in queue.
+- `MetaSonic.Session.ManifestReload` validates decoded authoring manifests
+  against a caller-owned catalog, derives static resource policy, projects
+  control metadata, and emits a `CmdHotSwap` value for later install
+  strategies. The CLI exposes `--manifest-reload-plan DEMO` for the built-in
+  manifest document and `--manifest-reload-plan-file MANIFEST.json DEMO` for
+  diagnostic external JSON validation. Both are non-audio planning paths.
 
-What is still intentionally absent: GUI toolkit bindings, manifest-driven
-session reload/resource allocation, broader MIDI behavior beyond the landed
+What is still intentionally absent: GUI toolkit bindings, live or
+host-level manifest-driven session reload/resource allocation beyond the
+diagnostic planning CLI, broader MIDI behavior beyond the landed
 MIDI ingress surface (note/CC/sustain/pitch-bend/all-notes-off command
 translation, producer-local channel filtering, and the small
 PortMIDI-backed decoded source), broader OSC behavior beyond symbolic
