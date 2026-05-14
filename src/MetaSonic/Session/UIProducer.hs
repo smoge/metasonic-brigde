@@ -9,7 +9,9 @@
 -- This module defines the narrow UI producer bridge for the generic
 -- session fan-in host. It consumes already-decoded UI intents, checks
 -- only the producer-local value shape, converts them to
--- 'SessionCommand's, and submits them as 'ProducerUI'.
+-- 'SessionCommand's, and submits them as 'ProducerUI'. Callers can
+-- either submit to a plain fan-in host or explicitly choose the
+-- service-owned arbitration path.
 --
 -- It deliberately doesn't implement a GUI toolkit binding, read an
 -- authoring manifest, authorize commands, drain the session host, or
@@ -32,7 +34,9 @@ module MetaSonic.Session.UIProducer
 
     -- * Fan-in submission
   , UIProducerEnqueueResult (..)
+  , UIProducerArbitratedEnqueueResult (..)
   , enqueueUIProducerIntent
+  , enqueueArbitratedUIProducerIntent
   ) where
 
 import           Control.DeepSeq            (NFData)
@@ -44,9 +48,14 @@ import           MetaSonic.Bridge.Templates (TemplateGraph)
 import           MetaSonic.Pattern          (ControlTag, SwapLabel,
                                              TemplateName, Value, VoiceKey)
 import           MetaSonic.Session.Command  (SessionCommand (..))
+import           MetaSonic.Session.ArbitrationGateway
+                                             (SessionArbitrationGatewayEnqueueResult)
 import           MetaSonic.Session.FanIn    (SessionFanInEnqueueResult,
                                              SessionFanInHost,
                                              enqueueSessionFanInCommand)
+import           MetaSonic.Session.FanInService
+                                             (SessionFanInService,
+                                              enqueueArbitratedSessionFanInServiceCommand)
 import           MetaSonic.Session.Queue    (ProducerId (..),
                                              ProducerKind (ProducerUI))
 
@@ -97,6 +106,21 @@ data UIProducerEnqueueResult
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
+-- | Result of translating and enqueueing one UI intent through the
+-- explicitly arbitrated service path.
+data UIProducerArbitratedEnqueueResult
+  = UIProducerArbitratedRejected !UIProducerIssue
+    -- ^ The UI intent failed producer-local shape checks, so no
+    -- command was submitted to the service.
+  | UIProducerArbitratedEnqueueAttempted
+      !SessionCommand
+      !SessionArbitrationGatewayEnqueueResult
+    -- ^ The intent decoded to a command and was passed to the
+    -- service-owned arbitration path. Inspect the nested result for
+    -- policy rejection, queue-full, or accepted-command details.
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
 -- | Producer identity used for commands emitted by this adapter.
 uiProducerId :: UIProducerOptions -> ProducerId
 uiProducerId opts =
@@ -138,6 +162,10 @@ decodeUISessionCommand intent = case intent of
 --
 -- This function only enqueues. It deliberately does not drain the host
 -- or perform runtime target resolution; callers choose those policies.
+-- Callers using a 'SessionFanInService' with a configured arbitration
+-- gateway should switch to 'enqueueArbitratedUIProducerIntent' for
+-- consistent policy enforcement; calling this function with a
+-- service-derived host bypasses the configured gateway.
 enqueueUIProducerIntent
   :: UIProducerOptions
   -> UIProducerIntent
@@ -151,6 +179,32 @@ enqueueUIProducerIntent opts intent host =
       result <-
         enqueueSessionFanInCommand (uiProducerId opts) command host
       pure (UIProducerEnqueueAttempted command result)
+
+-- | Decode and submit one UI intent to the explicit service-owned
+-- arbitration path.
+--
+-- Existing UI producers should keep using 'enqueueUIProducerIntent'
+-- unless the surrounding session deliberately opts into
+-- 'SessionFanInService' arbitration. With default service options this
+-- still preserves FIFO behavior; with configured gateway options, policy
+-- rejection is surfaced through the nested
+-- 'SessionArbitrationGatewayEnqueueResult' and the service issue hook.
+enqueueArbitratedUIProducerIntent
+  :: UIProducerOptions
+  -> UIProducerIntent
+  -> SessionFanInService
+  -> IO UIProducerArbitratedEnqueueResult
+enqueueArbitratedUIProducerIntent opts intent service =
+  case decodeUISessionCommand intent of
+    Left issue ->
+      pure (UIProducerArbitratedRejected issue)
+    Right command -> do
+      result <-
+        enqueueArbitratedSessionFanInServiceCommand
+          (uiProducerId opts)
+          command
+          service
+      pure (UIProducerArbitratedEnqueueAttempted command result)
 
 finiteValue :: Value -> Bool
 finiteValue value =

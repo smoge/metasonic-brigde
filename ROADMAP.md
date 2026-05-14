@@ -3279,10 +3279,10 @@ FIFO.
 Recent UI ingress follow-up: `MetaSonic.Session.UIProducer` translates
 already-decoded UI intents into `CmdVoiceOn`, `CmdVoiceOff`,
 `CmdControlWrite`, and `CmdHotSwap` values with `ProducerUI`
-attribution. It can target a plain `SessionFanInHost` or a scoped
-`SessionFanInService`, but it does not bind to a GUI toolkit, read or
-reload an authoring manifest, authorize commands, or add arbitration
-beyond FIFO.
+attribution. It can target a plain `SessionFanInHost`, a scoped
+`SessionFanInService` raw FIFO path, or the explicit service-owned
+arbitration path. It still does not bind to a GUI toolkit, read or
+reload an authoring manifest, or authorize commands.
 
 Recent arbitration follow-up: `MetaSonic.Session.Arbitration` provides
 the pure policy surface for `FifoOnly`, producer-priority, and
@@ -3301,8 +3301,10 @@ service-backed listener wrapper over that helper; their existing
 host-based paths remain FIFO. `--session-osc-arbitration-smoke` now
 exercises that opt-in OSC listener path with a `TargetClaim` policy and
 prints listener/service arbitration rejection counters for a non-audio
-manual probe. Existing live paths are not routed through arbitration
-unless a caller explicitly chooses that wrapper/path.
+manual probe. `MetaSonic.Session.UIProducer` also exposes an explicit
+arbitrated service enqueue helper for already-decoded UI intents.
+Existing live paths are not routed through arbitration unless a caller
+explicitly chooses that wrapper/path.
 
 Still gated:
 
@@ -3324,10 +3326,10 @@ Still gated:
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
-- [ ] MIDI, UI, and Pattern live coexistence/arbitration wiring beyond
+- [ ] MIDI and Pattern live coexistence/arbitration wiring beyond
   the landed opt-in gateway, service-owned arbitrated enqueue path,
-  explicit OSC producer helper, and opt-in OSC listener path. The policy
-  boundary is recorded in
+  explicit OSC producer helper, opt-in OSC listener path, and explicit
+  UI producer helper. The policy boundary is recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] Arbitration policy mutation API and voice-lifecycle ownership
   clearing. These remain use-case gated; do not implement them ahead of

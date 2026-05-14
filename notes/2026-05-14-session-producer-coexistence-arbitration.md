@@ -3,8 +3,9 @@
 Status: pure policy, optional gateway, service-owned opt-in gateway,
 service-level rejection observability, the explicit OSC producer service
 path, the opt-in OSC listener service path, and the non-audio OSC
-arbitration smoke diagnostics landed. This note records the arbitration
-boundary after MIDI listener-local coalescing. It does not change
+arbitration smoke diagnostics landed. The explicit UI producer service
+path has also landed. This note records the arbitration boundary after
+MIDI listener-local coalescing. It does not change
 `MetaSonic.Session.Queue` or `MetaSonic.Session.FanIn`; concrete
 producer/listener paths keep FIFO behavior unless a caller explicitly
 routes them through `MetaSonic.Session.ArbitrationGateway` or the
@@ -56,6 +57,9 @@ different user intents even when they write the same logical target.
   that routes decoded packets through the explicit OSC producer
   service path. Its existing host-based listener remains the default
   FIFO behavior.
+- `Session.UIProducer` has an explicit arbitrated service enqueue
+  helper for already-decoded UI intents. Its existing host-based enqueue
+  path remains the default FIFO behavior.
 - `--session-osc-arbitration-smoke` exercises the opt-in OSC listener
   service path with a configured `TargetClaim` policy and reports both
   listener-level and service-level arbitration rejection counters. It is
@@ -216,9 +220,9 @@ above fan-in, using a small pure policy function or wrapper:
   owner state.
 - A service-owned gateway rejection reports `SfsiiArbitrationRejected`
   without waking the drain worker.
-- The explicit OSC producer and listener service paths default to FIFO
-  behavior and report service-owned policy rejection when a
-  non-`FifoOnly` gateway is configured.
+- The explicit OSC producer/listener and UI producer service paths
+  default to FIFO behavior and report service-owned policy rejection
+  when a non-`FifoOnly` gateway is configured.
 
 ## Implementation Sequence
 
@@ -241,9 +245,10 @@ above fan-in, using a small pure policy function or wrapper:
 8. Wire one concrete listener path through the service-owned gateway
    while keeping default behavior FIFO. Done:
    `withArbitratedSessionOSCListener`.
-9. Wire additional MIDI, UI, or Pattern producer/listener
-   paths only when configuration can explicitly enable a non-FIFO
-   policy.
+9. Wire additional MIDI, UI, or Pattern producer/listener paths only
+   when configuration can explicitly enable a non-FIFO policy. Done for
+   UI producer: `enqueueArbitratedUIProducerIntent`. MIDI and Pattern
+   remain gated.
 10. Add smoke diagnostics if a live policy is enabled by configuration.
     Done: `--session-osc-arbitration-smoke` binds the opt-in
     arbitrated OSC listener path with a `TargetClaim` policy and reports
@@ -272,9 +277,9 @@ next implementation step:
 
 - Which component owns policy configuration: session options, authoring
   manifest, or a higher UI/runtime supervisor?
-- Which additional MIDI, UI, or Pattern producer/listener path should
-  next route through the service-owned gateway when a live non-FIFO
-  policy is enabled?
+- Which additional MIDI or Pattern producer/listener path should next
+  route through the service-owned gateway when a live non-FIFO policy is
+  enabled?
 - Should a default non-FIFO policy ever exist, or should all arbitration
   be opt-in?
 - Should multi-policy composition, such as target-claim precedence with
