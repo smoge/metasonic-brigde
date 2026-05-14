@@ -159,6 +159,8 @@ tests:
       - MetaSonic.Spec.Feature
       - MetaSonic.Spec.PatternOSCBuffer
       - MetaSonic.Spec.Session
+      - MetaSonic.Spec.SessionMIDI
+      - MetaSonic.Spec.SessionShared
     ghc-options:
       - -threaded
     dependencies:

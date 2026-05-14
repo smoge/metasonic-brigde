@@ -13,6 +13,7 @@ import           MetaSonic.Spec.FFI
 import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session
+import           MetaSonic.Spec.SessionMIDI
 
 main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
