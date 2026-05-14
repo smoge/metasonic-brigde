@@ -15386,17 +15386,27 @@ sessionMIDIProducerTests =
             ]
           mpcbState batch @?= initialMIDIProducerState
 
-  , testCase "channel all-notes-off keeps other active channels" $ do
+  , testCase "channel all-notes-off keeps other active and sustained channels" $ do
       let active =
-            testMIDIProducerState $
-              M.fromList
-                [ ((1, 65), VoiceKey "m1-65")
-                , ((0, 72), VoiceKey "m0-72")
-                , ((0, 60), VoiceKey "m0-60")
-                ]
+            (testMIDIProducerState $
+               M.fromList
+                 [ ((1, 65), VoiceKey "m1-65")
+                 , ((0, 72), VoiceKey "m0-72")
+                 , ((0, 60), VoiceKey "m0-60")
+                 ])
+              { mpsSustainedChannels = S.fromList [0, 1]
+              , mpsDeferredNoteOffs = M.fromList
+                  [ ((1, 65), VoiceKey "m1-65")
+                  , ((0, 60), VoiceKey "m0-60")
+                  ]
+              }
           expectedState =
-            testMIDIProducerState $
-              M.singleton (1, 65) (VoiceKey "m1-65")
+            (testMIDIProducerState $
+               M.singleton (1, 65) (VoiceKey "m1-65"))
+              { mpsSustainedChannels = S.singleton 1
+              , mpsDeferredNoteOffs =
+                  M.singleton (1, 65) (VoiceKey "m1-65")
+              }
       case decodeMIDISessionCommands
              testMIDIProducerOptions
              active

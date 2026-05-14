@@ -20,9 +20,12 @@ against OSC beyond the existing FIFO fan-in queue.
   writes for active notes, and non-centered bend state is replayed into
   later note-on initial controls on that channel. Sustain-pedal CC 64
   defers note-off commands while held and emits deterministic releases
-  when the pedal comes up. All-notes-off emits deterministic
-  `CmdVoiceOff` commands for active notes and can target either every
-  producer-local note or only notes on one MIDI channel.
+  when the pedal comes up. Sustained retriggers emit a `CmdVoiceOff`
+  and `CmdVoiceOn` with the same `VoiceKey`; correctness depends on the
+  runtime applying queued commands in FIFO order rather than coalescing
+  them. All-notes-off emits deterministic `CmdVoiceOff` commands for
+  active notes and can target either every producer-local note or only
+  notes on one MIDI channel.
 - `MIDIProducerOptions` carries the target template plus optional
   frequency, gate, and velocity initial-control targets and explicit CC
   and pitch-bend mappings. It also carries an optional zero-based
