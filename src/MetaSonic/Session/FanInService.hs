@@ -11,10 +11,12 @@
 -- installs a wakeup hook for successful enqueues, and runs one
 -- background worker that drains the host after wakeups.
 --
--- The service deliberately does not add producer arbitration beyond the
--- existing FIFO queue, repair a diverged owner, define a realtime
--- command queue, or make OSC/MIDI/UI policy decisions. On owner
--- divergence it reports the stopped drain and lets the worker exit.
+-- The service deliberately keeps the existing raw enqueue path as FIFO.
+-- Callers can opt into a service-owned arbitration gateway and use the
+-- arbitrated enqueue path, but no producer is routed through that path
+-- by default. The service still does not repair a diverged owner, define
+-- a realtime command queue, or make OSC/MIDI/UI policy decisions. On
+-- owner divergence it reports the stopped drain and lets the worker exit.
 
 module MetaSonic.Session.FanInService
   ( -- * Service
@@ -37,6 +39,7 @@ module MetaSonic.Session.FanInService
   , withSessionFanInService
   , withSessionFanInServiceHooks
   , enqueueSessionFanInServiceCommand
+  , enqueueArbitratedSessionFanInServiceCommand
   , readSessionFanInService
   ) where
 
@@ -52,6 +55,12 @@ import           GHC.Generics              (Generic)
 import           System.Timeout            (timeout)
 
 import           MetaSonic.Bridge.Templates (TemplateGraph)
+import           MetaSonic.Session.ArbitrationGateway
+                                            (SessionArbitrationGateway,
+                                             SessionArbitrationGatewayEnqueueResult (..),
+                                             SessionArbitrationGatewayOptions,
+                                             enqueueArbitratedSessionFanInCommand,
+                                             newSessionArbitrationGateway)
 import           MetaSonic.Session.Command  (SessionCommand)
 import           MetaSonic.Session.FanIn    (SessionFanInDrainResult (..),
                                              SessionFanInEnqueueResult,
@@ -73,6 +82,7 @@ import           MetaSonic.Session.Queue    (ProducerId,
 -- | Hidden handle for the scoped fan-in drain service.
 data SessionFanInService = SessionFanInService
   { sfsvcHost :: !SessionFanInHost
+  , sfsvcGateway :: !(Maybe SessionArbitrationGateway)
   }
 
 -- | Access the underlying fan-in host for existing concrete producers.
@@ -86,13 +96,19 @@ sessionFanInServiceHost =
 -- | Construction options for the fan-in service.
 data SessionFanInServiceOptions = SessionFanInServiceOptions
   { sfsoFanInOptions :: !SessionFanInOptions
+  , sfsoArbitrationGatewayOptions :: !(Maybe SessionArbitrationGatewayOptions)
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
 -- | Conservative service defaults.
+--
+-- Arbitration is disabled by default. Calling
+-- 'enqueueArbitratedSessionFanInServiceCommand' with this default still
+-- preserves FIFO behavior by submitting directly to fan-in.
 defaultSessionFanInServiceOptions :: SessionFanInServiceOptions
 defaultSessionFanInServiceOptions = SessionFanInServiceOptions
   { sfsoFanInOptions = defaultSessionFanInOptions
+  , sfsoArbitrationGatewayOptions = Nothing
   }
 
 -- | Service lifecycle hooks.
@@ -159,9 +175,13 @@ withSessionFanInServiceHooks hooks graph opts action = do
       graph
       (sfsoFanInOptions opts)
       $ \host -> do
+          gateway <- traverse
+            newSessionArbitrationGateway
+            (sfsoArbitrationGatewayOptions opts)
           worker <- forkIO (serviceLoop hooks closing wake done host)
           let service = SessionFanInService
                 { sfsvcHost = host
+                , sfsvcGateway = gateway
                 }
               stop = do
                 writeIORef closing True
@@ -181,6 +201,15 @@ withSessionFanInServiceHooks hooks graph opts action = do
       pure (Right value)
 
 -- | Enqueue one command through the service-owned fan-in host.
+--
+-- This is the raw FIFO path. If a gateway is configured via
+-- 'sfsoArbitrationGatewayOptions', this function still bypasses it and
+-- therefore does not reject by policy or update gateway owner state.
+-- Callers that need consistent policy enforcement across producers must
+-- route every producer through
+-- 'enqueueArbitratedSessionFanInServiceCommand'. Mixing raw and
+-- arbitrated paths with a configured gateway silently bypasses policy
+-- for raw-path commands.
 enqueueSessionFanInServiceCommand
   :: ProducerId
   -> SessionCommand
@@ -188,6 +217,30 @@ enqueueSessionFanInServiceCommand
   -> IO SessionFanInEnqueueResult
 enqueueSessionFanInServiceCommand producer cmd service =
   enqueueSessionFanInCommand producer cmd (sfsvcHost service)
+
+-- | Enqueue one command through the optional service-owned gateway.
+--
+-- With default options this falls back to the raw FIFO service enqueue.
+-- In that configuration only 'SagEnqueueAttempted' results are produced;
+-- 'SagArbitrationRejected' is reachable only when a gateway is
+-- configured.
+--
+-- When 'sfsoArbitrationGatewayOptions' is configured, policy rejection
+-- happens before fan-in and therefore does not wake the drain worker,
+-- consume queue capacity, or assign a command sequence.
+enqueueArbitratedSessionFanInServiceCommand
+  :: ProducerId
+  -> SessionCommand
+  -> SessionFanInService
+  -> IO SessionArbitrationGatewayEnqueueResult
+enqueueArbitratedSessionFanInServiceCommand producer cmd service =
+  case sfsvcGateway service of
+    Nothing ->
+      SagEnqueueAttempted
+        <$> enqueueSessionFanInServiceCommand producer cmd service
+    Just gateway ->
+      enqueueArbitratedSessionFanInCommand
+        gateway producer cmd (sfsvcHost service)
 
 -- | Read the service-owned fan-in host snapshot.
 readSessionFanInService

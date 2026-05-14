@@ -15237,7 +15237,8 @@ assertPriorityOwner policy target expected =
 -- This is the first minimal background lifecycle wrapper around the
 -- generic fan-in host. It wakes on successful enqueue, drains the
 -- existing FIFO host, reports stopped drains, and exits on owner
--- divergence. It does not add MIDI policy or producer arbitration.
+-- divergence. The raw enqueue path remains FIFO; arbitration is only
+-- exercised through the explicit service-owned gateway path.
 ------------------------------------------------------------
 
 sessionFanInServiceTests :: TestTree
@@ -15327,6 +15328,99 @@ sessionFanInServiceTests =
             (M.member (VoiceKey "v0") (ssVoices (sfisOwnerState snapshot)))
         Right (_enq, Nothing, _snapshot) ->
           assertFailure "timed out waiting for service drain"
+
+  , testCase "default arbitrated enqueue keeps FIFO service behavior" $ do
+      let graph = patternTemplates droneVibrato
+          producer = testProducer ProducerUI "ui"
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq <- enqueueArbitratedSessionFanInServiceCommand
+                       producer cmd service
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (enq, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (enq, Just drained, snapshot) -> do
+          queued <- gatewayQueuedOrFail enq
+          case sdrItems (sfidrDrain drained) of
+            [SessionDrainItem drainedQueued
+              (SessionOwnerStep (StepCommitted _ Nothing))] ->
+                drainedQueued @?= queued
+            other ->
+              assertFailure
+                ("expected one committed arbitrated drain, got: "
+                 <> show other)
+          sfidrQueueDepth drained @?= 0
+          sfisQueueDepth snapshot @?= 0
+        Right (_enq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for arbitrated service drain"
+
+  , testCase "configured arbitration rejects before service wake" $ do
+      let graph = patternTemplates droneVibrato
+          oscProducer = testProducer ProducerOSC "osc"
+          patternProducer = testProducer ProducerPattern "pattern"
+          target =
+            ControlArbitrationTarget (VoiceKey "v0") midiLevelTag
+          command =
+            CmdControlWrite (VoiceKey "v0") midiLevelTag 0.5
+          opts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy =
+                      ProducerPriority
+                        [ProducerMIDI, ProducerOSC, ProducerUI, ProducerPattern]
+                        emptyControlOwnerTable
+                  }
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = patternProducer
+            , aiCommand   = command
+            , aiTarget    = Just target
+            , aiReason    = ArrLowerPriorityThan oscProducer
+            , aiRetryable = False
+            }
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          opts
+          $ \service -> do
+              enq0 <- enqueueArbitratedSessionFanInServiceCommand
+                        oscProducer command service
+              mFirstDrain <- timeout 1000000 (takeMVar drainedVar)
+              rejected <- enqueueArbitratedSessionFanInServiceCommand
+                            patternProducer command service
+              mRejectedDrain <- timeout 100000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (enq0, mFirstDrain, rejected, mRejectedDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (enq0, Just _firstDrain, rejected, Nothing, snapshot) -> do
+          queued0 <- gatewayQueuedOrFail enq0
+          qscProducer queued0 @?= oscProducer
+          qscSequence queued0 @?= CommandSequence 0
+          rejected @?= SagArbitrationRejected expectedIssue
+          sfisQueueDepth snapshot @?= 0
+        Right (_enq0, Nothing, _rejected, _mRejectedDrain, _snapshot) ->
+          assertFailure "timed out waiting for first arbitrated drain"
+        Right (_enq0, Just _firstDrain, _rejected, Just extraDrain, _snapshot) ->
+          assertFailure
+            ("policy rejection unexpectedly woke service drain: "
+             <> show extraDrain)
 
   , testCase "service host wakes worker for OSC producer enqueue" $ do
       let graph = patternTemplates droneVibrato

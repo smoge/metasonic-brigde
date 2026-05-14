@@ -3286,9 +3286,12 @@ the pure policy surface for `FifoOnly`, producer-priority, and
 target-claim decisions, while `MetaSonic.Session.ArbitrationGateway`
 wraps fan-in enqueue as an opt-in boundary. The gateway defaults to
 `FifoOnly`, rejects policy-denied writes before fan-in, and updates
-priority ownership only after an accepted enqueue. Existing live
-producer/listener paths are not routed through it unless a caller
-explicitly chooses that wrapper.
+priority ownership only after an accepted enqueue.
+`MetaSonic.Session.FanInService` can now own an optional arbitration
+gateway for callers that explicitly choose its arbitrated enqueue path;
+the raw service enqueue path remains FIFO. Existing live
+producer/listener paths are not routed through arbitration unless a
+caller explicitly chooses that wrapper/path.
 
 Still gated:
 
@@ -3310,7 +3313,8 @@ Still gated:
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
 - [ ] MIDI, OSC, UI, and Pattern live coexistence/arbitration wiring
-  beyond the landed opt-in gateway. The policy boundary is recorded in
+  beyond the landed opt-in gateway and service-owned arbitrated enqueue
+  path. The policy boundary is recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] Manifest reload and resource allocation policy.
 - [ ] Failure/event semantics across compile, allocation, install, and

@@ -1,11 +1,13 @@
 # Session Producer Coexistence And Arbitration
 
-Status: pure policy and optional gateway landed. This note records the
-arbitration boundary after MIDI listener-local coalescing. It does not
-change `MetaSonic.Session.Queue` or `MetaSonic.Session.FanIn`; concrete
-producer/listener paths keep FIFO behavior unless a caller explicitly
-routes them through `MetaSonic.Session.ArbitrationGateway` with a
-non-`FifoOnly` policy.
+Status: pure policy, optional gateway, and service-owned opt-in gateway
+landed. This note records the arbitration boundary after MIDI
+listener-local coalescing. It does not change `MetaSonic.Session.Queue`
+or `MetaSonic.Session.FanIn`; concrete producer/listener paths keep FIFO
+behavior unless a caller explicitly routes them through
+`MetaSonic.Session.ArbitrationGateway` or the arbitrated
+`MetaSonic.Session.FanInService` enqueue path with a non-`FifoOnly`
+policy.
 
 The session layer now has multiple producers that can address the same
 symbolic control target:
@@ -39,6 +41,10 @@ different user intents even when they write the same logical target.
 - `Session.ArbitrationGateway` is an optional wrapper above fan-in. Its
   default policy is `FifoOnly`; policy rejections happen before enqueue
   and do not consume queue capacity or command sequence numbers.
+- `Session.FanInService` can optionally own one arbitration gateway. Its
+  raw enqueue path remains FIFO; the arbitrated service enqueue path uses
+  the service-owned gateway when configured and otherwise falls back to
+  FIFO.
 - The landed MIDI coalescer is listener-local. It can merge repeated
   MIDI-origin `CmdControlWrite`s before enqueue, but it cannot merge,
   reorder, or drop another producer's commands.
@@ -196,16 +202,19 @@ above fan-in, using a small pure policy function or wrapper:
    unclaimed targets, and unchanged FIFO behavior. Done in `test/Spec.hs`.
 4. Add an optional wrapper around producer enqueue paths while defaulting
    to `FifoOnly`. Done: `MetaSonic.Session.ArbitrationGateway`.
-5. Wire concrete MIDI, OSC, UI, or Pattern producer/listener paths only
+5. Let the scoped fan-in service own an optional gateway for callers that
+   explicitly choose the arbitrated enqueue path. Done:
+   `MetaSonic.Session.FanInService`.
+6. Wire concrete MIDI, OSC, UI, or Pattern producer/listener paths only
    when configuration can explicitly enable a non-FIFO policy.
-6. Add smoke diagnostics if a live policy is enabled by configuration.
+7. Add smoke diagnostics if a live policy is enabled by configuration.
 
 ## Open Questions
 
 - Which component owns policy configuration: session options, authoring
   manifest, or a higher UI/runtime supervisor?
-- Which configured producer/listener entrypoint should own the optional
-  gateway when a live non-FIFO policy is enabled?
+- Which concrete producer/listener path should first route through the
+  service-owned gateway when a live non-FIFO policy is enabled?
 - Should a default non-FIFO policy ever exist, or should all arbitration
   be opt-in?
 - Should multi-policy composition, such as target-claim precedence with
