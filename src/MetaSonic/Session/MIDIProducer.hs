@@ -356,6 +356,8 @@ decodeMIDISessionCommands opts st event = do
     pitchBendInitialControl ch note bends =
       case (M.lookup ch bends, mpoPitchBendMapping opts) of
         (Just value, Just mapping)
+          -- Emit only when pitch-bend has its own target distinct
+          -- from, or independent of, the frequency control target.
           | Just (mpbmTarget mapping) /= mpoFrequencyControl opts ->
               [ ( mpbmTarget mapping
                 , pitchBendFrequency (mpbmSemitones mapping) note value
