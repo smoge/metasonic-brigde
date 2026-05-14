@@ -17824,6 +17824,200 @@ sessionOSCListenerTests =
           assertFailure ("expected one OSC producer result, got: "
                          <> show other)
 
+  , testCase "arbitrated service listener loopback defaults to FIFO" $ do
+      let expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              1500.0
+          producer = oscProducerId defaultOSCProducerOptions
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          (patternTemplates droneVibrato)
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              received <- newEmptyMVar
+              let hooks = OSCS.SessionOSCArbitratedListenerHooks
+                    { OSCS.solahOnProducerResult = putMVar received
+                    , OSCS.solahOnIssue          = \_ -> pure ()
+                    }
+              OSCS.withArbitratedSessionOSCListenerHooks
+                hooks
+                defaultOSCProducerOptions
+                service
+                (OSCS.defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback
+                      (OSCS.liBoundPort info)
+                      messageBytesV0LpfFloat
+                    mResult <- timeout 1000000 (takeMVar received)
+                    mDrain <- timeout 1000000 (takeMVar drainedVar)
+                    snapshot <- readSessionFanInService service
+                    pure (mResult, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right
+          ( Just (OSCProducerArbitratedEnqueueAttempted command gatewayResult)
+          , Just drained
+          , snapshot
+          ) -> do
+            command @?= expected
+            queued <- gatewayQueuedOrFail gatewayResult
+            qscProducer queued @?= producer
+            qscCommand queued @?= expected
+            case map sdiResult (sdrItems (sfidrDrain drained)) of
+              [SessionOwnerStep (StepRejected (SiStaleVoice (VoiceKey "v0")))] ->
+                pure ()
+              other ->
+                assertFailure
+                  ("expected stale OSC control-write drain, got: "
+                   <> show other)
+            sfidrQueueDepth drained @?= 0
+            sfisQueueDepth snapshot @?= 0
+        Right (Nothing, _mDrain, _snapshot) ->
+          assertFailure
+            "timed out waiting for arbitrated OSC listener result"
+        Right (_mResult, Nothing, _snapshot) ->
+          assertFailure
+            "timed out waiting for arbitrated OSC listener drain"
+        Right other ->
+          assertFailure
+            ("expected arbitrated OSC listener enqueue, got: "
+             <> show other)
+
+  , testCase "arbitrated service listener reports policy rejection" $ do
+      let expected =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              1500.0
+          producer = oscProducerId defaultOSCProducerOptions
+          claimant = testProducer ProducerUI "ui"
+          target =
+            ControlArbitrationTarget
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+          serviceOpts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy =
+                      TargetClaim
+                        (claimControlTarget target claimant emptyTargetClaimTable)
+                  }
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = producer
+            , aiCommand   = expected
+            , aiTarget    = Just target
+            , aiReason    = ArrTargetClaimedBy claimant
+            , aiRetryable = False
+            }
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          (patternTemplates droneVibrato)
+          serviceOpts
+          $ \service -> do
+              received <- newEmptyMVar
+              issues <- newEmptyMVar
+              let hooks = OSCS.SessionOSCArbitratedListenerHooks
+                    { OSCS.solahOnProducerResult = putMVar received
+                    , OSCS.solahOnIssue          = putMVar issues
+                    }
+              OSCS.withArbitratedSessionOSCListenerHooks
+                hooks
+                defaultOSCProducerOptions
+                service
+                (OSCS.defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback
+                      (OSCS.liBoundPort info)
+                      messageBytesV0LpfFloat
+                    mResult <- timeout 1000000 (takeMVar received)
+                    mIssue <- timeout 1000000 (takeMVar issues)
+                    mDrain <- timeout 100000 (takeMVar drainedVar)
+                    snapshot <- readSessionFanInService service
+                    pure (mResult, mIssue, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right
+          ( Just (OSCProducerArbitratedEnqueueAttempted command rejected)
+          , Just reported
+          , Nothing
+          , snapshot
+          ) -> do
+            command @?= expected
+            rejected @?= SagArbitrationRejected expectedIssue
+            reported @?= OSCS.SoliArbitrationRejected expectedIssue
+            sfisQueueDepth snapshot @?= 0
+        Right (Nothing, _mIssue, _mDrain, _snapshot) ->
+          assertFailure
+            "timed out waiting for arbitrated OSC listener result"
+        Right (_mResult, Nothing, _mDrain, _snapshot) ->
+          assertFailure
+            "timed out waiting for arbitrated OSC listener issue"
+        Right (_mResult, Just _reported, Just extraDrain, _snapshot) ->
+          assertFailure
+            ("OSC listener policy rejection unexpectedly woke service drain: "
+             <> show extraDrain)
+        Right other ->
+          assertFailure
+            ("expected arbitrated OSC listener policy rejection, got: "
+             <> show other)
+
+  , testCase "arbitrated listener parse issue continues" $ do
+      result <-
+        withSessionFanInService
+          (patternTemplates droneVibrato)
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              issues <- newIORef []
+              validDone <- newEmptyMVar
+              let hooks = OSCS.SessionOSCArbitratedListenerHooks
+                    { OSCS.solahOnProducerResult =
+                        \result -> case result of
+                          OSCProducerArbitratedEnqueueAttempted {} ->
+                            putMVar validDone ()
+                          OSCProducerArbitratedDecodeRejected {} ->
+                            pure ()
+                    , OSCS.solahOnIssue =
+                        \issue -> modifyIORef' issues (issue :)
+                    }
+              OSCS.withArbitratedSessionOSCListenerHooks
+                hooks
+                defaultOSCProducerOptions
+                service
+                (OSCS.defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback (OSCS.liBoundPort info)
+                                    (OBS.pack [0x01, 0x02, 0x03, 0x04])
+                    sendUdpLoopback
+                      (OSCS.liBoundPort info)
+                      messageBytesV0LpfFloat
+                    mDone <- timeout 1000000 (takeMVar validDone)
+                    issueList <- readIORef issues
+                    pure (mDone, issueList)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (Just (), issueList) ->
+          assertBool
+            ("expected parse failure issue, got: " <> show issueList)
+            (any isSessionParseFailure issueList)
+        Right other ->
+          assertFailure
+            ("valid packet was not accepted after malformed one: "
+             <> show other)
+
   , testCase "malformed packet surfaces parse issue; listener continues" $ do
       result <-
         withSessionFanInHost

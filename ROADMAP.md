@@ -3242,8 +3242,11 @@ the shared symbolic control-write decoder,
 `MetaSonic.Session.OSCProducer` translates one decoded control write
 into `CmdControlWrite` and submits it through the fan-in host, and
 `MetaSonic.Session.OSCListener` brackets a UDP listener on top of that
-producer using the shared OSC listener loop. This path only parses and
-enqueues; it does not by itself drain the host, resolve controls
+producer using the shared OSC listener loop. The OSC producer and
+listener also have explicit service-backed entrypoints for callers that
+choose the service-owned arbitration path; the existing host-based
+entrypoints remain FIFO. This path only parses and enqueues; it does not
+by itself drain the host, resolve controls
 against a live runtime, or write the realtime control queue.
 
 Recent MIDI ingress follow-up: `MetaSonic.Session.MIDIProducer`
@@ -3293,9 +3296,10 @@ the raw service enqueue path remains FIFO. Service-owned policy
 rejections report `SfsiiArbitrationRejected` separately from fan-in
 queue pressure and drain-stop issues. `MetaSonic.Session.OSCProducer`
 now exposes an explicit arbitrated service enqueue helper for symbolic
-control writes; its existing host-based enqueue path remains FIFO.
-Existing live listener paths are not routed through arbitration unless a
-caller explicitly chooses that wrapper/path.
+control writes, and `MetaSonic.Session.OSCListener` exposes an opt-in
+service-backed listener wrapper over that helper; their existing
+host-based paths remain FIFO. Existing live paths are not routed through
+arbitration unless a caller explicitly chooses that wrapper/path.
 
 Still gated:
 
@@ -3317,10 +3321,10 @@ Still gated:
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
-- [ ] MIDI, OSC listener, UI, and Pattern live coexistence/arbitration
-  wiring beyond the landed opt-in gateway, service-owned arbitrated
-  enqueue path, and explicit OSC producer helper. The policy boundary is
-  recorded in
+- [ ] MIDI, UI, and Pattern live coexistence/arbitration wiring beyond
+  the landed opt-in gateway, service-owned arbitrated enqueue path,
+  explicit OSC producer helper, and opt-in OSC listener path. The policy
+  boundary is recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] Arbitration policy mutation API and voice-lifecycle ownership
   clearing. These remain use-case gated; do not implement them ahead of
