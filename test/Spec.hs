@@ -15422,6 +15422,90 @@ sessionFanInServiceTests =
             ("policy rejection unexpectedly woke service drain: "
              <> show extraDrain)
 
+  , testCase "target-claim arbitration rejects before service wake" $ do
+      let graph = patternTemplates droneVibrato
+          claimant = testProducer ProducerUI "ui"
+          blocked  = testProducer ProducerMIDI "midi"
+          target =
+            ControlArbitrationTarget (VoiceKey "v0") midiLevelTag
+          claimedCommand =
+            CmdControlWrite (VoiceKey "v0") midiLevelTag 0.25
+          otherCommand =
+            CmdControlWrite (VoiceKey "v0") midiFreqTag 440.0
+          opts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy =
+                      TargetClaim
+                        (claimControlTarget target claimant emptyTargetClaimTable)
+                  }
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = blocked
+            , aiCommand   = claimedCommand
+            , aiTarget    = Just target
+            , aiReason    = ArrTargetClaimedBy claimant
+            , aiRetryable = False
+            }
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          opts
+          $ \service -> do
+              claimantEnq <- enqueueArbitratedSessionFanInServiceCommand
+                               claimant claimedCommand service
+              mFirstDrain <- timeout 1000000 (takeMVar drainedVar)
+              rejected <- enqueueArbitratedSessionFanInServiceCommand
+                            blocked claimedCommand service
+              mRejectedDrain <- timeout 100000 (takeMVar drainedVar)
+              otherEnq <- enqueueArbitratedSessionFanInServiceCommand
+                            blocked otherCommand service
+              mOtherDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure
+                ( claimantEnq
+                , mFirstDrain
+                , rejected
+                , mRejectedDrain
+                , otherEnq
+                , mOtherDrain
+                , snapshot
+                )
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right
+          ( claimantEnq
+          , Just _firstDrain
+          , rejected
+          , Nothing
+          , otherEnq
+          , Just _otherDrain
+          , snapshot
+          ) -> do
+            q0 <- gatewayQueuedOrFail claimantEnq
+            q1 <- gatewayQueuedOrFail otherEnq
+            qscProducer q0 @?= claimant
+            qscProducer q1 @?= blocked
+            qscSequence q0 @?= CommandSequence 0
+            qscSequence q1 @?= CommandSequence 1
+            qscCommand q0 @?= claimedCommand
+            qscCommand q1 @?= otherCommand
+            rejected @?= SagArbitrationRejected expectedIssue
+            sfisQueueDepth snapshot @?= 0
+        Right (_claimantEnq, Nothing, _rejected, _mRejectedDrain, _otherEnq, _mOtherDrain, _snapshot) ->
+          assertFailure "timed out waiting for claimant drain"
+        Right (_claimantEnq, Just _firstDrain, _rejected, Just extraDrain, _otherEnq, _mOtherDrain, _snapshot) ->
+          assertFailure
+            ("target-claim rejection unexpectedly woke service drain: "
+             <> show extraDrain)
+        Right (_claimantEnq, Just _firstDrain, _rejected, Nothing, _otherEnq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for unrelated target drain"
+
   , testCase "service host wakes worker for OSC producer enqueue" $ do
       let graph = patternTemplates droneVibrato
           msg = OSC.OscMessage (OBSC.pack "/v0/lpf/0")
