@@ -2834,11 +2834,34 @@ See
 for the full contract.
 
 With 8.H landed, the manifest is a stable input shape for
-the eventual session layer. **Session Prep A** was the first
-non-runtime session-scoping slice: command/event vocabulary,
-OSC resolve-state rebuild, and buffer/plugin lifecycle
-reports. **Session Prep B** now adds a pure admission/commit
-state boundary on top of those nouns. **Session Prep C** adds
+the eventual session layer. A first manifest-reload follow-up
+has also landed, but only as a diagnostic/construction-time
+v1. `MetaSonic.Session.ManifestReload` validates a decoded
+`AuthoringManifestDoc` against a caller-owned
+`ManifestReloadCatalogEntry` list and derives a
+`ManifestReloadPlan`: selected `TemplateGraph`,
+`RTGraphAdapterOptions` from static voice/fx/template
+polyphony policy, typed control-surface metadata, FIFO
+arbitration default, and a `CmdHotSwap` projection for later
+install strategies. The app layer adapts the built-in demo
+registry into that catalog, and `--manifest-reload-plan DEMO`
+prints the plan/control/resource/command diagnostic without
+allocating an `RTGraph`, starting audio, enqueueing a command,
+or claiming live reload semantics.
+`MetaSonic.Session.ManifestReload.Construct` then adds the
+narrow construction helper:
+`constructManifestSessionFromPlan` brackets a fresh
+`SessionOwner` from the plan's graph and adapter options. The
+helper does not reload an existing owner, import an external
+manifest, step `CmdHotSwap`, migrate voices, interrupt audio,
+or choose a failure-recovery policy. In short:
+diagnostic/construction-time v1 is landed; manifest import and
+stopped-audio/live reload policy remain gated.
+
+**Session Prep A** was the first non-runtime session-scoping
+slice: command/event vocabulary, OSC resolve-state rebuild, and
+buffer/plugin lifecycle reports. **Session Prep B** now adds a pure
+admission/commit state boundary on top of those nouns. **Session Prep C** adds
 a checked plan/commit handshake so successful runtime facts
 cannot be applied to the wrong admitted plan. **Session Prep D**
 adds an injected runtime adapter contract and a single-step
@@ -2895,7 +2918,12 @@ first input-capable device when `--midi-device` is omitted and
 reporting listener coalescing / dropped-fence diagnostics, without
 starting audio or replacing the older `midi-poly` live-runtime demo. A
 later `MetaSonic.Session.UIProducer` slice adds a Haskell-only adapter
-for already-decoded UI intents.
+for already-decoded UI intents. The manifest-reload
+diagnostic/construction-time v1 described above lands after those ingress slices:
+the pure planner, app-owned catalog adapter, construction helper,
+tests, and `--manifest-reload-plan` CLI exist, while external manifest
+import, live owner reload, and host-level reload/resource recovery
+policy remain future work.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -2931,9 +2959,11 @@ minimal scoped fan-in drain worker", "add a first MIDI
 note/CC/sustain/pitch-bend/all-notes-off producer adapter with channel
 filtering", "add a decoded-source MIDI listener", "add a small
 PortMIDI-backed decoded source", or "add a first UI intent producer
-adapter"; it is GUI
+adapter", or "land the diagnostic/construction-time manifest reload
+v1"; it is GUI
 toolkit integration,
-manifest-driven session reload/resource policy, broader MIDI behavior
+manifest import and live/host-level reload policy beyond that v1,
+broader MIDI behavior
 beyond note/CC/sustain/pitch-bend/all-notes-off command translation,
 channel filtering, and the small source wrapper, any broader OSC behavior beyond
 symbolic control writes, arbitration beyond FIFO, long-running supervision
@@ -2941,6 +2971,18 @@ beyond the scoped service, unsupported respawn/reset policy, and recovery
 mechanisms around that owner.
 
 Session prep artifacts:
+- [Manifest-Driven Session Reload And Resource Policy](notes/2026-05-14-f-manifest-session-reload-policy.md)
+  records the pure planner boundary for validating an authoring manifest
+  against a caller-owned catalog and deriving static session resource
+  policy. It answers graph/catalog selection and template polyphony
+  planning without importing external manifests, allocating an `RTGraph`,
+  or choosing a runtime reload strategy.
+- [Manifest Reload Install Strategy](notes/2026-05-14-g-manifest-reload-install-strategy.md)
+  records the construction-time v1 install boundary. The landed helper
+  constructs a fresh owner from a validated `ManifestReloadPlan` and
+  proves that path with owner/RTGraph smoke coverage; stopped-audio
+  reload, preserving live hot-swap, host teardown/rebuild, and failure
+  recovery remain separate future strategies.
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-n-session-prep-a-contract.md)
   records the Haskell-only command/event vocabulary, pure OSC
   resolve-state rebuild helper, and read-only buffer/plugin lifecycle
@@ -3162,6 +3204,12 @@ Landed prep contracts:
   `SessionCommand`s, with hidden owner/queue state, locked enqueue,
   locked drain, queue-depth snapshots, and FIFO semantics inherited
   from `MetaSonic.Session.Queue` (`MetaSonic.Session.FanIn`).
+- [x] Manifest reload diagnostic/construction-time v1: pure
+  `MetaSonic.Session.ManifestReload` planner, app-owned demo catalog
+  adapter, `constructManifestSessionFromPlan`,
+  `--manifest-reload-plan DEMO`, and focused smoke coverage proving a
+  manifest-built owner can commit an ordinary voice start through the
+  real owner/RTGraph path.
 - [x] Focused library tests pin the command adapter, resolve rebuild
   policy, lifecycle report counters, admission decisions,
   commit-only mutation behavior, plan/commit handshake mismatch
@@ -3308,10 +3356,24 @@ service-owned arbitration helper for caller-driven Pattern blocks.
 Existing live paths are not routed through arbitration unless a caller
 explicitly chooses that wrapper/path.
 
+Recent manifest-reload follow-up:
+`MetaSonic.Session.ManifestReload` provides the pure planner for
+manifest/catalog validation, static resource-policy projection,
+control-surface projection, FIFO arbitration default, and `CmdHotSwap`
+projection. `app/MetaSonic/App/Demos` adapts authored demos into the
+caller-owned reload catalog, and `--manifest-reload-plan DEMO` prints a
+non-audio diagnostic from that app catalog.
+`MetaSonic.Session.ManifestReload.Construct` adds only
+`constructManifestSessionFromPlan`, a construction-time helper for a
+fresh owner. This is not external manifest import, stopped-audio reload
+of an existing owner, preserving live hot-swap, or host-level resource
+policy or failure-recovery policy.
+
 Still gated:
 
-- [ ] GUI toolkit bindings, manifest-driven session reload/resource
-  policy, broader MIDI behavior beyond the landed
+- [ ] GUI toolkit bindings, manifest import and live/host-level
+  manifest reload/resource policy beyond the landed
+  diagnostic/construction-time v1, broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
@@ -3337,7 +3399,9 @@ Still gated:
   clearing. These remain use-case gated; do not implement them ahead of
   a concrete live policy owner, release signal, or hot-swap/voice-key
   reuse decision.
-- [ ] Manifest reload and resource allocation policy.
+- [ ] Manifest import plus stopped-audio/live reload strategy and
+  host-level resource allocation/recovery policy beyond the landed
+  diagnostic planner and construction-time owner helper.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
@@ -3356,9 +3420,11 @@ default-omni channel filtering, bend replay for later note-on starts, and
 sustain-pedal deferred releases, a decoded-source MIDI listener with
 producer-local control coalescing, and the first Q / PortMIDI-backed
 decoded source with an auto-selecting manual CLI smoke probe, and
-already-decoded UI intent translation. Do not
+already-decoded UI intent translation, plus the
+diagnostic/construction-time manifest reload v1. Do not
 promote this into a full producer-facing session service until GUI
-toolkit integration, manifest-driven session reload/resource policy,
+toolkit integration, manifest import and live/host-level reload policy
+beyond the landed manifest v1,
 broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
 translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,
