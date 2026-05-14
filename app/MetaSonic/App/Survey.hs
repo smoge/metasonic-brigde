@@ -33,16 +33,16 @@ import           MetaSonic.App.Demos
 import           MetaSonic.Authoring.Report (AuthoringReport (..),
                                              ReportedControl (..))
 import qualified MetaSonic.App.FusionCostLab as FCL
-import           MetaSonic.App.FusionCostLab (GateMeasurement (..),
+import           MetaSonic.App.FusionCostLab (costLabGateIndex,
+                                              costLabGateIndexFor,
+                                              costLabShapeIndex)
+import           MetaSonic.App.FusionCostModel
+                                             (GateMeasurement (..),
                                               ShapeKey,
                                               ShapeSummary (..),
                                               Variant (..),
-                                              costLabGateIndex,
-                                              costLabGateIndexFor,
-                                              costLabShapeIndex,
                                               measuredWinThreshold,
-                                              shapeKeyOf,
-                                              variantName)
+                                              shapeKeyOf, variantName)
 import           MetaSonic.App.ProfitabilityGate (GateCounts (..),
                                                   GateInput (..),
                                                   GateRow (..),

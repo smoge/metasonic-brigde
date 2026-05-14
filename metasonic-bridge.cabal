@@ -127,6 +127,7 @@ executable metasonic-bridge
       MetaSonic.App.CorpusSurvey
       MetaSonic.App.Demos
       MetaSonic.App.FusionCostLab
+      MetaSonic.App.FusionCostModel
       MetaSonic.App.Osc
       MetaSonic.App.ProfitabilityGate
       MetaSonic.App.SessionMidiSmoke

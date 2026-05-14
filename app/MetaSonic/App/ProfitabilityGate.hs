@@ -35,7 +35,7 @@ module MetaSonic.App.ProfitabilityGate
   , summarizeGate
   ) where
 
-import           MetaSonic.App.FusionCostLab (measuredWinThreshold)
+import           MetaSonic.App.FusionCostModel (measuredWinThreshold)
 
 -- | The six terminal verdicts. The constructors are exported but
 -- callers should usually go through 'evaluateGate' so the

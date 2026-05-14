@@ -67,19 +67,12 @@ module MetaSonic.App.FusionCostLab
   , familyName
   , familyMembers
   , LabRow (..)
-  , Variant (..)
-  , variantName
   , FusionCaseFeatures (..)
   , extractFeatures
   , EquivalenceStatus (..)
     -- * Shape-keyed cost-model index (§7.C cost-model join)
-  , ShapeKey (..)
-  , ShapeSummary (..)
-  , measuredWinThreshold
   , costLabShapeIndex
-  , shapeKeyOf
     -- * Phase 7.F profitability gate index
-  , GateMeasurement (..)
   , costLabGateIndex
     -- * Phase 7.J gate-by-executor view
   , costLabGateIndexFor
@@ -124,6 +117,13 @@ import           MetaSonic.Bridge.Planner   (FusionCandidate (..),
                                              selectedFusionCandidates)
 import           MetaSonic.Bridge.Source
 import qualified MetaSonic.App.Demos        as Demos
+import           MetaSonic.App.FusionCostModel
+                                            (GateMeasurement (..),
+                                             ShapeKey (..),
+                                             ShapeSummary (..),
+                                             Variant (..),
+                                             measuredWinThreshold,
+                                             shapeKeyOf, variantName)
 import qualified MetaSonic.Pattern.Corpus   as Corpus
 
 import           MetaSonic.Types            (NodeIndex, NodeKind (..),
@@ -504,63 +504,8 @@ tailSweep16Mixed = runSynth $ do
   out 0 g8
 
 ------------------------------------------------------------
--- Variants and features
+-- Features
 ------------------------------------------------------------
-
--- | Which runtime path we want measured for this row. The
--- generated-fusion column does not exist yet; if a future slice
--- adds it, append a 'VarGenerated' constructor here, do not
--- repurpose the existing ones.
-data Variant
-  = VarNodeLoop
-    -- ^ The stripped baseline. Compiled through the normal runtime
-    -- compiler, then every region-kernel tag is forced back to
-    -- 'RNodeLoop' before loading.
-  | VarRegionKernel
-    -- ^ Hand-written region kernels — the current default. Uses
-    -- 'compileRuntimeGraph' and 'loadRuntimeGraph' as production
-    -- demos do.
-  | VarRFused
-    -- ^ Scalar-affine RFused rewrite layered on top of region
-    -- kernels via 'compileRuntimeGraphFused' /
-    -- 'loadRuntimeGraphFused'. The fused regions live alongside
-    -- the kernels, so this variant is "kernels + RFused", not
-    -- "RFused alone."
-  | VarGenerated
-    -- ^ §7.D generated fusion program, sample-major executor.
-    -- Compiles to a stripped 'RuntimeGraph' (every region
-    -- 'ExecNodeLoop'), runs the planner, then patches in a
-    -- generated 'FusionProgram' for the first generatable
-    -- selected candidate.
-  | VarGeneratedBlock
-    -- ^ §7.H generated fusion program, block-major executor.
-    -- Identical compile-time pipeline and identical emitted
-    -- 'FusionProgram' as 'VarGenerated'; only the per-region
-    -- 'RegionExec' selector differs ('ExecGeneratedBlock' rather
-    -- than 'ExecGenerated'), so the C++ side dispatches through
-    -- 'process_fusion_program_block' instead of the sample-major
-    -- 'process_fusion_program'. Exists for direct A/B
-    -- measurement; a future slice may collapse the variants
-    -- once the dispatch-model decision is made.
-  | VarGeneratedSuper
-    -- ^ §7.I generated fusion program, super-mode executor.
-    -- Identical compile-time pipeline and identical emitted
-    -- 'FusionProgram' as 'VarGenerated' and 'VarGeneratedBlock';
-    -- only the per-region 'RegionExec' selector differs
-    -- ('ExecGeneratedSuper'). The C++ side recognizes 'GainOut'
-    -- and 'AddGainOut' fused shapes as a single per-sample loop
-    -- and falls through to 'process_fusion_program_block' on
-    -- everything else. Exists for direct A/B/C measurement
-    -- across the three generated executors.
-  deriving stock (Eq, Show, Bounded, Enum)
-
-variantName :: Variant -> String
-variantName VarNodeLoop       = "node-loop"
-variantName VarRegionKernel   = "region-kernel"
-variantName VarRFused         = "rfused"
-variantName VarGenerated      = "generated"
-variantName VarGeneratedBlock = "generated-block"
-variantName VarGeneratedSuper = "generated-super"
 
 -- | The compiler facts we record per graph. The row schema stays
 -- deliberately small enough to inspect in JSONL, but it now includes
@@ -1150,44 +1095,6 @@ collectFusionCostLabRows opts =
 -- §7.C cost-model join: shape-keyed cost-lab index
 ------------------------------------------------------------
 
--- | Compact key for joining selected candidates to cost-lab rows.
--- 'skKinds' is the 'fromEnum'-encoded 'fcMemberKinds' sequence.
--- 'skGainAmountModes' is the tiny v1 feature axis: one encoded
--- 'GainAmountMode' per 'KGain' member, in member order. This keeps
--- scalar-gain and dynamic-gain chains from sharing measurements.
-data ShapeKey = ShapeKey
-  { skKinds           :: ![Int]
-  , skGainAmountModes :: ![Int]
-  } deriving (Eq, Ord, Show)
-
--- | Per-shape measurement summary keyed by 'shapeKeyOf'. Built once
--- from a @[LabRow]@ corpus by 'costLabShapeIndex' and consumed by the
--- survey to classify selected planner candidates.
---
--- 'ssSpeedup' is @ssBaselineNs / ssFastestNs@. The survey compares it
--- to 'measuredWinThreshold' before calling the row a measured win.
-data ShapeSummary = ShapeSummary
-  { ssSpeedup        :: !Double
-  , ssFastestVariant :: !Variant
-  , ssBaselineNs     :: !Double
-  , ssFastestNs      :: !Double
-  } deriving (Eq, Show)
-
--- | Minimum speedup before the diagnostic join calls a row a measured
--- win. Tiny >1.0 movements are benchmark noise for this tool; keeping
--- them in measured-loss prevents the 7.D gate from flapping.
-measuredWinThreshold :: Double
-measuredWinThreshold = 1.05
-
--- | Encode a selected planner candidate as an order-preserving key
--- usable in a 'Data.Map' (since 'NodeKind' lacks 'Ord' but has
--- 'Enum').
-shapeKeyOf :: FusionCandidate -> ShapeKey
-shapeKeyOf c = ShapeKey
-  { skKinds           = map fromEnum (fcMemberKinds c)
-  , skGainAmountModes = map fromEnum (fcGainAmountModes c)
-  }
-
 -- | Build a map from candidate shape key to the best measured
 -- speedup. For each cost-lab family member, the function
 -- re-compiles the member's 'SynthGraph', runs the planner, and
@@ -1298,13 +1205,6 @@ shapeKeysOf graph =
 -- strongest evidence for a shape, not the average. The gate then
 -- decides whether that strongest evidence is actually good
 -- enough.
-data GateMeasurement = GateMeasurement
-  { gmGeneratorError   :: !(Maybe String)
-  , gmGeneratedExact   :: !Bool
-  , gmGeneratedSpeedup :: !(Maybe Double)
-  , gmBestPeerSpeedup  :: !(Maybe Double)
-  } deriving (Eq, Show)
-
 -- | Build a 'ShapeKey' -> 'GateMeasurement' map by re-deriving
 -- selected shape keys for each cost-lab member graph (identical
 -- machinery to 'costLabShapeIndex') and joining them with that
