@@ -12,10 +12,10 @@
 -- 'SessionFanInHost' through 'MetaSonic.Session.MIDIProducer'.
 --
 -- It deliberately does not open PortMIDI devices, choose a live clock,
--- define pitch-bend or channel remapping/splits, arbitrate against OSC
--- beyond the existing FIFO fan-in queue, or repair a diverged owner.
--- Real device ownership should be added later as a source behind this
--- decoded-event boundary.
+-- define channel remapping/splits, arbitrate against OSC beyond the
+-- existing FIFO fan-in queue, or repair a diverged owner. Real device
+-- ownership should be added later as a source behind this decoded-event
+-- boundary.
 
 module MetaSonic.Session.MIDIListener
   ( -- * Decoded event source

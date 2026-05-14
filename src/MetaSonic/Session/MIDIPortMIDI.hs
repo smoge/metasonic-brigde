@@ -10,16 +10,16 @@
 -- This module adapts Q / PortMIDI input into the decoded-event source
 -- consumed by 'MetaSonic.Session.MIDIListener'. It owns only a small
 -- polling handle; the session listener owns the worker thread and the
--- MIDI producer owns note/CC translation policy.
+-- MIDI producer owns note/CC/pitch-bend translation policy.
 --
 -- A 'PortMIDISource' handle is single-consumer: poll it from one owner
 -- thread, and close it only after that owner has stopped polling.
 --
--- The source decodes MIDI 1.0 note-on, note-off, control-change, and
--- channel all-notes-off (CC 123) messages. Other messages are
--- consumed and ignored. Pitch bend, aftertouch, MIDI clock, channel
--- masks, and broader controller policy stay out of scope for this v1
--- source.
+-- The source decodes MIDI 1.0 note-on, note-off, control-change,
+-- pitch-bend, and channel all-notes-off (CC 123) messages. Other
+-- messages are consumed and ignored. Aftertouch, MIDI clock, channel
+-- remapping/splits, and broader controller policy stay out of scope for
+-- this source.
 
 module MetaSonic.Session.MIDIPortMIDI
   ( PortMIDISourceOptions (..)
@@ -119,8 +119,8 @@ pollPortMIDISourceEvent (PortMIDISource h) =
           then pure Nothing
           else do
             ch <- fromCDataByte <$> peek channelPtr
-            d1 <- fromCDataByte <$> peek data1Ptr
-            d2 <- fromCDataByte <$> peek data2Ptr
+            d1 <- peek data1Ptr
+            d2 <- peek data2Ptr
             pure (fromEventKind kind ch d1 d2)
 
 -- | Convert a polling PortMIDI handle into the blocking source shape
@@ -145,17 +145,21 @@ portMIDIListenerSource opts source =
           threadDelay (max 1 (pmsoPollDelayUsec opts))
           loop
 
-fromEventKind :: CInt -> Word8 -> Word8 -> Word8 -> Maybe MIDIProducerEvent
+fromEventKind :: CInt -> Word8 -> CInt -> CInt -> Maybe MIDIProducerEvent
 fromEventKind kind ch d1 d2
   | kind == rtSessionMIDIEventNoteOn =
-      Just (MIDIProducerNoteOn ch d1 d2)
+      Just (MIDIProducerNoteOn ch (fromCDataByte d1) (fromCDataByte d2))
   | kind == rtSessionMIDIEventNoteOff =
-      Just (MIDIProducerNoteOff ch d1 d2)
+      Just (MIDIProducerNoteOff ch (fromCDataByte d1) (fromCDataByte d2))
   | kind == rtSessionMIDIEventControlChange =
       Just $
-        if d1 == midiAllNotesOffController
+        if fromCDataByte d1 == midiAllNotesOffController
            then MIDIProducerAllNotesOff (Just ch)
-           else MIDIProducerControlChange ch d1 d2
+           else MIDIProducerControlChange ch
+                  (fromCDataByte d1)
+                  (fromCDataByte d2)
+  | kind == rtSessionMIDIEventPitchBend =
+      Just (MIDIProducerPitchBend ch (fromIntegral d1))
   | otherwise =
       Nothing
 
@@ -169,12 +173,13 @@ midiAllNotesOffController =
 
 -- | Diagnostic view of the C ABI event tags used by the decoder.
 -- Exposed so tests can pin the header-derived agreement contract.
-portMIDISourceEventKindTags :: (Int, Int, Int, Int)
+portMIDISourceEventKindTags :: (Int, Int, Int, Int, Int)
 portMIDISourceEventKindTags =
   ( fromIntegral rtSessionMIDIEventNone
   , fromIntegral rtSessionMIDIEventNoteOn
   , fromIntegral rtSessionMIDIEventNoteOff
   , fromIntegral rtSessionMIDIEventControlChange
+  , fromIntegral rtSessionMIDIEventPitchBend
   )
 
 rtSessionMIDIEventNone :: CInt
@@ -193,6 +198,10 @@ rtSessionMIDIEventControlChange :: CInt
 rtSessionMIDIEventControlChange =
   c_RT_SESSION_MIDI_EVENT_CONTROL_CHANGE
 
+rtSessionMIDIEventPitchBend :: CInt
+rtSessionMIDIEventPitchBend =
+  c_RT_SESSION_MIDI_EVENT_PITCH_BEND
+
 foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_NONE"
   c_RT_SESSION_MIDI_EVENT_NONE :: CInt
 
@@ -204,6 +213,9 @@ foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_NO
 
 foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_CONTROL_CHANGE"
   c_RT_SESSION_MIDI_EVENT_CONTROL_CHANGE :: CInt
+
+foreign import capi unsafe "session_midi_source.h value RT_SESSION_MIDI_EVENT_PITCH_BEND"
+  c_RT_SESSION_MIDI_EVENT_PITCH_BEND :: CInt
 
 foreign import ccall safe "rt_session_midi_source_open"
   c_rt_session_midi_source_open :: CInt -> IO (Ptr CPortMIDISource)

@@ -46,6 +46,10 @@ bool decode_raw(cycfi::q::midi_1_0::raw_message msg,
       out = DecodedEvent{RT_SESSION_MIDI_EVENT_CONTROL_CHANGE,
                          channel, data1, data2};
       return true;
+    case cycfi::q::midi_1_0::status::pitch_bend:
+      out = DecodedEvent{RT_SESSION_MIDI_EVENT_PITCH_BEND,
+                         channel, data1 | (data2 << 7), 0};
+      return true;
     default:
       return false;
   }

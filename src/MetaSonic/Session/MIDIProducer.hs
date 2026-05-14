@@ -7,8 +7,8 @@
 -- Description : Haskell-only MIDI event adapter for session fan-in.
 --
 -- This module defines a narrow, protocol-neutral MIDI producer above
--- 'MetaSonic.Session.FanIn'. It translates decoded MIDI note, CC, and
--- all-notes-off events into symbolic 'SessionCommand's, then
+-- 'MetaSonic.Session.FanIn'. It translates decoded MIDI note, CC,
+-- pitch-bend, and all-notes-off events into symbolic 'SessionCommand's, then
 -- submits them as 'ProducerMIDI'.
 --
 -- It deliberately does not open PortMIDI devices, own a listener
@@ -24,6 +24,7 @@ module MetaSonic.Session.MIDIProducer
     -- * Mapping
   , MIDIChannelFilter (..)
   , MIDIControlMapping (..)
+  , MIDIPitchBendMapping (..)
   , MIDIProducerOptions (..)
   , defaultMIDIProducerOptions
   , midiProducerId
@@ -50,7 +51,7 @@ import qualified Data.Map.Strict            as M
 import qualified Data.Set                   as S
 import           Data.Text                  (Text)
 import qualified Data.Text                  as T
-import           Data.Word                  (Word8)
+import           Data.Word                  (Word16, Word8)
 import           GHC.Generics               (Generic)
 
 import           MetaSonic.Pattern          (ControlTag, TemplateName (..),
@@ -68,6 +69,8 @@ import           MetaSonic.Session.Queue    (ProducerId (..),
 --
 -- Channels are zero-based MIDI channels. Note, velocity, controller,
 -- and controller values must be MIDI data bytes in @[0, 127]@.
+-- Pitch-bend values must be 14-bit MIDI values in @[0, 16383]@ with
+-- center at @8192@.
 -- For 'MIDIProducerAllNotesOff', 'Nothing' means every active producer
 -- note, and 'Just' means only notes currently active on that channel.
 data MIDIProducerEvent
@@ -86,6 +89,10 @@ data MIDIProducerEvent
       , mpeController :: !Word8
       , mpeValue      :: !Word8
       }
+  | MIDIProducerPitchBend
+      { mpeChannel        :: !Word8
+      , mpePitchBendValue :: !Word16
+      }
   | MIDIProducerAllNotesOff
       { mpeAllNotesChannel :: !(Maybe Word8)
       }
@@ -97,6 +104,18 @@ data MIDIControlMapping = MIDIControlMapping
   { mcmTarget :: !ControlTag
   , mcmMin    :: !Value
   , mcmMax    :: !Value
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | One pitch-bend binding into a symbolic per-note frequency target.
+--
+-- The target is usually the same control used by 'mpoFrequencyControl'.
+-- On each pitch-bend event, active notes on that MIDI channel receive
+-- @midiNoteFrequency note * 2 ** ((bend * semitones) / 12)@, where
+-- @bend@ maps the 14-bit MIDI value to @[-1, 1)@ with @8192@ as center.
+data MIDIPitchBendMapping = MIDIPitchBendMapping
+  { mpbmTarget    :: !ControlTag
+  , mpbmSemitones :: !Value
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -118,7 +137,8 @@ data MIDIChannelFilter
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
--- | Translation options for MIDI note, CC, and all-notes-off events.
+-- | Translation options for MIDI note, CC, pitch-bend, and
+-- all-notes-off events.
 data MIDIProducerOptions = MIDIProducerOptions
   { mpoProducerName     :: !Text
   , mpoTemplateName     :: !TemplateName
@@ -126,6 +146,7 @@ data MIDIProducerOptions = MIDIProducerOptions
   , mpoGateControl      :: !(Maybe ControlTag)
   , mpoVelocityControl  :: !(Maybe ControlTag)
   , mpoCCMappings       :: !(M.Map Word8 MIDIControlMapping)
+  , mpoPitchBendMapping :: !(Maybe MIDIPitchBendMapping)
   , mpoChannelFilter    :: !MIDIChannelFilter
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
@@ -139,6 +160,7 @@ defaultMIDIProducerOptions = MIDIProducerOptions
   , mpoGateControl      = Nothing
   , mpoVelocityControl  = Nothing
   , mpoCCMappings       = M.empty
+  , mpoPitchBendMapping = Nothing
   , mpoChannelFilter    = MIDIChannelOmni
   }
 
@@ -166,6 +188,8 @@ data MIDIProducerIssue
   | MpiNoteAlreadyActive !Word8 !Word8
   | MpiNoteNotActive !Word8 !Word8
   | MpiUnmappedControl !Word8
+  | MpiUnmappedPitchBend
+  | MpiInvalidPitchBendValue !Word16
   | MpiChannelFiltered !Word8
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
@@ -219,6 +243,8 @@ decodeMIDISessionCommands opts st event = do
       noteOff ch note st
     MIDIProducerControlChange _ch controller value ->
       controlChange controller value st
+    MIDIProducerPitchBend ch value ->
+      pitchBend ch value st
     MIDIProducerAllNotesOff target ->
       allNotesOff target st
   where
@@ -266,6 +292,22 @@ decodeMIDISessionCommands opts st event = do
                 [ CmdControlWrite vkey (mcmTarget mapping)
                     (scaleControl mapping value)
                 | vkey <- M.elems active
+                ]
+            , mpcbState =
+                st
+            }
+
+    pitchBend ch value (MIDIProducerState active) =
+      case mpoPitchBendMapping opts of
+        Nothing ->
+          Left MpiUnmappedPitchBend
+        Just mapping ->
+          Right MIDIProducerCommandBatch
+            { mpcbCommands =
+                [ CmdControlWrite vkey (mpbmTarget mapping)
+                    (pitchBendFrequency (mpbmSemitones mapping) note value)
+                | ((noteCh, note), vkey) <- M.toList active
+                , noteCh == ch
                 ]
             , mpcbState =
                 st
@@ -338,6 +380,9 @@ validateEvent event = case event of
     validateChannel ch
     validateDataByte (T.pack "controller") controller
     validateDataByte (T.pack "value") value
+  MIDIProducerPitchBend ch value -> do
+    validateChannel ch
+    validatePitchBendValue value
   MIDIProducerAllNotesOff Nothing ->
     Right ()
   MIDIProducerAllNotesOff (Just ch) ->
@@ -365,6 +410,8 @@ eventChannel event = case event of
     Just ch
   MIDIProducerControlChange ch _controller _value ->
     Just ch
+  MIDIProducerPitchBend ch _value ->
+    Just ch
   MIDIProducerAllNotesOff target ->
     target
 
@@ -390,9 +437,23 @@ validateDataByte label value
   | otherwise =
       Left (MpiInvalidDataByte label value)
 
+validatePitchBendValue :: Word16 -> Either MIDIProducerIssue ()
+validatePitchBendValue value
+  | value <= 16383 =
+      Right ()
+  | otherwise =
+      Left (MpiInvalidPitchBendValue value)
+
 velocityToUnit :: Word8 -> Value
 velocityToUnit velocity =
   fromIntegral velocity / 127.0
+
+pitchBendFrequency :: Value -> Word8 -> Word16 -> Value
+pitchBendFrequency semitones note value =
+  midiNoteFrequency note * (2.0 ** ((bend * semitones) / 12.0))
+  where
+    bend =
+      (fromIntegral value - 8192.0) / 8192.0
 
 scaleControl :: MIDIControlMapping -> Word8 -> Value
 scaleControl mapping value =

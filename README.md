@@ -269,10 +269,10 @@ The landed pieces are deliberately small:
   producer. It only parses and enqueues; draining is owned by the caller or by
   a composed `MetaSonic.Session.FanInService`.
 - `MetaSonic.Session.MIDIProducer` translates already-decoded MIDI note-on,
-  note-off, control-change, and all-notes-off events into session
+  note-off, control-change, pitch-bend, and all-notes-off events into session
   commands with `ProducerMIDI` identity, including per-note producer state,
-  configurable note/CC mappings, a default-omni channel allow-list, and
-  deterministic producer-local voice stops.
+  configurable note/CC/pitch-bend mappings, a default-omni channel allow-list,
+  and deterministic producer-local voice stops.
 - `MetaSonic.Session.MIDIListener` brackets a worker around an injected
   decoded MIDI event source and feeds `MetaSonic.Session.MIDIProducer`. It is
   testable without hardware and still does not own PortMIDI devices.
@@ -290,11 +290,12 @@ The landed pieces are deliberately small:
   values before they enter the fan-in queue.
 
 What is still intentionally absent: GUI toolkit bindings, manifest-driven
-session reload/resource allocation, broader MIDI behavior beyond note/CC
-command translation, CC 123 all-notes-off, producer-local channel filtering,
-and the small PortMIDI-backed decoded source, broader OSC behavior beyond
-symbolic control writes, pitch-bend control binding, arbitration beyond FIFO,
-long-running supervision beyond the scoped fan-in service, unsupported
+session reload/resource allocation, broader MIDI behavior beyond the landed
+MIDI ingress surface (note/CC/pitch-bend/all-notes-off command translation,
+producer-local channel filtering, and the small PortMIDI-backed decoded
+source), broader OSC behavior beyond symbolic control writes, channel
+remapping/splits, MIDI clock, aftertouch/sustain policy, arbitration beyond
+FIFO, long-running supervision beyond the scoped fan-in service, unsupported
 respawn/reset policy for preserving swaps, and recovery after terminal runtime
 divergence.
 

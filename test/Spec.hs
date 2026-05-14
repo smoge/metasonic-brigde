@@ -15135,6 +15135,33 @@ sessionMIDIProducerTests =
             ]
           mpcbState batch @?= active
 
+  , testCase "pitch-bend maps to channel-active frequency writes" $ do
+      let active = MIDIProducerState
+            { mpsActiveNotes = M.fromList
+                [ ((0, 72), VoiceKey "m0-72")
+                , ((1, 67), VoiceKey "m1-67")
+                , ((0, 60), VoiceKey "m0-60")
+                ]
+            }
+          value = 16383
+          expected note =
+            midiNoteFrequency note
+              * (2.0 ** ((((fromIntegral value - 8192.0) / 8192.0) * 2.0)
+                          / 12.0))
+      case decodeMIDISessionCommands
+             testMIDIProducerOptions
+             active
+             (MIDIProducerPitchBend 0 value) of
+        Left issue ->
+          assertFailure ("expected MIDI pitch-bend translation, got: "
+                         <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdControlWrite (VoiceKey "m0-60") midiFreqTag (expected 60)
+            , CmdControlWrite (VoiceKey "m0-72") midiFreqTag (expected 72)
+            ]
+          mpcbState batch @?= active
+
   , testCase "channel filter admits allow-listed channels" $ do
       let opts = testMIDIProducerOptions
             { mpoChannelFilter = MIDIChannelAllowList (S.singleton 2)
@@ -15159,6 +15186,11 @@ sessionMIDIProducerTests =
         opts
         initialMIDIProducerState
         (MIDIProducerControlChange 0 7 64)
+        @?= Left (MpiChannelFiltered 0)
+      decodeMIDISessionCommands
+        opts
+        initialMIDIProducerState
+        (MIDIProducerPitchBend 0 8192)
         @?= Left (MpiChannelFiltered 0)
       decodeMIDISessionCommands
         opts
@@ -15238,7 +15270,7 @@ sessionMIDIProducerTests =
             ]
           mpcbState batch @?= expectedState
 
-  , testCase "invalid data bytes and unmapped CCs reject explicitly" $ do
+  , testCase "invalid data bytes and unmapped controls reject explicitly" $ do
       decodeMIDISessionCommands
         testMIDIProducerOptions
         initialMIDIProducerState
@@ -15254,6 +15286,21 @@ sessionMIDIProducerTests =
         initialMIDIProducerState
         (MIDIProducerControlChange 0 74 64)
         @?= Left (MpiUnmappedControl 74)
+      decodeMIDISessionCommands
+        defaultMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerPitchBend 0 8192)
+        @?= Left MpiUnmappedPitchBend
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerPitchBend 16 8192)
+        @?= Left (MpiInvalidChannel 16)
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerPitchBend 0 16384)
+        @?= Left (MpiInvalidPitchBendValue 16384)
       decodeMIDISessionCommands
         testMIDIProducerOptions
         initialMIDIProducerState
@@ -15500,6 +15547,11 @@ testMIDIProducerOptions = defaultMIDIProducerOptions
         { mcmTarget = midiLevelTag
         , mcmMin    = 0.0
         , mcmMax    = 1.0
+        }
+  , mpoPitchBendMapping =
+      Just MIDIPitchBendMapping
+        { mpbmTarget    = midiFreqTag
+        , mpbmSemitones = 2.0
         }
   }
 
@@ -15947,7 +15999,7 @@ sessionMIDIPortMIDISourceTests :: TestTree
 sessionMIDIPortMIDISourceTests =
   testGroup "Session MIDI PortMIDI source"
   [ testCase "event tags match the C ABI header contract" $
-      MIDIPM.portMIDISourceEventKindTags @?= (0, 1, 2, 3)
+      MIDIPM.portMIDISourceEventKindTags @?= (0, 1, 2, 3, 4)
 
   , testCase "invalid device opens an idle closeable source" $ do
       result <-

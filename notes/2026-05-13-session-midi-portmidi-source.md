@@ -5,10 +5,10 @@ This slice adds the first Q / PortMIDI-backed source for
 
 The source is intentionally smaller than the existing live-MIDI demo
 path. It owns only a polling handle over `q::midi_input_stream`, decodes
-MIDI 1.0 note-on, note-off, control-change, and all-notes-off (CC 123)
-messages into `MIDIProducerEvent`s, and lets the Haskell session
-listener own the worker thread. It does not touch `RTGraph`,
-`VoiceAllocator`, or the runtime realtime queue.
+MIDI 1.0 note-on, note-off, control-change, pitch-bend, and
+all-notes-off (CC 123) messages into `MIDIProducerEvent`s, and lets the
+Haskell session listener own the worker thread. It does not touch
+`RTGraph`, `VoiceAllocator`, or the runtime realtime queue.
 
 ## Landed Scope
 
@@ -34,10 +34,9 @@ listener own the worker thread. It does not touch `RTGraph`,
 
 ## Still Out Of Scope
 
-- Pitch bend, aftertouch, MIDI clock, source-level channel filtering,
-  sustain-pedal semantics, or broader controller policy beyond CC 123
-  all-notes-off. Channel filtering is producer-level policy, and
-  pitch bend is deferred to a separate control-binding slice.
+- Aftertouch, MIDI clock, source-level channel filtering, sustain-pedal
+  semantics, or broader controller policy beyond CC 123 all-notes-off.
+  Channel filtering and pitch-bend binding are producer-level policy.
 - Producer arbitration beyond FIFO.
 - Reusing or replacing the existing C++ `MetaSonic.Bridge.MidiDemo`
   live-runtime path.
@@ -48,7 +47,8 @@ listener own the worker thread. It does not touch `RTGraph`,
 
 The tests use an invalid device id so they do not require MIDI
 hardware. They cover idle closeable open behavior, no-event polling,
-and composition with `MetaSonic.Session.MIDIListener` teardown.
+event-tag agreement, and composition with `MetaSonic.Session.MIDIListener`
+teardown.
 
 Manual live-device coverage is intentionally outside automated CI:
 
@@ -59,5 +59,5 @@ stack exec -- metasonic-bridge --midi-device <input-id> --session-midi-smoke 10
 ```
 
 The smoke command exits non-zero if it cannot open an input-capable
-device or if no supported note/CC/all-notes-off events produce drained
-session commands during the selected time window.
+device or if no supported note/CC/pitch-bend/all-notes-off events
+produce drained session commands during the selected time window.

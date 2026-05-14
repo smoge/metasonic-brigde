@@ -35,7 +35,8 @@ service hook blocks past a short grace period.
 
 - At this slice, MIDI/UI producer translation. The later
   [Session MIDI Producer Adapter](2026-05-13-session-midi-producer-adapter.md)
-  covers already-decoded MIDI note/CC command translation, and the
+  covers already-decoded MIDI note/CC/pitch-bend/all-notes-off command
+  translation, and the
   later
   [Session UI Producer Adapter](2026-05-13-session-ui-producer-adapter.md)
   covers already-decoded UI intent translation. Live PortMIDI

@@ -16,6 +16,7 @@ TEST_CASE("rt_session_midi_source: event tags stay stable") {
     CHECK(RT_SESSION_MIDI_EVENT_NOTE_ON == 1);
     CHECK(RT_SESSION_MIDI_EVENT_NOTE_OFF == 2);
     CHECK(RT_SESSION_MIDI_EVENT_CONTROL_CHANGE == 3);
+    CHECK(RT_SESSION_MIDI_EVENT_PITCH_BEND == 4);
 }
 
 TEST_CASE("rt_session_midi_source: null handles and null outputs reject safely") {

@@ -48,6 +48,7 @@ import qualified MetaSonic.Session.MIDIListener as MIDIS
 import           MetaSonic.Session.MIDIProducer (MIDIControlMapping (..),
                                                  MIDIProducerEnqueueResult (..),
                                                  MIDIProducerOptions (..),
+                                                 MIDIPitchBendMapping (..),
                                                  defaultMIDIProducerOptions,
                                                  initialMIDIProducerState,
                                                  mpcbCommands,
@@ -62,7 +63,8 @@ data SmokeMIDIDevice = SmokeMIDIDevice
 
 -- | Run a bounded manual smoke test over the session MIDI ingress
 -- stack. The command exits non-zero when no input device opens or
--- when no supported note/CC events are observed in the smoke window.
+-- when no supported note/CC/pitch-bend/all-notes-off events are
+-- observed in the smoke window.
 runSessionMidiSmoke :: Maybe Int -> Int -> IO ()
 runSessionMidiSmoke midiDevice seconds = do
   graph <- case compileTemplateGraph [("voice", sessionMidiSmokeGraph)] of
@@ -136,7 +138,7 @@ runSessionMidiSmoke midiDevice seconds = do
                 (MIDIPM.portMIDIListenerSource sourceOpts source)
                 (sessionFanInServiceHost service)
                 $ \listener -> do
-                    putStrLn "  Send note-on, note-off, and CC 7 now."
+                    putStrLn "  Send note-on, note-off, CC 7, and pitch-bend now."
                     threadDelay (seconds * 1000000)
                     -- Let the wake-on-enqueue drain worker report a
                     -- final event that landed at the end of the
@@ -164,8 +166,9 @@ runSessionMidiSmoke midiDevice seconds = do
             <> show (M.size (mpsActiveNotes listenerState))
             <> " queue_depth=" <> show (sfisQueueDepth snapshot)
           when (observed == 0) $
-            dieAfterFlush
-              "No supported MIDI note/CC events observed during smoke window."
+            dieAfterFlush $
+              "No supported MIDI note/CC/pitch-bend/all-notes-off events "
+              <> "observed during smoke window."
           when (drained == 0) $
             dieAfterFlush
               "No session commands drained during smoke window."
@@ -224,6 +227,11 @@ sessionMidiSmokeProducerOptions =
           { mcmTarget = ControlTag (MigrationKey "level") 0
           , mcmMin    = 0.0
           , mcmMax    = 1.0
+          }
+    , mpoPitchBendMapping =
+        Just MIDIPitchBendMapping
+          { mpbmTarget    = ControlTag (MigrationKey "carrier") 0
+          , mpbmSemitones = 2.0
           }
     }
 

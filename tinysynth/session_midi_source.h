@@ -3,12 +3,12 @@
 // Description : Small PortMIDI/Q decoded-event source for session MIDI
 // ================================================================
 //
-// This C ABI exposes a polling source of already-decoded MIDI note
-// and CC events. It is intentionally smaller than midi_demo.h: no
-// RTGraph, VoiceAllocator, realtime queue, worker thread, pitch-bend
-// policy, or control mapping lives here. Haskell owns the worker via
-// MetaSonic.Session.MIDIListener and polls this handle from that
-// worker.
+// This C ABI exposes a polling source of already-decoded MIDI note,
+// CC, and pitch-bend events. It is intentionally smaller than
+// midi_demo.h: no RTGraph, VoiceAllocator, realtime queue, worker
+// thread, pitch-bend policy, or control mapping lives here. Haskell
+// owns the worker via MetaSonic.Session.MIDIListener and polls this
+// handle from that worker.
 //
 // Threading: a source handle is single-consumer. Poll it from one
 // owner thread and do not close it while another thread is polling.
@@ -25,7 +25,8 @@ enum {
   RT_SESSION_MIDI_EVENT_NONE = 0,
   RT_SESSION_MIDI_EVENT_NOTE_ON = 1,
   RT_SESSION_MIDI_EVENT_NOTE_OFF = 2,
-  RT_SESSION_MIDI_EVENT_CONTROL_CHANGE = 3
+  RT_SESSION_MIDI_EVENT_CONTROL_CHANGE = 3,
+  RT_SESSION_MIDI_EVENT_PITCH_BEND = 4
 };
 
 // Open a polling source over a Q / PortMIDI input device.
@@ -54,6 +55,7 @@ int rt_session_midi_source_has_device(const rt_session_midi_source *h);
 //   note-on:        channel, note, velocity
 //   note-off:       channel, note, velocity
 //   control-change: channel, controller, value
+//   pitch-bend:     channel, 14-bit value in data1, 0 in data2
 //
 // Unsupported MIDI 1.0 messages are consumed and ignored. No-event and
 // no-device both return RT_SESSION_MIDI_EVENT_NONE.
