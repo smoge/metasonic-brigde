@@ -13,6 +13,7 @@ import           MetaSonic.Spec.FFI
 import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session
+import           MetaSonic.Spec.SessionManifestReload
 import           MetaSonic.Spec.SessionMIDI
 
 main :: IO ()
@@ -44,6 +45,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionLiveHotSwapOrchestrationTests
   , sessionFanInHostTests
   , sessionFanInServiceTests
+  , sessionManifestReloadTests
   , sessionMIDIProducerTests
   , sessionMIDIListenerTests
   , sessionMIDIPortMIDISourceTests

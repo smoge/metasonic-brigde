@@ -61,6 +61,7 @@ library
       MetaSonic.Session.Host
       MetaSonic.Session.FanIn
       MetaSonic.Session.FanInService
+      MetaSonic.Session.ManifestReload
       MetaSonic.Session.MIDIProducer
       MetaSonic.Session.MIDIListener
       MetaSonic.Session.MIDIPortMIDI
@@ -168,6 +169,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.Feature
       MetaSonic.Spec.PatternOSCBuffer
       MetaSonic.Spec.Session
+      MetaSonic.Spec.SessionManifestReload
       MetaSonic.Spec.SessionMIDI
       MetaSonic.Spec.SessionShared
   hs-source-dirs:
