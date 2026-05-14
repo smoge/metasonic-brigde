@@ -3083,10 +3083,9 @@ Session prep artifacts:
   FIFO.
 - [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
   records the pre-implementation policy boundary for high-rate control
-  traffic. It keeps voice lifecycle and hot-swap commands
-  non-coalescible, identifies repeated same-producer control writes as
-  the first possible coalescing candidate, and leaves queue behavior
-  unchanged.
+  traffic. It keeps the shared queue strict FIFO, makes coalescing
+  producer-local, treats every non-control-write command as a fence, and
+  leaves implementation gated on measurement.
 
 Landed prep contracts:
 

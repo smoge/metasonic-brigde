@@ -6,9 +6,12 @@ land in this slice.
 The session fan-in path now has real high-rate control producers:
 OSC symbolic control writes, MIDI CC, MIDI pitch-bend, UI control
 writes, and future Pattern automation can all target the same bounded
-FIFO queue. That makes queue pressure an operational risk, but changing
-drop/coalescing behavior is a cross-producer semantic decision rather
-than a MIDI-only optimization.
+FIFO queue. That makes queue pressure an operational risk, but the
+fan-in queue is the load-bearing contract across the producer family:
+if enqueue succeeds, the drained stream contains that command in FIFO
+order. Coalescing belongs at producer worker boundaries, before fan-in,
+so `MetaSonic.Session.Queue` and `MetaSonic.Session.FanIn` can remain
+strict FIFO.
 
 ## Current Contract
 
@@ -20,6 +23,10 @@ than a MIDI-only optimization.
 - Producer adapters preserve their own state on enqueue failure, so a
   full queue is observable backpressure rather than an implicit
   producer-side drop.
+- A shared queue-level coalescer would make successful enqueue
+  ambiguous: a command could be accepted but later disappear into a
+  merged value. That would invalidate the existing fan-in tests and
+  producer rollback assumptions.
 - Some existing producer behavior depends on FIFO order. In particular,
   MIDI sustained retriggers emit `CmdVoiceOff` followed by `CmdVoiceOn`
   with the same `VoiceKey`; correctness depends on the owner applying
@@ -27,24 +34,29 @@ than a MIDI-only optimization.
 
 ## Command Classes
 
-These commands are not coalescible:
+Every command except `CmdControlWrite` is a fence:
 
 - `CmdVoiceOn`
 - `CmdVoiceOff`
 - `CmdHotSwap`
 
-Voice lifecycle commands are ordering barriers. That includes
-MIDI all-notes-off releases, sustain-pedal releases, and sustained
-retrigger stop/start pairs. Coalescing or reordering them can change
-which voice exists, whether a stale `VoiceKey` is valid, or which graph
-owns a control target after hot-swap.
+Voice lifecycle commands and hot-swap commands are not coalescible.
+They also force a producer-local flush before the fence command itself
+is enqueued. That includes MIDI all-notes-off releases,
+sustain-pedal releases, and sustained retrigger stop/start pairs. The
+retrigger pair does not need a special carve-out: it contains a
+`CmdVoiceOff` followed by a `CmdVoiceOn`, and both commands are fences.
 
-The only obvious coalescing candidate is repeated `CmdControlWrite` to
-the same target:
+The only coalescing candidate is repeated `CmdControlWrite` to the same
+target within one producer worker:
 
 ```text
-(ProducerId, VoiceKey, ControlTag)
+Map (VoiceKey, ControlTag) Value
 ```
+
+`ProducerId` is implicit because the buffer lives inside exactly one
+producer worker. Diagnostics can still report the producer identity, but
+the merge boundary is the producer, not a shared global table.
 
 For those writes, last-write-wins can be musically acceptable for
 continuous controls such as MIDI CC, pitch-bend, OSC sliders, and UI
@@ -52,62 +64,103 @@ sliders. That rule is not automatically safe across producers, because
 OSC, MIDI, UI, and Pattern may represent different user intents even
 when they hit the same control target.
 
-## First Policy Candidate
+## Producer-Local Shape
 
-A first implementation should avoid global cross-producer arbitration.
-If coalescing is added, start with an explicit producer-local or
-producer-opted-in control-write coalescer:
+The safe shape is:
 
-- Key coalescing by `(ProducerId, VoiceKey, ControlTag)`.
-- Only coalesce `CmdControlWrite`.
-- Treat `CmdVoiceOn`, `CmdVoiceOff`, and `CmdHotSwap` as barriers that
-  flush any pending control write for affected voices or graphs before
-  they pass.
-- Preserve normal FIFO ordering between different producers.
-- Keep Pattern events non-coalesced by default; Pattern timing is
+```text
+producer decode -> producer-local coalesce buffer -> flush -> fan-in FIFO -> drain
+```
+
+The producer-local buffer is:
+
+```text
+Map (VoiceKey, ControlTag) Value
+```
+
+The rules are:
+
+- `CmdControlWrite vk ct v` updates pending state with
+  `insert (vk, ct) v pending`.
+- Updating an already-pending key increments the producer-local
+  coalesced counter.
+- Any non-`CmdControlWrite` command is a fence. The producer worker
+  flushes pending control writes in deterministic key order, enqueues
+  the fence command, then continues.
+- The fan-in queue does not learn about coalescing, barriers, or
+  producer-specific policy. It remains a strict FIFO of commands that
+  producers actually submit.
+- Cross-producer ordering remains whatever the existing fan-in FIFO
+  observes from separate enqueue calls; no producer can coalesce another
+  producer's command.
+- Keep Pattern events non-coalesced by default. Pattern timing is
   authored data, not just controller noise.
 
 This keeps the first policy narrow: it reduces repeated writes from one
-source while avoiding the stronger claim that two producers targeting
-the same control can be merged.
+source while preserving every existing fan-in and queue invariant.
+
+The exact flush cadence should be measurement-driven. A minimal v1 can
+flush at decoded-event boundaries and fences, preserving current visible
+rate while proving the policy. If realistic control streams still fill
+the queue, a timed producer-local flush can be added later without
+changing the shared FIFO contract.
 
 ## Observability
 
-Coalescing must not hide backpressure. A future implementation should
-report separate counters or hooks for at least:
+Coalescing must not hide backpressure. Keep producer-local and queue
+metrics separate:
 
-- queue-full rejections;
-- control writes accepted into the coalescer;
-- control writes replaced by a later write;
-- control writes flushed into the real fan-in queue;
-- barrier-forced flushes.
+Producer-local counters:
 
-Those counters should be distinct because queue-full means the session
-could not accept work, while coalescing means a configured policy
-accepted a newer value over an older one.
+- `coalesced_count`: pending control writes overwritten by later values;
+- `flushed_count`: control writes emitted into fan-in;
+- `barrier_flush_count`: flushes forced by fence commands.
+
+Queue counters remain unchanged:
+
+- `SeiQueueFull`;
+- queue depth snapshots such as `sfisQueueDepth`.
+
+A queue-full rejection means the queue is too small or the consumer is
+too slow. A high coalesced/flushed ratio means one producer is emitting
+more intermediate control values than the rest of the session can use.
+Mixing those signals would obscure both.
 
 ## Test Plan
 
-Before implementation, tests should pin:
+Implementation tests should live at producer-worker or producer-wrapper
+level, not by weakening fan-in tests:
 
-- FIFO preservation for `CmdVoiceOn`, `CmdVoiceOff`, and `CmdHotSwap`.
-- Same-producer same-target `CmdControlWrite` collapse to the latest
-  value only.
+- FIFO preservation: emit pending control writes followed by a fence and
+  observe flushed control writes before the fence.
+- Same-producer same-target control writes collapse to the latest value
+  within one flush window, with `coalesced_count == n - 1`.
 - Different-target control writes are not collapsed.
-- Different-producer same-target writes are not collapsed in v1.
-- Voice lifecycle and hot-swap commands flush or fence pending control
-  writes before the barrier command proceeds.
-- MIDI sustained retrigger remains a stop/start pair with the same
-  `VoiceKey` and is never coalesced.
-- Queue-full and coalesced/drop counters remain distinguishable.
+- Cross-producer same-target writes are not collapsed; two producers
+  still produce two fan-in commands in observed enqueue order.
+- Barrier flush: pending control write plus `CmdVoiceOff vk` drains as
+  `[CmdControlWrite vk ct v, CmdVoiceOff vk]`.
+- Sustained MIDI retrigger drains as its stop/start pair with no
+  coalescing of either fence.
+- Queue-full counters and producer-local coalescing counters remain
+  distinguishable.
+
+## Measurement Before Implementation
+
+Before landing behavior, measure whether the current strict FIFO fills
+under a realistic high-rate control stream, for example pitch-bend at
+100 Hz across 16 active voices plus normal note traffic. If the queue
+does not fill, the right outcome is to keep this note as the policy
+record and defer implementation. If it does fill, the measurement gives
+the coalescer a concrete throughput target and a regression benchmark.
 
 ## Open Questions
 
-- Whether the coalescer should live as a wrapper around
-  `SessionFanInHost` or as a separate producer-side helper.
+- Exact flush cadence: decoded-event boundary, timed tick, fence only,
+  or a hybrid.
 - Whether UI sliders should opt into the same producer-local policy as
   MIDI CC/pitch-bend.
 - Whether Pattern automation eventually needs an explicit
   authoring-level "continuous control" marker before it can opt in.
-- Whether a later owner-aware policy should coalesce across producers
-  only after an explicit priority/arbitration table exists.
+- Whether a later owner-aware policy should arbitrate across producers
+  only after an explicit priority table exists.
