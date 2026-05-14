@@ -1,7 +1,8 @@
 # Session Control Coalescing And Arbitration
 
-Status: design note only. No queue, producer, or runtime behavior changes
-land in this slice.
+Status: MIDI listener-local coalescing landed. The shared queue and
+fan-in service remain strict FIFO; OSC, UI, and Pattern coalescing are
+still design-only.
 
 The session fan-in path now has real high-rate control producers:
 OSC symbolic control writes, MIDI CC, MIDI pitch-bend, UI control
@@ -87,6 +88,10 @@ The rules are:
 - Any non-`CmdControlWrite` command is a fence. The producer worker
   flushes pending control writes in deterministic key order, enqueues
   the fence command, then continues.
+- If a fence-triggered flush is rejected, the fence command is not
+  submitted; a source that needs it must retry with a later event. The
+  producer worker must surface that drop explicitly, preserve the
+  pending controls, and keep producer state at the pre-fence value.
 - The fan-in queue does not learn about coalescing, barriers, or
   producer-specific policy. It remains a strict FIFO of commands that
   producers actually submit.
@@ -99,11 +104,11 @@ The rules are:
 This keeps the first policy narrow: it reduces repeated writes from one
 source while preserving every existing fan-in and queue invariant.
 
-The exact flush cadence should be measurement-driven. A minimal v1 can
-flush at decoded-event boundaries and fences, preserving current visible
-rate while proving the policy. If realistic control streams still fill
-the queue, a timed producer-local flush can be added later without
-changing the shared FIFO contract.
+The MIDI listener v1 uses a hybrid cadence: fence flushes,
+EOF/teardown flushes, and a conservative 20 ms timed flush by default.
+Deterministic tests can disable the timed flush and force the whole
+burst to drain at a later fence. Other producers should choose their
+cadence from measurement without changing the shared FIFO contract.
 
 ## Observability
 
@@ -113,7 +118,7 @@ metrics separate:
 Producer-local counters:
 
 - `coalesced_count`: pending control writes overwritten by later values;
-- `flushed_count`: control writes emitted into fan-in;
+- `flushed_count`: coalesced control writes accepted by fan-in;
 - `barrier_flush_count`: flushes forced by fence commands.
 
 Queue counters remain unchanged:
@@ -140,6 +145,9 @@ level, not by weakening fan-in tests:
   still produce two fan-in commands in observed enqueue order.
 - Barrier flush: pending control write plus `CmdVoiceOff vk` drains as
   `[CmdControlWrite vk ct v, CmdVoiceOff vk]`.
+- Barrier failure: pending control writes that hit queue-full preserve
+  pending state and report an explicit dropped-fence issue instead of
+  silently swallowing the fence.
 - Sustained MIDI retrigger drains as its stop/start pair with no
   coalescing of either fence.
 - Queue-full counters and producer-local coalescing counters remain
@@ -147,12 +155,13 @@ level, not by weakening fan-in tests:
 
 ## Measurement Before Implementation
 
-Before landing behavior, measure whether the current strict FIFO fills
-under a realistic high-rate control stream, for example pitch-bend at
-100 Hz across 16 active voices plus normal note traffic. If the queue
-does not fill, the right outcome is to keep this note as the policy
-record and defer implementation. If it does fill, the measurement gives
-the coalescer a concrete throughput target and a regression benchmark.
+Before extending behavior beyond MIDI, measure whether the current
+strict FIFO fills under a realistic high-rate control stream, for
+example pitch-bend at 100 Hz across 16 active voices plus normal note
+traffic. If the queue does not fill, the right outcome is to keep this
+note as the policy record for other producers and defer implementation.
+If it does fill, the measurement gives the next coalescer a concrete
+throughput target and a regression benchmark.
 
 Current deterministic coverage is separate from that realistic-rate
 gate. `Session MIDI producer adapter / pressure probe: high-rate
@@ -165,17 +174,17 @@ not a real-hardware throughput claim or a substitute for the
 implementation-gating measurement. A later coalescer must keep this
 probe passing or replace it with a documented contract change.
 
-That saturation probe does show queue pressure under its no-drain burst
-setup, so those counts are the current target for a producer-local
-coalescing experiment if realistic-rate measurement also justifies the
-complexity:
+That saturation probe showed queue pressure under its no-drain burst
+setup, so those counts became the target for the first MIDI
+producer-local coalescer:
 
 - Input burst: nine pitch-bend events across 16 active voices.
 - Current strict-FIFO output: 144 generated writes, 128 queued writes,
   16 queue-full rejections.
-- Expected producer-local coalescing target for the same burst, with a
-  cross-event flush window: 16 flushed writes, one latest value per
-  `(VoiceKey, ControlTag)`, and `coalesced_count == 128`.
+- MIDI listener-local coalesced output for the same burst, with timed
+  flush disabled and an all-notes-off fence: 16 flushed writes, one
+  latest value per `(VoiceKey, ControlTag)`, and
+  `coalesced_count == 128`.
 
 If the later realistic-rate measurement does not produce queue
 pressure, defer implementation and leave this note as the policy record
@@ -186,8 +195,8 @@ FIFO or fence semantics.
 
 ## Open Questions
 
-- Exact flush cadence: decoded-event boundary, timed tick, fence only,
-  or a hybrid.
+- Whether non-MIDI producers should use the MIDI listener's hybrid
+  fence/EOF/teardown/timed cadence or a source-specific cadence.
 - Whether UI sliders should opt into the same producer-local policy as
   MIDI CC/pitch-bend.
 - Whether Pattern automation eventually needs an explicit

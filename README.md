@@ -275,8 +275,9 @@ The landed pieces are deliberately small:
   note/CC/pitch-bend mappings, sustain-pedal deferral/release, a default-omni
   channel allow-list, and deterministic producer-local voice stops.
 - `MetaSonic.Session.MIDIListener` brackets a worker around an injected
-  decoded MIDI event source and feeds `MetaSonic.Session.MIDIProducer`. It is
-  testable without hardware and still does not own PortMIDI devices.
+  decoded MIDI event source, feeds `MetaSonic.Session.MIDIProducer`, and
+  coalesces repeated MIDI control writes locally before fan-in. It is testable
+  without hardware and still does not own PortMIDI devices.
 - `MetaSonic.MIDI.Devices` centralizes Q / PortMIDI device enumeration for
   both the legacy live MIDI demo and the session MIDI smoke command.
 - `MetaSonic.Session.MIDIPortMIDI` adapts a Q / PortMIDI input device into

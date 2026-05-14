@@ -214,6 +214,11 @@ data MIDIProducerCommandBatch = MIDIProducerCommandBatch
     deriving anyclass (NFData)
 
 -- | Result of translating and enqueueing one MIDI event.
+--
+-- Wrappers that defer enqueueing, such as the session MIDI listener's
+-- local control-write coalescer, may report a translated non-empty
+-- command batch with no enqueue results. Those commands are submitted
+-- later by the wrapper's flush path.
 data MIDIProducerEnqueueResult
   = MIDIProducerRejected !MIDIProducerIssue !MIDIProducerState
   | MIDIProducerEnqueueAttempted

@@ -39,7 +39,7 @@ import           Control.Monad             (forM, forM_, when)
 import           Data.Maybe                (isJust, isNothing, listToMaybe,
                                             mapMaybe)
 import           Data.Ord                  (comparing)
-import           Data.Word                 (Word8)
+import           Data.Word                 (Word16, Word8)
 import           Foreign.C.Types           (CDouble (..), CFloat (..),
                                             CInt, CLLong)
 import           Foreign.Marshal.Alloc     (allocaBytes)
@@ -182,7 +182,6 @@ import           MetaSonic.Types
 
 import qualified Data.ByteString           as OBS
 import qualified Data.ByteString.Char8     as OBSC
-import           Data.Word                 (Word8)
 
 main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
@@ -16148,6 +16147,325 @@ sessionMIDIListenerTests =
             ("expected note-on/all-notes-off listener results, got: "
              <> show other)
 
+  , testCase "listener coalesces pitch-bend writes until all-notes-off fence" $ do
+      let activeNotes =
+            M.fromList
+              [ ((0, note), midiVoiceKey 0 note)
+              | note <- [48..63]
+              ]
+          initialState =
+            testMIDIProducerState activeNotes
+          pitchValues =
+            [9000..9008] :: [Word16]
+          -- Last accepted value after the coalescing window.
+          finalValue =
+            9008 :: Word16
+          listenerOpts =
+            MIDIS.defaultSessionMIDIListenerOptions
+              { MIDIS.smloTimedControlFlushUsec = Nothing
+              }
+          expectedFreq note =
+            midiNoteFrequency note
+              * (2.0 ** ((((fromIntegral finalValue - 8192.0) / 8192.0) * 2.0)
+                          / 12.0))
+          expectedFlush =
+            [ CmdControlWrite (midiVoiceKey 0 note) midiFreqTag
+                (expectedFreq note)
+            | note <- [48..63]
+            ]
+          expectedFence =
+            [ CmdVoiceOff (midiVoiceKey 0 note)
+            | note <- [48..63]
+            ]
+      events <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult = putMVar producerResults
+            , MIDIS.smlhOnIssue          = \_ -> pure ()
+            }
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host ->
+              MIDIS.withSessionMIDIListenerHooksAndOptions
+                hooks
+                listenerOpts
+                testMIDIProducerOptions
+                initialState
+                source
+                host
+                $ \listener -> do
+                    pitchResults <- forM pitchValues $ \value -> do
+                      putMVar events (Just (MIDIProducerPitchBend 0 value))
+                      timeout 1000000 (takeMVar producerResults)
+                    putMVar events (Just (MIDIProducerAllNotesOff Nothing))
+                    mFence <- timeout 1000000 (takeMVar producerResults)
+                    stats <- MIDIS.readSessionMIDIListenerCoalescingStats
+                               listener
+                    state <- MIDIS.readSessionMIDIListenerState listener
+                    snapshot <- readSessionFanInHost host
+                    pure (pitchResults, mFence, stats, state, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (pitchResults,
+               Just (MIDIProducerEnqueueAttempted fenceBatch fenceEnqueues),
+               stats, state, snapshot) ->
+          case sequence pitchResults of
+            Nothing ->
+              assertFailure "timed out waiting for coalesced pitch-bend events"
+            Just results -> do
+              forM_ results $ \case
+                MIDIProducerEnqueueAttempted batch [] ->
+                  length (mpcbCommands batch) @?= 16
+                other ->
+                  assertFailure
+                    ("expected deferred pitch-bend result, got: "
+                     <> show other)
+              mpcbCommands fenceBatch @?= expectedFlush <> expectedFence
+              length fenceEnqueues @?= 32
+              map sfierQueueDepth fenceEnqueues @?= [1..32]
+              sfisQueueDepth snapshot @?= 32
+              mpsActiveNotes state @?= M.empty
+              MIDIS.smlcsCoalescedCount stats @?= 128
+              MIDIS.smlcsFlushedCount stats @?= 16
+              MIDIS.smlcsBarrierFlushCount stats @?= 1
+              MIDIS.smlcsPendingCount stats @?= 0
+        Right other ->
+          assertFailure
+            ("expected coalesced pitch-bend flush at all-notes-off fence, got: "
+             <> show other)
+
+  , testCase "listener reports dropped fence when coalesced flush is rejected" $ do
+      let activeNotes =
+            M.fromList
+              [ ((0, note), midiVoiceKey 0 note)
+              | note <- [48..63]
+              ]
+          initialState =
+            testMIDIProducerState activeNotes
+          pitchValue =
+            9000 :: Word16
+          stateAfterPitch =
+            initialState { mpsPitchBends = M.singleton 0 pitchValue }
+          fanInOpts =
+            defaultSessionFanInOptions
+              { sfioQueueOptions = SessionQueueOptions 8
+              }
+          listenerOpts =
+            MIDIS.defaultSessionMIDIListenerOptions
+              { MIDIS.smloTimedControlFlushUsec = Nothing
+              }
+          expectedFreq note =
+            midiNoteFrequency note
+              * (2.0 ** ((((fromIntegral pitchValue - 8192.0) / 8192.0) * 2.0)
+                          / 12.0))
+          expectedFlush =
+            [ CmdControlWrite (midiVoiceKey 0 note) midiFreqTag
+                (expectedFreq note)
+            | note <- [48..63]
+            ]
+      events <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      fenceIssues <- newEmptyMVar
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult = putMVar producerResults
+            , MIDIS.smlhOnIssue =
+                \case
+                  issue@(MIDIS.SmliFenceDroppedForFlushFailure _ _) ->
+                    putMVar fenceIssues issue
+                  _ ->
+                    pure ()
+            }
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          fanInOpts
+          $ \host ->
+              MIDIS.withSessionMIDIListenerHooksAndOptions
+                hooks
+                listenerOpts
+                testMIDIProducerOptions
+                initialState
+                source
+                host
+                $ \listener -> do
+                    putMVar events
+                      (Just (MIDIProducerPitchBend 0 pitchValue))
+                    mPitch <- timeout 1000000 (takeMVar producerResults)
+                    putMVar events (Just (MIDIProducerAllNotesOff Nothing))
+                    mFence <- timeout 1000000 (takeMVar producerResults)
+                    mIssue <- timeout 1000000 (takeMVar fenceIssues)
+                    stats <- MIDIS.readSessionMIDIListenerCoalescingStats
+                               listener
+                    state <- MIDIS.readSessionMIDIListenerState listener
+                    snapshot <- readSessionFanInHost host
+                    pure (mPitch, mFence, mIssue, stats, state, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (MIDIProducerEnqueueAttempted pitchBatch []),
+               Just (MIDIProducerEnqueueAttempted fenceBatch fenceEnqueues),
+               Just fenceIssue, stats, state, snapshot) -> do
+          length (mpcbCommands pitchBatch) @?= 16
+          mpcbCommands fenceBatch @?= expectedFlush
+          mpcbState fenceBatch @?= stateAfterPitch
+          length fenceEnqueues @?= 16
+          map sfierQueueDepth fenceEnqueues @?= [1..8] <> replicate 8 8
+          let accepted =
+                [ queued
+                | result' <- map sfierResult fenceEnqueues
+                , SessionEnqueued queued <- [result']
+                ]
+              rejected =
+                [ issue'
+                | result' <- map sfierResult fenceEnqueues
+                , SessionEnqueueRejected _ _ issue' <- [result']
+                ]
+          map qscCommand accepted @?= take 8 expectedFlush
+          rejected @?= replicate 8 (SeiQueueFull 8)
+          fenceIssue
+            @?= MIDIS.SmliFenceDroppedForFlushFailure
+                  (MIDIProducerAllNotesOff Nothing)
+                  8
+          sfisQueueDepth snapshot @?= 8
+          mpsActiveNotes state @?= activeNotes
+          mpsPitchBends state @?= M.singleton 0 pitchValue
+          MIDIS.smlcsCoalescedCount stats @?= 0
+          MIDIS.smlcsFlushedCount stats @?= 8
+          MIDIS.smlcsBarrierFlushCount stats @?= 1
+          MIDIS.smlcsPendingCount stats @?= 16
+        Right other ->
+          assertFailure
+            ("expected rejected coalesced flush to drop fence visibly, got: "
+             <> show other)
+
+  , testCase "listener flushes pending controls during teardown" $ do
+      let note =
+            60
+          activeNotes =
+            M.singleton (0, note) (midiVoiceKey 0 note)
+          initialState =
+            testMIDIProducerState activeNotes
+          pitchValue =
+            9000 :: Word16
+          listenerOpts =
+            MIDIS.defaultSessionMIDIListenerOptions
+              { MIDIS.smloTimedControlFlushUsec = Nothing
+              }
+          expectedFreq =
+            midiNoteFrequency note
+              * (2.0 ** ((((fromIntegral pitchValue - 8192.0) / 8192.0) * 2.0)
+                          / 12.0))
+          expectedCommand =
+            CmdControlWrite (midiVoiceKey 0 note) midiFreqTag expectedFreq
+      events <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult = putMVar producerResults
+            , MIDIS.smlhOnIssue          = \_ -> pure ()
+            }
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host -> do
+              mPitch <-
+                MIDIS.withSessionMIDIListenerHooksAndOptions
+                  hooks
+                  listenerOpts
+                  testMIDIProducerOptions
+                  initialState
+                  source
+                  host
+                  $ \_listener -> do
+                      putMVar events
+                        (Just (MIDIProducerPitchBend 0 pitchValue))
+                      timeout 1000000 (takeMVar producerResults)
+              drained <- drainSessionFanInHost host
+              pure (mPitch, drained)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (MIDIProducerEnqueueAttempted batch []), drained) -> do
+          mpcbCommands batch @?= [expectedCommand]
+          map (qscCommand . sdiQueued) (sdrItems (sfidrDrain drained))
+            @?= [expectedCommand]
+          sdrStopped (sfidrDrain drained) @?= Nothing
+          sfidrQueueDepth drained @?= 0
+        Right other ->
+          assertFailure
+            ("expected deferred pitch-bend flushed at teardown, got: "
+             <> show other)
+
+  , testCase "listener timed flush drains pending controls without a fence" $ do
+      let note =
+            60
+          activeNotes =
+            M.singleton (0, note) (midiVoiceKey 0 note)
+          initialState =
+            testMIDIProducerState activeNotes
+          pitchValue =
+            9000 :: Word16
+          listenerOpts =
+            MIDIS.defaultSessionMIDIListenerOptions
+              { MIDIS.smloTimedControlFlushUsec = Just 1000
+              }
+          expectedFreq =
+            midiNoteFrequency note
+              * (2.0 ** ((((fromIntegral pitchValue - 8192.0) / 8192.0) * 2.0)
+                          / 12.0))
+          expectedCommand =
+            CmdControlWrite (midiVoiceKey 0 note) midiFreqTag expectedFreq
+      events <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult = putMVar producerResults
+            , MIDIS.smlhOnIssue          = \_ -> pure ()
+            }
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host ->
+              MIDIS.withSessionMIDIListenerHooksAndOptions
+                hooks
+                listenerOpts
+                testMIDIProducerOptions
+                initialState
+                source
+                host
+                $ \listener -> do
+                    putMVar events
+                      (Just (MIDIProducerPitchBend 0 pitchValue))
+                    mPitch <- timeout 1000000 (takeMVar producerResults)
+                    (stats, snapshot) <-
+                      waitForTimedControlFlush listener host
+                    drained <- drainSessionFanInHost host
+                    pure (mPitch, stats, snapshot, drained)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (MIDIProducerEnqueueAttempted batch []),
+               stats, snapshot, drained) -> do
+          mpcbCommands batch @?= [expectedCommand]
+          sfisQueueDepth snapshot @?= 1
+          map (qscCommand . sdiQueued) (sdrItems (sfidrDrain drained))
+            @?= [expectedCommand]
+          MIDIS.smlcsCoalescedCount stats @?= 0
+          MIDIS.smlcsFlushedCount stats @?= 1
+          MIDIS.smlcsBarrierFlushCount stats @?= 0
+          MIDIS.smlcsPendingCount stats @?= 0
+        Right other ->
+          assertFailure
+            ("expected timed flush of deferred pitch-bend, got: "
+             <> show other)
+
   , testCase "queue-full rejection does not advance listener state" $ do
       let fanInOpts = defaultSessionFanInOptions
             { sfioQueueOptions = SessionQueueOptions 1
@@ -16300,6 +16618,24 @@ sessionMIDIListenerTests =
 midiMVarSource :: MVar (Maybe MIDIProducerEvent) -> MIDIS.MIDIListenerSource
 midiMVarSource events =
   MIDIS.MIDIListenerSource (takeMVar events)
+
+waitForTimedControlFlush
+  :: MIDIS.SessionMIDIListener
+  -> SessionFanInHost
+  -> IO (MIDIS.SessionMIDIListenerCoalescingStats, SessionFanInSnapshot)
+waitForTimedControlFlush listener host =
+  loop (100 :: Int)
+  where
+    loop 0 =
+      assertFailure "timed out waiting for MIDI listener timed control flush"
+    loop n = do
+      stats <- MIDIS.readSessionMIDIListenerCoalescingStats listener
+      snapshot <- readSessionFanInHost host
+      if MIDIS.smlcsPendingCount stats == 0 && sfisQueueDepth snapshot > 0
+         then pure (stats, snapshot)
+         else do
+           threadDelay 1000
+           loop (n - 1)
 
 ------------------------------------------------------------
 -- Session MIDI PortMIDI source

@@ -3082,13 +3082,11 @@ Session prep artifacts:
   binding, manifest reload/import, authorization, or arbitration beyond
   FIFO.
 - [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
-  records the pre-implementation policy boundary for high-rate control
-  traffic. It keeps the shared queue strict FIFO, makes coalescing
-  producer-local, treats every non-control-write command as a fence, and
-  leaves implementation gated on realistic-rate measurement. The
-  current deterministic pressure probe is a regression test for
-  strict-FIFO saturation under MIDI pitch-bend fanout before any
-  coalescer exists.
+  records the policy boundary for high-rate control traffic. It keeps
+  the shared queue strict FIFO, makes coalescing producer-local, treats
+  every non-control-write command as a fence, and documents the first
+  MIDI listener-local coalescer. OSC, UI, and Pattern coalescing remain
+  gated on measurement.
 
 Landed prep contracts:
 
@@ -3272,9 +3270,9 @@ Still gated:
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
-  throttling/coalescing implementation, and drain scheduling beyond the
-  scoped wake-on-enqueue fan-in service. The design constraints are
-  recorded in
+  throttling/coalescing beyond the landed MIDI listener-local control
+  coalescer, and drain scheduling beyond the scoped wake-on-enqueue
+  fan-in service. The design constraints are recorded in
   [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md).
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`
   ABI, if a later design proves one is needed.
@@ -3297,16 +3295,17 @@ fan-in, a session-backed OSC control-write ingress path, a scoped
 wake-on-enqueue background drain worker, producer-local MIDI
 note/CC/sustain/pitch-bend/all-notes-off command translation plus
 default-omni channel filtering, bend replay for later note-on starts, and
-sustain-pedal deferred releases, a decoded-source MIDI listener, and
-the first Q / PortMIDI-backed decoded source with an auto-selecting
-manual CLI smoke probe, and already-decoded UI intent translation. Do not
+sustain-pedal deferred releases, a decoded-source MIDI listener with
+producer-local control coalescing, and the first Q / PortMIDI-backed
+decoded source with an auto-selecting manual CLI smoke probe, and
+already-decoded UI intent translation. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration, manifest-driven session reload/resource policy,
 broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
 translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,
-arbitration/coalescing implementation beyond the documented design
-constraints, unsupported respawn/reset policy,
+arbitration/coalescing beyond the landed MIDI listener-local policy and
+the documented design constraints, unsupported respawn/reset policy,
 long-running ownership of the live-audio hot-swap path, and recovery
 policies are specified and tested in their own slices. The session does
 not need a generated fusion executor to ship;
