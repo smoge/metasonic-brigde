@@ -3221,7 +3221,9 @@ all-notes-off events into `CmdVoiceOn`, `CmdVoiceOff`, and
 `CmdControlWrite` values with `ProducerMIDI` attribution. It can target
 a plain `SessionFanInHost` or a scoped `SessionFanInService`, and its
 default-omni channel filter can reject channel-bearing events before
-they produce commands.
+they produce commands. Producer options are stable for the
+producer/listener lifetime; pitch-bend remains deferred to a separate
+control-binding slice.
 `MetaSonic.Session.MIDIListener` brackets a worker over an injected
 decoded-event source and feeds that producer while keeping listener
 state observable. `MetaSonic.Session.MIDIPortMIDI` adds the first Q /
@@ -3246,7 +3248,7 @@ Still gated:
 - [ ] GUI toolkit bindings, manifest-driven session reload/resource
   policy, broader MIDI behavior beyond the landed
   note/CC/all-notes-off/channel-filter adapter and small PortMIDI source,
-  and broader OSC producer scope
+  including pitch-bend control binding, and broader OSC producer scope
   beyond the landed symbolic control-write path.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
   throttling/coalescing, and drain scheduling beyond the scoped
@@ -3277,8 +3279,8 @@ probe, and already-decoded UI intent translation. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration, manifest-driven session reload/resource policy,
 broader MIDI policy beyond note/CC/all-notes-off translation, channel
-filtering, and source polling, broader OSC scope beyond symbolic control
-writes,
+filtering, source polling, and deferred pitch-bend binding, broader OSC
+scope beyond symbolic control writes,
 arbitration beyond FIFO, unsupported respawn/reset policy,
 long-running ownership of the live-audio hot-swap path, and recovery
 policies are specified and tested in their own slices. The session does

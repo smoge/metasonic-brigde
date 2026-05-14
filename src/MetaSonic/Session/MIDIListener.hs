@@ -12,10 +12,10 @@
 -- 'SessionFanInHost' through 'MetaSonic.Session.MIDIProducer'.
 --
 -- It deliberately does not open PortMIDI devices, choose a live clock,
--- define pitch-bend/channel policy, arbitrate against OSC beyond the
--- existing FIFO fan-in queue, or repair a diverged owner. Real device
--- ownership should be added later as a source behind this decoded-event
--- boundary.
+-- define pitch-bend or channel remapping/splits, arbitrate against OSC
+-- beyond the existing FIFO fan-in queue, or repair a diverged owner.
+-- Real device ownership should be added later as a source behind this
+-- decoded-event boundary.
 
 module MetaSonic.Session.MIDIListener
   ( -- * Decoded event source
@@ -118,6 +118,8 @@ defaultSessionMIDIListenerHooks = SessionMIDIListenerHooks
 -- The listener only enqueues into the supplied fan-in host; it never
 -- drains it. Producer-local note state starts from the supplied initial
 -- state and advances only according to 'enqueueMIDIProducerEvent'.
+-- Producer options, including channel filtering, are captured for the
+-- worker lifetime; use a new listener bracket for a new policy.
 withSessionMIDIListener
   :: MIDIProducerOptions
   -> MIDIProducerState

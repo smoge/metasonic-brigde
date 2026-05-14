@@ -21,7 +21,9 @@ or arbitrate against OSC beyond the existing FIFO fan-in queue.
 - `MIDIProducerOptions` carries the target template plus optional
   frequency, gate, and velocity initial-control targets and explicit CC
   mappings. It also carries an optional zero-based channel allow-list;
-  default options are omni.
+  default options are omni. The filter is intended to be stable for the
+  producer/listener lifetime; use producer-local all-notes-off before
+  narrowing policy while notes are active.
 - `MIDIProducerState` keeps producer-local note bookkeeping from
   `(channel, note)` to stable session `VoiceKey`s.
 - `enqueueMIDIProducerEvent` submits generated commands to a
@@ -37,7 +39,8 @@ or arbitrate against OSC beyond the existing FIFO fan-in queue.
   the decoded-source worker; PortMIDI device ownership remains out of
   scope.
 - Pitch bend, aftertouch, MIDI clock, channel remapping/splits, or
-  sustain-pedal semantics.
+  sustain-pedal semantics. Pitch bend is deferred to a separate
+  control-binding slice.
 - Release-phase CC fanout or producer-owned smoothing/coalescing.
 - Arbitration beyond FIFO producer order.
 - Long-running supervision beyond the scoped fan-in service.
@@ -46,7 +49,8 @@ or arbitrate against OSC beyond the existing FIFO fan-in queue.
 
 The tests cover note-on/off translation, velocity-zero release,
 configured initial controls, deterministic CC fanout, invalid data and
-unmapped-CC rejection, channel filtering, deterministic all-notes-off
-translation, successful `ProducerMIDI` enqueue attribution, queue-full
-state retention for note starts and all-notes-off, and composition
-through a scoped `MetaSonic.Session.FanInService` drain worker.
+unmapped-CC rejection, channel filtering including the empty allow-list,
+deterministic all-notes-off translation, successful `ProducerMIDI`
+enqueue attribution, queue-full state retention for note starts and
+all-notes-off, and composition through a scoped
+`MetaSonic.Session.FanInService` drain worker.

@@ -15139,9 +15139,17 @@ sessionMIDIProducerTests =
       let opts = testMIDIProducerOptions
             { mpoChannelFilter = MIDIChannelAllowList (S.singleton 2)
             }
+          emptyOpts = testMIDIProducerOptions
+            { mpoChannelFilter = MIDIChannelAllowList S.empty
+            }
           active = MIDIProducerState
             { mpsActiveNotes = M.singleton (0, 69) (VoiceKey "m0-69")
             }
+      decodeMIDISessionCommands
+        emptyOpts
+        initialMIDIProducerState
+        (MIDIProducerNoteOn 0 69 64)
+        @?= Left (MpiChannelFiltered 0)
       decodeMIDISessionCommands
         opts
         initialMIDIProducerState

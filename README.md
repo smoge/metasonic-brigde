@@ -293,9 +293,10 @@ What is still intentionally absent: GUI toolkit bindings, manifest-driven
 session reload/resource allocation, broader MIDI behavior beyond note/CC
 command translation, CC 123 all-notes-off, producer-local channel filtering,
 and the small PortMIDI-backed decoded source, broader OSC behavior beyond
-symbolic control writes, arbitration beyond FIFO, long-running supervision
-beyond the scoped fan-in service, unsupported respawn/reset policy for
-preserving swaps, and recovery after terminal runtime divergence.
+symbolic control writes, pitch-bend control binding, arbitration beyond FIFO,
+long-running supervision beyond the scoped fan-in service, unsupported
+respawn/reset policy for preserving swaps, and recovery after terminal runtime
+divergence.
 
 ---
 

@@ -21,6 +21,8 @@ binds Q / PortMIDI input behind the same session-facing loop.
 - The worker calls `enqueueMIDIProducerEvent` for each decoded event,
   advances listener-local `MIDIProducerState` from the producer result,
   and keeps the state readable through `readSessionMIDIListenerState`.
+  Producer options, including channel filtering, are stable for the
+  listener bracket lifetime.
 - Listener hooks report every producer result plus explicit producer
   rejection and fan-in enqueue rejection issues.
 
@@ -31,7 +33,8 @@ binds Q / PortMIDI input behind the same session-facing loop.
   [Session MIDI PortMIDI Source](2026-05-13-session-midi-portmidi-source.md)
   covers the small Q / PortMIDI source wrapper.
 - Pitch bend, aftertouch, MIDI clock, channel remapping/splits, or
-  sustain-pedal semantics.
+  sustain-pedal semantics. Pitch bend is deferred to a separate
+  control-binding slice.
 - Release-phase CC fanout or producer-owned smoothing/coalescing.
 - Arbitration beyond FIFO producer order.
 - Long-running supervision beyond the scoped listener and fan-in

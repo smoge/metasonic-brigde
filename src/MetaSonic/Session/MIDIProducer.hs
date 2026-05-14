@@ -106,6 +106,12 @@ data MIDIControlMapping = MIDIControlMapping
 -- channel. An empty 'MIDIChannelAllowList' rejects every
 -- channel-bearing event. Producer-local all-notes-off events with no
 -- channel target bypass this filter.
+--
+-- The filter is intended to be stable for a producer lifetime. If a
+-- caller narrows filtering while notes are active, a later
+-- channel-targeted all-notes-off for a now-filtered channel will also
+-- be rejected; use producer-local all-notes-off with no channel target
+-- before changing policy.
 data MIDIChannelFilter
   = MIDIChannelOmni
   | MIDIChannelAllowList !(S.Set Word8)
