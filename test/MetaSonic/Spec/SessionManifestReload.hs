@@ -16,10 +16,12 @@ import           MetaSonic.Pattern               (ControlTag (..),
                                                   TemplateName (..))
 import           MetaSonic.Session.Arbitration
 import           MetaSonic.Session.ManifestReload
+import           MetaSonic.Session.ManifestReload.Construct
 import           MetaSonic.Session.Command
 import           MetaSonic.Session.Owner
 import           MetaSonic.Session.Queue         (ProducerKind (..))
 import           MetaSonic.Session.RTGraphAdapter
+import           MetaSonic.Session.State
 
 
 sessionManifestReloadTests :: TestTree
@@ -290,6 +292,18 @@ sessionManifestReloadTests =
       sooBuilderCapacity ownerOptions @?= 1024
       sooMaxFrames ownerOptions @?= 256
       sooAdapterOptions ownerOptions @?= mrlpAdapterOptions plan
+
+  , testCase "construction helper brackets fresh owner from plan" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      result <-
+        constructManifestSessionFromPlan
+          plan
+          defaultSessionOwnerOptions
+          $ \owner -> do
+              state <- sessionOwnerState owner
+              status <- sessionOwnerStatus owner
+              pure (ssGraph state, status)
+      result @?= Right (validTemplateGraph, SessionOwnerReady)
   ]
 
 validRequest :: ManifestReloadRequest
