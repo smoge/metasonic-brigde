@@ -22,6 +22,7 @@ module MetaSonic.Session.MIDIProducer
   , midiNoteFrequency
 
     -- * Mapping
+  , MIDIChannelFilter (..)
   , MIDIControlMapping (..)
   , MIDIProducerOptions (..)
   , defaultMIDIProducerOptions
@@ -46,6 +47,7 @@ module MetaSonic.Session.MIDIProducer
 
 import           Control.DeepSeq            (NFData)
 import qualified Data.Map.Strict            as M
+import qualified Data.Set                   as S
 import           Data.Text                  (Text)
 import qualified Data.Text                  as T
 import           Data.Word                  (Word8)
@@ -98,7 +100,19 @@ data MIDIControlMapping = MIDIControlMapping
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
--- | Translation options for MIDI note and CC events.
+-- | MIDI channel admission policy.
+--
+-- Channels are zero-based. 'MIDIChannelOmni' accepts every valid
+-- channel. An empty 'MIDIChannelAllowList' rejects every
+-- channel-bearing event. Producer-local all-notes-off events with no
+-- channel target bypass this filter.
+data MIDIChannelFilter
+  = MIDIChannelOmni
+  | MIDIChannelAllowList !(S.Set Word8)
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
+-- | Translation options for MIDI note, CC, and all-notes-off events.
 data MIDIProducerOptions = MIDIProducerOptions
   { mpoProducerName     :: !Text
   , mpoTemplateName     :: !TemplateName
@@ -106,6 +120,7 @@ data MIDIProducerOptions = MIDIProducerOptions
   , mpoGateControl      :: !(Maybe ControlTag)
   , mpoVelocityControl  :: !(Maybe ControlTag)
   , mpoCCMappings       :: !(M.Map Word8 MIDIControlMapping)
+  , mpoChannelFilter    :: !MIDIChannelFilter
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -118,6 +133,7 @@ defaultMIDIProducerOptions = MIDIProducerOptions
   , mpoGateControl      = Nothing
   , mpoVelocityControl  = Nothing
   , mpoCCMappings       = M.empty
+  , mpoChannelFilter    = MIDIChannelOmni
   }
 
 -- | Producer identity used for fan-in queue entries.
@@ -144,6 +160,7 @@ data MIDIProducerIssue
   | MpiNoteAlreadyActive !Word8 !Word8
   | MpiNoteNotActive !Word8 !Word8
   | MpiUnmappedControl !Word8
+  | MpiChannelFiltered !Word8
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -185,6 +202,7 @@ decodeMIDISessionCommands
   -> Either MIDIProducerIssue MIDIProducerCommandBatch
 decodeMIDISessionCommands opts st event = do
   validateEvent event
+  validateChannelFilter (mpoChannelFilter opts) event
   case event of
     MIDIProducerNoteOn ch note velocity
       | velocity == 0 ->
@@ -318,6 +336,39 @@ validateEvent event = case event of
     Right ()
   MIDIProducerAllNotesOff (Just ch) ->
     validateChannel ch
+
+validateChannelFilter
+  :: MIDIChannelFilter
+  -> MIDIProducerEvent
+  -> Either MIDIProducerIssue ()
+validateChannelFilter channelFilter event =
+  case eventChannel event of
+    Nothing ->
+      Right ()
+    Just ch
+      | channelAccepted channelFilter ch ->
+          Right ()
+      | otherwise ->
+          Left (MpiChannelFiltered ch)
+
+eventChannel :: MIDIProducerEvent -> Maybe Word8
+eventChannel event = case event of
+  MIDIProducerNoteOn ch _note _velocity ->
+    Just ch
+  MIDIProducerNoteOff ch _note _velocity ->
+    Just ch
+  MIDIProducerControlChange ch _controller _value ->
+    Just ch
+  MIDIProducerAllNotesOff target ->
+    target
+
+channelAccepted :: MIDIChannelFilter -> Word8 -> Bool
+channelAccepted channelFilter ch =
+  case channelFilter of
+    MIDIChannelOmni ->
+      True
+    MIDIChannelAllowList accepted ->
+      S.member ch accepted
 
 validateChannel :: Word8 -> Either MIDIProducerIssue ()
 validateChannel ch

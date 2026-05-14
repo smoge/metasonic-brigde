@@ -34,8 +34,9 @@ listener own the worker thread. It does not touch `RTGraph`,
 
 ## Still Out Of Scope
 
-- Pitch bend, aftertouch, MIDI clock, channel masks, sustain-pedal
-  semantics, or broader controller policy beyond CC 123 all-notes-off.
+- Pitch bend, aftertouch, MIDI clock, source-level channel filtering,
+  sustain-pedal semantics, or broader controller policy beyond CC 123
+  all-notes-off. Channel filtering is producer-level policy.
 - Producer arbitration beyond FIFO.
 - Reusing or replacing the existing C++ `MetaSonic.Bridge.MidiDemo`
   live-runtime path.

@@ -15135,6 +15135,53 @@ sessionMIDIProducerTests =
             ]
           mpcbState batch @?= active
 
+  , testCase "channel filter admits allow-listed channels" $ do
+      let opts = testMIDIProducerOptions
+            { mpoChannelFilter = MIDIChannelAllowList (S.singleton 2)
+            }
+          active = MIDIProducerState
+            { mpsActiveNotes = M.singleton (0, 69) (VoiceKey "m0-69")
+            }
+      decodeMIDISessionCommands
+        opts
+        initialMIDIProducerState
+        (MIDIProducerNoteOn 0 69 64)
+        @?= Left (MpiChannelFiltered 0)
+      decodeMIDISessionCommands
+        opts
+        initialMIDIProducerState
+        (MIDIProducerControlChange 0 7 64)
+        @?= Left (MpiChannelFiltered 0)
+      decodeMIDISessionCommands
+        opts
+        active
+        (MIDIProducerAllNotesOff (Just 0))
+        @?= Left (MpiChannelFiltered 0)
+      case decodeMIDISessionCommands
+             opts
+             initialMIDIProducerState
+             (MIDIProducerNoteOn 2 60 64) of
+        Left issue ->
+          assertFailure ("expected allow-listed MIDI note, got: "
+                         <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdVoiceOn
+                (TemplateName "drone")
+                (VoiceKey "m2-60")
+                [ (midiFreqTag, midiNoteFrequency 60)
+                , (midiGateTag, 1.0)
+                , (midiVelocityTag, 64.0 / 127.0)
+                ]
+            ]
+          mpsActiveNotes (mpcbState batch)
+            @?= M.singleton (2, 60) (VoiceKey "m2-60")
+      decodeMIDISessionCommands opts active (MIDIProducerAllNotesOff Nothing)
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = [CmdVoiceOff (VoiceKey "m0-69")]
+              , mpcbState = initialMIDIProducerState
+              }
+
   , testCase "all-notes-off emits deterministic voice stops and clears state" $ do
       let active = MIDIProducerState
             { mpsActiveNotes = M.fromList
@@ -15230,6 +15277,32 @@ sessionMIDIProducerTests =
           sfisQueueDepth snapshot @?= 1
         Right other ->
           assertFailure ("expected MIDI enqueue attempt, got: "
+                         <> show other)
+
+  , testCase "filtered channel rejects before enqueue" $ do
+      let opts = testMIDIProducerOptions
+            { mpoChannelFilter = MIDIChannelAllowList (S.singleton 1)
+            }
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  defaultSessionFanInOptions
+                  $ \host -> do
+                    rejected <- enqueueMIDIProducerEvent
+                                  opts
+                                  initialMIDIProducerState
+                                  (MIDIProducerNoteOn 0 69 127)
+                                  host
+                    snapshot <- readSessionFanInHost host
+                    pure (rejected, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (MIDIProducerRejected issue st, snapshot) -> do
+          issue @?= MpiChannelFiltered 0
+          st @?= initialMIDIProducerState
+          sfisQueueDepth snapshot @?= 0
+        Right other ->
+          assertFailure ("expected filtered MIDI rejection, got: "
                          <> show other)
 
   , testCase "queue-full does not advance note state" $ do

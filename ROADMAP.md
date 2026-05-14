@@ -2912,7 +2912,8 @@ path with live-audio generation-wait orchestration, a generic
 serialized fan-in host, and symbolic OSC control-write ingress through
 that fan-in path, plus a minimal scoped background drain service around
 the fan-in host, a first Haskell-only MIDI note/CC/all-notes-off
-producer adapter, and a first Haskell-only UI intent producer adapter.
+producer adapter with default-omni channel filtering, and a first
+Haskell-only UI intent producer adapter.
 The remaining open work is not
 "create an owner", "define a queue", "turn Pattern events into queued
 commands", "compose one Pattern runner step", "serialize one Pattern
@@ -2920,15 +2921,16 @@ host", "decide preserving hot-swap semantics", or "choose the first
 preserving implementation strategy", "create a generic fan-in host", or
 "land the first OSC control-write producer/listener path", or "add a
 minimal scoped fan-in drain worker", "add a first MIDI
-note/CC/all-notes-off producer adapter", "add a decoded-source MIDI
-listener", "add a small PortMIDI-backed decoded source", or "add a
-first UI intent producer adapter"; it is GUI toolkit integration,
+note/CC/all-notes-off producer adapter with channel filtering", "add a
+decoded-source MIDI listener", "add a small PortMIDI-backed decoded
+source", or "add a first UI intent producer adapter"; it is GUI
+toolkit integration,
 manifest-driven session reload/resource policy, broader MIDI behavior
-beyond note/CC/all-notes-off command translation and the small source
-wrapper, any broader OSC behavior beyond symbolic control writes,
-arbitration beyond FIFO, long-running supervision
-beyond the scoped service, unsupported respawn/reset policy, and
-recovery mechanisms around that owner.
+beyond note/CC/all-notes-off command translation, channel filtering,
+and the small source wrapper, any broader OSC behavior beyond symbolic
+control writes, arbitration beyond FIFO, long-running supervision
+beyond the scoped service, unsupported respawn/reset policy, and recovery
+mechanisms around that owner.
 
 Session prep artifacts:
 - [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
@@ -3051,11 +3053,12 @@ Session prep artifacts:
   supervision, or divergence repair.
 - [Session MIDI Producer Adapter](notes/2026-05-13-session-midi-producer-adapter.md)
   records the first Haskell-only MIDI adapter above the generic fan-in
-  host. It consumes already-decoded note-on/off and CC events,
+  host. It consumes already-decoded note-on/off, CC, and
+  all-notes-off events,
   translates them to `SessionCommand`s with `ProducerMIDI` identity, and
-  keeps MIDI note bookkeeping producer-local. This is still not live
-  PortMIDI device ownership, pitch-bend/channel policy, MIDI clock, or
-  arbitration beyond FIFO.
+  keeps MIDI note bookkeeping and channel filtering producer-local.
+  This is still not live PortMIDI device ownership, pitch-bend, channel
+  remapping/splits, MIDI clock, or arbitration beyond FIFO.
 - [Session MIDI Listener](notes/2026-05-13-session-midi-listener.md)
   records the first session-backed decoded MIDI event listener. It
   owns a bracketed worker over an injected event source, feeds
@@ -3063,8 +3066,8 @@ Session prep artifacts:
   state observable for tests/callers. The later
   [Session MIDI PortMIDI Source](notes/2026-05-13-session-midi-portmidi-source.md)
   binds Q / PortMIDI input behind that decoded-source boundary. This
-  is still not pitch-bend/channel policy, MIDI clock, or arbitration
-  beyond FIFO.
+  is still not pitch-bend, channel remapping/splits, MIDI clock, or
+  arbitration beyond FIFO.
 - [Session UI Producer Adapter](notes/2026-05-13-session-ui-producer-adapter.md)
   records the first Haskell-only UI adapter above the generic fan-in
   host. It consumes already-decoded UI intents, translates them to
@@ -3187,7 +3190,7 @@ Landed prep contracts:
   note-on/off translation, note-on velocity-zero release semantics,
   configured frequency/gate/velocity initial controls, deterministic CC
   fanout over active notes, explicit invalid/unmapped rejection,
-  all-notes-off translation, queue-full state retention,
+  channel filtering, all-notes-off translation, queue-full state retention,
   `ProducerMIDI` enqueue attribution, and composition through the
   scoped fan-in drain service. The MIDI
   listener tests cover blocked-source bracket cleanup, explicit
@@ -3216,7 +3219,9 @@ Recent MIDI ingress follow-up: `MetaSonic.Session.MIDIProducer`
 translates already-decoded MIDI note-on, note-off, control-change, and
 all-notes-off events into `CmdVoiceOn`, `CmdVoiceOff`, and
 `CmdControlWrite` values with `ProducerMIDI` attribution. It can target
-a plain `SessionFanInHost` or a scoped `SessionFanInService`.
+a plain `SessionFanInHost` or a scoped `SessionFanInService`, and its
+default-omni channel filter can reject channel-bearing events before
+they produce commands.
 `MetaSonic.Session.MIDIListener` brackets a worker over an injected
 decoded-event source and feeds that producer while keeping listener
 state observable. `MetaSonic.Session.MIDIPortMIDI` adds the first Q /
@@ -3225,8 +3230,8 @@ PortMIDI-backed source behind that boundary. `--session-midi-smoke
 listener, producer, fan-in service, and drain path, with first-input
 auto-selection when `--midi-device` is omitted. The PortMIDI source maps
 MIDI CC 123 into channel-scoped all-notes-off. This path still does not
-define pitch-bend/channel policy, MIDI clock behavior, or arbitration
-beyond FIFO.
+define pitch-bend, channel remapping/splits, MIDI clock behavior, or
+arbitration beyond FIFO.
 
 Recent UI ingress follow-up: `MetaSonic.Session.UIProducer` translates
 already-decoded UI intents into `CmdVoiceOn`, `CmdVoiceOff`,
@@ -3239,8 +3244,9 @@ beyond FIFO.
 Still gated:
 
 - [ ] GUI toolkit bindings, manifest-driven session reload/resource
-  policy, broader MIDI behavior beyond the landed note/CC/all-notes-off
-  adapter and small PortMIDI source, and broader OSC producer scope
+  policy, broader MIDI behavior beyond the landed
+  note/CC/all-notes-off/channel-filter adapter and small PortMIDI source,
+  and broader OSC producer scope
   beyond the landed symbolic control-write path.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
   throttling/coalescing, and drain scheduling beyond the scoped
@@ -3264,14 +3270,15 @@ Pattern bridge/runner/host, preserving-hot-swap policy and
 implementation, live-audio install orchestration, generic serialized
 fan-in, a session-backed OSC control-write ingress path, a scoped
 wake-on-enqueue background drain worker, producer-local MIDI
-note/CC/all-notes-off command translation, a decoded-source MIDI
-listener, and the first Q / PortMIDI-backed decoded source with an
-auto-selecting manual CLI smoke probe, and already-decoded UI intent
-translation. Do not
+note/CC/all-notes-off command translation plus default-omni channel
+filtering, a decoded-source MIDI listener, and the first Q /
+PortMIDI-backed decoded source with an auto-selecting manual CLI smoke
+probe, and already-decoded UI intent translation. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration, manifest-driven session reload/resource policy,
-broader MIDI policy beyond note/CC/all-notes-off translation and source
-polling, broader OSC scope beyond symbolic control writes,
+broader MIDI policy beyond note/CC/all-notes-off translation, channel
+filtering, and source polling, broader OSC scope beyond symbolic control
+writes,
 arbitration beyond FIFO, unsupported respawn/reset policy,
 long-running ownership of the live-audio hot-swap path, and recovery
 policies are specified and tested in their own slices. The session does
