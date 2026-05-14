@@ -2879,8 +2879,8 @@ claim. A follow-up
 `MetaSonic.Session.FanInService` slice adds the first scoped background
 drain worker around the fan-in host. A later
 `MetaSonic.Session.MIDIProducer` slice adds a Haskell-only adapter for
-already-decoded MIDI note-on/off, CC, pitch-bend, and all-notes-off
-events. A later
+already-decoded MIDI note-on/off, CC, sustain-pedal, pitch-bend, and
+all-notes-off events. A later
 `MetaSonic.Session.MIDIListener` slice adds a decoded-source worker
 around that adapter. A later `MetaSonic.Session.MIDIPortMIDI` slice
 adds the first Q / PortMIDI-backed decoded source, but still does not
@@ -2912,8 +2912,9 @@ strategy evidence plus a supported stopped-audio preserving hot-swap
 path with live-audio generation-wait orchestration, a generic
 serialized fan-in host, and symbolic OSC control-write ingress through
 that fan-in path, plus a minimal scoped background drain service around
-the fan-in host, a first Haskell-only MIDI note/CC/pitch-bend/all-notes-off
-producer adapter with default-omni channel filtering, and a first
+the fan-in host, a first Haskell-only MIDI
+note/CC/sustain/pitch-bend/all-notes-off producer adapter with
+default-omni channel filtering, and a first
 Haskell-only UI intent producer adapter.
 The remaining open work is not
 "create an owner", "define a queue", "turn Pattern events into queued
@@ -2922,14 +2923,14 @@ host", "decide preserving hot-swap semantics", or "choose the first
 preserving implementation strategy", "create a generic fan-in host", or
 "land the first OSC control-write producer/listener path", or "add a
 minimal scoped fan-in drain worker", "add a first MIDI
-note/CC/pitch-bend/all-notes-off producer adapter with channel
+note/CC/sustain/pitch-bend/all-notes-off producer adapter with channel
 filtering", "add a decoded-source MIDI listener", "add a small
 PortMIDI-backed decoded source", or "add a first UI intent producer
 adapter"; it is GUI
 toolkit integration,
 manifest-driven session reload/resource policy, broader MIDI behavior
-beyond note/CC/pitch-bend/all-notes-off command translation, channel
-filtering, and the small source wrapper, any broader OSC behavior beyond
+beyond note/CC/sustain/pitch-bend/all-notes-off command translation,
+channel filtering, and the small source wrapper, any broader OSC behavior beyond
 symbolic control writes, arbitration beyond FIFO, long-running supervision
 beyond the scoped service, unsupported respawn/reset policy, and recovery
 mechanisms around that owner.
@@ -3055,10 +3056,11 @@ Session prep artifacts:
   supervision, or divergence repair.
 - [Session MIDI Producer Adapter](notes/2026-05-13-session-midi-producer-adapter.md)
   records the first Haskell-only MIDI adapter above the generic fan-in
-  host. It consumes already-decoded note-on/off, CC, pitch-bend, and
-  all-notes-off events,
+  host. It consumes already-decoded note-on/off, CC, sustain-pedal,
+  pitch-bend, and all-notes-off events,
   translates them to `SessionCommand`s with `ProducerMIDI` identity, and
-  keeps MIDI note bookkeeping and channel filtering producer-local.
+  keeps MIDI note bookkeeping, sustain policy, and channel filtering
+  producer-local.
   This is still not live PortMIDI device ownership, channel
   remapping/splits, MIDI clock, or arbitration beyond FIFO.
 - [Session MIDI Listener](notes/2026-05-13-session-midi-listener.md)
@@ -3192,9 +3194,10 @@ Landed prep contracts:
   note-on/off translation, note-on velocity-zero release semantics,
   configured frequency/gate/velocity initial controls, deterministic CC
   fanout over active notes, pitch-bend control binding and replay into
-  later note-on starts, explicit invalid/unmapped rejection, channel
-  filtering, all-notes-off translation, queue-full state retention,
-  `ProducerMIDI` enqueue attribution, and composition through the
+  later note-on starts, sustain-pedal deferral/release, explicit
+  invalid/unmapped rejection, channel filtering, all-notes-off
+  translation, queue-full state retention, `ProducerMIDI` enqueue
+  attribution, and composition through the
   scoped fan-in drain service. The MIDI
   listener tests cover blocked-source bracket cleanup, explicit
   end-of-input worker exit, producer rejection with continued event
@@ -3219,15 +3222,18 @@ enqueues; it does not by itself drain the host, resolve controls
 against a live runtime, or write the realtime control queue.
 
 Recent MIDI ingress follow-up: `MetaSonic.Session.MIDIProducer`
-translates already-decoded MIDI note-on, note-off, control-change, and
-pitch-bend/all-notes-off events into `CmdVoiceOn`, `CmdVoiceOff`, and
-`CmdControlWrite` values with `ProducerMIDI` attribution. It can target
+translates already-decoded MIDI note-on, note-off, control-change,
+sustain-pedal, pitch-bend, and all-notes-off events into `CmdVoiceOn`,
+`CmdVoiceOff`, and `CmdControlWrite` values with `ProducerMIDI`
+attribution. It can target
 a plain `SessionFanInHost` or a scoped `SessionFanInService`, and its
 default-omni channel filter can reject channel-bearing events before
 they produce commands. Producer options are stable for the
 producer/listener lifetime; pitch-bend is bound through producer-local
 frequency-control mapping over active channel notes and replayed into
-later note-on initial controls while the bend is held.
+later note-on initial controls while the bend is held. Sustain-pedal
+CC 64 is handled as producer-local deferred release state rather than
+a user CC mapping.
 `MetaSonic.Session.MIDIListener` brackets a worker over an injected
 decoded-event source and feeds that producer while keeping listener
 state observable. `MetaSonic.Session.MIDIPortMIDI` adds the first Q /
@@ -3235,8 +3241,9 @@ PortMIDI-backed source behind that boundary. `--session-midi-smoke
 [SECONDS]` now offers a manual live-device probe over the source,
 listener, producer, fan-in service, and drain path, with first-input
 auto-selection when `--midi-device` is omitted. The PortMIDI source maps
-MIDI CC 123 into channel-scoped all-notes-off and decodes pitch-bend
-into the same producer path. This path still does not define channel
+MIDI CC 123 into channel-scoped all-notes-off, leaves CC 64 available
+for producer-local sustain, and decodes pitch-bend into the same
+producer path. This path still does not define channel
 remapping/splits, MIDI clock behavior, or arbitration beyond FIFO.
 
 Recent UI ingress follow-up: `MetaSonic.Session.UIProducer` translates
@@ -3251,8 +3258,8 @@ Still gated:
 
 - [ ] GUI toolkit bindings, manifest-driven session reload/resource
   policy, broader MIDI behavior beyond the landed
-  note/CC/pitch-bend/all-notes-off/channel-filter adapter and small
-  PortMIDI source, and broader OSC producer scope
+  note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
+  small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
 - [ ] Arbitration beyond FIFO producer order, producer-specific
   throttling/coalescing, and drain scheduling beyond the scoped
@@ -3276,15 +3283,15 @@ Pattern bridge/runner/host, preserving-hot-swap policy and
 implementation, live-audio install orchestration, generic serialized
 fan-in, a session-backed OSC control-write ingress path, a scoped
 wake-on-enqueue background drain worker, producer-local MIDI
-note/CC/pitch-bend/all-notes-off command translation plus default-omni
-channel filtering and bend replay for later note-on starts, a
-decoded-source MIDI listener, and the first Q / PortMIDI-backed decoded
-source with an auto-selecting manual CLI smoke probe, and
-already-decoded UI intent translation. Do not
+note/CC/sustain/pitch-bend/all-notes-off command translation plus
+default-omni channel filtering, bend replay for later note-on starts, and
+sustain-pedal deferred releases, a decoded-source MIDI listener, and
+the first Q / PortMIDI-backed decoded source with an auto-selecting
+manual CLI smoke probe, and already-decoded UI intent translation. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration, manifest-driven session reload/resource policy,
-broader MIDI policy beyond note/CC/pitch-bend/all-notes-off translation,
-channel filtering, and source polling, broader OSC
+broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
+translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,
 arbitration beyond FIFO, unsupported respawn/reset policy,
 long-running ownership of the live-audio hot-swap path, and recovery

@@ -18,9 +18,11 @@ against OSC beyond the existing FIFO fan-in queue.
   mapped CC into deterministic `CmdControlWrite` fanout over active
   MIDI notes. Mapped pitch-bend emits per-channel frequency control
   writes for active notes, and non-centered bend state is replayed into
-  later note-on initial controls on that channel. All-notes-off emits
-  deterministic `CmdVoiceOff` commands for active notes and can target
-  either every producer-local note or only notes on one MIDI channel.
+  later note-on initial controls on that channel. Sustain-pedal CC 64
+  defers note-off commands while held and emits deterministic releases
+  when the pedal comes up. All-notes-off emits deterministic
+  `CmdVoiceOff` commands for active notes and can target either every
+  producer-local note or only notes on one MIDI channel.
 - `MIDIProducerOptions` carries the target template plus optional
   frequency, gate, and velocity initial-control targets and explicit CC
   and pitch-bend mappings. It also carries an optional zero-based
@@ -29,7 +31,8 @@ against OSC beyond the existing FIFO fan-in queue.
   all-notes-off before narrowing policy while notes are active.
 - `MIDIProducerState` keeps producer-local note bookkeeping from
   `(channel, note)` to stable session `VoiceKey`s, plus non-centered
-  per-channel pitch-bend state for note-on replay.
+  per-channel pitch-bend state for note-on replay and sustain-pedal
+  deferred note-offs.
 - `enqueueMIDIProducerEvent` submits generated commands to a
   `SessionFanInHost` with `ProducerMIDI` identity and advances producer
   state only after every generated enqueue succeeds.
@@ -42,8 +45,7 @@ against OSC beyond the existing FIFO fan-in queue.
   [Session MIDI Listener](2026-05-13-session-midi-listener.md) covers
   the decoded-source worker; PortMIDI device ownership remains out of
   scope.
-- Aftertouch, MIDI clock, channel remapping/splits, or sustain-pedal
-  semantics.
+- Aftertouch, MIDI clock, or channel remapping/splits.
 - Release-phase CC fanout or producer-owned smoothing/coalescing.
 - Arbitration beyond FIFO producer order.
 - Long-running supervision beyond the scoped fan-in service.
@@ -53,9 +55,10 @@ against OSC beyond the existing FIFO fan-in queue.
 The tests cover note-on/off translation, velocity-zero release,
 configured initial controls, deterministic CC fanout, pitch-bend control
 binding, empty pitch-bend fanout, per-channel pitch-bend replay for
-later note-on, invalid data and unmapped CC/pitch-bend rejection,
-channel filtering including the empty allow-list, deterministic
-all-notes-off translation, successful `ProducerMIDI` enqueue
-attribution, queue-full state retention for note starts and
-all-notes-off, and composition through a scoped
+later note-on, sustain-pedal deferral/release and retrigger behavior,
+invalid data and unmapped CC/pitch-bend rejection, channel filtering
+including the empty allow-list, deterministic all-notes-off
+translation, successful `ProducerMIDI` enqueue attribution, queue-full
+state retention for note starts, sustain release, and all-notes-off,
+and composition through a scoped
 `MetaSonic.Session.FanInService` drain worker.

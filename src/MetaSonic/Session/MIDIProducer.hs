@@ -8,8 +8,8 @@
 --
 -- This module defines a narrow, protocol-neutral MIDI producer above
 -- 'MetaSonic.Session.FanIn'. It translates decoded MIDI note, CC,
--- pitch-bend, and all-notes-off events into symbolic 'SessionCommand's, then
--- submits them as 'ProducerMIDI'.
+-- sustain-pedal, pitch-bend, and all-notes-off events into symbolic
+-- 'SessionCommand's, then submits them as 'ProducerMIDI'.
 --
 -- It deliberately does not open PortMIDI devices, own a listener
 -- thread, define a live clock, arbitrate against OSC beyond the
@@ -73,6 +73,8 @@ import           MetaSonic.Session.Queue    (ProducerId (..),
 -- center at @8192@.
 -- For 'MIDIProducerAllNotesOff', 'Nothing' means every active producer
 -- note, and 'Just' means only notes currently active on that channel.
+-- Control-change 64 is interpreted as sustain-pedal policy before
+-- user CC mappings are consulted.
 data MIDIProducerEvent
   = MIDIProducerNoteOn
       { mpeChannel  :: !Word8
@@ -137,8 +139,8 @@ data MIDIChannelFilter
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
--- | Translation options for MIDI note, CC, pitch-bend, and
--- all-notes-off events.
+-- | Translation options for MIDI note, CC, pitch-bend,
+-- sustain-pedal, and all-notes-off events.
 data MIDIProducerOptions = MIDIProducerOptions
   { mpoProducerName     :: !Text
   , mpoTemplateName     :: !TemplateName
@@ -175,16 +177,20 @@ midiProducerId opts =
 -- note-on starts at the currently held bend instead of waiting for the
 -- next pitch-bend event.
 data MIDIProducerState = MIDIProducerState
-  { mpsActiveNotes :: !(M.Map (Word8, Word8) VoiceKey)
-  , mpsPitchBends  :: !(M.Map Word8 Word16)
+  { mpsActiveNotes       :: !(M.Map (Word8, Word8) VoiceKey)
+  , mpsPitchBends        :: !(M.Map Word8 Word16)
+  , mpsSustainedChannels :: !(S.Set Word8)
+  , mpsDeferredNoteOffs  :: !(M.Map (Word8, Word8) VoiceKey)
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
 -- | Initial MIDI producer state.
 initialMIDIProducerState :: MIDIProducerState
 initialMIDIProducerState = MIDIProducerState
-  { mpsActiveNotes = M.empty
-  , mpsPitchBends  = M.empty
+  { mpsActiveNotes       = M.empty
+  , mpsPitchBends        = M.empty
+  , mpsSustainedChannels = S.empty
+  , mpsDeferredNoteOffs  = M.empty
   }
 
 -- | Translation or producer-state issue.
@@ -247,8 +253,11 @@ decodeMIDISessionCommands opts st event = do
           noteOn ch note velocity st
     MIDIProducerNoteOff ch note _velocity ->
       noteOff ch note st
-    MIDIProducerControlChange _ch controller value ->
-      controlChange controller value st
+    MIDIProducerControlChange ch controller value
+      | controller == midiSustainController ->
+          sustainPedal ch value st
+      | otherwise ->
+          controlChange controller value st
     MIDIProducerPitchBend ch value ->
       pitchBend ch value st
     MIDIProducerAllNotesOff target ->
@@ -259,6 +268,23 @@ decodeMIDISessionCommands opts st event = do
           bends  = mpsPitchBends st0
           key    = (ch, note)
       case M.lookup key active of
+        Just oldVkey
+          | M.member key (mpsDeferredNoteOffs st0) ->
+              let vkey = midiVoiceKey ch note
+                  controls = noteOnControls ch note velocity bends
+                  st' = st0
+                    { mpsActiveNotes = M.insert key vkey active
+                    , mpsDeferredNoteOffs =
+                        M.delete key (mpsDeferredNoteOffs st0)
+                    }
+              in Right MIDIProducerCommandBatch
+                   { mpcbCommands =
+                       [ CmdVoiceOff oldVkey
+                       , CmdVoiceOn (mpoTemplateName opts) vkey controls
+                       ]
+                   , mpcbState =
+                       st'
+                   }
         Just _ ->
           Left (MpiNoteAlreadyActive ch note)
         Nothing ->
@@ -279,10 +305,16 @@ decodeMIDISessionCommands opts st event = do
         Nothing ->
           Left (MpiNoteNotActive ch note)
         Just vkey ->
-          let st' = st0 { mpsActiveNotes = M.delete key active }
+          let sustained = S.member ch (mpsSustainedChannels st0)
+              st' = if sustained
+                       then st0
+                         { mpsDeferredNoteOffs =
+                             M.insert key vkey (mpsDeferredNoteOffs st0)
+                         }
+                       else st0 { mpsActiveNotes = M.delete key active }
           in Right MIDIProducerCommandBatch
                { mpcbCommands =
-                   [CmdVoiceOff vkey]
+                   [CmdVoiceOff vkey | not sustained]
                , mpcbState =
                    st'
                }
@@ -301,6 +333,39 @@ decodeMIDISessionCommands opts st event = do
             , mpcbState =
                 st0
             }
+
+    sustainPedal ch value st0
+      | value >= midiSustainThreshold =
+          Right MIDIProducerCommandBatch
+            { mpcbCommands =
+                []
+            , mpcbState =
+                st0
+                  { mpsSustainedChannels =
+                      S.insert ch (mpsSustainedChannels st0)
+                  }
+            }
+      | otherwise =
+          let (released, keptDeferred) =
+                M.partitionWithKey
+                  (\(noteCh, _note) _vkey -> noteCh == ch)
+                  (mpsDeferredNoteOffs st0)
+              st' = st0
+                { mpsActiveNotes =
+                    foldr M.delete (mpsActiveNotes st0) (M.keys released)
+                , mpsSustainedChannels =
+                    S.delete ch (mpsSustainedChannels st0)
+                , mpsDeferredNoteOffs =
+                    keptDeferred
+                }
+          in Right MIDIProducerCommandBatch
+               { mpcbCommands =
+                   [ CmdVoiceOff vkey
+                   | vkey <- M.elems released
+                   ]
+               , mpcbState =
+                   st'
+               }
 
     pitchBend ch value st0 =
       case mpoPitchBendMapping opts of
@@ -326,14 +391,25 @@ decodeMIDISessionCommands opts st event = do
             M.partitionWithKey
               (\(ch, _note) _vkey -> maybe True (== ch) target)
               (mpsActiveNotes st0)
-          st' = st0 { mpsActiveNotes = kept }
+          st' = st0
+            { mpsActiveNotes =
+                kept
+            , mpsSustainedChannels =
+                case target of
+                  Nothing ->
+                    S.empty
+                  Just ch ->
+                    S.delete ch (mpsSustainedChannels st0)
+            }
+          releasedDeferred =
+            foldr M.delete (mpsDeferredNoteOffs st0) (M.keys stopped)
       in Right MIDIProducerCommandBatch
            { mpcbCommands =
                [ CmdVoiceOff vkey
                | vkey <- M.elems stopped
                ]
            , mpcbState =
-               st'
+               st' { mpsDeferredNoteOffs = releasedDeferred }
            }
 
     noteOnControls ch note velocity bends =
@@ -504,6 +580,14 @@ scaleControl :: MIDIControlMapping -> Word8 -> Value
 scaleControl mapping value =
   let x = fromIntegral value / 127.0
   in mcmMin mapping + x * (mcmMax mapping - mcmMin mapping)
+
+midiSustainController :: Word8
+midiSustainController =
+  64
+
+midiSustainThreshold :: Word8
+midiSustainThreshold =
+  64
 
 enqueueAccepted :: SessionFanInEnqueueResult -> Bool
 enqueueAccepted result = case sfierResult result of

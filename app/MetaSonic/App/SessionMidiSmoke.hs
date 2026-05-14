@@ -63,7 +63,7 @@ data SmokeMIDIDevice = SmokeMIDIDevice
 
 -- | Run a bounded manual smoke test over the session MIDI ingress
 -- stack. The command exits non-zero when no input device opens or
--- when no supported note/CC/pitch-bend/all-notes-off events are
+-- when no supported note/CC/sustain/pitch-bend/all-notes-off events are
 -- observed in the smoke window.
 runSessionMidiSmoke :: Maybe Int -> Int -> IO ()
 runSessionMidiSmoke midiDevice seconds = do
@@ -138,7 +138,9 @@ runSessionMidiSmoke midiDevice seconds = do
                 (MIDIPM.portMIDIListenerSource sourceOpts source)
                 (sessionFanInServiceHost service)
                 $ \listener -> do
-                    putStrLn "  Send note-on, note-off, CC 7, and pitch-bend now."
+                    putStrLn $
+                      "  Send note-on, note-off, CC 7, sustain, "
+                      <> "and pitch-bend now."
                     threadDelay (seconds * 1000000)
                     -- Let the wake-on-enqueue drain worker report a
                     -- final event that landed at the end of the
@@ -167,7 +169,7 @@ runSessionMidiSmoke midiDevice seconds = do
             <> " queue_depth=" <> show (sfisQueueDepth snapshot)
           when (observed == 0) $
             dieAfterFlush $
-              "No supported MIDI note/CC/pitch-bend/all-notes-off events "
+              "No supported MIDI note/CC/sustain/pitch-bend/all-notes-off events "
               <> "observed during smoke window."
           when (drained == 0) $
             dieAfterFlush

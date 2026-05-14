@@ -34,9 +34,10 @@ Haskell session listener own the worker thread. It does not touch
 
 ## Still Out Of Scope
 
-- Aftertouch, MIDI clock, source-level channel filtering, sustain-pedal
-  semantics, or broader controller policy beyond CC 123 all-notes-off.
-  Channel filtering and pitch-bend binding are producer-level policy.
+- Aftertouch, MIDI clock, source-level channel filtering, or broader
+  controller policy beyond decoding CC messages. Channel filtering,
+  pitch-bend binding, sustain-pedal semantics, and all-notes-off
+  policy are producer-level behavior.
 - Producer arbitration beyond FIFO.
 - Reusing or replacing the existing C++ `MetaSonic.Bridge.MidiDemo`
   live-runtime path.
@@ -59,5 +60,5 @@ stack exec -- metasonic-bridge --midi-device <input-id> --session-midi-smoke 10
 ```
 
 The smoke command exits non-zero if it cannot open an input-capable
-device or if no supported note/CC/pitch-bend/all-notes-off events
+device or if no supported note/CC/sustain/pitch-bend/all-notes-off events
 produce drained session commands during the selected time window.

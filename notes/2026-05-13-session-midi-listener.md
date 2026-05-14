@@ -32,8 +32,7 @@ binds Q / PortMIDI input behind the same session-facing loop.
   slice. The later
   [Session MIDI PortMIDI Source](2026-05-13-session-midi-portmidi-source.md)
   covers the small Q / PortMIDI source wrapper.
-- Aftertouch, MIDI clock, channel remapping/splits, or sustain-pedal
-  semantics.
+- Aftertouch, MIDI clock, or channel remapping/splits.
 - Release-phase CC fanout or producer-owned smoothing/coalescing.
 - Arbitration beyond FIFO producer order.
 - Long-running supervision beyond the scoped listener and fan-in

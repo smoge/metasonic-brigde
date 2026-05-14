@@ -15218,6 +15218,80 @@ sessionMIDIProducerTests =
               , mpcbState = initialMIDIProducerState
               }
 
+  , testCase "sustain pedal defers note-off until pedal release" $ do
+      let active =
+            testMIDIProducerState $
+              M.fromList
+                [ ((0, 60), VoiceKey "m0-60")
+                , ((1, 65), VoiceKey "m1-65")
+                ]
+          downState =
+            active { mpsSustainedChannels = S.singleton 0 }
+          deferredState =
+            downState
+              { mpsDeferredNoteOffs =
+                  M.singleton (0, 60) (VoiceKey "m0-60")
+              }
+          releasedState =
+            testMIDIProducerState $
+              M.singleton (1, 65) (VoiceKey "m1-65")
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        active
+        (MIDIProducerControlChange 0 64 127)
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = []
+              , mpcbState = downState
+              }
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        downState
+        (MIDIProducerNoteOff 0 60 64)
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = []
+              , mpcbState = deferredState
+              }
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        deferredState
+        (MIDIProducerControlChange 0 64 0)
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = [CmdVoiceOff (VoiceKey "m0-60")]
+              , mpcbState = releasedState
+              }
+
+  , testCase "sustained note can be retriggered after deferred note-off" $ do
+      let deferredState =
+            (testMIDIProducerState $
+               M.singleton (0, 60) (VoiceKey "m0-60"))
+              { mpsSustainedChannels = S.singleton 0
+              , mpsDeferredNoteOffs =
+                  M.singleton (0, 60) (VoiceKey "m0-60")
+              }
+          retriggeredState =
+            (testMIDIProducerState $
+               M.singleton (0, 60) (VoiceKey "m0-60"))
+              { mpsSustainedChannels = S.singleton 0
+              }
+      case decodeMIDISessionCommands
+             testMIDIProducerOptions
+             deferredState
+             (MIDIProducerNoteOn 0 60 64) of
+        Left issue ->
+          assertFailure ("expected sustained retrigger, got: " <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdVoiceOff (VoiceKey "m0-60")
+            , CmdVoiceOn
+                (TemplateName "drone")
+                (VoiceKey "m0-60")
+                [ (midiFreqTag, midiNoteFrequency 60)
+                , (midiGateTag, 1.0)
+                , (midiVelocityTag, 64.0 / 127.0)
+                ]
+            ]
+          mpcbState batch @?= retriggeredState
+
   , testCase "channel filter admits allow-listed channels" $ do
       let opts = testMIDIProducerOptions
             { mpoChannelFilter = MIDIChannelAllowList (S.singleton 2)
@@ -15242,6 +15316,11 @@ sessionMIDIProducerTests =
         opts
         initialMIDIProducerState
         (MIDIProducerControlChange 0 7 64)
+        @?= Left (MpiChannelFiltered 0)
+      decodeMIDISessionCommands
+        opts
+        initialMIDIProducerState
+        (MIDIProducerControlChange 0 64 127)
         @?= Left (MpiChannelFiltered 0)
       decodeMIDISessionCommands
         opts
@@ -15280,12 +15359,18 @@ sessionMIDIProducerTests =
 
   , testCase "all-notes-off emits deterministic voice stops and clears state" $ do
       let active =
-            testMIDIProducerState $
-              M.fromList
-                [ ((1, 65), VoiceKey "m1-65")
-                , ((0, 72), VoiceKey "m0-72")
-                , ((0, 60), VoiceKey "m0-60")
-                ]
+            (testMIDIProducerState $
+               M.fromList
+                 [ ((1, 65), VoiceKey "m1-65")
+                 , ((0, 72), VoiceKey "m0-72")
+                 , ((0, 60), VoiceKey "m0-60")
+                 ])
+              { mpsSustainedChannels = S.fromList [0, 1]
+              , mpsDeferredNoteOffs = M.fromList
+                  [ ((1, 65), VoiceKey "m1-65")
+                  , ((0, 60), VoiceKey "m0-60")
+                  ]
+              }
       case decodeMIDISessionCommands
              testMIDIProducerOptions
              active
@@ -15490,6 +15575,48 @@ sessionMIDIProducerTests =
                   (SeiQueueFull 1)
         Right other ->
           assertFailure ("expected queue-full all-notes-off enqueue, got: "
+                         <> show other)
+
+  , testCase "queue-full does not advance sustain release state" $ do
+      let opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          active =
+            (testMIDIProducerState $
+               M.singleton (0, 69) (VoiceKey "m0-69"))
+              { mpsSustainedChannels = S.singleton 0
+              , mpsDeferredNoteOffs =
+                  M.singleton (0, 69) (VoiceKey "m0-69")
+              }
+          prefill =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  opts
+                  $ \host -> do
+                    _prefill <-
+                      enqueueSessionFanInCommand
+                        (testProducer ProducerTest "prefill")
+                        prefill
+                        host
+                    enqueueMIDIProducerEvent
+                      testMIDIProducerOptions
+                      active
+                      (MIDIProducerControlChange 0 64 0)
+                      host
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (MIDIProducerEnqueueAttempted batch [enq]) -> do
+          mpcbState batch @?= active
+          mpcbCommands batch @?= [CmdVoiceOff (VoiceKey "m0-69")]
+          sfierResult enq
+            @?= SessionEnqueueRejected
+                  (midiProducerId testMIDIProducerOptions)
+                  (CmdVoiceOff (VoiceKey "m0-69"))
+                  (SeiQueueFull 1)
+        Right other ->
+          assertFailure ("expected queue-full sustain release, got: "
                          <> show other)
 
   , testCase "partial all-notes-off enqueue failure keeps producer state" $ do

@@ -70,7 +70,7 @@ just session-midi-smoke-device 2 10
 During the smoke window, send a note-on, note-off, optionally CC 7, and
 optionally pitch-bend. The command prints producer and drain activity.
 It exits non-zero if it cannot open an input-capable device, observes no
-supported MIDI note/CC/pitch-bend/all-notes-off events, or observes
+supported MIDI note/CC/sustain/pitch-bend/all-notes-off events, or observes
 events that never drain into session commands.
 
 ## If No Input Device Appears
