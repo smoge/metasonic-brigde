@@ -136,12 +136,43 @@ different contracts.
 
 ### Stopped-Audio Reload
 
-A stopped-audio strategy can use `manifestReloadCommand` against an existing
-owner only after it has a policy for stopping the backend, draining or rejecting
-in-flight producer work, stepping the command, and restarting or reporting
-failure.
+The selected stopped-audio v1 contract is recorded in
+`2026-05-14-i-manifest-reload-runtime-strategy.md`. It picks strict
+quiescence and dispose-first fresh-owner construction, with a small helper
+boundary: the host validates the `ManifestReloadPlan` ahead of time,
+quiesces producers and listeners, drains the fan-in queue against the old
+owner *while audio is still running* (because accepted producer commands
+step through live realtime adapter entry points), verifies the queue is
+empty and producer state is at rest, and *then* stops audio and calls the
+helper. The helper rejects if the queue is not empty; otherwise it
+disposes the old owner and constructs a new one. The host restarts audio
+against the new owner and reopens listener/producer brackets bound to it.
+The helper does not call `startAudio` / `stopAudio`, does not validate the
+manifest, and does not touch listener threads. Manifest decode and
+resource-policy rejection happen pre-admission, never post-dispose. A
+failed reload (post-dispose construction failure) leaves the host with no
+owner. Active voices terminate; stale control writes are rejected on next
+enqueue; per-producer and per-listener bracket state is torn down and
+recreated by the host.
 
-It must say whether a failed install leaves the old owner usable or diverged.
+An earlier sketch — "step `manifestReloadCommand` against an existing owner
+after a policy for stopping the backend, draining producer work, stepping
+the command, and restarting" — is intentionally not the v1. Stepping
+`CmdHotSwap` against an existing owner is the preserving-hot-swap path, not
+stopped-audio reload; bundling it under the stopped-audio name would have
+quietly weakened the §5.2 preserving contract.
+
+The i-note also pins two implementation prerequisites that the v1 helper
+cannot invent itself. First, the fan-in admission decision must live in a
+single serialized piece of state (one MVar holding queue + reload status),
+because an IORef "fast path" split from the queue lock is a TOCTTOU race.
+Second, the v1 needs an explicit reloadable owner lifetime primitive at
+the `Owner.hs`/`FanIn.hs` layer: `withSessionOwner` is callback-scoped, so
+a plain `IORef SessionOwner` would dangle once the outer bracket closed.
+Either a new `withReloadableSessionOwner` bracket or a session-layer host
+teardown/rebuild under a producer-facing indirection. The latter
+converges with host teardown/rebuild and weakens the v1 thesis. See the
+i-note for full details.
 
 ### Preserving Hot-Swap
 
