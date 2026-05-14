@@ -23,6 +23,10 @@ binds Q / PortMIDI input behind the same session-facing loop.
   listener-local `MIDIProducerState`, and keeps the state readable
   through `readSessionMIDIListenerState`. Producer options, including
   channel filtering, are stable for the listener bracket lifetime.
+- `readSessionMIDIListenerState` and
+  `readSessionMIDIListenerCoalescingStats` remain valid after the
+  listener bracket exits, returning the final snapshots including any
+  synchronous teardown flush effects.
 - Repeated MIDI control writes are coalesced locally by
   `(VoiceKey, ControlTag)` before they enter fan-in. Non-control-write
   commands are fences; EOF, teardown, and the optional timed flush also

@@ -93,6 +93,10 @@ newtype SessionMIDIListener = SessionMIDIListener
   }
 
 -- | Read the listener-owned MIDI producer state.
+--
+-- This is also valid after the listener bracket exits; in that case it
+-- returns the final state snapshot, including any synchronous teardown
+-- flush effects.
 readSessionMIDIListenerState
   :: SessionMIDIListener
   -> IO MIDIProducerState
@@ -100,6 +104,10 @@ readSessionMIDIListenerState listener =
   mlwsProducerState <$> readMVar (smlWorkerState listener)
 
 -- | Read producer-local control coalescing counters.
+--
+-- This is also valid after the listener bracket exits; in that case it
+-- returns the final counters, including any synchronous teardown flush
+-- effects.
 readSessionMIDIListenerCoalescingStats
   :: SessionMIDIListener
   -> IO SessionMIDIListenerCoalescingStats
