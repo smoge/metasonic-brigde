@@ -151,6 +151,13 @@ tests:
   metasonic-bridge-test:
     main: Spec.hs
     source-dirs: test
+    other-modules:
+      - MetaSonic.Spec.Core
+      - MetaSonic.Spec.Driver
+      - MetaSonic.Spec.FFI
+      - MetaSonic.Spec.Feature
+      - MetaSonic.Spec.PatternOSCBuffer
+      - MetaSonic.Spec.Session
     ghc-options:
       - -threaded
     dependencies:

@@ -161,9 +161,12 @@ test-suite metasonic-bridge-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      Paths_metasonic_bridge
-  autogen-modules:
-      Paths_metasonic_bridge
+      MetaSonic.Spec.Core
+      MetaSonic.Spec.Driver
+      MetaSonic.Spec.FFI
+      MetaSonic.Spec.Feature
+      MetaSonic.Spec.PatternOSCBuffer
+      MetaSonic.Spec.Session
   hs-source-dirs:
       test
   ghc-options: -Wall -threaded
