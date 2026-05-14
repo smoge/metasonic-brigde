@@ -153,8 +153,12 @@ executables:
 tests:
   metasonic-bridge-test:
     main: Spec.hs
-    source-dirs: test
+    source-dirs:
+      - test
+      - app
     other-modules:
+      - MetaSonic.App.Demos
+      - MetaSonic.Spec.AppDemos
       - MetaSonic.Spec.Core
       - MetaSonic.Spec.Driver
       - MetaSonic.Spec.FFI

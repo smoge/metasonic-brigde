@@ -8,6 +8,7 @@ module Main (main) where
 
 import           Test.Tasty
 
+import           MetaSonic.Spec.AppDemos
 import           MetaSonic.Spec.Core
 import           MetaSonic.Spec.FFI
 import           MetaSonic.Spec.Feature
@@ -18,7 +19,8 @@ import           MetaSonic.Spec.SessionMIDI
 
 main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
-  [ unitTests
+  [ appDemoCatalogTests
+  , unitTests
   , properties
   , crossCuttingTests
   , t9DirectEqualsReductionTests

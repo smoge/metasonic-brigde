@@ -19,21 +19,31 @@ module MetaSonic.App.Demos
   , DemoBody (..)
   , Demo (..)
   , demoTable
+  , demoTemplateGraph
+  , demoManifestReloadCatalogEntry
+  , demoManifestReloadCatalog
     -- * Phase 8.G: authoring metadata reporting
   , namedControlGraph
   , namedControlAuthoring
   , sendReturnAuthoring
   ) where
 
+import           Data.Maybe                (catMaybes)
 import           Data.Word                 (Word8)
 
 import qualified MetaSonic.Authoring       as Auth
+import           MetaSonic.Authoring.Manifest
+                                            (manifestFromReport)
 import           MetaSonic.Authoring.Report (AuthoringReport,
                                              addReportedControl,
                                              emptyAuthoringReport,
                                              ensembleReport)
 import qualified MetaSonic.Authoring.Report as Report
 import           MetaSonic.Bridge.Source
+import           MetaSonic.Bridge.Templates (TemplateGraph,
+                                             compileTemplateGraph)
+import           MetaSonic.Session.ManifestReload
+                                            (ManifestReloadCatalogEntry (..))
 
 simpleGraph :: SynthGraph
 simpleGraph = runSynth $ do
@@ -492,6 +502,58 @@ demoTable =
          "Live MIDI poly synth (8 voices; CC7 → master, pitch-bend ±2)"
          (MidiPoly 8 midiPolySynth)
   ]
+
+-- | Compile a demo body into the template graph shape that session-owner
+-- construction and manifest reload planning consume.
+--
+-- Single-graph and MIDI demos use the demo key as the template name, matching
+-- the app runtime paths. Multi-template demos keep their authored template
+-- names.
+demoTemplateGraph :: Demo -> Either String TemplateGraph
+demoTemplateGraph demo =
+  compileTemplateGraph (demoTemplateRows demo)
+
+-- | Build a manifest reload catalog entry for an authored demo.
+--
+-- Demos without authoring metadata are not reload-catalog entries yet. The
+-- manifest is derived from the same report that export uses; the graph is
+-- compiled from the app-owned demo body.
+demoManifestReloadCatalogEntry
+  :: Demo
+  -> Either String (Maybe ManifestReloadCatalogEntry)
+demoManifestReloadCatalogEntry demo =
+  case demoAuthoring demo of
+    Nothing ->
+      Right Nothing
+    Just report -> do
+      graph <- demoTemplateGraph demo
+      pure $ Just ManifestReloadCatalogEntry
+        { mrcDemoKey       = demoKey demo
+        , mrcManifest      = manifestFromReport (demoKey demo) report
+        , mrcTemplateGraph = graph
+        }
+
+-- | App-owned manifest reload catalog for every authored demo in a table.
+--
+-- This is intentionally not CLI wiring and does not read external JSON. It is
+-- the adapter from the app's demo registry to the pure session planner's
+-- catalog input.
+demoManifestReloadCatalog
+  :: [Demo]
+  -> Either String [ManifestReloadCatalogEntry]
+demoManifestReloadCatalog demos =
+  catMaybes <$> traverse demoManifestReloadCatalogEntry demos
+
+demoTemplateRows :: Demo -> [(String, SynthGraph)]
+demoTemplateRows demo =
+  case demoBody demo of
+    SingleGraph graph ->
+      [(demoKey demo, graph)]
+    MultiTemplate templates ->
+      templates
+    MidiPoly _ build ->
+      let (_, graph) = runSynthWith build
+      in [(demoKey demo, graph)]
 
 --------------------------------------------------------------------------------
 -- CLI options
