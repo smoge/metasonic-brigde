@@ -30,6 +30,10 @@ module MetaSonic.Session.ManifestReload
 
     -- * Planning
   , planManifestReload
+
+    -- * Runtime projections
+  , manifestReloadCommand
+  , manifestSessionOwnerOptions
   ) where
 
 import qualified Data.Map.Strict                as M
@@ -50,6 +54,8 @@ import           MetaSonic.Bridge.Templates     (Template (..),
 import           MetaSonic.Pattern              (ControlTag (..), SwapLabel,
                                                  TemplateName (..))
 import           MetaSonic.Session.Arbitration  (ArbitrationPolicy (..))
+import           MetaSonic.Session.Command      (SessionCommand (..))
+import           MetaSonic.Session.Owner        (SessionOwnerOptions (..))
 import           MetaSonic.Session.RTGraphAdapter
                                                 (RTGraphAdapterOptions (..),
                                                  defaultRTGraphAdapterOptions)
@@ -189,6 +195,28 @@ planManifestReload doc catalog req
              }
   where
     requestedKey = mrrDemoKey req
+
+-- | Project a validated plan into the existing hot-swap command shape.
+--
+-- This does not choose when or how to install the command. Construction-time,
+-- stopped-audio, and live preserving strategies can all consume the same
+-- value differently.
+manifestReloadCommand :: ManifestReloadPlan -> SessionCommand
+manifestReloadCommand plan =
+  CmdHotSwap (mrlpSwapLabel plan) (mrlpTemplateGraph plan)
+
+-- | Apply a plan's adapter policy to caller-owned owner options.
+--
+-- Builder capacity and max-frame policy remain with the caller; the manifest
+-- plan supplies only the adapter options derived from resource policy.
+-- The plan's adapter options replace the base adapter options entirely;
+-- per-template polyphony from the base is not preserved.
+manifestSessionOwnerOptions
+  :: SessionOwnerOptions
+  -> ManifestReloadPlan
+  -> SessionOwnerOptions
+manifestSessionOwnerOptions base plan =
+  base { sooAdapterOptions = mrlpAdapterOptions plan }
 
 controlSurfaceFor :: AuthoringManifest -> [ManifestControlSurface]
 controlSurfaceFor manifest =

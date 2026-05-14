@@ -17,6 +17,7 @@ import           MetaSonic.Pattern               (ControlTag (..),
 import           MetaSonic.Session.Arbitration
 import           MetaSonic.Session.ManifestReload
 import           MetaSonic.Session.Command
+import           MetaSonic.Session.Owner
 import           MetaSonic.Session.Queue         (ProducerKind (..))
 import           MetaSonic.Session.RTGraphAdapter
 
@@ -270,6 +271,25 @@ sessionManifestReloadTests =
             @?= ArbitrationAllowed
         [] ->
           assertFailure "expected at least one projected control"
+
+  , testCase "plan projects to hot-swap command" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      manifestReloadCommand plan
+        @?= CmdHotSwap (SwapLabel "reload") validTemplateGraph
+
+  , testCase "plan projects adapter policy into owner options" $ do
+      let baseOptions = defaultSessionOwnerOptions
+            { sooBuilderCapacity = 1024
+            , sooMaxFrames       = 256
+            , sooAdapterOptions  = defaultRTGraphAdapterOptions
+                { raoDefaultPolyphony = 99
+                }
+            }
+      plan <- planOrFail validDoc validCatalog validRequest
+      let ownerOptions = manifestSessionOwnerOptions baseOptions plan
+      sooBuilderCapacity ownerOptions @?= 1024
+      sooMaxFrames ownerOptions @?= 256
+      sooAdapterOptions ownerOptions @?= mrlpAdapterOptions plan
   ]
 
 validRequest :: ManifestReloadRequest
