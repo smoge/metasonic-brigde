@@ -6,8 +6,10 @@ module Main where
 import           Control.DeepSeq            (force)
 import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
+import           Data.Bifunctor             (first)
 import           Data.Char                  (isDigit, toLower)
 import           Data.List                  (find, intercalate)
+import qualified Data.Map.Strict            as M
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
 import           System.Environment         (getArgs, getProgName)
@@ -46,6 +48,13 @@ import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.MIDI.Devices     (MidiDeviceInfo (..),
                                              midiDeviceList)
+import           MetaSonic.Pattern          (ControlTag (..),
+                                             SwapLabel (..),
+                                             TemplateName (..))
+import qualified MetaSonic.Session.ManifestReload as MR
+import           MetaSonic.Session.Command  (SessionCommand (..))
+import           MetaSonic.Session.RTGraphAdapter
+                                            (RTGraphAdapterOptions (..))
 import           MetaSonic.Types            (NodeIndex (..))
 import           MetaSonic.Visualize.Trace  (CompileTrace (..), traceCompile)
 
@@ -124,6 +133,13 @@ data RunMode
     -- list. Demos without authoring metadata are silently
     -- skipped; the document is always valid JSON, even when
     -- the resulting demo list is empty.
+  | ManifestReloadDiagnostic
+    -- ^ Non-audio diagnostic mode (--manifest-reload-plan DEMO).
+    -- Adapts the built-in demo registry into a manifest reload
+    -- catalog, plans one selected authored demo, and prints the
+    -- static plan/control/resource projection. It does not allocate
+    -- an RTGraph, start audio, enqueue a command, or claim live
+    -- reload semantics.
   deriving (Eq, Show)
 
 data Options = Options
@@ -193,6 +209,8 @@ parseArgs = go defaultOptions
       go opts { optMode = SnapshotCheck } xs
     go opts ("--authoring-manifest" : xs) =
       go opts { optMode = AuthoringManifest } xs
+    go opts ("--manifest-reload-plan" : xs) =
+      go opts { optMode = ManifestReloadDiagnostic } xs
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -329,6 +347,7 @@ usage prog = unlines
   , "  " <> prog <> " --fusion-cost-lab [--summary]"
   , "  " <> prog <> " --snapshot-check"
   , "  " <> prog <> " --authoring-manifest [DEMO ...]"
+  , "  " <> prog <> " --manifest-reload-plan DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
   , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
@@ -405,6 +424,15 @@ usage prog = unlines
   , "                   bindings, and migration keys. Demos without"
   , "                   authoring metadata are silently skipped; targets"
   , "                   filter the demo list. No audio, no TUI."
+  , "  --manifest-reload-plan DEMO"
+  , "                   Diagnostic-only manifest reload planning path."
+  , "                   Builds the app-owned reload catalog from built-in"
+  , "                   authored demos, derives the matching manifest doc,"
+  , "                   plans the selected DEMO with the default resource"
+  , "                   policy, and prints the template graph, per-template"
+  , "                   polyphony, control surface, arbitration policy, and"
+  , "                   CmdHotSwap projection. No audio, no RTGraph"
+  , "                   allocation, no live reload."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
@@ -462,6 +490,7 @@ usage prog = unlines
   , "  " <> prog <> " --session-midi-smoke 10"
   , "  " <> prog <> " --midi-device 2 --session-midi-smoke 10"
   , "  " <> prog <> " --session-osc-arbitration-smoke 10"
+  , "  " <> prog <> " --manifest-reload-plan send-return"
   ]
 
 --------------------------------------------------------------------------------
@@ -531,6 +560,9 @@ main = do
     AuthoringManifest -> do
       demos <- resolveSelectedDemos
       runAuthoringManifest demos
+    ManifestReloadDiagnostic -> do
+      demo <- either die pure (resolveManifestReloadDiagnosticTarget opts)
+      runManifestReloadDiagnostic demo
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -570,6 +602,161 @@ runAuthoringManifest demos = do
         , docDemos         = manifests
         }
   BL.putStr (encodeManifestDoc doc)
+
+-- Diagnostic-only app boundary for the manifest reload planner.
+--
+-- This exercises the product path from built-in demo registry to
+-- app-owned catalog, expected manifest document, pure reload plan, and
+-- runtime projection. It deliberately stops before allocating an RTGraph
+-- or installing the projected command.
+resolveManifestReloadDiagnosticTarget :: Options -> Either String Demo
+resolveManifestReloadDiagnosticTarget opts =
+  case optTargets opts of
+    [target] -> do
+      demo <- first formatResolveError (resolveTargets [target]) >>= oneDemo
+      case demoAuthoring demo of
+        Just _ ->
+          Right demo
+        Nothing ->
+          Left $
+            "Demo '" <> demoKey demo <> "' has no authoring metadata; "
+            <> "--manifest-reload-plan requires an authored demo."
+            <> "\nAuthored demos: "
+            <> intercalate ", " authoredDemoKeys
+    [] ->
+      Left $
+        "Specify exactly one demo: --manifest-reload-plan DEMO_KEY"
+        <> "\nAuthored demos: "
+        <> intercalate ", " authoredDemoKeys
+    targets ->
+      Left $
+        "Specify exactly one demo for --manifest-reload-plan; got "
+        <> show (length targets)
+        <> ": "
+        <> intercalate ", " targets
+  where
+    authoredDemoKeys =
+      [ demoKey d
+      | d <- demoTable
+      , Just _ <- [demoAuthoring d]
+      ]
+
+    oneDemo [demo] =
+      Right demo
+    oneDemo demos =
+      Left $
+        "Internal error: target resolution produced "
+        <> show (length demos)
+        <> " demos for --manifest-reload-plan."
+
+    formatResolveError err =
+      err <> "\nAuthored demos: " <> intercalate ", " authoredDemoKeys
+
+runManifestReloadDiagnostic :: Demo -> IO ()
+runManifestReloadDiagnostic demo = do
+  catalog <- either die pure (demoManifestReloadCatalog demoTable)
+  let doc = AuthoringManifestDoc
+        { docSchemaVersion = manifestSchemaVersion
+        , docDemos         = map MR.mrcManifest catalog
+        }
+      request = MR.ManifestReloadRequest
+        { MR.mrrDemoKey        = demoKey demo
+        , MR.mrrSwapLabel      = SwapLabel ("manifest:" <> demoKey demo)
+        , MR.mrrResourcePolicy = MR.defaultManifestResourcePolicy
+        }
+  case MR.planManifestReload doc catalog request of
+    Left issue ->
+      die $ "Manifest reload planning failed: " <> show issue
+    Right plan ->
+      printManifestReloadPlan plan
+
+printManifestReloadPlan :: MR.ManifestReloadPlan -> IO ()
+printManifestReloadPlan plan = do
+  putStrLn "Manifest reload plan diagnostic"
+  putStrLn $ "  demo: " <> MR.mrlpDemoKey plan
+  putStrLn $ "  swap label: " <> swapLabelText (MR.mrlpSwapLabel plan)
+  printManifestReloadTemplates (MR.mrlpTemplateGraph plan)
+  printManifestReloadResources (MR.mrlpAdapterOptions plan)
+  printManifestReloadControls (MR.mrlpControlSurface plan)
+  putStrLn $ "  arbitration policy: "
+          <> show (MR.mrlpArbitrationPolicy plan)
+  printManifestReloadCommand (MR.manifestReloadCommand plan)
+
+printManifestReloadTemplates :: TemplateGraph -> IO ()
+printManifestReloadTemplates graph = do
+  putStrLn "  template graph:"
+  putStrLn $ "    templates: " <> show (length (tgTemplates graph))
+  forM_ (tgTemplates graph) $ \tpl ->
+    putStrLn $
+      "    - "
+      <> tplName tpl
+      <> " nodes="
+      <> show (length (rgNodes (tplGraph tpl)))
+
+printManifestReloadResources :: RTGraphAdapterOptions -> IO ()
+printManifestReloadResources opts = do
+  putStrLn "  resource policy projection:"
+  putStrLn $
+    "    default polyphony: " <> show (raoDefaultPolyphony opts)
+  putStrLn $
+    "    hot-swap install timeout ms: "
+    <> show (raoHotSwapInstallTimeoutMs opts)
+  putStrLn "    per-template polyphony:"
+  case M.toList (raoPerTemplatePolyphony opts) of
+    [] ->
+      putStrLn "      (none)"
+    rows ->
+      forM_ rows $ \(TemplateName name, polyphony) ->
+        putStrLn $
+          "      - " <> name <> ": " <> show polyphony
+
+printManifestReloadControls :: [MR.ManifestControlSurface] -> IO ()
+printManifestReloadControls controls = do
+  putStrLn "  control surface:"
+  case controls of
+    [] ->
+      putStrLn "    (none)"
+    _ ->
+      forM_ controls $ \control ->
+        putStrLn $
+          "    - "
+          <> MR.mcsDisplayName control
+          <> ": tag="
+          <> controlTagText (MR.mcsControlTag control)
+          <> " default="
+          <> show (MR.mcsDefault control)
+          <> " range=["
+          <> show (MR.mcsRangeMin control)
+          <> ", "
+          <> show (MR.mcsRangeMax control)
+          <> "] smoothingHz="
+          <> show (MR.mcsSmoothingHz control)
+          <> " cc="
+          <> maybe "none" show (MR.mcsCC control)
+
+printManifestReloadCommand :: SessionCommand -> IO ()
+printManifestReloadCommand command =
+  case command of
+    CmdHotSwap label graph ->
+      putStrLn $
+        "  command projection: CmdHotSwap "
+        <> swapLabelText label
+        <> " templates="
+        <> show (length (tgTemplates graph))
+        <> " (not executed)"
+    _ ->
+      putStrLn $
+        "  command projection: "
+        <> show command
+        <> " (not executed)"
+
+swapLabelText :: SwapLabel -> String
+swapLabelText =
+  unSwapLabel
+
+controlTagText :: ControlTag -> String
+controlTagText (ControlTag key slot) =
+  unMigrationKey key <> "/" <> show slot
 
 printMidiDevices :: IO ()
 printMidiDevices = do
@@ -631,7 +818,8 @@ runDemo opts demo
     || optMode opts == SessionMidiSmoke
     || optMode opts == SessionOscArbitrationSmoke
     || optMode opts == PluginList
-    || optMode opts == AuthoringManifest =
+    || optMode opts == AuthoringManifest
+    || optMode opts == ManifestReloadDiagnostic =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -706,6 +894,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: PluginList should be handled by main, never reach here"
     AuthoringManifest ->
       error "runSingleDemo: AuthoringManifest should be handled by main, never reach here"
+    ManifestReloadDiagnostic ->
+      error "runSingleDemo: ManifestReloadDiagnostic should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare
