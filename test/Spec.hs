@@ -15390,10 +15390,12 @@ sessionFanInServiceTests =
             , aiRetryable = False
             }
       drainedVar <- newEmptyMVar
+      issueVar <- newEmptyMVar
       result <-
         withSessionFanInServiceHooks
           defaultSessionFanInServiceHooks
             { sfshOnDrain = putMVar drainedVar
+            , sfshOnIssue = putMVar issueVar
             }
           graph
           opts
@@ -15403,21 +15405,39 @@ sessionFanInServiceTests =
               mFirstDrain <- timeout 1000000 (takeMVar drainedVar)
               rejected <- enqueueArbitratedSessionFanInServiceCommand
                             patternProducer command service
+              mIssue <- timeout 1000000 (takeMVar issueVar)
               mRejectedDrain <- timeout 100000 (takeMVar drainedVar)
               snapshot <- readSessionFanInService service
-              pure (enq0, mFirstDrain, rejected, mRejectedDrain, snapshot)
+              pure
+                ( enq0
+                , mFirstDrain
+                , rejected
+                , mIssue
+                , mRejectedDrain
+                , snapshot
+                )
       case result of
         Left issue ->
           assertFailure ("expected fan-in service, got: " <> show issue)
-        Right (enq0, Just _firstDrain, rejected, Nothing, snapshot) -> do
-          queued0 <- gatewayQueuedOrFail enq0
-          qscProducer queued0 @?= oscProducer
-          qscSequence queued0 @?= CommandSequence 0
-          rejected @?= SagArbitrationRejected expectedIssue
-          sfisQueueDepth snapshot @?= 0
-        Right (_enq0, Nothing, _rejected, _mRejectedDrain, _snapshot) ->
+        Right
+          ( enq0
+          , Just _firstDrain
+          , rejected
+          , Just reported
+          , Nothing
+          , snapshot
+          ) -> do
+            queued0 <- gatewayQueuedOrFail enq0
+            qscProducer queued0 @?= oscProducer
+            qscSequence queued0 @?= CommandSequence 0
+            rejected @?= SagArbitrationRejected expectedIssue
+            reported @?= SfsiiArbitrationRejected expectedIssue
+            sfisQueueDepth snapshot @?= 0
+        Right (_enq0, Nothing, _rejected, _mIssue, _mRejectedDrain, _snapshot) ->
           assertFailure "timed out waiting for first arbitrated drain"
-        Right (_enq0, Just _firstDrain, _rejected, Just extraDrain, _snapshot) ->
+        Right (_enq0, Just _firstDrain, _rejected, Nothing, _mRejectedDrain, _snapshot) ->
+          assertFailure "timed out waiting for arbitration rejection issue"
+        Right (_enq0, Just _firstDrain, _rejected, Just _reported, Just extraDrain, _snapshot) ->
           assertFailure
             ("policy rejection unexpectedly woke service drain: "
              <> show extraDrain)

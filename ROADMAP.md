@@ -3289,9 +3289,11 @@ wraps fan-in enqueue as an opt-in boundary. The gateway defaults to
 priority ownership only after an accepted enqueue.
 `MetaSonic.Session.FanInService` can now own an optional arbitration
 gateway for callers that explicitly choose its arbitrated enqueue path;
-the raw service enqueue path remains FIFO. Existing live
-producer/listener paths are not routed through arbitration unless a
-caller explicitly chooses that wrapper/path.
+the raw service enqueue path remains FIFO. Service-owned policy
+rejections report `SfsiiArbitrationRejected` separately from fan-in
+queue pressure and drain-stop issues. Existing live producer/listener
+paths are not routed through arbitration unless a caller explicitly
+chooses that wrapper/path.
 
 Still gated:
 

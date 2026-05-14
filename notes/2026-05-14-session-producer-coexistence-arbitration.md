@@ -1,13 +1,13 @@
 # Session Producer Coexistence And Arbitration
 
-Status: pure policy, optional gateway, and service-owned opt-in gateway
-landed. This note records the arbitration boundary after MIDI
-listener-local coalescing. It does not change `MetaSonic.Session.Queue`
-or `MetaSonic.Session.FanIn`; concrete producer/listener paths keep FIFO
-behavior unless a caller explicitly routes them through
-`MetaSonic.Session.ArbitrationGateway` or the arbitrated
-`MetaSonic.Session.FanInService` enqueue path with a non-`FifoOnly`
-policy.
+Status: pure policy, optional gateway, service-owned opt-in gateway, and
+service-level rejection observability landed. This note records the
+arbitration boundary after MIDI listener-local coalescing. It does not
+change `MetaSonic.Session.Queue` or `MetaSonic.Session.FanIn`; concrete
+producer/listener paths keep FIFO behavior unless a caller explicitly
+routes them through `MetaSonic.Session.ArbitrationGateway` or the
+arbitrated `MetaSonic.Session.FanInService` enqueue path with a
+non-`FifoOnly` policy.
 
 The session layer now has multiple producers that can address the same
 symbolic control target:
@@ -44,7 +44,9 @@ different user intents even when they write the same logical target.
 - `Session.FanInService` can optionally own one arbitration gateway. Its
   raw enqueue path remains FIFO; the arbitrated service enqueue path uses
   the service-owned gateway when configured and otherwise falls back to
-  FIFO.
+  FIFO. Policy rejections from that service-owned path are reported as
+  `SfsiiArbitrationRejected`, separate from drain-stop and fan-in
+  backpressure issues.
 - The landed MIDI coalescer is listener-local. It can merge repeated
   MIDI-origin `CmdControlWrite`s before enqueue, but it cannot merge,
   reorder, or drop another producer's commands.
@@ -171,6 +173,8 @@ These counters should not be mixed with `SeiQueueFull`,
 means fan-in backpressure. Coalescing means a producer emitted more
 intermediate values than fan-in needed. Arbitration rejection means a
 policy chose another producer's intent for the same target.
+The service-owned gateway surfaces that case as
+`SfsiiArbitrationRejected` on `sfshOnIssue`.
 
 ## Test Plan
 
@@ -192,6 +196,8 @@ above fan-in, using a small pure policy function or wrapper:
 - Rejected commands do not consume queue capacity or sequence numbers.
 - A fan-in rejection after policy acceptance does not update priority
   owner state.
+- A service-owned gateway rejection reports `SfsiiArbitrationRejected`
+  without waking the drain worker.
 
 ## Implementation Sequence
 
@@ -205,9 +211,12 @@ above fan-in, using a small pure policy function or wrapper:
 5. Let the scoped fan-in service own an optional gateway for callers that
    explicitly choose the arbitrated enqueue path. Done:
    `MetaSonic.Session.FanInService`.
-6. Wire concrete MIDI, OSC, UI, or Pattern producer/listener paths only
+6. Report service-owned gateway policy rejections as service issues
+   separate from queue-full and drain-stop issues. Done:
+   `SfsiiArbitrationRejected`.
+7. Wire concrete MIDI, OSC, UI, or Pattern producer/listener paths only
    when configuration can explicitly enable a non-FIFO policy.
-7. Add smoke diagnostics if a live policy is enabled by configuration.
+8. Add smoke diagnostics if a live policy is enabled by configuration.
 
 ## Open Questions
 

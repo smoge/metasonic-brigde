@@ -55,6 +55,8 @@ import           GHC.Generics              (Generic)
 import           System.Timeout            (timeout)
 
 import           MetaSonic.Bridge.Templates (TemplateGraph)
+import           MetaSonic.Session.Arbitration
+                                            (ArbitrationIssue)
 import           MetaSonic.Session.ArbitrationGateway
                                             (SessionArbitrationGateway,
                                              SessionArbitrationGatewayEnqueueResult (..),
@@ -83,6 +85,7 @@ import           MetaSonic.Session.Queue    (ProducerId,
 data SessionFanInService = SessionFanInService
   { sfsvcHost :: !SessionFanInHost
   , sfsvcGateway :: !(Maybe SessionArbitrationGateway)
+  , sfsvcHooks :: !SessionFanInServiceHooks
   }
 
 -- | Access the underlying fan-in host for existing concrete producers.
@@ -130,9 +133,13 @@ newtype SessionFanInServiceSetupIssue
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
--- | Runtime issues reported by the background worker.
+-- | Runtime issues reported by the service.
 data SessionFanInServiceIssue
   = SfsiiDrainStopped !SessionFanInDrainResult
+    -- ^ The background drain worker observed a stopped drain.
+  | SfsiiArbitrationRejected !ArbitrationIssue
+    -- ^ The service-owned arbitration gateway rejected a command before
+    -- fan-in enqueue. This is policy denial, not queue pressure.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -182,6 +189,7 @@ withSessionFanInServiceHooks hooks graph opts action = do
           let service = SessionFanInService
                 { sfsvcHost = host
                 , sfsvcGateway = gateway
+                , sfsvcHooks = hooks
                 }
               stop = do
                 writeIORef closing True
@@ -238,9 +246,17 @@ enqueueArbitratedSessionFanInServiceCommand producer cmd service =
     Nothing ->
       SagEnqueueAttempted
         <$> enqueueSessionFanInServiceCommand producer cmd service
-    Just gateway ->
-      enqueueArbitratedSessionFanInCommand
-        gateway producer cmd (sfsvcHost service)
+    Just gateway -> do
+      result <-
+        enqueueArbitratedSessionFanInCommand
+          gateway producer cmd (sfsvcHost service)
+      case result of
+        SagArbitrationRejected issue ->
+          sfshOnIssue (sfsvcHooks service)
+            (SfsiiArbitrationRejected issue)
+        SagEnqueueAttempted {} ->
+          pure ()
+      pure result
 
 -- | Read the service-owned fan-in host snapshot.
 readSessionFanInService
