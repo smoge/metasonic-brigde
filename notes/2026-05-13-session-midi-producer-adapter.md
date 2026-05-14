@@ -5,17 +5,19 @@ This slice adds the first Haskell-only MIDI producer adapter above
 
 The adapter consumes already-decoded MIDI events. It does not open a
 PortMIDI device, own a listener thread, define a live clock, claim
-pitch-bend or channel policy, or arbitrate against OSC beyond the
-existing FIFO fan-in queue.
+pitch-bend or broader channel policy, or arbitrate against OSC beyond
+the existing FIFO fan-in queue.
 
 ## Landed Scope
 
 - `MetaSonic.Session.MIDIProducer` defines decoded note-on, note-off,
-  and control-change events for the session path.
+  control-change, and all-notes-off/reset events for the session path.
 - `decodeMIDISessionCommands` translates note-on into `CmdVoiceOn`,
   note-off into `CmdVoiceOff`, velocity-zero note-on into note-off, and
   mapped CC into deterministic `CmdControlWrite` fanout over active
-  MIDI notes.
+  MIDI notes. All-notes-off emits deterministic `CmdVoiceOff` commands
+  for active notes and can target either every producer-local note or
+  only notes on one MIDI channel.
 - `MIDIProducerOptions` carries the target template plus optional
   frequency, gate, and velocity initial-control targets and explicit CC
   mappings.
@@ -43,6 +45,7 @@ existing FIFO fan-in queue.
 
 The tests cover note-on/off translation, velocity-zero release,
 configured initial controls, deterministic CC fanout, invalid data and
-unmapped-CC rejection, successful `ProducerMIDI` enqueue attribution,
-queue-full state retention, and composition through a scoped
+unmapped-CC rejection, deterministic all-notes-off/reset translation,
+successful `ProducerMIDI` enqueue attribution, queue-full state
+retention for note starts and resets, and composition through a scoped
 `MetaSonic.Session.FanInService` drain worker.

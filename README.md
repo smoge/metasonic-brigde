@@ -269,9 +269,9 @@ The landed pieces are deliberately small:
   producer. It only parses and enqueues; draining is owned by the caller or by
   a composed `MetaSonic.Session.FanInService`.
 - `MetaSonic.Session.MIDIProducer` translates already-decoded MIDI note-on,
-  note-off, and control-change events into session commands with `ProducerMIDI`
-  identity, including per-note producer state and configurable note/CC
-  mappings.
+  note-off, control-change, and all-notes-off/reset events into session
+  commands with `ProducerMIDI` identity, including per-note producer state,
+  configurable note/CC mappings, and deterministic producer-local voice stops.
 - `MetaSonic.Session.MIDIListener` brackets a worker around an injected
   decoded MIDI event source and feeds `MetaSonic.Session.MIDIProducer`. It is
   testable without hardware and still does not own PortMIDI devices.
@@ -290,11 +290,11 @@ The landed pieces are deliberately small:
 
 What is still intentionally absent: GUI toolkit bindings, manifest-driven
 session reload/resource allocation, broader MIDI behavior beyond note/CC
-command translation and the small PortMIDI-backed decoded source, broader OSC
-behavior beyond symbolic control writes, arbitration beyond FIFO, long-running
-supervision beyond the scoped fan-in service, unsupported respawn/reset policy
-for preserving swaps, and recovery after terminal runtime
-divergence.
+command translation, CC 123 all-notes-off, and the small PortMIDI-backed
+decoded source, broader OSC behavior beyond symbolic control writes,
+arbitration beyond FIFO, long-running supervision beyond the scoped fan-in
+service, unsupported respawn/reset policy for preserving swaps, and recovery
+after terminal runtime divergence.
 
 ---
 

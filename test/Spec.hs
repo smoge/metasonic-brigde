@@ -15135,6 +15135,54 @@ sessionMIDIProducerTests =
             ]
           mpcbState batch @?= active
 
+  , testCase "all-notes-off emits deterministic voice stops and clears state" $ do
+      let active = MIDIProducerState
+            { mpsActiveNotes = M.fromList
+                [ ((1, 65), VoiceKey "m1-65")
+                , ((0, 72), VoiceKey "m0-72")
+                , ((0, 60), VoiceKey "m0-60")
+                ]
+            }
+      case decodeMIDISessionCommands
+             testMIDIProducerOptions
+             active
+             (MIDIProducerAllNotesOff Nothing) of
+        Left issue ->
+          assertFailure ("expected all-notes-off translation, got: "
+                         <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdVoiceOff (VoiceKey "m0-60")
+            , CmdVoiceOff (VoiceKey "m0-72")
+            , CmdVoiceOff (VoiceKey "m1-65")
+            ]
+          mpcbState batch @?= initialMIDIProducerState
+
+  , testCase "channel all-notes-off keeps other active channels" $ do
+      let active = MIDIProducerState
+            { mpsActiveNotes = M.fromList
+                [ ((1, 65), VoiceKey "m1-65")
+                , ((0, 72), VoiceKey "m0-72")
+                , ((0, 60), VoiceKey "m0-60")
+                ]
+            }
+          expectedState = MIDIProducerState
+            { mpsActiveNotes = M.singleton (1, 65) (VoiceKey "m1-65")
+            }
+      case decodeMIDISessionCommands
+             testMIDIProducerOptions
+             active
+             (MIDIProducerAllNotesOff (Just 0)) of
+        Left issue ->
+          assertFailure ("expected channel all-notes-off translation, got: "
+                         <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdVoiceOff (VoiceKey "m0-60")
+            , CmdVoiceOff (VoiceKey "m0-72")
+            ]
+          mpcbState batch @?= expectedState
+
   , testCase "invalid data bytes and unmapped CCs reject explicitly" $ do
       decodeMIDISessionCommands
         testMIDIProducerOptions
@@ -15151,6 +15199,11 @@ sessionMIDIProducerTests =
         initialMIDIProducerState
         (MIDIProducerControlChange 0 74 64)
         @?= Left (MpiUnmappedControl 74)
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerAllNotesOff (Just 16))
+        @?= Left (MpiInvalidChannel 16)
 
   , testCase "successful enqueue advances MIDI state under ProducerMIDI" $ do
       result <- withSessionFanInHost
@@ -15215,6 +15268,44 @@ sessionMIDIProducerTests =
               assertFailure ("expected one MIDI command, got: " <> show other)
         Right other ->
           assertFailure ("expected queue-full MIDI enqueue, got: "
+                         <> show other)
+
+  , testCase "queue-full does not advance all-notes-off state" $ do
+      let opts = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+          active = MIDIProducerState
+            { mpsActiveNotes = M.singleton (0, 69) (VoiceKey "m0-69")
+            }
+          prefill =
+            CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
+      result <- withSessionFanInHost
+                  (patternTemplates droneVibrato)
+                  opts
+                  $ \host -> do
+                    _prefill <-
+                      enqueueSessionFanInCommand
+                        (testProducer ProducerTest "prefill")
+                        prefill
+                        host
+                    enqueueMIDIProducerEvent
+                      testMIDIProducerOptions
+                      active
+                      (MIDIProducerAllNotesOff Nothing)
+                      host
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (MIDIProducerEnqueueAttempted batch [enq]) -> do
+          mpcbState batch @?= active
+          mpcbCommands batch @?= [CmdVoiceOff (VoiceKey "m0-69")]
+          sfierResult enq
+            @?= SessionEnqueueRejected
+                  (midiProducerId testMIDIProducerOptions)
+                  (CmdVoiceOff (VoiceKey "m0-69"))
+                  (SeiQueueFull 1)
+        Right other ->
+          assertFailure ("expected queue-full all-notes-off enqueue, got: "
                          <> show other)
 
   , testCase "service host wakes worker for MIDI note-on" $ do
@@ -15498,6 +15589,59 @@ sessionMIDIListenerTests =
           sfisQueueDepth snapshot @?= 2
         Right other ->
           assertFailure ("expected note-on/note-off listener results, got: "
+                         <> show other)
+
+  , testCase "listener state follows all-notes-off reset" $ do
+      events <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIListenerHooks
+            { MIDIS.smlhOnProducerResult = putMVar producerResults
+            , MIDIS.smlhOnIssue          = \_ -> pure ()
+            }
+      result <-
+        withSessionFanInHost
+          (patternTemplates droneVibrato)
+          defaultSessionFanInOptions
+          $ \host ->
+              MIDIS.withSessionMIDIListenerHooks
+                hooks
+                testMIDIProducerOptions
+                initialMIDIProducerState
+                source
+                host
+                $ \listener -> do
+                    putMVar events (Just (MIDIProducerNoteOn 0 69 100))
+                    mOn <- timeout 1000000 (takeMVar producerResults)
+                    putMVar events (Just (MIDIProducerAllNotesOff Nothing))
+                    mReset <- timeout 1000000 (takeMVar producerResults)
+                    stateAfterReset <-
+                      MIDIS.readSessionMIDIListenerState listener
+                    snapshot <- readSessionFanInHost host
+                    pure (mOn, mReset, stateAfterReset, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (MIDIProducerEnqueueAttempted _ [onEnq]),
+               Just (MIDIProducerEnqueueAttempted resetBatch [offEnq]),
+               stateAfterReset,
+               snapshot) -> do
+          onQueued <- fanInQueuedOrFail onEnq
+          offQueued <- fanInQueuedOrFail offEnq
+          qscCommand onQueued
+            @?= CmdVoiceOn
+                  (TemplateName "drone")
+                  (VoiceKey "m0-69")
+                  [ (midiFreqTag, 440.0)
+                  , (midiGateTag, 1.0)
+                  , (midiVelocityTag, 100.0 / 127.0)
+                  ]
+          mpcbCommands resetBatch @?= [CmdVoiceOff (VoiceKey "m0-69")]
+          qscCommand offQueued @?= CmdVoiceOff (VoiceKey "m0-69")
+          mpsActiveNotes stateAfterReset @?= M.empty
+          sfisQueueDepth snapshot @?= 2
+        Right other ->
+          assertFailure ("expected note-on/reset listener results, got: "
                          <> show other)
 
   , testCase "queue-full rejection does not advance listener state" $ do

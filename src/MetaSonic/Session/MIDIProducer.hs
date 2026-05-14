@@ -7,9 +7,9 @@
 -- Description : Haskell-only MIDI event adapter for session fan-in.
 --
 -- This module defines a narrow, protocol-neutral MIDI producer above
--- 'MetaSonic.Session.FanIn'. It translates decoded MIDI note and CC
--- events into symbolic 'SessionCommand's, then submits them as
--- 'ProducerMIDI'.
+-- 'MetaSonic.Session.FanIn'. It translates decoded MIDI note, CC, and
+-- all-notes-off/reset events into symbolic 'SessionCommand's, then
+-- submits them as 'ProducerMIDI'.
 --
 -- It deliberately does not open PortMIDI devices, own a listener
 -- thread, define a live clock, arbitrate against OSC beyond the
@@ -66,6 +66,8 @@ import           MetaSonic.Session.Queue    (ProducerId (..),
 --
 -- Channels are zero-based MIDI channels. Note, velocity, controller,
 -- and controller values must be MIDI data bytes in @[0, 127]@.
+-- For 'MIDIProducerAllNotesOff', 'Nothing' means every active producer
+-- note, and 'Just' means only notes currently active on that channel.
 data MIDIProducerEvent
   = MIDIProducerNoteOn
       { mpeChannel  :: !Word8
@@ -81,6 +83,9 @@ data MIDIProducerEvent
       { mpeChannel    :: !Word8
       , mpeController :: !Word8
       , mpeValue      :: !Word8
+      }
+  | MIDIProducerAllNotesOff
+      { mpeAllNotesChannel :: !(Maybe Word8)
       }
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
@@ -190,6 +195,8 @@ decodeMIDISessionCommands opts st event = do
       noteOff ch note st
     MIDIProducerControlChange _ch controller value ->
       controlChange controller value st
+    MIDIProducerAllNotesOff target ->
+      allNotesOff target st
   where
     noteOn ch note velocity (MIDIProducerState active) = do
       let key = (ch, note)
@@ -239,6 +246,23 @@ decodeMIDISessionCommands opts st event = do
             , mpcbState =
                 st
             }
+
+    allNotesOff target (MIDIProducerState active) =
+      let (stopped, kept) =
+            M.partitionWithKey
+              (\(ch, _note) _vkey -> maybe True (== ch) target)
+              active
+          st' = MIDIProducerState
+            { mpsActiveNotes = kept
+            }
+      in Right MIDIProducerCommandBatch
+           { mpcbCommands =
+               [ CmdVoiceOff vkey
+               | vkey <- M.elems stopped
+               ]
+           , mpcbState =
+               st'
+           }
 
     noteOnControls note velocity =
       concat
@@ -290,6 +314,10 @@ validateEvent event = case event of
     validateChannel ch
     validateDataByte (T.pack "controller") controller
     validateDataByte (T.pack "value") value
+  MIDIProducerAllNotesOff Nothing ->
+    Right ()
+  MIDIProducerAllNotesOff (Just ch) ->
+    validateChannel ch
 
 validateChannel :: Word8 -> Either MIDIProducerIssue ()
 validateChannel ch

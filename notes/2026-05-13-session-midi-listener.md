@@ -42,6 +42,6 @@ binds Q / PortMIDI input behind the same session-facing loop.
 The tests cover bracket cleanup while the decoded source is blocked,
 explicit end-of-input worker exit, producer rejection with continued
 processing of later events, note-on/note-off listener state
-transitions, queue-full state retention, blocked-hook teardown, and
-composition through a scoped `MetaSonic.Session.FanInService` drain
-worker.
+transitions, all-notes-off/reset state clearing, queue-full state
+retention, blocked-hook teardown, and composition through a scoped
+`MetaSonic.Session.FanInService` drain worker.

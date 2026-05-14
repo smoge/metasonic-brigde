@@ -15,10 +15,11 @@
 -- A 'PortMIDISource' handle is single-consumer: poll it from one owner
 -- thread, and close it only after that owner has stopped polling.
 --
--- The source decodes MIDI 1.0 note-on, note-off, and control-change
--- messages. Other messages are consumed and ignored. Pitch bend,
--- aftertouch, MIDI clock, channel masks, and all-notes-off policy stay
--- out of scope for this v1 source.
+-- The source decodes MIDI 1.0 note-on, note-off, control-change, and
+-- channel all-notes-off (CC 123) messages. Other messages are
+-- consumed and ignored. Pitch bend, aftertouch, MIDI clock, channel
+-- masks, and broader controller policy stay out of scope for this v1
+-- source.
 
 module MetaSonic.Session.MIDIPortMIDI
   ( PortMIDISourceOptions (..)
@@ -151,13 +152,20 @@ fromEventKind kind ch d1 d2
   | kind == rtSessionMIDIEventNoteOff =
       Just (MIDIProducerNoteOff ch d1 d2)
   | kind == rtSessionMIDIEventControlChange =
-      Just (MIDIProducerControlChange ch d1 d2)
+      Just $
+        if d1 == midiAllNotesOffController
+           then MIDIProducerAllNotesOff (Just ch)
+           else MIDIProducerControlChange ch d1 d2
   | otherwise =
       Nothing
 
 fromCDataByte :: CInt -> Word8
 fromCDataByte =
   fromIntegral
+
+midiAllNotesOffController :: Word8
+midiAllNotesOffController =
+  123
 
 -- | Diagnostic view of the C ABI event tags used by the decoder.
 -- Exposed so tests can pin the header-derived agreement contract.

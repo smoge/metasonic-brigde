@@ -5,10 +5,10 @@ This slice adds the first Q / PortMIDI-backed source for
 
 The source is intentionally smaller than the existing live-MIDI demo
 path. It owns only a polling handle over `q::midi_input_stream`, decodes
-MIDI 1.0 note-on, note-off, and control-change messages into
-`MIDIProducerEvent`s, and lets the Haskell session listener own the
-worker thread. It does not touch `RTGraph`, `VoiceAllocator`, or the
-runtime realtime queue.
+MIDI 1.0 note-on, note-off, control-change, and all-notes-off (CC 123)
+messages into `MIDIProducerEvent`s, and lets the Haskell session
+listener own the worker thread. It does not touch `RTGraph`,
+`VoiceAllocator`, or the runtime realtime queue.
 
 ## Landed Scope
 
@@ -35,7 +35,7 @@ runtime realtime queue.
 ## Still Out Of Scope
 
 - Pitch bend, aftertouch, MIDI clock, channel masks, sustain-pedal
-  semantics, or all-notes-off synthesis.
+  semantics, or broader controller policy beyond CC 123 all-notes-off.
 - Producer arbitration beyond FIFO.
 - Reusing or replacing the existing C++ `MetaSonic.Bridge.MidiDemo`
   live-runtime path.
@@ -57,5 +57,5 @@ stack exec -- metasonic-bridge --midi-device <input-id> --session-midi-smoke 10
 ```
 
 The smoke command exits non-zero if it cannot open an input-capable
-device or if no supported note/CC events produce drained session
-commands during the selected time window.
+device or if no supported note/CC/all-notes-off events produce drained
+session commands during the selected time window.
