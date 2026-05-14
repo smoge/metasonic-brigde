@@ -15095,9 +15095,9 @@ sessionMIDIProducerTests =
             @?= M.singleton (0, 69) (VoiceKey "m0-69")
 
   , testCase "note-on velocity zero is treated as note-off" $ do
-      let active = MIDIProducerState
-            { mpsActiveNotes = M.singleton (2, 60) (VoiceKey "m2-60")
-            }
+      let active =
+            testMIDIProducerState $
+              M.singleton (2, 60) (VoiceKey "m2-60")
           event = MIDIProducerNoteOn 2 60 0
       decodeMIDISessionCommands testMIDIProducerOptions active event
         @?= Right MIDIProducerCommandBatch
@@ -15107,9 +15107,9 @@ sessionMIDIProducerTests =
 
   , testCase "duplicate and stale notes are rejected before enqueue" $ do
       let opts = testMIDIProducerOptions
-          active = MIDIProducerState
-            { mpsActiveNotes = M.singleton (0, 69) (VoiceKey "m0-69")
-            }
+          active =
+            testMIDIProducerState $
+              M.singleton (0, 69) (VoiceKey "m0-69")
       decodeMIDISessionCommands opts active (MIDIProducerNoteOn 0 69 127)
         @?= Left (MpiNoteAlreadyActive 0 69)
       decodeMIDISessionCommands opts initialMIDIProducerState
@@ -15117,12 +15117,12 @@ sessionMIDIProducerTests =
         @?= Left (MpiNoteNotActive 0 69)
 
   , testCase "CC maps to deterministic control writes for active notes" $ do
-      let active = MIDIProducerState
-            { mpsActiveNotes = M.fromList
+      let active =
+            testMIDIProducerState $
+              M.fromList
                 [ ((0, 72), VoiceKey "m0-72")
                 , ((0, 60), VoiceKey "m0-60")
                 ]
-            }
           event = MIDIProducerControlChange 0 7 64
           expectedValue = 64.0 / 127.0
       case decodeMIDISessionCommands testMIDIProducerOptions active event of
@@ -15136,14 +15136,15 @@ sessionMIDIProducerTests =
           mpcbState batch @?= active
 
   , testCase "pitch-bend maps to channel-active frequency writes" $ do
-      let active = MIDIProducerState
-            { mpsActiveNotes = M.fromList
+      let active =
+            testMIDIProducerState $
+              M.fromList
                 [ ((0, 72), VoiceKey "m0-72")
                 , ((1, 67), VoiceKey "m1-67")
                 , ((0, 60), VoiceKey "m0-60")
                 ]
-            }
           value = 16383
+          bentState = active { mpsPitchBends = M.singleton 0 value }
           expected note =
             midiNoteFrequency note
               * (2.0 ** ((((fromIntegral value - 8192.0) / 8192.0) * 2.0)
@@ -15160,10 +15161,57 @@ sessionMIDIProducerTests =
             [ CmdControlWrite (VoiceKey "m0-60") midiFreqTag (expected 60)
             , CmdControlWrite (VoiceKey "m0-72") midiFreqTag (expected 72)
             ]
-          mpcbState batch @?= active
+          mpcbState batch @?= bentState
       decodeMIDISessionCommands
         testMIDIProducerOptions
         initialMIDIProducerState
+        (MIDIProducerPitchBend 0 8192)
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = []
+              , mpcbState = initialMIDIProducerState
+              }
+
+  , testCase "pitch-bend state applies to later note-on" $ do
+      let value = 16383
+          bentState =
+            initialMIDIProducerState
+              { mpsPitchBends = M.singleton 0 value
+              }
+          expectedFreq note =
+            midiNoteFrequency note
+              * (2.0 ** ((((fromIntegral value - 8192.0) / 8192.0) * 2.0)
+                          / 12.0))
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        initialMIDIProducerState
+        (MIDIProducerPitchBend 0 value)
+        @?= Right MIDIProducerCommandBatch
+              { mpcbCommands = []
+              , mpcbState = bentState
+              }
+      case decodeMIDISessionCommands
+             testMIDIProducerOptions
+             bentState
+             (MIDIProducerNoteOn 0 60 64) of
+        Left issue ->
+          assertFailure ("expected bent MIDI note-on, got: " <> show issue)
+        Right batch -> do
+          mpcbCommands batch @?=
+            [ CmdVoiceOn
+                (TemplateName "drone")
+                (VoiceKey "m0-60")
+                [ (midiFreqTag, expectedFreq 60)
+                , (midiGateTag, 1.0)
+                , (midiVelocityTag, 64.0 / 127.0)
+                ]
+            ]
+          mpcbState batch @?=
+            bentState
+              { mpsActiveNotes = M.singleton (0, 60) (VoiceKey "m0-60")
+              }
+      decodeMIDISessionCommands
+        testMIDIProducerOptions
+        bentState
         (MIDIProducerPitchBend 0 8192)
         @?= Right MIDIProducerCommandBatch
               { mpcbCommands = []
@@ -15177,9 +15225,9 @@ sessionMIDIProducerTests =
           emptyOpts = testMIDIProducerOptions
             { mpoChannelFilter = MIDIChannelAllowList S.empty
             }
-          active = MIDIProducerState
-            { mpsActiveNotes = M.singleton (0, 69) (VoiceKey "m0-69")
-            }
+          active =
+            testMIDIProducerState $
+              M.singleton (0, 69) (VoiceKey "m0-69")
       decodeMIDISessionCommands
         emptyOpts
         initialMIDIProducerState
@@ -15231,13 +15279,13 @@ sessionMIDIProducerTests =
               }
 
   , testCase "all-notes-off emits deterministic voice stops and clears state" $ do
-      let active = MIDIProducerState
-            { mpsActiveNotes = M.fromList
+      let active =
+            testMIDIProducerState $
+              M.fromList
                 [ ((1, 65), VoiceKey "m1-65")
                 , ((0, 72), VoiceKey "m0-72")
                 , ((0, 60), VoiceKey "m0-60")
                 ]
-            }
       case decodeMIDISessionCommands
              testMIDIProducerOptions
              active
@@ -15254,16 +15302,16 @@ sessionMIDIProducerTests =
           mpcbState batch @?= initialMIDIProducerState
 
   , testCase "channel all-notes-off keeps other active channels" $ do
-      let active = MIDIProducerState
-            { mpsActiveNotes = M.fromList
+      let active =
+            testMIDIProducerState $
+              M.fromList
                 [ ((1, 65), VoiceKey "m1-65")
                 , ((0, 72), VoiceKey "m0-72")
                 , ((0, 60), VoiceKey "m0-60")
                 ]
-            }
-          expectedState = MIDIProducerState
-            { mpsActiveNotes = M.singleton (1, 65) (VoiceKey "m1-65")
-            }
+          expectedState =
+            testMIDIProducerState $
+              M.singleton (1, 65) (VoiceKey "m1-65")
       case decodeMIDISessionCommands
              testMIDIProducerOptions
              active
@@ -15410,9 +15458,9 @@ sessionMIDIProducerTests =
       let opts = defaultSessionFanInOptions
             { sfioQueueOptions = SessionQueueOptions 1
             }
-          active = MIDIProducerState
-            { mpsActiveNotes = M.singleton (0, 69) (VoiceKey "m0-69")
-            }
+          active =
+            testMIDIProducerState $
+              M.singleton (0, 69) (VoiceKey "m0-69")
           prefill =
             CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
       result <- withSessionFanInHost
@@ -15448,13 +15496,13 @@ sessionMIDIProducerTests =
       let opts = defaultSessionFanInOptions
             { sfioQueueOptions = SessionQueueOptions 3
             }
-          active = MIDIProducerState
-            { mpsActiveNotes = M.fromList
+          active =
+            testMIDIProducerState $
+              M.fromList
                 [ ((1, 65), VoiceKey "m1-65")
                 , ((0, 72), VoiceKey "m0-72")
                 , ((0, 60), VoiceKey "m0-60")
                 ]
-            }
           prefill =
             CmdVoiceOn (TemplateName "drone") (VoiceKey "already") []
       result <- withSessionFanInHost
@@ -15539,6 +15587,10 @@ sessionMIDIProducerTests =
         Right other ->
           assertFailure ("expected MIDI service enqueue, got: " <> show other)
   ]
+
+testMIDIProducerState :: M.Map (Word8, Word8) VoiceKey -> MIDIProducerState
+testMIDIProducerState active =
+  initialMIDIProducerState { mpsActiveNotes = active }
 
 testMIDIProducerOptions :: MIDIProducerOptions
 testMIDIProducerOptions = defaultMIDIProducerOptions

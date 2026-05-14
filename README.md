@@ -271,8 +271,9 @@ The landed pieces are deliberately small:
 - `MetaSonic.Session.MIDIProducer` translates already-decoded MIDI note-on,
   note-off, control-change, pitch-bend, and all-notes-off events into session
   commands with `ProducerMIDI` identity, including per-note producer state,
-  configurable note/CC/pitch-bend mappings, a default-omni channel allow-list,
-  and deterministic producer-local voice stops.
+  per-channel bend replay for later note-on starts, configurable
+  note/CC/pitch-bend mappings, a default-omni channel allow-list, and
+  deterministic producer-local voice stops.
 - `MetaSonic.Session.MIDIListener` brackets a worker around an injected
   decoded MIDI event source and feeds `MetaSonic.Session.MIDIProducer`. It is
   testable without hardware and still does not own PortMIDI devices.

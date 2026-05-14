@@ -3191,9 +3191,9 @@ Landed prep contracts:
   fallback. The MIDI producer adapter tests cover
   note-on/off translation, note-on velocity-zero release semantics,
   configured frequency/gate/velocity initial controls, deterministic CC
-  fanout over active notes, pitch-bend control binding, explicit
-  invalid/unmapped rejection, channel filtering, all-notes-off translation,
-  queue-full state retention,
+  fanout over active notes, pitch-bend control binding and replay into
+  later note-on starts, explicit invalid/unmapped rejection, channel
+  filtering, all-notes-off translation, queue-full state retention,
   `ProducerMIDI` enqueue attribution, and composition through the
   scoped fan-in drain service. The MIDI
   listener tests cover blocked-source bracket cleanup, explicit
@@ -3226,7 +3226,8 @@ a plain `SessionFanInHost` or a scoped `SessionFanInService`, and its
 default-omni channel filter can reject channel-bearing events before
 they produce commands. Producer options are stable for the
 producer/listener lifetime; pitch-bend is bound through producer-local
-frequency-control mapping over active channel notes.
+frequency-control mapping over active channel notes and replayed into
+later note-on initial controls while the bend is held.
 `MetaSonic.Session.MIDIListener` brackets a worker over an injected
 decoded-event source and feeds that producer while keeping listener
 state observable. `MetaSonic.Session.MIDIPortMIDI` adds the first Q /
@@ -3276,9 +3277,10 @@ implementation, live-audio install orchestration, generic serialized
 fan-in, a session-backed OSC control-write ingress path, a scoped
 wake-on-enqueue background drain worker, producer-local MIDI
 note/CC/pitch-bend/all-notes-off command translation plus default-omni
-channel filtering, a decoded-source MIDI listener, and the first Q /
-PortMIDI-backed decoded source with an auto-selecting manual CLI smoke
-probe, and already-decoded UI intent translation. Do not
+channel filtering and bend replay for later note-on starts, a
+decoded-source MIDI listener, and the first Q / PortMIDI-backed decoded
+source with an auto-selecting manual CLI smoke probe, and
+already-decoded UI intent translation. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration, manifest-driven session reload/resource policy,
 broader MIDI policy beyond note/CC/pitch-bend/all-notes-off translation,

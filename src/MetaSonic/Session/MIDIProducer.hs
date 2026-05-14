@@ -170,8 +170,13 @@ midiProducerId opts =
   ProducerId ProducerMIDI (mpoProducerName opts)
 
 -- | MIDI producer state that is independent of the session owner.
-newtype MIDIProducerState = MIDIProducerState
-  { mpsActiveNotes :: M.Map (Word8, Word8) VoiceKey
+--
+-- Non-centered pitch-bend values are tracked per channel so a new
+-- note-on starts at the currently held bend instead of waiting for the
+-- next pitch-bend event.
+data MIDIProducerState = MIDIProducerState
+  { mpsActiveNotes :: !(M.Map (Word8, Word8) VoiceKey)
+  , mpsPitchBends  :: !(M.Map Word8 Word16)
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -179,6 +184,7 @@ newtype MIDIProducerState = MIDIProducerState
 initialMIDIProducerState :: MIDIProducerState
 initialMIDIProducerState = MIDIProducerState
   { mpsActiveNotes = M.empty
+  , mpsPitchBends  = M.empty
   }
 
 -- | Translation or producer-state issue.
@@ -248,17 +254,17 @@ decodeMIDISessionCommands opts st event = do
     MIDIProducerAllNotesOff target ->
       allNotesOff target st
   where
-    noteOn ch note velocity (MIDIProducerState active) = do
-      let key = (ch, note)
+    noteOn ch note velocity st0 = do
+      let active = mpsActiveNotes st0
+          bends  = mpsPitchBends st0
+          key    = (ch, note)
       case M.lookup key active of
         Just _ ->
           Left (MpiNoteAlreadyActive ch note)
         Nothing ->
           let vkey = midiVoiceKey ch note
-              controls = noteOnControls note velocity
-              st' = MIDIProducerState
-                { mpsActiveNotes = M.insert key vkey active
-                }
+              controls = noteOnControls ch note velocity bends
+              st' = st0 { mpsActiveNotes = M.insert key vkey active }
           in Right MIDIProducerCommandBatch
                { mpcbCommands =
                    [CmdVoiceOn (mpoTemplateName opts) vkey controls]
@@ -266,15 +272,14 @@ decodeMIDISessionCommands opts st event = do
                    st'
                }
 
-    noteOff ch note (MIDIProducerState active) = do
-      let key = (ch, note)
+    noteOff ch note st0 = do
+      let active = mpsActiveNotes st0
+          key    = (ch, note)
       case M.lookup key active of
         Nothing ->
           Left (MpiNoteNotActive ch note)
         Just vkey ->
-          let st' = MIDIProducerState
-                { mpsActiveNotes = M.delete key active
-                }
+          let st' = st0 { mpsActiveNotes = M.delete key active }
           in Right MIDIProducerCommandBatch
                { mpcbCommands =
                    [CmdVoiceOff vkey]
@@ -282,7 +287,7 @@ decodeMIDISessionCommands opts st event = do
                    st'
                }
 
-    controlChange controller value (MIDIProducerState active) =
+    controlChange controller value st0 =
       case M.lookup controller (mpoCCMappings opts) of
         Nothing ->
           Left (MpiUnmappedControl controller)
@@ -291,13 +296,13 @@ decodeMIDISessionCommands opts st event = do
             { mpcbCommands =
                 [ CmdControlWrite vkey (mcmTarget mapping)
                     (scaleControl mapping value)
-                | vkey <- M.elems active
+                | vkey <- M.elems (mpsActiveNotes st0)
                 ]
             , mpcbState =
-                st
+                st0
             }
 
-    pitchBend ch value (MIDIProducerState active) =
+    pitchBend ch value st0 =
       case mpoPitchBendMapping opts of
         Nothing ->
           Left MpiUnmappedPitchBend
@@ -306,21 +311,22 @@ decodeMIDISessionCommands opts st event = do
             { mpcbCommands =
                 [ CmdControlWrite vkey (mpbmTarget mapping)
                     (pitchBendFrequency (mpbmSemitones mapping) note value)
-                | ((noteCh, note), vkey) <- M.toList active
+                | ((noteCh, note), vkey) <- M.toList (mpsActiveNotes st0)
                 , noteCh == ch
                 ]
             , mpcbState =
-                st
+                st0
+                  { mpsPitchBends =
+                      updatePitchBend ch value (mpsPitchBends st0)
+                  }
             }
 
-    allNotesOff target (MIDIProducerState active) =
+    allNotesOff target st0 =
       let (stopped, kept) =
             M.partitionWithKey
               (\(ch, _note) _vkey -> maybe True (== ch) target)
-              active
-          st' = MIDIProducerState
-            { mpsActiveNotes = kept
-            }
+              (mpsActiveNotes st0)
+          st' = st0 { mpsActiveNotes = kept }
       in Right MIDIProducerCommandBatch
            { mpcbCommands =
                [ CmdVoiceOff vkey
@@ -330,15 +336,41 @@ decodeMIDISessionCommands opts st event = do
                st'
            }
 
-    noteOnControls note velocity =
+    noteOnControls ch note velocity bends =
       concat
-        [ maybe [] (\target -> [(target, midiNoteFrequency note)])
-            (mpoFrequencyControl opts)
+        [ frequencyInitialControl ch note bends
+        , pitchBendInitialControl ch note bends
         , maybe [] (\target -> [(target, 1.0)])
             (mpoGateControl opts)
         , maybe [] (\target -> [(target, velocityToUnit velocity)])
             (mpoVelocityControl opts)
         ]
+
+    frequencyInitialControl ch note bends =
+      case mpoFrequencyControl opts of
+        Nothing ->
+          []
+        Just target ->
+          [(target, noteInitialFrequency target ch note bends)]
+
+    pitchBendInitialControl ch note bends =
+      case (M.lookup ch bends, mpoPitchBendMapping opts) of
+        (Just value, Just mapping)
+          | Just (mpbmTarget mapping) /= mpoFrequencyControl opts ->
+              [ ( mpbmTarget mapping
+                , pitchBendFrequency (mpbmSemitones mapping) note value
+                )
+              ]
+        _ ->
+          []
+
+    noteInitialFrequency target ch note bends =
+      case (M.lookup ch bends, mpoPitchBendMapping opts) of
+        (Just value, Just mapping)
+          | target == mpbmTarget mapping ->
+              pitchBendFrequency (mpbmSemitones mapping) note value
+        _ ->
+          midiNoteFrequency note
 
 -- | Translate and enqueue one MIDI event through the supplied fan-in host.
 --
@@ -454,6 +486,17 @@ pitchBendFrequency semitones note value =
   where
     bend =
       (fromIntegral value - 8192.0) / 8192.0
+
+updatePitchBend :: Word8 -> Word16 -> M.Map Word8 Word16 -> M.Map Word8 Word16
+updatePitchBend ch value bends
+  | value == midiPitchBendCenter =
+      M.delete ch bends
+  | otherwise =
+      M.insert ch value bends
+
+midiPitchBendCenter :: Word16
+midiPitchBendCenter =
+  8192
 
 scaleControl :: MIDIControlMapping -> Word8 -> Value
 scaleControl mapping value =
