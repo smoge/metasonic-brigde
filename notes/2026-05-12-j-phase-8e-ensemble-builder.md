@@ -225,9 +225,9 @@ Case 1 is the target.
 
 ## Related artifacts
 
-- [notes/2026-05-12-phase-8d-routing-helpers.md](notes/2026-05-12-phase-8d-routing-helpers.md)
+- [notes/2026-05-12-i-phase-8d-routing-helpers.md](notes/2026-05-12-i-phase-8d-routing-helpers.md)
   — 8.D closeout; the `Bus` handle 8.E allocates against.
-- [notes/2026-05-11-phase-8-authoring-dsl-design.md](notes/2026-05-11-phase-8-authoring-dsl-design.md)
+- [notes/2026-05-11-l-phase-8-authoring-dsl-design.md](notes/2026-05-11-l-phase-8-authoring-dsl-design.md)
   — overall Phase 8 design.
 - [src/MetaSonic/Bridge/Templates.hs](src/MetaSonic/Bridge/Templates.hs)
   — `compileTemplateGraph` accepts `[(String, SynthGraph)]`

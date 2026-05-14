@@ -363,7 +363,7 @@ data DemoBody
 -- 'ccControl') -> out 0. Both controls flow through tagged
 -- KSmooth nodes; OSC dispatch resolves them at
 -- /<voice>/<name>/1 and the CC binding lands on the same
--- smoother slot 1 — see notes/2026-05-12-phase-8f-named-controls.md.
+-- smoother slot 1 — see notes/2026-05-12-k-phase-8f-named-controls.md.
 
 namedControlBuild :: SynthM (Auth.NamedControl, Auth.NamedControl)
 namedControlBuild = do

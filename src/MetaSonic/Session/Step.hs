@@ -13,7 +13,7 @@
 -- 'stepSessionCommand' is the only intended entry point. State changes
 -- if and only if the result is 'StepCommitted'.
 --
--- See [notes/2026-05-12-session-prep-d-runtime-adapter-shell.md].
+-- See [notes/2026-05-12-q-session-prep-d-runtime-adapter-shell.md].
 
 module MetaSonic.Session.Step
   ( -- * Step result

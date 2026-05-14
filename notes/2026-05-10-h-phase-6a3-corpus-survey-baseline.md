@@ -84,9 +84,9 @@ row 5 hypotheses.
 
 ### §4.D edge-rate opportunity producers
 
-Zero. The surveyed-demo baseline (per `notes/2026-05-09-phase-4e-...`
-and the 4D headline in `--fusion-survey`) is 4 producer nodes in 4
-kinds. The pattern corpus contributes nothing.
+Zero. The surveyed-demo baseline (per the Phase 4.E worker notes and
+the 4D headline in `--fusion-survey`) is 4 producer nodes in 4 kinds.
+The pattern corpus contributes nothing.
 
 This is the honest result. The corpus rows all wire envelope
 outputs into Gain *audio* inputs (sample-accurate consumer), which

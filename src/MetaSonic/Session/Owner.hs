@@ -16,7 +16,7 @@
 -- not fabricate owner values or manage the underlying runtime pieces
 -- directly.
 --
--- See [notes/2026-05-12-session-prep-f-runtime-owner.md].
+-- See [notes/2026-05-12-s-session-prep-f-runtime-owner.md].
 
 module MetaSonic.Session.Owner
   ( -- * Owner

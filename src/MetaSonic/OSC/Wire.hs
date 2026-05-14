@@ -13,7 +13,7 @@
 -- Anything outside that envelope is rejected with a diagnostic
 -- string.
 --
--- See [Phase 6.B OSC design](../../../notes/2026-05-10-phase-6b-osc-design.md)
+-- See [Phase 6.B OSC design](../../../notes/2026-05-10-i-phase-6b-osc-design.md)
 -- for the in-scope / out-of-scope cut.
 
 module MetaSonic.OSC.Wire

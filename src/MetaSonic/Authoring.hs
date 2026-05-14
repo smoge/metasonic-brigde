@@ -46,7 +46,7 @@
 -- emits. Pretty-API behavior alone is not the contract; the
 -- primitive shape is.
 --
--- See [notes/2026-05-11-phase-8-authoring-dsl-design.md].
+-- See [notes/2026-05-11-l-phase-8-authoring-dsl-design.md].
 
 module MetaSonic.Authoring
   ( -- * Channel-collection types

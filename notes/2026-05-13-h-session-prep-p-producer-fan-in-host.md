@@ -73,7 +73,7 @@ audio thread to install the published swap. At Prep P, a later
 background drain service or producer-side worker was the path to
 bounding enqueue latency. The first scoped version of that follow-up is
 recorded in
-[Session Fan-In Drain Service](2026-05-13-session-fan-in-drain-service.md).
+[Session Fan-In Drain Service](2026-05-13-i-session-fan-in-drain-service.md).
 
 `readSessionFanInHost` takes the lock and returns queue depth, owner
 state, and owner status. The raw queue and raw owner stay hidden.

@@ -21,18 +21,18 @@ Primary source material for this note:
 - [Project path draft](drafts/2026-05-08-project-path.md) and
   [full arc through Phase 4.E](drafts/2026-05-08-project-state-full-arc-through-4e.md)
   - older history checkpoints that this note extends.
-- [Phase 4 reasoning and work summary](2026-05-10-phase-4-reasoning-and-work-summary.md)
+- [Phase 4 reasoning and work summary](2026-05-10-b-phase-4-reasoning-and-work-summary.md)
   - region, fusion, rate, and worker-dispatch rationale.
-- [Phase 6.A-6.D state snapshot](2026-05-11-state-snapshot-phase-6-complete.md)
+- [Phase 6.A-6.D state snapshot](2026-05-11-g-state-snapshot-phase-6-complete.md)
   - pattern, OSC, buffer, and spectral boundary.
-- [Real project assessment](2026-05-11-real-project-assessment.md)
+- [Real project assessment](2026-05-11-m-real-project-assessment.md)
   - maturity checkpoint before Phase 7/8/session work.
-- [Phase 7.J gate closeout](2026-05-12-phase-7j-gate-closeout.md)
+- [Phase 7.J gate closeout](2026-05-12-g-phase-7j-gate-closeout.md)
   - current generated-fusion decision.
-- [Phase 8.H authoring manifest](2026-05-12-phase-8h-authoring-manifest.md)
+- [Phase 8.H authoring manifest](2026-05-12-m-phase-8h-authoring-manifest.md)
   - current authoring export boundary.
 - [Session live-control rollup](2026-05-14-b-session-live-control-rollup.md),
-  [coalescing note](2026-05-13-session-control-coalescing-arbitration.md),
+  [coalescing note](2026-05-13-o-session-control-coalescing-arbitration.md),
   and
   [producer arbitration note](2026-05-14-a-session-producer-coexistence-arbitration.md)
   - current session/live-control state.

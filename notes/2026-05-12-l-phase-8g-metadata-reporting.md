@@ -256,10 +256,10 @@ Case 1 is the target.
 
 ## Related artifacts
 
-- [notes/2026-05-12-phase-8e-ensemble-builder.md](notes/2026-05-12-phase-8e-ensemble-builder.md)
+- [notes/2026-05-12-j-phase-8e-ensemble-builder.md](notes/2026-05-12-j-phase-8e-ensemble-builder.md)
   — 8.E closeout; the source of the ensemble metadata
   this slice surfaces.
-- [notes/2026-05-12-phase-8f-named-controls.md](notes/2026-05-12-phase-8f-named-controls.md)
+- [notes/2026-05-12-k-phase-8f-named-controls.md](notes/2026-05-12-k-phase-8f-named-controls.md)
   — 8.F closeout; the source of the named-control
   metadata this slice surfaces.
 - [src/MetaSonic/Authoring.hs](src/MetaSonic/Authoring.hs)

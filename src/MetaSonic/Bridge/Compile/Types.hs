@@ -606,7 +606,7 @@ data RegionKernel
     --
     -- Added after the post-step-2 ranked missed-shape table
     -- crossed the kernel-add gate from
-    -- @notes/2026-05-08-fusion-strategy.md@: @missed=4, sources=4@,
+    -- @notes/2026-05-08-e-fusion-strategy.md@: @missed=4, sources=4@,
     -- producer in the proven sink-terminal family, kernel body
     -- absorbs the sink and avoids materializing NoiseGen / LPF /
     -- Gain output buffers in sequence. Tri / Pulse / Add filtered
@@ -683,9 +683,9 @@ their kernel; everything else returns 'RNodeLoop'. Code that wants
 to tell generated programs apart from node-loop pattern-matches on
 'rrExec' directly.
 
-See @notes/2026-05-12-phase-7d-runtime-program-abi.md@,
-@notes/2026-05-12-phase-7h-block-major-executor.md@, and
-@notes/2026-05-12-phase-7i-superinstruction-probe.md@.
+See @notes/2026-05-12-a-phase-7d-runtime-program-abi.md@,
+@notes/2026-05-12-e-phase-7h-block-major-executor.md@, and
+@notes/2026-05-12-f-phase-7i-superinstruction-probe.md@.
 -}
 
 -- | The dispatch selector for one 'RuntimeRegion'. See

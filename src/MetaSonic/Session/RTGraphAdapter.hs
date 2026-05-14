@@ -14,9 +14,9 @@
 -- graph metadata and returns a 'SessionRuntimeAdapter IO' for the
 -- voice/control/install surface.
 --
--- See [notes/2026-05-12-session-prep-e-rtgraph-adapter.md],
--- [notes/2026-05-13-session-prep-n-preserving-hot-swap-runtime-migration.md],
--- and [notes/2026-05-13-session-prep-o-live-audio-preserving-hot-swap.md].
+-- See [notes/2026-05-12-r-session-prep-e-rtgraph-adapter.md],
+-- [notes/2026-05-13-f-session-prep-n-preserving-hot-swap-runtime-migration.md],
+-- and [notes/2026-05-13-g-session-prep-o-live-audio-preserving-hot-swap.md].
 
 module MetaSonic.Session.RTGraphAdapter
   ( -- * Options

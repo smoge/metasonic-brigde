@@ -537,7 +537,7 @@ kindTag = ksTag . kindSpec
 -- than placeholders.
 --
 -- See Note [§6.D latency contract] in
--- @notes/2026-05-11-phase-6d-spectral-design.md@.
+-- @notes/2026-05-11-d-phase-6d-spectral-design.md@.
 kindLatency :: NodeKind -> Maybe Int
 kindLatency = \case
   KSpectralFreeze -> Just 1024
@@ -575,13 +575,13 @@ suite enforces a few cross-table biconditionals to prevent drift:
   * 'CapResourceAccess' iff a representative UGen of that kind has
     'inferEff' that contains a non-'Pure' effect.
 
-See @notes/2026-05-11-phase-7b-capability-metadata-decision.md@.
+See @notes/2026-05-11-p-phase-7b-capability-metadata-decision.md@.
 -}
 
 -- | Kind-level fusion legality flag.
 --
 -- See Note [Per-kind capability table] and
--- @notes/2026-05-11-phase-7b-capability-metadata-decision.md@.
+-- @notes/2026-05-11-p-phase-7b-capability-metadata-decision.md@.
 data KindCapability
   = CapStatelessOp
     -- ^ Output at sample @n@ is a deterministic function of inputs

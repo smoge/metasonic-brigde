@@ -226,9 +226,9 @@ round-trips, the slice is the closeout.
 
 ## Related artifacts
 
-- [notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md](notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md)
+- [notes/2026-05-12-h-phase-8c2-lifted-stateful-ugens.md](notes/2026-05-12-h-phase-8c2-lifted-stateful-ugens.md)
   — 8.C2 closeout; same elaboration-only contract.
-- [notes/2026-05-11-phase-8-authoring-dsl-design.md](notes/2026-05-11-phase-8-authoring-dsl-design.md)
+- [notes/2026-05-11-l-phase-8-authoring-dsl-design.md](notes/2026-05-11-l-phase-8-authoring-dsl-design.md)
   — overall Phase 8 design.
 - [src/MetaSonic/Bridge/Templates.hs](src/MetaSonic/Bridge/Templates.hs)
   — `BusFootprint` / `ResourceFootprint` / `Template`

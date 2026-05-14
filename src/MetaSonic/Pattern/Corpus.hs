@@ -5,7 +5,7 @@
 -- Each row is defensible as a musical idea independent of which
 -- §4 / §5 gates it incidentally exercises. See [Phase 6.A.2
 -- pattern corpus design]
--- (../../../notes/2026-05-10-phase-6a2-pattern-corpus-design.md)
+-- (../../../notes/2026-05-10-g-phase-6a2-pattern-corpus-design.md)
 -- for the contract and per-row hypotheses.
 
 module MetaSonic.Pattern.Corpus

@@ -591,7 +591,7 @@ crossCuttingTests = testGroup "End-to-end FFI"
     -- adds a fused-aware loader.
     testCase "loadRuntimeGraph rejects RFused inputs with the documented error" $ do
       -- 'Env' source: durable §4.C-only fixture (no §4.B kernel
-      -- candidate, per notes/2026-05-08-fusion-strategy.md). We need §4.C to
+      -- candidate, per notes/2026-05-08-e-fusion-strategy.md). We need §4.C to
       -- actually emit an 'RFused' input for the loader-rejection
       -- check to fire.
       let graph = runSynth $ do
@@ -2512,7 +2512,7 @@ assertFusedEquivalent name graph = do
 -- T-9: direct ≡ reduction equivalence (Phase §4.E.2.B3)
 ------------------------------------------------------------
 --
--- The headline gate from notes/2026-05-08-deterministic-bus-reduction-design.md.
+-- The headline gate from notes/2026-05-08-b-deterministic-bus-reduction-design.md.
 -- For every shape in t9CorpusGraphs / t9CorpusTemplates, render N
 -- blocks in direct mode and N blocks in reduction-capture mode
 -- (which folds slots back into output_buses on every sink-producing

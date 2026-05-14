@@ -592,7 +592,7 @@ should answer "what should it become next?"
 Candidate title:
 
 ```text
-notes/2026-05-11-project-direction-after-phase-6.md
+notes/2026-05-11-<letter>-project-direction-after-phase-6.md
 ```
 
 That note should decide whether Phase 7 is primarily:

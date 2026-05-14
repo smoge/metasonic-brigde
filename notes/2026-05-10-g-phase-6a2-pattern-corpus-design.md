@@ -7,7 +7,7 @@ of corpus rows before any module / test code lands.
 ## Position in the roadmap
 
 6.A.2 is the implementation step that follows the 6.A.1 bounds note
-([Phase 6.A pattern design](2026-05-10-phase-6a-pattern-design.md)).
+([Phase 6.A pattern design](2026-05-10-f-phase-6a-pattern-design.md)).
 This companion note settles two things 6.A.1 explicitly punted to
 6.A.2:
 

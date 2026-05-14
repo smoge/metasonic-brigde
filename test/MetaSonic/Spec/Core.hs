@@ -1356,7 +1356,7 @@ unitTests = testGroup "Unit tests"
           -- Uses an 'Env' source rather than any oscillator because
           -- §4.B's growing kernel set claims every contiguous
           -- @{Sin,Saw} → Gain → sink@ shape today, and (per
-          -- 'notes/2026-05-08-fusion-strategy.md') is the part of the design
+          -- 'notes/2026-05-08-e-fusion-strategy.md') is the part of the design
           -- expected to expand. Env is stateful and explicitly
           -- excluded from kernel candidacy in that note, so §4.B
           -- can't claim @Env → Gain → Out@ now or later, and §4.C

@@ -15,7 +15,7 @@
 -- is not the C++ realtime ABI queue, is not audio-thread visible, and
 -- does not enforce thread safety.
 --
--- See [notes/2026-05-12-session-prep-g-producer-queue.md].
+-- See [notes/2026-05-12-t-session-prep-g-producer-queue.md].
 
 module MetaSonic.Session.Queue
   ( -- * Producers

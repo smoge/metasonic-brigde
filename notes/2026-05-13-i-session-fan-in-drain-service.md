@@ -34,11 +34,11 @@ service hook blocks past a short grace period.
 ## Still Out Of Scope
 
 - At this slice, MIDI/UI producer translation. The later
-  [Session MIDI Producer Adapter](2026-05-13-session-midi-producer-adapter.md)
+  [Session MIDI Producer Adapter](2026-05-13-j-session-midi-producer-adapter.md)
   covers already-decoded MIDI note/CC/pitch-bend/all-notes-off command
   translation, and the
   later
-  [Session UI Producer Adapter](2026-05-13-session-ui-producer-adapter.md)
+  [Session UI Producer Adapter](2026-05-13-k-session-ui-producer-adapter.md)
   covers already-decoded UI intent translation. Live PortMIDI
   listener/device ownership, GUI toolkit bindings, and manifest-driven
   session reload remain out of scope.

@@ -15,7 +15,7 @@
 -- @--inspect-only@ and @--fusion-survey@. Adding a new field
 -- here does not affect compile output.
 --
--- See [notes/2026-05-12-phase-8g-metadata-reporting.md].
+-- See [notes/2026-05-12-l-phase-8g-metadata-reporting.md].
 
 module MetaSonic.Authoring.Report
   ( -- * Authoring report carrier

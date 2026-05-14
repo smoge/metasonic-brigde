@@ -10,7 +10,7 @@ typedef struct RTGraph RTGraph;
 // A prepared swap owns the RTGraphState that the audio thread will
 // install at the next block boundary, then owns the retired previous
 // state until the producer disposes the collected swap.
-// See notes/2026-05-10-phase-5-rcu-hot-swap-design.md.
+// See notes/2026-05-10-a-phase-5-rcu-hot-swap-design.md.
 typedef struct RTGraphSwap RTGraphSwap;
 
 // ----------------------------------------------------------------
@@ -1234,7 +1234,7 @@ int rt_graph_test_last_c1d_parallel_region_item_count(const RTGraph *g);
 // yet published swap; once publish has succeeded the runtime owns the
 // swap and only the audio thread can move it to the retire slot.
 //
-// See notes/2026-05-10-phase-5-rcu-hot-swap-design.md for the full
+// See notes/2026-05-10-a-phase-5-rcu-hot-swap-design.md for the full
 // protocol, world boundary, and migration deferral rationale.
 
 // [T:construction] Allocate a default next-world handle off-audio. The

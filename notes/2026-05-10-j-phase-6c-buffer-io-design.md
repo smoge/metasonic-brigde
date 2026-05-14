@@ -5,8 +5,8 @@ Status: design only; bounds 6.C before any contract or
 implementation lands. v2 — revised after review.
 
 This note plays the same role for 6.C that
-[Phase 6.A pattern design](2026-05-10-phase-6a-pattern-design.md)
-and [Phase 6.B OSC design](2026-05-10-phase-6b-osc-design.md)
+[Phase 6.A pattern design](2026-05-10-f-phase-6a-pattern-design.md)
+and [Phase 6.B OSC design](2026-05-10-i-phase-6b-osc-design.md)
 played for their sub-phases: it fences the work and pins the
 load-bearing decisions before any contract or code lands. The
 ROADMAP explicitly flags 6.C as a "design pass" — this is that

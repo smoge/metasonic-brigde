@@ -198,14 +198,14 @@ Use American English spelling in new comments and notes.
 1. ~~Finish hardening `RBusInLpfGainOut` around zero/invalid source-bus
    behavior and the related control-identity tests, if that is not already
    committed.~~ Done.
-2. ~~Update `notes/2026-05-08-fusion-strategy.md` to reflect the validated BusIn
+2. ~~Update `notes/2026-05-08-e-fusion-strategy.md` to reflect the validated BusIn
    filtered kernel and the parked Noise filtered kernel.~~ Done; updated
    again at the `RNoiseLpfGainOut` landing to record the unparking and
    the new parked entries (Tri/Pulse/Add filtered tails).
 3. ~~Keep `RNoiseLpfGainOut` parked until survey recurrence grows.~~
    Done: corpus expansion put the shape at `missed=4, sources=4` in the
    ranked missed-shape table, the kernel-add gate from
-   `notes/2026-05-08-fusion-strategy.md` triggered, and the kernel landed with
+   `notes/2026-05-08-e-fusion-strategy.md` triggered, and the kernel landed with
    benchmark median ~1.25x. Tri/Pulse/Add filtered tails stayed
    singleton-source and remain parked.
 4. Avoid a broad codegen pivot until another few kernels make the helper

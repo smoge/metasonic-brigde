@@ -17,7 +17,7 @@
 -- adapters, and does not define its own hot-swap recovery policy; it
 -- inherits owner/adapter behavior.
 --
--- See [notes/2026-05-13-session-prep-j-thread-safe-host.md].
+-- See [notes/2026-05-13-c-session-prep-j-thread-safe-host.md].
 
 module MetaSonic.Session.Host
   ( -- * Host

@@ -169,9 +169,9 @@ audit on the snapshot corpus — not more executor work.
 
 ## Related artifacts
 
-- [notes/2026-05-12-phase-7i-superinstruction-probe.md](notes/2026-05-12-phase-7i-superinstruction-probe.md)
+- [notes/2026-05-12-f-phase-7i-superinstruction-probe.md](notes/2026-05-12-f-phase-7i-superinstruction-probe.md)
   — 7.I decision artifact (super-mode probe).
-- [notes/2026-05-12-phase-7f-profitability-gate.md](notes/2026-05-12-phase-7f-profitability-gate.md)
+- [notes/2026-05-12-c-phase-7f-profitability-gate.md](notes/2026-05-12-c-phase-7f-profitability-gate.md)
   — 7.F gate rules, priority order, and verdict ADT.
 - [app/MetaSonic/App/ProfitabilityGate.hs](app/MetaSonic/App/ProfitabilityGate.hs)
   — unchanged in this slice; the rules surface stays exactly

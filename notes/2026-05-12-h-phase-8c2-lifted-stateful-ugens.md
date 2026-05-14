@@ -149,7 +149,7 @@ boundary.
 
 ## Related artifacts
 
-- [notes/2026-05-11-phase-8-authoring-dsl-design.md](notes/2026-05-11-phase-8-authoring-dsl-design.md)
+- [notes/2026-05-11-l-phase-8-authoring-dsl-design.md](notes/2026-05-11-l-phase-8-authoring-dsl-design.md)
   — overall Phase 8 contract: elaboration only, primitive
   graph stays inspectable, no second compiler.
 - [src/MetaSonic/Authoring.hs](src/MetaSonic/Authoring.hs)

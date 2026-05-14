@@ -12,7 +12,7 @@
 -- a background drain loop, and does not own the 'SessionOwner'
 -- bracket. It composes Prep F, Prep G, and Prep H.
 --
--- See [notes/2026-05-13-session-prep-i-scripted-runner.md].
+-- See [notes/2026-05-13-a-session-prep-i-scripted-runner.md].
 
 module MetaSonic.Session.Runner
   ( -- * Step result

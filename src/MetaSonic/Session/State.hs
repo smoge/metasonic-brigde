@@ -15,7 +15,7 @@
 -- The module owns no 'RTGraph', writes no realtime queue, performs no
 -- IO, and does not install graphs.
 --
--- See [notes/2026-05-12-session-prep-b-admission-commit.md].
+-- See [notes/2026-05-12-o-session-prep-b-admission-commit.md].
 
 module MetaSonic.Session.State
   ( -- * State

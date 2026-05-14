@@ -45,7 +45,7 @@ against OSC beyond the existing FIFO fan-in queue.
 - Opening, polling, or bracketing PortMIDI devices.
 - At this producer-adapter slice, a session-backed MIDI listener
   thread. The later
-  [Session MIDI Listener](2026-05-13-session-midi-listener.md) covers
+  [Session MIDI Listener](2026-05-13-l-session-midi-listener.md) covers
   the decoded-source worker; PortMIDI device ownership remains out of
   scope.
 - Aftertouch, MIDI clock, or channel remapping/splits.

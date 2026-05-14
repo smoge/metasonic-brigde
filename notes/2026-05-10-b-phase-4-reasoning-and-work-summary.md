@@ -126,7 +126,7 @@ leaves behind:
 - per-port consumption metadata for future block-rate decisions;
 - global schedule and band introspection, later carried as swappable
   `RTGraphState` scratch in
-  [Phase 5.1.B](2026-05-10-phase-5-rcu-hot-swap-design.md);
+  [Phase 5.1.B](2026-05-10-a-phase-5-rcu-hot-swap-design.md);
 - deterministic writer-slot reservation and reduction infrastructure;
 - worker dispatch counters that separate "ran in parallel" from "looked
   faster in a benchmark row."

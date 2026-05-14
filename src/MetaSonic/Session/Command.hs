@@ -25,7 +25,7 @@
 -- disparate input sources converge on one command set instead of
 -- growing parallel runtime mutation paths.
 --
--- See [notes/2026-05-12-session-prep-a-contract.md]
+-- See [notes/2026-05-12-n-session-prep-a-contract.md]
 
 module MetaSonic.Session.Command
   ( -- * Commands

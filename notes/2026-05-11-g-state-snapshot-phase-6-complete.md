@@ -128,7 +128,7 @@ What's *not* in 6.D: a second spectral kind, spectrum-stream
 types between kinds (SC's PV_* family), runtime-tunable N / hop,
 multichannel STFT, latency compensation (the parked decision is
 recorded at
-[notes/2026-05-11-phase-6d-latency-followup-decision.md](2026-05-11-phase-6d-latency-followup-decision.md))
+[notes/2026-05-11-e-phase-6d-latency-followup-decision.md](2026-05-11-e-phase-6d-latency-followup-decision.md))
 and block-rate region promotion.
 
 ### 6.E — Plugin Hosting (open)

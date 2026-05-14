@@ -13,7 +13,7 @@
 -- Phase 7.D step 2: pure types only, no compilation pass, no FFI,
 -- no planner integration.
 --
--- See @notes/2026-05-12-phase-7d-runtime-program-abi.md@ for the
+-- See @notes/2026-05-12-a-phase-7d-runtime-program-abi.md@ for the
 -- decision contract — in particular:
 --
 --   * Generated execution is a /fourth/ runtime path, distinct

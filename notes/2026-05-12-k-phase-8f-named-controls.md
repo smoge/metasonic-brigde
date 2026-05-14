@@ -236,10 +236,10 @@ Case 1 is the target.
 
 ## Related artifacts
 
-- [notes/2026-05-12-phase-8e-ensemble-builder.md](notes/2026-05-12-phase-8e-ensemble-builder.md)
+- [notes/2026-05-12-j-phase-8e-ensemble-builder.md](notes/2026-05-12-j-phase-8e-ensemble-builder.md)
   — 8.E closeout; the ensemble builder named controls
   attach metadata to in 8.G.
-- [notes/2026-05-11-phase-8-authoring-dsl-design.md](notes/2026-05-11-phase-8-authoring-dsl-design.md)
+- [notes/2026-05-11-l-phase-8-authoring-dsl-design.md](notes/2026-05-11-l-phase-8-authoring-dsl-design.md)
   — overall Phase 8 design.
 - [src/MetaSonic/Bridge/Source.hs](src/MetaSonic/Bridge/Source.hs)
   — `cc`, `tagged`, `MigrationKey`, `CCSpec`, and the new

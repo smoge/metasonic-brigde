@@ -946,9 +946,9 @@ Phase C has now landed as a test-gated substrate:
 
 The bench slice (`2c737ce`) added a schedule-worker section to
 `tools/rt_graph_bench.cpp`. The interpretation is recorded in
-`notes/2026-05-09-phase-4e-worker-bench-interpretation.md`; the
+`notes/2026-05-09-a-phase-4e-worker-bench-interpretation.md`; the
 turn-on decision is recorded in
-`notes/2026-05-09-phase-4e-worker-turn-on-decision.md`.
+`notes/2026-05-09-b-phase-4e-worker-turn-on-decision.md`.
 
 Decision summary: do not turn worker dispatch on by default, do not
 expose a public runtime switch yet, and do not start Phase-D
@@ -994,7 +994,7 @@ schedule entries rather than individual regions inside one FreeLayer
 step.
 
 The C1d region-layer dispatch contract is now recorded in
-`notes/2026-05-09-phase-4e-c1d-region-layer-dispatch-design.md`.
+`notes/2026-05-09-d-phase-4e-c1d-region-layer-dispatch-design.md`.
 It keeps the first implementation sink-free, requires a serial
 region-item equivalence slice before parallel dispatch, and treats
 sink-bearing same-instance region dispatch as a later problem because

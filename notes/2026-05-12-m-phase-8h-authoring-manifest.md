@@ -224,7 +224,7 @@ Case 1 is the target.
 
 ## Related artifacts
 
-- [notes/2026-05-12-phase-8g-metadata-reporting.md](notes/2026-05-12-phase-8g-metadata-reporting.md)
+- [notes/2026-05-12-l-phase-8g-metadata-reporting.md](notes/2026-05-12-l-phase-8g-metadata-reporting.md)
   — 8.G closeout; the source of the `AuthoringReport`
   that 8.H translates.
 - [src/MetaSonic/Authoring/Report.hs](src/MetaSonic/Authoring/Report.hs)

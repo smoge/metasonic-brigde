@@ -25,7 +25,7 @@
 --     manifest for an in-repo demo must be byte-stable
 --     across machines.
 --
--- See [notes/2026-05-12-phase-8h-authoring-manifest.md].
+-- See [notes/2026-05-12-m-phase-8h-authoring-manifest.md].
 
 module MetaSonic.Authoring.Manifest
   ( -- * Schema version

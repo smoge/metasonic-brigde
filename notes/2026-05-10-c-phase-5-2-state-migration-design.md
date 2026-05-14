@@ -3,7 +3,7 @@
 Date: 2026-05-10
 Status: 5.2.A/B/C implemented.
 Scope: Phase 5.2.A–C (controls, DSP state, live-instance survival).
-Companion: [2026-05-10-phase-5-rcu-hot-swap-design.md](2026-05-10-phase-5-rcu-hot-swap-design.md) §7.
+Companion: [2026-05-10-a-phase-5-rcu-hot-swap-design.md](2026-05-10-a-phase-5-rcu-hot-swap-design.md) §7.
 
 Phase 5.1.A/B landed the swap protocol substrate and a real world
 payload, but every install starts the new world with default node

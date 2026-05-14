@@ -17,7 +17,7 @@
 -- realtime clock. Callers can use the pure queue helper or explicitly
 -- choose the service-owned arbitration path.
 --
--- See [notes/2026-05-12-session-prep-h-pattern-producer.md].
+-- See [notes/2026-05-12-u-session-prep-h-pattern-producer.md].
 
 module MetaSonic.Session.PatternProducer
   ( -- * Options

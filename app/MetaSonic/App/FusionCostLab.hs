@@ -52,7 +52,7 @@
 -- them before later slices turn rows into /Fuse/ // /DoNotFuse/ //
 -- /NeedsBenchmark/ decisions.
 --
--- See [notes/2026-05-11-phase-7a-fusion-cost-lab-design.md].
+-- See [notes/2026-05-11-k-phase-7a-fusion-cost-lab-design.md].
 
 module MetaSonic.App.FusionCostLab
   ( -- * CLI entry point

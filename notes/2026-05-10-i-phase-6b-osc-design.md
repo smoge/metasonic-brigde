@@ -4,7 +4,7 @@ Date: 2026-05-10
 Status: design only; bounds 6.B before any code lands.
 
 This note plays the same role for 6.B that
-[Phase 6.A pattern design](2026-05-10-phase-6a-pattern-design.md)
+[Phase 6.A pattern design](2026-05-10-f-phase-6a-pattern-design.md)
 plays for 6.A: it fences the work before the contract or the
 implementation lands.
 

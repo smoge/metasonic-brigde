@@ -9,8 +9,8 @@ producer-facing wrapper names are singular (`retireBuffer`,
 two-constructor pair `BiNotRetired` / `BiCollectStillLive`.
 
 This note follows
-[Phase 6.C.1 buffer I/O bounds](2026-05-10-phase-6c-buffer-io-design.md)
-and [Phase 6.C.2 buffer I/O contract](2026-05-10-phase-6c2-buffer-io-contract.md),
+[Phase 6.C.1 buffer I/O bounds](2026-05-10-j-phase-6c-buffer-io-design.md)
+and [Phase 6.C.2 buffer I/O contract](2026-05-10-k-phase-6c2-buffer-io-contract.md),
 both of which are now functionally complete on the read path
 (6.C.3a shipped in commits c93dfa0 / 427c697 / 5592e69).
 6.C.3b is the resource-lifetime hardening step that
@@ -26,7 +26,7 @@ In scope:
   and onto the stable `RTGraph` handle, alongside `audio`,
   `control_queue`, `worker_pool`, `sample_rate`, `max_frames`,
   and `capacity` (see the §5.1.A/B world-boundary table in
-  [the Phase 5 RCU note](2026-05-10-phase-5-rcu-hot-swap-design.md)).
+  [the Phase 5 RCU note](2026-05-10-a-phase-5-rcu-hot-swap-design.md)).
 - **Live-safe retire / collect.** A new
   `rt_graph_buffer_retire` + `rt_graph_buffer_collect_retired`
   pair that lets the producer remove a buffer while audio is

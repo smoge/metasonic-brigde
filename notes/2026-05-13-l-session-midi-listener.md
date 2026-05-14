@@ -9,7 +9,7 @@ producer-local MIDI note state and control-coalescing state inside the
 listener, and enqueues translated commands into a `SessionFanInHost`.
 The source boundary is deliberately separated from hardware ownership.
 The later
-[Session MIDI PortMIDI Source](2026-05-13-session-midi-portmidi-source.md)
+[Session MIDI PortMIDI Source](2026-05-13-m-session-midi-portmidi-source.md)
 binds Q / PortMIDI input behind the same session-facing loop.
 
 ## Landed Scope
@@ -52,7 +52,7 @@ binds Q / PortMIDI input behind the same session-facing loop.
 
 - Opening, polling, or bracketing PortMIDI devices at this listener
   slice. The later
-  [Session MIDI PortMIDI Source](2026-05-13-session-midi-portmidi-source.md)
+  [Session MIDI PortMIDI Source](2026-05-13-m-session-midi-portmidi-source.md)
   covers the small Q / PortMIDI source wrapper.
 - Aftertouch, MIDI clock, or channel remapping/splits.
 - Release-phase CC fanout or coalescing outside the MIDI listener.

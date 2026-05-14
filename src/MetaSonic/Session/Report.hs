@@ -7,7 +7,7 @@
 -- diagnostics counters and static metadata; it does not allocate
 -- buffers, load plugins, install graphs, or mutate runtime state.
 --
--- See [notes/2026-05-12-session-prep-a-contract.md].
+-- See [notes/2026-05-12-n-session-prep-a-contract.md].
 
 module MetaSonic.Session.Report
   ( BufferLifecycleReport (..)

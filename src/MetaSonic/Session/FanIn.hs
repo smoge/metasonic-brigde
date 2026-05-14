@@ -16,7 +16,7 @@
 -- submit 'SessionCommand' values here once they have chosen their own
 -- protocol-specific translation policy.
 --
--- See [notes/2026-05-13-session-prep-p-producer-fan-in-host.md].
+-- See [notes/2026-05-13-h-session-prep-p-producer-fan-in-host.md].
 
 module MetaSonic.Session.FanIn
   ( -- * Host

@@ -44,8 +44,8 @@ rather than command coalescing.
 
 The detailed MIDI adapter contract lives in:
 
-- [Session MIDI Producer Adapter](2026-05-13-session-midi-producer-adapter.md)
-- [Session MIDI Listener](2026-05-13-session-midi-listener.md)
+- [Session MIDI Producer Adapter](2026-05-13-j-session-midi-producer-adapter.md)
+- [Session MIDI Listener](2026-05-13-l-session-midi-listener.md)
 
 ## Control Coalescing
 
@@ -76,7 +76,7 @@ buildup.
 
 The detailed coalescing contract lives in:
 
-- [Session Control Coalescing And Arbitration](2026-05-13-session-control-coalescing-arbitration.md)
+- [Session Control Coalescing And Arbitration](2026-05-13-o-session-control-coalescing-arbitration.md)
 
 ## Producer Arbitration
 

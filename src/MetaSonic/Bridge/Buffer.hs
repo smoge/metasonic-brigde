@@ -35,9 +35,9 @@
 -- * Errors surface as 'BufferIssue' via 'Control.Exception.throwIO'.
 --
 -- See 'MetaSonic.Bridge.Source.playBufMono' for the consumer-side
--- UGen and 'notes/2026-05-10-phase-6c2-buffer-io-contract.md' for
+-- UGen and 'notes/2026-05-10-k-phase-6c2-buffer-io-contract.md' for
 -- the read-path contract; lifetime work is in
--- 'notes/2026-05-11-phase-6c3b-lifetime-design.md'.
+-- 'notes/2026-05-11-a-phase-6c3b-lifetime-design.md'.
 
 module MetaSonic.Bridge.Buffer
   ( -- * Allocation / load / clear (stopped-audio fast path)

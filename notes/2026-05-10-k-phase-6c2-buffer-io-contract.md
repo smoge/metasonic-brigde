@@ -5,7 +5,7 @@ Status: contract only; pins the v1 shape that 6.C.3a
 implements. No code lands here.
 
 This note follows
-[Phase 6.C.1 buffer I/O bounds](2026-05-10-phase-6c-buffer-io-design.md).
+[Phase 6.C.1 buffer I/O bounds](2026-05-10-j-phase-6c-buffer-io-design.md).
 6.C.1 settled what 6.C is and is not; this note pins the
 exact Haskell types, C ABI signatures, kindSpec / ugenView /
 inferEff rows, control vector, and error vocabulary that

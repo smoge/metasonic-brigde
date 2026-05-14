@@ -15,7 +15,7 @@
 -- pass that produces them, and the selected-candidate view consumed
 -- by survey/snapshot tooling.
 --
--- See @notes/2026-05-11-phase-7c-planner-decision.md@ for the
+-- See @notes/2026-05-11-q-phase-7c-planner-decision.md@ for the
 -- legality rule list, the "no chain-caps union" constraint, and the
 -- relationship to the existing §4.B kernel set.
 
@@ -280,7 +280,7 @@ matchedShape region nodes
 -- (relaxed rules for stateful kinds and resource access), positions
 -- @[1..len-2]@ are true interior (strict rules), position @len-1@ is
 -- the terminal sink. See
--- @notes/2026-05-11-phase-7c-planner-decision.md@.
+-- @notes/2026-05-11-q-phase-7c-planner-decision.md@.
 firstViolation :: [RuntimeNode] -> Maybe RejectionReason
 firstViolation nodes =
   let len = length nodes

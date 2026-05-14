@@ -98,7 +98,7 @@ Parked / deferred:
       instrumentation are all in place; the bench can now distinguish
       C1c band-level wins from C1d-c region-item wins from schedule
       noise. Decision recorded in
-      `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` remains
+      `notes/2026-05-09-b-phase-4e-worker-turn-on-decision.md` remains
       default-off: the synthetic envelope wins at scale, the
       Haskell-loaded corpus barely crosses 1.0x on the best C1d-c row,
       and no representative workload demands runtime parallelism
@@ -674,7 +674,7 @@ Current status:
    the measured grid. Targeted free-only probes are positive and keep
    C1d investigation alive, but no row supports default-on worker
    scheduling. Current numbers and the standing decision live in
-   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md`.
+   `notes/2026-05-09-b-phase-4e-worker-turn-on-decision.md`.
 
 9. [x] **C1d-a region work-item metadata.** The runtime now expands
    each `GlobalScheduleEntry` into `RegionLayerWorkItem`s, one per
@@ -686,7 +686,7 @@ Current status:
    writer-slot subranges, lowered-polyphony capacity, mixed sink-free
    / sink-bearing `has_sink_writer` OR logic, and reset behavior.
    Review note:
-   `notes/2026-05-09-c1d-a-region-work-item-metadata-review.md`.
+   `notes/2026-05-09-e-c1d-a-region-work-item-metadata-review.md`.
 
 10. [x] **C1d-b serial region-item executor.** Test-gated. When
    `rt_graph_test_set_global_schedule_execution` is enabled and a Free
@@ -720,7 +720,7 @@ Current status:
    `RegionItems` reaches 2.20x at width 32 / block 512 / pool 4;
    Haskell-loaded best C1d-c is 1.14x on a single targeted probe with
    another row losing. Decision in
-   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` remains
+   `notes/2026-05-09-b-phase-4e-worker-turn-on-decision.md` remains
    default-off.
 
 **Phase 4.E is now frozen as test/bench-gated.** No further §4.E
@@ -743,7 +743,7 @@ When a workload candidate does appear, the next §4.E slice is:
    synthetic envelope (`RegionItems` at comparable width / block).
 
 3. **Replace the decision record.** Open a successor to
-   `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` that names
+   `notes/2026-05-09-b-phase-4e-worker-turn-on-decision.md` that names
    the corpus, threshold, and proposed switch policy. Do not extend
    that note in place — the freeze is recorded against its current
    text.
@@ -871,7 +871,7 @@ surface.
 - Observed envelope (medians, single-template ~5 µs prepare+publish,
   two-template ~8.5 µs, collect 0.3–0.5 µs, install reliably one block
   on the offline driver) is recorded in [rcu hot-swap
-  note](notes/2026-05-10-phase-5-rcu-hot-swap-design.md) §4.2.
+  note](notes/2026-05-10-a-phase-5-rcu-hot-swap-design.md) §4.2.
 
 **Decision: 5.3.D (`rt_graph_wait_swap_installed`) deferred.** The
 bench shows producer cost is microseconds and install is one process
@@ -899,7 +899,7 @@ migration plan:
   templates can violate that while looking structurally valid. The
   design recommends turning this into a prepare-time precondition.
 
-Note: [producer identity note](notes/2026-05-10-phase-5-4-producer-identity-after-install-design.md)
+Note: [producer identity note](notes/2026-05-10-d-phase-5-4-producer-identity-after-install-design.md)
 
 ### [x] 5.4.B Template identity precondition
 
@@ -982,7 +982,7 @@ Settles four bounds before any code lands:
   §5 freeze anticipated; treat that as a positive signal, not a
   regression.
 
-Note: [Phase 6.A pattern design](notes/2026-05-10-phase-6a-pattern-design.md).
+Note: [Phase 6.A pattern design](notes/2026-05-10-f-phase-6a-pattern-design.md).
 
 #### [x] 6.A.2 Minimal pattern corpus
 
@@ -1009,7 +1009,7 @@ Three layers of verification:
   reports per-row kernel coverage, corpus-wide kernel totals,
   claimed / missed sink shapes, and §4.D edge-rate opportunity
   contribution. The baseline run is recorded in
-  [notes/2026-05-10-phase-6a3-corpus-survey-baseline.md](notes/2026-05-10-phase-6a3-corpus-survey-baseline.md);
+  [notes/2026-05-10-h-phase-6a3-corpus-survey-baseline.md](notes/2026-05-10-h-phase-6a3-corpus-survey-baseline.md);
   future runs compare against it. A follow-up `spectral-freeze-pad`
   row connects the pattern corpus to §6.D's first spectral kind
   without changing the pattern-driver contract.
@@ -1046,7 +1046,7 @@ names the §5.4.C connection, and previews the
 `MetaSonic.OSC.{Wire,Dispatch}` module shape that 6.B.2 will
 implement.
 
-Note: [Phase 6.B OSC design](notes/2026-05-10-phase-6b-osc-design.md).
+Note: [Phase 6.B OSC design](notes/2026-05-10-i-phase-6b-osc-design.md).
 
 #### [x] 6.B.2a Wire and dispatch (pure)
 
@@ -1124,7 +1124,7 @@ buffers is a 6.C.4 concern, gated on a real `BufWrite` UGen.
 6.C.3 is split into 6.C.3a (read path) and 6.C.3b (live-safe
 retire/free).
 
-Note: [Phase 6.C buffer I/O design](notes/2026-05-10-phase-6c-buffer-io-design.md).
+Note: [Phase 6.C buffer I/O design](notes/2026-05-10-j-phase-6c-buffer-io-design.md).
 
 #### [x] 6.C.2 Contract
 
@@ -1144,7 +1144,7 @@ live-safe retire/collect lands in 6.C.3b) plus
 `_invalid_read_count` test surfaces. `MAX_BUFFERS = 64`. No
 pattern / OSC coupling in v1.
 
-Note: [Phase 6.C.2 buffer I/O contract](notes/2026-05-10-phase-6c2-buffer-io-contract.md).
+Note: [Phase 6.C.2 buffer I/O contract](notes/2026-05-10-k-phase-6c2-buffer-io-contract.md).
 
 #### [x] 6.C.3a Resident mono buffer read
 
@@ -1229,7 +1229,7 @@ needs is not a writer kind directly — it's the resource-ordering
 layer that a writer kind would require, lifted up to a
 generalized `ResourceFootprint`. That work opens as 6.C.4.
 
-Note: [Phase 6.C.3b lifetime design](notes/2026-05-11-phase-6c3b-lifetime-design.md).
+Note: [Phase 6.C.3b lifetime design](notes/2026-05-11-a-phase-6c3b-lifetime-design.md).
 
 #### [x] 6.C.4 Buffer resource ordering
 
@@ -1291,8 +1291,8 @@ ordering machinery picks it up automatically.
 558 tests total (9 new since 6.C.3b).
 
 Notes:
-- [Phase 6.C.4 resource-ordering design](notes/2026-05-11-phase-6c4-resource-ordering-design.md)
-- [Minimal RecordBufMono contract](notes/2026-05-11-record-buf-mono-design.md) — design for the first audio-thread writer (shipped in the 6.C.4 follow-up below).
+- [Phase 6.C.4 resource-ordering design](notes/2026-05-11-b-phase-6c4-resource-ordering-design.md)
+- [Minimal RecordBufMono contract](notes/2026-05-11-c-record-buf-mono-design.md) — design for the first audio-thread writer (shipped in the 6.C.4 follow-up below).
 
 #### [x] 6.C.4 follow-up — minimal `RecordBufMono`
 
@@ -1430,7 +1430,7 @@ project sees. Bidirectional coupling: §4.D's executor waits on signal,
 and 6.D produces signal.
 
 Landed initial kind:
-- [Phase 6.D minimal-spectral-kind design](notes/2026-05-11-phase-6d-spectral-design.md)
+- [Phase 6.D minimal-spectral-kind design](notes/2026-05-11-d-phase-6d-spectral-design.md)
   — bounds the first kind (`KSpectralFreeze`, tag 22, N=1024 / hop=256,
   Hann window, freeze gate), pins per-instance window ownership,
   declares N-sample latency through a new `kindLatency` accessor,
@@ -1449,7 +1449,7 @@ Open follow-up queue:
    latency compensation or a second spectral kind. Decision:
    compensation stays parked because the real corpus reports declared
    latency but no uncompensated skew; see
-   [Phase 6.D latency follow-up decision](notes/2026-05-11-phase-6d-latency-followup-decision.md).
+   [Phase 6.D latency follow-up decision](notes/2026-05-11-e-phase-6d-latency-followup-decision.md).
 5. [x] Surface the declared-latency footprint in `--fusion-survey`
    output (parity with `--corpus-survey`'s per-row view), plus a
    `shape/spectral-freeze-tail` shape probe so the corpus-wide
@@ -1474,7 +1474,7 @@ Coupling to 6.C is real (sample-buffer access) and may force 6.C and
 6.E to be co-designed even if 6.E lands later.
 
 Design / implementation note:
-- [Phase 6.E plugin-hosting design](notes/2026-05-11-phase-6e-plugin-hosting-design.md)
+- [Phase 6.E plugin-hosting design](notes/2026-05-11-h-phase-6e-plugin-hosting-design.md)
   — bounds the first kind (`KStaticPlugin`, tag 23) as a fixed
   `Identity`-profile static shim: two audio inputs, one audio output,
   one frozen `plugin_id` metadata control, zero plugin parameters,
@@ -1505,7 +1505,7 @@ template precedence — without breaking the kind-level
 table-shaped sites that adding-a-new-kind currently touches.
 
 Decision note:
-- [Phase 6.E.3 plugin metadata decision](notes/2026-05-11-phase-6e3-plugin-metadata-decision.md)
+- [Phase 6.E.3 plugin metadata decision](notes/2026-05-11-n-phase-6e3-plugin-metadata-decision.md)
   — chooses a Haskell-side per-plugin metadata table while keeping
   `KStaticPlugin` as the only plugin `NodeKind` for now.
 
@@ -1556,7 +1556,7 @@ new C ABI surface. Those reopen only after the metadata shape has been
 exercised by a second static plugin.
 
 State snapshot at the 6.A–6.D boundary:
-- [Phase 6.A–6.D state snapshot](notes/2026-05-11-state-snapshot-phase-6-complete.md).
+- [Phase 6.A–6.D state snapshot](notes/2026-05-11-g-state-snapshot-phase-6-complete.md).
 
 ---
 
@@ -1576,11 +1576,11 @@ equivalence where possible, and produce a cost model that the future
 fusion planner can consume.
 
 Design notes:
-- [Phase 7 generated-fusion plan](notes/2026-05-11-phase-7-generated-fusion-plan.md)
+- [Phase 7 generated-fusion plan](notes/2026-05-11-j-phase-7-generated-fusion-plan.md)
   — describes the missing pieces: first-class fusion IR, legality
   model, profitability model, runtime program ABI, survey diagnostics,
   and staged generated-executor rollout.
-- [Phase 7.A fusion cost lab design](notes/2026-05-11-phase-7a-fusion-cost-lab-design.md)
+- [Phase 7.A fusion cost lab design](notes/2026-05-11-k-phase-7a-fusion-cost-lab-design.md)
   — scopes the first tool: parametric graph generation, paired
   benchmarks, equivalence gates, feature extraction, JSONL/CSV output,
   and explainable cost-model summaries.
@@ -1663,7 +1663,7 @@ No runtime, C ABI, or compiler-behavior change. The output is the
 legality vocabulary the planner and cost lab share.
 
 Decision note:
-- [Phase 7.B capability metadata decision](notes/2026-05-11-phase-7b-capability-metadata-decision.md).
+- [Phase 7.B capability metadata decision](notes/2026-05-11-p-phase-7b-capability-metadata-decision.md).
 
 ### Phase 7.C — Fusion Verdict IR and Survey-Only Planner (partial)
 
@@ -1721,8 +1721,8 @@ planner-to-executor emission and profitability decisions still belong
 to the later gate.
 
 Decision notes:
-- [Phase 7.C planner decision](notes/2026-05-11-phase-7c-planner-decision.md).
-- [Phase 7.C cost-model join decision](notes/2026-05-11-phase-7c-cost-model-join-decision.md).
+- [Phase 7.C planner decision](notes/2026-05-11-q-phase-7c-planner-decision.md).
+- [Phase 7.C cost-model join decision](notes/2026-05-11-r-phase-7c-cost-model-join-decision.md).
 
 7.C gate hardened: the cost-lab side now filters non-exact rows from
 the shape index, the join applies a `measuredWinThreshold` (1.05×) so
@@ -1927,7 +1927,7 @@ the verdicts, no FFI changes, no §4.B kernel is replaced by a
 generated program, no CLI override knob. The point is to
 formalize the safety rule so the existence of `ExecGenerated` is
 not mistaken for readiness. Decision artifact:
-[notes/2026-05-12-phase-7f-profitability-gate.md](notes/2026-05-12-phase-7f-profitability-gate.md).
+[notes/2026-05-12-c-phase-7f-profitability-gate.md](notes/2026-05-12-c-phase-7f-profitability-gate.md).
 
 Open follow-ups (in roughly the order they unlock value):
 
@@ -2037,7 +2037,7 @@ unpinned for bench-noise reasons. Three new bit-exact tests in
 `[Add,Gain,Out]`, `[Add,Add,Gain,Out]`.
 
 Decision artifact:
-[notes/2026-05-12-phase-7g-generated-tail-sweep.md](notes/2026-05-12-phase-7g-generated-tail-sweep.md).
+[notes/2026-05-12-d-phase-7g-generated-tail-sweep.md](notes/2026-05-12-d-phase-7g-generated-tail-sweep.md).
 
 Open follow-ups (in roughly the order the evidence suggests):
 
@@ -2150,7 +2150,7 @@ bit-exact tests in [test/Spec.hs](test/Spec.hs) cover
 shape under the block-major path.
 
 Decision artifact:
-[notes/2026-05-12-phase-7h-block-major-executor.md](notes/2026-05-12-phase-7h-block-major-executor.md).
+[notes/2026-05-12-e-phase-7h-block-major-executor.md](notes/2026-05-12-e-phase-7h-block-major-executor.md).
 
 Open follow-ups (in roughly the order the evidence suggests):
 
@@ -2350,7 +2350,7 @@ under the super-mode path. The recognized tests also call
 classifier returns the right tag.
 
 Decision artifact:
-[notes/2026-05-12-phase-7i-superinstruction-probe.md](notes/2026-05-12-phase-7i-superinstruction-probe.md).
+[notes/2026-05-12-f-phase-7i-superinstruction-probe.md](notes/2026-05-12-f-phase-7i-superinstruction-probe.md).
 
 Open follow-ups (in roughly the order the evidence suggests):
 
@@ -2457,7 +2457,7 @@ why:
   thinner than the wider survey's.
 
 Decision artifact:
-[notes/2026-05-12-phase-7j-gate-closeout.md](notes/2026-05-12-phase-7j-gate-closeout.md)
+[notes/2026-05-12-g-phase-7j-gate-closeout.md](notes/2026-05-12-g-phase-7j-gate-closeout.md)
 records the slice's scope, the case-3 outcome on the
 ladder, and the followup-not-to-do list.
 
@@ -2507,12 +2507,12 @@ shorter, safer, and easier to inspect while keeping the generated graph
 fully transparent to the existing tools.
 
 Design note:
-- [Phase 8 authoring DSL design](notes/2026-05-11-phase-8-authoring-dsl-design.md)
+- [Phase 8 authoring DSL design](notes/2026-05-11-l-phase-8-authoring-dsl-design.md)
   — records the elaboration-only contract, first signal collection
   types, multichannel expansion rules, routing/ensemble/control
   follow-ups, lowering transparency requirements, and first
   implementation series.
-- [Session layer scoping gate](notes/2026-05-11-session-layer-scoping.md)
+- [Session layer scoping gate](notes/2026-05-11-o-session-layer-scoping.md)
   — records the structural pushback: session/authoring is a next
   product direction, but session runtime implementation waits for a
   Phase 7 planner/cost-model v1 and gets its own ownership scoping.
@@ -2586,7 +2586,7 @@ behavior). A new `stereo-fx` demo exercises the chain end-to-end:
 `stereoSrc → hpfS → envS → delayS → gainS → stereoOut`.
 
 Decision artifact:
-[notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md](notes/2026-05-12-phase-8c2-lifted-stateful-ugens.md).
+[notes/2026-05-12-h-phase-8c2-lifted-stateful-ugens.md](notes/2026-05-12-h-phase-8c2-lifted-stateful-ugens.md).
 
 What 8.C still does not cover (deliberately): exotic primitives
 (spectral, plugin, buffer I/O) and the bus-allocation helpers
@@ -2629,7 +2629,7 @@ Deliberately out of scope for 8.D:
   balance and notes the gap in the decision artifact.
 
 Decision artifact:
-[notes/2026-05-12-phase-8d-routing-helpers.md](notes/2026-05-12-phase-8d-routing-helpers.md).
+[notes/2026-05-12-i-phase-8d-routing-helpers.md](notes/2026-05-12-i-phase-8d-routing-helpers.md).
 
 The bus-visibility contract holds: every 8.D helper lowers
 through `BusOut` / `BusIn` / `Out`, so `BusFootprint`,
@@ -2678,7 +2678,7 @@ hand-picked `7` to the deterministic `16` (default
 `eoBusBase`).
 
 Decision artifact:
-[notes/2026-05-12-phase-8e-ensemble-builder.md](notes/2026-05-12-phase-8e-ensemble-builder.md).
+[notes/2026-05-12-j-phase-8e-ensemble-builder.md](notes/2026-05-12-j-phase-8e-ensemble-builder.md).
 
 Deliberately out of scope for 8.E:
 
@@ -2720,13 +2720,13 @@ What this slice doesn't try to settle:
   targeting the same control. The dispatcher and live-MIDI
   runner both write to the same slot today; arbitration
   is the session layer's problem. The later
-  [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
+  [Session Control Coalescing And Arbitration](notes/2026-05-13-o-session-control-coalescing-arbitration.md)
   note records the producer-local coalescing boundary, and
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md)
   records the cross-producer policy boundary.
 
 See
-[notes/2026-05-12-phase-8f-named-controls.md](notes/2026-05-12-phase-8f-named-controls.md)
+[notes/2026-05-12-k-phase-8f-named-controls.md](notes/2026-05-12-k-phase-8f-named-controls.md)
 for the contract.
 
 With 8.F landed, surfacing authoring metadata in the
@@ -2771,7 +2771,7 @@ What this slice does **not** try to settle:
   app-side snapshot runner.
 
 See
-[notes/2026-05-12-phase-8g-metadata-reporting.md](notes/2026-05-12-phase-8g-metadata-reporting.md)
+[notes/2026-05-12-l-phase-8g-metadata-reporting.md](notes/2026-05-12-l-phase-8g-metadata-reporting.md)
 for the full contract.
 
 With 8.G landed, the cleanest next gaps are (a) metadata
@@ -2830,7 +2830,7 @@ snapshot tool); the unit tests cover the
 same structural facts inline.
 
 See
-[notes/2026-05-12-phase-8h-authoring-manifest.md](notes/2026-05-12-phase-8h-authoring-manifest.md)
+[notes/2026-05-12-m-phase-8h-authoring-manifest.md](notes/2026-05-12-m-phase-8h-authoring-manifest.md)
 for the full contract.
 
 With 8.H landed, the manifest is a stable input shape for
@@ -2941,29 +2941,29 @@ beyond the scoped service, unsupported respawn/reset policy, and recovery
 mechanisms around that owner.
 
 Session prep artifacts:
-- [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-session-prep-a-contract.md)
+- [Session Prep A - Command, Resolve, And Lifecycle Contracts](notes/2026-05-12-n-session-prep-a-contract.md)
   records the Haskell-only command/event vocabulary, pure OSC
   resolve-state rebuild helper, and read-only buffer/plugin lifecycle
   reports. This is not the runtime session layer.
-- [Session Prep B - Admission And Commit Contract](notes/2026-05-12-session-prep-b-admission-commit.md)
+- [Session Prep B - Admission And Commit Contract](notes/2026-05-12-o-session-prep-b-admission-commit.md)
   records the Haskell-only admission/commit split: admission validates
   commands and returns plans without mutation; commits update pure
   session-visible state only after the caller reports a successful
   runtime action. This is still not the runtime session layer.
-- [Session Prep C - Plan/Commit Handshake](notes/2026-05-12-session-prep-c-plan-commit-handshake.md)
+- [Session Prep C - Plan/Commit Handshake](notes/2026-05-12-p-session-prep-c-plan-commit-handshake.md)
   records the checked relationship between an admitted `SessionPlan`
   and the later `SessionCommit` returned by a runtime shell. Failed
   handshakes leave `SessionState` unchanged, and hot-swap commits
   return the authoritative commit-time resolve rebuild result. This is
   still not the runtime session layer.
-- [Session Prep D - Runtime Adapter Shell](notes/2026-05-12-session-prep-d-runtime-adapter-shell.md)
+- [Session Prep D - Runtime Adapter Shell](notes/2026-05-12-q-session-prep-d-runtime-adapter-shell.md)
   records the narrow injected `SessionRuntimeAdapter` vocabulary and a
   single-step orchestrator that composes admission, the adapter, and
   the plan/commit handshake. The orchestrator's failure classes —
   admission rejection, runtime failure, commit mismatch, and adapter
   protocol bug — stay structurally distinct. This is still not the
   runtime session layer.
-- [Session Prep E - RTGraph Runtime Adapter](notes/2026-05-12-session-prep-e-rtgraph-adapter.md)
+- [Session Prep E - RTGraph Runtime Adapter](notes/2026-05-12-r-session-prep-e-rtgraph-adapter.md)
   records the first real adapter over a caller-owned `RTGraph`.
   It reuses `loadTemplateGraphWithAutoSpawns` and the existing
   `rt_graph_realtime_*` ABI, supports voice start/stop and symbolic
@@ -2971,14 +2971,14 @@ Session prep artifacts:
   installs: empty-session or drop-all swaps could install, while swaps
   that would preserve live voices were rejected until Prep N/O. This is
   still not the runtime session layer.
-- [Session Prep F - Single-Threaded Runtime Owner](notes/2026-05-12-session-prep-f-runtime-owner.md)
+- [Session Prep F - Single-Threaded Runtime Owner](notes/2026-05-12-s-session-prep-f-runtime-owner.md)
   records the first scoped Haskell owner for a real `RTGraph` adapter.
   It exposes `withSessionOwner`, `stepSessionOwner`, owner state/status
   readers, and a terminal-divergence policy. The owner is explicitly
   single-threaded and does not enforce serialization at runtime. This
   is still not a queue, producer fan-in layer, or preserving hot-swap
   implementation.
-- [Session Prep G - Producer Queue And Arbitration Contract](notes/2026-05-12-session-prep-g-producer-queue.md)
+- [Session Prep G - Producer Queue And Arbitration Contract](notes/2026-05-12-t-session-prep-g-producer-queue.md)
   records the first bounded producer-intent queue above
   `stepSessionOwner`. It attaches producer identity and per-queue
   sequence numbers, rejects full queues explicitly, preserves FIFO
@@ -2986,7 +2986,7 @@ Session prep artifacts:
   blocked. This is still not a thread-safe producer fan-in layer,
   concrete OSC/MIDI/Pattern adapter, background worker, realtime ABI
   queue, or preserving hot-swap implementation.
-- [Session Prep H - Pattern Producer Bridge](notes/2026-05-12-session-prep-h-pattern-producer.md)
+- [Session Prep H - Pattern Producer Bridge](notes/2026-05-12-u-session-prep-h-pattern-producer.md)
   records the first concrete Haskell-only producer bridge above the
   Prep G queue. It expands one deterministic `Pattern` block/range or
   retries one pending backlog, converts `PatternEvent` values through
@@ -2994,21 +2994,21 @@ Session prep artifacts:
   retains rejected events for retry. This is still not a live clock,
   background worker, thread-safe fan-in layer, OSC/MIDI/UI adapter, or
   preserving hot-swap implementation.
-- [Session Prep I - Scripted Pattern Runner](notes/2026-05-13-session-prep-i-scripted-runner.md)
+- [Session Prep I - Scripted Pattern Runner](notes/2026-05-13-a-session-prep-i-scripted-runner.md)
   records the first caller-driven runner boundary above Prep F/G/H. It
   composes one Pattern producer enqueue with one queue drain into a
   caller-owned `SessionOwner`, returning both reports and the
   carry-forward state. This is still not a live clock, background
   worker, thread-safe fan-in layer, OSC/MIDI/UI adapter, or preserving
   hot-swap implementation.
-- [Session Prep J - Thread-Safe Pattern Host](notes/2026-05-13-session-prep-j-thread-safe-host.md)
+- [Session Prep J - Thread-Safe Pattern Host](notes/2026-05-13-c-session-prep-j-thread-safe-host.md)
   records the first serialized host boundary above Prep F/G/H/I. It
   owns the `SessionOwner` bracket, hides Pattern producer and queue
   state behind an `MVar`, and exposes synchronous step/snapshot calls.
   This is still not a background worker, live clock, OSC/MIDI/UI
   adapter, generic producer service, or preserving hot-swap
   implementation.
-- [Session Prep K - Preserving Hot-Swap Decision](notes/2026-05-13-session-prep-k-preserving-hot-swap-decision.md)
+- [Session Prep K - Preserving Hot-Swap Decision](notes/2026-05-13-d-session-prep-k-preserving-hot-swap-decision.md)
   records the policy gate for preserving hot-swap before broadening
   producer fan-in. It kept the then-current real-adapter rejection in
   place, required execution-time preview rebuilds, defined how stale
@@ -3022,14 +3022,14 @@ Session prep artifacts:
   hot-swap preview after a first swap commits, stale voice-off after a
   dropped voice, and explicit missing-control failure after a modeled
   preserving swap.
-- [Session Prep M - Preserving Hot-Swap Strategy Evidence](notes/2026-05-13-session-prep-m-preserving-hot-swap-strategy-evidence.md)
+- [Session Prep M - Preserving Hot-Swap Strategy Evidence](notes/2026-05-13-e-session-prep-m-preserving-hot-swap-strategy-evidence.md)
   records the runtime/FFI evidence for choosing a narrow
   runtime-migration-backed preserving hot-swap implementation first.
   The existing prepare/publish/collect substrate, slot/template-id
   migration counters, and node-state support make runtime migration the
   smaller first implementation than session respawn for supported
   oscillator/filter graphs.
-- [Session Prep N - Preserving Hot-Swap Runtime Migration](notes/2026-05-13-session-prep-n-preserving-hot-swap-runtime-migration.md)
+- [Session Prep N - Preserving Hot-Swap Runtime Migration](notes/2026-05-13-f-session-prep-n-preserving-hot-swap-runtime-migration.md)
   implements that first narrow runtime-migration path in the real
   `RTGraph` session adapter. Supported preserving swaps build an
   offline next world with matching live slots, publish through the
@@ -3037,7 +3037,7 @@ Session prep artifacts:
   step, inspect migration counters, and then commit the existing
   `CommitGraphInstalled` shape. Unsupported stateful graphs still
   reject non-terminally rather than silently resetting live voices.
-- [Session Prep O - Live-Audio Preserving Hot-Swap Orchestration](notes/2026-05-13-session-prep-o-live-audio-preserving-hot-swap.md)
+- [Session Prep O - Live-Audio Preserving Hot-Swap Orchestration](notes/2026-05-13-g-session-prep-o-live-audio-preserving-hot-swap.md)
   implements the audio-running version of Prep N's
   preserving swap: publish the prepared next world, wait for the audio
   callback to advance swap generation, collect retired migration stats,
@@ -3045,13 +3045,13 @@ Session prep artifacts:
   failure policy: publish rejection is retryable, while post-publish
   timeout, retired-missing, and incomplete migration are terminal owner
   divergence until a repair protocol exists.
-- [Session Prep P - Producer Fan-In Host](notes/2026-05-13-session-prep-p-producer-fan-in-host.md)
+- [Session Prep P - Producer Fan-In Host](notes/2026-05-13-h-session-prep-p-producer-fan-in-host.md)
   implements the first generic serialized command-ingress host above
   Prep F/G. It owns a scoped `SessionOwner` and one bounded
   `SessionCommandQueue` behind an `MVar`, exposing enqueue, drain, and
   snapshot operations for already-formed `SessionCommand`s from OSC,
   MIDI, UI, Pattern, or future background producers.
-- [Session Fan-In Drain Service](notes/2026-05-13-session-fan-in-drain-service.md)
+- [Session Fan-In Drain Service](notes/2026-05-13-i-session-fan-in-drain-service.md)
   records the first scoped background worker around the generic fan-in
   host. Successful enqueues wake one FIFO drain; stopped drains are
   reported, owner divergence terminates the worker, and teardown has a
@@ -3059,7 +3059,7 @@ Session prep artifacts:
   producer arbitration beyond FIFO, GUI toolkit integration, live
   PortMIDI device ownership, broad OSC policy, long-running
   supervision, or divergence repair.
-- [Session MIDI Producer Adapter](notes/2026-05-13-session-midi-producer-adapter.md)
+- [Session MIDI Producer Adapter](notes/2026-05-13-j-session-midi-producer-adapter.md)
   records the first Haskell-only MIDI adapter above the generic fan-in
   host. It consumes already-decoded note-on/off, CC, sustain-pedal,
   pitch-bend, and all-notes-off events,
@@ -3068,23 +3068,23 @@ Session prep artifacts:
   producer-local.
   This is still not live PortMIDI device ownership, channel
   remapping/splits, MIDI clock, or arbitration beyond FIFO.
-- [Session MIDI Listener](notes/2026-05-13-session-midi-listener.md)
+- [Session MIDI Listener](notes/2026-05-13-l-session-midi-listener.md)
   records the first session-backed decoded MIDI event listener. It
   owns a bracketed worker over an injected event source, feeds
   `MetaSonic.Session.MIDIProducer`, and keeps listener-local MIDI
   state observable for tests/callers. The later
-  [Session MIDI PortMIDI Source](notes/2026-05-13-session-midi-portmidi-source.md)
+  [Session MIDI PortMIDI Source](notes/2026-05-13-m-session-midi-portmidi-source.md)
   binds Q / PortMIDI input behind that decoded-source boundary. This
   is still not channel remapping/splits, MIDI clock, or arbitration
   beyond FIFO.
-- [Session UI Producer Adapter](notes/2026-05-13-session-ui-producer-adapter.md)
+- [Session UI Producer Adapter](notes/2026-05-13-k-session-ui-producer-adapter.md)
   records the first Haskell-only UI adapter above the generic fan-in
   host. It consumes already-decoded UI intents, translates them to
   `SessionCommand`s with `ProducerUI` identity, and rejects non-finite
   control values before enqueue. This is still not a GUI toolkit
   binding, manifest reload/import, authorization, or arbitration beyond
   FIFO.
-- [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
+- [Session Control Coalescing And Arbitration](notes/2026-05-13-o-session-control-coalescing-arbitration.md)
   records the policy boundary for high-rate control traffic. It keeps
   the shared queue strict FIFO, makes coalescing producer-local, treats
   every non-control-write command as a fence, and documents the first
@@ -3321,7 +3321,7 @@ Still gated:
   coalescing, and drain scheduling beyond the scoped wake-on-enqueue
   fan-in service. The
   design constraints are recorded in
-  [Session Control Coalescing And Arbitration](notes/2026-05-13-session-control-coalescing-arbitration.md)
+  [Session Control Coalescing And Arbitration](notes/2026-05-13-o-session-control-coalescing-arbitration.md)
   and
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md).
 - [ ] A realtime command queue beyond the existing `rt_graph_realtime_*`

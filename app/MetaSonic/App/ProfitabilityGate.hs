@@ -16,7 +16,7 @@
 -- verdicts. The point is to formalize the safety rule so the
 -- existence of @ExecGenerated@ is not mistaken for readiness.
 --
--- See [notes/2026-05-12-phase-7f-profitability-gate.md] for the
+-- See [notes/2026-05-12-c-phase-7f-profitability-gate.md] for the
 -- decision artifact and rule motivation.
 module MetaSonic.App.ProfitabilityGate
   ( -- * Verdicts
@@ -147,7 +147,7 @@ data GateRow = GateRow
 -- rule wins; rules below it do not run.
 --
 -- Order is intentional and matches
--- [notes/2026-05-12-phase-7f-profitability-gate.md]:
+-- [notes/2026-05-12-c-phase-7f-profitability-gate.md]:
 --
 --   1. 'Unsupported'    — generator declined.
 --   2. 'NonExact'       — correctness divergence (hard no).

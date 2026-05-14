@@ -16,7 +16,7 @@ drift.
 ## 0. Anchors
 
 This note assumes the state pinned in
-[notes/2026-05-11-state-snapshot-phase-6-complete.md](2026-05-11-state-snapshot-phase-6-complete.md).
+[notes/2026-05-11-g-state-snapshot-phase-6-complete.md](2026-05-11-g-state-snapshot-phase-6-complete.md).
 The five contracts that snapshot settles are the load-bearing
 ones for 6.E:
 

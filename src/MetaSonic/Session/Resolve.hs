@@ -24,7 +24,7 @@
 -- cannot be represented in the new graph are dropped with explicit
 -- diagnostics.
 --
--- See [notes/2026-05-12-session-prep-a-contract.md].
+-- See [notes/2026-05-12-n-session-prep-a-contract.md].
 
 module MetaSonic.Session.Resolve
   ( -- * Migration Types

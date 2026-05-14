@@ -13,8 +13,8 @@
 -- driver layer (not shipped in 6.A.2) translates symbolic events into
 -- the realtime ABI surface.
 --
--- See [Phase 6.A pattern design](../../../notes/2026-05-10-phase-6a-pattern-design.md)
--- and [Phase 6.A.2 contract and corpus](../../../notes/2026-05-10-phase-6a2-pattern-corpus-design.md).
+-- See [Phase 6.A pattern design](../../notes/2026-05-10-f-phase-6a-pattern-design.md)
+-- and [Phase 6.A.2 contract and corpus](../../notes/2026-05-10-g-phase-6a2-pattern-corpus-design.md).
 
 module MetaSonic.Pattern
   ( -- * Symbolic identifiers

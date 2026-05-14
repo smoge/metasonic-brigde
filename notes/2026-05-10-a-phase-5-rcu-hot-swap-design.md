@@ -452,7 +452,7 @@ loops don't shift content.
   `rt_graph_wait_swap_installed` if 5.3.C data or a real producer shows
   polling is insufficient.
 - **5.4.A — Producer identity after install.** Done as
-  [notes/2026-05-10-phase-5-4-producer-identity-after-install-design.md](2026-05-10-phase-5-4-producer-identity-after-install-design.md).
+  [notes/2026-05-10-d-phase-5-4-producer-identity-after-install-design.md](2026-05-10-d-phase-5-4-producer-identity-after-install-design.md).
   Node retargeting remains producer-owned, bus identity remains numeric
   and caller-owned, and template identity is selected as the runtime
   precondition gap.

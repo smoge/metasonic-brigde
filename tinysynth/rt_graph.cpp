@@ -2247,7 +2247,7 @@ and output_buses_prev corresponds to InFeedback.ar's source.
 /* Note [Contribution storage — Phase §4.E.2.B1]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Storage for the writer-slot-keyed contribution table the design note
-in notes/2026-05-08-deterministic-bus-reduction-design.md (§5)
+in notes/2026-05-08-b-deterministic-bus-reduction-design.md (§5)
 specifies. B1 introduced the storage; B2/B3 route sink writes into it
 under reduction-capture mode and fold them back in canonical order.
 
@@ -2735,7 +2735,7 @@ struct RTGraph {
   // No allocation runs on the audio thread: the install path is one
   // atomic exchange (pending -> null), two unique_ptr moves, one
   // retired-slot store, and one generation increment. See
-  // notes/2026-05-10-phase-5-rcu-hot-swap-design.md.
+  // notes/2026-05-10-a-phase-5-rcu-hot-swap-design.md.
   std::atomic<RTGraphSwap *> pending_swap{nullptr};
   std::atomic<RTGraphSwap *> retired_swap{nullptr};
   std::atomic<bool> swap_in_flight{false};
@@ -4236,7 +4236,7 @@ static void process_env(
 
 /* Note [Writer-slot plumbing — Phase §4.E.2.B0 / B2]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The reduction model in notes/2026-05-08-deterministic-bus-reduction-design.md
+The reduction model in notes/2026-05-08-b-deterministic-bus-reduction-design.md
 keys contribution buffers by *writer slot*: a canonical-order index over
 sink writers across the whole block, ordered by
 (template_id, instance_slot, scheduled_region_ordinal, sink_ordinal_within_region).
@@ -4318,7 +4318,7 @@ collapse them into 'slot[fi] = a + b' inside the slot, then fold
 not bit-equal under IEEE-754. Today every sink kernel issues
 exactly one add per (slot, fi), so this is a contract for future
 kernels rather than a current bug. See §3 of
-notes/2026-05-08-deterministic-bus-reduction-design.md for the
+notes/2026-05-08-b-deterministic-bus-reduction-design.md for the
 canonical-writer-slot model that motivates this rule.
 */
 struct BusWriteTarget {

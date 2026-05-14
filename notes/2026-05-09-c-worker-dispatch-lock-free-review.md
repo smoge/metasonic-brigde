@@ -111,17 +111,17 @@ window.
 
 The documentation updates line up with the implementation:
 
-- `notes/2026-05-09-phase-4e-worker-bench-interpretation.md` preserves
+- `notes/2026-05-09-a-phase-4e-worker-bench-interpretation.md` preserves
   the prior bench note as workload-shape evidence while marking its
   timing numbers as measured against the old mutex/cv dispatch path.
-- `notes/2026-05-09-phase-4e-worker-turn-on-decision.md` removes the
+- `notes/2026-05-09-b-phase-4e-worker-turn-on-decision.md` removes the
   old "needs realtime-safe primitive" prerequisite and keeps the
   remaining gates: representative speedup and a successor decision
   record.
 - `ROADMAP.md` now records the dispatch primitive as atomic and
   lock/allocation-free on the audio thread, and shifts the next slice
   from building the primitive to rerunning benchmarks against it.
-- `notes/2026-05-08-deterministic-bus-reduction-design.md` keeps the
+- `notes/2026-05-08-b-deterministic-bus-reduction-design.md` keeps the
   default-off policy tied to post-atomic-dispatch evidence, not to the
   old mutex/cv limitation.
 

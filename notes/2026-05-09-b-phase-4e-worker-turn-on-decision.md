@@ -9,7 +9,7 @@ slice (`969a0d3` C1d-c runtime, follow-up bench column wiring).
 Inputs:
 
 - `2c737ce Benchmark global schedule worker dispatch`
-- `notes/2026-05-09-phase-4e-worker-bench-interpretation.md`
+- `notes/2026-05-09-a-phase-4e-worker-bench-interpretation.md`
 - C1c correctness gates: C++ schedule-worker tests and Haskell T-9 corpus
   equivalence under `pool_size=3`
 - `3c77d0e Survey corpus schedule worker width`
@@ -19,7 +19,7 @@ Inputs:
   `sched/parallel-compute-before-master`,
   `sched/poly-voices-master-fx`, and
   `sched/parallel-fx-rack-master`
-- `notes/2026-05-09-phase-4e-c1d-region-layer-dispatch-design.md`
+- `notes/2026-05-09-d-phase-4e-c1d-region-layer-dispatch-design.md`
 - `e77868f Make worker dispatch lock-free on audio thread`
 
 ## Decision
