@@ -2,9 +2,9 @@
 
 Status: pure policy, optional gateway, service-owned opt-in gateway,
 service-level rejection observability, the explicit OSC producer service
-path, and the opt-in OSC listener service path landed. This note records
-the arbitration boundary after MIDI listener-local coalescing. It does
-not change
+path, the opt-in OSC listener service path, and the non-audio OSC
+arbitration smoke diagnostics landed. This note records the arbitration
+boundary after MIDI listener-local coalescing. It does not change
 `MetaSonic.Session.Queue` or `MetaSonic.Session.FanIn`; concrete
 producer/listener paths keep FIFO behavior unless a caller explicitly
 routes them through `MetaSonic.Session.ArbitrationGateway` or the
@@ -56,6 +56,10 @@ different user intents even when they write the same logical target.
   that routes decoded packets through the explicit OSC producer
   service path. Its existing host-based listener remains the default
   FIFO behavior.
+- `--session-osc-arbitration-smoke` exercises the opt-in OSC listener
+  service path with a configured `TargetClaim` policy and reports both
+  listener-level and service-level arbitration rejection counters. It is
+  a non-audio diagnostic probe, not a default live-policy route.
 - The landed MIDI coalescer is listener-local. It can merge repeated
   MIDI-origin `CmdControlWrite`s before enqueue, but it cannot merge,
   reorder, or drop another producer's commands.
@@ -184,6 +188,11 @@ intermediate values than fan-in needed. Arbitration rejection means a
 policy chose another producer's intent for the same target.
 The service-owned gateway surfaces that case as
 `SfsiiArbitrationRejected` on `sfshOnIssue`.
+The manual `--session-osc-arbitration-smoke` command exposes that
+service issue alongside the OSC listener's `SoliArbitrationRejected`
+counter so operators can see both the cross-producer service signal and
+the producer-specific packet signal without treating either as queue
+pressure.
 
 ## Test Plan
 
@@ -236,6 +245,9 @@ above fan-in, using a small pure policy function or wrapper:
    paths only when configuration can explicitly enable a non-FIFO
    policy.
 10. Add smoke diagnostics if a live policy is enabled by configuration.
+    Done: `--session-osc-arbitration-smoke` binds the opt-in
+    arbitrated OSC listener path with a `TargetClaim` policy and reports
+    listener/service arbitration counters.
 
 ## Deferred Work
 

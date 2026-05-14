@@ -27,6 +27,8 @@ import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
 import qualified MetaSonic.App.FusionCostLab as FCL
 import           MetaSonic.App.Osc          (runOscListen)
 import           MetaSonic.App.SessionMidiSmoke (runSessionMidiSmoke)
+import           MetaSonic.App.SessionOscArbitrationSmoke
+                                             (runSessionOscArbitrationSmoke)
 import           MetaSonic.App.SnapshotCheck (runSnapshotCheck)
 import           MetaSonic.OSC.Listen       (parseListenerPort)
 import           MetaSonic.App.Survey       (printFusionSummary,
@@ -92,6 +94,12 @@ data RunMode
     -- Opens the session-backed PortMIDI source, runs it through the
     -- decoded MIDI listener and fan-in service, and reports producer /
     -- drain activity. Targets are ignored.
+  | SessionOscArbitrationSmoke
+    -- ^ Manual non-audio smoke mode
+    -- (--session-osc-arbitration-smoke [SECONDS]). Binds an OSC
+    -- session listener, routes it through the service-owned arbitration
+    -- path with a target-claim policy, and reports producer / listener /
+    -- service rejection activity. Targets are ignored.
   | PluginList
     -- ^ Non-audio reporting mode (--plugin-list). Enumerates the
     -- build-linked static plugin registry that KStaticPlugin resolves
@@ -137,6 +145,10 @@ data Options = Options
     -- --fusion-cost-lab.
   , optSessionMidiSmokeSeconds :: Int
     -- ^ Manual smoke-test duration for --session-midi-smoke.
+  , optSessionOscSmokeSeconds :: Int
+    -- ^ Manual smoke-test duration for --session-osc-arbitration-smoke.
+  , optSessionOscPort :: Int
+    -- ^ UDP port for --session-osc-arbitration-smoke. Default 7001.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
@@ -148,6 +160,8 @@ defaultOptions = Options
   , optMidiDevice = Nothing
   , optFCLSummary = False
   , optSessionMidiSmokeSeconds = 10
+  , optSessionOscSmokeSeconds = 10
+  , optSessionOscPort = 7001
   }
 
 parseArgs :: [String] -> Either String Options
@@ -190,6 +204,13 @@ parseArgs = go defaultOptions
           go opts { optMode = SessionMidiSmoke
                   , optSessionMidiSmokeSeconds = seconds
                   } rest
+    go opts ("--session-osc-arbitration-smoke" : xs) =
+      case takeSessionOscSmokeSeconds xs of
+        Left err              -> Left err
+        Right (seconds, rest) ->
+          go opts { optMode = SessionOscArbitrationSmoke
+                  , optSessionOscSmokeSeconds = seconds
+                  } rest
     go opts ("--plugin-list" : xs) =
       go opts { optMode = PluginList } xs
     go opts ("--midi-device" : s : xs) =
@@ -200,6 +221,14 @@ parseArgs = go defaultOptions
           <> " (expected non-negative integer)"
     go _ ("--midi-device" : []) =
       Left "Missing value for --midi-device"
+    go opts ("--session-osc-port" : s : xs) =
+      case parseListenerPort s of
+        Just port -> go opts { optSessionOscPort = port } xs
+        Nothing -> Left $
+          "Invalid port for --session-osc-port: " <> s
+          <> " (expected integer in [1, 65535])"
+    go _ ("--session-osc-port" : []) =
+      Left "Missing value for --session-osc-port"
     go opts ("--osc-listen" : xs) = case takeOscPort xs of
       Left err           -> Left err
       Right (port, rest) ->
@@ -218,8 +247,8 @@ parseArgs = go defaultOptions
       , length s <= 9 = Just (read s)
       | otherwise     = Nothing
 
-    parseSessionMidiSmokeSeconds :: String -> Maybe Int
-    parseSessionMidiSmokeSeconds s
+    parseSmokeSeconds :: String -> Maybe Int
+    parseSmokeSeconds s
       | not (null s)
       , all isDigit s
       , length s <= 4
@@ -253,10 +282,23 @@ parseArgs = go defaultOptions
       | "--" `prefixOf` s =
           Right (optSessionMidiSmokeSeconds defaultOptions, s : rest)
       | otherwise =
-          case parseSessionMidiSmokeSeconds s of
+          case parseSmokeSeconds s of
             Just n  -> Right (n, rest)
             Nothing -> Left $
               "Invalid duration for --session-midi-smoke: " <> s
+              <> " (expected integer seconds in [1, 3600])"
+
+    takeSessionOscSmokeSeconds :: [String] -> Either String (Int, [String])
+    takeSessionOscSmokeSeconds [] =
+      Right (optSessionOscSmokeSeconds defaultOptions, [])
+    takeSessionOscSmokeSeconds (s : rest)
+      | "--" `prefixOf` s =
+          Right (optSessionOscSmokeSeconds defaultOptions, s : rest)
+      | otherwise =
+          case parseSmokeSeconds s of
+            Just n  -> Right (n, rest)
+            Nothing -> Left $
+              "Invalid duration for --session-osc-arbitration-smoke: " <> s
               <> " (expected integer seconds in [1, 3600])"
 
 resolveTargets :: [String] -> Either String [Demo]
@@ -289,6 +331,7 @@ usage prog = unlines
   , "  " <> prog <> " --authoring-manifest [DEMO ...]"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
+  , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
   , "  " <> prog <> " --plugin-list"
   , "  " <> prog <> " --osc-listen [PORT]"
   , ""
@@ -379,6 +422,18 @@ usage prog = unlines
   , "                   session commands were observed. When --midi-device is"
   , "                   omitted, the first input-capable device is selected."
   , "                   Default window is 10 seconds; demo targets are ignored."
+  , "  --session-osc-arbitration-smoke [SECONDS]"
+  , "                   Manual non-audio probe for the explicit session OSC"
+  , "                   arbitration path. Binds a UDP listener, routes decoded"
+  , "                   packets through MetaSonic.Session.OSCListener and"
+  , "                   FanInService with a TargetClaim policy on /v0/lpf/0,"
+  , "                   and reports listener/service arbitration counters."
+  , "                   Send /v0/lpf/0 to trigger policy rejection; send"
+  , "                   /v1/lpf/0 to exercise normal fan-in drain. Default"
+  , "                   window is 10 seconds; demo targets are ignored."
+  , "  --session-osc-port N"
+  , "                   UDP port for --session-osc-arbitration-smoke."
+  , "                   Default is 7001. Ignored by other modes."
   , "  --plugin-list    Print the build-linked static plugin registry"
   , "                   used by KStaticPlugin and exit. No audio, no TUI."
   , "  --osc-listen [PORT]"
@@ -406,6 +461,7 @@ usage prog = unlines
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke 10"
   , "  " <> prog <> " --midi-device 2 --session-midi-smoke 10"
+  , "  " <> prog <> " --session-osc-arbitration-smoke 10"
   ]
 
 --------------------------------------------------------------------------------
@@ -483,6 +539,10 @@ main = do
       runSessionMidiSmoke
         (optMidiDevice opts)
         (optSessionMidiSmokeSeconds opts)
+    SessionOscArbitrationSmoke ->
+      runSessionOscArbitrationSmoke
+        (optSessionOscSmokeSeconds opts)
+        (optSessionOscPort opts)
     PluginList ->
       printPlugins
     AudioOnly      -> runDemos "Running selected demos."
@@ -569,6 +629,7 @@ runDemo opts demo
     || optMode opts == OscListen
     || optMode opts == MidiList
     || optMode opts == SessionMidiSmoke
+    || optMode opts == SessionOscArbitrationSmoke
     || optMode opts == PluginList
     || optMode opts == AuthoringManifest =
       error "runDemo: reporting modes should be handled by main, never reach here"
@@ -639,6 +700,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: MidiList should be handled by main, never reach here"
     SessionMidiSmoke ->
       error "runSingleDemo: SessionMidiSmoke should be handled by main, never reach here"
+    SessionOscArbitrationSmoke ->
+      error "runSingleDemo: SessionOscArbitrationSmoke should be handled by main, never reach here"
     PluginList ->
       error "runSingleDemo: PluginList should be handled by main, never reach here"
     AuthoringManifest ->

@@ -43,6 +43,15 @@ session-midi-smoke seconds="10":
 session-midi-smoke-device device seconds="10":
     stack exec -- metasonic-bridge --midi-device {{device}} --session-midi-smoke {{seconds}}
 
+session-osc-arbitration-smoke seconds="10" port="7001":
+    stack exec -- metasonic-bridge --session-osc-port {{port}} --session-osc-arbitration-smoke {{seconds}}
+
+session-osc-arbitration-send-claimed value port="7001":
+    python3 tools/send_osc.py --port {{port}} --address /v0/lpf/0 --value {{value}}
+
+session-osc-arbitration-send-allowed value port="7001":
+    python3 tools/send_osc.py --port {{port}} --address /v1/lpf/0 --value {{value}}
+
 osc-listen port="7000":
     stack exec -- metasonic-bridge --osc-listen {{port}}
 

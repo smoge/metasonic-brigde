@@ -3298,8 +3298,11 @@ queue pressure and drain-stop issues. `MetaSonic.Session.OSCProducer`
 now exposes an explicit arbitrated service enqueue helper for symbolic
 control writes, and `MetaSonic.Session.OSCListener` exposes an opt-in
 service-backed listener wrapper over that helper; their existing
-host-based paths remain FIFO. Existing live paths are not routed through
-arbitration unless a caller explicitly chooses that wrapper/path.
+host-based paths remain FIFO. `--session-osc-arbitration-smoke` now
+exercises that opt-in OSC listener path with a `TargetClaim` policy and
+prints listener/service arbitration rejection counters for a non-audio
+manual probe. Existing live paths are not routed through arbitration
+unless a caller explicitly chooses that wrapper/path.
 
 Still gated:
 
