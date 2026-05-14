@@ -13706,6 +13706,35 @@ sessionArbitrationTests =
       arbitrateSessionCommand policy loser command
         @?= ArbitrationRejected expectedIssue
 
+  , testCase "priority policy allows equal-priority producers" $ do
+      let owner     = testProducer ProducerMIDI "midi-a"
+          peer      = testProducer ProducerMIDI "midi-b"
+          target =
+            ControlArbitrationTarget (VoiceKey "v0") midiLevelTag
+          command =
+            CmdControlWrite (VoiceKey "v0") midiLevelTag 0.5
+          owners =
+            setControlOwner target owner emptyControlOwnerTable
+          policy =
+            ProducerPriority
+              [ProducerMIDI, ProducerOSC, ProducerUI, ProducerPattern]
+              owners
+      arbitrateSessionCommand policy owner command
+        @?= ArbitrationAllowed
+      arbitrateSessionCommand policy peer command
+        @?= ArbitrationAllowed
+
+  , testCase "priority policy allows unowned targets" $ do
+      let producer = testProducer ProducerPattern "pattern"
+          command =
+            CmdControlWrite (VoiceKey "v0") midiLevelTag 0.5
+          policy =
+            ProducerPriority
+              [ProducerMIDI, ProducerOSC, ProducerUI, ProducerPattern]
+              emptyControlOwnerTable
+      arbitrateSessionCommand policy producer command
+        @?= ArbitrationAllowed
+
   , testCase "target claim blocks only the claimed control target" $ do
       let claimant  = testProducer ProducerUI "ui"
           blocked   = testProducer ProducerMIDI "midi"
