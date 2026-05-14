@@ -197,6 +197,9 @@ above fan-in, using a small pure policy function or wrapper:
   policy state, a session policy wrapper, or a higher orchestration layer?
 - Should a default non-FIFO policy ever exist, or should all arbitration
   be opt-in?
+- Should multi-policy composition, such as target-claim precedence with
+  priority fallback, be modeled as a new constructor or a policy
+  combinator?
 - What release signal ends a MIDI or UI `TouchOverride` claim?
 - Does hot-swap clear claims, preserve claims by symbolic target, or
   require an explicit migration policy?

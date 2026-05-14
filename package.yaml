@@ -64,6 +64,7 @@ library:
     - MetaSonic.Pattern
     - MetaSonic.Pattern.Corpus
     - MetaSonic.Session.AdapterIssue
+    - MetaSonic.Session.Arbitration
     - MetaSonic.Session.Command
     - MetaSonic.Session.Resolve
     - MetaSonic.Session.Report
