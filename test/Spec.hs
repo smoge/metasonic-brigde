@@ -14249,6 +14249,246 @@ sessionPatternProducerTests = testGroup "Session Prep H: Pattern producer"
           assertBool
             ("expected v0 voice after drain, got " <> show (ssVoices st))
             (M.member (VoiceKey "v0") (ssVoices st))
+
+  , testCase "arbitrated service Pattern enqueue defaults to FIFO" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions
+          { ppoProducerName = T.pack "pattern-arb"
+          , ppoBlockFrames  = 64
+          })
+      expectedEvent <- case listToMaybe droneVibratoEvents of
+        Just event ->
+          pure event
+        Nothing ->
+          assertFailure "expected droneVibratoEvents to contain a first event"
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          (patternTemplates droneVibrato)
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              outcome <- enqueueArbitratedPatternBlock
+                           droneVibrato
+                           producer
+                           service
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (outcome, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (outcome, Just drained, snapshot) -> do
+          let result' = paeoResult outcome
+          assertBool
+            "arbitrated Pattern producer should not leave backlog after one clean block"
+            (not (isBacklogged (paeoState outcome)))
+          paerBacklogged result' @?= 0
+          paerNextStart result' @?= SamplePos 64
+          case paerItems result' of
+            [item] -> do
+              paeiSamplePos item @?= fst expectedEvent
+              paeiEvent item @?= snd expectedEvent
+              paeiCommand item @?= fromPatternEvent (snd expectedEvent)
+              queued <- gatewayQueuedOrFail (paeiResult item)
+              qscProducer queued
+                @?= ProducerId ProducerPattern (T.pack "pattern-arb")
+              qscCommand queued @?= paeiCommand item
+              map sdiQueued (sdrItems (sfidrDrain drained)) @?= [queued]
+              case map sdiResult (sdrItems (sfidrDrain drained)) of
+                [SessionOwnerStep (StepCommitted _ Nothing)] ->
+                  pure ()
+                other ->
+                  assertFailure
+                    ("expected arbitrated Pattern voice-on to commit, got: "
+                     <> show other)
+            other ->
+              assertFailure ("expected one arbitrated Pattern item, got: "
+                             <> show other)
+          sfisQueueDepth snapshot @?= 0
+          assertBool
+            "expected Pattern voice after arbitrated service drain"
+            (M.member (VoiceKey "v0") (ssVoices (sfisOwnerState snapshot)))
+        Right (_outcome, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for arbitrated Pattern service drain"
+
+  , testCase "arbitrated service Pattern rejection reports service issue" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions
+          { ppoProducerName = T.pack "pattern-arb"
+          , ppoBlockFrames  = 8
+          })
+      let event =
+            ( SamplePos 0
+            , PEControlWrite (VoiceKey "v0") midiLevelTag 0.75
+            )
+          pat = droneVibrato { patternEvents = staticEvents [event] }
+          command = fromPatternEvent (snd event)
+          producerId = ProducerId ProducerPattern (T.pack "pattern-arb")
+          claimant = testProducer ProducerUI "ui"
+          target =
+            ControlArbitrationTarget (VoiceKey "v0") midiLevelTag
+          serviceOpts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy =
+                      TargetClaim
+                        (claimControlTarget target claimant emptyTargetClaimTable)
+                  }
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = producerId
+            , aiCommand   = command
+            , aiTarget    = Just target
+            , aiReason    = ArrTargetClaimedBy claimant
+            , aiRetryable = False
+            }
+      drainedVar <- newEmptyMVar
+      issueVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            , sfshOnIssue = putMVar issueVar
+            }
+          (patternTemplates droneVibrato)
+          serviceOpts
+          $ \service -> do
+              outcome <- enqueueArbitratedPatternBlock pat producer service
+              mIssue <- timeout 1000000 (takeMVar issueVar)
+              mDrain <- timeout 100000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (outcome, mIssue, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (outcome, Just reported, Nothing, snapshot) -> do
+          let result' = paeoResult outcome
+          assertBool
+            "policy-rejected Pattern event should remain backlogged"
+            (isBacklogged (paeoState outcome))
+          paerBacklogged result' @?= 1
+          paerNextStart result' @?= SamplePos 8
+          case paerItems result' of
+            [item] -> do
+              paeiSamplePos item @?= fst event
+              paeiEvent item @?= snd event
+              paeiCommand item @?= command
+              paeiResult item @?= SagArbitrationRejected expectedIssue
+            other ->
+              assertFailure
+                ("expected one rejected arbitrated Pattern item, got: "
+                 <> show other)
+          reported @?= SfsiiArbitrationRejected expectedIssue
+          sfisQueueDepth snapshot @?= 0
+        Right (_outcome, Nothing, _mDrain, _snapshot) ->
+          assertFailure "timed out waiting for Pattern arbitration rejection issue"
+        Right (_outcome, Just _reported, Just extraDrain, _snapshot) ->
+          assertFailure
+            ("Pattern policy rejection unexpectedly woke service drain: "
+             <> show extraDrain)
+
+  , testCase "arbitrated service Pattern halts on mid-block rejection" $ do
+      producer <- patternProducerOrFail
+        (defaultPatternProducerOptions
+          { ppoProducerName = T.pack "pattern-arb"
+          , ppoBlockFrames  = 8
+          })
+      let firstTarget = ControlTag (MigrationKey "lpf") 1
+          claimedTarget = midiLevelTag
+          firstEvent =
+            ( SamplePos 0
+            , PEControlWrite (VoiceKey "v0") firstTarget 4.0
+            )
+          rejectedEvent =
+            ( SamplePos 1
+            , PEControlWrite (VoiceKey "v0") claimedTarget 0.75
+            )
+          tailEvent =
+            (SamplePos 2, PEVoiceOff (VoiceKey "v0"))
+          events =
+            [firstEvent, rejectedEvent, tailEvent]
+          pat = droneVibrato { patternEvents = staticEvents events }
+          producerId = ProducerId ProducerPattern (T.pack "pattern-arb")
+          claimant = testProducer ProducerUI "ui"
+          target =
+            ControlArbitrationTarget (VoiceKey "v0") claimedTarget
+          firstCommand = fromPatternEvent (snd firstEvent)
+          rejectedCommand = fromPatternEvent (snd rejectedEvent)
+          tailCommand = fromPatternEvent (snd tailEvent)
+          serviceOpts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy =
+                      TargetClaim
+                        (claimControlTarget target claimant emptyTargetClaimTable)
+                  }
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = producerId
+            , aiCommand   = rejectedCommand
+            , aiTarget    = Just target
+            , aiReason    = ArrTargetClaimedBy claimant
+            , aiRetryable = False
+            }
+      drainedVar <- newEmptyMVar
+      issueVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            , sfshOnIssue = putMVar issueVar
+            }
+          (patternTemplates droneVibrato)
+          serviceOpts
+          $ \service -> do
+              outcome <- enqueueArbitratedPatternBlock pat producer service
+              mIssue <- timeout 1000000 (takeMVar issueVar)
+              mFirstDrain <- timeout 1000000 (takeMVar drainedVar)
+              mSecondDrain <- timeout 100000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (outcome, mIssue, mFirstDrain, mSecondDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (outcome, Just reported, Just firstDrain, Nothing, snapshot) -> do
+          let result' = paeoResult outcome
+              items = paerItems result'
+          assertBool
+            "mid-block rejection should leave Pattern producer backlogged"
+            (isBacklogged (paeoState outcome))
+          paerBacklogged result' @?= 2
+          paerNextStart result' @?= SamplePos 8
+          map paeiCommand items @?= [firstCommand, rejectedCommand]
+          assertBool
+            "tail command should not be attempted after mid-block rejection"
+            (tailCommand `notElem` map paeiCommand items)
+          case items of
+            [acceptedItem, rejectedItem] -> do
+              queued <- gatewayQueuedOrFail (paeiResult acceptedItem)
+              qscProducer queued @?= producerId
+              qscCommand queued @?= firstCommand
+              paeiResult rejectedItem
+                @?= SagArbitrationRejected expectedIssue
+              map sdiQueued (sdrItems (sfidrDrain firstDrain))
+                @?= [queued]
+              length (sdrItems (sfidrDrain firstDrain)) @?= 1
+            other ->
+              assertFailure
+                ("expected accepted then rejected Pattern items, got: "
+                 <> show other)
+          reported @?= SfsiiArbitrationRejected expectedIssue
+          sfisQueueDepth snapshot @?= 0
+        Right (_outcome, Nothing, _mFirstDrain, _mSecondDrain, _snapshot) ->
+          assertFailure "timed out waiting for Pattern arbitration rejection issue"
+        Right (_outcome, Just _reported, Nothing, _mSecondDrain, _snapshot) ->
+          assertFailure "timed out waiting for admitted Pattern drain"
+        Right (_outcome, Just _reported, Just _firstDrain, Just extraDrain, _snapshot) ->
+          assertFailure
+            ("Pattern mid-block rejection unexpectedly produced extra drain: "
+             <> show extraDrain)
   ]
 
 ------------------------------------------------------------

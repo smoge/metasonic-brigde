@@ -3303,6 +3303,8 @@ exercises that opt-in OSC listener path with a `TargetClaim` policy and
 prints listener/service arbitration rejection counters for a non-audio
 manual probe. `MetaSonic.Session.UIProducer` also exposes an explicit
 arbitrated service enqueue helper for already-decoded UI intents.
+`MetaSonic.Session.PatternProducer` exposes the same kind of explicit
+service-owned arbitration helper for caller-driven Pattern blocks.
 Existing live paths are not routed through arbitration unless a caller
 explicitly chooses that wrapper/path.
 
@@ -3326,10 +3328,10 @@ Still gated:
   ABI, if a later design proves one is needed.
 - [ ] Session-level respawn/replacement-binding policy for preserving
   swaps that cannot use runtime state migration.
-- [ ] MIDI and Pattern live coexistence/arbitration wiring beyond
+- [ ] MIDI live coexistence/arbitration wiring beyond
   the landed opt-in gateway, service-owned arbitrated enqueue path,
   explicit OSC producer helper, opt-in OSC listener path, and explicit
-  UI producer helper. The policy boundary is recorded in
+  UI and Pattern producer helpers. The policy boundary is recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-session-producer-coexistence-arbitration.md).
 - [ ] Arbitration policy mutation API and voice-lifecycle ownership
   clearing. These remain use-case gated; do not implement them ahead of

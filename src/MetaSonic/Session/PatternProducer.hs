@@ -14,7 +14,8 @@
 --
 -- This module is Haskell-only. It does not own a 'SessionOwner', does
 -- not drain queues, does not create threads, and does not define a
--- realtime clock.
+-- realtime clock. Callers can use the pure queue helper or explicitly
+-- choose the service-owned arbitration path.
 --
 -- See [notes/2026-05-12-session-prep-h-pattern-producer.md].
 
@@ -33,10 +34,14 @@ module MetaSonic.Session.PatternProducer
   , PatternEnqueueItem (..)
   , PatternEnqueueResult (..)
   , PatternEnqueueOutcome (..)
+  , PatternArbitratedEnqueueItem (..)
+  , PatternArbitratedEnqueueResult (..)
+  , PatternArbitratedEnqueueOutcome (..)
 
     -- * Operations
   , newPatternProducerState
   , enqueuePatternBlock
+  , enqueueArbitratedPatternBlock
   , isBacklogged
   ) where
 
@@ -48,7 +53,13 @@ import           GHC.Generics              (Generic)
 import           MetaSonic.Pattern         (Pattern, PatternEvent,
                                             SamplePos (..), SampleRange (..),
                                             expandPattern)
+import           MetaSonic.Session.ArbitrationGateway
+                                           (SessionArbitrationGatewayEnqueueResult (..))
 import           MetaSonic.Session.Command (SessionCommand, fromPatternEvent)
+import           MetaSonic.Session.FanIn   (SessionFanInEnqueueResult (..))
+import           MetaSonic.Session.FanInService
+                                           (SessionFanInService,
+                                            enqueueArbitratedSessionFanInServiceCommand)
 import           MetaSonic.Session.Queue   (ProducerId (..),
                                             ProducerKind (ProducerPattern),
                                             SessionCommandQueue,
@@ -136,6 +147,41 @@ data PatternEnqueueOutcome = PatternEnqueueOutcome
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
+-- | One Pattern event attempted against the service-owned arbitration
+-- path.
+data PatternArbitratedEnqueueItem = PatternArbitratedEnqueueItem
+  { paeiSamplePos :: !SamplePos
+    -- ^ Original Pattern sample position.
+  , paeiEvent     :: !PatternEvent
+    -- ^ Original Pattern event.
+  , paeiCommand   :: !SessionCommand
+    -- ^ Command produced by 'MetaSonic.Session.Command.fromPatternEvent'.
+  , paeiResult    :: !SessionArbitrationGatewayEnqueueResult
+    -- ^ Service-owned arbitration/fan-in result for this attempted
+    -- event.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Summary of one service-backed Pattern producer enqueue call.
+data PatternArbitratedEnqueueResult = PatternArbitratedEnqueueResult
+  { paerItems      :: ![PatternArbitratedEnqueueItem]
+    -- ^ Attempted events in Pattern order.
+  , paerBacklogged :: !Int
+    -- ^ Number of events retained for retry after this call.
+  , paerNextStart  :: !SamplePos
+    -- ^ Producer cursor after this call. Backlog retry calls do not
+    -- advance this cursor.
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Named return value for the producer state and service-backed
+-- enqueue report.
+data PatternArbitratedEnqueueOutcome = PatternArbitratedEnqueueOutcome
+  { paeoState  :: !PatternProducerState
+  , paeoResult :: !PatternArbitratedEnqueueResult
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
 -- | Construct an initial Pattern producer state.
 newPatternProducerState
   :: PatternProducerOptions
@@ -159,7 +205,9 @@ newPatternProducerState opts
 --
 -- Calls that start with backlog retry only that backlog. They do not
 -- generate a new Pattern range in the same call, even if the backlog
--- fully drains.
+-- fully drains. This raw queue helper does not consult a service-owned
+-- arbitration gateway; callers that need consistent service-level
+-- policy enforcement should use 'enqueueArbitratedPatternBlock'.
 enqueuePatternBlock
   :: Pattern
   -> PatternProducerState
@@ -179,6 +227,37 @@ enqueuePatternBlock pat state queue =
        , peoQueue  = queue'
        , peoResult = result
        }
+
+-- | Enqueue one Pattern block through the explicit service-owned
+-- arbitration path.
+--
+-- This is the Pattern counterpart to the OSC/UI explicit arbitrated
+-- helpers. Existing Pattern callers should keep using
+-- 'enqueuePatternBlock', 'MetaSonic.Session.Runner.stepPatternSession',
+-- or 'MetaSonic.Session.Host.stepPatternSessionHost' unless the
+-- surrounding session deliberately opts into 'SessionFanInService'
+-- arbitration. With default service options this still preserves FIFO
+-- behavior; with configured gateway options, policy rejection stops the
+-- current Pattern call at the rejected event and retains that event plus
+-- the remaining tail as backlog for a later retry.
+enqueueArbitratedPatternBlock
+  :: Pattern
+  -> PatternProducerState
+  -> SessionFanInService
+  -> IO PatternArbitratedEnqueueOutcome
+enqueueArbitratedPatternBlock pat state service = do
+  let (events, stateWithCursor) = eventsForCall pat state
+  (state', items) <-
+    enqueueArbitratedEvents stateWithCursor service events
+  let result = PatternArbitratedEnqueueResult
+        { paerItems      = items
+        , paerBacklogged = length (ppsBacklog state')
+        , paerNextStart  = ppsNextStart state'
+        }
+  pure PatternArbitratedEnqueueOutcome
+    { paeoState  = state'
+    , paeoResult = result
+    }
 
 eventsForCall
   :: Pattern
@@ -223,6 +302,45 @@ enqueueEvents state queue events =
              go (item : itemsRev) queue' rest
            SessionEnqueueRejected {} ->
              ((samplePos, event) : rest, queue', reverse (item : itemsRev))
+
+enqueueArbitratedEvents
+  :: PatternProducerState
+  -> SessionFanInService
+  -> [(SamplePos, PatternEvent)]
+  -> IO (PatternProducerState, [PatternArbitratedEnqueueItem])
+enqueueArbitratedEvents state service events =
+  go [] events
+  where
+    go itemsRev [] =
+      pure (state { ppsBacklog = [] }, reverse itemsRev)
+    go itemsRev ((samplePos, event) : rest) = do
+      let command = fromPatternEvent event
+      res <-
+        enqueueArbitratedSessionFanInServiceCommand
+          (ppsProducer state)
+          command
+          service
+      let item = PatternArbitratedEnqueueItem
+            { paeiSamplePos = samplePos
+            , paeiEvent     = event
+            , paeiCommand   = command
+            , paeiResult    = res
+            }
+      case res of
+        SagArbitrationRejected {} ->
+          pure
+            ( state { ppsBacklog = (samplePos, event) : rest }
+            , reverse (item : itemsRev)
+            )
+        SagEnqueueAttempted fanInResult ->
+          case sfierResult fanInResult of
+            SessionEnqueued {} ->
+              go (item : itemsRev) rest
+            SessionEnqueueRejected {} ->
+              pure
+                ( state { ppsBacklog = (samplePos, event) : rest }
+                , reverse (item : itemsRev)
+                )
 
 addSampleFrames :: Int -> SamplePos -> SamplePos
 addSampleFrames n (SamplePos start) =
