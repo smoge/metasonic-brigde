@@ -18,10 +18,15 @@
 module MetaSonic.App.ManifestReloadHost
   ( ManifestReloadHostConfig (..)
   , ManifestReloadHostIssue (..)
+  , ManifestReloadHostStrategy (..)
+  , ManifestReloadHostStrategyIssue (..)
+  , ManifestReloadHostStrategyRan (..)
+  , preservingAllowsStoppedAudioFallback
   , manifestReloadHostOps
   , manifestPreservingReloadHostOps
   , reloadManifestStoppedAudioHost
   , reloadManifestPreservingHost
+  , reloadManifestHostWithStrategy
   ) where
 
 import           MetaSonic.App.ManifestReloadIngress
@@ -32,7 +37,7 @@ import           MetaSonic.App.ManifestReloadIngress
 import           MetaSonic.App.ManifestReloadOrchestration
                                                   (HostPreservingDrainFailure (..),
                                                    HostPreservingReloadFailure (..),
-                                                   HostPreservingReloadIssue,
+                                                   HostPreservingReloadIssue (..),
                                                    HostPreservingReloadOps (..),
                                                    HostStoppedAudioDrainFailure (..),
                                                    HostStoppedAudioReloadFailure (..),
@@ -98,6 +103,37 @@ data ManifestReloadHostIssue ingressIssue
   | MrhiPreservingReloadRejected !ManifestPreservingHotSwapReport
   | MrhiPreservingReloadStopped !ManifestPreservingHotSwapReport
   | MrhiPreservingReloadUnexpected !ManifestPreservingHotSwapReport
+  deriving stock (Eq, Show)
+
+-- | Explicit host-level manifest reload strategy.
+--
+-- 'TryPreservingThenStoppedAudio' falls back only from preserving
+-- rejection paths that prove the old owner is still installed and old
+-- ingress has resumed. It never falls back after preserving has
+-- already changed the live owner.
+data ManifestReloadHostStrategy
+  = RequirePreserving
+  | TryPreservingThenStoppedAudio
+  | StoppedAudioOnly
+  deriving stock (Eq, Show)
+
+-- | Strategy-level failure with both causes preserved when explicit
+-- fallback was attempted.
+data ManifestReloadHostStrategyIssue issue
+  = MrhsiPreservingFailed !(HostPreservingReloadIssue issue)
+  | MrhsiStoppedAudioFailed !(HostStoppedAudioReloadIssue issue)
+  | MrhsiFallbackStoppedAudioFailed
+      !(HostPreservingReloadIssue issue)
+      !(HostStoppedAudioReloadIssue issue)
+  deriving stock (Eq, Show)
+
+-- | Successful strategy outcome, including which install path actually
+-- ran.
+data ManifestReloadHostStrategyRan issue
+  = MrhsrPreserving
+  | MrhsrStoppedAudio
+  | MrhsrStoppedAudioAfterPreservingRejected
+      !(HostPreservingReloadIssue issue)
   deriving stock (Eq, Show)
 
 -- | Build stopped-audio orchestration slots backed by the real session
@@ -335,6 +371,69 @@ reloadManifestPreservingHost producer config doc catalog request =
     (manifestPreservingReloadHostOps producer config doc catalog)
     request
 
+-- | Run one manifest reload through an explicit host strategy.
+--
+-- The producer id is used only by preserving-capable modes. In
+-- 'TryPreservingThenStoppedAudio', stopped-audio fallback is attempted
+-- only after a retryable preserving command rejection; all other
+-- preserving failures are returned directly.
+reloadManifestHostWithStrategy
+  :: ProducerId
+  -> ManifestReloadHostStrategy
+  -> ManifestReloadHostConfig target ingressIssue handle
+  -> AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> MR.ManifestReloadRequest
+  -> IO (Either
+          (ManifestReloadHostStrategyIssue
+            (ManifestReloadHostIssue ingressIssue))
+          (ManifestReloadHostStrategyRan
+            (ManifestReloadHostIssue ingressIssue)))
+reloadManifestHostWithStrategy producer strategy config doc catalog request =
+  case strategy of
+    RequirePreserving -> do
+      preserving <- runPreserving
+      pure $ case preserving of
+        Left issue ->
+          Left (MrhsiPreservingFailed issue)
+        Right () ->
+          Right MrhsrPreserving
+    TryPreservingThenStoppedAudio -> do
+      preserving <- runPreserving
+      case preserving of
+        Right () ->
+          pure (Right MrhsrPreserving)
+        Left preservingIssue
+          | preservingAllowsStoppedAudioFallback preservingIssue ->
+              runFallback preservingIssue
+          | otherwise ->
+              pure (Left (MrhsiPreservingFailed preservingIssue))
+    StoppedAudioOnly -> do
+      stopped <- runStopped
+      pure $ case stopped of
+        Left issue ->
+          Left (MrhsiStoppedAudioFailed issue)
+        Right () ->
+          Right MrhsrStoppedAudio
+  where
+    runPreserving =
+      reloadManifestPreservingHost producer config doc catalog request
+
+    runStopped =
+      reloadManifestStoppedAudioHost config doc catalog request
+
+    runFallback preservingIssue = do
+      stopped <- runStopped
+      pure $ case stopped of
+        Left stoppedIssue ->
+          Left
+            (MrhsiFallbackStoppedAudioFailed
+              preservingIssue
+              stoppedIssue)
+        Right () ->
+          Right
+            (MrhsrStoppedAudioAfterPreservingRejected preservingIssue)
+
 mapReloadIssue
   :: SessionFanInReloadIssue
   -> HostStoppedAudioReloadFailure (ManifestReloadHostIssue ingressIssue)
@@ -355,6 +454,37 @@ mapReloadIssue issue =
       HsarfOldOwnerStillInstalled (MrhiReload issue)
     noOwner =
       HsarfNoOwner (MrhiReload issue)
+
+preservingAllowsStoppedAudioFallback
+  :: HostPreservingReloadIssue issue
+  -> Bool
+preservingAllowsStoppedAudioFallback issue =
+  -- Conservative fallback gate: only a plain preserving reload
+  -- rejection proves old ingress resumed and the old owner is still the
+  -- live graph. Drain/quiesce failures may have pending work or only a
+  -- partially recovered ingress surface, and post-install failures have
+  -- already changed the live owner.
+  case issue of
+    HpariReloadRejected {} ->
+      True
+    HpariPlanRejected {} ->
+      False
+    HpariQuiesceRejected {} ->
+      False
+    HpariQuiesceRejectedResumeFailed {} ->
+      False
+    HpariDrainRejected {} ->
+      False
+    HpariDrainRejectedResumeFailed {} ->
+      False
+    HpariDrainFailedTerminal {} ->
+      False
+    HpariReloadRejectedResumeFailed {} ->
+      False
+    HpariReloadFailedTerminal {} ->
+      False
+    HpariIngressRestartFailed {} ->
+      False
 
 mapPreservingReloadReport
   :: ManifestPreservingHotSwapReport

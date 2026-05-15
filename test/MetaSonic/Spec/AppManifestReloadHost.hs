@@ -1,5 +1,4 @@
--- | Deterministic tests for the host-facing stopped-audio manifest
--- reload command.
+-- | Deterministic tests for host-facing manifest reload commands.
 
 module MetaSonic.Spec.AppManifestReloadHost where
 
@@ -428,6 +427,212 @@ appManifestReloadHostTests =
           , AudioReady 100
           , IngressClosed initialHandle
           ]
+
+  , testCase "strategy stopped-audio-only runs stopped-audio reload" $
+      withHostFixture initialTestIngressState $ \fixture -> do
+        started <- startFixtureAudio fixture
+        started @?= Right ()
+        outcome <-
+          reloadStrategyFixture
+            StoppedAudioOnly
+            fixture
+            (hfRequest fixture)
+        snapshot <- readSessionFanInService (hfService fixture)
+        ingressSnapshot <-
+          readManifestReloadIngressManager (hfIngressManager fixture)
+        events <- readIORef (hfEvents fixture)
+        outcome @?= Right MrhsrStoppedAudio
+        ssGraph (sfisOwnerState snapshot) @?=
+          MR.mrcTemplateGraph (hfNewEntry fixture)
+        sfisAudioRunning snapshot @?= True
+        ingressSnapshot @?= MrisOpen NewTarget (TestHandle 1 NewTarget)
+        events @?=
+          [ AudioStart 2 (-1)
+          , AudioReady 100
+          , IngressClosed initialHandle
+          , AudioStop
+          , AudioStart 2 (-1)
+          , AudioReady 100
+          , IngressOpened (TestHandle 1 NewTarget)
+          ]
+
+  , testCase "strategy require-preserving rejects without stopped-audio fallback" $
+      withHostFixture initialTestIngressState $ \fixture -> do
+        started <- startFixtureAudio fixture
+        started @?= Right ()
+        outcome <-
+          reloadStrategyFixture
+            RequirePreserving
+            fixture
+            (hfRequest fixture)
+        snapshot <- readSessionFanInService (hfService fixture)
+        ingressSnapshot <-
+          readManifestReloadIngressManager (hfIngressManager fixture)
+        events <- readIORef (hfEvents fixture)
+        case outcome of
+          Left
+            (MrhsiPreservingFailed
+              issue@(HpariReloadRejected (MrhiPreservingReloadRejected report))) -> do
+                assertPreservingRuntimeRejected report
+                issue @?= HpariReloadRejected (MrhiPreservingReloadRejected report)
+          other ->
+            assertFailure
+              ("expected require-preserving rejection, got: " <> show other)
+        ssGraph (sfisOwnerState snapshot) @?=
+          MR.mrcTemplateGraph (hfOldEntry fixture)
+        sfisAudioRunning snapshot @?= True
+        ingressSnapshot @?= MrisOpen OldTarget (TestHandle 1 OldTarget)
+        events @?=
+          [ AudioStart 2 (-1)
+          , AudioReady 100
+          , IngressClosed initialHandle
+          , IngressOpened (TestHandle 1 OldTarget)
+          ]
+
+  , testCase "strategy try-preserving falls back to stopped-audio after retryable rejection" $
+      withHostFixture initialTestIngressState $ \fixture -> do
+        started <- startFixtureAudio fixture
+        started @?= Right ()
+        outcome <-
+          reloadStrategyFixture
+            TryPreservingThenStoppedAudio
+            fixture
+            (hfRequest fixture)
+        snapshot <- readSessionFanInService (hfService fixture)
+        ingressSnapshot <-
+          readManifestReloadIngressManager (hfIngressManager fixture)
+        events <- readIORef (hfEvents fixture)
+        case outcome of
+          Right
+            (MrhsrStoppedAudioAfterPreservingRejected
+              (HpariReloadRejected (MrhiPreservingReloadRejected report))) ->
+                assertPreservingRuntimeRejected report
+          other ->
+            assertFailure
+              ("expected preserving-to-stopped fallback success, got: "
+               <> show other)
+        ssGraph (sfisOwnerState snapshot) @?=
+          MR.mrcTemplateGraph (hfNewEntry fixture)
+        sfisAudioRunning snapshot @?= True
+        ingressSnapshot @?= MrisOpen NewTarget (TestHandle 2 NewTarget)
+        events @?=
+          [ AudioStart 2 (-1)
+          , AudioReady 100
+          , IngressClosed initialHandle
+          , IngressOpened (TestHandle 1 OldTarget)
+          , IngressClosed (TestHandle 1 OldTarget)
+          , AudioStop
+          , AudioStart 2 (-1)
+          , AudioReady 100
+          , IngressOpened (TestHandle 2 NewTarget)
+          ]
+
+  , testCase "strategy try-preserving preserves stopped-audio failure cause after fallback" $
+      withHostFixture
+        initialTestIngressState
+          { tisFailOpen = Just NewTarget
+          }
+        $ \fixture -> do
+            started <- startFixtureAudio fixture
+            started @?= Right ()
+            outcome <-
+              reloadStrategyFixture
+                TryPreservingThenStoppedAudio
+                fixture
+                (hfRequest fixture)
+            snapshot <- readSessionFanInService (hfService fixture)
+            ingressSnapshot <-
+              readManifestReloadIngressManager (hfIngressManager fixture)
+            events <- readIORef (hfEvents fixture)
+            case outcome of
+              Left
+                (MrhsiFallbackStoppedAudioFailed
+                  (HpariReloadRejected
+                    (MrhiPreservingReloadRejected report))
+                  (HsariListenerRestartFailed
+                    (MrhiIngress (TestOpenFailed NewTarget)))) ->
+                      assertPreservingRuntimeRejected report
+              other ->
+                assertFailure
+                  ("expected fallback listener failure with both causes, got: "
+                   <> show other)
+            ssGraph (sfisOwnerState snapshot) @?=
+              MR.mrcTemplateGraph (hfNewEntry fixture)
+            sfisAudioRunning snapshot @?= False
+            ingressSnapshot @?= MrisClosed
+            events @?=
+              [ AudioStart 2 (-1)
+              , AudioReady 100
+              , IngressClosed initialHandle
+              , IngressOpened (TestHandle 1 OldTarget)
+              , IngressClosed (TestHandle 1 OldTarget)
+              , AudioStop
+              , AudioStart 2 (-1)
+              , AudioReady 100
+              , IngressOpenFailed NewTarget
+              , AudioStop
+              ]
+
+  , testCase "strategy try-preserving does not fall back after preserving installs graph" $
+      withPreservingHostFixture
+        initialTestIngressState
+          { tisFailOpen = Just NewTarget
+          }
+        $ \fixture -> do
+            started <- startFixtureAudio fixture
+            started @?= Right ()
+            startPreservingVoice fixture
+            outcome <-
+              reloadStrategyFixture
+                TryPreservingThenStoppedAudio
+                fixture
+                (hfRequest fixture)
+            snapshot <- readSessionFanInService (hfService fixture)
+            ingressSnapshot <-
+              readManifestReloadIngressManager (hfIngressManager fixture)
+            events <- readIORef (hfEvents fixture)
+            outcome @?=
+              Left
+                (MrhsiPreservingFailed
+                  (HpariIngressRestartFailed
+                    (MrhiIngress (TestOpenFailed NewTarget))))
+            ssGraph (sfisOwnerState snapshot) @?=
+              MR.mrcTemplateGraph (hfNewEntry fixture)
+            assertBool
+              "expected active voice to survive preserving reload"
+              (M.member preservingVoiceKey (ssVoices (sfisOwnerState snapshot)))
+            sfisAudioRunning snapshot @?= True
+            ingressSnapshot @?= MrisClosed
+            events @?=
+              [ AudioStart 2 (-1)
+              , AudioReady 100
+              , IngressClosed initialHandle
+              , IngressOpenFailed NewTarget
+              ]
+
+  , testCase "strategy fallback gate allows only plain preserving reload rejection" $ do
+      let allowed =
+            HpariReloadRejected strategyProbeIssue
+          rejected =
+            [ HpariPlanRejected strategyProbeIssue
+            , HpariQuiesceRejected strategyProbeIssue
+            , HpariQuiesceRejectedResumeFailed
+                strategyProbeIssue
+                strategyProbeIssue
+            , HpariDrainRejected strategyProbeIssue
+            , HpariDrainRejectedResumeFailed
+                strategyProbeIssue
+                strategyProbeIssue
+            , HpariDrainFailedTerminal strategyProbeIssue
+            , HpariReloadRejectedResumeFailed
+                strategyProbeIssue
+                strategyProbeIssue
+            , HpariReloadFailedTerminal strategyProbeIssue
+            , HpariIngressRestartFailed strategyProbeIssue
+            ]
+      preservingAllowsStoppedAudioFallback allowed @?= True
+      map preservingAllowsStoppedAudioFallback rejected @?=
+        replicate (length rejected) False
   ]
 
 withHostFixture
@@ -559,6 +764,23 @@ reloadPreservingFixture
 reloadPreservingFixture fixture =
   reloadManifestPreservingHost
     preservingReloadProducer
+    (fixtureConfig fixture)
+    (hfDoc fixture)
+    (hfCatalog fixture)
+
+reloadStrategyFixture
+  :: ManifestReloadHostStrategy
+  -> HostFixture
+  -> MR.ManifestReloadRequest
+  -> IO (Either
+          (ManifestReloadHostStrategyIssue
+            (ManifestReloadHostIssue TestIngressIssue))
+          (ManifestReloadHostStrategyRan
+            (ManifestReloadHostIssue TestIngressIssue)))
+reloadStrategyFixture strategy fixture =
+  reloadManifestHostWithStrategy
+    preservingReloadProducer
+    strategy
     (fixtureConfig fixture)
     (hfDoc fixture)
     (hfCatalog fixture)
@@ -722,6 +944,10 @@ preservingVoiceOnCommand =
     (TemplateName "drone")
     preservingVoiceKey
     [(ControlTag (MigrationKey "lpf") 0, 1500.0)]
+
+strategyProbeIssue :: ManifestReloadHostIssue TestIngressIssue
+strategyProbeIssue =
+  MrhiPlanning (MR.MriUnknownManifestDemo "probe")
 
 preservingOldEntry :: MR.ManifestReloadCatalogEntry
 preservingOldEntry = MR.ManifestReloadCatalogEntry
