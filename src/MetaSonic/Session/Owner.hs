@@ -39,6 +39,7 @@ module MetaSonic.Session.Owner
   , acquireSessionOwner
   , releaseSessionOwner
   , sessionOwnerHandleOwner
+  , sessionOwnerHandleRTGraph
   , stepSessionOwner
   , sessionOwnerState
   , sessionOwnerStatus
@@ -211,6 +212,16 @@ releaseSessionOwner =
 sessionOwnerHandleOwner :: SessionOwnerHandle -> SessionOwner
 sessionOwnerHandleOwner =
   sohOwner
+
+-- | Borrow the underlying RTGraph pointer from a live handle.
+--
+-- This is intended for session-layer audio lifecycle helpers that need to
+-- call 'startAudio' / 'stopAudio' / 'waitAudioStarted' against the current
+-- owner's RTGraph. The pointer must not be retained past the operation;
+-- it becomes invalid after the handle is released or replaced.
+sessionOwnerHandleRTGraph :: SessionOwnerHandle -> Ptr RTGraph
+sessionOwnerHandleRTGraph =
+  sohRTGraph
 
 -- | Read the last pure session state known to agree with the runtime.
 --

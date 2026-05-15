@@ -9,7 +9,8 @@
 -- This module defines Session Prep P's generic producer fan-in
 -- boundary. It owns a reloadable 'SessionOwner' generation and one
 -- bounded 'SessionCommandQueue', then serializes enqueue, drain,
--- snapshot, and owner-reload admission behind an 'MVar'.
+-- snapshot, owner-reload admission, and current-owner audio
+-- lifecycle behind an 'MVar'.
 --
 -- It does not parse OSC, read MIDI, create a background worker, define
 -- a realtime clock, or add a new runtime queue. Concrete producers can
@@ -32,12 +33,22 @@ module MetaSonic.Session.FanIn
   , SessionFanInSetupIssue (..)
   , SessionFanInReloadStatus (..)
   , SessionFanInReloadIssue (..)
+  , SessionFanInAudioIssue (..)
 
     -- * Operation reports
   , SessionFanInEnqueueResult (..)
   , SessionFanInDrainResult (..)
   , SessionFanInSnapshot (..)
   , SessionFanInReloadReport (..)
+
+    -- * Audio lifecycle
+  , SessionFanInAudioOptions (..)
+  , SessionFanInAudioFFI (..)
+  , defaultSessionFanInAudioFFI
+  , startSessionFanInHostAudio
+  , startSessionFanInHostAudioWith
+  , stopSessionFanInHostAudio
+  , stopSessionFanInHostAudioWith
 
     -- * Scoped host
   , withSessionFanInHost
@@ -53,8 +64,11 @@ import           Control.Exception               (finally, mask,
                                                   onException)
 import           Control.DeepSeq                 (NFData)
 import           Control.Monad                   (forM_)
+import           Foreign.Ptr                     (Ptr)
 import           GHC.Generics                    (Generic)
 
+import qualified MetaSonic.Bridge.FFI            as FFI
+import           MetaSonic.Bridge.FFI            (RTGraph)
 import           MetaSonic.Bridge.Templates      (TemplateGraph)
 import           MetaSonic.Session.AdapterIssue  (SessionAdapterSetupIssue)
 import           MetaSonic.Session.Command       (SessionCommand)
@@ -65,8 +79,9 @@ import           MetaSonic.Session.Owner         (SessionOwnerDivergence (..),
                                                   acquireSessionOwner,
                                                   defaultSessionOwnerOptions,
                                                   releaseSessionOwner,
-                                                  sessionOwnerState,
                                                   sessionOwnerHandleOwner,
+                                                  sessionOwnerHandleRTGraph,
+                                                  sessionOwnerState,
                                                   sessionOwnerStatus)
 import           MetaSonic.Session.Queue         (ProducerId,
                                                   SessionCommandQueue,
@@ -97,6 +112,7 @@ data SessionFanInHostState = SessionFanInHostState
   { sfihsOwner        :: !(Maybe SessionOwnerHandle)
   , sfihsQueue        :: !SessionCommandQueue
   , sfihsReloadStatus :: !SessionFanInReloadStatus
+  , sfihsAudioRunning :: !Bool
   , sfihsLastState    :: !SessionState
   , sfihsLastStatus   :: !SessionOwnerStatus
   }
@@ -149,8 +165,54 @@ data SessionFanInReloadStatus
 data SessionFanInReloadIssue
   = SfriReloadAlreadyInProgress
   | SfriQueueNotEmpty !Int
+  | SfriAudioStillRunning
   | SfriNoOwner
   | SfriOwnerSetupFailed !SessionAdapterSetupIssue
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
+-- | Audio-lifecycle configuration for the current fan-in owner.
+--
+-- The host (not the session layer) supplies these per call; the fan-in
+-- host does not retain audio configuration across owner replacement.
+data SessionFanInAudioOptions = SessionFanInAudioOptions
+  { sfiaoOutputChannels :: !Int
+  , sfiaoDeviceID       :: !Int
+  , sfiaoReadyTimeoutMs :: !Int
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Injected FFI entry points for current-owner audio lifecycle.
+--
+-- Production code uses 'defaultSessionFanInAudioFFI'. Tests inject mocks
+-- so the audio state machine is observable without PortAudio.
+data SessionFanInAudioFFI = SessionFanInAudioFFI
+  { saffiStartAudio       :: !(Ptr RTGraph -> Int -> Int -> IO Int)
+  , saffiWaitAudioStarted :: !(Ptr RTGraph -> Int -> IO Bool)
+  , saffiStopAudio        :: !(Ptr RTGraph -> IO ())
+  }
+
+-- | Real-FFI audio entry points.
+defaultSessionFanInAudioFFI :: SessionFanInAudioFFI
+defaultSessionFanInAudioFFI = SessionFanInAudioFFI
+  { saffiStartAudio       = FFI.startAudio
+  , saffiWaitAudioStarted = FFI.waitAudioStarted
+  , saffiStopAudio        = FFI.stopAudio
+  }
+
+-- | Current-owner audio lifecycle failures.
+data SessionFanInAudioIssue
+  = SfaiNoOwner
+  | SfaiReloadInProgress
+  | SfaiAudioAlreadyRunning
+  | SfaiAudioAlreadyStopped
+  | SfaiStartFailed !Int
+    -- ^ Underlying 'startAudio' returned a nonzero status code.
+  | SfaiReadyTimeout
+    -- ^ 'startAudio' accepted, but the runtime did not flip to
+    -- audio-running within the configured ready timeout. The helper
+    -- calls 'stopAudio' before returning so PortAudio is not left in an
+    -- indeterminate state.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -174,6 +236,7 @@ data SessionFanInSnapshot = SessionFanInSnapshot
   , sfisOwnerState   :: !SessionState
   , sfisOwnerStatus  :: !SessionOwnerStatus
   , sfisReloadStatus :: !SessionFanInReloadStatus
+  , sfisAudioRunning :: !Bool
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -222,6 +285,8 @@ withSessionFanInHostHooks hooks graph opts action =
                   queue
               , sfihsReloadStatus =
                   SessionFanInNormalOperation
+              , sfihsAudioRunning =
+                  False
               , sfihsLastState =
                   initialSessionState graph
               , sfihsLastStatus =
@@ -364,16 +429,142 @@ readSessionFanInHost host =
               ownerStatus
           , sfisReloadStatus =
               sfihsReloadStatus hostState'
+          , sfisAudioRunning =
+              sfihsAudioRunning hostState'
           }
       )
+
+-- | Start audio on the fan-in host's current owner.
+--
+-- Validates that an owner is installed, reload is not in progress, and
+-- audio is not already running. The fan-in state transitions to
+-- audio-running under the admission lock /before/ any FFI call runs,
+-- so a concurrent 'reloadSessionFanInHostOwnerStoppedAudio' cannot
+-- admit during the FFI window. On failure after admission the helper
+-- attempts to stop audio: if cleanup 'stopAudio' returns successfully
+-- the audio flag is reverted to False; if cleanup 'stopAudio' fails
+-- (throws or is interrupted), the flag stays True and the exception
+-- propagates, so a later reload fails closed with
+-- 'SfriAudioStillRunning' rather than disposing the owner while the
+-- C++ stream might still be live.
+--
+-- Bundles a wait-for-callback-ready step; returns 'SfaiReadyTimeout' if
+-- the configured timeout elapses, after issuing 'stopAudio' to avoid
+-- leaving PortAudio in an indeterminate state.
+startSessionFanInHostAudio
+  :: SessionFanInHost
+  -> SessionFanInAudioOptions
+  -> IO (Either SessionFanInAudioIssue ())
+startSessionFanInHostAudio =
+  startSessionFanInHostAudioWith defaultSessionFanInAudioFFI
+
+-- | 'startSessionFanInHostAudio' with injected FFI; intended for tests.
+startSessionFanInHostAudioWith
+  :: SessionFanInAudioFFI
+  -> SessionFanInHost
+  -> SessionFanInAudioOptions
+  -> IO (Either SessionFanInAudioIssue ())
+startSessionFanInHostAudioWith ffi host opts = mask $ \restore -> do
+  admitted <- modifyMVar (sfihState host) $ \hostState ->
+    case (sfihsReloadStatus hostState, sfihsOwner hostState, sfihsAudioRunning hostState) of
+      (SessionFanInReloadInProgress, _, _) ->
+        pure (hostState, Left SfaiReloadInProgress)
+      (SessionFanInReloadFailed, _, _) ->
+        pure (hostState, Left SfaiNoOwner)
+      (SessionFanInNormalOperation, Nothing, _) ->
+        pure (hostState, Left SfaiNoOwner)
+      (SessionFanInNormalOperation, Just _, True) ->
+        pure (hostState, Left SfaiAudioAlreadyRunning)
+      (SessionFanInNormalOperation, Just owner, False) ->
+        pure
+          ( hostState { sfihsAudioRunning = True }
+          , Right owner
+          )
+  case admitted of
+    Left issue ->
+      pure (Left issue)
+    Right ownerHandle -> do
+      let rt          = sessionOwnerHandleRTGraph ownerHandle
+          markStopped = setSessionFanInAudioRunning host False
+          -- Cleanup is fail-closed: only flip the host to audio-stopped
+          -- after stopAudio has returned successfully. If the cleanup
+          -- stopAudio throws or is interrupted, the audio-running flag
+          -- stays True so a later reload rejects with
+          -- SfriAudioStillRunning rather than disposing the owner while
+          -- the C++ stream might still be live.
+          stopAndMark = saffiStopAudio ffi rt >> markStopped
+      rc <- restore (saffiStartAudio ffi rt
+                       (sfiaoOutputChannels opts)
+                       (sfiaoDeviceID opts))
+              `onException` stopAndMark
+      if rc /= 0
+        then do
+          markStopped
+          pure (Left (SfaiStartFailed rc))
+        else do
+          ready <- restore
+                     (saffiWaitAudioStarted ffi rt
+                        (sfiaoReadyTimeoutMs opts))
+                     `onException` stopAndMark
+          if ready
+            then pure (Right ())
+            else do
+              stopAndMark
+              pure (Left SfaiReadyTimeout)
+
+-- | Stop audio on the fan-in host's current owner.
+--
+-- Validates that an owner is installed, reload is not in progress, and
+-- audio is currently running. The audio-running flag is cleared only
+-- /after/ 'stopAudio' returns successfully. If 'stopAudio' is
+-- interrupted, the flag stays True and the caller can retry — fail
+-- closed against a stale "stopped" state that would let reload dispose
+-- the owner while the C++ callback might still be live.
+stopSessionFanInHostAudio
+  :: SessionFanInHost
+  -> IO (Either SessionFanInAudioIssue ())
+stopSessionFanInHostAudio =
+  stopSessionFanInHostAudioWith defaultSessionFanInAudioFFI
+
+-- | 'stopSessionFanInHostAudio' with injected FFI; intended for tests.
+stopSessionFanInHostAudioWith
+  :: SessionFanInAudioFFI
+  -> SessionFanInHost
+  -> IO (Either SessionFanInAudioIssue ())
+stopSessionFanInHostAudioWith ffi host = mask $ \restore -> do
+  admitted <- modifyMVar (sfihState host) $ \hostState ->
+    case (sfihsReloadStatus hostState, sfihsOwner hostState, sfihsAudioRunning hostState) of
+      (SessionFanInReloadInProgress, _, _) ->
+        pure (hostState, Left SfaiReloadInProgress)
+      (SessionFanInReloadFailed, _, _) ->
+        pure (hostState, Left SfaiNoOwner)
+      (SessionFanInNormalOperation, Nothing, _) ->
+        pure (hostState, Left SfaiNoOwner)
+      (SessionFanInNormalOperation, Just _, False) ->
+        pure (hostState, Left SfaiAudioAlreadyStopped)
+      (SessionFanInNormalOperation, Just owner, True) ->
+        pure (hostState, Right owner)
+  case admitted of
+    Left issue ->
+      pure (Left issue)
+    Right ownerHandle -> do
+      let rt = sessionOwnerHandleRTGraph ownerHandle
+      restore (saffiStopAudio ffi rt)
+      setSessionFanInAudioRunning host False
+      pure (Right ())
+
+setSessionFanInAudioRunning :: SessionFanInHost -> Bool -> IO ()
+setSessionFanInAudioRunning host running =
+  modifyMVar (sfihState host) $ \hostState ->
+    pure (hostState { sfihsAudioRunning = running }, ())
 
 -- | Replace the current owner after the host has stopped audio,
 -- quiesced producers, and drained the queue.
 --
--- The helper enforces only the precondition it can observe: the
--- queue must be empty and the host must be in normal operation. It
--- does not call start/stop audio, drain accepted commands, or reset
--- producer/listener state.
+-- The helper enforces only the preconditions it can observe: audio
+-- must be stopped, the queue must be empty, and the host must be in
+-- normal operation. It does not call start/stop audio, drain accepted
+-- commands, or reset producer/listener state.
 reloadSessionFanInHostOwnerStoppedAudio
   :: SessionFanInHost
   -> TemplateGraph
@@ -392,6 +583,8 @@ reloadSessionFanInHostOwnerStoppedAudio host graph opts = mask $ \_restore -> do
           Nothing ->
             pure (hostState, Left SfriNoOwner)
           Just ownerHandle
+            | sfihsAudioRunning hostState ->
+                pure (hostState, Left SfriAudioStillRunning)
             | queueDepth /= 0 ->
                 pure (hostState, Left (SfriQueueNotEmpty queueDepth))
             | otherwise ->
