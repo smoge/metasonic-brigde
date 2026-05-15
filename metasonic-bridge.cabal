@@ -132,6 +132,8 @@ executable metasonic-bridge
       MetaSonic.App.FusionCostLab
       MetaSonic.App.FusionCostModel
       MetaSonic.App.ManifestReloadCli
+      MetaSonic.App.ManifestReloadOrchestration
+      MetaSonic.App.ManifestReloadSupervisor
       MetaSonic.App.Osc
       MetaSonic.App.ProfitabilityGate
       MetaSonic.App.SessionMidiSmoke
@@ -168,7 +170,11 @@ test-suite metasonic-bridge-test
   other-modules:
       MetaSonic.App.Demos
       MetaSonic.App.ManifestReloadCli
+      MetaSonic.App.ManifestReloadOrchestration
+      MetaSonic.App.ManifestReloadSupervisor
       MetaSonic.Spec.AppManifestReloadCli
+      MetaSonic.Spec.AppManifestReloadOrchestration
+      MetaSonic.Spec.AppManifestReloadSupervisor
       MetaSonic.Spec.AppDemos
       MetaSonic.Spec.Core
       MetaSonic.Spec.Driver
