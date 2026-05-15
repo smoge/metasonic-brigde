@@ -3450,8 +3450,17 @@ optional CC), and `MetaSonic.App.ManifestReloadOSCIngress.submitManifestOSCMessa
 consumes a received `OscMessage`, runs it through the existing
 symbolic decoder, validates the tag against the projection, and
 forwards accepted writes through `MetaSonic.Session.OSCProducer`
-without opening a UDP socket. MIDI ingress projection and a real
-device-backed listener lifecycle remain gated.
+without opening a UDP socket. The MIDI pair is also landed:
+`MetaSonic.App.ManifestReloadMIDIBinding` projects the plan into a pure
+`ManifestMIDIIngressTarget` that carries only controls with
+`mcsCC = Just`, a CC routing table keyed by CC number, and a
+caller-supplied default voice key; duplicate CC numbers reject at
+projection time. `MetaSonic.App.ManifestReloadMIDIIngress.submitManifestMIDICCEvent`
+consumes a decoded MIDI CC event, validates channel and data bytes,
+scales the 7-bit value through the binding's range, and enqueues one
+`CmdControlWrite` against the default voice under `midiProducerId`
+without opening a PortMIDI device. A real device-backed listener
+lifecycle remains gated.
 
 Still gated:
 
@@ -3460,8 +3469,9 @@ Still gated:
   non-audio stopped-audio owner-swap helper plus smoke CLI, app-level
   stopped-audio and preserving host reload paths, explicit host
   strategy selector, operator-visible non-device strategy smoke CLI,
-  pure UI ingress projection plus UI producer binding, and pure OSC
-  ingress projection plus no-socket OSC producer consumer,
+  pure UI ingress projection plus UI producer binding, pure OSC
+  ingress projection plus no-socket OSC producer consumer, and pure
+  MIDI CC ingress projection plus no-device MIDI producer consumer,
   broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
@@ -3495,12 +3505,13 @@ Still gated:
   stopped-audio/preserving host orchestration, explicit strategy
   selector, operator-visible non-device strategy smoke CLI, pure UI
   ingress projection plus UI producer binding, pure OSC ingress
-  projection plus no-socket OSC producer consumer, host orchestration
-  design note, and host supervisor / recovery policy design note.
-  Remaining work is a concrete MIDI ingress projection plus its
-  producer binding, a real device-backed listener lifecycle (UDP
-  socket for OSC, PortMIDI device for MIDI), device-backed smoke
-  coverage, and resource/allocation recovery events.
+  projection plus no-socket OSC producer consumer, pure MIDI CC
+  ingress projection plus no-device MIDI producer consumer, host
+  orchestration design note, and host supervisor / recovery policy
+  design note. Remaining work is a real device-backed listener
+  lifecycle (UDP socket for OSC, PortMIDI device for MIDI),
+  device-backed smoke coverage, and resource/allocation recovery
+  events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

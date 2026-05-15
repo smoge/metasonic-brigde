@@ -13,6 +13,8 @@ import           MetaSonic.Spec.AppManifestReloadBinding
 import           MetaSonic.Spec.AppManifestReloadCli
 import           MetaSonic.Spec.AppManifestReloadHost
 import           MetaSonic.Spec.AppManifestReloadIngress
+import           MetaSonic.Spec.AppManifestReloadMIDIBinding
+import           MetaSonic.Spec.AppManifestReloadMIDIIngress
 import           MetaSonic.Spec.AppManifestReloadOrchestration
 import           MetaSonic.Spec.AppManifestReloadOSCBinding
 import           MetaSonic.Spec.AppManifestReloadOSCIngress
@@ -33,6 +35,8 @@ main = defaultMain $ testGroup "MetaSonic"
   , appManifestReloadCliTests
   , appManifestReloadHostTests
   , appManifestReloadIngressTests
+  , appManifestReloadMIDIBindingTests
+  , appManifestReloadMIDIIngressTests
   , appManifestReloadOrchestrationTests
   , appManifestReloadOSCBindingTests
   , appManifestReloadOSCIngressTests

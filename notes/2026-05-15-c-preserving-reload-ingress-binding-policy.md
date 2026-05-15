@@ -19,8 +19,14 @@ reload. The OSC pair has also landed as
 no-socket consumer `MetaSonic.App.ManifestReloadOSCIngress` that
 decodes a received `OscMessage` through the existing symbolic parser,
 validates the tag against the projection, and forwards through
-`MetaSonic.Session.OSCProducer`. MIDI remains ahead of this note;
-device-backed listener lifecycle also remains ahead.
+`MetaSonic.Session.OSCProducer`. The MIDI pair has also landed as
+`MetaSonic.App.ManifestReloadMIDIBinding.ManifestMIDIIngressTarget`
+plus a no-device consumer `MetaSonic.App.ManifestReloadMIDIIngress`
+that projects only controls with `mcsCC = Just`, rejects duplicate CC
+numbers at projection time, scales 7-bit CC values through the
+binding range, and enqueues `CmdControlWrite` against a
+producer-configured default voice under `midiProducerId`. Real
+device-backed listener lifecycle remains ahead.
 
 ## The question
 
@@ -55,10 +61,11 @@ listener/producer surface concretely looks like per producer kind.
   not resumed on the old one.
 - `mrlpControlSurface` is captured in the plan, rendered by the CLI
   smoke, and consumed by the landed UI projection plus producer binding
-  (`ManifestUIIngressTarget` / `submitManifestUIIngress`) and the
-  landed OSC projection plus no-socket consumer
-  (`ManifestOSCIngressTarget` / `submitManifestOSCMessage`); MIDI has
-  no consumer yet.
+  (`ManifestUIIngressTarget` / `submitManifestUIIngress`), the landed
+  OSC projection plus no-socket consumer (`ManifestOSCIngressTarget` /
+  `submitManifestOSCMessage`), and the landed MIDI projection plus
+  no-device consumer (`ManifestMIDIIngressTarget` /
+  `submitManifestMIDICCEvent`).
 - `mrlpArbitrationPolicy` defaults to `FifoOnly`. The planner does not
   emit any other policy.
 - UI retain-across-reload is producer-local: the caller threads a
@@ -103,17 +110,25 @@ the path-supplied `VoiceKey`. Reload does not change this contract; the
 new address namespace is the union of surviving and new tags, and the
 voice component is always client-supplied.
 
-**MIDI ingress.** The fresh target is a CC routing table built from
-entries where `mcsCC` is `Just cc`. If the new manifest changes a tag's
-CC number, the old CC mapping is dropped and the new CC mapping is
-installed. If a tag drops its `mcsCC`, no MIDI binding exists for it
-after reload. The session's symbolic control write is what producers
-emit; the listener-local CC→tag table is what changes. `VoiceKey` for
-a MIDI CC has no caller-supplied source — v1 routes MIDI CCs to a
-producer-configured default voice key (typically the singleton fx
-voice), the same convention the current MIDI listener already uses.
-Per-channel-to-voice mapping is a producer-local concern, not a
-manifest concern.
+**MIDI ingress.** *Landed.* The fresh target is a CC routing table
+built from entries where `mcsCC` is `Just cc`, projected by
+`manifestMIDIIngressTargetFromPlan`. The projection rejects duplicate
+CC numbers at build time (`MmpiDuplicateCC` carries the colliding tags
+in manifest order). If the new manifest changes a tag's CC number, the
+old CC mapping is dropped and the new CC mapping is installed; if a
+tag drops its `mcsCC`, no MIDI binding exists for it after reload. The
+session's symbolic control write is what producers emit; the
+listener-local CC→tag table is what changes. `VoiceKey` for a MIDI CC
+has no caller-supplied source — v1 routes MIDI CCs to a
+producer-configured default voice carried on the target as
+`mmitDefaultVoice` (typically the singleton fx voice). The consumer
+`submitManifestMIDICCEvent` validates channel and data bytes, scales
+the 7-bit value through the binding's `[mmcbRangeMin, mmcbRangeMax]`
+range, and enqueues a single `CmdControlWrite` against the default
+voice under `midiProducerId` — bypassing the active-notes routing in
+`MIDIProducer.controlChange` because the v1 binding policy targets a
+fixed voice, not the currently-held notes. Per-channel-to-voice
+mapping remains a producer-local concern, not a manifest concern.
 
 **Arbitration.** The fresh target reads `mrlpArbitrationPolicy` and
 re-applies it to the session's arbitration layer. With `FifoOnly` the
@@ -134,25 +149,44 @@ until its binding has been rebuilt against the new control surface.
 
 These should be resolved before the first non-smoke listener lands:
 
-1. **Who derives `mrhcNewIngressTarget`?** A pure function over
-   `ManifestReloadPlan`? Built host-side per app? Both — pure projection
-   plus a host-supplied factory? For UI, the derived target must also
-   include the host's voice-selection policy, because `ManifestControlSurface`
-   alone cannot choose the `VoiceKey` for a control write. The strategy
-   CLI smoke ducks this by using opaque sentinel targets.
+1. **Who derives `mrhcNewIngressTarget`?** *Decided for per-producer
+   pure derivation; open for the combined real-listener
+   target/factory.* Pure per-producer projections are landed for all
+   three kinds (`manifestUIIngressTargetFromPlan`,
+   `manifestOSCIngressTargetFromPlan`,
+   `manifestMIDIIngressTargetFromPlan`), each taking the producer
+   policy that the manifest does not own (UI voice selection plus
+   retain map; MIDI default voice). What is still open is the combined
+   listener-shape target that the orchestrator's
+   `mrhcNewIngressTarget` carries — is it a record bundling the three,
+   a sum, or a host-supplied factory that owns device lifecycle and
+   yields them on open? The strategy CLI smoke ducks this by using
+   opaque sentinel targets.
 2. **Last-written value store for retain-across-reload.** *Decided for
-   UI; open for OSC/MIDI.* v1 retains surviving tags' last-written
-   values; the implementation shape for UI is producer-local
-   (`submitManifestUIIngress` threads a `Map ControlTag Value` in and
-   out, updating it only on accepted fan-in enqueue). Whether OSC and
-   MIDI use the same per-producer cache, share one, or read back from
-   the live owner's control state is still open — different choices
-   have different consistency guarantees when several producers wrote
-   to the same tag before reload.
-3. **MIDI mapping migration.** If a CC# moves from one tag to another
-   across reload, is the old CC silenced first, or does the new mapping
-   replace it atomically? Matters for hardware that holds CC values
-   between reloads.
+   UI and no-device MIDI; open for OSC and device-backed MIDI policy.*
+   v1 retains surviving tags' last-written values for UI: the
+   implementation is producer-local (`submitManifestUIIngress` threads
+   a `Map ControlTag Value` in and out, updating it only on accepted
+   fan-in enqueue). The no-device MIDI consumer carries no retain map
+   because CC values flow continuously from a device — the next CC
+   event replaces whatever the producer last wrote without needing a
+   producer-local cache. What remains open is whether OSC uses the
+   same per-producer cache shape as UI, shares one, or reads back from
+   the live owner's control state, and whether a device-backed MIDI
+   path will eventually want a snapshot (e.g. to seed a UI mirror at
+   reload time) — different choices have different consistency
+   guarantees when several producers wrote to the same tag before
+   reload.
+3. **MIDI mapping migration.** *Decided for the no-device slice.* The
+   reopen path closes the old ingress target before opening the new
+   one (the ingress manager is binary, not partial), so the old CC
+   table is structurally gone by the time the new table accepts
+   events. There is no "silence the old CC first" step inside the
+   projection itself. What is still open is operator UX: hardware that
+   holds a CC value between reloads will start emitting against the
+   new mapping on the operator's next nudge, with no replay of the
+   last value through the new tag — equivalent to UI's "new control
+   starts at manifest default" rule.
 4. **OSC subscription state.** Do bundle-listener subscriptions
    survive? If the address function is deterministic over `ControlTag`,
    subscriptions to surviving tags continue to work. Subscriptions to
