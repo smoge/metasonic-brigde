@@ -3472,9 +3472,13 @@ composes `withListenerLoop` with `submitManifestOSCMessage`, exposing
 both a bracketed `withManifestOSCListener` and a handle-style
 `openManifestOSCListener` / `closeManifestOSCListener` pair. Packets
 that target controls absent from the current manifest reject at the
-projection layer without enqueueing. Wiring this handle into
-`ManifestReloadIngressOps` (step 2) and a PortMIDI-backed MIDI
-listener remain gated.
+projection layer without enqueueing. Step 2 has also landed as
+`MetaSonic.App.ManifestOSCIngressOps.manifestOSCIngressOps`: an
+adapter from `ManifestReloadIngressTarget` to
+`ManifestReloadIngressOps` so the existing ingress manager drives a
+real UDP listener through `mitOSC target`. A PortMIDI-backed MIDI
+listener and the orchestration-level integration that swaps real OSC
+ingress across a preserving reload remain gated.
 
 Still gated:
 
@@ -3487,9 +3491,12 @@ Still gated:
   ingress projection plus no-socket OSC producer consumer, pure
   MIDI CC ingress projection plus no-device MIDI producer consumer,
   the combined `ManifestReloadIngressTarget` bundle that the strategy
-  smoke now opens, and the manifest-target-aware UDP OSC listener
+  smoke now opens, the manifest-target-aware UDP OSC listener
   (`MetaSonic.App.ManifestOSCListener`) with both bracketed and
-  handle-style entry points, broader MIDI behavior beyond the landed
+  handle-style entry points, and the
+  `MetaSonic.App.ManifestOSCIngressOps` adapter that drives a real
+  UDP listener through `ManifestReloadIngressOps`, broader MIDI
+  behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
@@ -3526,13 +3533,14 @@ Still gated:
   ingress projection plus no-device MIDI producer consumer, the
   combined `ManifestReloadIngressTarget` projection wired into the
   strategy CLI smoke, the manifest-target-aware UDP OSC listener
-  handle and its bracketed wrapper, host orchestration design note,
+  handle and its bracketed wrapper, the
+  `MetaSonic.App.ManifestOSCIngressOps` adapter wiring that listener
+  into `ManifestReloadIngressOps`, host orchestration design note,
   and host supervisor / recovery policy design note. Remaining work
-  is wiring the OSC listener handle into `ManifestReloadIngressOps`
-  so preserving reload closes old OSC ingress and opens fresh OSC
-  ingress for the new target, a PortMIDI device-backed listener
-  lifecycle, device-backed smoke coverage, and resource/allocation
-  recovery events.
+  is integrating that adapter into the strategy CLI smoke and the
+  preserving-reload orchestrator end-to-end, a PortMIDI device-backed
+  listener lifecycle, device-backed smoke coverage, and
+  resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

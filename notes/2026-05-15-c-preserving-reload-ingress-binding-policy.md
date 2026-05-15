@@ -28,7 +28,21 @@ received datagram is parsed, projection-validated against the supplied
 `ManifestOSCIngressTarget`, and either accepted into the OSC producer
 or dropped at the manifest layer — packets aimed at controls absent
 from the current manifest never reach `MetaSonic.Session.OSCProducer`.
-Wiring this handle into `ManifestReloadIngressOps` is step 2.
+
+Step 2 has also landed as
+`MetaSonic.App.ManifestOSCIngressOps.manifestOSCIngressOps`. It is an
+adapter from `ManifestReloadIngressTarget` to
+`ManifestReloadIngressOps`: `mrioOpenIngress` calls
+`openManifestOSCListener` against `mitOSC target`, packaging the
+listener handle plus its `ListenerInfo` into
+`ManifestOSCIngressHandle`; `mrioCloseIngress` calls
+`closeManifestOSCListener`; open failures surface as
+`MoioiOpenFailed`. The combined target's UI and MIDI projections ride
+through unchanged for future steps. Host-level tests prove that
+`openFreshManifestReloadIngress` against a different target really
+swaps device-backed OSC ingress (old paths reject, new paths accept),
+and that an open failure on a fresh reopen leaves the manager closed
+without dirtying the fan-in queue.
 
 The UI ingress projection has landed as
 `MetaSonic.App.ManifestReloadBinding.ManifestUIIngressTarget` plus a
@@ -47,9 +61,10 @@ plus a no-device consumer `MetaSonic.App.ManifestReloadMIDIIngress`
 that projects only controls with `mcsCC = Just`, rejects duplicate CC
 numbers at projection time, scales 7-bit CC values through the
 binding range, and enqueues `CmdControlWrite` against a
-producer-configured default voice under `midiProducerId`. Wiring the
-OSC listener handle into `ManifestReloadIngressOps` and a
-PortMIDI-backed MIDI lifecycle remain ahead.
+producer-configured default voice under `midiProducerId`. Integrating
+the OSC ingress-ops adapter into the strategy CLI smoke and the
+preserving-reload orchestrator end-to-end, plus a PortMIDI-backed MIDI
+lifecycle, remain ahead.
 
 ## The question
 
@@ -168,9 +183,10 @@ binding rebuild. The contract that this note pins is narrower: a
 concrete UI/OSC/MIDI listener cannot enqueue against the new graph
 until its binding has been rebuilt against the new control surface.
 
-## Open sub-questions blocking real listener wiring
+## Remaining ingress policy questions
 
-These should be resolved before the first non-smoke listener lands:
+These should be resolved before wiring more device-backed listener
+behavior:
 
 1. **Who derives `mrhcNewIngressTarget`?** *Decided.* Pure per-producer
    projections are landed for all three kinds
@@ -186,11 +202,13 @@ These should be resolved before the first non-smoke listener lands:
    can fail with `ManifestMIDIProjectionIssue` if MIDI CC numbers
    duplicate. The strategy CLI smoke now opens fresh ingress against
    this combined target instead of the UI-only sentinel it used
-   before. What remains gated to a future slice is whether a
-   host-supplied factory wrapping this projection plus device
-   lifecycle is needed once a real OSC UDP listener and a real
-   PortMIDI device land — likely yes, but that wrapping is host
-   policy, not manifest policy.
+   before. The OSC listener has also landed plus its
+   `ManifestReloadIngressOps` adapter
+   (`MetaSonic.App.ManifestOSCIngressOps`), so the only remaining
+   factory question is whether a host-supplied wrapper around this
+   projection plus a PortMIDI device lifecycle is needed once MIDI
+   gets its own device-backed listener — likely yes, but that wrapping
+   is host policy, not manifest policy.
 2. **Last-written value store for retain-across-reload.** *Decided for
    UI and no-device MIDI; open for OSC and device-backed MIDI policy.*
    v1 retains surviving tags' last-written values for UI: the
