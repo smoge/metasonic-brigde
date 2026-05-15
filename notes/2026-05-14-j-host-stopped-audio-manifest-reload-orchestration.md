@@ -191,8 +191,9 @@ Preflight should also snapshot the host configuration needed for recovery:
 - active listener specifications, such as OSC port and MIDI source choice;
 - producer configuration, such as Pattern runner identity and UI producer
   identity;
-- the previous known-good startup plan, if the app wants a full rebuild
-  fallback.
+- the plan currently running (captured at reload entry as the supervisor's
+  rebuild fallback; see
+  `2026-05-14-k-host-reload-supervisor.md`).
 
 ### 2. Announce Reload Intent To The App Layer
 
@@ -413,10 +414,14 @@ Do not retry the same helper in place, because the current helper's failed
 state has no `ReloadFailed -> ReloadInProgress` transition and no owner to
 dispose.
 
-If a future app wants automatic recovery, it should use an outer host
-supervisor that can close the failed fan-in host bracket and build a fresh
-host from a preserved previous plan or from the requested plan. That is host
-teardown/rebuild, not in-place stopped-audio reload.
+Recovery beyond "keep audio stopped, keep ingress closed, report failure"
+is the host supervisor's job, not this command's. The supervisor's binding
+rules — rebuild only from the plan that was running at reload entry
+(captured per-reload, not accumulated state), one bounded recovery
+attempt, single active stack invariant, and escalate-on-second-failure
+— are pinned in `2026-05-14-k-host-reload-supervisor.md`. This command
+terminates with the failure value; the supervisor decides what to do
+next.
 
 ### Audio Restart Failure After Successful Owner Reload
 

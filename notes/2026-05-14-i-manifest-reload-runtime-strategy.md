@@ -9,8 +9,10 @@ construction smoke in `2026-05-14-h-manifest-session-construction-smoke.md`.
 This note pins the v1 reload contract; the landed implementation covers the
 session-layer helper and diagnostic CLI smoke only. The host-level
 stopped-audio orchestration sequence is pinned separately in
-`2026-05-14-j-host-stopped-audio-manifest-reload-orchestration.md`;
-audio-running reload implementation remains open.
+`2026-05-14-j-host-stopped-audio-manifest-reload-orchestration.md`, and
+the outer host supervisor and recovery policy in
+`2026-05-14-k-host-reload-supervisor.md`; audio-running reload
+implementation remains open.
 
 Implemented in the first helper slice:
 

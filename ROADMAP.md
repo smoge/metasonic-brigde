@@ -3409,8 +3409,12 @@ now pinned in
 [Host Stopped-Audio Manifest Reload Orchestration](notes/2026-05-14-j-host-stopped-audio-manifest-reload-orchestration.md):
 quiesce producers/listeners, drain while audio is live, stop audio, call the
 helper, restart audio on the new owner, reopen listener/producer brackets, and
-treat `SfriOwnerSetupFailed` as a terminal no-owner state requiring explicit
-host rebuild or process-level recovery.
+treat `SfriOwnerSetupFailed` as a terminal no-owner state. The outer
+recovery-policy contract — supervisor rebuilds only from the plan that
+was running at reload entry (captured as a per-reload local, not
+accumulated state), single bounded recovery attempt, single active
+stack invariant, escalate on second failure — is pinned separately in
+[Manifest Reload Host Supervisor And Recovery Policy](notes/2026-05-14-k-host-reload-supervisor.md).
 
 Still gated:
 
@@ -3447,7 +3451,8 @@ Still gated:
   allocation/recovery policy beyond the landed diagnostic planner,
   external JSON validation CLI, construction-time owner helper, and
   construction-smoke CLI, non-audio stopped-audio owner-swap helper and
-  smoke CLI, and host orchestration design note.
+  smoke CLI, host orchestration design note, and host supervisor /
+  recovery policy design note.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
