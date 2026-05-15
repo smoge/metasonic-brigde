@@ -67,9 +67,17 @@ OSC ingress path: `runManifestHostStrategyReloadSmokeWithCatalog`
 builds real `manifestOSCIngressOps`, performs a real initial open
 against the OSC projection (surfacing bind failure as a CLI-level
 `MrciOSCIngressOpenFailed`), and the rendered snapshot reports the
-bound UDP port via `oscPort=`. Running the full preserving-reload
-orchestrator with packet traffic before and after reload, plus a
-PortMIDI-backed MIDI lifecycle, remain ahead.
+bound UDP port via `oscPort=`. The first end-to-end packet-traffic
+test has also landed
+(`MetaSonic.Spec.AppManifestOSCReloadE2E`): it builds a two-entry
+custom catalog with disjoint control surfaces, sends a real UDP
+packet to the initial listener and observes acceptance, runs
+`reloadManifestHostWithStrategy TryPreservingThenStoppedAudio`
+(falls back to stopped-audio in the current empty-owner setup),
+then sends old-path and new-path packets to the post-reload listener
+and observes manifest rejection / acceptance respectively. A
+true-preserving variant with live-voice scaffolding and a
+PortMIDI-backed MIDI lifecycle remain ahead.
 
 ## The question
 

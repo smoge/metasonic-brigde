@@ -3504,8 +3504,11 @@ Still gated:
   UDP listener through `ManifestReloadIngressOps` and is now wired
   into the strategy CLI smoke (with a bound `oscPort=` rendered in
   the diagnostic output and a CLI-level `MrciOSCIngressOpenFailed`
-  surfacing real bind failure), broader MIDI behavior beyond the
-  landed
+  surfacing real bind failure), and the first end-to-end
+  packet-traffic test (`MetaSonic.Spec.AppManifestOSCReloadE2E`)
+  that runs `reloadManifestHostWithStrategy TryPreservingThenStoppedAudio`
+  with real UDP traffic before and after the swap, broader MIDI
+  behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
@@ -3546,12 +3549,16 @@ Still gated:
   `MetaSonic.App.ManifestOSCIngressOps` adapter wiring that listener
   into `ManifestReloadIngressOps` and the strategy CLI smoke's
   end-to-end use of that adapter (real initial open, real
-  closeOld + openFresh, bound `oscPort=` in the rendered output),
-  host orchestration design note, and host supervisor / recovery
-  policy design note. Remaining work is a full preserving-reload
-  orchestrator test that sends OSC packets across the reload, a
-  PortMIDI device-backed listener lifecycle, device-backed smoke
-  coverage, and resource/allocation recovery events.
+  closeOld + openFresh, bound `oscPort=` in the rendered output), the
+  first end-to-end packet-traffic test
+  (`MetaSonic.Spec.AppManifestOSCReloadE2E`) covering the
+  stopped-audio fallback path with real UDP traffic before and after
+  the swap, host orchestration design note, and host supervisor /
+  recovery policy design note. Remaining work is the true-preserving
+  variant of that end-to-end test (with live-voice scaffolding so
+  preserving actually commits instead of falling back), a PortMIDI
+  device-backed listener lifecycle, device-backed smoke coverage, and
+  resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

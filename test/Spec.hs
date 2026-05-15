@@ -11,6 +11,7 @@ import           Test.Tasty
 import           MetaSonic.Spec.AppDemos
 import           MetaSonic.Spec.AppManifestOSCIngressOps
 import           MetaSonic.Spec.AppManifestOSCListener
+import           MetaSonic.Spec.AppManifestOSCReloadE2E
 import           MetaSonic.Spec.AppManifestReloadBinding
 import           MetaSonic.Spec.AppManifestReloadCli
 import           MetaSonic.Spec.AppManifestReloadHost
@@ -36,6 +37,7 @@ main = defaultMain $ testGroup "MetaSonic"
   [ appDemoCatalogTests
   , appManifestOSCIngressOpsTests
   , appManifestOSCListenerTests
+  , appManifestOSCReloadE2ETests
   , appManifestReloadBindingTests
   , appManifestReloadCliTests
   , appManifestReloadHostTests

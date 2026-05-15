@@ -189,6 +189,7 @@ tests:
       - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.Spec.AppManifestOSCIngressOps
       - MetaSonic.Spec.AppManifestOSCListener
+      - MetaSonic.Spec.AppManifestOSCReloadE2E
       - MetaSonic.Spec.AppManifestReloadBinding
       - MetaSonic.Spec.AppManifestReloadCli
       - MetaSonic.Spec.AppManifestReloadHost
