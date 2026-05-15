@@ -61,6 +61,9 @@ osc-send value port="7000" host="127.0.0.1":
 stack-test:
     stack test
 
+notes-html:
+    ./tools/render_notes_html.sh
+
 cpp-configure:
     cmake -S . -B {{cpp_build_dir}} -G Ninja \
       -DCMAKE_BUILD_TYPE=Debug \
