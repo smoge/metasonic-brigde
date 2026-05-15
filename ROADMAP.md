@@ -3466,8 +3466,15 @@ into a single `ManifestReloadIngressTarget` record (UI + OSC + MIDI),
 and the strategy CLI smoke (`--manifest-host-reload-smoke`) opens fresh
 ingress against that combined target instead of the prior UI-only
 sentinel; duplicate-CC manifests fail target construction rather than
-opening a partial surface. A real device-backed listener lifecycle
-remains gated.
+opening a partial surface. Device-backed OSC step 1 has also landed as
+`MetaSonic.App.ManifestOSCListener`: a target-aware UDP listener that
+composes `withListenerLoop` with `submitManifestOSCMessage`, exposing
+both a bracketed `withManifestOSCListener` and a handle-style
+`openManifestOSCListener` / `closeManifestOSCListener` pair. Packets
+that target controls absent from the current manifest reject at the
+projection layer without enqueueing. Wiring this handle into
+`ManifestReloadIngressOps` (step 2) and a PortMIDI-backed MIDI
+listener remain gated.
 
 Still gated:
 
@@ -3479,8 +3486,10 @@ Still gated:
   pure UI ingress projection plus UI producer binding, pure OSC
   ingress projection plus no-socket OSC producer consumer, pure
   MIDI CC ingress projection plus no-device MIDI producer consumer,
-  and the combined `ManifestReloadIngressTarget` bundle that the
-  strategy smoke now opens, broader MIDI behavior beyond the landed
+  the combined `ManifestReloadIngressTarget` bundle that the strategy
+  smoke now opens, and the manifest-target-aware UDP OSC listener
+  (`MetaSonic.App.ManifestOSCListener`) with both bracketed and
+  handle-style entry points, broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
@@ -3516,11 +3525,14 @@ Still gated:
   projection plus no-socket OSC producer consumer, pure MIDI CC
   ingress projection plus no-device MIDI producer consumer, the
   combined `ManifestReloadIngressTarget` projection wired into the
-  strategy CLI smoke, host orchestration design note, and host
-  supervisor / recovery policy design note. Remaining work is a real
-  device-backed listener lifecycle (UDP socket for OSC, PortMIDI
-  device for MIDI), device-backed smoke coverage, and
-  resource/allocation recovery events.
+  strategy CLI smoke, the manifest-target-aware UDP OSC listener
+  handle and its bracketed wrapper, host orchestration design note,
+  and host supervisor / recovery policy design note. Remaining work
+  is wiring the OSC listener handle into `ManifestReloadIngressOps`
+  so preserving reload closes old OSC ingress and opens fresh OSC
+  ingress for the new target, a PortMIDI device-backed listener
+  lifecycle, device-backed smoke coverage, and resource/allocation
+  recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

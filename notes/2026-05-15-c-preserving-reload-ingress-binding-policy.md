@@ -18,6 +18,18 @@ projection composes the three per-producer projections below; duplicate
 CC numbers in the manifest surface as a construction failure so the
 orchestrator cannot open a partial surface.
 
+Step 1 of device-backed OSC has also landed as
+`MetaSonic.App.ManifestOSCListener`. It composes the existing UDP
+listener substrate (`MetaSonic.OSC.Listen.withListenerLoop`) with the
+manifest-target validator (`submitManifestOSCMessage`) and exposes both
+a bracketed `withManifestOSCListener` and a handle-style
+`openManifestOSCListener` / `closeManifestOSCListener` API. Each
+received datagram is parsed, projection-validated against the supplied
+`ManifestOSCIngressTarget`, and either accepted into the OSC producer
+or dropped at the manifest layer — packets aimed at controls absent
+from the current manifest never reach `MetaSonic.Session.OSCProducer`.
+Wiring this handle into `ManifestReloadIngressOps` is step 2.
+
 The UI ingress projection has landed as
 `MetaSonic.App.ManifestReloadBinding.ManifestUIIngressTarget` plus a
 concrete consumer `MetaSonic.App.ManifestReloadUIIngress`. Last-written
@@ -35,8 +47,9 @@ plus a no-device consumer `MetaSonic.App.ManifestReloadMIDIIngress`
 that projects only controls with `mcsCC = Just`, rejects duplicate CC
 numbers at projection time, scales 7-bit CC values through the
 binding range, and enqueues `CmdControlWrite` against a
-producer-configured default voice under `midiProducerId`. Real
-device-backed listener lifecycle remains ahead.
+producer-configured default voice under `midiProducerId`. Wiring the
+OSC listener handle into `ManifestReloadIngressOps` and a
+PortMIDI-backed MIDI lifecycle remain ahead.
 
 ## The question
 
