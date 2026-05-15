@@ -3512,7 +3512,15 @@ Still gated:
   that installs a live voice via `CmdVoiceOn` on the
   `hotSwapEdit` / `hotSwapEditAfterTemplates` graph pair and
   asserts `Right MrhsrPreserving`, no `AudioStop` events, audio
-  still running, and voice survival in `ssVoices`, broader MIDI
+  still running, and voice survival in `ssVoices`, the
+  manifest-target-aware MIDI listener
+  (`MetaSonic.App.ManifestMIDIListener`) over an injected
+  `MIDIListenerSource` and the
+  `MetaSonic.App.ManifestMIDIIngressOps` adapter that drives that
+  listener through `ManifestReloadIngressOps` via a bracket-shaped
+  source factory (source-close failures fire an adapter hook and
+  still report a clean close so the ingress manager's state stays
+  honest), broader MIDI
   behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
@@ -3560,10 +3568,13 @@ Still gated:
   stopped-audio fallback path and the true-preserving path (live
   voice installed before reload, `Right MrhsrPreserving`, audio not
   stopped, voice survives, OSC paths swap correctly) with real UDP
-  traffic before and after the swap, host orchestration design note,
+  traffic before and after the swap, the manifest-target-aware MIDI
+  listener and its `ManifestReloadIngressOps` adapter via a
+  bracket-shaped source factory, host orchestration design note,
   and host supervisor / recovery policy design note. Remaining work
-  is a PortMIDI device-backed listener lifecycle, device-backed
-  smoke coverage, and resource/allocation recovery events.
+  is a PortMIDI device-backed source factory, a MIDI end-to-end
+  packet-traffic test, device-backed smoke coverage, and
+  resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

@@ -83,8 +83,28 @@ graph pair, installs a live voice via `CmdVoiceOn (TemplateName
 strategy, and asserts the outcome is `Right MrhsrPreserving` (no
 silent fallback), the captured fake-audio events never include
 `AudioStop`, `sfisAudioRunning` stays `True`, the live voice
-survives in `ssVoices`, and old/new OSC paths swap correctly. A
-PortMIDI-backed MIDI lifecycle remains ahead.
+survives in `ssVoices`, and old/new OSC paths swap correctly.
+
+The MIDI side has caught up through step 2:
+`MetaSonic.App.ManifestMIDIListener` is the MIDI analogue of
+`ManifestOSCListener` — a small worker over an injected
+`MIDIListenerSource` that routes `MIDIProducerControlChange`
+through `submitManifestMIDICCEvent`, surfaces non-CC events via the
+`MmliIgnoredEvent` diagnostic, and exposes bracketed plus
+handle-style entry points. It deliberately does not wrap
+`Session.MIDIListener` because the latter's note/sustain/coalescing
+semantics belong to the rich session path, not the v1 manifest
+path. `MetaSonic.App.ManifestMIDIIngressOps` is the
+`ManifestReloadIngressOps` adapter: it takes a bracket-shaped
+`ManifestMIDISourceFactory issue source` so the same shape carries
+both PortMIDI-backed and test-only sources, owns both the source
+handle and the listener handle, and closes them listener-first to
+satisfy the PortMIDI single-consumer contract. Source-close
+failures fire an adapter hook and still report a clean close to
+the ingress manager so its `MrisClosed` state stays honest after
+the listener is already stopped; a manager-level regression test
+pins this behavior. A PortMIDI device-backed source factory and an
+MIDI end-to-end packet-traffic test remain ahead.
 
 ## The question
 
