@@ -48,7 +48,8 @@ import           MetaSonic.OSC.Dispatch     (ResolveState, dropVoice,
 import           MetaSonic.Pattern          (ControlTag, SwapLabel,
                                              TemplateName (..), Value,
                                              VoiceKey (..))
-import           MetaSonic.Session.Command  (SessionCommand (..),
+import           MetaSonic.Session.Command  (HotSwapInstallMode (..),
+                                             SessionCommand (..),
                                              SessionIssue (..))
 import           MetaSonic.Session.Resolve  (ResolveRebuildIssue (..),
                                              ResolveRebuildResult (..),
@@ -80,7 +81,7 @@ data SessionPlan
   = PlanVoiceStart !TemplateName !VoiceKey ![(ControlTag, Value)]
   | PlanVoiceStop !VoiceBinding
   | PlanControlWrite !VoiceBinding !ControlTag !Value
-  | PlanHotSwap !SwapLabel !TemplateGraph !ResolveRebuildResult
+  | PlanHotSwap !HotSwapInstallMode !SwapLabel !TemplateGraph !ResolveRebuildResult
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -142,7 +143,11 @@ admitSessionCommand cmd st = case cmd of
 
   CmdHotSwap label graph ->
     SessionAdmitted cmd
-      (PlanHotSwap label graph (previewResolveRebuild graph st))
+      (PlanHotSwap HotSwapAllowRebuild label graph (previewResolveRebuild graph st))
+
+  CmdHotSwapPreservingOnly label graph ->
+    SessionAdmitted cmd
+      (PlanHotSwap HotSwapPreservingOnly label graph (previewResolveRebuild graph st))
 
 -- | Apply a successful runtime fact to pure session state.
 applySessionCommit :: SessionCommit -> SessionState -> SessionState
@@ -201,7 +206,7 @@ applyPlannedCommit plan commit st =
     (PlanControlWrite {}, _) ->
       Left SciControlPlanHasNoStateCommit
 
-    (PlanHotSwap expectedLabel expectedGraph _, CommitGraphInstalled actualLabel actualGraph)
+    (PlanHotSwap _ expectedLabel expectedGraph _, CommitGraphInstalled actualLabel actualGraph)
       | actualLabel /= expectedLabel ->
           Left (SciSwapLabelMismatch expectedLabel actualLabel)
       | actualGraph /= expectedGraph ->

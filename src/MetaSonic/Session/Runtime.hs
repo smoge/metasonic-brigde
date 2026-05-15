@@ -100,6 +100,11 @@ data SessionRuntimeIssue
   | SriHotSwapPublishRejected
     -- ^ The runtime rejected a prepared hot-swap publish before
     -- ownership transferred to the audio/runtime side.
+  | SriHotSwapRebuildForbidden
+    -- ^ A preserving-only hot-swap was requested, but no live voice
+    -- bindings needed preservation, so the only applicable install
+    -- path would have been the clear/rebuild fallback that the command
+    -- explicitly forbids.
   | SriHotSwapRequiresStoppedAudio
     -- ^ A preserving hot-swap adapter exposed only a scripted
     -- stopped-audio path and rejected execution while realtime audio

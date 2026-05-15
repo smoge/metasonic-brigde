@@ -42,7 +42,7 @@ appManifestReloadCliTests =
           assertContains "  audio stopped by helper: no" output
           assertContains "  listener restart executed: no" output
           assertContains
-            "  command projection: CmdHotSwap manifest:send-return templates=2 (not executed)"
+            "  command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (not executed)"
             output
 
   , testCase "missing manifest file reports read failure" $ do

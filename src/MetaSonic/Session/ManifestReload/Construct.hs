@@ -22,7 +22,7 @@ import           MetaSonic.Session.Owner          (SessionOwner,
 -- | Bracket a fresh session owner from a validated manifest reload plan.
 --
 -- This is construction-time only. It does not reload an existing owner, step a
--- 'CmdHotSwap', migrate state, interrupt audio, or choose a recovery policy.
+-- hot-swap command, migrate state, interrupt audio, or choose a recovery policy.
 -- Manifest-derived metadata such as the control surface remains available to
 -- callers through the plan they already hold.
 constructManifestSessionFromPlan

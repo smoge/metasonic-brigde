@@ -198,12 +198,13 @@ planManifestReload doc catalog req
 
 -- | Project a validated plan into the existing hot-swap command shape.
 --
--- This does not choose when or how to install the command. Construction-time,
--- stopped-audio, and live preserving strategies can all consume the same
--- value differently.
+-- This command is preserving-only: manifest live reload must not silently fall
+-- back to the stopped-audio clear/rebuild path. Construction-time and
+-- stopped-audio helpers use the plan graph directly rather than executing this
+-- command.
 manifestReloadCommand :: ManifestReloadPlan -> SessionCommand
 manifestReloadCommand plan =
-  CmdHotSwap (mrlpSwapLabel plan) (mrlpTemplateGraph plan)
+  CmdHotSwapPreservingOnly (mrlpSwapLabel plan) (mrlpTemplateGraph plan)
 
 -- | Apply a plan's adapter policy to caller-owned owner options.
 --

@@ -333,6 +333,12 @@ renderManifestReloadCommand command =
       <> " templates="
       <> show (length (tgTemplates graph))
       <> " (not executed)"
+    CmdHotSwapPreservingOnly label graph ->
+      "  command projection: CmdHotSwapPreservingOnly "
+      <> swapLabelText label
+      <> " templates="
+      <> show (length (tgTemplates graph))
+      <> " (not executed)"
     _ ->
       "  command projection: "
       <> show command

@@ -104,6 +104,7 @@ import           MetaSonic.Pattern          (ControlTag, TemplateName (..),
 import           MetaSonic.Session.AdapterIssue
                                              (SessionAdapterSetupIssue (..),
                                              SessionPrewarmIssue (..))
+import           MetaSonic.Session.Command  (HotSwapInstallMode (..))
 import           MetaSonic.Session.Runtime  (SessionRuntimeAdapter (..),
                                              RealtimeOp (..),
                                              SessionRuntimeIssue (..),
@@ -674,8 +675,8 @@ runRTGraphAdapter env plan = do
     PlanControlWrite binding controlTag value ->
       runControlWrite st binding controlTag value
 
-    PlanHotSwap label graph preview ->
-      runHotSwap env st label graph preview
+    PlanHotSwap mode label graph preview ->
+      runHotSwap env st mode label graph preview
 
 runVoiceStart
   :: RTGraphAdapterState
@@ -773,6 +774,7 @@ runControlWrite st binding controlTag value =
 runHotSwap
   :: RTGraphAdapterEnv
   -> RTGraphAdapterState
+  -> HotSwapInstallMode
   -> SwapLabel
   -> TemplateGraph
   -> ResolveRebuildResult
@@ -781,13 +783,17 @@ runHotSwap
 -- runtime may be in an indeterminate state while the caller-visible
 -- 'SessionState' still claims the old graph. The owner treats this as
 -- terminal divergence; this adapter does not attempt in-place repair.
-runHotSwap env current label graph preview
+-- This concern is specific to the rebuild branch below; the
+-- preserving-only rejection returns before any clear/install attempt.
+runHotSwap env current mode label graph preview
   | not (null preservedBindings) =
       case preservingHotSwapPlan current graph preview of
         Left issue ->
           pure (Left issue)
         Right plan ->
           runPreservingHotSwap env current label graph plan
+  | mode == HotSwapPreservingOnly =
+      pure (Left SriHotSwapRebuildForbidden)
   | otherwise = do
       installed <- installSessionGraph
                      (rtgasRTGraph current)

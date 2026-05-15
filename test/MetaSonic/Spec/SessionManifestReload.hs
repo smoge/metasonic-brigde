@@ -286,7 +286,7 @@ sessionManifestReloadTests =
   , testCase "plan projects to hot-swap command" $ do
       plan <- planOrFail validDoc validCatalog validRequest
       manifestReloadCommand plan
-        @?= CmdHotSwap (SwapLabel "reload") validTemplateGraph
+        @?= CmdHotSwapPreservingOnly (SwapLabel "reload") validTemplateGraph
 
   , testCase "plan projects adapter policy into owner options" $ do
       let baseOptions = defaultSessionOwnerOptions

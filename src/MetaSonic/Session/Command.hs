@@ -30,6 +30,7 @@
 module MetaSonic.Session.Command
   ( -- * Commands
     SessionCommand (..)
+  , HotSwapInstallMode (..)
   , fromPatternEvent
 
     -- * Diagnostic Events
@@ -45,6 +46,20 @@ import           MetaSonic.Pattern          (ControlTag, PatternEvent (..),
                                              SwapLabel, TemplateName, Value,
                                              VoiceKey)
 
+-- | Per-command hot-swap install policy.
+--
+-- Generic pattern/UI swaps may preserve live voices when possible and
+-- fall back to a clear/rebuild install when no preservable bindings
+-- exist. Manifest live-reload commands use the preserving-only mode
+-- so they cannot silently take the stopped-audio rebuild path.
+data HotSwapInstallMode
+  = HotSwapAllowRebuild
+    -- ^ Preserve when possible, otherwise allow the runtime adapter's
+    -- clear/rebuild fallback.
+  | HotSwapPreservingOnly
+    -- ^ Reject any swap that cannot use the preserving runtime path.
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
 
 -- | Producer-agnostic command vocabulary for session owners.
 --
@@ -52,6 +67,11 @@ import           MetaSonic.Pattern          (ControlTag, PatternEvent (..),
 -- serve a different architectural purpose. 'PatternEvent' represents
 -- one producer's output; 'SessionCommand' is the normalized request
 -- format that the session layer validates before execution.
+--
+-- The two hot-swap constructors deliberately expose policy at each call site.
+-- A single @CmdHotSwap HotSwapInstallMode SwapLabel TemplateGraph@ would scale
+-- to more modes, but would make preserving-only intent less visible in pattern
+-- matches and producer adapters.
 data SessionCommand
   = CmdVoiceOn      !TemplateName !VoiceKey ![(ControlTag, Value)]
     -- ^ Request instantiation of one named-template voice with
@@ -62,8 +82,13 @@ data SessionCommand
     -- ^ Request a symbolic control write against a live voice.
   | CmdHotSwap      !SwapLabel !TemplateGraph
     -- ^ Request installation of a precompiled replacement template
-    -- graph. Install timing and safety policy belong to the session
-    -- state/owner/adapter layers, not this vocabulary module.
+    -- graph. The runtime adapter may use the clear/rebuild fallback
+    -- when no preservable live bindings exist.
+  | CmdHotSwapPreservingOnly !SwapLabel !TemplateGraph
+    -- ^ Request installation of a precompiled replacement template
+    -- graph only through the preserving hot-swap path. This is the
+    -- command shape for live manifest reloads that must not silently
+    -- degrade into stopped-audio rebuild semantics.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 

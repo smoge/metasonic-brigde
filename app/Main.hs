@@ -958,6 +958,13 @@ printManifestReloadCommand command =
         <> " templates="
         <> show (length (tgTemplates graph))
         <> " (not executed)"
+    CmdHotSwapPreservingOnly label graph ->
+      putStrLn $
+        "  command projection: CmdHotSwapPreservingOnly "
+        <> swapLabelText label
+        <> " templates="
+        <> show (length (tgTemplates graph))
+        <> " (not executed)"
     _ ->
       putStrLn $
         "  command projection: "

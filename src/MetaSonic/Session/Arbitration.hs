@@ -89,6 +89,8 @@ sessionCommandControlTarget command = case command of
     Nothing
   CmdHotSwap _ _ ->
     Nothing
+  CmdHotSwapPreservingOnly _ _ ->
+    Nothing
 
 -- | Current per-control owner table for priority-style policies.
 --

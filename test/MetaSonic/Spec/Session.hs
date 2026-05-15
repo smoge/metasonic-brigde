@@ -425,7 +425,8 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
           expectedDrop =
             [RriMissingTemplate (VoiceKey "v0") (TemplateName "drone")]
       case admitSessionCommand cmd st0 of
-        SessionAdmitted _ (PlanHotSwap _ graph preview) -> do
+        SessionAdmitted _ (PlanHotSwap mode _ graph preview) -> do
+          mode @?= HotSwapAllowRebuild
           graph @?= newGraph
           rrrDropped preview @?= expectedDrop
         other ->
@@ -449,7 +450,7 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
             , RriMissingTemplate (VoiceKey "v1") (TemplateName "drone")
             ]
       case admitSessionCommand cmd st0 of
-        SessionAdmitted _ (PlanHotSwap _ _ preview) ->
+        SessionAdmitted _ (PlanHotSwap _ _ _ preview) ->
           rrrDropped preview @?= previewDrop
         other ->
           assertFailure ("expected hot-swap plan, got: " <> show other)
@@ -589,7 +590,7 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
             , RriMissingTemplate (VoiceKey "v1") (TemplateName "drone")
             ]
       case admitSessionCommand cmd st0 of
-        SessionAdmitted _ plan@(PlanHotSwap _ _ preview) -> do
+        SessionAdmitted _ plan@(PlanHotSwap _ _ _ preview) -> do
           rrrDropped preview @?= expectedPreview
           let st1 = applySessionCommit (CommitVoiceStarted binding1) st0
               commit = CommitGraphInstalled swapLabel newGraph
@@ -612,7 +613,11 @@ sessionStateTests = testGroup "Session Prep B/C: admission, commits, and handsha
           st0 = applySessionCommit
                   (CommitVoiceStarted binding)
                   (initialSessionState oldGraph)
-          plan = PlanHotSwap swapLabel newGraph (rebuildResolveState newGraph [binding])
+          plan = PlanHotSwap
+                   HotSwapAllowRebuild
+                   swapLabel
+                   newGraph
+                   (rebuildResolveState newGraph [binding])
           wrongLabelCommit = CommitGraphInstalled wrongLabel newGraph
           wrongGraphCommit = CommitGraphInstalled swapLabel oldGraph
           wrongCtor = CommitVoiceStopped (VoiceKey "v0")
@@ -1129,6 +1134,27 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
             assertFailure ("expected empty-session hot-swap commit, got: "
                            <> show other)
 
+  , testCase "preserving-only hot-swap rejects empty-session rebuild fallback" $ do
+      let oldGraph = patternTemplates droneVibrato
+          newGraph = patternTemplates polyphonicStab
+          st0      = initialSessionState oldGraph
+          swapCmd  = CmdHotSwapPreservingOnly (SwapLabel "to-stab") newGraph
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      withInstalledAdapter oldGraph defaultRTGraphAdapterOptions $ \_rt adapter -> do
+        swapped <- stepSessionCommand adapter swapCmd st0
+        swapped @?= StepRuntimeFailed SriHotSwapRebuildForbidden
+
+        -- The adapter must not have taken the clear/rebuild fallback.
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing ->
+            assertBool
+              "expected original graph to remain usable after rejection"
+              (M.member (VoiceKey "v0") (ssVoices st1))
+          other ->
+            assertFailure ("expected original-graph voice start, got: "
+                           <> show other)
+
   , testCase "step hot-swap install failure preserves structured setup issue" $ do
       let oldGraph = patternTemplates droneVibrato
           base     = patternTemplates arpeggioSendReturn
@@ -1235,6 +1261,49 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
                   other ->
                     assertFailure
                       ("expected preserving hot-swap commit, got: "
+                       <> show other)
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "preserving-only hot-swap migrates supported active voice" $ do
+      newGraph <- compileTemplateGraphOrFail hotSwapEditAfterTemplates
+      let oldGraph = patternTemplates hotSwapEdit
+          st0      = initialSessionState oldGraph
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0")
+                       [(ControlTag (MigrationKey "lpf") 0, 1500.0)]
+          swapCmd  =
+            CmdHotSwapPreservingOnly (SwapLabel "manifest-edit") newGraph
+      withInstalledAdapter oldGraph defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing ->
+            case M.lookup (VoiceKey "v0") (ssVoices st1) of
+              Nothing ->
+                assertFailure "expected committed voice binding"
+              Just binding -> do
+                c_rt_graph_process rt 1
+                beforeStatus <- c_rt_graph_instance_status
+                                  rt
+                                  (fromIntegral (vbSlotId binding))
+                beforeStatus @?= instanceStatusLive
+                beforeGeneration <- readSwapGeneration rt
+                swapped <- stepSessionCommand adapter swapCmd st1
+                case swapped of
+                  StepCommitted st2 (Just rebuild) -> do
+                    rrrDropped rebuild @?= []
+                    ssGraph st2 @?= newGraph
+                    M.lookup (VoiceKey "v0") (ssVoices st2) @?= Just binding
+                    afterGeneration <- readSwapGeneration rt
+                    assertBool
+                      "expected preserving-only swap generation to advance"
+                      (afterGeneration > beforeGeneration)
+                    afterStatus <- c_rt_graph_instance_status
+                                     rt
+                                     (fromIntegral (vbSlotId binding))
+                    afterStatus @?= instanceStatusLive
+                  other ->
+                    assertFailure
+                      ("expected preserving-only hot-swap commit, got: "
                        <> show other)
           other ->
             assertFailure ("expected start commit, got: " <> show other)
@@ -3267,7 +3336,8 @@ assertObservedPreservingPlan
   -> Assertion
 assertObservedPreservingPlan observedPlan expectedLabel expectedGraph =
   case observedPlan of
-    Just (PlanHotSwap label graph rebuild) -> do
+    Just (PlanHotSwap mode label graph rebuild) -> do
+      mode @?= HotSwapAllowRebuild
       label @?= expectedLabel
       graph @?= expectedGraph
       rrrDropped rebuild @?= []

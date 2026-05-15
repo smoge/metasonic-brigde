@@ -1,0 +1,188 @@
+digraph hot_swap_reload_current_interaction {
+  graph [
+    rankdir=LR,
+    bgcolor="transparent",
+    color="#6b7280",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    labelloc="t",
+    label="MetaSonic manifest reload and hot-swap interaction graph - current state"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#64748b",
+    fillcolor="#f8fafc",
+    fontname="DejaVu Sans",
+    fontsize=10,
+    margin="0.08,0.06"
+  ];
+
+  edge [
+    color="#475569",
+    fontname="DejaVu Sans",
+    fontsize=9,
+    arrowsize=0.7
+  ];
+
+  subgraph cluster_inputs {
+    label="Inputs and app catalog";
+    color="#94a3b8";
+
+    authoring_doc [label="AuthoringManifestDoc\n(JSON or in-memory)"];
+    demo_catalog [label="demoManifestReloadCatalog\nApp.Demos"];
+    reload_request [label="ManifestReloadRequest\n(demo key, swap label,\nresource policy)"];
+  }
+
+  subgraph cluster_planner {
+    label="Pure manifest reload planning";
+    color="#60a5fa";
+
+    plan_manifest [label="planManifestReload\nMetaSonic.Session.ManifestReload"];
+    reload_plan [label="ManifestReloadPlan\nTemplateGraph\nRTGraphAdapterOptions\nControlSurface\nArbitrationPolicy=FifoOnly"];
+    command_projection [label="manifestReloadCommand"];
+    owner_options_projection [label="manifestSessionOwnerOptions"];
+    cmd_hot_swap [label="CmdHotSwap\nSwapLabel + TemplateGraph"];
+  }
+
+  subgraph cluster_cli {
+    label="Current diagnostic / smoke entry points";
+    color="#c084fc";
+
+    cli_plan [label="--manifest-reload-plan\n--manifest-reload-plan-file"];
+    cli_construct [label="--manifest-session-smoke"];
+    cli_stopped_smoke [label="--manifest-stopped-audio-reload-smoke"];
+  }
+
+  subgraph cluster_construction {
+    label="Construction-time session setup";
+    color="#22c55e";
+
+    construct_from_plan [label="constructManifestSessionFromPlan\nManifestReload.Construct"];
+    with_session_owner [label="withSessionOwner /\nacquireSessionOwner"];
+    new_adapter [label="newRTGraphAdapter"];
+    install_graph [label="installSessionGraph\nloader clear/rebuild path"];
+    rt_graph [label="RTGraph\nC++ runtime handle", fillcolor="#ecfdf5"];
+  }
+
+  subgraph cluster_fanin {
+    label="Current owner, queue, service, and audio state";
+    color="#f59e0b";
+
+    fanin_service [label="SessionFanInService\nbackground drain worker"];
+    fanin_host [label="SessionFanInHost\nMVar: owner + queue +\nreload status + audio-running"];
+    session_queue [label="SessionCommandQueue\nbounded FIFO"];
+    session_owner [label="SessionOwner\nsingle-threaded owner"];
+    step_owner [label="stepSessionOwner"];
+    session_step [label="stepSessionCommand\nadmit -> runtime -> commit"];
+    session_state [label="SessionState\nTemplateGraph + voices + resolve"];
+    audio_lifecycle [label="start/stopSessionFanInHostAudioWith"];
+  }
+
+  subgraph cluster_stopped {
+    label="Landed stopped-audio manifest reload";
+    color="#ef4444";
+
+    reload_host [label="reloadManifestStoppedAudioHost\nManifestReloadHost"];
+    host_ops [label="manifestReloadHostOps\nHostStoppedAudioReloadOps"];
+    stopped_orchestrator [label="orchestrateHostStoppedAudioReload\nplan -> quiesce -> drain ->\nstop -> reload -> start -> reopen"];
+    ingress [label="ManifestReloadIngress\nclose / resume / open-fresh"];
+    quiesce_drain [label="quiesceAndDrainSessionFanInService"];
+    reload_stopped [label="reloadManifestSessionStoppedAudio\nManifestReload.Runtime"];
+    fanin_reload [label="reloadSessionFanInHostOwnerStoppedAudio\nreplace owner only after queue empty\nand audio stopped"];
+    release_acquire [label="release old owner\nacquire new owner"];
+  }
+
+  subgraph cluster_hot_swap {
+    label="Existing command-level hot-swap runtime path";
+    color="#14b8a6";
+
+    admit_hot_swap [label="admitSessionCommand\nCmdHotSwap -> PlanHotSwap"];
+    run_hot_swap [label="RTGraphAdapter.runHotSwap"];
+    preserving_probe [label="preservingHotSwapPlan\ncurrent RTGraphAdapterState +\ntarget TemplateGraph + resolve preview"];
+    preserving_builder [label="installPreservingHotSwap\nprepare next world"];
+    live_protocol [label="runLiveHotSwapProtocol\nread generation -> acquire -> publish ->\nwait -> collect retired stats -> verify"];
+    scripted_preserving [label="scripted preserving path\nwhen audio is not running"];
+    fallback_clear [label="non-preserving fallback\ninstallSessionGraph\nstop/clear/rebuild", fillcolor="#fff7ed"];
+    owner_divergence [label="SessionOwner divergence\non install failure / backend stopped /\ncommit mismatch / protocol bug", fillcolor="#fef2f2"];
+  }
+
+  subgraph cluster_missing {
+    label="Not landed yet";
+    color="#64748b";
+    style="dashed";
+
+    preserving_only_mode [label="preserving-only command or strategy\nmust not fall back to stop/clear", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
+    preserving_manifest_helper [label="reloadManifestSessionPreservingHotSwap\nmissing session helper", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
+    host_preserving_ops [label="HostPreservingReloadOps\neligibility/fence/submit/wait/verify/rebind", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
+    strategy_selector [label="host strategy selector\nprefer preserving -> explicit fallback", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
+    binding_rebuild [label="producer/listener binding rebuild contract\nstill missing", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
+  }
+
+  authoring_doc -> plan_manifest;
+  demo_catalog -> plan_manifest;
+  reload_request -> plan_manifest;
+  plan_manifest -> reload_plan;
+  reload_plan -> command_projection;
+  command_projection -> cmd_hot_swap;
+  reload_plan -> owner_options_projection;
+
+  cli_plan -> plan_manifest;
+  cli_construct -> construct_from_plan;
+  cli_stopped_smoke -> reload_stopped;
+
+  reload_plan -> construct_from_plan;
+  construct_from_plan -> owner_options_projection;
+  construct_from_plan -> with_session_owner;
+  with_session_owner -> new_adapter;
+  new_adapter -> install_graph;
+  install_graph -> rt_graph;
+
+  fanin_service -> fanin_host;
+  fanin_host -> session_queue;
+  fanin_host -> session_owner;
+  fanin_host -> audio_lifecycle;
+  session_owner -> step_owner;
+  step_owner -> session_step;
+  session_step -> session_state;
+
+  reload_host -> host_ops;
+  host_ops -> stopped_orchestrator;
+  stopped_orchestrator -> plan_manifest [label="prepare plan"];
+  stopped_orchestrator -> ingress [label="quiesce"];
+  stopped_orchestrator -> quiesce_drain [label="drain live queue"];
+  quiesce_drain -> fanin_service;
+  stopped_orchestrator -> audio_lifecycle [label="stop old / start new"];
+  stopped_orchestrator -> reload_stopped [label="with audio stopped"];
+  reload_stopped -> owner_options_projection;
+  reload_stopped -> fanin_reload;
+  fanin_reload -> fanin_host;
+  fanin_reload -> release_acquire;
+  release_acquire -> session_owner;
+  stopped_orchestrator -> ingress [label="reopen or resume"];
+
+  cmd_hot_swap -> admit_hot_swap;
+  admit_hot_swap -> session_step;
+  session_step -> run_hot_swap;
+  run_hot_swap -> preserving_probe [label="if preserved bindings exist"];
+  preserving_probe -> preserving_builder;
+  preserving_builder -> live_protocol [label="if audio running"];
+  preserving_builder -> scripted_preserving [label="if audio stopped"];
+  live_protocol -> rt_graph;
+  scripted_preserving -> rt_graph;
+  run_hot_swap -> fallback_clear [label="if no preserved bindings"];
+  fallback_clear -> install_graph;
+  run_hot_swap -> owner_divergence [style=dashed, label="terminal failures"];
+  session_owner -> owner_divergence [style=dashed];
+
+  reload_plan -> preserving_manifest_helper [style=dashed, label="future input"];
+  preserving_manifest_helper -> preserving_only_mode [style=dashed];
+  preserving_only_mode -> cmd_hot_swap [style=dashed];
+  preserving_manifest_helper -> fanin_host [style=dashed, label="future locked step"];
+  host_preserving_ops -> preserving_manifest_helper [style=dashed];
+  host_preserving_ops -> ingress [style=dashed, label="reuse close/open policy"];
+  host_preserving_ops -> binding_rebuild [style=dashed];
+  strategy_selector -> host_preserving_ops [style=dashed];
+  strategy_selector -> reload_host [style=dashed, label="explicit stopped-audio fallback"];
+}
