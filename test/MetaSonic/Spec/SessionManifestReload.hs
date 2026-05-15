@@ -15,9 +15,12 @@ import           MetaSonic.Authoring.Manifest
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Pattern               (ControlTag (..),
+                                                  Pattern (..),
                                                   SwapLabel (..),
                                                   VoiceKey (..),
                                                   TemplateName (..))
+import           MetaSonic.Pattern.Corpus        (hotSwapEdit,
+                                                  hotSwapEditAfterTemplates)
 import           MetaSonic.Session.Arbitration
 import           MetaSonic.Session.ManifestReload
 import           MetaSonic.Session.ManifestReload.Construct
@@ -26,9 +29,14 @@ import           MetaSonic.Session.Command
 import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.Owner
 import           MetaSonic.Session.Queue         (ProducerKind (..),
+                                                  QueuedSessionCommand (..),
+                                                  SessionDrainItem (..),
+                                                  SessionDrainResult (..),
                                                   SessionEnqueueIssue (..),
-                                                  SessionEnqueueResult (..))
+                                                  SessionEnqueueResult (..),
+                                                  SessionQueueOptions (..))
 import           MetaSonic.Session.RTGraphAdapter
+import           MetaSonic.Session.Runtime       (SessionRuntimeIssue (..))
 import           MetaSonic.Session.State
 import           MetaSonic.Session.Step          (SessionStepResult (..))
 
@@ -370,6 +378,195 @@ sessionManifestReloadTests =
         Right (_, Left issue, _) ->
           assertFailure
             ("expected stopped-audio reload success, got: " <> show issue)
+
+  , testCase "preserving hot-swap reload helper drains through live fan-in path" $ do
+      let oldGraph = patternTemplates hotSwapEdit
+          newGraph = compileTemplateGraphOrError hotSwapEditAfterTemplates
+          plan = preservingHotSwapManifestPlan newGraph
+          voiceProducer = testProducer ProducerPattern "pattern"
+          reloadProducer = testProducer ProducerUI "manifest-live"
+          voiceKey = VoiceKey "v0"
+          startCmd =
+            CmdVoiceOn
+              (TemplateName "drone")
+              voiceKey
+              [(ControlTag (MigrationKey "lpf") 0, 1500.0)]
+      result <-
+        withSessionFanInHost
+          oldGraph
+          defaultSessionFanInOptions
+          $ \host -> do
+              startEnqueue <-
+                enqueueSessionFanInCommand voiceProducer startCmd host
+              startDrain <- drainSessionFanInHost host
+              reload <-
+                reloadManifestSessionPreservingHotSwap reloadProducer host plan
+              pure (startEnqueue, startDrain, reload)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (startEnqueue, startDrain, report) -> do
+          case (sfierResult startEnqueue, sfidrDrain startDrain) of
+            ( SessionEnqueued {}
+              , SessionDrainResult
+                  { sdrItems =
+                      [ SessionDrainItem
+                          { sdiResult =
+                              SessionOwnerStep
+                                (StepCommitted startedState Nothing)
+                          }
+                      ]
+                  , sdrRemaining =
+                      0
+                  , sdrStopped =
+                      Nothing
+                  }
+              ) ->
+                assertBool
+                  "expected live voice before manifest preserving reload"
+                  (M.member voiceKey (ssVoices startedState))
+            other ->
+              assertFailure
+                ("expected voice-start enqueue and drain, got: "
+                 <> show other)
+
+          mphsrDemoKey report @?= "hot-swap"
+          mphsrSwapLabel report @?= SwapLabel "manifest-edit"
+          mphsrCommand report
+            @?= CmdHotSwapPreservingOnly
+                  (SwapLabel "manifest-edit")
+                  newGraph
+          case sfierResult (mphsrEnqueueResult report) of
+            SessionEnqueued queued -> do
+              qscProducer queued @?= reloadProducer
+              qscCommand queued @?= mphsrCommand report
+            other ->
+              assertFailure
+                ("expected preserving reload enqueue success, got: "
+                 <> show other)
+          case mphsrDrainResult report of
+            Just SessionFanInDrainResult
+              { sfidrDrain =
+                  SessionDrainResult
+                    { sdrItems =
+                        [ SessionDrainItem
+                            { sdiQueued =
+                                queued
+                            , sdiResult =
+                                SessionOwnerStep
+                                  (StepCommitted swappedState (Just _))
+                            }
+                        ]
+                    , sdrRemaining =
+                        0
+                    , sdrStopped =
+                        Nothing
+                    }
+              , sfidrQueueDepth =
+                  0
+              } -> do
+                qscCommand queued @?= mphsrCommand report
+                ssGraph swappedState @?= newGraph
+                assertBool
+                  "expected preserving reload to keep the active voice"
+                  (M.member voiceKey (ssVoices swappedState))
+            other ->
+              assertFailure
+                ("expected preserving reload drain commit, got: "
+                 <> show other)
+          mphsrOwnerStatus report @?= SessionOwnerReady
+          ssGraph (mphsrOwnerState report) @?= newGraph
+          assertBool
+            "expected final fan-in owner state to keep the active voice"
+            (M.member voiceKey (ssVoices (mphsrOwnerState report)))
+
+  , testCase "preserving hot-swap reload helper reports rejected enqueue without draining" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      let producer = testProducer ProducerPattern "pattern"
+          reloadProducer = testProducer ProducerUI "manifest-live"
+          command = CmdVoiceOn (TemplateName "voice") (VoiceKey "v0") []
+          fanInOptions = defaultSessionFanInOptions
+            { sfioQueueOptions = SessionQueueOptions 1
+            }
+      result <-
+        withSessionFanInHost
+          voiceOnlyTemplateGraph
+          fanInOptions
+          $ \host -> do
+              enqueued <- enqueueSessionFanInCommand producer command host
+              reload <-
+                reloadManifestSessionPreservingHotSwap
+                  reloadProducer
+                  host
+                  plan
+              pure (enqueued, reload)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (enqueued, report) -> do
+          case sfierResult enqueued of
+            SessionEnqueued {} ->
+              pure ()
+            other ->
+              assertFailure
+                ("expected initial enqueue success, got: " <> show other)
+          sfierResult (mphsrEnqueueResult report)
+            @?= SessionEnqueueRejected
+                  reloadProducer
+                  (manifestReloadCommand plan)
+                  (SeiQueueFull 1)
+          mphsrDrainResult report @?= Nothing
+          mphsrOwnerStatus report @?= SessionOwnerReady
+          ssGraph (mphsrOwnerState report) @?= voiceOnlyTemplateGraph
+
+  , testCase "preserving hot-swap reload helper reports runtime rejection without replacing owner" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      let producer = testProducer ProducerUI "manifest-live"
+      result <-
+        withSessionFanInHost
+          voiceOnlyTemplateGraph
+          defaultSessionFanInOptions
+          $ \host ->
+              reloadManifestSessionPreservingHotSwap producer host plan
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right report -> do
+          case sfierResult (mphsrEnqueueResult report) of
+            SessionEnqueued queued -> do
+              qscProducer queued @?= producer
+              qscCommand queued @?= manifestReloadCommand plan
+            other ->
+              assertFailure
+                ("expected preserving reload enqueue success, got: "
+                 <> show other)
+          case mphsrDrainResult report of
+            Just SessionFanInDrainResult
+              { sfidrDrain =
+                  SessionDrainResult
+                    { sdrItems =
+                        [ SessionDrainItem
+                            { sdiResult =
+                                SessionOwnerStep
+                                  (StepRuntimeFailed
+                                    SriHotSwapRebuildForbidden)
+                            }
+                        ]
+                    , sdrRemaining =
+                        0
+                    , sdrStopped =
+                        Nothing
+                    }
+              , sfidrQueueDepth =
+                  0
+              } ->
+                pure ()
+            other ->
+              assertFailure
+                ("expected preserving reload runtime rejection, got: "
+                 <> show other)
+          mphsrOwnerStatus report @?= SessionOwnerReady
+          ssGraph (mphsrOwnerState report) @?= voiceOnlyTemplateGraph
 
   , testCase "stopped-audio reload rejects when fan-in queue is not empty" $ do
       plan <- planOrFail validDoc validCatalog validRequest
@@ -836,6 +1033,16 @@ duplicateTemplateGraph =
           [] ->
             []
     }
+
+preservingHotSwapManifestPlan :: TemplateGraph -> ManifestReloadPlan
+preservingHotSwapManifestPlan graph = ManifestReloadPlan
+  { mrlpDemoKey            = "hot-swap"
+  , mrlpSwapLabel          = SwapLabel "manifest-edit"
+  , mrlpTemplateGraph      = graph
+  , mrlpAdapterOptions     = defaultRTGraphAdapterOptions
+  , mrlpControlSurface     = []
+  , mrlpArbitrationPolicy  = FifoOnly
+  }
 
 simpleGraph :: SynthGraph
 simpleGraph = runSynth $ do

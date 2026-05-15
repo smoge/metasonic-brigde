@@ -6,29 +6,42 @@
 -- Module      : MetaSonic.Session.ManifestReload.Runtime
 -- Description : Runtime-facing manifest reload helpers.
 --
--- This module implements the non-audio stopped-reload helper from
--- notes/2026-05-14-i-manifest-reload-runtime-strategy.md. The caller
--- supplies a prevalidated 'ManifestReloadPlan', stops audio before
--- calling, and restarts audio/listeners after a successful result.
+-- This module implements runtime-facing helpers from
+-- notes/2026-05-14-i-manifest-reload-runtime-strategy.md. Callers
+-- supply a prevalidated 'ManifestReloadPlan' and choose the install
+-- strategy explicitly: stopped-audio owner replacement, or preserving
+-- hot-swap through the live fan-in path.
 
 module MetaSonic.Session.ManifestReload.Runtime
   ( ManifestStoppedAudioReloadReport (..)
+  , ManifestPreservingHotSwapReport (..)
   , reloadManifestSessionStoppedAudio
+  , reloadManifestSessionPreservingHotSwap
   ) where
 
 import           Control.DeepSeq                 (NFData)
 import           GHC.Generics                    (Generic)
 
 import           MetaSonic.Pattern               (SwapLabel)
-import           MetaSonic.Session.FanIn         (SessionFanInHost,
+import           MetaSonic.Session.Command       (SessionCommand)
+import           MetaSonic.Session.FanIn         (SessionFanInDrainResult,
+                                                  SessionFanInEnqueueResult (..),
+                                                  SessionFanInHost,
+                                                  SessionFanInSnapshot (..),
                                                   SessionFanInReloadIssue,
                                                   SessionFanInReloadReport (..),
+                                                  drainSessionFanInHost,
+                                                  enqueueSessionFanInCommand,
+                                                  readSessionFanInHost,
                                                   reloadSessionFanInHostOwnerStoppedAudio)
 import           MetaSonic.Session.ManifestReload
                                                 (ManifestReloadPlan (..),
+                                                 manifestReloadCommand,
                                                  manifestSessionOwnerOptions)
 import           MetaSonic.Session.Owner         (SessionOwnerOptions,
                                                   SessionOwnerStatus)
+import           MetaSonic.Session.Queue         (ProducerId,
+                                                  SessionEnqueueResult (..))
 import           MetaSonic.Session.State         (SessionState)
 
 
@@ -43,6 +56,30 @@ data ManifestStoppedAudioReloadReport = ManifestStoppedAudioReloadReport
   , msarrOwnerState           :: !SessionState
   , msarrOwnerStatus          :: !SessionOwnerStatus
   , msarrListenersMustRestart :: !Bool
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Report from submitting a preserving manifest reload through the
+-- existing owner/fan-in command path.
+--
+-- The helper returns a report for both accepted and rejected enqueue
+-- attempts. If enqueue is rejected, no queue drain is attempted, so the
+-- helper does not accidentally process unrelated pending work.
+data ManifestPreservingHotSwapReport = ManifestPreservingHotSwapReport
+  { mphsrDemoKey       :: !String
+  , mphsrSwapLabel     :: !SwapLabel
+  , mphsrCommand       :: !SessionCommand
+  , mphsrEnqueueResult :: !SessionFanInEnqueueResult
+  , mphsrDrainResult   :: !(Maybe SessionFanInDrainResult)
+    -- ^ Drain result for all commands drained after a successful
+    -- enqueue, including this helper's accepted hot-swap command.
+    -- 'Nothing' means enqueue was rejected and no drain was attempted.
+  , mphsrOwnerState    :: !SessionState
+    -- ^ Host owner state from the post-drain or post-rejection
+    -- snapshot.
+  , mphsrOwnerStatus   :: !SessionOwnerStatus
+    -- ^ Host owner status from the post-drain or post-rejection
+    -- snapshot.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -85,3 +122,50 @@ reloadManifestSessionStoppedAudio host baseOptions plan = do
         , msarrListenersMustRestart =
             True
         }
+
+-- | Submit a manifest reload as a preserving-only hot-swap command.
+--
+-- This is the live-reload sibling of 'reloadManifestSessionStoppedAudio':
+-- it projects the prevalidated plan to 'manifestReloadCommand', enqueues
+-- that command through the existing producer fan-in host, and, if
+-- accepted, drains all currently queued commands through the current
+-- owner, including the accepted manifest hot-swap command.
+--
+-- Unlike 'reloadManifestSessionStoppedAudio', this helper has no
+-- queue-empty admission rule. That asymmetry is intentional: the live
+-- preserving path composes with producer playback already admitted to
+-- the fan-in queue. It never replaces the owner, never calls the
+-- stopped-audio reload helper, and never falls back to clear/rebuild
+-- semantics on behalf of the caller.
+--
+-- A rejected enqueue is reported directly with no drain attempt.
+reloadManifestSessionPreservingHotSwap
+  :: ProducerId
+  -> SessionFanInHost
+  -> ManifestReloadPlan
+  -> IO ManifestPreservingHotSwapReport
+reloadManifestSessionPreservingHotSwap producer host plan = do
+  let command = manifestReloadCommand plan
+  enqueueResult <- enqueueSessionFanInCommand producer command host
+  drainResult <- case sfierResult enqueueResult of
+    SessionEnqueued {} ->
+      Just <$> drainSessionFanInHost host
+    SessionEnqueueRejected {} ->
+      pure Nothing
+  snapshot <- readSessionFanInHost host
+  pure ManifestPreservingHotSwapReport
+    { mphsrDemoKey =
+        mrlpDemoKey plan
+    , mphsrSwapLabel =
+        mrlpSwapLabel plan
+    , mphsrCommand =
+        command
+    , mphsrEnqueueResult =
+        enqueueResult
+    , mphsrDrainResult =
+        drainResult
+    , mphsrOwnerState =
+        sfisOwnerState snapshot
+    , mphsrOwnerStatus =
+        sfisOwnerStatus snapshot
+    }
