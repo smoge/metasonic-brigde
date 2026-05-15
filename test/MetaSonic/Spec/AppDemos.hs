@@ -12,6 +12,14 @@ import           MetaSonic.Pattern                (SwapLabel (..))
 import           MetaSonic.Session.ManifestReload
 import           MetaSonic.Session.ManifestReload.Construct
                                                    (constructManifestSessionFromPlan)
+import           MetaSonic.Session.ManifestReload.Runtime
+                                                   (ManifestStoppedAudioReloadReport (..),
+                                                    reloadManifestSessionStoppedAudio)
+import           MetaSonic.Session.FanIn           (SessionFanInReloadStatus (..),
+                                                    SessionFanInSnapshot (..),
+                                                    defaultSessionFanInOptions,
+                                                    readSessionFanInHost,
+                                                    withSessionFanInHost)
 import           MetaSonic.Session.Owner          (SessionOwnerStatus (..),
                                                    defaultSessionOwnerOptions,
                                                    sessionOwnerState,
@@ -134,6 +142,59 @@ appDemoCatalogTests =
         Right (state, status) -> do
           ssGraph state @?= mrcTemplateGraph sendReturn
           status @?= SessionOwnerReady
+
+  , testCase "external manifest JSON stopped-audio reload replaces fan-in owner through built-in catalog" $ do
+      catalog <- catalogOrFail demoTable
+      namedControl <- entryOrFail "named-control" catalog
+      sendReturn <- entryOrFail "send-return" catalog
+      let exportedDoc =
+            AuthoringManifestDoc
+              manifestSchemaVersion
+              [mrcManifest sendReturn]
+          request = ManifestReloadRequest
+            { mrrDemoKey        = "send-return"
+            , mrrSwapLabel      = SwapLabel "external-stopped-audio-smoke"
+            , mrrResourcePolicy = defaultManifestResourcePolicy
+            }
+      decodedDoc <-
+        case decodeManifestDoc (encodeManifestDoc exportedDoc) of
+          Left err  -> assertFailure ("expected decoded manifest: " <> err)
+          Right doc -> pure doc
+      plan <-
+        case planManifestReload decodedDoc catalog request of
+          Left issue ->
+            assertFailure ("expected external manifest reload plan, got: " <> show issue)
+          Right p ->
+            pure p
+      result <-
+        withSessionFanInHost
+          (mrcTemplateGraph namedControl)
+          defaultSessionFanInOptions
+          $ \host -> do
+              before <- readSessionFanInHost host
+              reload <-
+                reloadManifestSessionStoppedAudio
+                  host
+                  defaultSessionOwnerOptions
+                  plan
+              snapshotAfter <- readSessionFanInHost host
+              pure (before, reload, snapshotAfter)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (_, Left issue, _) ->
+          assertFailure
+            ("expected stopped-audio reload success, got: " <> show issue)
+        Right (before, Right report, snapshotAfter) -> do
+          ssGraph (sfisOwnerState before) @?= mrcTemplateGraph namedControl
+          ssGraph (msarrOwnerState report) @?= mrcTemplateGraph sendReturn
+          msarrDemoKey report @?= "send-return"
+          msarrSwapLabel report @?= SwapLabel "external-stopped-audio-smoke"
+          msarrOwnerStatus report @?= SessionOwnerReady
+          msarrListenersMustRestart report @?= True
+          sfisQueueDepth snapshotAfter @?= 0
+          sfisReloadStatus snapshotAfter @?= SessionFanInNormalOperation
+          ssGraph (sfisOwnerState snapshotAfter) @?= mrcTemplateGraph sendReturn
   ]
 
 catalogOrFail :: [Demo] -> IO [ManifestReloadCatalogEntry]

@@ -3393,21 +3393,24 @@ graph/resource facts after constructing a fresh non-audio owner. This
 is not stopped-audio reload of an existing owner, preserving live
 hot-swap, or host-level resource policy or failure-recovery policy.
 `MetaSonic.Session.ManifestReload.Runtime` now adds the first non-audio
-stopped-reload helper: given a prevalidated plan and an existing fan-in
+stopped-audio reload helper: given a prevalidated plan and an existing fan-in
 host, `reloadManifestSessionStoppedAudio` swaps the owner generation only
 after the queue is empty, returns a listener/producer-restart signal, and
 keeps audio stop/start plus bracket restart policy outside the session
 layer. The lower-level `MetaSonic.Session.FanIn` owner-swap helper
 serializes queue, reload status, and current owner in one state MVar and
 rejects producer enqueues distinctly during reload vs after failed
-post-dispose construction. This is still not live reload or an audio
-host integration.
+post-dispose construction. `--manifest-stopped-audio-reload-smoke
+MANIFEST.json DEMO` now exposes that helper in the CLI by creating an
+existing non-audio fan-in host, replacing its owner from the plan, and
+printing queue, reload, and owner status. This is still not live reload or an
+audio host integration.
 
 Still gated:
 
 - [ ] GUI toolkit bindings and live/host-level manifest reload/resource
   policy beyond the landed diagnostic import, construction-time v1, and
-  non-audio stopped-reload owner-swap helper,
+  non-audio stopped-audio owner-swap helper plus smoke CLI,
   broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope

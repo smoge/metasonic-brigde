@@ -56,7 +56,14 @@ import           MetaSonic.Pattern          (ControlTag (..),
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.ManifestReload.Construct
                                             (constructManifestSessionFromPlan)
+import           MetaSonic.Session.ManifestReload.Runtime
+                                            (ManifestStoppedAudioReloadReport (..),
+                                             reloadManifestSessionStoppedAudio)
 import           MetaSonic.Session.Command  (SessionCommand (..))
+import           MetaSonic.Session.FanIn    (SessionFanInSnapshot (..),
+                                             defaultSessionFanInOptions,
+                                             readSessionFanInHost,
+                                             withSessionFanInHost)
 import           MetaSonic.Session.Owner    (SessionOwnerStatus,
                                              defaultSessionOwnerOptions,
                                              sessionOwnerState,
@@ -165,6 +172,14 @@ data RunMode
     -- SessionOwner from the resulting plan, prints status, and exits.
     -- It does not start audio, step CmdHotSwap, or claim live reload
     -- semantics.
+  | ManifestStoppedAudioReloadSmoke
+    -- ^ Non-audio stopped-audio reload smoke
+    -- (--manifest-stopped-audio-reload-smoke MANIFEST.json DEMO). Reads an
+    -- external authoring manifest document, validates the selected demo
+    -- against the built-in authored-demo catalog, creates an existing
+    -- fan-in host, replaces its owner with the planned manifest owner,
+    -- prints status, and exits. It does not start/stop audio, reset
+    -- listeners, step CmdHotSwap, or claim live reload semantics.
   deriving (Eq, Show)
 
 data Options = Options
@@ -258,6 +273,15 @@ parseArgs = go defaultOptions
                   } xs
     go _ ("--manifest-session-smoke" : []) =
       Left "Missing manifest JSON file for --manifest-session-smoke"
+    go opts ("--manifest-stopped-audio-reload-smoke" : path : xs)
+      | null path || "--" `prefixOf` path =
+          Left "Missing manifest JSON file for --manifest-stopped-audio-reload-smoke"
+      | otherwise =
+          go opts { optMode = ManifestStoppedAudioReloadSmoke
+                  , optManifestReloadFile = Just path
+                  } xs
+    go _ ("--manifest-stopped-audio-reload-smoke" : []) =
+      Left "Missing manifest JSON file for --manifest-stopped-audio-reload-smoke"
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -397,6 +421,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-reload-plan DEMO"
   , "  " <> prog <> " --manifest-reload-plan-file MANIFEST.json DEMO"
   , "  " <> prog <> " --manifest-session-smoke MANIFEST.json DEMO"
+  , "  " <> prog <> " --manifest-stopped-audio-reload-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
   , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
@@ -498,6 +523,15 @@ usage prog = unlines
   , "                   SessionOwner from the plan, prints owner status and"
   , "                   graph/resource summary, then exits. No audio, no"
   , "                   CmdHotSwap execution, no live reload."
+  , "  --manifest-stopped-audio-reload-smoke MANIFEST.json DEMO"
+  , "                   Non-audio stopped-audio reload helper smoke. Reads"
+  , "                   MANIFEST.json, validates DEMO against the built-in"
+  , "                   authored-demo reload catalog, creates an existing"
+  , "                   FanIn host from a built-in authored demo, calls"
+  , "                   reloadManifestSessionStoppedAudio with the planned"
+  , "                   owner, reports queue, reload, and owner status, then"
+  , "                   exits. No audio start/stop, no listener restart,"
+  , "                   no CmdHotSwap execution, no live reload."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
@@ -558,6 +592,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-reload-plan send-return"
   , "  " <> prog <> " --manifest-reload-plan-file manifest.json send-return"
   , "  " <> prog <> " --manifest-session-smoke manifest.json send-return"
+  , "  " <> prog <> " --manifest-stopped-audio-reload-smoke manifest.json send-return"
   ]
 
 --------------------------------------------------------------------------------
@@ -656,6 +691,17 @@ main = do
           "--manifest-session-smoke MANIFEST.json DEMO_KEY"
           opts
       runManifestSessionSmoke manifestPath demo
+    ManifestStoppedAudioReloadSmoke -> do
+      manifestPath <- maybe
+        (die "Missing manifest JSON file for --manifest-stopped-audio-reload-smoke")
+        pure
+        (optManifestReloadFile opts)
+      demo <- either die pure $
+        resolveManifestReloadDiagnosticTarget
+          "--manifest-stopped-audio-reload-smoke"
+          "--manifest-stopped-audio-reload-smoke MANIFEST.json DEMO_KEY"
+          opts
+      runManifestStoppedAudioReloadSmoke manifestPath demo
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -782,6 +828,52 @@ runManifestSessionSmoke path demo = do
     Right (state, status) ->
       printManifestSessionSmoke plan state status
 
+runManifestStoppedAudioReloadSmoke :: FilePath -> Demo -> IO ()
+runManifestStoppedAudioReloadSmoke path demo = do
+  doc <- readManifestReloadDoc path
+  catalog <- either die pure (demoManifestReloadCatalog demoTable)
+  plan <- planManifestReloadOrDie doc catalog demo
+  initialEntry <- selectStoppedAudioReloadInitialEntry demo catalog
+  result <-
+    withSessionFanInHost
+      (MR.mrcTemplateGraph initialEntry)
+      defaultSessionFanInOptions
+      $ \host -> do
+          before <- readSessionFanInHost host
+          reload <-
+            reloadManifestSessionStoppedAudio
+              host
+              defaultSessionOwnerOptions
+              plan
+          after <- readSessionFanInHost host
+          pure (before, reload, after)
+  case result of
+    Left issue ->
+      die $
+        "Manifest stopped-audio reload smoke host setup failed: "
+        <> show issue
+    Right (_, Left issue, _) ->
+      die $ "Manifest stopped-audio reload smoke failed: " <> show issue
+    Right (before, Right report, after) ->
+      printManifestStoppedAudioReloadSmoke initialEntry plan before report after
+
+selectStoppedAudioReloadInitialEntry
+  :: Demo
+  -> [MR.ManifestReloadCatalogEntry]
+  -> IO MR.ManifestReloadCatalogEntry
+selectStoppedAudioReloadInitialEntry demo catalog =
+  case find ((/= demoKey demo) . MR.mrcDemoKey) catalog of
+    Just entry ->
+      pure entry
+    Nothing ->
+      case find ((== demoKey demo) . MR.mrcDemoKey) catalog of
+        Just entry ->
+          pure entry
+        Nothing ->
+          die $
+            "Internal error: no catalog entry for planned demo "
+            <> demoKey demo
+
 readManifestReloadDoc :: FilePath -> IO AuthoringManifestDoc
 readManifestReloadDoc path = do
   readResult <- try (BL.readFile path)
@@ -854,6 +946,60 @@ printManifestSessionSmoke plan state status = do
   putStrLn $ "  active voices: " <> show (M.size (ssVoices state))
   putStrLn "  audio started: no"
   putStrLn "  command projection: not executed"
+
+printManifestStoppedAudioReloadSmoke
+  :: MR.ManifestReloadCatalogEntry
+  -> MR.ManifestReloadPlan
+  -> SessionFanInSnapshot
+  -> ManifestStoppedAudioReloadReport
+  -> SessionFanInSnapshot
+  -> IO ()
+printManifestStoppedAudioReloadSmoke initialEntry plan before report after = do
+  putStrLn "Manifest stopped-audio reload smoke"
+  putStrLn $ "  initial demo: " <> MR.mrcDemoKey initialEntry
+  putStrLn $ "  target demo: " <> MR.mrlpDemoKey plan
+  putStrLn $ "  swap label: " <> swapLabelText (MR.mrlpSwapLabel plan)
+  printManifestReloadTemplates (MR.mrlpTemplateGraph plan)
+  printManifestReloadResources (MR.mrlpAdapterOptions plan)
+  printManifestReloadControls (MR.mrlpControlSurface plan)
+  putStrLn $ "  arbitration policy: "
+          <> show (MR.mrlpArbitrationPolicy plan)
+  putStrLn "  pre-reload fan-in:"
+  putStrLn $ "    queue depth: " <> show (sfisQueueDepth before)
+  putStrLn $ "    owner status: " <> show (sfisOwnerStatus before)
+  putStrLn $ "    reload status: " <> show (sfisReloadStatus before)
+  putStrLn $
+    "    initial graph installed: "
+    <> if ssGraph (sfisOwnerState before) == MR.mrcTemplateGraph initialEntry
+          then "yes"
+          else "no"
+  putStrLn "  post-reload fan-in:"
+  putStrLn $ "    queue depth: " <> show (sfisQueueDepth after)
+  putStrLn $ "    owner status: " <> show (sfisOwnerStatus after)
+  putStrLn $ "    reload status: " <> show (sfisReloadStatus after)
+  putStrLn $
+    "    graph installed: "
+    <> if ssGraph (sfisOwnerState after) == MR.mrlpTemplateGraph plan
+          then "yes"
+          else "no"
+  putStrLn $
+    "    active voices: "
+    <> show (M.size (ssVoices (sfisOwnerState after)))
+  putStrLn $ "  report demo: " <> msarrDemoKey report
+  putStrLn $ "  report swap label: " <> swapLabelText (msarrSwapLabel report)
+  putStrLn $ "  report owner status: " <> show (msarrOwnerStatus report)
+  putStrLn $
+    "  report graph installed: "
+    <> if ssGraph (msarrOwnerState report) == MR.mrlpTemplateGraph plan
+          then "yes"
+          else "no"
+  putStrLn $
+    "  listener/producer restart required: "
+    <> if msarrListenersMustRestart report then "yes" else "no"
+  putStrLn "  audio started: no"
+  putStrLn "  audio stopped by helper: no"
+  putStrLn "  listener restart executed: no"
+  printManifestReloadCommand (MR.manifestReloadCommand plan)
 
 printManifestReloadTemplates :: TemplateGraph -> IO ()
 printManifestReloadTemplates graph = do
@@ -994,7 +1140,8 @@ runDemo opts demo
     || optMode opts == AuthoringManifest
     || optMode opts == ManifestReloadDiagnostic
     || optMode opts == ManifestReloadFileDiagnostic
-    || optMode opts == ManifestSessionSmoke =
+    || optMode opts == ManifestSessionSmoke
+    || optMode opts == ManifestStoppedAudioReloadSmoke =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -1075,6 +1222,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: ManifestReloadFileDiagnostic should be handled by main, never reach here"
     ManifestSessionSmoke ->
       error "runSingleDemo: ManifestSessionSmoke should be handled by main, never reach here"
+    ManifestStoppedAudioReloadSmoke ->
+      error "runSingleDemo: ManifestStoppedAudioReloadSmoke should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare

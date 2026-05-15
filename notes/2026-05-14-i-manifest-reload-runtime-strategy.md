@@ -7,7 +7,7 @@ construction-time install boundary is recorded in
 `2026-05-14-g-manifest-reload-install-strategy.md` and the app-visible
 construction smoke in `2026-05-14-h-manifest-session-construction-smoke.md`.
 This note pins the v1 reload contract; the landed implementation covers the
-session-layer helper only.
+session-layer helper and diagnostic CLI smoke only.
 
 Implemented in the first helper slice:
 
@@ -28,6 +28,11 @@ Implemented in the first helper slice:
   "listeners/producers must restart" report. It does not call
   `startAudio` / `stopAudio`, validate manifests, drain queues, or touch
   listener brackets.
+- `--manifest-stopped-audio-reload-smoke MANIFEST.json DEMO` reads an
+  external manifest, plans against the built-in authored-demo catalog, creates
+  an existing non-audio fan-in host, calls the stopped-audio reload helper,
+  and prints queue, reload, and owner status. It does not start/stop audio or
+  restart listener/producer brackets.
 
 ## Three Strategies
 
@@ -472,14 +477,14 @@ Closed by the first helper slice:
 - completion signal: the manifest helper returns
   `msarrListenersMustRestart = True`, leaving listener/producer bracket
   restart to the host.
+- diagnostic CLI smoke: `--manifest-stopped-audio-reload-smoke` exercises the
+  helper without pretending to be an audio-running reload path.
 
 Still open for host integration:
 
 - a host command that performs the whole stop window: quiesce producers and
   listeners, drain while audio is live, stop audio, call the helper, restart
   audio, and reopen producer/listener brackets;
-- a diagnostic CLI smoke for the new helper that does not pretend to be
-  audio-running live reload;
 - an app-owned recovery policy after `SfriOwnerSetupFailed`, since the helper
   intentionally leaves the host with no owner after post-dispose construction
   failure.

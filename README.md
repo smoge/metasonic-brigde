@@ -311,19 +311,23 @@ The landed pieces are deliberately small:
   manifest document and `--manifest-reload-plan-file MANIFEST.json DEMO` for
   diagnostic external JSON validation. `--manifest-session-smoke
   MANIFEST.json DEMO` then uses that plan to construct a fresh non-audio
-  `SessionOwner` and report status. These paths do not start audio, enqueue
-  producer commands, or execute `CmdHotSwap`.
+  `SessionOwner` and report status. `--manifest-stopped-audio-reload-smoke
+  MANIFEST.json DEMO` creates an existing non-audio fan-in host and uses the
+  planned manifest owner to exercise the stopped-audio reload helper. These
+  paths do not start audio, enqueue producer commands, or execute `CmdHotSwap`.
 - `MetaSonic.Session.ManifestReload.Runtime` exposes
-  `reloadManifestSessionStoppedAudio` for the first non-audio stopped-reload
-  helper. It takes a prevalidated plan, requires the fan-in queue to be empty,
-  replaces the current owner generation, and reports that listener/producer
-  brackets must restart. It does not call `startAudio` / `stopAudio`, validate
-  manifests, drain queued commands, or restart listener threads.
+  `reloadManifestSessionStoppedAudio` for the first non-audio stopped-audio
+  reload helper. It takes a prevalidated plan, requires the fan-in queue to be
+  empty, replaces the current owner generation, and reports that
+  listener/producer brackets must restart. It does not call `startAudio` /
+  `stopAudio`, validate manifests, drain queued commands, or restart listener
+  threads.
 
 What is still intentionally absent: GUI toolkit bindings, live or
 host-level manifest-driven session reload/resource allocation beyond the
-diagnostic planning, construction-smoke CLI, and non-audio stopped-reload
-owner-swap helper, broader MIDI behavior beyond the landed
+diagnostic planning, construction-smoke CLI, non-audio stopped-audio
+owner-swap helper, and stopped-audio reload smoke CLI, broader MIDI behavior
+beyond the landed
 MIDI ingress surface (note/CC/sustain/pitch-bend/all-notes-off command
 translation, producer-local channel filtering, and the small
 PortMIDI-backed decoded source), broader OSC behavior beyond symbolic

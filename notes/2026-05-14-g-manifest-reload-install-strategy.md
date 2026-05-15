@@ -3,7 +3,7 @@
 Date: 2026-05-14
 
 Status: implemented for the v1 construction-time helper, owner/RTGraph
-smoke coverage, and the first non-audio stopped-reload owner replacement
+smoke coverage, and the first non-audio stopped-audio owner replacement
 helper. This note remains the install-strategy design record for the first
 runtime-facing manifest slices. The app-visible construction smoke is covered
 by `2026-05-14-h-manifest-session-construction-smoke.md`; the stopped-audio
@@ -232,6 +232,18 @@ metasonic-bridge --manifest-session-smoke MANIFEST.json DEMO
 That command reads an external manifest, plans against the built-in
 authored-demo catalog, constructs a fresh owner, prints status, and exits. It
 does not step `CmdHotSwap`, start audio, or reload an existing owner.
+
+The CLI also exposes the first stopped-audio reload helper boundary with:
+
+```text
+metasonic-bridge --manifest-stopped-audio-reload-smoke MANIFEST.json DEMO
+```
+
+That command reads an external manifest, plans against the built-in
+authored-demo catalog, creates an existing non-audio fan-in host, replaces the
+host owner through `reloadManifestSessionStoppedAudio`, prints queue, reload,
+and owner status, and exits. It does not start/stop audio, drain producer
+work, restart listener brackets, or execute `CmdHotSwap`.
 
 The existing pure tests should continue to cover:
 
