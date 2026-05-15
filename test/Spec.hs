@@ -15,6 +15,7 @@ import           MetaSonic.Spec.AppManifestReloadHost
 import           MetaSonic.Spec.AppManifestReloadIngress
 import           MetaSonic.Spec.AppManifestReloadOrchestration
 import           MetaSonic.Spec.AppManifestReloadSupervisor
+import           MetaSonic.Spec.AppManifestReloadUIIngress
 import           MetaSonic.Spec.Core
 import           MetaSonic.Spec.FFI
 import           MetaSonic.Spec.Feature
@@ -32,6 +33,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , appManifestReloadIngressTests
   , appManifestReloadOrchestrationTests
   , appManifestReloadSupervisorTests
+  , appManifestReloadUIIngressTests
   , unitTests
   , properties
   , crossCuttingTests

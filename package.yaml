@@ -143,6 +143,7 @@ executables:
       - MetaSonic.App.ManifestReloadIngress
       - MetaSonic.App.ManifestReloadOrchestration
       - MetaSonic.App.ManifestReloadSupervisor
+      - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.App.Osc
       - MetaSonic.App.ProfitabilityGate
       - MetaSonic.App.SessionMidiSmoke
@@ -171,12 +172,14 @@ tests:
       - MetaSonic.App.ManifestReloadIngress
       - MetaSonic.App.ManifestReloadOrchestration
       - MetaSonic.App.ManifestReloadSupervisor
+      - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.Spec.AppManifestReloadBinding
       - MetaSonic.Spec.AppManifestReloadCli
       - MetaSonic.Spec.AppManifestReloadHost
       - MetaSonic.Spec.AppManifestReloadIngress
       - MetaSonic.Spec.AppManifestReloadOrchestration
       - MetaSonic.Spec.AppManifestReloadSupervisor
+      - MetaSonic.Spec.AppManifestReloadUIIngress
       - MetaSonic.Spec.AppDemos
       - MetaSonic.Spec.Core
       - MetaSonic.Spec.Driver
