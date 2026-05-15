@@ -87,7 +87,7 @@ appManifestReloadCliTests =
             "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected"
             output
           assertContains "    graph installed: yes" output
-          assertContains "  ingress: open new handle=1" output
+          assertContains "  ingress: open demo=send-return" output
           assertContains "  fake audio events:" output
           assertContains "    - start channels=2 device=-1" output
           assertContains "    - stop" output
@@ -117,7 +117,7 @@ appManifestReloadCliTests =
           assertContains "  strategy: stopped-audio-only" output
           assertContains "  strategy result: success: MrhsrStoppedAudio" output
           assertContains "    graph installed: yes" output
-          assertContains "  ingress: open new handle=1" output
+          assertContains "  ingress: open demo=send-return" output
           assertContains "  fake audio events:" output
           assertContains "    - start channels=2 device=-1" output
           assertContains "    - stop" output
@@ -146,7 +146,7 @@ appManifestReloadCliTests =
           assertContains "  strategy: require-preserving" output
           assertContains "  strategy result: failed: MrhsiPreservingFailed" output
           assertContains "    graph installed: no" output
-          assertContains "  ingress: open old handle=1" output
+          assertContains "  ingress: open demo=named-control" output
           assertContains "  selector command projection:" output
 
   , testCase "missing manifest file reports read failure" $ do

@@ -131,6 +131,7 @@ executable metasonic-bridge
       MetaSonic.App.Demos
       MetaSonic.App.FusionCostLab
       MetaSonic.App.FusionCostModel
+      MetaSonic.App.ManifestReloadBinding
       MetaSonic.App.ManifestReloadCli
       MetaSonic.App.ManifestReloadHost
       MetaSonic.App.ManifestReloadIngress
@@ -171,11 +172,13 @@ test-suite metasonic-bridge-test
   main-is: Spec.hs
   other-modules:
       MetaSonic.App.Demos
+      MetaSonic.App.ManifestReloadBinding
       MetaSonic.App.ManifestReloadCli
       MetaSonic.App.ManifestReloadHost
       MetaSonic.App.ManifestReloadIngress
       MetaSonic.App.ManifestReloadOrchestration
       MetaSonic.App.ManifestReloadSupervisor
+      MetaSonic.Spec.AppManifestReloadBinding
       MetaSonic.Spec.AppManifestReloadCli
       MetaSonic.Spec.AppManifestReloadHost
       MetaSonic.Spec.AppManifestReloadIngress

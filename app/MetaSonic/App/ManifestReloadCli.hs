@@ -37,6 +37,14 @@ import qualified Data.Text                        as T
 
 import           MetaSonic.App.Demos              (Demo (..), demoTable,
                                                    demoManifestReloadCatalog)
+import           MetaSonic.App.ManifestReloadBinding
+                                                  (ManifestUIIngressTarget,
+                                                   ManifestUIVoiceSelection (..),
+                                                   manifestUIIngressTargetFromPlan,
+                                                   muitControls,
+                                                   muitDemoKey,
+                                                   muitVoiceSelection,
+                                                   muvsDefaultVoice)
 import           MetaSonic.App.ManifestReloadHost
                                                   (ManifestReloadHostConfig (..),
                                                    ManifestReloadHostIssue,
@@ -49,15 +57,17 @@ import           MetaSonic.App.ManifestReloadIngress
                                                    ManifestReloadIngressSnapshot (..),
                                                    newManifestReloadIngressManager,
                                                    readManifestReloadIngressManager)
-import           MetaSonic.Authoring.Manifest     (AuthoringManifestDoc,
-                                                   decodeManifestDoc)
+import           MetaSonic.Authoring.Manifest     (AuthoringManifestDoc (..),
+                                                   decodeManifestDoc,
+                                                   manifestSchemaVersion)
 import           MetaSonic.Bridge.Compile         (RuntimeGraph (..))
 import           MetaSonic.Bridge.Source          (unMigrationKey)
 import           MetaSonic.Bridge.Templates       (Template (..),
                                                    TemplateGraph (..))
 import           MetaSonic.Pattern                (ControlTag (..),
                                                    SwapLabel (..),
-                                                   TemplateName (..))
+                                                   TemplateName (..),
+                                                   VoiceKey (..))
 import           MetaSonic.Session.Command        (SessionCommand (..))
 import           MetaSonic.Session.FanIn          (SessionFanInAudioFFI (..),
                                                    SessionFanInAudioIssue,
@@ -121,20 +131,14 @@ data ManifestHostStrategyReloadSmokeResult =
                                     ManifestHostStrategySmokeIngressIssue)))
     , mshsAfter           :: !SessionFanInSnapshot
     , mshsIngressSnapshot :: !(ManifestReloadIngressSnapshot
-                                ManifestHostStrategySmokeTarget
+                                ManifestUIIngressTarget
                                 ManifestHostStrategySmokeHandle)
     , mshsAudioEvents     :: ![ManifestHostStrategySmokeAudioEvent]
     } deriving (Eq, Show)
 
-data ManifestHostStrategySmokeTarget
-  = ManifestHostStrategySmokeOldIngress
-  | ManifestHostStrategySmokeNewIngress
-  deriving (Eq, Show)
-
 data ManifestHostStrategySmokeHandle =
   ManifestHostStrategySmokeHandle
-    { mhsshId     :: !Int
-    , mhsshTarget :: !ManifestHostStrategySmokeTarget
+    { mhsshId :: !Int
     } deriving (Eq, Show)
 
 data ManifestHostStrategySmokeIngressIssue =
@@ -325,85 +329,100 @@ runManifestHostStrategyReloadSmokeResultWithCatalog strategy doc catalog demo =
       case selectStoppedAudioReloadInitialEntry demo catalog of
         Left issue ->
           pure (Left issue)
-        Right initialEntry -> do
-          result <-
-            withSessionFanInService
-              (MR.mrcTemplateGraph initialEntry)
-              defaultSessionFanInServiceOptions
-              $ \service -> do
-                  events <- newIORef []
-                  ingressManager <-
-                    newManifestReloadIngressManager
-                      manifestHostStrategySmokeIngressOps
-                      ManifestHostStrategySmokeOldIngress
-                      (ManifestHostStrategySmokeHandle
-                        0
-                        ManifestHostStrategySmokeOldIngress)
-                  let audioFFI =
-                        manifestHostStrategySmokeAudioFFI events
-                      config = ManifestReloadHostConfig
-                        { mrhcService =
-                            service
-                        , mrhcIngressManager =
-                            ingressManager
-                        , mrhcOldIngressTarget =
-                            ManifestHostStrategySmokeOldIngress
-                        , mrhcNewIngressTarget =
-                            ManifestHostStrategySmokeNewIngress
-                        , mrhcAudioFFI =
-                            audioFFI
-                        , mrhcAudioOptions =
-                            manifestHostStrategySmokeAudioOptions
-                        , mrhcOwnerOptions =
-                            defaultSessionOwnerOptions
-                        }
-                  audioStarted <-
-                    startSessionFanInHostAudioWith
-                      audioFFI
-                      (sessionFanInServiceHost service)
-                      manifestHostStrategySmokeAudioOptions
-                  case audioStarted of
-                    Left issue ->
-                      pure (Left (MrciHostStrategyAudioStartFailed issue))
-                    Right () -> do
-                      before <- readSessionFanInService service
-                      outcome <-
-                        reloadManifestHostWithStrategy
-                          manifestHostStrategySmokeProducer
-                          strategy
-                          config
-                          doc
-                          catalog
-                          (manifestReloadRequestForDemo demo)
-                      after <- readSessionFanInService service
-                      ingressSnapshot <-
-                        readManifestReloadIngressManager ingressManager
-                      audioEvents <- readIORef events
-                      pure (Right ManifestHostStrategyReloadSmokeResult
-                        { mshsInitialEntry =
-                            initialEntry
-                        , mshsStrategy =
-                            strategy
-                        , mshsPlan =
-                            plan
-                        , mshsBefore =
-                            before
-                        , mshsOutcome =
-                            outcome
-                        , mshsAfter =
-                            after
-                        , mshsIngressSnapshot =
-                            ingressSnapshot
-                        , mshsAudioEvents =
-                            audioEvents
-                        })
-          pure $ case result of
+        Right initialEntry ->
+          case planManifestReloadForCatalogEntry initialEntry of
             Left issue ->
-              Left (MrciHostStrategySetupFailed issue)
-            Right (Left issue) ->
-              Left issue
-            Right (Right smoke) ->
-              Right smoke
+              pure (Left issue)
+            Right initialPlan -> do
+              let oldTarget =
+                    manifestUIIngressTargetFromPlan
+                      manifestHostStrategySmokeVoiceSelection
+                      M.empty
+                      initialPlan
+                  newTarget =
+                    manifestUIIngressTargetFromPlan
+                      manifestHostStrategySmokeVoiceSelection
+                      M.empty
+                      plan
+              runSmoke plan initialEntry oldTarget newTarget
+  where
+    runSmoke targetPlan initialEntry oldTarget newTarget = do
+      result <-
+        withSessionFanInService
+          (MR.mrcTemplateGraph initialEntry)
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              events <- newIORef []
+              ingressManager <-
+                newManifestReloadIngressManager
+                  manifestHostStrategySmokeIngressOps
+                  oldTarget
+                  (ManifestHostStrategySmokeHandle 0)
+              let audioFFI =
+                    manifestHostStrategySmokeAudioFFI events
+                  config = ManifestReloadHostConfig
+                    { mrhcService =
+                        service
+                    , mrhcIngressManager =
+                        ingressManager
+                    , mrhcOldIngressTarget =
+                        oldTarget
+                    , mrhcNewIngressTarget =
+                        newTarget
+                    , mrhcAudioFFI =
+                        audioFFI
+                    , mrhcAudioOptions =
+                        manifestHostStrategySmokeAudioOptions
+                    , mrhcOwnerOptions =
+                        defaultSessionOwnerOptions
+                    }
+              audioStarted <-
+                startSessionFanInHostAudioWith
+                  audioFFI
+                  (sessionFanInServiceHost service)
+                  manifestHostStrategySmokeAudioOptions
+              case audioStarted of
+                Left issue ->
+                  pure (Left (MrciHostStrategyAudioStartFailed issue))
+                Right () -> do
+                  before <- readSessionFanInService service
+                  outcome <-
+                    reloadManifestHostWithStrategy
+                      manifestHostStrategySmokeProducer
+                      strategy
+                      config
+                      doc
+                      catalog
+                      (manifestReloadRequestForDemo demo)
+                  after <- readSessionFanInService service
+                  ingressSnapshot <-
+                    readManifestReloadIngressManager ingressManager
+                  audioEvents <- readIORef events
+                  pure (Right ManifestHostStrategyReloadSmokeResult
+                    { mshsInitialEntry =
+                        initialEntry
+                    , mshsStrategy =
+                        strategy
+                    , mshsPlan =
+                        targetPlan
+                    , mshsBefore =
+                        before
+                    , mshsOutcome =
+                        outcome
+                    , mshsAfter =
+                        after
+                    , mshsIngressSnapshot =
+                        ingressSnapshot
+                    , mshsAudioEvents =
+                        audioEvents
+                    })
+      pure $ case result of
+        Left issue ->
+          Left (MrciHostStrategySetupFailed issue)
+        Right (Left issue) ->
+          Left issue
+        Right (Right smoke) ->
+          Right smoke
 
 renderManifestReloadCliIssue :: ManifestReloadCliIssue -> String
 renderManifestReloadCliIssue issue =
@@ -565,7 +584,7 @@ renderStrategyOutcome outcome =
 
 renderSmokeIngressSnapshot
   :: ManifestReloadIngressSnapshot
-       ManifestHostStrategySmokeTarget
+       ManifestUIIngressTarget
        ManifestHostStrategySmokeHandle
   -> String
 renderSmokeIngressSnapshot snapshot =
@@ -573,18 +592,15 @@ renderSmokeIngressSnapshot snapshot =
     MrisClosed ->
       "closed"
     MrisOpen target handle ->
-      "open "
-      <> renderSmokeTarget target
+      "open demo="
+      <> muitDemoKey target
+      <> " controls="
+      <> show (length (muitControls target))
+      <> " defaultVoice="
+      <> voiceKeyText
+           (muvsDefaultVoice (muitVoiceSelection target))
       <> " handle="
       <> show (mhsshId handle)
-
-renderSmokeTarget :: ManifestHostStrategySmokeTarget -> String
-renderSmokeTarget target =
-  case target of
-    ManifestHostStrategySmokeOldIngress ->
-      "old"
-    ManifestHostStrategySmokeNewIngress ->
-      "new"
 
 renderSmokeAudioEvents :: [ManifestHostStrategySmokeAudioEvent] -> [String]
 renderSmokeAudioEvents events =
@@ -641,6 +657,27 @@ selectStoppedAudioReloadInitialEntry demo catalog =
         Nothing ->
           Left (MrciNoCatalogEntry (demoKey demo))
 
+planManifestReloadForCatalogEntry
+  :: MR.ManifestReloadCatalogEntry
+  -> Either ManifestReloadCliIssue MR.ManifestReloadPlan
+planManifestReloadForCatalogEntry entry =
+  -- Smoke-only convenience: production old ingress should come from
+  -- the host's prior bring-up or previous reload state. The CLI smoke
+  -- has only catalog entries, so it builds the same pure projection
+  -- shape from the selected initial entry.
+  first MrciPlanningFailed $
+    MR.planManifestReload
+      (AuthoringManifestDoc manifestSchemaVersion [MR.mrcManifest entry])
+      [entry]
+      MR.ManifestReloadRequest
+        { MR.mrrDemoKey =
+            MR.mrcDemoKey entry
+        , MR.mrrSwapLabel =
+            SwapLabel ("manifest:" <> MR.mrcDemoKey entry)
+        , MR.mrrResourcePolicy =
+            MR.defaultManifestResourcePolicy
+        }
+
 manifestReloadRequestForDemo :: Demo -> MR.ManifestReloadRequest
 manifestReloadRequestForDemo demo =
   MR.ManifestReloadRequest
@@ -655,6 +692,14 @@ manifestReloadRequestForDemo demo =
 manifestHostStrategySmokeProducer :: ProducerId
 manifestHostStrategySmokeProducer =
   ProducerId ProducerUI (T.pack "manifest-host-strategy-smoke")
+
+manifestHostStrategySmokeVoiceSelection :: ManifestUIVoiceSelection
+manifestHostStrategySmokeVoiceSelection = ManifestUIVoiceSelection
+  { muvsFocusedVoice =
+      Nothing
+  , muvsDefaultVoice =
+      VoiceKey "v0"
+  }
 
 manifestHostStrategySmokeAudioOptions :: SessionFanInAudioOptions
 manifestHostStrategySmokeAudioOptions = SessionFanInAudioOptions
@@ -689,14 +734,14 @@ appendSmokeAudioEvent ref event =
 
 manifestHostStrategySmokeIngressOps
   :: ManifestReloadIngressOps
-       ManifestHostStrategySmokeTarget
+       ManifestUIIngressTarget
        ManifestHostStrategySmokeIngressIssue
        ManifestHostStrategySmokeHandle
 manifestHostStrategySmokeIngressOps =
   ManifestReloadIngressOps
     { mrioOpenIngress =
-        \target ->
-          pure (Right (ManifestHostStrategySmokeHandle 1 target))
+        \_target ->
+          pure (Right (ManifestHostStrategySmokeHandle 1))
     , mrioCloseIngress =
         \_handle ->
           pure (Right ())
@@ -788,3 +833,7 @@ swapLabelText =
 controlTagText :: ControlTag -> String
 controlTagText (ControlTag key slot) =
   unMigrationKey key <> "/" <> show slot
+
+voiceKeyText :: VoiceKey -> String
+voiceKeyText =
+  unVoiceKey
