@@ -9,6 +9,7 @@ module Main (main) where
 import           Test.Tasty
 
 import           MetaSonic.Spec.AppDemos
+import           MetaSonic.Spec.AppManifestMIDIListener
 import           MetaSonic.Spec.AppManifestOSCIngressOps
 import           MetaSonic.Spec.AppManifestOSCListener
 import           MetaSonic.Spec.AppManifestOSCReloadE2E
@@ -35,6 +36,7 @@ import           MetaSonic.Spec.SessionMIDI
 main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
   [ appDemoCatalogTests
+  , appManifestMIDIListenerTests
   , appManifestOSCIngressOpsTests
   , appManifestOSCListenerTests
   , appManifestOSCReloadE2ETests
