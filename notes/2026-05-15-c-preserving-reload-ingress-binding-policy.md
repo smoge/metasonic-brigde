@@ -8,7 +8,17 @@ preserving-reload host opens "fresh ingress" against the same live owner,
 and which sub-questions remain open before real OSC/MIDI/UI listeners can
 be wired against the landed strategy substrate.
 
-Implementation update: the UI ingress projection has landed as
+Implementation update: the combined ingress target has landed as
+`MetaSonic.App.ManifestReloadIngressTarget.ManifestReloadIngressTarget`,
+projected by `manifestReloadIngressTargetFromPlan` from a
+`ManifestReloadIngressTargetPolicy` plus the validated reload plan; the
+strategy CLI smoke (`--manifest-host-reload-smoke`) now opens fresh
+ingress against this combined target instead of a UI-only one. The
+projection composes the three per-producer projections below; duplicate
+CC numbers in the manifest surface as a construction failure so the
+orchestrator cannot open a partial surface.
+
+The UI ingress projection has landed as
 `MetaSonic.App.ManifestReloadBinding.ManifestUIIngressTarget` plus a
 concrete consumer `MetaSonic.App.ManifestReloadUIIngress`. Last-written
 UI values are stored producer-local in a caller-owned
@@ -149,19 +159,25 @@ until its binding has been rebuilt against the new control surface.
 
 These should be resolved before the first non-smoke listener lands:
 
-1. **Who derives `mrhcNewIngressTarget`?** *Decided for per-producer
-   pure derivation; open for the combined real-listener
-   target/factory.* Pure per-producer projections are landed for all
-   three kinds (`manifestUIIngressTargetFromPlan`,
+1. **Who derives `mrhcNewIngressTarget`?** *Decided.* Pure per-producer
+   projections are landed for all three kinds
+   (`manifestUIIngressTargetFromPlan`,
    `manifestOSCIngressTargetFromPlan`,
    `manifestMIDIIngressTargetFromPlan`), each taking the producer
    policy that the manifest does not own (UI voice selection plus
-   retain map; MIDI default voice). What is still open is the combined
-   listener-shape target that the orchestrator's
-   `mrhcNewIngressTarget` carries — is it a record bundling the three,
-   a sum, or a host-supplied factory that owns device lifecycle and
-   yields them on open? The strategy CLI smoke ducks this by using
-   opaque sentinel targets.
+   retain map; MIDI default voice). They are composed by
+   `manifestReloadIngressTargetFromPlan` into a single
+   `ManifestReloadIngressTarget` record carried as
+   `mrhcNewIngressTarget`. Construction is a pure function from
+   `ManifestReloadIngressTargetPolicy` plus the validated plan; it
+   can fail with `ManifestMIDIProjectionIssue` if MIDI CC numbers
+   duplicate. The strategy CLI smoke now opens fresh ingress against
+   this combined target instead of the UI-only sentinel it used
+   before. What remains gated to a future slice is whether a
+   host-supplied factory wrapping this projection plus device
+   lifecycle is needed once a real OSC UDP listener and a real
+   PortMIDI device land — likely yes, but that wrapping is host
+   policy, not manifest policy.
 2. **Last-written value store for retain-across-reload.** *Decided for
    UI and no-device MIDI; open for OSC and device-backed MIDI policy.*
    v1 retains surviving tags' last-written values for UI: the

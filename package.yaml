@@ -141,6 +141,7 @@ executables:
       - MetaSonic.App.ManifestReloadCli
       - MetaSonic.App.ManifestReloadHost
       - MetaSonic.App.ManifestReloadIngress
+      - MetaSonic.App.ManifestReloadIngressTarget
       - MetaSonic.App.ManifestReloadMIDIBinding
       - MetaSonic.App.ManifestReloadMIDIIngress
       - MetaSonic.App.ManifestReloadOrchestration
@@ -174,6 +175,7 @@ tests:
       - MetaSonic.App.ManifestReloadCli
       - MetaSonic.App.ManifestReloadHost
       - MetaSonic.App.ManifestReloadIngress
+      - MetaSonic.App.ManifestReloadIngressTarget
       - MetaSonic.App.ManifestReloadMIDIBinding
       - MetaSonic.App.ManifestReloadMIDIIngress
       - MetaSonic.App.ManifestReloadOrchestration
@@ -185,6 +187,7 @@ tests:
       - MetaSonic.Spec.AppManifestReloadCli
       - MetaSonic.Spec.AppManifestReloadHost
       - MetaSonic.Spec.AppManifestReloadIngress
+      - MetaSonic.Spec.AppManifestReloadIngressTarget
       - MetaSonic.Spec.AppManifestReloadMIDIBinding
       - MetaSonic.Spec.AppManifestReloadMIDIIngress
       - MetaSonic.Spec.AppManifestReloadOrchestration

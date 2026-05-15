@@ -38,13 +38,20 @@ import qualified Data.Text                        as T
 import           MetaSonic.App.Demos              (Demo (..), demoTable,
                                                    demoManifestReloadCatalog)
 import           MetaSonic.App.ManifestReloadBinding
-                                                  (ManifestUIIngressTarget,
-                                                   ManifestUIVoiceSelection (..),
-                                                   manifestUIIngressTargetFromPlan,
+                                                  (ManifestUIVoiceSelection (..),
                                                    muitControls,
                                                    muitDemoKey,
                                                    muitVoiceSelection,
                                                    muvsDefaultVoice)
+import           MetaSonic.App.ManifestReloadIngressTarget
+                                                  (ManifestReloadIngressTarget (..),
+                                                   ManifestReloadIngressTargetPolicy (..),
+                                                   manifestReloadIngressTargetFromPlan)
+import           MetaSonic.App.ManifestReloadMIDIBinding
+                                                  (ManifestMIDIProjectionIssue,
+                                                   mmitControls)
+import           MetaSonic.App.ManifestReloadOSCBinding
+                                                  (motControls)
 import           MetaSonic.App.ManifestReloadHost
                                                   (ManifestReloadHostConfig (..),
                                                    ManifestReloadHostIssue,
@@ -105,6 +112,7 @@ data ManifestReloadCliIssue
   | MrciStoppedAudioReloadFailed !SessionFanInReloadIssue
   | MrciHostStrategySetupFailed !SessionFanInServiceSetupIssue
   | MrciHostStrategyAudioStartFailed !SessionFanInAudioIssue
+  | MrciIngressTargetFailed !ManifestMIDIProjectionIssue
   deriving (Eq, Show)
 
 data ManifestStoppedAudioReloadSmokeResult =
@@ -131,7 +139,7 @@ data ManifestHostStrategyReloadSmokeResult =
                                     ManifestHostStrategySmokeIngressIssue)))
     , mshsAfter           :: !SessionFanInSnapshot
     , mshsIngressSnapshot :: !(ManifestReloadIngressSnapshot
-                                ManifestUIIngressTarget
+                                ManifestReloadIngressTarget
                                 ManifestHostStrategySmokeHandle)
     , mshsAudioEvents     :: ![ManifestHostStrategySmokeAudioEvent]
     } deriving (Eq, Show)
@@ -333,18 +341,20 @@ runManifestHostStrategyReloadSmokeResultWithCatalog strategy doc catalog demo =
           case planManifestReloadForCatalogEntry initialEntry of
             Left issue ->
               pure (Left issue)
-            Right initialPlan -> do
-              let oldTarget =
-                    manifestUIIngressTargetFromPlan
-                      manifestHostStrategySmokeVoiceSelection
-                      M.empty
-                      initialPlan
-                  newTarget =
-                    manifestUIIngressTargetFromPlan
-                      manifestHostStrategySmokeVoiceSelection
-                      M.empty
-                      plan
-              runSmoke plan initialEntry oldTarget newTarget
+            Right initialPlan ->
+              case manifestReloadIngressTargetFromPlan
+                     manifestHostStrategySmokeIngressTargetPolicy
+                     initialPlan of
+                Left issue ->
+                  pure (Left (MrciIngressTargetFailed issue))
+                Right oldTarget ->
+                  case manifestReloadIngressTargetFromPlan
+                         manifestHostStrategySmokeIngressTargetPolicy
+                         plan of
+                    Left issue ->
+                      pure (Left (MrciIngressTargetFailed issue))
+                    Right newTarget ->
+                      runSmoke plan initialEntry oldTarget newTarget
   where
     runSmoke targetPlan initialEntry oldTarget newTarget = do
       result <-
@@ -446,6 +456,9 @@ renderManifestReloadCliIssue issue =
       "Manifest host strategy reload smoke setup failed: " <> show err
     MrciHostStrategyAudioStartFailed err ->
       "Manifest host strategy reload smoke fake audio start failed: "
+      <> show err
+    MrciIngressTargetFailed err ->
+      "Manifest reload smoke ingress target projection failed: "
       <> show err
 
 renderManifestStoppedAudioReloadSmoke
@@ -584,7 +597,7 @@ renderStrategyOutcome outcome =
 
 renderSmokeIngressSnapshot
   :: ManifestReloadIngressSnapshot
-       ManifestUIIngressTarget
+       ManifestReloadIngressTarget
        ManifestHostStrategySmokeHandle
   -> String
 renderSmokeIngressSnapshot snapshot =
@@ -593,12 +606,16 @@ renderSmokeIngressSnapshot snapshot =
       "closed"
     MrisOpen target handle ->
       "open demo="
-      <> muitDemoKey target
-      <> " controls="
-      <> show (length (muitControls target))
+      <> muitDemoKey (mitUI target)
+      <> " ui-controls="
+      <> show (length (muitControls (mitUI target)))
+      <> " osc-controls="
+      <> show (length (motControls (mitOSC target)))
+      <> " midi-cc="
+      <> show (length (mmitControls (mitMIDI target)))
       <> " defaultVoice="
       <> voiceKeyText
-           (muvsDefaultVoice (muitVoiceSelection target))
+           (muvsDefaultVoice (muitVoiceSelection (mitUI target)))
       <> " handle="
       <> show (mhsshId handle)
 
@@ -734,7 +751,7 @@ appendSmokeAudioEvent ref event =
 
 manifestHostStrategySmokeIngressOps
   :: ManifestReloadIngressOps
-       ManifestUIIngressTarget
+       ManifestReloadIngressTarget
        ManifestHostStrategySmokeIngressIssue
        ManifestHostStrategySmokeHandle
 manifestHostStrategySmokeIngressOps =
@@ -745,6 +762,18 @@ manifestHostStrategySmokeIngressOps =
     , mrioCloseIngress =
         \_handle ->
           pure (Right ())
+    }
+
+manifestHostStrategySmokeIngressTargetPolicy
+  :: ManifestReloadIngressTargetPolicy
+manifestHostStrategySmokeIngressTargetPolicy =
+  ManifestReloadIngressTargetPolicy
+    { mritpUIVoiceSelection =
+        manifestHostStrategySmokeVoiceSelection
+    , mritpUIRetainedValues =
+        M.empty
+    , mritpMIDIDefaultVoice =
+        muvsDefaultVoice manifestHostStrategySmokeVoiceSelection
     }
 
 renderManifestReloadTemplates :: TemplateGraph -> [String]

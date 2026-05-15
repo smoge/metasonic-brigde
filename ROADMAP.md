@@ -3457,10 +3457,17 @@ without opening a UDP socket. The MIDI pair is also landed:
 caller-supplied default voice key; duplicate CC numbers reject at
 projection time. `MetaSonic.App.ManifestReloadMIDIIngress.submitManifestMIDICCEvent`
 consumes a decoded MIDI CC event, validates channel and data bytes,
-scales the 7-bit value through the binding's range, and enqueues one
-`CmdControlWrite` against the default voice under `midiProducerId`
-without opening a PortMIDI device. A real device-backed listener
-lifecycle remains gated.
+applies the producer's allow-list filter, scales the 7-bit value
+through the binding's range, and enqueues one `CmdControlWrite` against
+the default voice under `midiProducerId` without opening a PortMIDI
+device. The three projections are now composed by
+`MetaSonic.App.ManifestReloadIngressTarget.manifestReloadIngressTargetFromPlan`
+into a single `ManifestReloadIngressTarget` record (UI + OSC + MIDI),
+and the strategy CLI smoke (`--manifest-host-reload-smoke`) opens fresh
+ingress against that combined target instead of the prior UI-only
+sentinel; duplicate-CC manifests fail target construction rather than
+opening a partial surface. A real device-backed listener lifecycle
+remains gated.
 
 Still gated:
 
@@ -3470,9 +3477,10 @@ Still gated:
   stopped-audio and preserving host reload paths, explicit host
   strategy selector, operator-visible non-device strategy smoke CLI,
   pure UI ingress projection plus UI producer binding, pure OSC
-  ingress projection plus no-socket OSC producer consumer, and pure
+  ingress projection plus no-socket OSC producer consumer, pure
   MIDI CC ingress projection plus no-device MIDI producer consumer,
-  broader MIDI behavior beyond the landed
+  and the combined `ManifestReloadIngressTarget` bundle that the
+  strategy smoke now opens, broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
@@ -3506,12 +3514,13 @@ Still gated:
   selector, operator-visible non-device strategy smoke CLI, pure UI
   ingress projection plus UI producer binding, pure OSC ingress
   projection plus no-socket OSC producer consumer, pure MIDI CC
-  ingress projection plus no-device MIDI producer consumer, host
-  orchestration design note, and host supervisor / recovery policy
-  design note. Remaining work is a real device-backed listener
-  lifecycle (UDP socket for OSC, PortMIDI device for MIDI),
-  device-backed smoke coverage, and resource/allocation recovery
-  events.
+  ingress projection plus no-device MIDI producer consumer, the
+  combined `ManifestReloadIngressTarget` projection wired into the
+  strategy CLI smoke, host orchestration design note, and host
+  supervisor / recovery policy design note. Remaining work is a real
+  device-backed listener lifecycle (UDP socket for OSC, PortMIDI
+  device for MIDI), device-backed smoke coverage, and
+  resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

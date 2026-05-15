@@ -94,6 +94,12 @@ appManifestReloadCliTests =
           assertContains
             "  selector command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (selector-controlled)"
             output
+          -- Combined ingress target is wired: the rendered snapshot
+          -- shows ui-controls, osc-controls, and midi-cc counts
+          -- alongside the demo key, instead of a single UI count.
+          assertContains "ui-controls=" output
+          assertContains "osc-controls=" output
+          assertContains "midi-cc=" output
 
   , testCase "host strategy smoke renders stopped-audio-only outcome" $ do
       targetDemo <- demoOrFail "send-return"
