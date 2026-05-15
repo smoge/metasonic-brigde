@@ -3476,9 +3476,15 @@ projection layer without enqueueing. Step 2 has also landed as
 `MetaSonic.App.ManifestOSCIngressOps.manifestOSCIngressOps`: an
 adapter from `ManifestReloadIngressTarget` to
 `ManifestReloadIngressOps` so the existing ingress manager drives a
-real UDP listener through `mitOSC target`. A PortMIDI-backed MIDI
-listener and the orchestration-level integration that swaps real OSC
-ingress across a preserving reload remain gated.
+real UDP listener through `mitOSC target`. The strategy CLI smoke
+(`--manifest-host-reload-smoke`) now uses that adapter end-to-end:
+real initial open against the OSC projection (with
+`MrciOSCIngressOpenFailed` surfacing bind failure as a CLI issue),
+preserving-fallback and stopped-audio reloads driven through real
+`closeOld + openFresh`, and the rendered snapshot reports the bound
+UDP port via `oscPort=`. A PortMIDI-backed MIDI listener and a full
+preserving-reload end-to-end test that sends OSC packets across the
+reload remain gated.
 
 Still gated:
 
@@ -3495,8 +3501,11 @@ Still gated:
   (`MetaSonic.App.ManifestOSCListener`) with both bracketed and
   handle-style entry points, and the
   `MetaSonic.App.ManifestOSCIngressOps` adapter that drives a real
-  UDP listener through `ManifestReloadIngressOps`, broader MIDI
-  behavior beyond the landed
+  UDP listener through `ManifestReloadIngressOps` and is now wired
+  into the strategy CLI smoke (with a bound `oscPort=` rendered in
+  the diagnostic output and a CLI-level `MrciOSCIngressOpenFailed`
+  surfacing real bind failure), broader MIDI behavior beyond the
+  landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
@@ -3535,12 +3544,14 @@ Still gated:
   strategy CLI smoke, the manifest-target-aware UDP OSC listener
   handle and its bracketed wrapper, the
   `MetaSonic.App.ManifestOSCIngressOps` adapter wiring that listener
-  into `ManifestReloadIngressOps`, host orchestration design note,
-  and host supervisor / recovery policy design note. Remaining work
-  is integrating that adapter into the strategy CLI smoke and the
-  preserving-reload orchestrator end-to-end, a PortMIDI device-backed
-  listener lifecycle, device-backed smoke coverage, and
-  resource/allocation recovery events.
+  into `ManifestReloadIngressOps` and the strategy CLI smoke's
+  end-to-end use of that adapter (real initial open, real
+  closeOld + openFresh, bound `oscPort=` in the rendered output),
+  host orchestration design note, and host supervisor / recovery
+  policy design note. Remaining work is a full preserving-reload
+  orchestrator test that sends OSC packets across the reload, a
+  PortMIDI device-backed listener lifecycle, device-backed smoke
+  coverage, and resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

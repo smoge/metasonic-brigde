@@ -41,10 +41,20 @@ import           MetaSonic.Session.OSCProducer    (OSCProducerOptions)
 -- 'moihListener' owns the UDP socket and listener thread.
 -- 'moihInfo' is retained for diagnostics so callers (and snapshots)
 -- can see the bound port without re-querying the socket.
+--
+-- A hand-written 'Show' instance reports the bound port and elides
+-- the listener handle; the listener carries MVars that have no useful
+-- 'Show' rendering anyway.
 data ManifestOSCIngressHandle = ManifestOSCIngressHandle
   { moihListener :: !ManifestOSCListenerHandle
   , moihInfo     :: !ListenerInfo
   }
+
+instance Show ManifestOSCIngressHandle where
+  show handle =
+    "ManifestOSCIngressHandle { moihInfo = "
+    <> show (moihInfo handle)
+    <> ", moihListener = <handle> }"
 
 -- | Adapter-level issue.
 --

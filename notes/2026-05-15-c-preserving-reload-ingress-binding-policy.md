@@ -61,10 +61,15 @@ plus a no-device consumer `MetaSonic.App.ManifestReloadMIDIIngress`
 that projects only controls with `mcsCC = Just`, rejects duplicate CC
 numbers at projection time, scales 7-bit CC values through the
 binding range, and enqueues `CmdControlWrite` against a
-producer-configured default voice under `midiProducerId`. Integrating
-the OSC ingress-ops adapter into the strategy CLI smoke and the
-preserving-reload orchestrator end-to-end, plus a PortMIDI-backed MIDI
-lifecycle, remain ahead.
+producer-configured default voice under `midiProducerId`. The strategy
+CLI smoke (`--manifest-host-reload-smoke`) now drives the device-backed
+OSC ingress path: `runManifestHostStrategyReloadSmokeWithCatalog`
+builds real `manifestOSCIngressOps`, performs a real initial open
+against the OSC projection (surfacing bind failure as a CLI-level
+`MrciOSCIngressOpenFailed`), and the rendered snapshot reports the
+bound UDP port via `oscPort=`. Running the full preserving-reload
+orchestrator with packet traffic before and after reload, plus a
+PortMIDI-backed MIDI lifecycle, remain ahead.
 
 ## The question
 

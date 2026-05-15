@@ -2,12 +2,18 @@
 module MetaSonic.Spec.AppManifestReloadCli where
 
 import qualified Data.ByteString.Lazy.Char8       as BL
-import           Data.List                        (isInfixOf)
+import           Data.Char                        (isDigit)
+import           Data.List                        (isInfixOf, stripPrefix)
 
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
 import           MetaSonic.App.Demos
+import           MetaSonic.App.ManifestOSCListener
+                                                (defaultListenerConfig,
+                                                 lcPort,
+                                                 liBoundPort)
+import           MetaSonic.OSC.Listen           (withListenerSocket)
 import           MetaSonic.App.ManifestReloadCli
 import           MetaSonic.App.ManifestReloadHost
                                                 (ManifestReloadHostStrategy (..))
@@ -203,7 +209,161 @@ appManifestReloadCliTests =
             (renderManifestReloadCliIssue issue)
         Right _ ->
           assertFailure "expected missing manifest demo to fail"
+
+  , testCase "strategy smoke opens real OSC ingress and reports a bound port" $ do
+      targetDemo <- demoOrFail "send-return"
+      catalog <- catalogOrFail demoTable
+      sendReturnEntry <- entryOrFail "send-return" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            [mrcManifest sendReturnEntry]
+      result <-
+        runManifestHostStrategyReloadSmokeWithDoc
+          StoppedAudioOnly
+          doc
+          targetDemo
+      case result of
+        Left issue ->
+          assertFailure
+            ("expected strategy smoke success, got: "
+             <> renderManifestReloadCliIssue issue)
+        Right output -> do
+          assertContains "oscPort=" output
+          -- Bound port must be a non-zero integer, proving a real UDP
+          -- listener was bound (port 0 would be the unbound sentinel).
+          let port = extractOscPort output
+          assertBool
+            ("expected positive oscPort, got: " <> show port
+             <> " in output:\n" <> output)
+            (port > 0)
+
+  , testCase "preserving reload swaps real OSC ingress to a bound port on the new target" $ do
+      -- TryPreservingThenStoppedAudio falls back to stopped-audio in
+      -- the smoke (no live bindings to migrate), so the manager runs
+      -- closeOld + openFresh against real ops. The final snapshot
+      -- reflects the post-reload listener's bound port — concrete
+      -- evidence that the ingress swap landed.
+      targetDemo <- demoOrFail "send-return"
+      catalog <- catalogOrFail demoTable
+      sendReturnEntry <- entryOrFail "send-return" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            [mrcManifest sendReturnEntry]
+      result <-
+        runManifestHostStrategyReloadSmokeWithDoc
+          TryPreservingThenStoppedAudio
+          doc
+          targetDemo
+      case result of
+        Left issue ->
+          assertFailure
+            ("expected strategy smoke success, got: "
+             <> renderManifestReloadCliIssue issue)
+        Right output -> do
+          assertContains
+            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected"
+            output
+          assertContains "  ingress: open demo=send-return" output
+          assertContains "oscPort=" output
+          let port = extractOscPort output
+          assertBool
+            ("expected positive oscPort after reload, got: " <> show port)
+            (port > 0)
+
+  , testCase "strategy smoke releases its OSC port before returning" $ do
+      -- After the smoke completes, the same UDP port must be
+      -- re-bindable. This regression-protects the cleanup path: if the
+      -- runner left its ingress manager open, the listener would still
+      -- hold the socket and the second bind would fail with EADDRINUSE.
+      targetDemo <- demoOrFail "send-return"
+      catalog <- catalogOrFail demoTable
+      sendReturnEntry <- entryOrFail "send-return" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            [mrcManifest sendReturnEntry]
+      port <- pickFreePort
+      let fixedCfg = (defaultListenerConfig 0) { lcPort = port }
+      result <-
+        runManifestHostStrategyReloadSmokeWithListenerConfig
+          fixedCfg
+          StoppedAudioOnly
+          doc
+          catalog
+          targetDemo
+      case result of
+        Left issue ->
+          assertFailure
+            ("expected strategy smoke success on fixed port "
+             <> show port
+             <> ", got: "
+             <> renderManifestReloadCliIssue issue)
+        Right _output ->
+          -- The smoke has returned; if cleanup ran, the port is free.
+          withListenerSocket fixedCfg $ \(_sock, info) ->
+            liBoundPort info @?= port
+
+  , testCase "strategy smoke surfaces real OSC bind failure cleanly" $ do
+      -- Occupy a UDP port for the test scope, then force the smoke to
+      -- bind on the same port. The initial open inside the runner must
+      -- surface MrciOSCIngressOpenFailed without falling back silently
+      -- to a fake handle.
+      targetDemo <- demoOrFail "send-return"
+      catalog <- catalogOrFail demoTable
+      sendReturnEntry <- entryOrFail "send-return" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            [mrcManifest sendReturnEntry]
+      withListenerSocket (defaultListenerConfig 0) $ \(_sock, info) -> do
+        let busyPort = liBoundPort info
+            busyCfg  = (defaultListenerConfig 0) { lcPort = busyPort }
+        result <-
+          runManifestHostStrategyReloadSmokeWithListenerConfig
+            busyCfg
+            StoppedAudioOnly
+            doc
+            catalog
+            targetDemo
+        case result of
+          Left issue ->
+            assertContains
+              "Manifest reload smoke OSC ingress open failed:"
+              (renderManifestReloadCliIssue issue)
+          Right output ->
+            assertFailure
+              ("expected real OSC bind failure, got success:\n" <> output)
   ]
+
+-- | Pull the numeric value following @oscPort=@ out of the smoke's
+-- rendered output. The renderer emits @oscPort=<digits>@ followed by
+-- whitespace or end-of-line. Returns 0 if the substring is missing or
+-- the value is not a digit string.
+extractOscPort :: String -> Int
+extractOscPort output =
+  case scanForSuffix "oscPort=" output of
+    Nothing ->
+      0
+    Just suffix ->
+      case takeWhile isDigit suffix of
+        []     -> 0
+        digits -> read digits
+
+-- | Find the first occurrence of @needle@ in @haystack@ and return the
+-- text that immediately follows it. 'Nothing' if @needle@ is absent.
+scanForSuffix :: String -> String -> Maybe String
+scanForSuffix _ [] = Nothing
+scanForSuffix needle s@(_ : rest) =
+  case stripPrefix needle s of
+    Just suffix -> Just suffix
+    Nothing     -> scanForSuffix needle rest
+
+-- | Bind a UDP socket on an ephemeral port, learn the OS-allocated
+-- port number, and release the socket. Racy in principle — the port
+-- could be taken before the caller rebinds — but adequate for a
+-- single-test scenario inside one process.
+pickFreePort :: IO Int
+pickFreePort =
+  withListenerSocket (defaultListenerConfig 0) $ \(_sock, info) ->
+    pure (liBoundPort info)
 
 demoOrFail :: String -> IO Demo
 demoOrFail key =
