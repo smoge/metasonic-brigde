@@ -4,8 +4,7 @@
 module Main where
 
 import           Control.DeepSeq            (force)
-import           Control.Exception          (IOException, evaluate, finally,
-                                             try)
+import           Control.Exception          (evaluate, finally)
 import           Control.Monad              (forM_, replicateM)
 import           Data.Bifunctor             (first)
 import           Data.Char                  (isDigit, toLower)
@@ -19,7 +18,6 @@ import           System.Exit                (die)
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
 import qualified Data.ByteString.Lazy.Char8  as BL
 import           MetaSonic.Authoring.Manifest (AuthoringManifestDoc (..),
-                                                 decodeManifestDoc,
                                                  encodeManifestDoc,
                                                  manifestFromReport,
                                                  manifestSchemaVersion)
@@ -29,6 +27,10 @@ import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
                                               OutputFormat (..),
                                               runFusionCostLab)
 import qualified MetaSonic.App.FusionCostLab as FCL
+import           MetaSonic.App.ManifestReloadCli
+                                            (readManifestReloadDocFile,
+                                             renderManifestReloadCliIssue,
+                                             runManifestStoppedAudioReloadSmokeFile)
 import           MetaSonic.App.Osc          (runOscListen)
 import           MetaSonic.App.SessionMidiSmoke (runSessionMidiSmoke)
 import           MetaSonic.App.SessionOscArbitrationSmoke
@@ -56,14 +58,7 @@ import           MetaSonic.Pattern          (ControlTag (..),
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.ManifestReload.Construct
                                             (constructManifestSessionFromPlan)
-import           MetaSonic.Session.ManifestReload.Runtime
-                                            (ManifestStoppedAudioReloadReport (..),
-                                             reloadManifestSessionStoppedAudio)
 import           MetaSonic.Session.Command  (SessionCommand (..))
-import           MetaSonic.Session.FanIn    (SessionFanInSnapshot (..),
-                                             defaultSessionFanInOptions,
-                                             readSessionFanInHost,
-                                             withSessionFanInHost)
 import           MetaSonic.Session.Owner    (SessionOwnerStatus,
                                              defaultSessionOwnerOptions,
                                              sessionOwnerState,
@@ -701,7 +696,12 @@ main = do
           "--manifest-stopped-audio-reload-smoke"
           "--manifest-stopped-audio-reload-smoke MANIFEST.json DEMO_KEY"
           opts
-      runManifestStoppedAudioReloadSmoke manifestPath demo
+      result <- runManifestStoppedAudioReloadSmokeFile manifestPath demo
+      case result of
+        Left issue ->
+          die (renderManifestReloadCliIssue issue)
+        Right output ->
+          putStr output
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -828,63 +828,12 @@ runManifestSessionSmoke path demo = do
     Right (state, status) ->
       printManifestSessionSmoke plan state status
 
-runManifestStoppedAudioReloadSmoke :: FilePath -> Demo -> IO ()
-runManifestStoppedAudioReloadSmoke path demo = do
-  doc <- readManifestReloadDoc path
-  catalog <- either die pure (demoManifestReloadCatalog demoTable)
-  plan <- planManifestReloadOrDie doc catalog demo
-  initialEntry <- selectStoppedAudioReloadInitialEntry demo catalog
-  result <-
-    withSessionFanInHost
-      (MR.mrcTemplateGraph initialEntry)
-      defaultSessionFanInOptions
-      $ \host -> do
-          before <- readSessionFanInHost host
-          reload <-
-            reloadManifestSessionStoppedAudio
-              host
-              defaultSessionOwnerOptions
-              plan
-          after <- readSessionFanInHost host
-          pure (before, reload, after)
-  case result of
-    Left issue ->
-      die $
-        "Manifest stopped-audio reload smoke host setup failed: "
-        <> show issue
-    Right (_, Left issue, _) ->
-      die $ "Manifest stopped-audio reload smoke failed: " <> show issue
-    Right (before, Right report, after) ->
-      printManifestStoppedAudioReloadSmoke initialEntry plan before report after
-
-selectStoppedAudioReloadInitialEntry
-  :: Demo
-  -> [MR.ManifestReloadCatalogEntry]
-  -> IO MR.ManifestReloadCatalogEntry
-selectStoppedAudioReloadInitialEntry demo catalog =
-  case find ((/= demoKey demo) . MR.mrcDemoKey) catalog of
-    Just entry ->
-      pure entry
-    Nothing ->
-      case find ((== demoKey demo) . MR.mrcDemoKey) catalog of
-        Just entry ->
-          pure entry
-        Nothing ->
-          die $
-            "Internal error: no catalog entry for planned demo "
-            <> demoKey demo
-
 readManifestReloadDoc :: FilePath -> IO AuthoringManifestDoc
 readManifestReloadDoc path = do
-  readResult <- try (BL.readFile path)
-  bytes <- case (readResult :: Either IOException BL.ByteString) of
-    Left err ->
-      die $ "Failed to read manifest file '" <> path <> "': " <> show err
-    Right bs ->
-      pure bs
-  case decodeManifestDoc bytes of
-    Left err ->
-      die $ "Failed to decode manifest file '" <> path <> "': " <> err
+  result <- readManifestReloadDocFile path
+  case result of
+    Left issue ->
+      die (renderManifestReloadCliIssue issue)
     Right doc ->
       pure doc
 
@@ -946,60 +895,6 @@ printManifestSessionSmoke plan state status = do
   putStrLn $ "  active voices: " <> show (M.size (ssVoices state))
   putStrLn "  audio started: no"
   putStrLn "  command projection: not executed"
-
-printManifestStoppedAudioReloadSmoke
-  :: MR.ManifestReloadCatalogEntry
-  -> MR.ManifestReloadPlan
-  -> SessionFanInSnapshot
-  -> ManifestStoppedAudioReloadReport
-  -> SessionFanInSnapshot
-  -> IO ()
-printManifestStoppedAudioReloadSmoke initialEntry plan before report after = do
-  putStrLn "Manifest stopped-audio reload smoke"
-  putStrLn $ "  initial demo: " <> MR.mrcDemoKey initialEntry
-  putStrLn $ "  target demo: " <> MR.mrlpDemoKey plan
-  putStrLn $ "  swap label: " <> swapLabelText (MR.mrlpSwapLabel plan)
-  printManifestReloadTemplates (MR.mrlpTemplateGraph plan)
-  printManifestReloadResources (MR.mrlpAdapterOptions plan)
-  printManifestReloadControls (MR.mrlpControlSurface plan)
-  putStrLn $ "  arbitration policy: "
-          <> show (MR.mrlpArbitrationPolicy plan)
-  putStrLn "  pre-reload fan-in:"
-  putStrLn $ "    queue depth: " <> show (sfisQueueDepth before)
-  putStrLn $ "    owner status: " <> show (sfisOwnerStatus before)
-  putStrLn $ "    reload status: " <> show (sfisReloadStatus before)
-  putStrLn $
-    "    initial graph installed: "
-    <> if ssGraph (sfisOwnerState before) == MR.mrcTemplateGraph initialEntry
-          then "yes"
-          else "no"
-  putStrLn "  post-reload fan-in:"
-  putStrLn $ "    queue depth: " <> show (sfisQueueDepth after)
-  putStrLn $ "    owner status: " <> show (sfisOwnerStatus after)
-  putStrLn $ "    reload status: " <> show (sfisReloadStatus after)
-  putStrLn $
-    "    graph installed: "
-    <> if ssGraph (sfisOwnerState after) == MR.mrlpTemplateGraph plan
-          then "yes"
-          else "no"
-  putStrLn $
-    "    active voices: "
-    <> show (M.size (ssVoices (sfisOwnerState after)))
-  putStrLn $ "  report demo: " <> msarrDemoKey report
-  putStrLn $ "  report swap label: " <> swapLabelText (msarrSwapLabel report)
-  putStrLn $ "  report owner status: " <> show (msarrOwnerStatus report)
-  putStrLn $
-    "  report graph installed: "
-    <> if ssGraph (msarrOwnerState report) == MR.mrlpTemplateGraph plan
-          then "yes"
-          else "no"
-  putStrLn $
-    "  listener/producer restart required: "
-    <> if msarrListenersMustRestart report then "yes" else "no"
-  putStrLn "  audio started: no"
-  putStrLn "  audio stopped by helper: no"
-  putStrLn "  listener restart executed: no"
-  printManifestReloadCommand (MR.manifestReloadCommand plan)
 
 printManifestReloadTemplates :: TemplateGraph -> IO ()
 printManifestReloadTemplates graph = do

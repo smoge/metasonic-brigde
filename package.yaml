@@ -137,6 +137,7 @@ executables:
       - MetaSonic.App.Demos
       - MetaSonic.App.FusionCostLab
       - MetaSonic.App.FusionCostModel
+      - MetaSonic.App.ManifestReloadCli
       - MetaSonic.App.Osc
       - MetaSonic.App.ProfitabilityGate
       - MetaSonic.App.SessionMidiSmoke
@@ -159,6 +160,8 @@ tests:
       - app
     other-modules:
       - MetaSonic.App.Demos
+      - MetaSonic.App.ManifestReloadCli
+      - MetaSonic.Spec.AppManifestReloadCli
       - MetaSonic.Spec.AppDemos
       - MetaSonic.Spec.Core
       - MetaSonic.Spec.Driver
