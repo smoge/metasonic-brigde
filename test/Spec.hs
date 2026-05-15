@@ -10,6 +10,7 @@ import           Test.Tasty
 
 import           MetaSonic.Spec.AppDemos
 import           MetaSonic.Spec.AppManifestReloadCli
+import           MetaSonic.Spec.AppManifestReloadIngress
 import           MetaSonic.Spec.AppManifestReloadOrchestration
 import           MetaSonic.Spec.AppManifestReloadSupervisor
 import           MetaSonic.Spec.Core
@@ -24,6 +25,7 @@ main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
   [ appDemoCatalogTests
   , appManifestReloadCliTests
+  , appManifestReloadIngressTests
   , appManifestReloadOrchestrationTests
   , appManifestReloadSupervisorTests
   , unitTests
