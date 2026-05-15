@@ -3430,15 +3430,20 @@ The app-level `reloadManifestHostWithStrategy` selector exposes three explicit m
 ran and falls back only from the retryable preserving rejection shape
 where the old owner remains installed and old ingress has resumed; it
 does not silently fall back after the preserving path has changed the
-live owner.
+live owner. `--manifest-host-reload-smoke STRATEGY MANIFEST.json DEMO`
+now exposes that selector in the CLI as a manual diagnostic mode: it
+reads an external authoring manifest, runs the selector with fake
+audio lifecycle hooks against a non-device fan-in host, and reports
+which strategy ran or failed without opening PortAudio or claiming
+live reload semantics.
 
 Still gated:
 
 - [ ] GUI toolkit bindings and concrete live-app manifest reload/resource
   policy beyond the landed diagnostic import, construction-time v1,
   non-audio stopped-audio owner-swap helper plus smoke CLI, app-level
-  stopped-audio and preserving host reload paths, and explicit host
-  strategy selector,
+  stopped-audio and preserving host reload paths, explicit host
+  strategy selector, and operator-visible non-device strategy smoke CLI,
   broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
@@ -3470,10 +3475,11 @@ Still gated:
   CLI, construction-time owner helper and construction-smoke CLI,
   non-audio stopped-audio owner-swap helper and smoke CLI,
   stopped-audio/preserving host orchestration, explicit strategy
-  selector, host orchestration design note, and host supervisor /
-  recovery policy design note. Remaining work is concrete
-  producer/listener binding policy, operator-facing strategy selection,
-  device-backed smoke coverage, and resource/allocation recovery events.
+  selector, operator-visible non-device strategy smoke CLI, host
+  orchestration design note, and host supervisor / recovery policy
+  design note. Remaining work is real device/live-app producer/listener
+  binding, device-backed smoke coverage, and resource/allocation
+  recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
