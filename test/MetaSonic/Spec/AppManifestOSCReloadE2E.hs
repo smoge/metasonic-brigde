@@ -1,28 +1,34 @@
 -- | End-to-end packet-traffic test for device-backed OSC ingress
 -- across a real manifest reload strategy run.
 --
--- This test combines four landed pieces: the manifest-target-aware UDP
+-- This module combines four landed pieces: the manifest-target-aware UDP
 -- listener (`MetaSonic.App.ManifestOSCListener`), the ingress-ops
 -- adapter (`MetaSonic.App.ManifestOSCIngressOps`), the host strategy
 -- selector (`reloadManifestHostWithStrategy`), and the fan-in
 -- service. It proves the close-old/open-fresh contract under real
--- traffic: a packet that targets a control present only in the old
--- manifest is accepted on the initial listener, then rejected by the
--- post-reload listener; a packet that targets a control present only
--- in the new manifest is accepted by the post-reload listener.
+-- traffic in two strategy modes:
 --
--- The current empty-owner smoke setup forces
--- 'TryPreservingThenStoppedAudio' to take the stopped-audio fallback
--- (no live bindings to migrate). A future test will add live-voice
--- scaffolding so true-preserving traffic can be exercised; that is
--- intentionally not in scope here.
+-- * The fallback test runs `TryPreservingThenStoppedAudio` against an
+--   empty-owner setup so the strategy commits the stopped-audio
+--   fallback path; OSC packets before and after the swap exercise the
+--   manifest projection on both listeners.
+--
+-- * The preserving test installs a live voice on the
+--   `hotSwapEdit` / `hotSwapEditAfterTemplates` graph pair before the
+--   reload, runs the same strategy, and asserts the preserving path
+--   commits (`Right MrhsrPreserving`, no `AudioStop`, voice survives,
+--   new graph installed) under the same OSC swap contract.
 module MetaSonic.Spec.AppManifestOSCReloadE2E where
 
+import           Control.Concurrent.Chan          (Chan, newChan, readChan,
+                                                   writeChan)
 import           Control.Concurrent.MVar          (newEmptyMVar, putMVar,
                                                    takeMVar)
 import           Control.Exception                (bracket_)
 import           Control.Monad                    (void)
 import qualified Data.ByteString.Char8            as OBSC
+import           Data.IORef                       (IORef, modifyIORef',
+                                                   newIORef, readIORef)
 import qualified Data.Map.Strict                  as M
 import qualified Data.Text                        as T
 import           System.Timeout                   (timeout)
@@ -60,16 +66,33 @@ import           MetaSonic.App.ManifestReloadOSCIngress
 import           MetaSonic.Authoring.Manifest     (AuthoringManifest (..),
                                                    AuthoringManifestDoc (..),
                                                    ManifestControl (..),
+                                                   ManifestTemplate (..),
                                                    manifestSchemaVersion)
-import           MetaSonic.Bridge.Templates       (TemplateGraph (..))
-import           MetaSonic.Pattern                (SwapLabel (..),
-                                                   VoiceKey (..))
+import           MetaSonic.Bridge.Source          (MigrationKey (..),
+                                                   SynthGraph)
+import           MetaSonic.Bridge.Templates       (TemplateGraph (..),
+                                                   compileTemplateGraph)
+import           MetaSonic.Pattern                (ControlTag (..),
+                                                   SwapLabel (..),
+                                                   TemplateName (..),
+                                                   VoiceKey (..),
+                                                   patternTemplates)
+import           MetaSonic.Pattern.Corpus         (hotSwapEdit,
+                                                   hotSwapEditAfterTemplates)
+import           MetaSonic.Session.Command        (SessionCommand (..))
 import           MetaSonic.Session.FanIn          (SessionFanInAudioFFI (..),
                                                    SessionFanInAudioOptions (..),
+                                                   SessionFanInEnqueueResult (..),
+                                                   SessionFanInSnapshot (..),
                                                    startSessionFanInHostAudioWith)
-import           MetaSonic.Session.FanInService   (defaultSessionFanInServiceOptions,
+import           MetaSonic.Session.FanInService   (SessionFanInServiceHooks (..),
+                                                   defaultSessionFanInServiceHooks,
+                                                   defaultSessionFanInServiceOptions,
+                                                   enqueueSessionFanInServiceCommand,
+                                                   readSessionFanInService,
                                                    sessionFanInServiceHost,
-                                                   withSessionFanInService)
+                                                   withSessionFanInService,
+                                                   withSessionFanInServiceHooks)
 import           MetaSonic.Session.ManifestReload (ManifestReloadCatalogEntry (..),
                                                    ManifestReloadRequest (..),
                                                    defaultManifestResourcePolicy,
@@ -78,7 +101,9 @@ import           MetaSonic.Session.OSCProducer    (OSCProducerEnqueueResult (..)
                                                    defaultOSCProducerOptions)
 import           MetaSonic.Session.Owner          (defaultSessionOwnerOptions)
 import           MetaSonic.Session.Queue          (ProducerId (..),
-                                                   ProducerKind (..))
+                                                   ProducerKind (..),
+                                                   SessionEnqueueResult (..))
+import           MetaSonic.Session.State          (SessionState (..))
 import           MetaSonic.Spec.Core              (sendUdpLoopback)
 
 
@@ -152,6 +177,88 @@ appManifestOSCReloadE2ETests =
                   acceptedMV
                   issueMV
                   preReloadResult)
+
+      case svcResult of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right () ->
+          pure ()
+
+  , testCase "TryPreservingThenStoppedAudio preserves live voice and swaps OSC ingress under real traffic" $ do
+      -- Preserving variant: install a live voice on the old graph
+      -- BEFORE reload, run TryPreservingThenStoppedAudio, assert the
+      -- preserving path commits (no stopped-audio fallback), the
+      -- voice survives, audio never stops, and old/new OSC paths
+      -- swap correctly. Reuses the preserving-compatible graph pair
+      -- from the existing AppManifestReloadHost fixture
+      -- (`hotSwapEdit` / `hotSwapEditAfterTemplates`).
+      oldTarget <- projectPreservingTargetOrFail "preserve-cutoff"
+      newTarget <- projectPreservingTargetOrFail "preserve-vol"
+
+      acceptedMV <- newEmptyMVar
+      issueMV    <- newEmptyMVar
+      let hooks = ManifestOSCListenerHooks
+            { molhOnAccepted =
+                putMVar acceptedMV
+            , molhOnIssue =
+                putMVar issueMV
+            }
+
+      audioEventsRef <- newIORef []
+      drainCh        <- newChan
+      let audioFFI = capturingAudioFFI audioEventsRef
+          audioOpts = SessionFanInAudioOptions
+            { sfiaoOutputChannels = 2
+            , sfiaoDeviceID       = -1
+            , sfiaoReadyTimeoutMs = 100
+            }
+          serviceHooks = defaultSessionFanInServiceHooks
+            { sfshOnDrain =
+                writeChan drainCh
+            }
+
+      svcResult <-
+        withSessionFanInServiceHooks
+          serviceHooks
+          (mrcTemplateGraph preservingOldEntry)
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              let ops =
+                    manifestOSCIngressOps
+                      hooks
+                      defaultOSCProducerOptions
+                      (sessionFanInServiceHost service)
+                      (defaultListenerConfig 0)
+
+              initialOpened <- mrioOpenIngress ops oldTarget
+              initialHandle <-
+                case initialOpened of
+                  Left issue ->
+                    assertFailure
+                      ("expected initial open, got: " <> show issue)
+                    >> error "unreachable"
+                  Right h ->
+                    pure h
+              let initialPort = liBoundPort (moihInfo initialHandle)
+
+              ingressManager <-
+                newManifestReloadIngressManager ops oldTarget initialHandle
+
+              bracket_
+                (startAudio audioFFI audioOpts service)
+                (void (closeManifestReloadIngress ingressManager))
+                (runPreservingScenario
+                  ingressManager
+                  oldTarget
+                  newTarget
+                  audioFFI
+                  audioOpts
+                  service
+                  drainCh
+                  audioEventsRef
+                  acceptedMV
+                  issueMV
+                  initialPort)
 
       case svcResult of
         Left issue ->
@@ -279,6 +386,149 @@ appManifestOSCReloadE2ETests =
               >> error "unreachable"
             Right target ->
               pure target
+
+    -- Lookup helper for the preserving catalog.
+    projectPreservingTargetOrFail demoKey =
+      case planManifestReload preservingManifestDoc preservingCatalog
+             (planRequestFor demoKey) of
+        Left issue ->
+          assertFailure
+            ("expected preserving plan for " <> demoKey
+             <> ", got: " <> show issue)
+          >> error "unreachable"
+        Right plan ->
+          case manifestReloadIngressTargetFromPlan policy plan of
+            Left issue ->
+              assertFailure
+                ("expected preserving target for " <> demoKey
+                 <> ", got: " <> show issue)
+              >> error "unreachable"
+            Right target ->
+              pure target
+
+    runPreservingScenario ingressManager oldTarget newTarget audioFFI
+        audioOpts service drainCh audioEventsRef acceptedMV issueMV
+        initialPort = do
+      -- Install live voice on the old graph.
+      voiceEnq <-
+        enqueueSessionFanInServiceCommand
+          preservingVoiceProducer
+          preservingVoiceOnCommand
+          service
+      case sfierResult voiceEnq of
+        SessionEnqueued _ ->
+          pure ()
+        other ->
+          assertFailure
+            ("expected voice-on enqueued, got: " <> show other)
+      firstDrain <- timeout 1000000 (readChan drainCh)
+      case firstDrain of
+        Nothing ->
+          assertFailure
+            "timed out waiting for preserving voice-start drain"
+        Just _ ->
+          pure ()
+      snapshotPreReload <- readSessionFanInService service
+      assertBool
+        "expected preserving voice live before reload"
+        (M.member preservingVoiceKey
+          (ssVoices (sfisOwnerState snapshotPreReload)))
+
+      -- Pre-reload: old OSC path accepts on initial listener.
+      sendUdpLoopback initialPort cutoffPacket
+      preReloadResult <- timeout 1000000 (takeMVar acceptedMV)
+      case preReloadResult of
+        Just (OSCProducerEnqueueAttempted _cmd _) ->
+          pure ()
+        other ->
+          assertFailure
+            ("expected pre-reload cutoff accepted, got: "
+             <> show other)
+
+      -- Run the preserving strategy.
+      let request = ManifestReloadRequest
+            { mrrDemoKey =
+                "preserve-vol"
+            , mrrSwapLabel =
+                SwapLabel "preserve-vol"
+            , mrrResourcePolicy =
+                defaultManifestResourcePolicy
+            }
+          config = ManifestReloadHostConfig
+            { mrhcService =
+                service
+            , mrhcIngressManager =
+                ingressManager
+            , mrhcOldIngressTarget =
+                oldTarget
+            , mrhcNewIngressTarget =
+                newTarget
+            , mrhcAudioFFI =
+                audioFFI
+            , mrhcAudioOptions =
+                audioOpts
+            , mrhcOwnerOptions =
+                defaultSessionOwnerOptions
+            }
+      outcome <-
+        reloadManifestHostWithStrategy
+          (ProducerId ProducerUI
+            (T.pack "manifest-osc-reload-e2e-preserve"))
+          TryPreservingThenStoppedAudio
+          config
+          preservingManifestDoc
+          preservingCatalog
+          request
+      outcome @?= Right MrhsrPreserving
+
+      -- The strategy committed preserving — assert audio kept
+      -- running across the swap (no AudioStop fired) and the live
+      -- voice survived.
+      audioEvents <- readIORef audioEventsRef
+      assertBool
+        ("expected no AudioStop during preserving reload, got: "
+         <> show audioEvents)
+        (AudioStop `notElem` audioEvents)
+      snapshotPostReload <- readSessionFanInService service
+      sfisAudioRunning snapshotPostReload @?= True
+      assertBool
+        "expected live voice to survive preserving reload"
+        (M.member preservingVoiceKey
+          (ssVoices (sfisOwnerState snapshotPostReload)))
+      ssGraph (sfisOwnerState snapshotPostReload)
+        @?= mrcTemplateGraph preservingNewEntry
+
+      -- Read the fresh ingress snapshot and exercise post-reload
+      -- traffic: old path rejects, new path accepts.
+      reloadSnapshot <- readManifestReloadIngressManager ingressManager
+      handle' <-
+        case reloadSnapshot of
+          MrisOpen _ h ->
+            pure h
+          MrisClosed ->
+            assertFailure
+              "expected ingress open after preserving reload"
+            >> error "unreachable"
+      let newPort = liBoundPort (moihInfo handle')
+
+      sendUdpLoopback newPort cutoffPacket
+      postOldResult <- timeout 1000000 (takeMVar issueMV)
+      case postOldResult of
+        Just (MoliManifestIssue (MoiiAddressIssue _)) ->
+          pure ()
+        other ->
+          assertFailure
+            ("expected post-reload cutoff rejection, got: "
+             <> show other)
+
+      sendUdpLoopback newPort volPacket
+      postNewResult <- timeout 1000000 (takeMVar acceptedMV)
+      case postNewResult of
+        Just (OSCProducerEnqueueAttempted _cmd _) ->
+          pure ()
+        other ->
+          assertFailure
+            ("expected post-reload vol accepted, got: " <> show other)
 
     planRequestFor demoKey = ManifestReloadRequest
       { mrrDemoKey =
@@ -428,3 +678,98 @@ fakeAudioFFI = SessionFanInAudioFFI
   , saffiStopAudio =
       \_rt -> pure ()
   }
+
+-- | Tagged audio FFI events captured during the preserving test so
+-- assertions can confirm @AudioStop@ never fired.
+data AudioEvent
+  = AudioStart
+  | AudioReady
+  | AudioStop
+  deriving (Eq, Show)
+
+capturingAudioFFI :: IORef [AudioEvent] -> SessionFanInAudioFFI
+capturingAudioFFI ref = SessionFanInAudioFFI
+  { saffiStartAudio =
+      \_rt _channels _deviceID -> do
+        modifyIORef' ref (<> [AudioStart])
+        pure 0
+  , saffiWaitAudioStarted =
+      \_rt _timeoutMs -> do
+        modifyIORef' ref (<> [AudioReady])
+        pure True
+  , saffiStopAudio =
+      \_rt ->
+        modifyIORef' ref (<> [AudioStop])
+  }
+
+-- | Preserving catalog reuses the existing hot-swap fixture pair so
+-- the new graph can migrate the live voice from the old graph. Both
+-- entries declare the @drone@ template the voice targets.
+preservingCatalog :: [ManifestReloadCatalogEntry]
+preservingCatalog =
+  [preservingOldEntry, preservingNewEntry]
+
+preservingManifestDoc :: AuthoringManifestDoc
+preservingManifestDoc = AuthoringManifestDoc
+  { docSchemaVersion =
+      manifestSchemaVersion
+  , docDemos =
+      [ preservingDroneManifest "preserve-cutoff" cutoffControl
+      , preservingDroneManifest "preserve-vol"    volControl
+      ]
+  }
+
+preservingOldEntry :: ManifestReloadCatalogEntry
+preservingOldEntry = ManifestReloadCatalogEntry
+  { mrcDemoKey =
+      "preserve-cutoff"
+  , mrcManifest =
+      preservingDroneManifest "preserve-cutoff" cutoffControl
+  , mrcTemplateGraph =
+      patternTemplates hotSwapEdit
+  }
+
+preservingNewEntry :: ManifestReloadCatalogEntry
+preservingNewEntry = ManifestReloadCatalogEntry
+  { mrcDemoKey =
+      "preserve-vol"
+  , mrcManifest =
+      preservingDroneManifest "preserve-vol" volControl
+  , mrcTemplateGraph =
+      compileTemplateGraphOrError hotSwapEditAfterTemplates
+  }
+
+preservingDroneManifest :: String -> ManifestControl -> AuthoringManifest
+preservingDroneManifest key control = AuthoringManifest
+  { mfDemoKey =
+      key
+  , mfTemplates =
+      [ManifestTemplate "drone" "voice"]
+  , mfBuses =
+      []
+  , mfControls =
+      [control]
+  }
+
+compileTemplateGraphOrError :: [(String, SynthGraph)] -> TemplateGraph
+compileTemplateGraphOrError rows =
+  case compileTemplateGraph rows of
+    Right graph ->
+      graph
+    Left err ->
+      error ("compileTemplateGraph failed: " <> err)
+
+preservingVoiceKey :: VoiceKey
+preservingVoiceKey =
+  VoiceKey "v0"
+
+preservingVoiceOnCommand :: SessionCommand
+preservingVoiceOnCommand =
+  CmdVoiceOn
+    (TemplateName "drone")
+    preservingVoiceKey
+    [(ControlTag (MigrationKey "lpf") 0, 1500.0)]
+
+preservingVoiceProducer :: ProducerId
+preservingVoiceProducer =
+  ProducerId ProducerPattern (T.pack "preserving-voice")

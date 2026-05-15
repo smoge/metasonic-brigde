@@ -67,17 +67,24 @@ OSC ingress path: `runManifestHostStrategyReloadSmokeWithCatalog`
 builds real `manifestOSCIngressOps`, performs a real initial open
 against the OSC projection (surfacing bind failure as a CLI-level
 `MrciOSCIngressOpenFailed`), and the rendered snapshot reports the
-bound UDP port via `oscPort=`. The first end-to-end packet-traffic
-test has also landed
-(`MetaSonic.Spec.AppManifestOSCReloadE2E`): it builds a two-entry
-custom catalog with disjoint control surfaces, sends a real UDP
-packet to the initial listener and observes acceptance, runs
-`reloadManifestHostWithStrategy TryPreservingThenStoppedAudio`
-(falls back to stopped-audio in the current empty-owner setup),
-then sends old-path and new-path packets to the post-reload listener
-and observes manifest rejection / acceptance respectively. A
-true-preserving variant with live-voice scaffolding and a
-PortMIDI-backed MIDI lifecycle remain ahead.
+bound UDP port via `oscPort=`. The end-to-end packet-traffic
+tests have also landed
+(`MetaSonic.Spec.AppManifestOSCReloadE2E`). The fallback variant
+builds a two-entry custom catalog with disjoint control surfaces,
+sends a real UDP packet to the initial listener and observes
+acceptance, runs `reloadManifestHostWithStrategy
+TryPreservingThenStoppedAudio` (falls back to stopped-audio in an
+empty-owner setup), then sends old-path and new-path packets to the
+post-reload listener and observes manifest rejection / acceptance
+respectively. The preserving variant reuses the existing
+`hotSwapEdit` / `hotSwapEditAfterTemplates` preserving-compatible
+graph pair, installs a live voice via `CmdVoiceOn (TemplateName
+"drone") (VoiceKey "v0") [...]` before the reload, runs the same
+strategy, and asserts the outcome is `Right MrhsrPreserving` (no
+silent fallback), the captured fake-audio events never include
+`AudioStop`, `sfisAudioRunning` stays `True`, the live voice
+survives in `ssVoices`, and old/new OSC paths swap correctly. A
+PortMIDI-backed MIDI lifecycle remains ahead.
 
 ## The question
 

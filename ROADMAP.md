@@ -3504,10 +3504,15 @@ Still gated:
   UDP listener through `ManifestReloadIngressOps` and is now wired
   into the strategy CLI smoke (with a bound `oscPort=` rendered in
   the diagnostic output and a CLI-level `MrciOSCIngressOpenFailed`
-  surfacing real bind failure), and the first end-to-end
-  packet-traffic test (`MetaSonic.Spec.AppManifestOSCReloadE2E`)
-  that runs `reloadManifestHostWithStrategy TryPreservingThenStoppedAudio`
-  with real UDP traffic before and after the swap, broader MIDI
+  surfacing real bind failure), and both end-to-end
+  packet-traffic tests (`MetaSonic.Spec.AppManifestOSCReloadE2E`)
+  that run `reloadManifestHostWithStrategy TryPreservingThenStoppedAudio`
+  with real UDP traffic before and after the swap — the fallback
+  variant against an empty-owner setup, and the preserving variant
+  that installs a live voice via `CmdVoiceOn` on the
+  `hotSwapEdit` / `hotSwapEditAfterTemplates` graph pair and
+  asserts `Right MrhsrPreserving`, no `AudioStop` events, audio
+  still running, and voice survival in `ssVoices`, broader MIDI
   behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
@@ -3549,16 +3554,16 @@ Still gated:
   `MetaSonic.App.ManifestOSCIngressOps` adapter wiring that listener
   into `ManifestReloadIngressOps` and the strategy CLI smoke's
   end-to-end use of that adapter (real initial open, real
-  closeOld + openFresh, bound `oscPort=` in the rendered output), the
-  first end-to-end packet-traffic test
+  closeOld + openFresh, bound `oscPort=` in the rendered output), both
+  end-to-end packet-traffic tests
   (`MetaSonic.Spec.AppManifestOSCReloadE2E`) covering the
-  stopped-audio fallback path with real UDP traffic before and after
-  the swap, host orchestration design note, and host supervisor /
-  recovery policy design note. Remaining work is the true-preserving
-  variant of that end-to-end test (with live-voice scaffolding so
-  preserving actually commits instead of falling back), a PortMIDI
-  device-backed listener lifecycle, device-backed smoke coverage, and
-  resource/allocation recovery events.
+  stopped-audio fallback path and the true-preserving path (live
+  voice installed before reload, `Right MrhsrPreserving`, audio not
+  stopped, voice survives, OSC paths swap correctly) with real UDP
+  traffic before and after the swap, host orchestration design note,
+  and host supervisor / recovery policy design note. Remaining work
+  is a PortMIDI device-backed listener lifecycle, device-backed
+  smoke coverage, and resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
