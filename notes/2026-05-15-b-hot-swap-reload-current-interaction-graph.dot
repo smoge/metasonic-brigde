@@ -43,7 +43,7 @@ digraph hot_swap_reload_current_interaction {
     reload_plan [label="ManifestReloadPlan\nTemplateGraph\nRTGraphAdapterOptions\nControlSurface\nArbitrationPolicy=FifoOnly"];
     command_projection [label="manifestReloadCommand"];
     owner_options_projection [label="manifestSessionOwnerOptions"];
-    cmd_hot_swap [label="CmdHotSwap\nSwapLabel + TemplateGraph"];
+    cmd_hot_swap [label="CmdHotSwap /\nCmdHotSwapPreservingOnly\nSwapLabel + TemplateGraph"];
   }
 
   subgraph cluster_cli {
@@ -108,15 +108,22 @@ digraph hot_swap_reload_current_interaction {
     owner_divergence [label="SessionOwner divergence\non install failure / backend stopped /\ncommit mismatch / protocol bug", fillcolor="#fef2f2"];
   }
 
-  subgraph cluster_missing {
-    label="Not landed yet";
+  subgraph cluster_preserving_manifest {
+    label="Landed preserving manifest reload and selector";
+    color="#22c55e";
+
+    preserving_only_mode [label="CmdHotSwapPreservingOnly\nHotSwapPreservingOnly\nreject clear/rebuild fallback"];
+    preserving_manifest_helper [label="reloadManifestSessionPreservingHotSwap\nsubmit plan through live fan-in"];
+    preserving_host [label="reloadManifestPreservingHost\nManifestReloadHost"];
+    host_preserving_ops [label="HostPreservingReloadOps\nplan -> quiesce -> drain ->\npreserving reload -> resume -> reopen"];
+    strategy_selector [label="reloadManifestHostWithStrategy\nRequirePreserving /\nTryPreservingThenStoppedAudio /\nStoppedAudioOnly"];
+  }
+
+  subgraph cluster_open {
+    label="Still open";
     color="#64748b";
     style="dashed";
 
-    preserving_only_mode [label="preserving-only command or strategy\nmust not fall back to stop/clear", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
-    preserving_manifest_helper [label="reloadManifestSessionPreservingHotSwap\nmissing session helper", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
-    host_preserving_ops [label="HostPreservingReloadOps\neligibility/fence/submit/wait/verify/rebind", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
-    strategy_selector [label="host strategy selector\nprefer preserving -> explicit fallback", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
     binding_rebuild [label="producer/listener binding rebuild contract\nstill missing", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
   }
 
@@ -176,13 +183,14 @@ digraph hot_swap_reload_current_interaction {
   run_hot_swap -> owner_divergence [style=dashed, label="terminal failures"];
   session_owner -> owner_divergence [style=dashed];
 
-  reload_plan -> preserving_manifest_helper [style=dashed, label="future input"];
-  preserving_manifest_helper -> preserving_only_mode [style=dashed];
-  preserving_only_mode -> cmd_hot_swap [style=dashed];
-  preserving_manifest_helper -> fanin_host [style=dashed, label="future locked step"];
-  host_preserving_ops -> preserving_manifest_helper [style=dashed];
-  host_preserving_ops -> ingress [style=dashed, label="reuse close/open policy"];
+  reload_plan -> preserving_manifest_helper [label="plan input"];
+  preserving_manifest_helper -> preserving_only_mode;
+  preserving_only_mode -> cmd_hot_swap [label="variant"];
+  preserving_manifest_helper -> fanin_host [label="enqueue + drain"];
+  preserving_host -> host_preserving_ops;
+  host_preserving_ops -> preserving_manifest_helper;
+  host_preserving_ops -> ingress [label="reuse close/open policy"];
   host_preserving_ops -> binding_rebuild [style=dashed];
-  strategy_selector -> host_preserving_ops [style=dashed];
-  strategy_selector -> reload_host [style=dashed, label="explicit stopped-audio fallback"];
+  strategy_selector -> preserving_host;
+  strategy_selector -> reload_host [label="explicit stopped-audio fallback"];
 }

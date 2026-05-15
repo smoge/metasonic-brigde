@@ -2932,8 +2932,9 @@ the pure planner, app-owned catalog adapter, construction helper,
 tests, `--manifest-reload-plan`, and
 `--manifest-reload-plan-file` exist. The follow-up
 `--manifest-session-smoke` mode constructs a fresh owner from that plan
-without audio or `CmdHotSwap`; live owner reload and host-level
-reload/resource recovery policy remain future work.
+without audio or `CmdHotSwap`; the later stopped-audio and preserving
+host reload paths described below are separate live-owner strategies,
+not part of this construction-time smoke.
 
 ### Session-Layer Scoping Gate (not a numbered phase yet)
 
@@ -3415,12 +3416,29 @@ was running at reload entry (captured as a per-reload local, not
 accumulated state), single bounded recovery attempt, single active
 stack invariant, escalate on second failure — is pinned separately in
 [Manifest Reload Host Supervisor And Recovery Policy](notes/2026-05-14-k-host-reload-supervisor.md).
+The preserving-live sibling path has also landed behind explicit host
+APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
+runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`
+projects a prevalidated manifest plan through the live fan-in path,
+`HostPreservingReloadOps` quiesces ingress, drains accepted work, runs
+the preserving command without stopping audio or replacing the owner,
+and opens a fresh ingress generation for the same owner;
+`reloadManifestPreservingHost` wires those slots to the real app host pieces.
+The app-level `reloadManifestHostWithStrategy` selector exposes three explicit modes:
+`RequirePreserving`, `TryPreservingThenStoppedAudio`, and
+`StoppedAudioOnly`. The fallback mode records which strategy actually
+ran and falls back only from the retryable preserving rejection shape
+where the old owner remains installed and old ingress has resumed; it
+does not silently fall back after the preserving path has changed the
+live owner.
 
 Still gated:
 
-- [ ] GUI toolkit bindings and live/host-level manifest reload/resource
-  policy beyond the landed diagnostic import, construction-time v1, and
-  non-audio stopped-audio owner-swap helper plus smoke CLI,
+- [ ] GUI toolkit bindings and concrete live-app manifest reload/resource
+  policy beyond the landed diagnostic import, construction-time v1,
+  non-audio stopped-audio owner-swap helper plus smoke CLI, app-level
+  stopped-audio and preserving host reload paths, and explicit host
+  strategy selector,
   broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
@@ -3447,12 +3465,15 @@ Still gated:
   clearing. These remain use-case gated; do not implement them ahead of
   a concrete live policy owner, release signal, or hot-swap/voice-key
   reuse decision.
-- [ ] Stopped-audio/live manifest reload implementation and host-level resource
-  allocation/recovery policy beyond the landed diagnostic planner,
-  external JSON validation CLI, construction-time owner helper, and
-  construction-smoke CLI, non-audio stopped-audio owner-swap helper and
-  smoke CLI, host orchestration design note, and host supervisor /
-  recovery policy design note.
+- [ ] Concrete app/device integration for stopped-audio/live manifest
+  reload beyond the landed diagnostic planner, external JSON validation
+  CLI, construction-time owner helper and construction-smoke CLI,
+  non-audio stopped-audio owner-swap helper and smoke CLI,
+  stopped-audio/preserving host orchestration, explicit strategy
+  selector, host orchestration design note, and host supervisor /
+  recovery policy design note. Remaining work is concrete
+  producer/listener binding policy, operator-facing strategy selection,
+  device-backed smoke coverage, and resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
@@ -3472,10 +3493,12 @@ sustain-pedal deferred releases, a decoded-source MIDI listener with
 producer-local control coalescing, and the first Q / PortMIDI-backed
 decoded source with an auto-selecting manual CLI smoke probe, and
 already-decoded UI intent translation, plus the
-diagnostic/construction-time manifest reload v1. Do not
+diagnostic/construction-time manifest reload v1, stopped-audio and
+preserving host reload strategies, and explicit app-level reload
+strategy selection. Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration and live/host-level reload policy beyond the landed
-manifest diagnostic/construction-time v1,
+manifest diagnostic/construction-time v1 and host strategy substrate,
 broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
 translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,
