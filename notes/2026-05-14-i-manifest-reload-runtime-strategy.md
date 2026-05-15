@@ -7,7 +7,10 @@ construction-time install boundary is recorded in
 `2026-05-14-g-manifest-reload-install-strategy.md` and the app-visible
 construction smoke in `2026-05-14-h-manifest-session-construction-smoke.md`.
 This note pins the v1 reload contract; the landed implementation covers the
-session-layer helper and diagnostic CLI smoke only.
+session-layer helper and diagnostic CLI smoke only. The host-level
+stopped-audio orchestration sequence is pinned separately in
+`2026-05-14-j-host-stopped-audio-manifest-reload-orchestration.md`;
+audio-running reload implementation remains open.
 
 Implemented in the first helper slice:
 
@@ -484,7 +487,9 @@ Still open for host integration:
 
 - a host command that performs the whole stop window: quiesce producers and
   listeners, drain while audio is live, stop audio, call the helper, restart
-  audio, and reopen producer/listener brackets;
+  audio, and reopen producer/listener brackets. The required app-side state
+  machine and failure policy are pinned in
+  `2026-05-14-j-host-stopped-audio-manifest-reload-orchestration.md`;
 - an app-owned recovery policy after `SfriOwnerSetupFailed`, since the helper
   intentionally leaves the host with no owner after post-dispose construction
   failure.

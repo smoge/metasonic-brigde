@@ -3404,7 +3404,13 @@ post-dispose construction. `--manifest-stopped-audio-reload-smoke
 MANIFEST.json DEMO` now exposes that helper in the CLI by creating an
 existing non-audio fan-in host, replacing its owner from the plan, and
 printing queue, reload, and owner status. This is still not live reload or an
-audio host integration.
+audio host integration. The app-side stopped-audio orchestration contract is
+now pinned in
+[Host Stopped-Audio Manifest Reload Orchestration](notes/2026-05-14-j-host-stopped-audio-manifest-reload-orchestration.md):
+quiesce producers/listeners, drain while audio is live, stop audio, call the
+helper, restart audio on the new owner, reopen listener/producer brackets, and
+treat `SfriOwnerSetupFailed` as a terminal no-owner state requiring explicit
+host rebuild or process-level recovery.
 
 Still gated:
 
@@ -3437,10 +3443,11 @@ Still gated:
   clearing. These remain use-case gated; do not implement them ahead of
   a concrete live policy owner, release signal, or hot-swap/voice-key
   reuse decision.
-- [ ] Stopped-audio/live manifest reload strategy and host-level resource
+- [ ] Stopped-audio/live manifest reload implementation and host-level resource
   allocation/recovery policy beyond the landed diagnostic planner,
   external JSON validation CLI, construction-time owner helper, and
-  construction-smoke CLI.
+  construction-smoke CLI, non-audio stopped-audio owner-swap helper and
+  smoke CLI, and host orchestration design note.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
