@@ -28,6 +28,7 @@ data FakeFailure
   | FakeAudioRestartFailed
   | FakeListenerRestartFailed
   | FakeOldAudioRestartFailed
+  | FakeResumeOldIngressFailed
   deriving (Eq, Show)
 
 data FakeOwner
@@ -42,6 +43,7 @@ data FakeState = FakeState
   , fsIngressOpen   :: !Bool
   , fsQueueDepth    :: !Int
   , fsFinalizerSend :: !Bool
+  , fsResumeFails   :: !Bool
   , fsFailureMode   :: !(Maybe FakeFailureMode)
   , fsTrace         :: ![FakeEvent]
   } deriving (Eq, Show)
@@ -65,6 +67,7 @@ data FakeEvent
   | StopOldAudio
   | ReloadStopped !String
   | RestartOldAudio
+  | ResumeOldIngress
   | StartNewAudio
   | ReopenIngress
   | StopNewAudio
@@ -97,14 +100,59 @@ appManifestReloadOrchestrationTests =
       fsAudioRunning state @?= True
       fsIngressOpen state @?= True
       StopOldAudio `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , ResumeOldIngress
+        ]
 
-  , testCase "drain failure aborts before stop-audio with ingress closed" $ do
+  , testCase "quiesce failure reports resume failure if old ingress cannot reopen" $ do
+      (ops, ref) <- mkFakeOps initialFakeState
+        { fsFailureMode = Just FailQuiesce
+        , fsResumeFails = True
+        }
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?=
+        Left
+          (HsariQuiesceRejectedResumeFailed
+            FakeQuiesceRejected
+            FakeResumeOldIngressFailed)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      StopOldAudio `elem` fsTrace state @?= False
+
+  , testCase "drain failure aborts before stop-audio and reopens ingress" $ do
       (ops, ref) <- mkFakeOps initialFakeState
         { fsFailureMode = Just FailDrain
         }
       outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
       state <- readIORef ref
       outcome @?= Left (HsariDrainRejected FakeDrainRejected)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= True
+      StopOldAudio `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , ResumeOldIngress
+        ]
+
+  , testCase "drain failure reports resume failure and leaves ingress closed" $ do
+      (ops, ref) <- mkFakeOps initialFakeState
+        { fsFailureMode = Just FailDrain
+        , fsResumeFails = True
+        }
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?=
+        Left
+          (HsariDrainRejectedResumeFailed
+            FakeDrainRejected
+            FakeResumeOldIngressFailed)
       fsOwner state @?= FakeOldOwner
       fsAudioRunning state @?= True
       fsIngressOpen state @?= False
@@ -160,6 +208,31 @@ appManifestReloadOrchestrationTests =
         Left (HsariReloadRejectedOldOwnerRestarted FakeQueueNotEmpty)
       fsOwner state @?= FakeOldOwner
       fsAudioRunning state @?= True
+      fsIngressOpen state @?= True
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , StopOldAudio
+        , ReloadStopped preparedPlan
+        , RestartOldAudio
+        , ResumeOldIngress
+        ]
+
+  , testCase "queue-not-empty old-owner recovery reports resume failure" $ do
+      (ops, ref) <- mkFakeOps initialFakeState
+        { fsFailureMode = Just FailReloadQueueNotEmpty
+        , fsResumeFails = True
+        }
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?=
+        Left
+          (HsariReloadRejectedOldOwnerResumeFailed
+            FakeQueueNotEmpty
+            FakeResumeOldIngressFailed)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
       fsIngressOpen state @?= False
       fsTrace state @?=
         [ PreparePlan requestedPlan
@@ -168,6 +241,7 @@ appManifestReloadOrchestrationTests =
         , StopOldAudio
         , ReloadStopped preparedPlan
         , RestartOldAudio
+        , ResumeOldIngress
         ]
 
   , testCase "old audio restart failure preserves both causes" $ do
@@ -251,6 +325,8 @@ mkFakeOps state0 = do
             reloadStopped ref
         , hsaroRestartOldAudio =
             restartOldAudio ref
+        , hsaroResumeOldIngress =
+            resumeOldIngress ref
         , hsaroStartNewAudio =
             startNewAudio ref
         , hsaroReopenIngress =
@@ -267,6 +343,7 @@ initialFakeState = FakeState
   , fsIngressOpen = True
   , fsQueueDepth = 0
   , fsFinalizerSend = False
+  , fsResumeFails = False
   , fsFailureMode = Nothing
   , fsTrace = []
   }
@@ -293,7 +370,8 @@ quiesceIngress ref = do
   appendTrace ref CloseIngress
   mode <- fsFailureMode <$> readIORef ref
   case mode of
-    Just FailQuiesce ->
+    Just FailQuiesce -> do
+      modifyIORef' ref $ \state -> state { fsIngressOpen = False }
       pure (Left FakeQuiesceRejected)
     _ -> do
       modifyIORef' ref $ \state ->
@@ -356,6 +434,16 @@ restartOldAudio ref = do
       pure (Left FakeOldAudioRestartFailed)
     _ -> do
       modifyIORef' ref $ \state -> state { fsAudioRunning = True }
+      pure (Right ())
+
+resumeOldIngress :: IORef FakeState -> IO (Either FakeFailure ())
+resumeOldIngress ref = do
+  appendTrace ref ResumeOldIngress
+  shouldFail <- fsResumeFails <$> readIORef ref
+  if shouldFail
+    then pure (Left FakeResumeOldIngressFailed)
+    else do
+      modifyIORef' ref $ \state -> state { fsIngressOpen = True }
       pure (Right ())
 
 startNewAudio :: IORef FakeState -> IO (Either FakeFailure ())

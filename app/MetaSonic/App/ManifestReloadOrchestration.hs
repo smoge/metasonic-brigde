@@ -44,6 +44,13 @@ data HostStoppedAudioReloadOps request plan issue =
     , hsaroRestartOldAudio   :: !(IO (Either issue ()))
       -- ^ Best-effort restart for pre-dispose reload rejection, where
       -- the old owner is still installed.
+    , hsaroResumeOldIngress  :: !(IO (Either issue ()))
+      -- ^ Reopen producer/listener brackets against the old owner. Used
+      -- by retryable failure paths (quiesce/drain failure, pre-dispose
+      -- helper rejection followed by old-audio restart) so the host
+      -- returns to a live state running the previous plan rather than a
+      -- live-audio-but-no-ingress degraded state. Idempotent: safe to
+      -- call when ingress is already open.
     , hsaroStartNewAudio     :: !(IO (Either issue ()))
       -- ^ Start audio on the newly installed owner.
     , hsaroReopenIngress     :: !(IO (Either issue ()))
@@ -65,13 +72,22 @@ data HostStoppedAudioReloadFailure issue
   deriving stock (Eq, Show)
 
 -- | User-visible outcome for one host stopped-audio reload attempt.
+--
+-- Variants ending in @ResumeFailed@ name two causes: the original
+-- failure and the subsequent resume-ingress failure. They mark a
+-- partially recovered host that has the old owner installed but no
+-- live ingress, which is degraded but not catastrophic - the caller
+-- can retry resume later or escalate to host rebuild.
 data HostStoppedAudioReloadIssue issue
   = HsariPlanRejected !issue
   | HsariQuiesceRejected !issue
+  | HsariQuiesceRejectedResumeFailed !issue !issue
   | HsariDrainRejected !issue
+  | HsariDrainRejectedResumeFailed !issue !issue
   | HsariStopOldAudioFailed !issue
   | HsariReloadRejectedOldOwnerRestarted !issue
   | HsariReloadRejectedOldOwnerRestartFailed !issue !issue
+  | HsariReloadRejectedOldOwnerResumeFailed !issue !issue
   | HsariReloadFailedNoOwner !issue
   | HsariAudioRestartFailed !issue
   | HsariListenerRestartFailed !issue
@@ -82,6 +98,12 @@ data HostStoppedAudioReloadIssue issue
 -- On success, the requested plan is installed, audio has restarted, and
 -- ingress has reopened. On failure, the returned constructor documents
 -- the boundary that failed and the cleanup policy that was attempted.
+--
+-- Retryable failure paths (quiesce/drain failure, pre-dispose helper
+-- rejection) attempt 'hsaroResumeOldIngress' so the host returns to a
+-- live state running the previous plan. Resume-failure variants
+-- (@*ResumeFailed@) report when the resume itself failed and the host
+-- is left with the old owner running but no live ingress.
 orchestrateHostStoppedAudioReload
   :: HostStoppedAudioReloadOps request plan issue
   -> request
@@ -98,7 +120,10 @@ orchestrateHostStoppedAudioReload ops request = do
       result <- hsaroQuiesceIngress ops
       case result of
         Left issue ->
-          pure (Left (HsariQuiesceRejected issue))
+          resumeAfterFailure
+            issue
+            HsariQuiesceRejected
+            HsariQuiesceRejectedResumeFailed
         Right () ->
           drain plan
 
@@ -106,7 +131,10 @@ orchestrateHostStoppedAudioReload ops request = do
       result <- hsaroDrainLive ops
       case result of
         Left issue ->
-          pure (Left (HsariDrainRejected issue))
+          resumeAfterFailure
+            issue
+            HsariDrainRejected
+            HsariDrainRejectedResumeFailed
         Right () ->
           stopOldAudio plan
 
@@ -130,11 +158,15 @@ orchestrateHostStoppedAudioReload ops request = do
 
     restartOldAudio issue = do
       result <- hsaroRestartOldAudio ops
-      pure $ case result of
-        Right () ->
-          Left (HsariReloadRejectedOldOwnerRestarted issue)
+      case result of
         Left restartIssue ->
-          Left (HsariReloadRejectedOldOwnerRestartFailed issue restartIssue)
+          pure
+            (Left (HsariReloadRejectedOldOwnerRestartFailed issue restartIssue))
+        Right () ->
+          resumeAfterFailure
+            issue
+            HsariReloadRejectedOldOwnerRestarted
+            HsariReloadRejectedOldOwnerResumeFailed
 
     startNewAudio = do
       result <- hsaroStartNewAudio ops
@@ -152,3 +184,11 @@ orchestrateHostStoppedAudioReload ops request = do
           pure (Left (HsariListenerRestartFailed issue))
         Right () ->
           pure (Right ())
+
+    resumeAfterFailure originalIssue mkResumed mkResumeFailed = do
+      resumeResult <- hsaroResumeOldIngress ops
+      pure $ case resumeResult of
+        Right () ->
+          Left (mkResumed originalIssue)
+        Left resumeIssue ->
+          Left (mkResumeFailed originalIssue resumeIssue)
