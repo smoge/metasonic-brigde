@@ -9,6 +9,8 @@ import           Test.Tasty.HUnit
 
 import           MetaSonic.App.Demos
 import           MetaSonic.App.ManifestReloadCli
+import           MetaSonic.App.ManifestReloadHost
+                                                (ManifestReloadHostStrategy (..))
 import           MetaSonic.Authoring.Manifest
 import           MetaSonic.Session.ManifestReload
 
@@ -16,7 +18,17 @@ import           MetaSonic.Session.ManifestReload
 appManifestReloadCliTests :: TestTree
 appManifestReloadCliTests =
   testGroup "App manifest reload CLI helpers"
-  [ testCase "stopped-audio smoke renders successful external manifest output" $ do
+  [ testCase "parses operator-visible host reload strategies" $ do
+      parseManifestReloadHostStrategy "require-preserving"
+        @?= Just RequirePreserving
+      parseManifestReloadHostStrategy "try-preserving"
+        @?= Just TryPreservingThenStoppedAudio
+      parseManifestReloadHostStrategy "stopped-audio-only"
+        @?= Just StoppedAudioOnly
+      parseManifestReloadHostStrategy "maybe-preserving"
+        @?= Nothing
+
+  , testCase "stopped-audio smoke renders successful external manifest output" $ do
       targetDemo <- demoOrFail "send-return"
       catalog <- catalogOrFail demoTable
       sendReturnEntry <- entryOrFail "send-return" catalog
@@ -44,6 +56,98 @@ appManifestReloadCliTests =
           assertContains
             "  command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (not executed)"
             output
+
+  , testCase "host strategy smoke renders explicit fallback outcome" $ do
+      targetDemo <- demoOrFail "send-return"
+      catalog <- catalogOrFail demoTable
+      sendReturnEntry <- entryOrFail "send-return" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            [mrcManifest sendReturnEntry]
+      -- The smoke host starts from an empty owner. Preserving-only
+      -- reload therefore has no live bindings to migrate, so the
+      -- explicit try-preserving strategy must take the stopped-audio
+      -- fallback path.
+      result <-
+        runManifestHostStrategyReloadSmokeWithDoc
+          TryPreservingThenStoppedAudio
+          doc
+          targetDemo
+      case result of
+        Left issue ->
+          assertFailure
+            ("expected host strategy smoke success, got: "
+             <> renderManifestReloadCliIssue issue)
+        Right output -> do
+          assertContains "Manifest host strategy reload smoke" output
+          assertContains "  strategy: try-preserving" output
+          assertContains "  initial demo: named-control" output
+          assertContains "  target demo: send-return" output
+          assertContains
+            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected"
+            output
+          assertContains "    graph installed: yes" output
+          assertContains "  ingress: open new handle=1" output
+          assertContains "  fake audio events:" output
+          assertContains "    - start channels=2 device=-1" output
+          assertContains "    - stop" output
+          assertContains
+            "  selector command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (selector-controlled)"
+            output
+
+  , testCase "host strategy smoke renders stopped-audio-only outcome" $ do
+      targetDemo <- demoOrFail "send-return"
+      catalog <- catalogOrFail demoTable
+      sendReturnEntry <- entryOrFail "send-return" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            [mrcManifest sendReturnEntry]
+      result <-
+        runManifestHostStrategyReloadSmokeWithDoc
+          StoppedAudioOnly
+          doc
+          targetDemo
+      case result of
+        Left issue ->
+          assertFailure
+            ("expected stopped-audio-only host strategy smoke success, got: "
+             <> renderManifestReloadCliIssue issue)
+        Right output -> do
+          assertContains "Manifest host strategy reload smoke" output
+          assertContains "  strategy: stopped-audio-only" output
+          assertContains "  strategy result: success: MrhsrStoppedAudio" output
+          assertContains "    graph installed: yes" output
+          assertContains "  ingress: open new handle=1" output
+          assertContains "  fake audio events:" output
+          assertContains "    - start channels=2 device=-1" output
+          assertContains "    - stop" output
+          assertContains
+            "  selector command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (selector-controlled)"
+            output
+
+  , testCase "host strategy smoke renders preserving-required failure as diagnostic output" $ do
+      targetDemo <- demoOrFail "send-return"
+      catalog <- catalogOrFail demoTable
+      sendReturnEntry <- entryOrFail "send-return" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            [mrcManifest sendReturnEntry]
+      result <-
+        runManifestHostStrategyReloadSmokeWithDoc
+          RequirePreserving
+          doc
+          targetDemo
+      case result of
+        Left issue ->
+          assertFailure
+            ("expected host strategy smoke diagnostic output, got: "
+             <> renderManifestReloadCliIssue issue)
+        Right output -> do
+          assertContains "  strategy: require-preserving" output
+          assertContains "  strategy result: failed: MrhsiPreservingFailed" output
+          assertContains "    graph installed: no" output
+          assertContains "  ingress: open old handle=1" output
+          assertContains "  selector command projection:" output
 
   , testCase "missing manifest file reports read failure" $ do
       result <-

@@ -28,9 +28,15 @@ import           MetaSonic.App.FusionCostLab (FusionCostLabOptions (..),
                                               runFusionCostLab)
 import qualified MetaSonic.App.FusionCostLab as FCL
 import           MetaSonic.App.ManifestReloadCli
-                                            (readManifestReloadDocFile,
+                                            (manifestReloadHostStrategyNames,
+                                             parseManifestReloadHostStrategy,
+                                             readManifestReloadDocFile,
                                              renderManifestReloadCliIssue,
+                                             renderManifestReloadHostStrategy,
+                                             runManifestHostStrategyReloadSmokeFile,
                                              runManifestStoppedAudioReloadSmokeFile)
+import           MetaSonic.App.ManifestReloadHost
+                                            (ManifestReloadHostStrategy)
 import           MetaSonic.App.Osc          (runOscListen)
 import           MetaSonic.App.SessionMidiSmoke (runSessionMidiSmoke)
 import           MetaSonic.App.SessionOscArbitrationSmoke
@@ -175,6 +181,15 @@ data RunMode
     -- fan-in host, replaces its owner with the planned manifest owner,
     -- prints status, and exits. It does not start/stop audio, reset
     -- listeners, step CmdHotSwap, or claim live reload semantics.
+  | ManifestHostStrategyReloadSmoke
+    -- ^ Manual non-audio host strategy smoke
+    -- (--manifest-host-reload-smoke STRATEGY MANIFEST.json DEMO).
+    -- Reads an external authoring manifest document, validates the
+    -- selected demo against the built-in authored-demo catalog, runs
+    -- the app-level manifest reload strategy selector with fake audio
+    -- lifecycle hooks, prints which strategy ran or failed, and exits.
+    -- It does not open PortAudio, run the normal demo path, or make
+    -- any selector mode the default.
   deriving (Eq, Show)
 
 data Options = Options
@@ -183,6 +198,9 @@ data Options = Options
   , optManifestReloadFile :: Maybe FilePath
     -- ^ External authoring manifest JSON path for manifest reload
     -- diagnostic / construction-smoke modes.
+  , optManifestReloadHostStrategy :: Maybe ManifestReloadHostStrategy
+    -- ^ Explicit selector mode for
+    -- --manifest-host-reload-smoke.
   , optFused   :: Bool
     -- ^ When True, demos load through 'loadRuntimeGraphFused' /
     -- 'loadTemplateGraphFused' on a 'compileRuntimeGraphFused'-
@@ -210,6 +228,7 @@ defaultOptions = Options
   { optMode    = AudioOnly
   , optTargets = []
   , optManifestReloadFile = Nothing
+  , optManifestReloadHostStrategy = Nothing
   , optFused   = False
   , optOscPort = 7000
   , optMidiDevice = Nothing
@@ -277,6 +296,40 @@ parseArgs = go defaultOptions
                   } xs
     go _ ("--manifest-stopped-audio-reload-smoke" : []) =
       Left "Missing manifest JSON file for --manifest-stopped-audio-reload-smoke"
+    go opts ("--manifest-host-reload-smoke" : strategyText : path : xs)
+      | null strategyText || "--" `prefixOf` strategyText =
+          Left $
+            "Missing strategy for --manifest-host-reload-smoke"
+            <> "\nStrategies: "
+            <> intercalate ", " manifestReloadHostStrategyNames
+      | null path || "--" `prefixOf` path =
+          Left "Missing manifest JSON file for --manifest-host-reload-smoke"
+      | otherwise =
+          case parseManifestReloadHostStrategy strategyText of
+            Just strategy ->
+              go opts { optMode = ManifestHostStrategyReloadSmoke
+                      , optManifestReloadFile = Just path
+                      , optManifestReloadHostStrategy = Just strategy
+                      } xs
+            Nothing ->
+              Left (invalidManifestHostStrategy strategyText)
+    go _ ("--manifest-host-reload-smoke" : strategyText : [])
+      | null strategyText || "--" `prefixOf` strategyText =
+          Left $
+            "Missing strategy for --manifest-host-reload-smoke"
+            <> "\nStrategies: "
+            <> intercalate ", " manifestReloadHostStrategyNames
+      | otherwise =
+          case parseManifestReloadHostStrategy strategyText of
+            Just _ ->
+              Left "Missing manifest JSON file for --manifest-host-reload-smoke"
+            Nothing ->
+              Left (invalidManifestHostStrategy strategyText)
+    go _ ("--manifest-host-reload-smoke" : []) =
+      Left $
+        "Missing strategy for --manifest-host-reload-smoke"
+        <> "\nStrategies: "
+        <> intercalate ", " manifestReloadHostStrategyNames
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -330,6 +383,13 @@ parseArgs = go defaultOptions
       , all isDigit s
       , length s <= 9 = Just (read s)
       | otherwise     = Nothing
+
+    invalidManifestHostStrategy strategyText =
+      "Invalid strategy for --manifest-host-reload-smoke: "
+      <> strategyText
+      <> " (expected one of: "
+      <> intercalate ", " manifestReloadHostStrategyNames
+      <> ")"
 
     parseSmokeSeconds :: String -> Maybe Int
     parseSmokeSeconds s
@@ -417,6 +477,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-reload-plan-file MANIFEST.json DEMO"
   , "  " <> prog <> " --manifest-session-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --manifest-stopped-audio-reload-smoke MANIFEST.json DEMO"
+  , "  " <> prog <> " --manifest-host-reload-smoke STRATEGY MANIFEST.json DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
   , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
@@ -527,6 +588,16 @@ usage prog = unlines
   , "                   owner, reports queue, reload, and owner status, then"
   , "                   exits. No audio start/stop, no listener restart,"
   , "                   no CmdHotSwap execution, no live reload."
+  , "  --manifest-host-reload-smoke STRATEGY MANIFEST.json DEMO"
+  , "                   Manual non-device host selector smoke. STRATEGY is"
+  , "                   one of: " <> intercalate ", " manifestReloadHostStrategyNames
+  , "                   Reads MANIFEST.json, validates DEMO against the"
+  , "                   built-in authored-demo reload catalog, starts fake"
+  , "                   host audio, runs reloadManifestHostWithStrategy,"
+  , "                   reports whether preserving, stopped-audio, or"
+  , "                   explicit fallback ran, then exits. No PortAudio"
+  , "                   device is opened and the normal demo path is not"
+  , "                   affected."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
@@ -588,6 +659,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-reload-plan-file manifest.json send-return"
   , "  " <> prog <> " --manifest-session-smoke manifest.json send-return"
   , "  " <> prog <> " --manifest-stopped-audio-reload-smoke manifest.json send-return"
+  , "  " <> prog <> " --manifest-host-reload-smoke try-preserving manifest.json send-return"
   ]
 
 --------------------------------------------------------------------------------
@@ -697,6 +769,32 @@ main = do
           "--manifest-stopped-audio-reload-smoke MANIFEST.json DEMO_KEY"
           opts
       result <- runManifestStoppedAudioReloadSmokeFile manifestPath demo
+      case result of
+        Left issue ->
+          die (renderManifestReloadCliIssue issue)
+        Right output ->
+          putStr output
+    ManifestHostStrategyReloadSmoke -> do
+      manifestPath <- maybe
+        (die "Missing manifest JSON file for --manifest-host-reload-smoke")
+        pure
+        (optManifestReloadFile opts)
+      strategy <- maybe
+        (die "Missing strategy for --manifest-host-reload-smoke")
+        pure
+        (optManifestReloadHostStrategy opts)
+      demo <- either die pure $
+        resolveManifestReloadDiagnosticTarget
+          "--manifest-host-reload-smoke"
+          ("--manifest-host-reload-smoke "
+           <> renderManifestReloadHostStrategy strategy
+           <> " MANIFEST.json DEMO_KEY")
+          opts
+      result <-
+        runManifestHostStrategyReloadSmokeFile
+          strategy
+          manifestPath
+          demo
       case result of
         Left issue ->
           die (renderManifestReloadCliIssue issue)
@@ -1043,7 +1141,8 @@ runDemo opts demo
     || optMode opts == ManifestReloadDiagnostic
     || optMode opts == ManifestReloadFileDiagnostic
     || optMode opts == ManifestSessionSmoke
-    || optMode opts == ManifestStoppedAudioReloadSmoke =
+    || optMode opts == ManifestStoppedAudioReloadSmoke
+    || optMode opts == ManifestHostStrategyReloadSmoke =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -1126,6 +1225,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: ManifestSessionSmoke should be handled by main, never reach here"
     ManifestStoppedAudioReloadSmoke ->
       error "runSingleDemo: ManifestStoppedAudioReloadSmoke should be handled by main, never reach here"
+    ManifestHostStrategyReloadSmoke ->
+      error "runSingleDemo: ManifestHostStrategyReloadSmoke should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare
