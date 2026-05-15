@@ -15,8 +15,15 @@ module MetaSonic.App.ManifestReloadOrchestration
   ( HostStoppedAudioReloadOps (..)
   , HostStoppedAudioReloadIssue (..)
   , HostStoppedAudioReloadFailure (..)
+  , wireManifestReloadIngress
   , orchestrateHostStoppedAudioReload
   ) where
+
+import           MetaSonic.App.ManifestReloadIngress
+                   (ManifestReloadIngressManager,
+                    closeManifestReloadIngress,
+                    openFreshManifestReloadIngress,
+                    resumeManifestReloadIngress)
 
 
 -- | Operations owned by an audio-running host reload command.
@@ -92,6 +99,27 @@ data HostStoppedAudioReloadIssue issue
   | HsariAudioRestartFailed !issue
   | HsariListenerRestartFailed !issue
   deriving stock (Eq, Show)
+
+-- | Fill the orchestration ingress slots from a fresh-bracket manager.
+--
+-- The old target is used when a retryable failure needs to reopen the
+-- previous known-good ingress. The new target is used after the reload
+-- helper has installed the requested owner and new audio has started.
+wireManifestReloadIngress
+  :: ManifestReloadIngressManager target issue handle
+  -> target
+  -> target
+  -> HostStoppedAudioReloadOps request plan issue
+  -> HostStoppedAudioReloadOps request plan issue
+wireManifestReloadIngress manager oldTarget newTarget ops =
+  ops
+    { hsaroQuiesceIngress =
+        closeManifestReloadIngress manager
+    , hsaroResumeOldIngress =
+        resumeManifestReloadIngress manager oldTarget
+    , hsaroReopenIngress =
+        openFreshManifestReloadIngress manager newTarget
+    }
 
 -- | Run the stopped-audio reload window.
 --

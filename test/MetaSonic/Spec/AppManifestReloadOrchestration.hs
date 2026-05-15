@@ -15,6 +15,7 @@ import           Data.List                                   (elemIndex)
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
+import           MetaSonic.App.ManifestReloadIngress
 import           MetaSonic.App.ManifestReloadOrchestration
 
 
@@ -72,6 +73,30 @@ data FakeEvent
   | ReopenIngress
   | StopNewAudio
   deriving (Eq, Show)
+
+data FakeIngressTarget
+  = FakeOldIngressTarget
+  | FakeNewIngressTarget
+  deriving (Eq, Show)
+
+data FakeIngressHandle = FakeIngressHandle
+  { fihId     :: !Int
+  , fihTarget :: !FakeIngressTarget
+  } deriving (Eq, Show)
+
+data FakeIngressEvent
+  = FakeIngressClosed !FakeIngressHandle
+  | FakeIngressCloseFailed !FakeIngressHandle
+  | FakeIngressOpened !FakeIngressHandle
+  | FakeIngressOpenFailed !FakeIngressTarget
+  deriving (Eq, Show)
+
+data FakeIngressState = FakeIngressState
+  { fisNextHandle :: !Int
+  , fisFailOpen   :: !(Maybe FakeIngressTarget)
+  , fisFailClose  :: !(Maybe Int)
+  , fisEvents     :: ![FakeIngressEvent]
+  } deriving (Eq, Show)
 
 
 appManifestReloadOrchestrationTests :: TestTree
@@ -302,6 +327,138 @@ appManifestReloadOrchestrationTests =
         , ReopenIngress
         , StopNewAudio
         ]
+
+  , testCase
+      "ingress manager wiring closes old ingress and opens new on success" $ do
+      (ops0, hostRef) <- mkFakeOps initialFakeState
+      (manager, ingressRef) <-
+        mkFakeIngressManager hostRef initialFakeIngressState
+      let ops =
+            wireManifestReloadIngress
+              manager
+              FakeOldIngressTarget
+              FakeNewIngressTarget
+              ops0
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      hostState <- readIORef hostRef
+      ingressSnapshot <- readManifestReloadIngressManager manager
+      ingressEvents <- fisEvents <$> readIORef ingressRef
+      outcome @?= Right ()
+      ingressSnapshot @?=
+        MrisOpen
+          FakeNewIngressTarget
+          (FakeIngressHandle 1 FakeNewIngressTarget)
+      ingressEvents @?=
+        [ FakeIngressClosed initialFakeIngressHandle
+        , FakeIngressOpened (FakeIngressHandle 1 FakeNewIngressTarget)
+        ]
+      fsTrace hostState @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , StopOldAudio
+        , ReloadStopped preparedPlan
+        , StartNewAudio
+        , ReopenIngress
+        ]
+
+  , testCase
+      "ingress manager wiring keeps old ingress open when close fails" $ do
+      (ops0, hostRef) <- mkFakeOps initialFakeState
+      (manager, ingressRef) <-
+        mkFakeIngressManager hostRef initialFakeIngressState
+          { fisFailClose = Just (fihId initialFakeIngressHandle)
+          }
+      let ops =
+            wireManifestReloadIngress
+              manager
+              FakeOldIngressTarget
+              FakeNewIngressTarget
+              ops0
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      hostState <- readIORef hostRef
+      ingressSnapshot <- readManifestReloadIngressManager manager
+      ingressEvents <- fisEvents <$> readIORef ingressRef
+      outcome @?= Left (HsariQuiesceRejected FakeQuiesceRejected)
+      fsIngressOpen hostState @?= True
+      ingressSnapshot @?= MrisOpen FakeOldIngressTarget initialFakeIngressHandle
+      ingressEvents @?= [FakeIngressCloseFailed initialFakeIngressHandle]
+      fsTrace hostState @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        ]
+
+  , testCase
+      "ingress manager wiring resumes old ingress on retryable reload" $ do
+      (ops0, hostRef) <- mkFakeOps initialFakeState
+        { fsFailureMode = Just FailReloadQueueNotEmpty
+        }
+      (manager, ingressRef) <-
+        mkFakeIngressManager hostRef initialFakeIngressState
+      let ops =
+            wireManifestReloadIngress
+              manager
+              FakeOldIngressTarget
+              FakeNewIngressTarget
+              ops0
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      hostState <- readIORef hostRef
+      ingressSnapshot <- readManifestReloadIngressManager manager
+      ingressEvents <- fisEvents <$> readIORef ingressRef
+      outcome @?=
+        Left (HsariReloadRejectedOldOwnerRestarted FakeQueueNotEmpty)
+      ingressSnapshot @?=
+        MrisOpen
+          FakeOldIngressTarget
+          (FakeIngressHandle 1 FakeOldIngressTarget)
+      ingressEvents @?=
+        [ FakeIngressClosed initialFakeIngressHandle
+        , FakeIngressOpened (FakeIngressHandle 1 FakeOldIngressTarget)
+        ]
+      fsTrace hostState @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , StopOldAudio
+        , ReloadStopped preparedPlan
+        , RestartOldAudio
+        , ResumeOldIngress
+        ]
+
+  , testCase
+      "ingress manager wiring leaves manager closed when new open fails" $ do
+      (ops0, hostRef) <- mkFakeOps initialFakeState
+      (manager, ingressRef) <-
+        mkFakeIngressManager hostRef initialFakeIngressState
+          { fisFailOpen = Just FakeNewIngressTarget
+          }
+      let ops =
+            wireManifestReloadIngress
+              manager
+              FakeOldIngressTarget
+              FakeNewIngressTarget
+              ops0
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      hostState <- readIORef hostRef
+      ingressSnapshot <- readManifestReloadIngressManager manager
+      ingressEvents <- fisEvents <$> readIORef ingressRef
+      outcome @?= Left (HsariListenerRestartFailed FakeListenerRestartFailed)
+      ingressSnapshot @?= MrisClosed
+      ingressEvents @?=
+        [ FakeIngressClosed initialFakeIngressHandle
+        , FakeIngressOpenFailed FakeNewIngressTarget
+        ]
+      fsAudioRunning hostState @?= False
+      fsTrace hostState @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , StopOldAudio
+        , ReloadStopped preparedPlan
+        , StartNewAudio
+        , ReopenIngress
+        , StopNewAudio
+        ]
   ]
 
 
@@ -472,6 +629,117 @@ stopNewAudio :: IORef FakeState -> IO ()
 stopNewAudio ref = do
   appendTrace ref StopNewAudio
   modifyIORef' ref $ \state -> state { fsAudioRunning = False }
+
+mkFakeIngressManager
+  :: IORef FakeState
+  -> FakeIngressState
+  -> IO ( ManifestReloadIngressManager
+            FakeIngressTarget
+            FakeFailure
+            FakeIngressHandle
+        , IORef FakeIngressState
+        )
+mkFakeIngressManager hostRef state0 = do
+  ingressRef <- newIORef state0
+  manager <-
+    newManifestReloadIngressManager
+      ManifestReloadIngressOps
+        { mrioOpenIngress =
+            openFakeIngress hostRef ingressRef
+        , mrioCloseIngress =
+            closeFakeIngress hostRef ingressRef
+        }
+      FakeOldIngressTarget
+      initialFakeIngressHandle
+  pure (manager, ingressRef)
+
+initialFakeIngressHandle :: FakeIngressHandle
+initialFakeIngressHandle =
+  FakeIngressHandle 0 FakeOldIngressTarget
+
+initialFakeIngressState :: FakeIngressState
+initialFakeIngressState = FakeIngressState
+  { fisNextHandle = 1
+  , fisFailOpen = Nothing
+  , fisFailClose = Nothing
+  , fisEvents = []
+  }
+
+openFakeIngress
+  :: IORef FakeState
+  -> IORef FakeIngressState
+  -> FakeIngressTarget
+  -> IO (Either FakeFailure FakeIngressHandle)
+openFakeIngress hostRef ingressRef target = do
+  ingressState <- readIORef ingressRef
+  if fisFailOpen ingressState == Just target
+    then do
+      appendIngressEvent ingressRef (FakeIngressOpenFailed target)
+      recordIngressTrace hostRef (openIngressTrace target) False
+      pure (Left (openIngressIssue target))
+    else do
+      let handle =
+            FakeIngressHandle (fisNextHandle ingressState) target
+      modifyIORef' ingressRef $ \state ->
+        state
+          { fisNextHandle =
+              fisNextHandle state + 1
+          , fisEvents =
+              fisEvents state <> [FakeIngressOpened handle]
+          }
+      recordIngressTrace hostRef (openIngressTrace target) True
+      pure (Right handle)
+
+closeFakeIngress
+  :: IORef FakeState
+  -> IORef FakeIngressState
+  -> FakeIngressHandle
+  -> IO (Either FakeFailure ())
+closeFakeIngress hostRef ingressRef handle = do
+  ingressState <- readIORef ingressRef
+  if fisFailClose ingressState == Just (fihId handle)
+    then do
+      appendIngressEvent ingressRef (FakeIngressCloseFailed handle)
+      recordIngressTrace hostRef CloseIngress True
+      pure (Left FakeQuiesceRejected)
+    else do
+      appendIngressEvent ingressRef (FakeIngressClosed handle)
+      recordIngressTrace hostRef CloseIngress False
+      pure (Right ())
+
+openIngressTrace :: FakeIngressTarget -> FakeEvent
+openIngressTrace target =
+  case target of
+    FakeOldIngressTarget ->
+      ResumeOldIngress
+    FakeNewIngressTarget ->
+      ReopenIngress
+
+openIngressIssue :: FakeIngressTarget -> FakeFailure
+openIngressIssue target =
+  case target of
+    FakeOldIngressTarget ->
+      FakeResumeOldIngressFailed
+    FakeNewIngressTarget ->
+      FakeListenerRestartFailed
+
+recordIngressTrace :: IORef FakeState -> FakeEvent -> Bool -> IO ()
+recordIngressTrace ref event open =
+  modifyIORef' ref $ \state ->
+    state
+      { fsIngressOpen =
+          open
+      , fsTrace =
+          fsTrace state <> [event]
+      }
+
+appendIngressEvent
+  :: IORef FakeIngressState
+  -> FakeIngressEvent
+  -> IO ()
+appendIngressEvent ref event =
+  modifyIORef' ref $ \state ->
+    state { fisEvents = fisEvents state <> [event] }
 
 appendTrace :: IORef FakeState -> FakeEvent -> IO ()
 appendTrace ref event =
