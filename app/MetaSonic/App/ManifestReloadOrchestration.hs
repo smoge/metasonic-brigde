@@ -16,8 +16,13 @@ module MetaSonic.App.ManifestReloadOrchestration
   , HostStoppedAudioReloadIssue (..)
   , HostStoppedAudioDrainFailure (..)
   , HostStoppedAudioReloadFailure (..)
+  , HostPreservingReloadOps (..)
+  , HostPreservingReloadIssue (..)
+  , HostPreservingDrainFailure (..)
+  , HostPreservingReloadFailure (..)
   , wireManifestReloadIngress
   , orchestrateHostStoppedAudioReload
+  , orchestrateHostPreservingReload
   ) where
 
 import           MetaSonic.App.ManifestReloadIngress
@@ -110,6 +115,77 @@ data HostStoppedAudioReloadIssue issue
   | HsariReloadFailedNoOwner !issue
   | HsariAudioRestartFailed !issue
   | HsariListenerRestartFailed !issue
+  deriving stock (Eq, Show)
+
+-- | Operations owned by a live preserving manifest reload command.
+--
+-- This is intentionally stricter than the low-level preserving helper:
+-- v1 closes ingress, drains already admitted commands, and requires the
+-- drain slot to prove a clean handoff before submitting the preserving
+-- hot-swap command. It never stops audio and never replaces the owner.
+data HostPreservingReloadOps request plan issue =
+  HostPreservingReloadOps
+    { hproPreparePlan       :: !(request -> IO (Either issue plan))
+      -- ^ Validate/import the requested manifest and produce a
+      -- preserving reload plan. Failure leaves the running stack
+      -- untouched.
+    , hproQuiesceIngress    :: !(IO (Either issue ()))
+      -- ^ Close producer/listener ingress so no new commands are
+      -- admitted while the preserving command is installed.
+    , hproDrainLive         :: !(IO (Either (HostPreservingDrainFailure issue) ()))
+      -- ^ Quiesce the service worker and drain accepted commands. V1
+      -- requires this slot to reject if the queue is not cleanly empty
+      -- after the handoff. A leftover-queue rejection should be
+      -- 'HprdfRetryable' for now: the old owner is still live, so the
+      -- host can resume old ingress and let a later policy decide
+      -- whether to retry, fence more strictly, or fall back.
+    , hproReloadPreserving  :: !(plan -> IO (Either (HostPreservingReloadFailure issue) ()))
+      -- ^ Submit the preserving-only hot-swap through the live fan-in
+      -- path. Failure shape distinguishes retryable old-owner-still-live
+      -- rejection from terminal owner/service failure.
+    , hproResumeService     :: !(IO ())
+      -- ^ Reopen the fan-in service gate and worker before concrete
+      -- ingress is reopened. This slot is intentionally infallible at
+      -- the expected-error level and should be idempotent; unexpected
+      -- exceptions may still propagate.
+    , hproResumeOldIngress  :: !(IO (Either issue ()))
+      -- ^ Reopen old producer/listener brackets after a retryable
+      -- failure. Idempotent: safe when ingress never fully closed.
+    , hproReopenIngress     :: !(IO (Either issue ()))
+      -- ^ Open fresh producer/listener brackets for the graph now
+      -- installed in the same live owner.
+    }
+
+-- | Recovery policy for preserving-reload preflight drain failures.
+data HostPreservingDrainFailure issue
+  = HprdfRetryable !issue
+    -- ^ The old owner/service can still be resumed.
+  | HprdfTerminal !issue
+    -- ^ The old owner/service is not healthy enough for automatic
+    -- ingress resume.
+  deriving stock (Eq, Show)
+
+-- | Owner/service state after the preserving hot-swap command fails.
+data HostPreservingReloadFailure issue
+  = HprfOldOwnerStillInstalled !issue
+    -- ^ The preserving command rejected without replacing or stopping
+    -- the old owner.
+  | HprfTerminal !issue
+    -- ^ The preserving command reached a terminal owner/service state.
+  deriving stock (Eq, Show)
+
+-- | User-visible outcome for one preserving manifest reload attempt.
+data HostPreservingReloadIssue issue
+  = HpariPlanRejected !issue
+  | HpariQuiesceRejected !issue
+  | HpariQuiesceRejectedResumeFailed !issue !issue
+  | HpariDrainRejected !issue
+  | HpariDrainRejectedResumeFailed !issue !issue
+  | HpariDrainFailedTerminal !issue
+  | HpariReloadRejected !issue
+  | HpariReloadRejectedResumeFailed !issue !issue
+  | HpariReloadFailedTerminal !issue
+  | HpariIngressRestartFailed !issue
   deriving stock (Eq, Show)
 
 -- | Fill the orchestration ingress slots from a fresh-bracket manager.
@@ -231,6 +307,83 @@ orchestrateHostStoppedAudioReload ops request = do
 
     resumeAfterFailure originalIssue mkResumed mkResumeFailed = do
       resumeResult <- hsaroResumeOldIngress ops
+      pure $ case resumeResult of
+        Right () ->
+          Left (mkResumed originalIssue)
+        Left resumeIssue ->
+          Left (mkResumeFailed originalIssue resumeIssue)
+
+-- | Run the live preserving reload window.
+--
+-- On success, the requested plan has been submitted through the
+-- preserving hot-swap path, audio was never stopped, the same owner is
+-- still live, service ingress has resumed, and concrete ingress has
+-- reopened for the installed graph.
+--
+-- Retryable failure paths attempt service resume followed by old
+-- ingress resume. Terminal drain/reload failures do not automatically
+-- reopen ingress because the owner/service health is no longer known.
+orchestrateHostPreservingReload
+  :: HostPreservingReloadOps request plan issue
+  -> request
+  -> IO (Either (HostPreservingReloadIssue issue) ())
+orchestrateHostPreservingReload ops request = do
+  prepared <- hproPreparePlan ops request
+  case prepared of
+    Left issue ->
+      pure (Left (HpariPlanRejected issue))
+    Right plan ->
+      quiesce plan
+  where
+    quiesce plan = do
+      result <- hproQuiesceIngress ops
+      case result of
+        Left issue ->
+          resumeAfterFailure
+            issue
+            HpariQuiesceRejected
+            HpariQuiesceRejectedResumeFailed
+        Right () ->
+          drain plan
+
+    drain plan = do
+      result <- hproDrainLive ops
+      case result of
+        Left (HprdfRetryable issue) ->
+          resumeAfterFailure
+            issue
+            HpariDrainRejected
+            HpariDrainRejectedResumeFailed
+        Left (HprdfTerminal issue) ->
+          pure (Left (HpariDrainFailedTerminal issue))
+        Right () ->
+          reloadPreserving plan
+
+    reloadPreserving plan = do
+      result <- hproReloadPreserving ops plan
+      case result of
+        Left (HprfOldOwnerStillInstalled issue) ->
+          resumeAfterFailure
+            issue
+            HpariReloadRejected
+            HpariReloadRejectedResumeFailed
+        Left (HprfTerminal issue) ->
+          pure (Left (HpariReloadFailedTerminal issue))
+        Right () ->
+          reopenNewIngress
+
+    reopenNewIngress = do
+      hproResumeService ops
+      result <- hproReopenIngress ops
+      pure $ case result of
+        Left issue ->
+          Left (HpariIngressRestartFailed issue)
+        Right () ->
+          Right ()
+
+    resumeAfterFailure originalIssue mkResumed mkResumeFailed = do
+      hproResumeService ops
+      resumeResult <- hproResumeOldIngress ops
       pure $ case resumeResult of
         Right () ->
           Left (mkResumed originalIssue)

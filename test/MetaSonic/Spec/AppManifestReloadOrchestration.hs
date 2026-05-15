@@ -31,11 +31,16 @@ data FakeFailure
   | FakeListenerRestartFailed
   | FakeOldAudioRestartFailed
   | FakeResumeOldIngressFailed
+  | FakeQueueLeftAfterDrain
+  | FakePreservingRejected
+  | FakePreservingTerminal
   deriving (Eq, Show)
 
 data FakeOwner
   = FakeOldOwner
+  | FakePreservedOwner
   | FakeNewOwner
+  | FakeTerminalOwner
   | FakeNoOwner
   deriving (Eq, Show)
 
@@ -61,6 +66,9 @@ data FakeFailureMode
   | FailRestartOldAudio
   | FailStartNewAudio
   | FailReopenIngress
+  | FailDrainLeftQueued
+  | FailPreservingReload
+  | FailPreservingReloadTerminal
   deriving (Eq, Show)
 
 data FakeEvent
@@ -69,7 +77,9 @@ data FakeEvent
   | DrainLive !Int
   | StopOldAudio
   | ReloadStopped !String
+  | ReloadPreserving !String
   | RestartOldAudio
+  | ResumeService
   | ResumeOldIngress
   | StartNewAudio
   | ReopenIngress
@@ -240,6 +250,232 @@ appManifestReloadOrchestrationTests =
         , StopOldAudio
         , ReloadStopped preparedPlan
         , StartNewAudio
+        , ReopenIngress
+        ]
+
+  , testCase "preserving plan failure leaves old audio and ingress running" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailPlan
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HpariPlanRejected FakePlanRejected)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= True
+      fsTrace state @?= [PreparePlan requestedPlan]
+
+  , testCase "preserving quiesce failure resumes old ingress without draining" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailQuiesce
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HpariQuiesceRejected FakeQuiesceRejected)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= True
+      DrainLive 0 `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , ResumeService
+        , ResumeOldIngress
+        ]
+
+  , testCase "preserving quiesce failure reports resume failure" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailQuiesce
+        , fsResumeFails = True
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?=
+        Left
+          (HpariQuiesceRejectedResumeFailed
+            FakeQuiesceRejected
+            FakeResumeOldIngressFailed)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , ResumeService
+        , ResumeOldIngress
+        ]
+
+  , testCase "preserving path runs without stopping audio or replacing owner" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Right ()
+      fsOwner state @?= FakePreservedOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= True
+      StopOldAudio `elem` fsTrace state @?= False
+      StartNewAudio `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , ReloadPreserving preparedPlan
+        , ResumeService
+        , ReopenIngress
+        ]
+
+  , testCase "preserving finalizer commands drain before reload" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFinalizerSend = True
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Right ()
+      assertBefore (fsTrace state) (DrainLive 1) (ReloadPreserving preparedPlan)
+      fsQueueDepth state @?= 0
+
+  , testCase "preserving drain rejects leftover queue before reload" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailDrainLeftQueued
+        , fsQueueDepth = 1
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HpariDrainRejected FakeQueueLeftAfterDrain)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= True
+      ReloadPreserving preparedPlan `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 1
+        , ResumeService
+        , ResumeOldIngress
+        ]
+
+  , testCase "preserving drain failure reports resume failure" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailDrain
+        , fsResumeFails = True
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?=
+        Left
+          (HpariDrainRejectedResumeFailed
+            FakeDrainRejected
+            FakeResumeOldIngressFailed)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      ReloadPreserving preparedPlan `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , ResumeService
+        , ResumeOldIngress
+        ]
+
+  , testCase "terminal preserving drain failure does not resume ingress" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailDrainTerminal
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HpariDrainFailedTerminal FakeDrainStopped)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      ResumeService `elem` fsTrace state @?= False
+      ResumeOldIngress `elem` fsTrace state @?= False
+      ReloadPreserving preparedPlan `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        ]
+
+  , testCase "preserving reload rejection resumes old ingress" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailPreservingReload
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HpariReloadRejected FakePreservingRejected)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= True
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , ReloadPreserving preparedPlan
+        , ResumeService
+        , ResumeOldIngress
+        ]
+
+  , testCase "preserving reload rejection reports resume failure" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailPreservingReload
+        , fsResumeFails = True
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?=
+        Left
+          (HpariReloadRejectedResumeFailed
+            FakePreservingRejected
+            FakeResumeOldIngressFailed)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , ReloadPreserving preparedPlan
+        , ResumeService
+        , ResumeOldIngress
+        ]
+
+  , testCase "terminal preserving reload failure does not resume ingress" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailPreservingReloadTerminal
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HpariReloadFailedTerminal FakePreservingTerminal)
+      fsOwner state @?= FakeTerminalOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      ResumeService `elem` fsTrace state @?= False
+      ResumeOldIngress `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , ReloadPreserving preparedPlan
+        ]
+
+  , testCase "preserving ingress reopen failure leaves new graph live" $ do
+      (ops, ref) <- mkFakePreservingOps initialFakeState
+        { fsFailureMode = Just FailReopenIngress
+        }
+      outcome <- orchestrateHostPreservingReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HpariIngressRestartFailed FakeListenerRestartFailed)
+      fsOwner state @?= FakePreservedOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      StopNewAudio `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        , ReloadPreserving preparedPlan
+        , ResumeService
         , ReopenIngress
         ]
 
@@ -513,6 +749,31 @@ mkFakeOps state0 = do
         }
   pure (ops, ref)
 
+mkFakePreservingOps
+  :: FakeState
+  -> IO ( HostPreservingReloadOps String String FakeFailure
+        , IORef FakeState
+        )
+mkFakePreservingOps state0 = do
+  ref <- newIORef state0
+  let ops = HostPreservingReloadOps
+        { hproPreparePlan =
+            preparePlan ref
+        , hproQuiesceIngress =
+            quiesceIngress ref
+        , hproDrainLive =
+            drainPreservingLive ref
+        , hproReloadPreserving =
+            reloadPreserving ref
+        , hproResumeService =
+            resumeService ref
+        , hproResumeOldIngress =
+            resumeOldIngress ref
+        , hproReopenIngress =
+            reopenIngress ref
+        }
+  pure (ops, ref)
+
 initialFakeState :: FakeState
 initialFakeState = FakeState
   { fsOwner = FakeOldOwner
@@ -576,6 +837,24 @@ drainLive ref = do
       modifyIORef' ref $ \state' -> state' { fsQueueDepth = 0 }
       pure (Right ())
 
+drainPreservingLive
+  :: IORef FakeState
+  -> IO (Either (HostPreservingDrainFailure FakeFailure) ())
+drainPreservingLive ref = do
+  state <- readIORef ref
+  appendTrace ref (DrainLive (fsQueueDepth state))
+  mode <- fsFailureMode <$> readIORef ref
+  case mode of
+    Just FailDrain ->
+      pure (Left (HprdfRetryable FakeDrainRejected))
+    Just FailDrainTerminal ->
+      pure (Left (HprdfTerminal FakeDrainStopped))
+    Just FailDrainLeftQueued ->
+      pure (Left (HprdfRetryable FakeQueueLeftAfterDrain))
+    _ -> do
+      modifyIORef' ref $ \state' -> state' { fsQueueDepth = 0 }
+      pure (Right ())
+
 stopOldAudio :: IORef FakeState -> IO (Either FakeFailure ())
 stopOldAudio ref = do
   appendTrace ref StopOldAudio
@@ -606,6 +885,23 @@ reloadStopped ref plan = do
       modifyIORef' ref $ \state -> state { fsOwner = FakeNewOwner }
       pure (Right ())
 
+reloadPreserving
+  :: IORef FakeState
+  -> String
+  -> IO (Either (HostPreservingReloadFailure FakeFailure) ())
+reloadPreserving ref plan = do
+  appendTrace ref (ReloadPreserving plan)
+  mode <- fsFailureMode <$> readIORef ref
+  case mode of
+    Just FailPreservingReload ->
+      pure (Left (HprfOldOwnerStillInstalled FakePreservingRejected))
+    Just FailPreservingReloadTerminal -> do
+      modifyIORef' ref $ \state -> state { fsOwner = FakeTerminalOwner }
+      pure (Left (HprfTerminal FakePreservingTerminal))
+    _ -> do
+      modifyIORef' ref $ \state -> state { fsOwner = FakePreservedOwner }
+      pure (Right ())
+
 restartOldAudio :: IORef FakeState -> IO (Either FakeFailure ())
 restartOldAudio ref = do
   appendTrace ref RestartOldAudio
@@ -616,6 +912,10 @@ restartOldAudio ref = do
     _ -> do
       modifyIORef' ref $ \state -> state { fsAudioRunning = True }
       pure (Right ())
+
+resumeService :: IORef FakeState -> IO ()
+resumeService ref =
+  appendTrace ref ResumeService
 
 resumeOldIngress :: IORef FakeState -> IO (Either FakeFailure ())
 resumeOldIngress ref = do
