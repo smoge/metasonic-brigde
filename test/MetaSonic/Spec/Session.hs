@@ -1217,6 +1217,35 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
           other ->
             assertFailure ("expected start commit, got: " <> show other)
 
+  , testCase "preserving-only unsupported hot-swap rejects without rebuild" $ do
+      let graph    = patternTemplates droneVibrato
+          st0      = initialSessionState graph
+          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          swapCmd  = CmdHotSwapPreservingOnly
+                       (SwapLabel "preserve-drone-only")
+                       graph
+      withInstalledAdapter graph defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing ->
+            case M.lookup (VoiceKey "v0") (ssVoices st1) of
+              Nothing ->
+                assertFailure "expected committed voice binding"
+              Just binding -> do
+                c_rt_graph_process rt 1
+                before <- c_rt_graph_instance_status
+                            rt
+                            (fromIntegral (vbSlotId binding))
+                before @?= instanceStatusLive
+                swapped <- stepSessionCommand adapter swapCmd st1
+                swapped @?= StepRuntimeFailed SriHotSwapWouldPreserveVoices
+                afterStatus <- c_rt_graph_instance_status
+                                 rt
+                                 (fromIntegral (vbSlotId binding))
+                afterStatus @?= instanceStatusLive
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
+
   , testCase "step preserving hot-swap migrates supported active voice" $ do
       newGraph <- compileTemplateGraphOrFail hotSwapEditAfterTemplates
       let oldGraph = patternTemplates hotSwapEdit
@@ -3203,6 +3232,20 @@ sessionLiveHotSwapOrchestrationTests =
       result @?= StepRuntimeFailed SriHotSwapPublishRejected
       assertObservedPreservingPlan observedPlan swapLabel newGraph
 
+  , testCase "preserving-only publish rejection keeps preserving-only plan" $ do
+      (st0, cmd, swapLabel, newGraph) <-
+        liveHotSwapFixtureWith
+          CmdHotSwapPreservingOnly
+          "live-preserving-only-publish-rejected"
+      (result, observedPlan) <-
+        runMockLiveHotSwap st0 cmd SriHotSwapPublishRejected
+      result @?= StepRuntimeFailed SriHotSwapPublishRejected
+      assertObservedHotSwapPlan
+        HotSwapPreservingOnly
+        observedPlan
+        swapLabel
+        newGraph
+
   , testCase "install timeout maps to terminal install failure wrapper" $ do
       assertMockLiveInstallFailure
         "live-install-timeout"
@@ -3217,6 +3260,21 @@ sessionLiveHotSwapOrchestrationTests =
       assertMockLiveInstallFailure
         "live-incomplete-migration"
         "preserving hot-swap migration was incomplete"
+
+  , testCase "preserving-only post-publish failures keep preserving-only plan" $ do
+      let cases =
+            [ ("timeout", "preserving hot-swap install timed out")
+            , ( "retired-missing"
+              , "preserving hot-swap installed but retired swap was missing"
+              )
+            , ( "incomplete-migration"
+              , "preserving hot-swap migration was incomplete"
+              )
+            ]
+      forM_ cases $ \(labelSuffix, message) ->
+        assertMockPreservingOnlyLiveInstallFailure
+          ("live-preserving-only-" <> labelSuffix)
+          message
 
   , testCase "deterministic live protocol orders publish wait collect verify" $ do
       eventsRef <- newIORef []
@@ -3296,7 +3354,14 @@ sessionLiveHotSwapOrchestrationTests =
 liveHotSwapFixture
   :: String
   -> IO (SessionState, SessionCommand, SwapLabel, TemplateGraph)
-liveHotSwapFixture labelText = do
+liveHotSwapFixture =
+  liveHotSwapFixtureWith CmdHotSwap
+
+liveHotSwapFixtureWith
+  :: (SwapLabel -> TemplateGraph -> SessionCommand)
+  -> String
+  -> IO (SessionState, SessionCommand, SwapLabel, TemplateGraph)
+liveHotSwapFixtureWith commandFor labelText = do
   newGraph <- compileTemplateGraphOrFail hotSwapEditAfterTemplates
   let oldGraph = patternTemplates hotSwapEdit
       binding  = VoiceBinding (VoiceKey "vLive") 3 (TemplateName "drone")
@@ -3304,7 +3369,7 @@ liveHotSwapFixture labelText = do
                    (CommitVoiceStarted binding)
                    (initialSessionState oldGraph)
       label    = SwapLabel labelText
-      cmd      = CmdHotSwap label newGraph
+      cmd      = commandFor label newGraph
   pure (st0, cmd, label, newGraph)
 
 runMockLiveHotSwap
@@ -3329,15 +3394,41 @@ assertMockLiveInstallFailure labelText message = do
   result @?= StepRuntimeFailed issue
   assertObservedPreservingPlan observedPlan swapLabel newGraph
 
+assertMockPreservingOnlyLiveInstallFailure :: String -> String -> Assertion
+assertMockPreservingOnlyLiveInstallFailure labelText message = do
+  (st0, cmd, swapLabel, newGraph) <-
+    liveHotSwapFixtureWith CmdHotSwapPreservingOnly labelText
+  let issue = SriHotSwapInstallFailed (SasiLoaderException message)
+  (result, observedPlan) <- runMockLiveHotSwap st0 cmd issue
+  result @?= StepRuntimeFailed issue
+  assertObservedHotSwapPlan
+    HotSwapPreservingOnly
+    observedPlan
+    swapLabel
+    newGraph
+
 assertObservedPreservingPlan
   :: Maybe SessionPlan
   -> SwapLabel
   -> TemplateGraph
   -> Assertion
 assertObservedPreservingPlan observedPlan expectedLabel expectedGraph =
+  assertObservedHotSwapPlan
+    HotSwapAllowRebuild
+    observedPlan
+    expectedLabel
+    expectedGraph
+
+assertObservedHotSwapPlan
+  :: HotSwapInstallMode
+  -> Maybe SessionPlan
+  -> SwapLabel
+  -> TemplateGraph
+  -> Assertion
+assertObservedHotSwapPlan expectedMode observedPlan expectedLabel expectedGraph =
   case observedPlan of
     Just (PlanHotSwap mode label graph rebuild) -> do
-      mode @?= HotSwapAllowRebuild
+      mode @?= expectedMode
       label @?= expectedLabel
       graph @?= expectedGraph
       rrrDropped rebuild @?= []
