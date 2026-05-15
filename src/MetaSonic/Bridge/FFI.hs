@@ -23,7 +23,9 @@ module MetaSonic.Bridge.FFI
   , SwapMigrationStats (..)
   , HotSwapWaitResult (..)
   , -- * Lifecycle
-    withRTGraph
+    createRTGraph
+  , destroyRTGraph
+  , withRTGraph
   , c_rt_graph_capacity
   , c_rt_graph_max_frames
   , c_rt_graph_audio_running
@@ -1329,8 +1331,21 @@ pluginRegistryEntries = do
 withRTGraph :: BuilderCapacity -> MaxFrames -> (Ptr RTGraph -> IO a) -> IO a
 withRTGraph capacity maxFrames =
   bracket
-    (c_rt_graph_create (fromIntegral capacity) (fromIntegral maxFrames))
-    c_rt_graph_destroy
+    (createRTGraph capacity maxFrames)
+    destroyRTGraph
+
+-- | Allocate a C++ runtime graph without a continuation bracket.
+--
+-- Prefer 'withRTGraph' unless a higher-level owner must replace the
+-- current graph under its own longer-lived bracket.
+createRTGraph :: BuilderCapacity -> MaxFrames -> IO (Ptr RTGraph)
+createRTGraph capacity maxFrames =
+  c_rt_graph_create (fromIntegral capacity) (fromIntegral maxFrames)
+
+-- | Release a runtime graph allocated by 'createRTGraph'.
+destroyRTGraph :: Ptr RTGraph -> IO ()
+destroyRTGraph =
+  c_rt_graph_destroy
 
 {- Note [Phase 5.3 hot-swap helpers]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

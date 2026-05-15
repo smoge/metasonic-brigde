@@ -7,9 +7,9 @@
 -- Description : Serialized session command fan-in host.
 --
 -- This module defines Session Prep P's generic producer fan-in
--- boundary. It owns a scoped 'SessionOwner' and one bounded
--- 'SessionCommandQueue', then serializes enqueue, drain, and snapshot
--- operations behind an 'MVar'.
+-- boundary. It owns a reloadable 'SessionOwner' generation and one
+-- bounded 'SessionCommandQueue', then serializes enqueue, drain,
+-- snapshot, and owner-reload admission behind an 'MVar'.
 --
 -- It does not parse OSC, read MIDI, create a background worker, define
 -- a realtime clock, or add a new runtime queue. Concrete producers can
@@ -30,11 +30,14 @@ module MetaSonic.Session.FanIn
 
     -- * Setup issues
   , SessionFanInSetupIssue (..)
+  , SessionFanInReloadStatus (..)
+  , SessionFanInReloadIssue (..)
 
     -- * Operation reports
   , SessionFanInEnqueueResult (..)
   , SessionFanInDrainResult (..)
   , SessionFanInSnapshot (..)
+  , SessionFanInReloadReport (..)
 
     -- * Scoped host
   , withSessionFanInHost
@@ -42,26 +45,33 @@ module MetaSonic.Session.FanIn
   , enqueueSessionFanInCommand
   , drainSessionFanInHost
   , readSessionFanInHost
+  , reloadSessionFanInHostOwnerStoppedAudio
   ) where
 
-import           Control.Concurrent.MVar         (MVar, modifyMVar, newMVar,
-                                                  withMVar)
+import           Control.Concurrent.MVar         (MVar, modifyMVar, newMVar)
+import           Control.Exception               (finally, mask,
+                                                  onException)
 import           Control.DeepSeq                 (NFData)
+import           Control.Monad                   (forM_)
 import           GHC.Generics                    (Generic)
 
 import           MetaSonic.Bridge.Templates      (TemplateGraph)
 import           MetaSonic.Session.AdapterIssue  (SessionAdapterSetupIssue)
 import           MetaSonic.Session.Command       (SessionCommand)
-import           MetaSonic.Session.Owner         (SessionOwner,
+import           MetaSonic.Session.Owner         (SessionOwnerDivergence (..),
+                                                  SessionOwnerHandle,
                                                   SessionOwnerOptions,
-                                                  SessionOwnerStatus,
+                                                  SessionOwnerStatus (..),
+                                                  acquireSessionOwner,
                                                   defaultSessionOwnerOptions,
+                                                  releaseSessionOwner,
                                                   sessionOwnerState,
-                                                  sessionOwnerStatus,
-                                                  withSessionOwner)
+                                                  sessionOwnerHandleOwner,
+                                                  sessionOwnerStatus)
 import           MetaSonic.Session.Queue         (ProducerId,
                                                   SessionCommandQueue,
-                                                  SessionDrainResult,
+                                                  SessionDrainResult (..),
+                                                  SessionEnqueueIssue (..),
                                                   SessionEnqueueResult (..),
                                                   SessionQueueOptions,
                                                   SessionQueueSetupIssue,
@@ -70,7 +80,8 @@ import           MetaSonic.Session.Queue         (ProducerId,
                                                   enqueueSessionCommand,
                                                   newSessionCommandQueue,
                                                   queuedCommandCount)
-import           MetaSonic.Session.State         (SessionState)
+import           MetaSonic.Session.State         (SessionState,
+                                                  initialSessionState)
 
 
 -- | Hidden serialized host for producer command fan-in.
@@ -78,9 +89,16 @@ import           MetaSonic.Session.State         (SessionState)
 -- The constructor stays private so callers cannot bypass the lock or
 -- retain the underlying 'SessionOwner' outside the bracket.
 data SessionFanInHost = SessionFanInHost
-  { sfihOwner :: !SessionOwner
-  , sfihQueue :: !(MVar SessionCommandQueue)
+  { sfihState :: !(MVar SessionFanInHostState)
   , sfihHooks :: !SessionFanInHostHooks
+  }
+
+data SessionFanInHostState = SessionFanInHostState
+  { sfihsOwner        :: !(Maybe SessionOwnerHandle)
+  , sfihsQueue        :: !SessionCommandQueue
+  , sfihsReloadStatus :: !SessionFanInReloadStatus
+  , sfihsLastState    :: !SessionState
+  , sfihsLastStatus   :: !SessionOwnerStatus
   }
 
 -- | Construction options for the generic fan-in host.
@@ -119,6 +137,23 @@ data SessionFanInSetupIssue
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
+-- | Reload admission state for a fan-in host.
+data SessionFanInReloadStatus
+  = SessionFanInNormalOperation
+  | SessionFanInReloadInProgress
+  | SessionFanInReloadFailed
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
+-- | Stopped-audio owner-reload admission/setup failures.
+data SessionFanInReloadIssue
+  = SfriReloadAlreadyInProgress
+  | SfriQueueNotEmpty !Int
+  | SfriNoOwner
+  | SfriOwnerSetupFailed !SessionAdapterSetupIssue
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
 -- | Result of one serialized enqueue attempt.
 data SessionFanInEnqueueResult = SessionFanInEnqueueResult
   { sfierResult     :: !SessionEnqueueResult
@@ -135,9 +170,18 @@ data SessionFanInDrainResult = SessionFanInDrainResult
 
 -- | Lock-protected snapshot of queued work and owner state.
 data SessionFanInSnapshot = SessionFanInSnapshot
-  { sfisQueueDepth  :: !Int
-  , sfisOwnerState  :: !SessionState
-  , sfisOwnerStatus :: !SessionOwnerStatus
+  { sfisQueueDepth   :: !Int
+  , sfisOwnerState   :: !SessionState
+  , sfisOwnerStatus  :: !SessionOwnerStatus
+  , sfisReloadStatus :: !SessionFanInReloadStatus
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+-- | Successful stopped-audio owner reload report.
+data SessionFanInReloadReport = SessionFanInReloadReport
+  { sfirrQueueDepth  :: !Int
+  , sfirrOwnerState  :: !SessionState
+  , sfirrOwnerStatus :: !SessionOwnerStatus
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -163,20 +207,34 @@ withSessionFanInHostHooks hooks graph opts action =
   case newSessionCommandQueue (sfioQueueOptions opts) of
     Left issue ->
       pure (Left (SfisiQueue issue))
-    Right queue -> do
-      ownerResult <-
-        withSessionOwner graph (sfioOwnerOptions opts) $ \owner -> do
-          queueVar <- newMVar queue
-          action SessionFanInHost
-            { sfihOwner = owner
-            , sfihQueue = queueVar
-            , sfihHooks = hooks
-            }
-      case ownerResult of
-        Left issue ->
-          pure (Left (SfisiOwner issue))
-        Right value ->
-          pure (Right value)
+    Right queue ->
+      mask $ \restore -> do
+        ownerResult <-
+          acquireSessionOwner graph (sfioOwnerOptions opts)
+        case ownerResult of
+          Left issue ->
+            pure (Left (SfisiOwner issue))
+          Right owner -> do
+            stateVar <- newMVar SessionFanInHostState
+              { sfihsOwner =
+                  Just owner
+              , sfihsQueue =
+                  queue
+              , sfihsReloadStatus =
+                  SessionFanInNormalOperation
+              , sfihsLastState =
+                  initialSessionState graph
+              , sfihsLastStatus =
+                  SessionOwnerReady
+              }
+            let host = SessionFanInHost
+                  { sfihState =
+                      stateVar
+                  , sfihHooks =
+                      hooks
+                  }
+            Right <$> restore (action host)
+              `finally` releaseSessionFanInHostOwners host
 
 -- | Enqueue one producer command under the host lock.
 enqueueSessionFanInCommand
@@ -185,17 +243,36 @@ enqueueSessionFanInCommand
   -> SessionFanInHost
   -> IO SessionFanInEnqueueResult
 enqueueSessionFanInCommand producer cmd host = do
-  result <- modifyMVar (sfihQueue host) $ \queue -> do
-    let (queue', enqueueResult) = enqueueSessionCommand producer cmd queue
-    pure
-      ( queue'
-      , SessionFanInEnqueueResult
-          { sfierResult =
-              enqueueResult
-          , sfierQueueDepth =
-              queuedCommandCount queue'
-          }
-      )
+  result <- modifyMVar (sfihState host) $ \hostState -> do
+    let queue = sfihsQueue hostState
+        reject issue =
+          ( hostState
+          , SessionFanInEnqueueResult
+              { sfierResult =
+                  SessionEnqueueRejected producer cmd issue
+              , sfierQueueDepth =
+                  queuedCommandCount queue
+              }
+          )
+    case (sfihsReloadStatus hostState, sfihsOwner hostState) of
+      (SessionFanInNormalOperation, Just _) ->
+        let (queue', enqueueResult) = enqueueSessionCommand producer cmd queue
+            hostState' = hostState { sfihsQueue = queue' }
+        in pure
+             ( hostState'
+             , SessionFanInEnqueueResult
+                 { sfierResult =
+                     enqueueResult
+                 , sfierQueueDepth =
+                     queuedCommandCount queue'
+                 }
+             )
+      (SessionFanInReloadInProgress, _) ->
+        pure (reject SeiReloadInProgress)
+      (SessionFanInReloadFailed, _) ->
+        pure (reject SeiSessionUnavailable)
+      (SessionFanInNormalOperation, Nothing) ->
+        pure (reject SeiSessionUnavailable)
   case sfierResult result of
     SessionEnqueued {} ->
       sfihhOnEnqueued (sfihHooks host)
@@ -211,31 +288,188 @@ drainSessionFanInHost
   :: SessionFanInHost
   -> IO SessionFanInDrainResult
 drainSessionFanInHost host =
-  modifyMVar (sfihQueue host) $ \queue -> do
-    (queue', drain) <- drainSessionCommandQueue (sfihOwner host) queue
-    pure
-      ( queue'
-      , SessionFanInDrainResult
-          { sfidrDrain =
-              drain
-          , sfidrQueueDepth =
-              queuedCommandCount queue'
-          }
-      )
+  modifyMVar (sfihState host) $ \hostState -> do
+    let queue = sfihsQueue hostState
+        emptyDrain stopped =
+          SessionFanInDrainResult
+            { sfidrDrain =
+                SessionDrainResult
+                  { sdrItems =
+                      []
+                  , sdrRemaining =
+                      queuedCommandCount queue
+                  , sdrStopped =
+                      stopped
+                  }
+            , sfidrQueueDepth =
+                queuedCommandCount queue
+            }
+    case (sfihsReloadStatus hostState, sfihsOwner hostState) of
+      (SessionFanInNormalOperation, Just ownerHandle) -> do
+        (queue', drain) <-
+          drainSessionCommandQueue
+            (sessionOwnerHandleOwner ownerHandle)
+            queue
+        pure
+          ( hostState { sfihsQueue = queue' }
+          , SessionFanInDrainResult
+              { sfidrDrain =
+                  drain
+              , sfidrQueueDepth =
+                  queuedCommandCount queue'
+              }
+          )
+      (SessionFanInReloadInProgress, _) ->
+        pure (hostState, emptyDrain Nothing)
+      (SessionFanInReloadFailed, _) ->
+        pure (hostState, emptyDrain (Just SodBackendStopped))
+      (SessionFanInNormalOperation, Nothing) ->
+        pure (hostState, emptyDrain (Just SodBackendStopped))
 
 -- | Read a consistent fan-in host snapshot.
 readSessionFanInHost
   :: SessionFanInHost
   -> IO SessionFanInSnapshot
 readSessionFanInHost host =
-  withMVar (sfihQueue host) $ \queue -> do
-    ownerState <- sessionOwnerState (sfihOwner host)
-    ownerStatus <- sessionOwnerStatus (sfihOwner host)
-    pure SessionFanInSnapshot
-      { sfisQueueDepth =
-          queuedCommandCount queue
-      , sfisOwnerState =
-          ownerState
-      , sfisOwnerStatus =
-          ownerStatus
-      }
+  modifyMVar (sfihState host) $ \hostState -> do
+    (hostState', ownerState, ownerStatus) <-
+      case sfihsOwner hostState of
+        Nothing ->
+          pure
+            ( hostState
+            , sfihsLastState hostState
+            , sfihsLastStatus hostState
+            )
+        Just ownerHandle -> do
+          ownerState <- sessionOwnerState (sessionOwnerHandleOwner ownerHandle)
+          ownerStatus <- sessionOwnerStatus (sessionOwnerHandleOwner ownerHandle)
+          pure
+            ( hostState
+                { sfihsLastState =
+                    ownerState
+                , sfihsLastStatus =
+                    ownerStatus
+                }
+            , ownerState
+            , ownerStatus
+            )
+    pure
+      ( hostState'
+      , SessionFanInSnapshot
+          { sfisQueueDepth =
+              queuedCommandCount (sfihsQueue hostState')
+          , sfisOwnerState =
+              ownerState
+          , sfisOwnerStatus =
+              ownerStatus
+          , sfisReloadStatus =
+              sfihsReloadStatus hostState'
+          }
+      )
+
+-- | Replace the current owner after the host has stopped audio,
+-- quiesced producers, and drained the queue.
+--
+-- The helper enforces only the precondition it can observe: the
+-- queue must be empty and the host must be in normal operation. It
+-- does not call start/stop audio, drain accepted commands, or reset
+-- producer/listener state.
+reloadSessionFanInHostOwnerStoppedAudio
+  :: SessionFanInHost
+  -> TemplateGraph
+  -> SessionOwnerOptions
+  -> IO (Either SessionFanInReloadIssue SessionFanInReloadReport)
+reloadSessionFanInHostOwnerStoppedAudio host graph opts = mask $ \_restore -> do
+  admitted <- modifyMVar (sfihState host) $ \hostState -> do
+    let queueDepth = queuedCommandCount (sfihsQueue hostState)
+    case sfihsReloadStatus hostState of
+      SessionFanInReloadInProgress ->
+        pure (hostState, Left SfriReloadAlreadyInProgress)
+      SessionFanInReloadFailed ->
+        pure (hostState, Left SfriNoOwner)
+      SessionFanInNormalOperation ->
+        case sfihsOwner hostState of
+          Nothing ->
+            pure (hostState, Left SfriNoOwner)
+          Just ownerHandle
+            | queueDepth /= 0 ->
+                pure (hostState, Left (SfriQueueNotEmpty queueDepth))
+            | otherwise ->
+                pure
+                  ( hostState
+                      { sfihsOwner =
+                          Nothing
+                      , sfihsReloadStatus =
+                          SessionFanInReloadInProgress
+                      }
+                  , Right ownerHandle
+                  )
+  case admitted of
+    Left issue ->
+      pure (Left issue)
+    Right oldOwner -> do
+      releaseSessionOwner oldOwner
+        `onException` markReloadFailed host
+      acquired <- acquireSessionOwner graph opts
+        `onException` markReloadFailed host
+      case acquired of
+        Left setupIssue -> do
+          markReloadFailed host
+          pure (Left (SfriOwnerSetupFailed setupIssue))
+        Right newOwner ->
+          installReloadedOwner newOwner
+            `onException`
+              (releaseSessionOwner newOwner `finally` markReloadFailed host)
+  where
+    installReloadedOwner newOwner = do
+      ownerState <- sessionOwnerState (sessionOwnerHandleOwner newOwner)
+      ownerStatus <- sessionOwnerStatus (sessionOwnerHandleOwner newOwner)
+      modifyMVar (sfihState host) $ \hostState ->
+        pure
+          ( hostState
+              { sfihsOwner =
+                  Just newOwner
+              , sfihsReloadStatus =
+                  SessionFanInNormalOperation
+              , sfihsLastState =
+                  ownerState
+              , sfihsLastStatus =
+                  ownerStatus
+              }
+          , ()
+          )
+      pure $ Right SessionFanInReloadReport
+        { sfirrQueueDepth =
+            0
+        , sfirrOwnerState =
+            ownerState
+        , sfirrOwnerStatus =
+            ownerStatus
+        }
+
+markReloadFailed :: SessionFanInHost -> IO ()
+markReloadFailed host =
+  modifyMVar (sfihState host) $ \hostState ->
+    pure
+      ( hostState
+          { sfihsOwner =
+              Nothing
+          , sfihsReloadStatus =
+              SessionFanInReloadFailed
+          }
+      , ()
+      )
+
+releaseSessionFanInHostOwners :: SessionFanInHost -> IO ()
+releaseSessionFanInHostOwners host = do
+  owner <- modifyMVar (sfihState host) $ \hostState ->
+    pure
+      ( hostState
+          { sfihsOwner =
+              Nothing
+          , sfihsReloadStatus =
+              SessionFanInReloadFailed
+          }
+      , sfihsOwner hostState
+      )
+  forM_ owner releaseSessionOwner

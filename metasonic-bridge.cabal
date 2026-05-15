@@ -63,6 +63,7 @@ library
       MetaSonic.Session.FanInService
       MetaSonic.Session.ManifestReload
       MetaSonic.Session.ManifestReload.Construct
+      MetaSonic.Session.ManifestReload.Runtime
       MetaSonic.Session.MIDIProducer
       MetaSonic.Session.MIDIListener
       MetaSonic.Session.MIDIPortMIDI

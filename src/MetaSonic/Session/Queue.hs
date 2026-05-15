@@ -135,6 +135,12 @@ data SessionQueueSetupIssue
 data SessionEnqueueIssue
   = SeiQueueFull !Int
     -- ^ The queue was already at the configured capacity.
+  | SeiReloadInProgress
+    -- ^ A stopped-audio reload has admitted and temporarily closed
+    -- producer ingress.
+  | SeiSessionUnavailable
+    -- ^ The host has no installed owner, usually after a failed
+    -- dispose-first reload.
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 

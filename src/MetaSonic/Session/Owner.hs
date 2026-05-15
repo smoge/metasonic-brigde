@@ -21,6 +21,7 @@
 module MetaSonic.Session.Owner
   ( -- * Owner
     SessionOwner
+  , SessionOwnerHandle
 
     -- * Options
   , SessionOwnerOptions (..)
@@ -35,17 +36,24 @@ module MetaSonic.Session.Owner
 
     -- * Scoped owner
   , withSessionOwner
+  , acquireSessionOwner
+  , releaseSessionOwner
+  , sessionOwnerHandleOwner
   , stepSessionOwner
   , sessionOwnerState
   , sessionOwnerStatus
   ) where
 
+import           Control.Exception                (finally, mask,
+                                                   onException)
 import           Control.DeepSeq                  (NFData)
 import           Data.IORef                       (IORef, newIORef,
                                                    readIORef, writeIORef)
+import           Foreign.Ptr                      (Ptr)
 import           GHC.Generics                     (Generic)
 
-import           MetaSonic.Bridge.FFI             (withRTGraph)
+import           MetaSonic.Bridge.FFI             (RTGraph, createRTGraph,
+                                                   destroyRTGraph)
 import           MetaSonic.Bridge.Templates       (TemplateGraph)
 import           MetaSonic.Session.AdapterIssue   (SessionAdapterSetupIssue)
 import           MetaSonic.Session.Command        (SessionCommand)
@@ -69,6 +77,16 @@ data SessionOwner = SessionOwner
   { soState   :: !(IORef SessionState)
   , soStatus  :: !(IORef SessionOwnerStatus)
   , soAdapter :: !(SessionRuntimeAdapter IO)
+  }
+
+-- | Manually scoped owner handle.
+--
+-- This exists for higher-level session hosts that must keep one outer
+-- host lifetime while replacing the current owner generation. Plain
+-- callers should keep using 'withSessionOwner'.
+data SessionOwnerHandle = SessionOwnerHandle
+  { sohOwner   :: !SessionOwner
+  , sohRTGraph :: !(Ptr RTGraph)
   }
 
 -- | Construction options for the owner bracket.
@@ -139,23 +157,60 @@ withSessionOwner
   -> (SessionOwner -> IO a)
   -> IO (Either SessionAdapterSetupIssue a)
 withSessionOwner graph opts action =
-  withRTGraph (sooBuilderCapacity opts) (sooMaxFrames opts) $ \rt -> do
-    adapterResult <-
-      RTGraphAdapter.newRTGraphAdapter
+  mask $ \restore -> do
+    acquired <- acquireSessionOwner graph opts
+    case acquired of
+      Left issue ->
+        pure (Left issue)
+      Right handle ->
+        (Right <$> restore (action (sessionOwnerHandleOwner handle)))
+          `finally` releaseSessionOwner handle
+
+-- | Acquire an owner generation without a continuation bracket.
+--
+-- The returned handle must be released exactly once with
+-- 'releaseSessionOwner'. If setup fails, the temporary RTGraph is
+-- released before the failure is returned.
+acquireSessionOwner
+  :: TemplateGraph
+  -> SessionOwnerOptions
+  -> IO (Either SessionAdapterSetupIssue SessionOwnerHandle)
+acquireSessionOwner graph opts =
+  mask $ \restore -> do
+    rt <- createRTGraph (sooBuilderCapacity opts) (sooMaxFrames opts)
+    adapterResult <- restore
+      (RTGraphAdapter.newRTGraphAdapter
         rt
         graph
-        (sooAdapterOptions opts)
+        (sooAdapterOptions opts))
+      `onException` destroyRTGraph rt
     case adapterResult of
-      Left issue ->
+      Left issue -> do
+        destroyRTGraph rt
         pure (Left issue)
       Right adapter -> do
         stateRef <- newIORef (initialSessionState graph)
         statusRef <- newIORef SessionOwnerReady
-        Right <$> action SessionOwner
-          { soState   = stateRef
-          , soStatus  = statusRef
-          , soAdapter = adapter
+        pure $ Right SessionOwnerHandle
+          { sohOwner =
+              SessionOwner
+                { soState   = stateRef
+                , soStatus  = statusRef
+                , soAdapter = adapter
+                }
+          , sohRTGraph =
+              rt
           }
+
+-- | Release an owner generation acquired by 'acquireSessionOwner'.
+releaseSessionOwner :: SessionOwnerHandle -> IO ()
+releaseSessionOwner =
+  destroyRTGraph . sohRTGraph
+
+-- | Borrow the owner value from a live handle.
+sessionOwnerHandleOwner :: SessionOwnerHandle -> SessionOwner
+sessionOwnerHandleOwner =
+  sohOwner
 
 -- | Read the last pure session state known to agree with the runtime.
 --

@@ -313,10 +313,17 @@ The landed pieces are deliberately small:
   MANIFEST.json DEMO` then uses that plan to construct a fresh non-audio
   `SessionOwner` and report status. These paths do not start audio, enqueue
   producer commands, or execute `CmdHotSwap`.
+- `MetaSonic.Session.ManifestReload.Runtime` exposes
+  `reloadManifestSessionStoppedAudio` for the first non-audio stopped-reload
+  helper. It takes a prevalidated plan, requires the fan-in queue to be empty,
+  replaces the current owner generation, and reports that listener/producer
+  brackets must restart. It does not call `startAudio` / `stopAudio`, validate
+  manifests, drain queued commands, or restart listener threads.
 
 What is still intentionally absent: GUI toolkit bindings, live or
 host-level manifest-driven session reload/resource allocation beyond the
-diagnostic planning and construction-smoke CLI, broader MIDI behavior beyond the landed
+diagnostic planning, construction-smoke CLI, and non-audio stopped-reload
+owner-swap helper, broader MIDI behavior beyond the landed
 MIDI ingress surface (note/CC/sustain/pitch-bend/all-notes-off command
 translation, producer-local channel filtering, and the small
 PortMIDI-backed decoded source), broader OSC behavior beyond symbolic

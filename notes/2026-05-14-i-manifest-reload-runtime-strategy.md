@@ -2,11 +2,32 @@
 
 Date: 2026-05-14
 
-Status: design note for the next runtime-facing manifest slice. No
-implementation yet. The construction-time install boundary is recorded in
+Status: design note plus first non-audio helper slice. The
+construction-time install boundary is recorded in
 `2026-05-14-g-manifest-reload-install-strategy.md` and the app-visible
 construction smoke in `2026-05-14-h-manifest-session-construction-smoke.md`.
-This note pins the v1 reload contract before any implementation lands.
+This note pins the v1 reload contract; the landed implementation covers the
+session-layer helper only.
+
+Implemented in the first helper slice:
+
+- `MetaSonic.Bridge.FFI.createRTGraph` / `destroyRTGraph` expose a structured
+  manual RTGraph lifetime for higher-level reloadable owners.
+- `MetaSonic.Session.Owner` exposes `SessionOwnerHandle`,
+  `acquireSessionOwner`, and `releaseSessionOwner` so a longer-lived host can
+  own multiple owner generations without dangling a callback-scoped
+  `SessionOwner`.
+- `MetaSonic.Session.FanIn` now serializes queue, reload status, and current
+  owner generation in one `MVar`, rejects producer enqueues with
+  `SeiReloadInProgress` during reload and `SeiSessionUnavailable` after
+  post-dispose construction failure, and implements
+  `reloadSessionFanInHostOwnerStoppedAudio`.
+- `MetaSonic.Session.ManifestReload.Runtime.reloadManifestSessionStoppedAudio`
+  takes a prevalidated `ManifestReloadPlan`, enforces the empty-queue
+  admission rule, replaces the owner, and returns a
+  "listeners/producers must restart" report. It does not call
+  `startAudio` / `stopAudio`, validate manifests, drain queues, or touch
+  listener brackets.
 
 ## Three Strategies
 
@@ -30,10 +51,9 @@ lifetime primitive.
   ([FFI.hs:2397-2401](../src/MetaSonic/Bridge/FFI.hs#L2397-L2401)) — device
   policy that today lives at the app
   ([Main.hs:1456](../app/Main.hs#L1456)). V1 does not move that policy into
-  the session layer. The missing session-layer pieces are a reloadable
-  owner lifetime primitive (because `withSessionOwner` is callback-scoped),
-  a single serialized admission point, and a recovery story when the new
-  owner fails to construct.
+  the session layer. The reloadable owner lifetime primitive and serialized
+  admission point have landed; host-level recovery after post-dispose
+  construction failure remains policy owned by the host.
 - Correctness risk: low at the session layer, conditional on the host
   quiescing producers, draining the queue live, and then stopping audio
   before calling the helper. The helper itself does not migrate live state
@@ -379,10 +399,9 @@ the fan-in host stays intact across reload.
 ### Owner Lifetime: The Prerequisite That A Mutable Slot Does Not Solve
 
 `withSessionOwner`
-([Owner.hs:136-158](../src/MetaSonic/Session/Owner.hs#L136-L158))
+([Owner.hs:154-166](../src/MetaSonic/Session/Owner.hs#L154-L166))
 is callback-scoped. The `SessionOwner` it produces is only valid inside the
-callback, because the underlying `withRTGraph` bracket disposes the
-RTGraph, the adapter, and the owner state when the callback returns.
+callback, because the owner handle is released when the callback returns.
 Storing that `SessionOwner` in an `IORef` or `MVar` and then returning from
 `withSessionOwner` would yield a dangling reference: the slot points at an
 owner whose `RTGraph` has already been released.
@@ -392,8 +411,8 @@ helper cannot dispose the old owner by closing its bracket and then open a
 new bracket inside the slot, because the slot's lifetime is longer than any
 single `withSessionOwner` call.
 
-V1 needs an explicit reloadable owner lifetime abstraction. Two honest
-shapes:
+V1 needed an explicit reloadable owner lifetime abstraction. Two honest
+shapes were available:
 
 1. **`withReloadableSessionOwner`.** A new bracket that manually owns the
    `withRTGraph` lifetime via `mask`/`bracket` primitives rather than as a
@@ -413,55 +432,61 @@ shapes:
    except it stays inside the session module — but it requires the same
    indirection on the producer-facing side.
 
-(1) is the more honest shape for stopped-audio reload because it keeps a
+(1) was the more honest shape for stopped-audio reload because it keeps a
 single host lifetime over multiple owner generations and matches the v1
-admission/commit sequence above. (2) is simpler to implement but converges
-with host teardown/rebuild and weakens the v1 thesis that "only the owner
-is replaced".
+admission/commit sequence above. The landed slice implements that shape
+without adding a public `withReloadableSessionOwner` wrapper:
 
-Either way, the prerequisite slice is bigger than "add a mutable field."
-It is a new lifetime primitive at the
-`Owner.hs`/`FanIn.hs` layer. That slice should land — and have its own
-note — before the v1 reload helper. If neither shape is acceptable, v1
-collapses with host teardown/rebuild and this note's framing should be
-revisited.
+- `MetaSonic.Bridge.FFI` exposes `createRTGraph` / `destroyRTGraph`, keeping
+  `withRTGraph` as the default scoped API while making manual ownership
+  available to higher-level brackets.
+- `MetaSonic.Session.Owner` exposes an abstract `SessionOwnerHandle` with
+  `acquireSessionOwner`, `releaseSessionOwner`, and
+  `sessionOwnerHandleOwner`. The plain `withSessionOwner` path now delegates
+  to that handle and still presents the same callback-scoped API.
+- `MetaSonic.Session.FanIn` owns the current `SessionOwnerHandle` inside one
+  `SessionFanInHostState` MVar together with the queue and reload status. The
+  host bracket releases whichever owner generation is current at teardown.
+- `reloadSessionFanInHostOwnerStoppedAudio` performs the dispose-first
+  replacement under that host lifetime. It masks the dispose/acquire/install
+  sequence so asynchronous interruption cannot strand the host in the
+  admitted reload window or leak a newly acquired owner.
+
+The reloadable lifetime therefore lives where the contract needs it: at the
+fan-in host boundary. `Owner.hs` exposes only the small manual handle needed
+by that host; callers that do not need replacement continue to use
+`withSessionOwner`.
 
 ## Open Implementation Questions
 
-These do not block the contract. They become real once implementation
-starts.
+Closed by the first helper slice:
 
-- Which reloadable owner lifetime shape, (1) `withReloadableSessionOwner`
-  or (2) session-layer host teardown/rebuild under a producer-facing
-  indirection? (1) preserves the v1 thesis; (2) is simpler but converges
-  with host teardown/rebuild.
-- Does the fan-in service need a dedicated reload-rejection variant on
-  `SessionEnqueueIssue`, or is reusing `SeiQueueFull` acceptable? A
-  dedicated variant is honest for producers that want to distinguish
-  back-pressure from reload; `SeiQueueFull` is simpler and already wired.
-  The contract above requires that producers can distinguish the
-  "reload in progress" rejection from "host has no owner" — at least
-  those two states must be observable, even if back-pressure shares one
-  of them.
-- How does the host signal listeners/producers that they must restart?
-  A single "reload completed" hook returned by the helper is enough for
-  v1; a per-producer registry inside the session layer is not.
-- Should the first CLI for v1 reload remain a non-audio smoke that
-  exercises the admit/dispose/construct sequence (and the
-  queue-not-empty / invalid-plan rejection paths) without audio
-  involvement, or stage a host-driven stop → reload → start window with
-  real audio? A non-audio smoke first, matching the construction-smoke
-  pattern, is the lower-risk slice — and since the helper does not call
-  `startAudio` / `stopAudio` at all, an audio-running smoke is a host-side
-  integration test, not a helper test.
-- Does the reload command surface live on the fan-in host or on a separate
-  `MetaSonic.Session.ManifestReload.Runtime` module? Keeping it outside
-  `Session.Owner` and `Session.FanIn` preserves both existing APIs and
-  matches the construction-helper split.
+- lifetime shape: the fan-in host owns a replaceable `SessionOwnerHandle`
+  generation under one serialized state MVar;
+- enqueue rejection shape: producers now see `SeiReloadInProgress` during the
+  admitted reload window and `SeiSessionUnavailable` after a dispose-first
+  construction failure leaves the host with no owner;
+- command surface: manifest-specific stopped-audio reload lives in
+  `MetaSonic.Session.ManifestReload.Runtime`, while the lower-level owner swap
+  remains on `MetaSonic.Session.FanIn`;
+- completion signal: the manifest helper returns
+  `msarrListenersMustRestart = True`, leaving listener/producer bracket
+  restart to the host.
+
+Still open for host integration:
+
+- a host command that performs the whole stop window: quiesce producers and
+  listeners, drain while audio is live, stop audio, call the helper, restart
+  audio, and reopen producer/listener brackets;
+- a diagnostic CLI smoke for the new helper that does not pretend to be
+  audio-running live reload;
+- an app-owned recovery policy after `SfriOwnerSetupFailed`, since the helper
+  intentionally leaves the host with no owner after post-dispose construction
+  failure.
 
 ## Review Checklist
 
-Any future v1 implementation should still satisfy:
+The landed helper and any future host integration should still satisfy:
 
 - the helper name spells out the strategy (`StoppedAudio` or equivalent);
 - the contract above is the contract — no silent weakening of any of the

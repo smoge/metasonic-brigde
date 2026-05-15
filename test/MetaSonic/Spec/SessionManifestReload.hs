@@ -17,9 +17,13 @@ import           MetaSonic.Pattern               (ControlTag (..),
 import           MetaSonic.Session.Arbitration
 import           MetaSonic.Session.ManifestReload
 import           MetaSonic.Session.ManifestReload.Construct
+import           MetaSonic.Session.ManifestReload.Runtime
 import           MetaSonic.Session.Command
+import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.Owner
-import           MetaSonic.Session.Queue         (ProducerKind (..))
+import           MetaSonic.Session.Queue         (ProducerKind (..),
+                                                  SessionEnqueueIssue (..),
+                                                  SessionEnqueueResult (..))
 import           MetaSonic.Session.RTGraphAdapter
 import           MetaSonic.Session.State
 import           MetaSonic.Session.Step          (SessionStepResult (..))
@@ -330,6 +334,97 @@ sessionManifestReloadTests =
           assertFailure
             ("expected manifest-built owner voice-start commit, got: "
              <> show other)
+
+  , testCase "stopped-audio reload helper replaces host owner from plan" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      result <-
+        withSessionFanInHost
+          voiceOnlyTemplateGraph
+          defaultSessionFanInOptions
+          $ \host -> do
+              before <- readSessionFanInHost host
+              reload <-
+                reloadManifestSessionStoppedAudio
+                  host
+                  defaultSessionOwnerOptions
+                  plan
+              snapshotAfter <- readSessionFanInHost host
+              pure (before, reload, snapshotAfter)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (before, Right report, snapshotAfter) -> do
+          ssGraph (sfisOwnerState before) @?= voiceOnlyTemplateGraph
+          msarrDemoKey report @?= "demo"
+          msarrSwapLabel report @?= SwapLabel "reload"
+          ssGraph (msarrOwnerState report) @?= validTemplateGraph
+          msarrOwnerStatus report @?= SessionOwnerReady
+          msarrListenersMustRestart report @?= True
+          sfisQueueDepth snapshotAfter @?= 0
+          sfisReloadStatus snapshotAfter @?= SessionFanInNormalOperation
+          ssGraph (sfisOwnerState snapshotAfter) @?= validTemplateGraph
+        Right (_, Left issue, _) ->
+          assertFailure
+            ("expected stopped-audio reload success, got: " <> show issue)
+
+  , testCase "stopped-audio reload rejects when fan-in queue is not empty" $ do
+      plan <- planOrFail validDoc validCatalog validRequest
+      let producer = testProducer ProducerTest "reload"
+          command = CmdVoiceOn (TemplateName "voice") (VoiceKey "v0") []
+      result <-
+        withSessionFanInHost
+          voiceOnlyTemplateGraph
+          defaultSessionFanInOptions
+          $ \host -> do
+              enqueued <- enqueueSessionFanInCommand producer command host
+              reload <-
+                reloadManifestSessionStoppedAudio
+                  host
+                  defaultSessionOwnerOptions
+                  plan
+              snapshot <- readSessionFanInHost host
+              pure (enqueued, reload, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (enqueued, reload, snapshot) -> do
+          case sfierResult enqueued of
+            SessionEnqueued {} ->
+              pure ()
+            other ->
+              assertFailure ("expected enqueue success, got: " <> show other)
+          reload @?= Left (SfriQueueNotEmpty 1)
+          sfisQueueDepth snapshot @?= 1
+          sfisReloadStatus snapshot @?= SessionFanInNormalOperation
+          ssGraph (sfisOwnerState snapshot) @?= voiceOnlyTemplateGraph
+
+  , testCase "failed stopped-audio owner reload leaves host unavailable" $ do
+      let producer = testProducer ProducerTest "reload"
+          command = CmdVoiceOn (TemplateName "voice") (VoiceKey "v0") []
+      result <-
+        withSessionFanInHost
+          voiceOnlyTemplateGraph
+          defaultSessionFanInOptions
+          $ \host -> do
+              reload <-
+                reloadSessionFanInHostOwnerStoppedAudio
+                  host
+                  duplicateTemplateGraph
+                  defaultSessionOwnerOptions
+              rejected <- enqueueSessionFanInCommand producer command host
+              snapshot <- readSessionFanInHost host
+              pure (reload, rejected, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Left (SfriOwnerSetupFailed _), rejected, snapshot) -> do
+          sfierResult rejected @?=
+            SessionEnqueueRejected producer command SeiSessionUnavailable
+          sfisQueueDepth snapshot @?= 0
+          sfisReloadStatus snapshot @?= SessionFanInReloadFailed
+        Right (other, _, _) ->
+          assertFailure
+            ("expected owner setup failure, got: " <> show other)
   ]
 
 validRequest :: ManifestReloadRequest
@@ -406,6 +501,17 @@ validTemplateGraph =
 voiceOnlyTemplateGraph :: TemplateGraph
 voiceOnlyTemplateGraph =
   compileTemplateGraphOrError [("voice", simpleGraph)]
+
+duplicateTemplateGraph :: TemplateGraph
+duplicateTemplateGraph =
+  validTemplateGraph
+    { tgTemplates =
+        case tgTemplates validTemplateGraph of
+          tpl : rest ->
+            tpl : tpl : rest
+          [] ->
+            []
+    }
 
 simpleGraph :: SynthGraph
 simpleGraph = runSynth $ do

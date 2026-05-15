@@ -2,14 +2,20 @@
 
 Date: 2026-05-14
 
-Status: implemented for the v1 construction-time helper and owner/RTGraph
-smoke coverage. This note remains the install-strategy design record for the
-first runtime-facing manifest slice. The app-visible construction smoke is
-covered by `2026-05-14-h-manifest-session-construction-smoke.md`.
+Status: implemented for the v1 construction-time helper, owner/RTGraph
+smoke coverage, and the first non-audio stopped-reload owner replacement
+helper. This note remains the install-strategy design record for the first
+runtime-facing manifest slices. The app-visible construction smoke is covered
+by `2026-05-14-h-manifest-session-construction-smoke.md`; the stopped-audio
+runtime contract is covered by
+`2026-05-14-i-manifest-reload-runtime-strategy.md`.
 
 ## Decision
 
-The first runtime-facing manifest slice is construction-time only.
+The first runtime-facing manifest slice is construction-time only. The next
+slice adds an explicitly stopped-audio helper for replacing an existing fan-in
+host's owner from a prevalidated plan, but it still does not claim live reload
+or own host audio/listener orchestration.
 
 V1 uses a `ManifestReloadPlan` to construct a new session owner with:
 
@@ -126,7 +132,7 @@ V1 construction-time install must not implement:
 - failure recovery for partial installs;
 - concurrent-session install or multi-producer install arbitration;
 - background queue drain or producer lifecycle ownership;
-- CLI manifest import that installs or reloads a runtime owner;
+- CLI manifest import that reloads an existing owner or starts audio;
 - app-level catalog selection beyond the built-in diagnostic catalog.
 
 These are not rejected as future features. They are separate strategies with
@@ -155,6 +161,19 @@ owner. Active voices terminate; stale control writes are rejected on next
 enqueue; per-producer and per-listener bracket state is torn down and
 recreated by the host.
 
+That first non-audio helper has landed:
+
+- `MetaSonic.Session.FanIn.reloadSessionFanInHostOwnerStoppedAudio` replaces
+  the current owner generation under an existing fan-in host after admitting
+  only an empty queue and normal reload status.
+- `MetaSonic.Session.ManifestReload.Runtime.reloadManifestSessionStoppedAudio`
+  applies `manifestSessionOwnerOptions`, swaps from the plan's
+  `mrlpTemplateGraph`, and returns a report that explicitly says listener and
+  producer brackets must restart.
+- Producer enqueues distinguish the admitted reload window
+  (`SeiReloadInProgress`) from a host that no longer has an installed owner
+  (`SeiSessionUnavailable`).
+
 An earlier sketch — "step `manifestReloadCommand` against an existing owner
 after a policy for stopping the backend, draining producer work, stepping
 the command, and restarting" — is intentionally not the v1. Stepping
@@ -162,17 +181,14 @@ the command, and restarting" — is intentionally not the v1. Stepping
 stopped-audio reload; bundling it under the stopped-audio name would have
 quietly weakened the §5.2 preserving contract.
 
-The i-note also pins two implementation prerequisites that the v1 helper
-cannot invent itself. First, the fan-in admission decision must live in a
-single serialized piece of state (one MVar holding queue + reload status),
-because an IORef "fast path" split from the queue lock is a TOCTTOU race.
-Second, the v1 needs an explicit reloadable owner lifetime primitive at
-the `Owner.hs`/`FanIn.hs` layer: `withSessionOwner` is callback-scoped, so
-a plain `IORef SessionOwner` would dangle once the outer bracket closed.
-Either a new `withReloadableSessionOwner` bracket or a session-layer host
-teardown/rebuild under a producer-facing indirection. The latter
-converges with host teardown/rebuild and weakens the v1 thesis. See the
-i-note for full details.
+The prerequisite lifetime/admission work has also landed. The fan-in
+admission decision lives in a single serialized `SessionFanInHostState`
+holding queue, reload status, and the current owner handle. `Owner.hs`
+exposes an abstract `SessionOwnerHandle` with `acquireSessionOwner` /
+`releaseSessionOwner`, backed by manual `createRTGraph` / `destroyRTGraph`
+lifetime in the FFI layer. That gives the fan-in host one stable lifetime
+over multiple owner generations without storing a dangling
+callback-scoped `SessionOwner`.
 
 ### Preserving Hot-Swap
 
