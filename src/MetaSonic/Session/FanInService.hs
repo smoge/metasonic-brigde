@@ -40,15 +40,17 @@ module MetaSonic.Session.FanInService
   , withSessionFanInServiceHooks
   , enqueueSessionFanInServiceCommand
   , enqueueArbitratedSessionFanInServiceCommand
+  , quiesceAndDrainSessionFanInService
   , readSessionFanInService
   ) where
 
 import           Control.Concurrent        (MVar, forkIO, killThread,
-                                            newEmptyMVar, putMVar, takeMVar,
-                                            tryPutMVar)
+                                            modifyMVar_, newEmptyMVar,
+                                            newMVar, putMVar, readMVar,
+                                            takeMVar, tryPutMVar, withMVar)
 import           Control.DeepSeq           (NFData)
 import           Control.Exception         (finally)
-import           Control.Monad             (unless, void, when)
+import           Control.Monad             (void, when)
 import           Data.IORef                (IORef, newIORef, readIORef,
                                             writeIORef)
 import           GHC.Generics              (Generic)
@@ -65,12 +67,12 @@ import           MetaSonic.Session.ArbitrationGateway
                                              newSessionArbitrationGateway)
 import           MetaSonic.Session.Command  (SessionCommand)
 import           MetaSonic.Session.FanIn    (SessionFanInDrainResult (..),
-                                             SessionFanInEnqueueResult,
+                                             SessionFanInEnqueueResult (..),
                                              SessionFanInHost,
                                              SessionFanInHostHooks (..),
                                              SessionFanInOptions,
                                              SessionFanInSetupIssue,
-                                             SessionFanInSnapshot,
+                                             SessionFanInSnapshot (..),
                                              defaultSessionFanInOptions,
                                              defaultSessionFanInHostHooks,
                                              drainSessionFanInHost,
@@ -78,7 +80,9 @@ import           MetaSonic.Session.FanIn    (SessionFanInDrainResult (..),
                                              readSessionFanInHost,
                                              withSessionFanInHostHooks)
 import           MetaSonic.Session.Queue    (ProducerId,
-                                             SessionDrainResult (..))
+                                             SessionDrainResult (..),
+                                             SessionEnqueueIssue (..),
+                                             SessionEnqueueResult (..))
 
 
 -- | Hidden handle for the scoped fan-in drain service.
@@ -86,12 +90,27 @@ data SessionFanInService = SessionFanInService
   { sfsvcHost :: !SessionFanInHost
   , sfsvcGateway :: !(Maybe SessionArbitrationGateway)
   , sfsvcHooks :: !SessionFanInServiceHooks
+  , sfsvcControl :: !SessionFanInServiceControl
   }
+
+data SessionFanInServiceControl = SessionFanInServiceControl
+  { sfscIngress         :: !(MVar SessionFanInServiceIngress)
+  , sfscWorkerAccepting :: !(IORef Bool)
+  , sfscWake            :: !(MVar ())
+  , sfscDone            :: !(MVar ())
+  }
+
+data SessionFanInServiceIngress
+  = SessionFanInServiceIngressOpen
+  | SessionFanInServiceIngressQuiesced
 
 -- | Access the underlying fan-in host for existing concrete producers.
 --
 -- Enqueues through this host wake the service worker because the
--- service installs a host enqueue hook at construction.
+-- service installs a host enqueue hook at construction while the service
+-- is running. After 'quiesceAndDrainSessionFanInService', raw host
+-- enqueues still bypass service ingress policy but no longer wake the
+-- background worker; the caller must have quiesced producers first.
 -- If this service was configured with an arbitration gateway, callers
 -- that need consistent policy enforcement should prefer
 -- 'enqueueArbitratedSessionFanInServiceCommand'. Using the returned
@@ -178,10 +197,17 @@ withSessionFanInServiceHooks
   -> IO (Either SessionFanInServiceSetupIssue a)
 withSessionFanInServiceHooks hooks graph opts action = do
   wake <- newEmptyMVar
-  closing <- newIORef False
+  accepting <- newIORef True
+  ingress <- newMVar SessionFanInServiceIngressOpen
   done <- newEmptyMVar
-  let signalWorker =
-        void (tryPutMVar wake ())
+  let control = SessionFanInServiceControl
+        { sfscIngress = ingress
+        , sfscWorkerAccepting = accepting
+        , sfscWake = wake
+        , sfscDone = done
+        }
+      signalWorker =
+        signalSessionFanInServiceWorker control
       hostHooks = defaultSessionFanInHostHooks
         { sfihhOnEnqueued = signalWorker
         }
@@ -194,22 +220,23 @@ withSessionFanInServiceHooks hooks graph opts action = do
           gateway <- traverse
             newSessionArbitrationGateway
             (sfsoArbitrationGatewayOptions opts)
-          worker <- forkIO (serviceLoop hooks closing wake done host)
+          worker <- forkIO (serviceLoop hooks control host)
           let service = SessionFanInService
                 { sfsvcHost = host
                 , sfsvcGateway = gateway
                 , sfsvcHooks = hooks
+                , sfsvcControl = control
                 }
               stop = do
-                writeIORef closing True
-                signalWorker
-                mDone <- timeout serviceShutdownGraceUsec (takeMVar done)
+                closeSessionFanInServiceIngress control
+                wakeSessionFanInServiceWorker control
+                mDone <- timeout serviceShutdownGraceUsec (readMVar done)
                 case mDone of
                   Just () ->
                     pure ()
                   Nothing -> do
                     killThread worker
-                    takeMVar done
+                    readMVar done
           action service `finally` stop
   case result of
     Left issue ->
@@ -233,7 +260,12 @@ enqueueSessionFanInServiceCommand
   -> SessionFanInService
   -> IO SessionFanInEnqueueResult
 enqueueSessionFanInServiceCommand producer cmd service =
-  enqueueSessionFanInCommand producer cmd (sfsvcHost service)
+  withServiceIngress
+    producer
+    cmd
+    service
+    (enqueueSessionFanInCommand producer cmd (sfsvcHost service))
+    pure
 
 -- | Enqueue one command through the optional service-owned gateway.
 --
@@ -251,21 +283,43 @@ enqueueArbitratedSessionFanInServiceCommand
   -> SessionFanInService
   -> IO SessionArbitrationGatewayEnqueueResult
 enqueueArbitratedSessionFanInServiceCommand producer cmd service =
-  case sfsvcGateway service of
-    Nothing ->
-      SagEnqueueAttempted
-        <$> enqueueSessionFanInServiceCommand producer cmd service
-    Just gateway -> do
-      result <-
-        enqueueArbitratedSessionFanInCommand
-          gateway producer cmd (sfsvcHost service)
-      case result of
-        SagArbitrationRejected issue ->
-          sfshOnIssue (sfsvcHooks service)
-            (SfsiiArbitrationRejected issue)
-        SagEnqueueAttempted {} ->
-          pure ()
-      pure result
+  withServiceIngress producer cmd service open (pure . SagEnqueueAttempted)
+  where
+    open =
+      case sfsvcGateway service of
+        Nothing ->
+          SagEnqueueAttempted
+            <$> enqueueSessionFanInCommand producer cmd (sfsvcHost service)
+        Just gateway -> do
+          result <-
+            enqueueArbitratedSessionFanInCommand
+              gateway producer cmd (sfsvcHost service)
+          case result of
+            SagArbitrationRejected issue ->
+              sfshOnIssue (sfsvcHooks service)
+                (SfsiiArbitrationRejected issue)
+            SagEnqueueAttempted {} ->
+              pure ()
+          pure result
+
+-- | Stop the service worker from accepting further wakeups and perform
+-- one final orchestration-owned drain.
+--
+-- This is the handoff point for stopped-audio reload orchestration: the
+-- background worker exits first, so it cannot re-pull commands after the
+-- caller's final drain observes an empty queue. Service enqueue helpers
+-- reject after this call starts. Raw access through
+-- 'sessionFanInServiceHost' can still bypass that service ingress gate,
+-- so hosts must quiesce concrete producers before calling this helper.
+quiesceAndDrainSessionFanInService
+  :: SessionFanInService
+  -> IO SessionFanInDrainResult
+quiesceAndDrainSessionFanInService service = do
+  let control = sfsvcControl service
+  closeSessionFanInServiceIngress control
+  wakeSessionFanInServiceWorker control
+  readMVar (sfscDone control)
+  drainSessionFanInHost (sfsvcHost service)
 
 -- | Read the service-owned fan-in host snapshot.
 readSessionFanInService
@@ -276,27 +330,72 @@ readSessionFanInService =
 
 serviceLoop
   :: SessionFanInServiceHooks
-  -> IORef Bool
-  -> MVar ()
-  -> MVar ()
+  -> SessionFanInServiceControl
   -> SessionFanInHost
   -> IO ()
-serviceLoop hooks closing wake done host =
-  loop `finally` putMVar done ()
+serviceLoop hooks control host =
+  loop `finally` putMVar (sfscDone control) ()
   where
     loop = do
-      takeMVar wake
-      shouldClose <- readIORef closing
-      unless shouldClose $ do
+      takeMVar (sfscWake control)
+      shouldRun <- readIORef (sfscWorkerAccepting control)
+      when shouldRun $ do
         drained <- drainSessionFanInHost host
         sfshOnDrain hooks drained
         case sdrStopped (sfidrDrain drained) of
           Just _reason ->
             sfshOnIssue hooks (SfsiiDrainStopped drained)
           Nothing -> do
-            when (sfidrQueueDepth drained > 0) $
-              void (tryPutMVar wake ())
-            loop
+            shouldContinue <- readIORef (sfscWorkerAccepting control)
+            when shouldContinue $ do
+              when (sfidrQueueDepth drained > 0) $
+                signalSessionFanInServiceWorker control
+              loop
+
+withServiceIngress
+  :: ProducerId
+  -> SessionCommand
+  -> SessionFanInService
+  -> IO a
+  -> (SessionFanInEnqueueResult -> IO a)
+  -> IO a
+withServiceIngress producer cmd service enqueue reject =
+  withMVar (sfscIngress (sfsvcControl service)) $ \ingress ->
+    case ingress of
+      SessionFanInServiceIngressOpen ->
+        enqueue
+      SessionFanInServiceIngressQuiesced ->
+        rejectServiceEnqueue producer cmd service >>= reject
+
+rejectServiceEnqueue
+  :: ProducerId
+  -> SessionCommand
+  -> SessionFanInService
+  -> IO SessionFanInEnqueueResult
+rejectServiceEnqueue producer cmd service = do
+  snapshot <- readSessionFanInService service
+  pure SessionFanInEnqueueResult
+    { sfierResult =
+        SessionEnqueueRejected producer cmd SeiReloadInProgress
+    , sfierQueueDepth =
+        sfisQueueDepth snapshot
+    }
+
+closeSessionFanInServiceIngress :: SessionFanInServiceControl -> IO ()
+closeSessionFanInServiceIngress control =
+  modifyMVar_ (sfscIngress control) $ \_ingress -> do
+    writeIORef (sfscWorkerAccepting control) False
+    pure SessionFanInServiceIngressQuiesced
+
+signalSessionFanInServiceWorker :: SessionFanInServiceControl -> IO ()
+signalSessionFanInServiceWorker control = do
+  accepting <- readIORef (sfscWorkerAccepting control)
+  when accepting $
+    wakeSessionFanInServiceWorker control
+
+wakeSessionFanInServiceWorker :: SessionFanInServiceControl -> IO ()
+wakeSessionFanInServiceWorker control =
+  void (tryPutMVar (sfscWake control) ())
 
 serviceShutdownGraceUsec :: Int
 -- Keep this fixed until slow shutdown hooks become a real use case.

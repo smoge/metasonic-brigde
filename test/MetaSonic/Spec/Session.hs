@@ -3642,6 +3642,158 @@ sessionFanInServiceTests =
         Right (_enq, Nothing, _snapshot) ->
           assertFailure "timed out waiting for service drain"
 
+  , testCase "quiesce/drain waits for active worker and owns final drain" $ do
+      let graph = patternTemplates droneVibrato
+          producer = testProducer ProducerUI "ui"
+          firstCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+          secondCmd =
+            CmdControlWrite
+              (VoiceKey "v0")
+              (ControlTag (MigrationKey "lpf") 0)
+              0.75
+      hookCount <- newIORef (0 :: Int)
+      firstWorkerDrain <- newEmptyMVar
+      releaseFirstHook <- newEmptyMVar
+      unexpectedWorkerDrain <- newEmptyMVar
+      finalDrainVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain =
+                \drained -> do
+                  n <- readIORef hookCount
+                  writeIORef hookCount (n + 1)
+                  if n == 0
+                    then do
+                      putMVar firstWorkerDrain drained
+                      takeMVar releaseFirstHook
+                    else
+                      putMVar unexpectedWorkerDrain drained
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              enq0 <- enqueueSessionFanInServiceCommand
+                        producer firstCmd service
+              mFirstDrain <- timeout 1000000 (takeMVar firstWorkerDrain)
+              enq1 <- enqueueSessionFanInServiceCommand
+                        producer secondCmd service
+              _worker <- forkIO $
+                quiesceAndDrainSessionFanInService service
+                  >>= putMVar finalDrainVar
+              mEarlyFinal <- timeout 100000 (takeMVar finalDrainVar)
+              putMVar releaseFirstHook ()
+              mFinalDrain <- timeout 1000000 (takeMVar finalDrainVar)
+              mUnexpectedWorkerDrain <-
+                timeout 100000 (takeMVar unexpectedWorkerDrain)
+              snapshot <- readSessionFanInService service
+              pure
+                ( enq0
+                , mFirstDrain
+                , enq1
+                , mEarlyFinal
+                , mFinalDrain
+                , mUnexpectedWorkerDrain
+                , snapshot
+                )
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right
+          ( enq0
+          , Just firstDrain
+          , enq1
+          , Nothing
+          , Just finalDrain
+          , Nothing
+          , snapshot
+          ) -> do
+            queued0 <- fanInQueuedOrFail enq0
+            queued1 <- fanInQueuedOrFail enq1
+            case sdrItems (sfidrDrain firstDrain) of
+              [SessionDrainItem drainedQueued
+                (SessionOwnerStep (StepCommitted _ Nothing))] ->
+                  drainedQueued @?= queued0
+              other ->
+                assertFailure
+                  ("expected first worker drain to own v0, got: "
+                   <> show other)
+            case sdrItems (sfidrDrain finalDrain) of
+              [SessionDrainItem drainedQueued
+                (SessionOwnerStep StepControlAccepted)] ->
+                  drainedQueued @?= queued1
+              other ->
+                assertFailure
+                  ("expected final quiesce drain to own control write, got: "
+                   <> show other)
+            sfidrQueueDepth finalDrain @?= 0
+            sfisQueueDepth snapshot @?= 0
+            assertBool
+              "expected v0 in owner state after quiesce drain"
+              (M.member (VoiceKey "v0") (ssVoices (sfisOwnerState snapshot)))
+        Right (_enq0, Nothing, _enq1, _mEarly, _mFinal, _mUnexpected, _snapshot) ->
+          assertFailure "timed out waiting for first worker drain"
+        Right (_enq0, Just _first, _enq1, Just early, _mFinal, _mUnexpected, _snapshot) ->
+          assertFailure
+            ("quiesce final drain returned before worker settled: "
+             <> show early)
+        Right (_enq0, Just _first, _enq1, Nothing, Nothing, _mUnexpected, _snapshot) ->
+          assertFailure "timed out waiting for final quiesce drain"
+        Right (_enq0, Just _first, _enq1, Nothing, Just _final, Just extra, _snapshot) ->
+          assertFailure
+            ("background worker drained after quiesce request: "
+             <> show extra)
+
+  , testCase "quiesce rejects service enqueues without waking worker" $ do
+      let graph = patternTemplates droneVibrato
+          producer = testProducer ProducerUI "ui"
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              finalDrain <- quiesceAndDrainSessionFanInService service
+              rawRejected <- enqueueSessionFanInServiceCommand
+                               producer cmd service
+              arbitratedRejected <- enqueueArbitratedSessionFanInServiceCommand
+                                      producer cmd service
+              mWorkerDrain <- timeout 100000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure
+                ( finalDrain
+                , rawRejected
+                , arbitratedRejected
+                , mWorkerDrain
+                , snapshot
+                )
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (finalDrain, rawRejected, arbitratedRejected, Nothing, snapshot) -> do
+          sdrItems (sfidrDrain finalDrain) @?= []
+          sfidrQueueDepth finalDrain @?= 0
+          sfierResult rawRejected @?=
+            SessionEnqueueRejected producer cmd SeiReloadInProgress
+          sfierQueueDepth rawRejected @?= 0
+          case arbitratedRejected of
+            SagEnqueueAttempted nested -> do
+              sfierResult nested @?=
+                SessionEnqueueRejected producer cmd SeiReloadInProgress
+              sfierQueueDepth nested @?= 0
+            other ->
+              assertFailure
+                ("expected quiesced arbitrated enqueue attempt, got: "
+                 <> show other)
+          sfisQueueDepth snapshot @?= 0
+        Right (_finalDrain, _rawRejected, _arbitratedRejected, Just drained, _snapshot) ->
+          assertFailure
+            ("quiesced service unexpectedly woke worker: " <> show drained)
+
   , testCase "default arbitrated enqueue keeps FIFO service behavior" $ do
       let graph = patternTemplates droneVibrato
           producer = testProducer ProducerUI "ui"
