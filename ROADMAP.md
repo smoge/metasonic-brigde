@@ -3435,7 +3435,23 @@ now exposes that selector in the CLI as a manual diagnostic mode: it
 reads an external authoring manifest, runs the selector with fake
 audio lifecycle hooks against a non-device fan-in host, and reports
 which strategy ran or failed without opening PortAudio or claiming
-live reload semantics.
+live reload semantics. The first concrete producer bindings have also
+landed: `MetaSonic.App.ManifestReloadBinding` projects a prevalidated
+plan into a pure `ManifestUIIngressTarget` (display, range, default,
+retained-value source, voice-selection policy), and
+`MetaSonic.App.ManifestReloadUIIngress.submitManifestUIIngress`
+consumes that target plus an already-decoded UI write, forwards the
+command through `MetaSonic.Session.UIProducer`, and threads a
+caller-owned `Map ControlTag Value` retain map that is updated only on
+accepted fan-in enqueue. The OSC pair is also landed:
+`MetaSonic.App.ManifestReloadOSCBinding` projects the plan into a pure
+`ManifestOSCIngressTarget` (address tail derivation, range, default,
+optional CC), and `MetaSonic.App.ManifestReloadOSCIngress.submitManifestOSCMessage`
+consumes a received `OscMessage`, runs it through the existing
+symbolic decoder, validates the tag against the projection, and
+forwards accepted writes through `MetaSonic.Session.OSCProducer`
+without opening a UDP socket. MIDI ingress projection and a real
+device-backed listener lifecycle remain gated.
 
 Still gated:
 
@@ -3443,7 +3459,9 @@ Still gated:
   policy beyond the landed diagnostic import, construction-time v1,
   non-audio stopped-audio owner-swap helper plus smoke CLI, app-level
   stopped-audio and preserving host reload paths, explicit host
-  strategy selector, and operator-visible non-device strategy smoke CLI,
+  strategy selector, operator-visible non-device strategy smoke CLI,
+  pure UI ingress projection plus UI producer binding, and pure OSC
+  ingress projection plus no-socket OSC producer consumer,
   broader MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
@@ -3475,11 +3493,14 @@ Still gated:
   CLI, construction-time owner helper and construction-smoke CLI,
   non-audio stopped-audio owner-swap helper and smoke CLI,
   stopped-audio/preserving host orchestration, explicit strategy
-  selector, operator-visible non-device strategy smoke CLI, host
-  orchestration design note, and host supervisor / recovery policy
-  design note. Remaining work is real device/live-app producer/listener
-  binding, device-backed smoke coverage, and resource/allocation
-  recovery events.
+  selector, operator-visible non-device strategy smoke CLI, pure UI
+  ingress projection plus UI producer binding, pure OSC ingress
+  projection plus no-socket OSC producer consumer, host orchestration
+  design note, and host supervisor / recovery policy design note.
+  Remaining work is a concrete MIDI ingress projection plus its
+  producer binding, a real device-backed listener lifecycle (UDP
+  socket for OSC, PortMIDI device for MIDI), device-backed smoke
+  coverage, and resource/allocation recovery events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

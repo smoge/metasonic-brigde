@@ -136,6 +136,8 @@ executable metasonic-bridge
       MetaSonic.App.ManifestReloadHost
       MetaSonic.App.ManifestReloadIngress
       MetaSonic.App.ManifestReloadOrchestration
+      MetaSonic.App.ManifestReloadOSCBinding
+      MetaSonic.App.ManifestReloadOSCIngress
       MetaSonic.App.ManifestReloadSupervisor
       MetaSonic.App.ManifestReloadUIIngress
       MetaSonic.App.Osc
@@ -178,6 +180,8 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestReloadHost
       MetaSonic.App.ManifestReloadIngress
       MetaSonic.App.ManifestReloadOrchestration
+      MetaSonic.App.ManifestReloadOSCBinding
+      MetaSonic.App.ManifestReloadOSCIngress
       MetaSonic.App.ManifestReloadSupervisor
       MetaSonic.App.ManifestReloadUIIngress
       MetaSonic.Spec.AppManifestReloadBinding
@@ -185,6 +189,8 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestReloadHost
       MetaSonic.Spec.AppManifestReloadIngress
       MetaSonic.Spec.AppManifestReloadOrchestration
+      MetaSonic.Spec.AppManifestReloadOSCBinding
+      MetaSonic.Spec.AppManifestReloadOSCIngress
       MetaSonic.Spec.AppManifestReloadSupervisor
       MetaSonic.Spec.AppManifestReloadUIIngress
       MetaSonic.Spec.AppDemos

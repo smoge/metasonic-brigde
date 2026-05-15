@@ -8,6 +8,20 @@ preserving-reload host opens "fresh ingress" against the same live owner,
 and which sub-questions remain open before real OSC/MIDI/UI listeners can
 be wired against the landed strategy substrate.
 
+Implementation update: the UI ingress projection has landed as
+`MetaSonic.App.ManifestReloadBinding.ManifestUIIngressTarget` plus a
+concrete consumer `MetaSonic.App.ManifestReloadUIIngress`. Last-written
+UI values are stored producer-local in a caller-owned
+`Map ControlTag Value` that is updated only on accepted fan-in enqueue
+and threaded back into `manifestUIIngressTargetFromPlan` at the next
+reload. The OSC pair has also landed as
+`MetaSonic.App.ManifestReloadOSCBinding.ManifestOSCIngressTarget` plus a
+no-socket consumer `MetaSonic.App.ManifestReloadOSCIngress` that
+decodes a received `OscMessage` through the existing symbolic parser,
+validates the tag against the projection, and forwards through
+`MetaSonic.Session.OSCProducer`. MIDI remains ahead of this note;
+device-backed listener lifecycle also remains ahead.
+
 ## The question
 
 After a preserving reload succeeds, the orchestrator calls
@@ -40,9 +54,16 @@ listener/producer surface concretely looks like per producer kind.
   preserving command commits. It is opened against a fresh `target`,
   not resumed on the old one.
 - `mrlpControlSurface` is captured in the plan, rendered by the CLI
-  smoke, and otherwise pure data with no producer bound to it.
+  smoke, and consumed by the landed UI projection plus producer binding
+  (`ManifestUIIngressTarget` / `submitManifestUIIngress`) and the
+  landed OSC projection plus no-socket consumer
+  (`ManifestOSCIngressTarget` / `submitManifestOSCMessage`); MIDI has
+  no consumer yet.
 - `mrlpArbitrationPolicy` defaults to `FifoOnly`. The planner does not
   emit any other policy.
+- UI retain-across-reload is producer-local: the caller threads a
+  `Map ControlTag Value` through `submitManifestUIIngress`, and that
+  same map feeds `manifestUIIngressTargetFromPlan` on the next reload.
 
 ## v1 binding rule per producer kind
 
@@ -54,21 +75,22 @@ must say where its `VoiceKey` comes from. That mapping is producer
 policy, not manifest data, and v1 should encode it explicitly per
 producer kind below rather than leave it implicit.
 
-**UI ingress.** The fresh target is the set of `ManifestControlSurface`
-entries, projected to a UI control list (display name, range, default,
-smoothing, current value). Each control becomes a UI binding keyed by
-its `ControlTag`. Surviving tags retain their last-written value as
-v1 policy; new tags initialize to `mcsDefault`; removed tags are
-dropped. The implementation shape that holds last-written values
-across a reload is left open (see sub-question 2). `VoiceKey` is the
-host-selected target — typically the singleton fx voice for global
-controls, or the operator-selected voice for per-voice controls. The
-manifest does not currently distinguish global from per-voice
-controls, so v1 routes UI writes to whichever voice the host UI has
-focused, and a producer-supplied default voice key for unfocused
-writes. That means the UI ingress target is not just a projected
-control list: it must also carry a host-supplied voice-selection policy
-for resolving "focused voice" plus the default fallback voice.
+**UI ingress.** *Landed.* The fresh target is the set of
+`ManifestControlSurface` entries, projected to a UI control list
+(display name, range, default, smoothing, current value) by
+`manifestUIIngressTargetFromPlan`. Each control becomes a UI binding
+keyed by its `ControlTag`. Surviving tags retain their last-written
+value (tagged `MuicRetainedValue`); new tags initialize to `mcsDefault`
+(tagged `MuicManifestDefault`); removed tags are dropped. The retained
+store is producer-local: a caller-owned `Map ControlTag Value` threaded
+through `submitManifestUIIngress`, updated only on accepted fan-in
+enqueue, and passed back into the projection on the next reload (see
+sub-question 2 for the decision rationale). `VoiceKey` is the host-
+selected target — focused voice or producer-supplied default — encoded
+as `ManifestUIVoiceSelection { focusedVoice, defaultVoice }` on the
+target. The manifest does not currently distinguish global from per-
+voice controls, so v1 routes UI writes to whichever voice the host UI
+has focused, falling back to the default for unfocused writes.
 
 **OSC ingress.** The fresh target is an OSC address namespace derived
 deterministically from `ControlTag` — concretely, a stable address
@@ -118,14 +140,15 @@ These should be resolved before the first non-smoke listener lands:
    include the host's voice-selection policy, because `ManifestControlSurface`
    alone cannot choose the `VoiceKey` for a control write. The strategy
    CLI smoke ducks this by using opaque sentinel targets.
-2. **Last-written value store for retain-across-reload.** v1 retains
-   surviving tags' last-written values (decision above). The
-   implementation shape is still open: is the cache producer-local
-   (each UI/OSC/MIDI binding remembers its own last write), session-
-   level (read back from the live owner's control state), or
-   manifest-time (a sidecar map keyed by `ControlTag`)? Different
-   choices have different consistency guarantees when several
-   producers wrote to the same tag before reload.
+2. **Last-written value store for retain-across-reload.** *Decided for
+   UI; open for OSC/MIDI.* v1 retains surviving tags' last-written
+   values; the implementation shape for UI is producer-local
+   (`submitManifestUIIngress` threads a `Map ControlTag Value` in and
+   out, updating it only on accepted fan-in enqueue). Whether OSC and
+   MIDI use the same per-producer cache, share one, or read back from
+   the live owner's control state is still open — different choices
+   have different consistency guarantees when several producers wrote
+   to the same tag before reload.
 3. **MIDI mapping migration.** If a CC# moves from one tag to another
    across reload, is the old CC silenced first, or does the new mapping
    replace it atomically? Matters for hardware that holds CC values
