@@ -14,6 +14,7 @@
 module MetaSonic.App.ManifestReloadOrchestration
   ( HostStoppedAudioReloadOps (..)
   , HostStoppedAudioReloadIssue (..)
+  , HostStoppedAudioDrainFailure (..)
   , HostStoppedAudioReloadFailure (..)
   , wireManifestReloadIngress
   , orchestrateHostStoppedAudioReload
@@ -40,7 +41,7 @@ data HostStoppedAudioReloadOps request plan issue =
     , hsaroQuiesceIngress    :: !(IO (Either issue ()))
       -- ^ Close producer/listener ingress. Listener finalizers may still
       -- submit final commands that the following live drain must consume.
-    , hsaroDrainLive         :: !(IO (Either issue ()))
+    , hsaroDrainLive         :: !(IO (Either (HostStoppedAudioDrainFailure issue) ()))
       -- ^ Drain already accepted commands while old audio is still live.
     , hsaroStopOldAudio      :: !(IO (Either issue ()))
       -- ^ Stop audio on the old owner after ingress is closed and the
@@ -78,6 +79,16 @@ data HostStoppedAudioReloadFailure issue
     -- setup failure. The caller must not try to restart old audio.
   deriving stock (Eq, Show)
 
+-- | Recovery policy for live-drain failures.
+data HostStoppedAudioDrainFailure issue
+  = HsadfRetryable !issue
+    -- ^ The old owner/service can still be resumed, so orchestration
+    -- should reopen old ingress after reporting the rejection.
+  | HsadfTerminal !issue
+    -- ^ The old owner or service is no longer healthy enough for
+    -- automatic ingress resume.
+  deriving stock (Eq, Show)
+
 -- | User-visible outcome for one host stopped-audio reload attempt.
 --
 -- Variants ending in @ResumeFailed@ name two causes: the original
@@ -91,6 +102,7 @@ data HostStoppedAudioReloadIssue issue
   | HsariQuiesceRejectedResumeFailed !issue !issue
   | HsariDrainRejected !issue
   | HsariDrainRejectedResumeFailed !issue !issue
+  | HsariDrainFailedTerminal !issue
   | HsariStopOldAudioFailed !issue
   | HsariReloadRejectedOldOwnerRestarted !issue
   | HsariReloadRejectedOldOwnerRestartFailed !issue !issue
@@ -127,11 +139,13 @@ wireManifestReloadIngress manager oldTarget newTarget ops =
 -- ingress has reopened. On failure, the returned constructor documents
 -- the boundary that failed and the cleanup policy that was attempted.
 --
--- Retryable failure paths (quiesce/drain failure, pre-dispose helper
--- rejection) attempt 'hsaroResumeOldIngress' so the host returns to a
--- live state running the previous plan. Resume-failure variants
--- (@*ResumeFailed@) report when the resume itself failed and the host
--- is left with the old owner running but no live ingress.
+-- Retryable failure paths (quiesce failure, retryable drain failure,
+-- pre-dispose helper rejection) attempt 'hsaroResumeOldIngress' so the
+-- host returns to a live state running the previous plan.
+-- Resume-failure variants (@*ResumeFailed@) report when the resume
+-- itself failed and the host is left with the old owner running but no
+-- live ingress. Terminal drain failures do not attempt automatic
+-- ingress resume.
 orchestrateHostStoppedAudioReload
   :: HostStoppedAudioReloadOps request plan issue
   -> request
@@ -158,11 +172,13 @@ orchestrateHostStoppedAudioReload ops request = do
     drain plan = do
       result <- hsaroDrainLive ops
       case result of
-        Left issue ->
+        Left (HsadfRetryable issue) ->
           resumeAfterFailure
             issue
             HsariDrainRejected
             HsariDrainRejectedResumeFailed
+        Left (HsadfTerminal issue) ->
+          pure (Left (HsariDrainFailedTerminal issue))
         Right () ->
           stopOldAudio plan
 

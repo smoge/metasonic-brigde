@@ -138,6 +138,7 @@ executables:
       - MetaSonic.App.FusionCostLab
       - MetaSonic.App.FusionCostModel
       - MetaSonic.App.ManifestReloadCli
+      - MetaSonic.App.ManifestReloadHost
       - MetaSonic.App.ManifestReloadIngress
       - MetaSonic.App.ManifestReloadOrchestration
       - MetaSonic.App.ManifestReloadSupervisor
@@ -164,10 +165,12 @@ tests:
     other-modules:
       - MetaSonic.App.Demos
       - MetaSonic.App.ManifestReloadCli
+      - MetaSonic.App.ManifestReloadHost
       - MetaSonic.App.ManifestReloadIngress
       - MetaSonic.App.ManifestReloadOrchestration
       - MetaSonic.App.ManifestReloadSupervisor
       - MetaSonic.Spec.AppManifestReloadCli
+      - MetaSonic.Spec.AppManifestReloadHost
       - MetaSonic.Spec.AppManifestReloadIngress
       - MetaSonic.Spec.AppManifestReloadOrchestration
       - MetaSonic.Spec.AppManifestReloadSupervisor

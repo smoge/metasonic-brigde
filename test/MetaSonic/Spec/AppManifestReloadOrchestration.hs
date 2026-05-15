@@ -23,6 +23,7 @@ data FakeFailure
   = FakePlanRejected
   | FakeQuiesceRejected
   | FakeDrainRejected
+  | FakeDrainStopped
   | FakeStopOldAudioFailed
   | FakeQueueNotEmpty
   | FakeOwnerSetupFailed
@@ -53,6 +54,7 @@ data FakeFailureMode
   = FailPlan
   | FailQuiesce
   | FailDrain
+  | FailDrainTerminal
   | FailStopOldAudio
   | FailReloadQueueNotEmpty
   | FailReloadOwnerSetup
@@ -182,6 +184,24 @@ appManifestReloadOrchestrationTests =
       fsAudioRunning state @?= True
       fsIngressOpen state @?= False
       StopOldAudio `elem` fsTrace state @?= False
+
+  , testCase "terminal drain failure does not resume ingress" $ do
+      (ops, ref) <- mkFakeOps initialFakeState
+        { fsFailureMode = Just FailDrainTerminal
+        }
+      outcome <- orchestrateHostStoppedAudioReload ops requestedPlan
+      state <- readIORef ref
+      outcome @?= Left (HsariDrainFailedTerminal FakeDrainStopped)
+      fsOwner state @?= FakeOldOwner
+      fsAudioRunning state @?= True
+      fsIngressOpen state @?= False
+      StopOldAudio `elem` fsTrace state @?= False
+      ResumeOldIngress `elem` fsTrace state @?= False
+      fsTrace state @?=
+        [ PreparePlan requestedPlan
+        , CloseIngress
+        , DrainLive 0
+        ]
 
   , testCase "stop-old-audio failure aborts before owner reload" $ do
       (ops, ref) <- mkFakeOps initialFakeState
@@ -540,14 +560,18 @@ quiesceIngress ref = do
           }
       pure (Right ())
 
-drainLive :: IORef FakeState -> IO (Either FakeFailure ())
+drainLive
+  :: IORef FakeState
+  -> IO (Either (HostStoppedAudioDrainFailure FakeFailure) ())
 drainLive ref = do
   state <- readIORef ref
   appendTrace ref (DrainLive (fsQueueDepth state))
   mode <- fsFailureMode <$> readIORef ref
   case mode of
     Just FailDrain ->
-      pure (Left FakeDrainRejected)
+      pure (Left (HsadfRetryable FakeDrainRejected))
+    Just FailDrainTerminal ->
+      pure (Left (HsadfTerminal FakeDrainStopped))
     _ -> do
       modifyIORef' ref $ \state' -> state' { fsQueueDepth = 0 }
       pure (Right ())

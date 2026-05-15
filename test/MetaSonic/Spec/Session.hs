@@ -3794,6 +3794,46 @@ sessionFanInServiceTests =
           assertFailure
             ("quiesced service unexpectedly woke worker: " <> show drained)
 
+  , testCase "resume after quiesce starts a fresh drain worker" $ do
+      let graph = patternTemplates droneVibrato
+          producer = testProducer ProducerUI "ui"
+          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
+      drainedVar <- newEmptyMVar
+      result <-
+        withSessionFanInServiceHooks
+          defaultSessionFanInServiceHooks
+            { sfshOnDrain = putMVar drainedVar
+            }
+          graph
+          defaultSessionFanInServiceOptions
+          $ \service -> do
+              finalDrain <- quiesceAndDrainSessionFanInService service
+              resumeSessionFanInService service
+              enq <- enqueueSessionFanInServiceCommand producer cmd service
+              mDrain <- timeout 1000000 (takeMVar drainedVar)
+              snapshot <- readSessionFanInService service
+              pure (finalDrain, enq, mDrain, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (finalDrain, enq, Just drained, snapshot) -> do
+          sdrItems (sfidrDrain finalDrain) @?= []
+          sfidrQueueDepth finalDrain @?= 0
+          queued <- fanInQueuedOrFail enq
+          case sdrItems (sfidrDrain drained) of
+            [SessionDrainItem drainedQueued
+              (SessionOwnerStep (StepCommitted _ Nothing))] ->
+                drainedQueued @?= queued
+            other ->
+              assertFailure
+                ("expected resumed worker to drain one command, got: "
+                 <> show other)
+          sdrStopped (sfidrDrain drained) @?= Nothing
+          sfidrQueueDepth drained @?= 0
+          sfisQueueDepth snapshot @?= 0
+        Right (_finalDrain, _enq, Nothing, _snapshot) ->
+          assertFailure "timed out waiting for resumed service drain"
+
   , testCase "default arbitrated enqueue keeps FIFO service behavior" $ do
       let graph = patternTemplates droneVibrato
           producer = testProducer ProducerUI "ui"
