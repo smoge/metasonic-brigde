@@ -16,6 +16,12 @@
 
 module MetaSonic.App.ManifestLiveReloadDemo
   ( runManifestLiveReloadDemo
+    -- * Strategy-outcome renderer (exported for regression tests)
+  , renderOutcome
+  , renderStrategyRan
+  , renderStrategyFailure
+  , renderHostPreservingIssueTag
+  , renderHostStoppedAudioIssueTag
   ) where
 
 import           Control.Concurrent             (threadDelay)
@@ -520,10 +526,10 @@ renderOutcome outcome = case outcome of
   Right ran     -> "success: " <> renderStrategyRan ran
   Left  failure -> "failed: "  <> renderStrategyFailure failure
 
-renderStrategyRan
-  :: ManifestReloadHostStrategyRan
-       (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
-  -> String
+-- | Polymorphic in the issue type so output-regression tests can pass
+-- a stand-in payload (e.g. a 'String' containing the banned substrings)
+-- without fabricating real reload state.
+renderStrategyRan :: ManifestReloadHostStrategyRan issue -> String
 renderStrategyRan ran = case ran of
   MrhsrPreserving ->
     "preserving installed (audio kept, voices preserved)"
@@ -534,10 +540,8 @@ renderStrategyRan ran = case ran of
     <> renderHostPreservingIssueTag prevIssue
     <> "), stopped-audio fallback installed"
 
-renderStrategyFailure
-  :: ManifestReloadHostStrategyIssue
-       (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
-  -> String
+-- | Polymorphic in the issue type; see 'renderStrategyRan'.
+renderStrategyFailure :: ManifestReloadHostStrategyIssue issue -> String
 renderStrategyFailure failure = case failure of
   MrhsiPreservingFailed prev ->
     "preserving: " <> renderHostPreservingIssueTag prev
