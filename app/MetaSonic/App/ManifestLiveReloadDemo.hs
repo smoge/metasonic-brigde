@@ -20,8 +20,9 @@ module MetaSonic.App.ManifestLiveReloadDemo
 
 import           Control.Concurrent             (threadDelay)
 import           Control.Exception              (finally)
-import           Control.Monad                  (forM_, void, when)
+import           Control.Monad                  (forM, forM_, unless, void)
 import qualified Data.Map.Strict                as M
+import qualified Data.Set                       as S
 import qualified Data.Text                      as T
 import           System.Exit                    (die)
 import           System.IO                      (hFlush, stdout)
@@ -176,7 +177,8 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
                         host)
           (do
              startAudioOrDie host
-             autoStartTemplates "initial" service oldPlan
+             initialVoices <- autoStartTemplates "initial" service oldPlan
+             warnIfMissingVoices service initialVoices
              printServiceSnapshot "initial fan-in" service
              printIngressSnapshot ingressManager
              printAddressableSurface service oldTarget
@@ -212,12 +214,13 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
              putStrLn ""
              putStrLn $ "  strategy outcome: " <> renderOutcome outcome
              afterReload <- readSessionFanInService service
-             case outcome of
+             postReloadVoices <- case outcome of
                Right _
                  | M.null (ssVoices (sfisOwnerState afterReload)) ->
                      autoStartTemplates "post-reload" service newPlan
                _ ->
-                 pure ()
+                 pure []
+             warnIfMissingVoices service postReloadVoices
              printServiceSnapshot "post-reload fan-in" service
              -- The strategy's failure paths can leave ingress in
              -- different states (closed, resumed on the old target, or
@@ -302,22 +305,57 @@ startAudioOrDie host = do
     Right () ->
       pure ()
 
+-- | Pick an OSC-safe voice key for an auto-spawned template.
+--
+-- The OSC dispatch layer caps voice keys at 16 bytes (see
+-- 'isOscSafeIdentifier'); the previous "auto-<name>" scheme rejected
+-- as 'DiIdentifierProfile' for template names longer than 11
+-- characters (e.g. "auto-named-control" is 18 bytes). Policy:
+--
+--   * Template literally named "fx" keeps "fx" as its voice key
+--     (already a valid identifier and operator-meaningful).
+--   * Everything else gets "v<index>" where index counts non-"fx"
+--     templates in declaration order.
+--
+-- Both shapes satisfy 'isOscSafeIdentifier' for any input.
+autoVoiceKeyPolicy :: String -> Int -> VoiceKey
+autoVoiceKeyPolicy name nonFxIndex
+  | name == "fx" = VoiceKey "fx"
+  | otherwise    = VoiceKey ("v" <> show nonFxIndex)
+
+-- | Pair every template with the voice key it will be auto-spawned
+-- under. Preserves declaration order so the policy's "v<index>" tracks
+-- the operator-visible ordering in the addressable surface print.
+assignAutoVoiceKeys :: [Template] -> [(Template, VoiceKey)]
+assignAutoVoiceKeys = go 0
+  where
+    go _   []     = []
+    go idx (t:ts)
+      | tplName t == "fx" =
+          (t, autoVoiceKeyPolicy (tplName t) idx) : go idx ts
+      | otherwise =
+          (t, autoVoiceKeyPolicy (tplName t) idx) : go (idx + 1) ts
+
+-- | Enqueue one 'CmdVoiceOn' per template using the OSC-safe key
+-- policy from 'autoVoiceKeyPolicy', and return the keys the caller
+-- should wait for and surface. The wait is no longer inline so callers
+-- can decide between 'waitForVoices' and proceeding immediately.
 autoStartTemplates
   :: String
   -> SessionFanInService
   -> MR.ManifestReloadPlan
-  -> IO ()
+  -> IO [VoiceKey]
 autoStartTemplates label service plan = do
   let templates = tgTemplates (MR.mrlpTemplateGraph plan)
   case templates of
-    [] ->
+    [] -> do
       putStrLn $ "  " <> label <> ": no templates to auto-start."
+      pure []
     _ -> do
       putStrLn $
         "  " <> label <> ": auto-starting one instance per template..."
-      forM_ templates $ \tpl -> do
+      forM (assignAutoVoiceKeys templates) $ \(tpl, voice) -> do
         let name = tplName tpl
-            voice = VoiceKey ("auto-" <> name)
             cmd = CmdVoiceOn (TemplateName name) voice []
         enq <- enqueueSessionFanInServiceCommand
                  liveReloadProducer
@@ -325,19 +363,42 @@ autoStartTemplates label service plan = do
                  service
         putStrLn $
           "    " <> name <> " -> " <> renderEnqueue enq
-      ready <- waitForAnyVoice service
-      when (not ready) $
-        putStrLn "    warning: no active voice observed after auto-start."
+        pure voice
 
-waitForAnyVoice :: SessionFanInService -> IO Bool
-waitForAnyVoice service =
+-- | Wait (up to 1s) for every named key to appear in 'ssVoices'.
+-- Returns True if all keys arrived, False on timeout. Replaces the
+-- old 'waitForAnyVoice' which could not distinguish "the voice I
+-- auto-spawned arrived" from "some other voice exists" — the
+-- downstream surface printer needs the specific keys to be live
+-- before snapshotting.
+waitForVoices :: [VoiceKey] -> SessionFanInService -> IO Bool
+waitForVoices []   _       = pure True
+waitForVoices want service =
   maybe False id <$> timeout 1000000 loop
   where
+    wantSet = S.fromList want
     loop = do
       snapshot <- readSessionFanInService service
-      if M.null (ssVoices (sfisOwnerState snapshot))
-        then threadDelay 10000 >> loop
-        else pure True
+      let have = M.keysSet (ssVoices (sfisOwnerState snapshot))
+      if wantSet `S.isSubsetOf` have
+        then pure True
+        else threadDelay 10000 >> loop
+
+-- | Wait for the supplied auto-spawned voice keys and emit a single
+-- warning line if any failed to arrive in time. The list is the
+-- caller-tracked truth (from 'autoStartTemplates'), not 'ssVoices' —
+-- so the warning names exactly which keys didn't show up.
+warnIfMissingVoices :: SessionFanInService -> [VoiceKey] -> IO ()
+warnIfMissingVoices _       []   = pure ()
+warnIfMissingVoices service want = do
+  ready <- waitForVoices want service
+  unless ready $ do
+    snapshot <- readSessionFanInService service
+    let have    = M.keysSet (ssVoices (sfisOwnerState snapshot))
+        missing = [ k | k <- want, not (S.member k have) ]
+    putStrLn $
+      "    warning: auto-started voices did not all arrive in time; missing="
+      <> show (map unVoiceKey missing)
 
 printServiceSnapshot :: String -> SessionFanInService -> IO ()
 printServiceSnapshot label service = do
@@ -396,8 +457,13 @@ renderOSCControls label target = do
 -- right now. The address surface is voices × bound CC controls — the
 -- 'renderOSCControls' table above prints the pattern with a literal
 -- @\<voice\>@ placeholder; this resolves the placeholder against the
--- voices that are actually live in 'ssVoices'. Empty voice set means
--- OSC writes will route nowhere; the operator should know.
+-- voices that are actually live in 'ssVoices'.
+--
+-- Empty voice set is rare in practice because the caller is expected
+-- to have just run 'warnIfMissingVoices' against the keys returned by
+-- 'autoStartTemplates'. If it still happens, surface a true statement
+-- — writes are still accepted at the manifest layer, but they have no
+-- audible target until a voice is live for them to drive.
 printAddressableSurface
   :: SessionFanInService
   -> ManifestReloadIngressTarget
@@ -409,7 +475,7 @@ printAddressableSurface service target = do
   case (voices, bindings) of
     ([], _) ->
       putStrLn
-        "  addressable OSC surface: (no active voices, OSC writes route nowhere)"
+        "  addressable OSC surface: (no live voices; manifest writes are accepted but have no audible target)"
     (_, []) ->
       putStrLn
         "  addressable OSC surface: (manifest binds no OSC controls)"
