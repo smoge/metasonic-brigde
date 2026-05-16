@@ -3482,9 +3482,18 @@ real initial open against the OSC projection (with
 `MrciOSCIngressOpenFailed` surfacing bind failure as a CLI issue),
 preserving-fallback and stopped-audio reloads driven through real
 `closeOld + openFresh`, and the rendered snapshot reports the bound
-UDP port via `oscPort=`. A PortMIDI-backed MIDI listener and a full
-preserving-reload end-to-end test that sends OSC packets across the
-reload remain gated.
+UDP port via `oscPort=`. The manual device-backed MIDI smoke has also
+landed as `MetaSonic.App.ManifestMIDIReloadSmoke` and
+`--manifest-midi-reload-smoke MANIFEST.json DEMO`: it opens a real
+PortMIDI input through `manifestPortMIDISourceFactory`, runs
+`manifestMIDIIngressOps` against the plan's MIDI ingress projection,
+prints accepted `CmdControlWrite` lines plus manifest-layer rejects
+and ignored non-CC events, and exits non-zero only when the factory
+cannot produce an input-capable source. It is the only path that
+exercises the `hasDevice == True` branch of
+`manifestPortMIDISourceFactory`; it does not start audio, run a
+hot-swap, or claim reload semantics. The v1 boundary is pinned in
+[Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md).
 
 Still gated:
 
@@ -3583,10 +3592,19 @@ Still gated:
   packet-traffic tests covering the stopped-audio fallback and
   true-preserving paths under real CC traffic, the PortMIDI-backed
   source factory (CI-safe `NoInputDevice` branch tested; device-active
-  success path out-of-band), host orchestration design note, and
-  host supervisor / recovery policy design note. Remaining work is
-  a device-backed MIDI smoke (manual or hardware-gated CI) and
-  resource/allocation recovery events.
+  success path covered by the manual MIDI device smoke),
+  the manual MIDI device smoke CLI
+  (`MetaSonic.App.ManifestMIDIReloadSmoke` /
+  `--manifest-midi-reload-smoke`) that exercises the
+  `hasDevice == True` PortMIDI branch end-to-end and prints
+  per-event ingress activity, host orchestration design note,
+  host supervisor / recovery policy design note, and the
+  [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
+  checkpoint that pins the v1 scope, non-goals, and remaining
+  work. Remaining work in this arc is a
+  resource/allocation recovery event stream (gated on a concrete
+  consumer), operator UX polish on the manual smokes, and
+  hardware-gated CI for the device-backed paths.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped
