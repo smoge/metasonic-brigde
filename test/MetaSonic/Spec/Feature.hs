@@ -1278,7 +1278,7 @@ authoringReportTests =
           Right volRng     = Auth.controlRange 0 1
           ((cutoff, vol), _) = runSynthWith $ do
             c <- Auth.control     cutoffName 1200 cutoffRng
-            v <- Auth.ccControl 7 volName    0.3  volRng
+            v <- Auth.ccControl 10 volName   0.3  volRng
             pure (c, v)
           report = (addReportedControl vol
                   $ addReportedControl cutoff emptyAuthoringReport)
@@ -1294,7 +1294,7 @@ authoringReportTests =
         , "    cutoff  default=1200.0  range=[200.0, 8000.0]"
           <> "  smooth=20.0  key=cutoff  slot=1"
         , "    vol  default=0.3  range=[0.0, 1.0]"
-          <> "  smooth=20.0  cc=7  key=vol  slot=1"
+          <> "  smooth=20.0  cc=10  key=vol  slot=1"
         ]
 
   , testCase "renderAuthoringReport on a send-return ensemble report is stable" $ do
@@ -1337,7 +1337,7 @@ namedControlReport =
       Right vrng   = Auth.controlRange 0 1
       ((cutoff, vol), _) = runSynthWith $ do
         c <- Auth.control     cname 1200 crng
-        v <- Auth.ccControl 7 vname 0.3  vrng
+        v <- Auth.ccControl 10 vname 0.3  vrng
         pure (c, v)
   in (addReportedControl vol
     $ addReportedControl cutoff emptyAuthoringReport)
@@ -1383,7 +1383,7 @@ authoringManifestTests =
       length (mfControls m)  @?= 2
       let ccBound = [ c | c <- mfControls m, isJust (mcCC c) ]
       length ccBound @?= 1
-      map mcCC ccBound @?= [Just 7]
+      map mcCC ccBound @?= [Just 10]
 
   , testCase "send-return manifest has 2 templates and main-send bus 16" $ do
       let m = manifestFromReport "send-return" sendReturnReport

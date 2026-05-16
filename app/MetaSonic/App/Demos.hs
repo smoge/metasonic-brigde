@@ -391,7 +391,7 @@ namedControlBuild = do
   volRng <- case Auth.controlRange 0 1 of
     Right r  -> pure r
     Left err -> error $ "named-control demo: " <> err
-  vol <- Auth.ccControl 7 volName 0.3 volRng
+  vol <- Auth.ccControl 10 volName 0.3 volRng
 
   osc    <- sawOsc 220.0 0.0
   filt   <- lpf osc (Auth.controlConnection cutoff)
@@ -491,7 +491,7 @@ demoTable =
   , demoNoAuth "im"        "Intermodulation showcase (PulseOsc-PWM → BPF-sweep → Out)"
          (SingleGraph intermodGraph)
   , demoWithAuth "named-control"
-         "Named controls (Saw → LPF[cutoff] → Gain[vol=CC7] → Out, Phase 8.F/G)"
+         "Named controls (Saw → LPF[cutoff] → Gain[vol=CC10] → Out, Phase 8.F/G)"
          (SingleGraph namedControlGraph)
          namedControlAuthoring
   , demoWithAuth "send-return"

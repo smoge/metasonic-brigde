@@ -7,7 +7,8 @@
 -- tests. It opens a real PortMIDI input through
 -- 'manifestPortMIDISourceFactory', starts a 'manifestMIDIIngressOps'
 -- adapter against the projected MIDI ingress target of a manifest plan,
--- and reports per-event activity:
+-- drains accepted commands through 'SessionFanInService', and reports
+-- per-event activity:
 --
 -- * accepted manifest-bound CC writes (printed as
 --   'CmdControlWrite' lines);
@@ -34,7 +35,7 @@ module MetaSonic.App.ManifestMIDIReloadSmoke
 
 import           Control.Concurrent             (threadDelay)
 import           Control.Exception              (finally)
-import           Control.Monad                  (forM_, void)
+import           Control.Monad                  (forM_, when, void)
 import           Data.IORef                     (IORef, atomicModifyIORef',
                                                  newIORef, readIORef)
 import           Data.List                      (find, sortOn)
@@ -84,16 +85,23 @@ import           MetaSonic.MIDI.Devices         (MidiDeviceInfo (..),
 import           MetaSonic.Pattern              (ControlTag (..),
                                                  VoiceKey (..))
 import           MetaSonic.Session.Command      (SessionCommand (..))
-import           MetaSonic.Session.FanIn        (SessionFanInEnqueueResult (..),
-                                                 defaultSessionFanInOptions,
-                                                 withSessionFanInHost)
+import           MetaSonic.Session.FanIn        (SessionFanInDrainResult,
+                                                 SessionFanInEnqueueResult (..),
+                                                 sfidrDrain,
+                                                 sfidrQueueDepth)
+import           MetaSonic.Session.FanInService (SessionFanInServiceHooks (..),
+                                                 defaultSessionFanInServiceHooks,
+                                                 defaultSessionFanInServiceOptions,
+                                                 sessionFanInServiceHost,
+                                                 withSessionFanInServiceHooks)
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.MIDIPortMIDI (PortMIDISourceOptions (..),
                                                  defaultPortMIDISourceOptions)
 import           MetaSonic.Session.MIDIProducer (MIDIProducerEvent (..),
                                                  defaultMIDIProducerOptions)
 import           MetaSonic.Session.Queue        (QueuedSessionCommand (..),
-                                                 SessionEnqueueResult (..))
+                                                 SessionEnqueueResult (..),
+                                                 sdrItems, sdrStopped)
 
 
 data SmokeMIDIDeviceChoice = SmokeMIDIDeviceChoice
@@ -104,6 +112,7 @@ data SmokeMIDIDeviceChoice = SmokeMIDIDeviceChoice
 data SmokeCounters = SmokeCounters
   { scAccepted     :: !(IORef Int)
   , scEnqueueReject :: !(IORef Int)
+  , scDrained      :: !(IORef Int)
   , scUnboundCC    :: !(IORef (M.Map Word8 Int))
   , scOtherIngress :: !(IORef (M.Map String Int))
   , scIgnored      :: !(IORef (M.Map String Int))
@@ -191,11 +200,19 @@ runManifestMIDIReloadSmoke manifestPath demo midiDevice seconds = do
                  <> show issue)
         }
 
+  let serviceHooks = defaultSessionFanInServiceHooks
+        { sfshOnDrain = handleDrain counters
+        , sfshOnIssue = \issue ->
+            hPutStrLn stderr ("  service issue: " <> show issue)
+        }
+
   setupResult <-
-    withSessionFanInHost
+    withSessionFanInServiceHooks
+      serviceHooks
       (MR.mrlpTemplateGraph plan)
-      defaultSessionFanInOptions
-      $ \host -> do
+      defaultSessionFanInServiceOptions
+      $ \service -> do
+          let host = sessionFanInServiceHost service
           let ops =
                 manifestMIDIIngressOps
                   listenerHooks
@@ -215,11 +232,14 @@ runManifestMIDIReloadSmoke manifestPath demo midiDevice seconds = do
                  hFlush stdout
                  threadDelay (seconds * 1000000))
                 `finally` void (closeManifestReloadIngress manager)
+              -- Give the wake-on-enqueue worker a short chance to
+              -- drain events that arrive at the end of the window.
+              threadDelay 50000
               pure (Right ())
 
   case setupResult of
     Left issue ->
-      die ("Manifest MIDI smoke fan-in host setup failed: " <> show issue)
+      die ("Manifest MIDI smoke fan-in service setup failed: " <> show issue)
     Right (Left openIssue) ->
       dieOpenFailure (smdcDeviceId selected) openIssue
     Right (Right ()) -> do
@@ -266,6 +286,7 @@ newSmokeCounters :: IO SmokeCounters
 newSmokeCounters = SmokeCounters
   <$> newIORef 0
   <*> newIORef 0
+  <*> newIORef 0
   <*> newIORef M.empty
   <*> newIORef M.empty
   <*> newIORef M.empty
@@ -307,9 +328,23 @@ handleIssue counters issue = case issue of
     bumpStringKey (scIgnored counters) (eventKind event)
     putStrLn ("  ignored: " <> renderEvent event)
 
+handleDrain :: SmokeCounters -> SessionFanInDrainResult -> IO ()
+handleDrain counters drained = do
+  let n = length (sdrItems (sfidrDrain drained))
+  bumpBy (scDrained counters) n
+  when (n > 0) $
+    putStrLn $
+      "  drain: items=" <> show n
+      <> " queue_depth=" <> show (sfidrQueueDepth drained)
+      <> " stopped=" <> show (sdrStopped (sfidrDrain drained))
+
 bumpInt :: IORef Int -> IO ()
 bumpInt ref =
   atomicModifyIORef' ref (\n -> (n + 1, ()))
+
+bumpBy :: IORef Int -> Int -> IO ()
+bumpBy ref k =
+  atomicModifyIORef' ref (\n -> (n + k, ()))
 
 bumpKey :: Ord k => IORef (M.Map k Int) -> k -> IO ()
 bumpKey ref k =
@@ -374,12 +409,14 @@ printSummary :: SmokeCounters -> IO ()
 printSummary counters = do
   accepted <- readIORef (scAccepted counters)
   enqueueReject <- readIORef (scEnqueueReject counters)
+  drained <- readIORef (scDrained counters)
   unbound <- readIORef (scUnboundCC counters)
   other <- readIORef (scOtherIngress counters)
   ignored <- readIORef (scIgnored counters)
   putStrLn ""
   putStrLn "  summary:"
   putStrLn $ "    accepted: " <> show accepted
+  putStrLn $ "    drained: " <> show drained
   putStrLn $ "    enqueue-rejected: " <> show enqueueReject
   putStrLn $ "    unbound-cc rejects: " <> show (sumValues unbound)
   forM_ (M.toAscList unbound) $ \(cc, count) ->

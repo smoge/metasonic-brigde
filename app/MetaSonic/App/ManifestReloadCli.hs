@@ -33,10 +33,11 @@ import           Control.Monad                    (void)
 import           Data.Bifunctor                   (first)
 import           Data.IORef                       (IORef, modifyIORef',
                                                    newIORef, readIORef)
-import           Data.List                        (find)
+import           Data.List                        (find, intercalate)
 import qualified Data.ByteString.Lazy.Char8       as BL
 import qualified Data.Map.Strict                  as M
 import qualified Data.Text                        as T
+import           Data.Word                        (Word8)
 
 import           MetaSonic.App.Demos              (Demo (..), demoTable,
                                                    demoManifestReloadCatalog)
@@ -77,7 +78,11 @@ import           MetaSonic.App.ManifestReloadIngress
                                                    closeManifestReloadIngress,
                                                    newManifestReloadIngressManager,
                                                    readManifestReloadIngressManager)
-import           MetaSonic.Authoring.Manifest     (AuthoringManifestDoc (..),
+import           MetaSonic.Authoring.Manifest     (AuthoringManifest (..),
+                                                   AuthoringManifestDoc (..),
+                                                   ManifestBus (..),
+                                                   ManifestControl (..),
+                                                   ManifestTemplate (..),
                                                    decodeManifestDoc,
                                                    manifestSchemaVersion)
 import           MetaSonic.Bridge.Compile         (RuntimeGraph (..))
@@ -516,7 +521,7 @@ renderManifestReloadCliIssue issue =
     MrciCatalogFailed err ->
       err
     MrciPlanningFailed err ->
-      "Manifest reload planning failed: " <> show err
+      "Manifest reload planning failed: " <> renderManifestReloadIssue err
     MrciNoCatalogEntry key ->
       "Internal error: no catalog entry for planned demo " <> key
     MrciHostSetupFailed err ->
@@ -534,6 +539,142 @@ renderManifestReloadCliIssue issue =
       <> show err
     MrciOSCIngressOpenFailed err ->
       "Manifest reload smoke OSC ingress open failed: " <> show err
+
+renderManifestReloadIssue :: MR.ManifestReloadIssue -> String
+renderManifestReloadIssue issue =
+  case issue of
+    MR.MriManifestMismatch key requested catalog ->
+      unlines $
+        [ "manifest for demo '" <> key
+          <> "' does not match the compiled authoring catalog."
+        , "  The external manifest is validated as a catalog snapshot;"
+        , "  JSON-only edits do not remap the built-in demo."
+        , "  Regenerate with --authoring-manifest " <> key
+          <> ", or update the demo source and regenerate."
+        , "  differences:"
+        ]
+        <> manifestDifferenceLines requested catalog
+    _ ->
+      show issue
+
+manifestDifferenceLines
+  :: AuthoringManifest
+  -> AuthoringManifest
+  -> [String]
+manifestDifferenceLines requested catalog =
+  case diffs of
+    [] -> ["    - manifests differ, but no simple field diff was found"]
+    _  -> diffs
+  where
+    diffs =
+      showDiff "demo key" show (mfDemoKey requested) (mfDemoKey catalog)
+      <> showListDiff
+           "templates"
+           renderManifestTemplate
+           (mfTemplates requested)
+           (mfTemplates catalog)
+      <> showListDiff
+           "buses"
+           renderManifestBus
+           (mfBuses requested)
+           (mfBuses catalog)
+      <> controlDifferenceLines
+           (mfControls requested)
+           (mfControls catalog)
+
+showDiff :: Eq a => String -> (a -> String) -> a -> a -> [String]
+showDiff label render requested catalog
+  | requested == catalog = []
+  | otherwise =
+      [ "    - " <> label
+        <> ": manifest=" <> render requested
+        <> " catalog=" <> render catalog
+      ]
+
+showListDiff :: Eq a => String -> (a -> String) -> [a] -> [a] -> [String]
+showListDiff label render requested catalog
+  | requested == catalog = []
+  | otherwise =
+      [ "    - " <> label
+        <> ": manifest=" <> renderList render requested
+        <> " catalog=" <> renderList render catalog
+      ]
+
+controlDifferenceLines
+  :: [ManifestControl]
+  -> [ManifestControl]
+  -> [String]
+controlDifferenceLines requested catalog
+  | requested == catalog = []
+  | null diffs =
+      [ "    - control order: manifest="
+        <> renderList mcName requested
+        <> " catalog="
+        <> renderList mcName catalog
+      ]
+  | otherwise = diffs
+  where
+    names =
+      map mcName requested
+      <> [ mcName c | c <- catalog, mcName c `notElem` map mcName requested ]
+    diffs = concatMap diffControl names
+
+    diffControl name =
+      case (findControl name requested, findControl name catalog) of
+        (Just a, Just b) ->
+          showDiff ("control " <> name <> " default")
+            show (mcDefault a) (mcDefault b)
+          <> showDiff ("control " <> name <> " rangeMin")
+            show (mcRangeMin a) (mcRangeMin b)
+          <> showDiff ("control " <> name <> " rangeMax")
+            show (mcRangeMax a) (mcRangeMax b)
+          <> showDiff ("control " <> name <> " smoothingHz")
+            show (mcSmoothingHz a) (mcSmoothingHz b)
+          <> showDiff ("control " <> name <> " cc")
+            renderMaybeCC (mcCC a) (mcCC b)
+          <> showDiff ("control " <> name <> " key")
+            show (mcKey a) (mcKey b)
+          <> showDiff ("control " <> name <> " slot")
+            show (mcSlot a) (mcSlot b)
+        (Just a, Nothing) ->
+          [ "    - control " <> name
+            <> ": present in manifest only ("
+            <> renderControlSummary a
+            <> ")"
+          ]
+        (Nothing, Just b) ->
+          [ "    - control " <> name
+            <> ": present in catalog only ("
+            <> renderControlSummary b
+            <> ")"
+          ]
+        (Nothing, Nothing) ->
+          []
+
+findControl :: String -> [ManifestControl] -> Maybe ManifestControl
+findControl name = find ((== name) . mcName)
+
+renderManifestTemplate :: ManifestTemplate -> String
+renderManifestTemplate template =
+  mtName template <> ":" <> mtRole template
+
+renderManifestBus :: ManifestBus -> String
+renderManifestBus bus =
+  mbName bus <> ":" <> show (mbIndex bus)
+
+renderControlSummary :: ManifestControl -> String
+renderControlSummary control =
+  "cc=" <> renderMaybeCC (mcCC control)
+  <> ", key=" <> show (mcKey control)
+  <> ", slot=" <> show (mcSlot control)
+
+renderMaybeCC :: Maybe Word8 -> String
+renderMaybeCC Nothing   = "none"
+renderMaybeCC (Just cc) = show cc
+
+renderList :: (a -> String) -> [a] -> String
+renderList render xs =
+  "[" <> intercalate ", " (map render xs) <> "]"
 
 renderManifestStoppedAudioReloadSmoke
   :: ManifestStoppedAudioReloadSmokeResult

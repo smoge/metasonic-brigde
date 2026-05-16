@@ -2745,7 +2745,7 @@ metadata, so legacy demos see no output change.
 
 The first opt-in demo (`named-control`, new) exercises
 `control` + `ccControl` end-to-end through a tiny saw →
-lpf[cutoff] → gain[vol=CC7] → out patch. The existing
+lpf[cutoff] → gain[vol=CC10] → out patch. The existing
 `send-return` ensemble demo gains its metadata via
 `ensembleReport sendReturnEnsemble`.
 

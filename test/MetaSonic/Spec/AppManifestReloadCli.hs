@@ -210,6 +210,38 @@ appManifestReloadCliTests =
         Right _ ->
           assertFailure "expected missing manifest demo to fail"
 
+  , testCase "manifest/catalog mismatch reports a focused control diff" $ do
+      targetDemo <- demoOrFail "named-control"
+      catalog <- catalogOrFail demoTable
+      namedControlEntry <- entryOrFail "named-control" catalog
+      let catalogManifest = mrcManifest namedControlEntry
+          requestedManifest = catalogManifest
+            { mfControls =
+                [ if mcName c == "vol"
+                     then c { mcCC = Just 7 }
+                     else c
+                | c <- mfControls catalogManifest
+                ]
+            }
+          doc =
+            AuthoringManifestDoc manifestSchemaVersion [requestedManifest]
+      result <- runManifestStoppedAudioReloadSmokeWithDoc doc targetDemo
+      case result of
+        Left issue -> do
+          let output = renderManifestReloadCliIssue issue
+          assertContains
+            "manifest for demo 'named-control' does not match the compiled authoring catalog"
+            output
+          assertContains
+            "JSON-only edits do not remap the built-in demo"
+            output
+          assertContains
+            "control vol cc: manifest=7 catalog=10"
+            output
+          assertNotContains "AuthoringManifest {" output
+        Right _ ->
+          assertFailure "expected manifest/catalog mismatch to fail"
+
   , testCase "strategy smoke opens real OSC ingress and reports a bound port" $ do
       targetDemo <- demoOrFail "send-return"
       catalog <- catalogOrFail demoTable
@@ -394,3 +426,9 @@ assertContains needle haystack =
   assertBool
     ("expected output to contain " <> show needle <> "\n\noutput:\n" <> haystack)
     (needle `isInfixOf` haystack)
+
+assertNotContains :: String -> String -> Assertion
+assertNotContains needle haystack =
+  assertBool
+    ("expected output not to contain " <> show needle <> "\n\noutput:\n" <> haystack)
+    (not (needle `isInfixOf` haystack))
