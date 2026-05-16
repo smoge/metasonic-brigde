@@ -3520,7 +3520,10 @@ Still gated:
   listener through `ManifestReloadIngressOps` via a bracket-shaped
   source factory (source-close failures fire an adapter hook and
   still report a clean close so the ingress manager's state stays
-  honest), broader MIDI
+  honest), and both MIDI end-to-end packet-traffic tests
+  (`MetaSonic.Spec.AppManifestMIDIReloadE2E`) covering the
+  stopped-audio fallback path and the true-preserving path under
+  real CC traffic via a `Chan`-backed source factory, broader MIDI
   behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
@@ -3569,12 +3572,14 @@ Still gated:
   voice installed before reload, `Right MrhsrPreserving`, audio not
   stopped, voice survives, OSC paths swap correctly) with real UDP
   traffic before and after the swap, the manifest-target-aware MIDI
-  listener and its `ManifestReloadIngressOps` adapter via a
-  bracket-shaped source factory, host orchestration design note,
-  and host supervisor / recovery policy design note. Remaining work
-  is a PortMIDI device-backed source factory, a MIDI end-to-end
-  packet-traffic test, device-backed smoke coverage, and
-  resource/allocation recovery events.
+  listener, its `ManifestReloadIngressOps` adapter via a
+  bracket-shaped source factory, both MIDI end-to-end
+  packet-traffic tests covering the stopped-audio fallback and
+  true-preserving paths under real CC traffic, host orchestration
+  design note, and host supervisor / recovery policy design note.
+  Remaining work is a PortMIDI device-backed source factory,
+  device-backed smoke coverage, and resource/allocation recovery
+  events.
 - [ ] Failure/event semantics across compile, allocation, install, and
   stale producer commands.
 - [ ] Long-running owner supervision, teardown beyond the scoped

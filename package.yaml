@@ -193,6 +193,7 @@ tests:
       - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.Spec.AppManifestMIDIIngressOps
       - MetaSonic.Spec.AppManifestMIDIListener
+      - MetaSonic.Spec.AppManifestMIDIReloadE2E
       - MetaSonic.Spec.AppManifestOSCIngressOps
       - MetaSonic.Spec.AppManifestOSCListener
       - MetaSonic.Spec.AppManifestOSCReloadE2E

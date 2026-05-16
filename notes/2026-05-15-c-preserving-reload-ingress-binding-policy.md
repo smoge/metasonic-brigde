@@ -103,8 +103,24 @@ satisfy the PortMIDI single-consumer contract. Source-close
 failures fire an adapter hook and still report a clean close to
 the ingress manager so its `MrisClosed` state stays honest after
 the listener is already stopped; a manager-level regression test
-pins this behavior. A PortMIDI device-backed source factory and an
-MIDI end-to-end packet-traffic test remain ahead.
+pins this behavior. The MIDI end-to-end packet-traffic tests have also landed
+(`MetaSonic.Spec.AppManifestMIDIReloadE2E`). The fallback variant
+builds a two-entry catalog with disjoint CC bindings (CC 7 on the
+old entry, CC 11 on the new), sends a `MIDIProducerControlChange`
+event through a `Chan`-backed source factory and observes
+acceptance on the initial listener, runs
+`reloadManifestHostWithStrategy TryPreservingThenStoppedAudio`
+(falls back to stopped-audio in the empty-owner setup), then
+exercises old-CC rejection / new-CC acceptance on the post-reload
+listener. The preserving variant reuses the same hotSwapEdit /
+hotSwapEditAfterTemplates graph pair as the OSC preserving test,
+installs a live voice via `CmdVoiceOn (TemplateName "drone")
+(VoiceKey "v0") [...]`, runs the same strategy, and asserts the
+outcome is `Right MrhsrPreserving`, the captured audio events
+never include `AudioStop`, `sfisAudioRunning` stays `True`, the
+live voice survives, the new graph is installed, and the CC swap
+contract holds. A PortMIDI device-backed source factory remains
+ahead.
 
 ## The question
 
