@@ -132,6 +132,47 @@ Fix shape: explicit `drain-then-snapshot` step before printing the
 initial fan-in snapshot, or a small wait + retry. The reload-side
 shape suggests the bug only bites the initial setup phase.
 
+## Follow-up status
+
+The three operator-UX issues above were addressed in focused
+follow-up commits the same day. Treat the friction sections above as
+historical context; the live demo CLI now matches them.
+
+- **F-1** — fixed by `5d1d843` (introduces `renderStrategyRan` /
+  `renderStrategyFailure` plus short `Hpari` / `Hsari` constructor
+  classifiers, replacing the raw `show`) and refined by `359f1f1`
+  (relabel `HpariReloadRejected` to its actually-shared meaning,
+  "old owner still installed", rather than the narrower
+  "graphs not preserving-compatible"). Pinned by `7bfaa83`, which
+  makes the leaf renderers polymorphic in their issue payload so a
+  show-based fallback regression is uncompilable, plus runtime
+  assertions in
+  [test/MetaSonic/Spec/AppManifestLiveReloadDemoRender.hs](../test/MetaSonic/Spec/AppManifestLiveReloadDemoRender.hs)
+  covering every constructor against a probe payload that explicitly
+  contains the banned `TemplateGraph` / `RuntimeNode` substrings.
+
+- **F-2** and **F-3** — both fixed by `b84cf4c`. Voice-key
+  generation moved to an OSC-safe policy (`v<index>` with `fx` as a
+  special case so the 16-byte `isOscSafeIdentifier` cap is never
+  hit); `autoStartTemplates` now returns the spawned keys; a new
+  `waitForVoices` polls for the specific keys before the
+  initial-fan-in snapshot is printed; and the misleading
+  "OSC writes route nowhere" branch was replaced with text that is
+  accurate when it does fire (writes accepted at the manifest layer,
+  no audible target).
+
+Live verification after the polish pass: initial fan-in reports
+`active voices: 1` instead of `0`; the surface print emits
+copy-pasteable concrete addresses (`/v0/cutoff/1`, `/v0/vol/1`);
+`/v0/cutoff/1 = 600` accepts with `voice=v0` and was audibly heard;
+the post-reload strategy outcome renders as one 135-character line
+(`success: preserving rejected (reload-rejected (old owner still
+installed)), stopped-audio fallback installed`) instead of the
+~12000-character `Show` dump.
+
+What's left from this recap is what the run itself couldn't prove,
+not friction it surfaced — see "Recommended next steps" below.
+
 ## Comparison to the runbook expectations
 
 Item-by-item against
@@ -221,24 +262,27 @@ in the same process via `<>` is the only clean fix.
 
 ## Recommended next steps
 
-In rough priority order:
+F-1, F-2, and F-3 are closed (see "Follow-up status" above). What
+remains is what this run itself could not exercise:
 
-1. **Fix F-1: short strategy-outcome line.** Highest value per unit
-   of work. The current dump makes the demo's most informative
-   piece of output unreadable.
-2. **Fix F-2: choose an OSC-reachable voice key and stop printing
-   misleading surface guidance.** Without this the demo cannot
-   actually be operated from its own printed output.
-3. **Fix F-3: drain before snapshotting the initial fan-in.**
-   Cosmetic, but the warning is alarming during a successful run.
-4. **Add a preserving-compatible CLI pair** (or extend the existing
+1. **Add a preserving-compatible CLI pair** (or extend the existing
    pair) so a single demo invocation can also validate
-   `MrhsrPreserving` audibly.
-5. **Add a target demo with OSC controls** so the post-reload
-   accept path is exercisable end-to-end in one session.
+   `MrhsrPreserving` audibly. The `named-control` → `send-return`
+   pair is shape-incompatible by design and only hits the
+   stopped-audio fallback. The OSC preserving e2e test in
+   [test/MetaSonic/Spec/AppManifestOSCReloadE2E.hs](../test/MetaSonic/Spec/AppManifestOSCReloadE2E.hs)
+   uses `hotSwapEdit` / `hotSwapEditAfterTemplates` for this; a
+   CLI-exposed pair on top of those would be the cleanest audible
+   followup.
 
-None of these touch the manifest reload arc contract. They are all
-demo-CLI polish on top of a working reload pipeline.
+2. **Add a target demo with OSC controls** so the post-reload accept
+   path is exercisable end-to-end in one session. Currently
+   `send-return` binds no OSC controls, so every post-reload packet
+   correctly rejects but the audible-write-after-reload behaviour
+   cannot be heard.
+
+Neither touches the manifest reload arc contract; both are demo-CLI
+content choices on top of a working pipeline.
 
 ## Operator artifacts
 
