@@ -80,6 +80,42 @@ appManifestOSCListenerTests =
           assertFailure
             ("expected accepted producer result, got: " <> show other)
 
+  , testCase "int control packet enqueues a CmdControlWrite" $ do
+      let target = manifestOSCIngressTargetFromPlan validPlan
+          expected =
+            CmdControlWrite (VoiceKey "v0") cutoffTag 42.0
+      result <-
+        withSessionFanInHost
+          (TemplateGraph [] M.empty)
+          defaultSessionFanInOptions
+          $ \host -> do
+              received <- newEmptyMVar
+              let hooks = ManifestOSCListenerHooks
+                    { molhOnAccepted =
+                        putMVar received
+                    , molhOnIssue =
+                        \_ -> pure ()
+                    }
+              withManifestOSCListener
+                hooks
+                defaultOSCProducerOptions
+                target
+                host
+                (defaultListenerConfig 0)
+                $ \info -> do
+                    sendUdpLoopback
+                      (liBoundPort info)
+                      messageBytesV0CutoffInt
+                    timeout 1000000 (takeMVar received)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Just (OSCProducerEnqueueAttempted command _enq)) ->
+          command @?= expected
+        Right other ->
+          assertFailure
+            ("expected accepted producer result, got: " <> show other)
+
   , testCase "unknown control packet rejects and queue stays empty" $ do
       let target = manifestOSCIngressTargetFromPlan trimmedPlan
       result <-
@@ -326,21 +362,29 @@ volTag =
   ControlTag (MigrationKey "vol") 0
 
 -- Hand-built OSC wire fixtures matching the manifest tag layout
--- (/v0/<tag>/<slot> ,f 1500.0). The control surface above uses slot 0.
+-- (/v0/<tag>/<slot> with one numeric argument). The control surface
+-- above uses slot 0.
 messageBytesV0CutoffFloat :: OBSC.ByteString
-messageBytesV0CutoffFloat = oscMessageBytes "/v0/cutoff/0"
+messageBytesV0CutoffFloat =
+  oscMessageBytes "/v0/cutoff/0" ",f" floatBytes1500
+
+messageBytesV0CutoffInt :: OBSC.ByteString
+messageBytesV0CutoffInt =
+  oscMessageBytes "/v0/cutoff/0" ",i" intBytes42
 
 messageBytesV0VolFloat :: OBSC.ByteString
-messageBytesV0VolFloat = oscMessageBytes "/v0/vol/0"
+messageBytesV0VolFloat =
+  oscMessageBytes "/v0/vol/0" ",f" floatBytes1500
 
 messageBytesSingleSegment :: OBSC.ByteString
-messageBytesSingleSegment = oscMessageBytes "/just-one-segment"
+messageBytesSingleSegment =
+  oscMessageBytes "/just-one-segment" ",f" floatBytes1500
 
-oscMessageBytes :: String -> OBSC.ByteString
-oscMessageBytes addr = OBSC.concat
+oscMessageBytes :: String -> String -> OBSC.ByteString -> OBSC.ByteString
+oscMessageBytes addr typeTag payload = OBSC.concat
   [ oscString (OBSC.pack addr)
-  , oscString (OBSC.pack ",f")
-  , floatBytes1500
+  , oscString (OBSC.pack typeTag)
+  , payload
   ]
 
 oscString :: OBSC.ByteString -> OBSC.ByteString
@@ -351,3 +395,6 @@ oscString s =
 
 floatBytes1500 :: OBSC.ByteString
 floatBytes1500 = OBSC.pack ['\x44', '\xBB', '\x80', '\NUL']
+
+intBytes42 :: OBSC.ByteString
+intBytes42 = OBSC.pack ['\NUL', '\NUL', '\NUL', '*']

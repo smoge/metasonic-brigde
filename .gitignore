@@ -59,6 +59,7 @@ cabal.project.freeze
 *.swp
 *.swo
 *~
+**/__pycache__/
 
 ############################################################
 # Profiling

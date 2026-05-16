@@ -55,8 +55,11 @@ session-osc-arbitration-send-allowed value port="7001":
 osc-listen port="7000":
     stack exec -- metasonic-bridge --osc-listen {{port}}
 
-osc-send value port="7000" host="127.0.0.1":
-    python3 tools/send_osc.py --host {{host}} --port {{port}} --value {{value}}
+osc-send value port="7000" host="127.0.0.1" address="/v0/outgain/0":
+    python3 tools/send_osc.py --host {{host}} --port {{port}} --address {{address}} --value {{value}}
+
+osc-tool-test:
+    python3 tools/test_send_osc.py
 
 stack-test:
     stack test
