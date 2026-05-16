@@ -35,6 +35,8 @@ import           MetaSonic.App.ManifestReloadCli
                                              renderManifestReloadHostStrategy,
                                              runManifestHostStrategyReloadSmokeFile,
                                              runManifestStoppedAudioReloadSmokeFile)
+import           MetaSonic.App.ManifestMIDIReloadSmoke
+                                            (runManifestMIDIReloadSmoke)
 import           MetaSonic.App.ManifestReloadHost
                                             (ManifestReloadHostStrategy)
 import           MetaSonic.App.Osc          (runOscListen)
@@ -190,6 +192,17 @@ data RunMode
     -- lifecycle hooks, prints which strategy ran or failed, and exits.
     -- It does not open PortAudio, run the normal demo path, or make
     -- any selector mode the default.
+  | ManifestMIDIReloadSmoke
+    -- ^ Manual device-backed MIDI smoke
+    -- (--manifest-midi-reload-smoke MANIFEST.json DEMO). Reads an
+    -- external authoring manifest document, validates the selected
+    -- demo against the built-in authored-demo catalog, opens a real
+    -- PortMIDI input through the manifest MIDI ingress projection,
+    -- and reports per-event activity (accepted CC writes,
+    -- manifest-layer rejects, ignored non-CC events). It does not
+    -- start audio, does not run a hot-swap, and does not claim
+    -- reload semantics. Exits non-zero only when no input-capable
+    -- PortMIDI device opens.
   deriving (Eq, Show)
 
 data Options = Options
@@ -221,6 +234,8 @@ data Options = Options
     -- ^ Manual smoke-test duration for --session-osc-arbitration-smoke.
   , optSessionOscPort :: Int
     -- ^ UDP port for --session-osc-arbitration-smoke. Default 7001.
+  , optManifestMIDISmokeSeconds :: Int
+    -- ^ Manual smoke-test duration for --manifest-midi-reload-smoke.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
@@ -236,6 +251,7 @@ defaultOptions = Options
   , optSessionMidiSmokeSeconds = 10
   , optSessionOscSmokeSeconds = 10
   , optSessionOscPort = 7001
+  , optManifestMIDISmokeSeconds = 10
   }
 
 parseArgs :: [String] -> Either String Options
@@ -330,6 +346,23 @@ parseArgs = go defaultOptions
         "Missing strategy for --manifest-host-reload-smoke"
         <> "\nStrategies: "
         <> intercalate ", " manifestReloadHostStrategyNames
+    go opts ("--manifest-midi-reload-smoke" : path : xs)
+      | null path || "--" `prefixOf` path =
+          Left "Missing manifest JSON file for --manifest-midi-reload-smoke"
+      | otherwise =
+          go opts { optMode = ManifestMIDIReloadSmoke
+                  , optManifestReloadFile = Just path
+                  } xs
+    go _ ("--manifest-midi-reload-smoke" : []) =
+      Left "Missing manifest JSON file for --manifest-midi-reload-smoke"
+    go opts ("--manifest-midi-smoke-seconds" : s : xs) =
+      case parseSmokeSeconds s of
+        Just n  -> go opts { optManifestMIDISmokeSeconds = n } xs
+        Nothing -> Left $
+          "Invalid duration for --manifest-midi-smoke-seconds: " <> s
+          <> " (expected integer seconds in [1, 3600])"
+    go _ ("--manifest-midi-smoke-seconds" : []) =
+      Left "Missing value for --manifest-midi-smoke-seconds"
     go opts ("--summary" : xs) =
       go opts { optFCLSummary = True } xs
     go opts ("--midi-list" : xs) =
@@ -478,6 +511,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-session-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --manifest-stopped-audio-reload-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --manifest-host-reload-smoke STRATEGY MANIFEST.json DEMO"
+  , "  " <> prog <> " --manifest-midi-reload-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
   , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
@@ -598,13 +632,34 @@ usage prog = unlines
   , "                   explicit fallback ran, then exits. No PortAudio"
   , "                   device is opened and the normal demo path is not"
   , "                   affected."
+  , "  --manifest-midi-reload-smoke MANIFEST.json DEMO"
+  , "                   Manual device-backed MIDI smoke for the manifest"
+  , "                   MIDI ingress projection. Reads MANIFEST.json,"
+  , "                   validates DEMO against the built-in authored-demo"
+  , "                   reload catalog, opens a real PortMIDI input through"
+  , "                   manifestPortMIDISourceFactory, and prints accepted"
+  , "                   CC writes, manifest-layer rejects (unbound CC,"
+  , "                   invalid byte, filtered channel), and ignored non-CC"
+  , "                   events for the smoke window. Use --midi-device N to"
+  , "                   pick a specific input; otherwise the first"
+  , "                   input-capable device from --midi-list is selected."
+  , "                   --manifest-midi-smoke-seconds N sets the window"
+  , "                   (default 10 seconds). No audio start, no hot-swap"
+  , "                   execution, no reload semantics; exits non-zero only"
+  , "                   when the PortMIDI factory cannot produce an"
+  , "                   input-capable source."
+  , "  --manifest-midi-smoke-seconds N"
+  , "                   Smoke window in seconds for"
+  , "                   --manifest-midi-reload-smoke. Default 10."
+  , "                   Ignored by other modes."
   , "  --summary        Switch --fusion-cost-lab output from JSONL to a"
   , "                   per-row summary table. Ignored by other modes."
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
   , "                   with inputs can be passed to --midi-device."
-  , "  --midi-device N  Select PortMIDI device id N for midi-poly or"
-  , "                   --session-midi-smoke. Use --midi-list to discover"
-  , "                   ids. Ignored by non-MIDI modes."
+  , "  --midi-device N  Select PortMIDI device id N for midi-poly,"
+  , "                   --session-midi-smoke, or"
+  , "                   --manifest-midi-reload-smoke. Use --midi-list to"
+  , "                   discover ids. Ignored by non-MIDI modes."
   , "  --session-midi-smoke [SECONDS]"
   , "                   Manual non-audio probe for the session MIDI ingress"
   , "                   path. Opens the Q / PortMIDI source, feeds decoded"
@@ -660,6 +715,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-session-smoke manifest.json send-return"
   , "  " <> prog <> " --manifest-stopped-audio-reload-smoke manifest.json send-return"
   , "  " <> prog <> " --manifest-host-reload-smoke try-preserving manifest.json send-return"
+  , "  " <> prog <> " --manifest-midi-reload-smoke manifest.json send-return --midi-device 2"
   ]
 
 --------------------------------------------------------------------------------
@@ -800,6 +856,21 @@ main = do
           die (renderManifestReloadCliIssue issue)
         Right output ->
           putStr output
+    ManifestMIDIReloadSmoke -> do
+      manifestPath <- maybe
+        (die "Missing manifest JSON file for --manifest-midi-reload-smoke")
+        pure
+        (optManifestReloadFile opts)
+      demo <- either die pure $
+        resolveManifestReloadDiagnosticTarget
+          "--manifest-midi-reload-smoke"
+          "--manifest-midi-reload-smoke MANIFEST.json DEMO_KEY"
+          opts
+      runManifestMIDIReloadSmoke
+        manifestPath
+        demo
+        (optMidiDevice opts)
+        (optManifestMIDISmokeSeconds opts)
     OscListen ->
       runOscListen (optOscPort opts)
     MidiList ->
@@ -1098,8 +1169,8 @@ printMidiDevices = do
           <> "  " <> usable
           <> "  name=\"" <> midiDeviceName d <> "\""
       putStrLn ""
-      putStrLn "Use an input-capable id with --midi-device N for midi-poly"
-      putStrLn "or --session-midi-smoke."
+      putStrLn "Use an input-capable id with --midi-device N for midi-poly,"
+      putStrLn "--session-midi-smoke, or --manifest-midi-reload-smoke."
 
 printPlugins :: IO ()
 printPlugins = do
@@ -1142,7 +1213,8 @@ runDemo opts demo
     || optMode opts == ManifestReloadFileDiagnostic
     || optMode opts == ManifestSessionSmoke
     || optMode opts == ManifestStoppedAudioReloadSmoke
-    || optMode opts == ManifestHostStrategyReloadSmoke =
+    || optMode opts == ManifestHostStrategyReloadSmoke
+    || optMode opts == ManifestMIDIReloadSmoke =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
       SingleGraph    g          -> runSingleDemo   opts demo g
@@ -1227,6 +1299,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: ManifestStoppedAudioReloadSmoke should be handled by main, never reach here"
     ManifestHostStrategyReloadSmoke ->
       error "runSingleDemo: ManifestHostStrategyReloadSmoke should be handled by main, never reach here"
+    ManifestMIDIReloadSmoke ->
+      error "runSingleDemo: ManifestMIDIReloadSmoke should be handled by main, never reach here"
 
 -- Print just the fusion summary for a single-graph demo, without
 -- running audio. Used by --inspect-only so callers can compare

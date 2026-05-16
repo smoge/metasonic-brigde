@@ -143,6 +143,7 @@ executables:
       - MetaSonic.App.ManifestMIDIIngressOps
       - MetaSonic.App.ManifestMIDIListener
       - MetaSonic.App.ManifestMIDIPortMIDI
+      - MetaSonic.App.ManifestMIDIReloadSmoke
       - MetaSonic.App.ManifestOSCIngressOps
       - MetaSonic.App.ManifestOSCListener
       - MetaSonic.App.ManifestReloadIngress
@@ -182,6 +183,7 @@ tests:
       - MetaSonic.App.ManifestMIDIIngressOps
       - MetaSonic.App.ManifestMIDIListener
       - MetaSonic.App.ManifestMIDIPortMIDI
+      - MetaSonic.App.ManifestMIDIReloadSmoke
       - MetaSonic.App.ManifestOSCIngressOps
       - MetaSonic.App.ManifestOSCListener
       - MetaSonic.App.ManifestReloadIngress

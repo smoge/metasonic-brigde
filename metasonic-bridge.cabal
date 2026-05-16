@@ -137,6 +137,7 @@ executable metasonic-bridge
       MetaSonic.App.ManifestMIDIIngressOps
       MetaSonic.App.ManifestMIDIListener
       MetaSonic.App.ManifestMIDIPortMIDI
+      MetaSonic.App.ManifestMIDIReloadSmoke
       MetaSonic.App.ManifestOSCIngressOps
       MetaSonic.App.ManifestOSCListener
       MetaSonic.App.ManifestReloadIngress
@@ -189,6 +190,7 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestMIDIIngressOps
       MetaSonic.App.ManifestMIDIListener
       MetaSonic.App.ManifestMIDIPortMIDI
+      MetaSonic.App.ManifestMIDIReloadSmoke
       MetaSonic.App.ManifestOSCIngressOps
       MetaSonic.App.ManifestOSCListener
       MetaSonic.App.ManifestReloadIngress
