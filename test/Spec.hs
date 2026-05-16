@@ -11,6 +11,7 @@ import           Test.Tasty
 import           MetaSonic.Spec.AppDemos
 import           MetaSonic.Spec.AppManifestMIDIIngressOps
 import           MetaSonic.Spec.AppManifestMIDIListener
+import           MetaSonic.Spec.AppManifestMIDIPortMIDI
 import           MetaSonic.Spec.AppManifestMIDIReloadE2E
 import           MetaSonic.Spec.AppManifestOSCIngressOps
 import           MetaSonic.Spec.AppManifestOSCListener
@@ -40,6 +41,7 @@ main = defaultMain $ testGroup "MetaSonic"
   [ appDemoCatalogTests
   , appManifestMIDIIngressOpsTests
   , appManifestMIDIListenerTests
+  , appManifestMIDIPortMIDITests
   , appManifestMIDIReloadE2ETests
   , appManifestOSCIngressOpsTests
   , appManifestOSCListenerTests

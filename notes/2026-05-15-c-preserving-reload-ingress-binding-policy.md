@@ -119,8 +119,18 @@ installs a live voice via `CmdVoiceOn (TemplateName "drone")
 outcome is `Right MrhsrPreserving`, the captured audio events
 never include `AudioStop`, `sfisAudioRunning` stays `True`, the
 live voice survives, the new graph is installed, and the CC swap
-contract holds. A PortMIDI device-backed source factory remains
-ahead.
+contract holds. The PortMIDI-backed source factory has also landed as
+`MetaSonic.App.ManifestMIDIPortMIDI.manifestPortMIDISourceFactory`.
+It opens via `openPortMIDISource`, distinguishes the
+no-handle case (`Nothing` from open) from the idle-handle case
+(`portMIDISourceHasDevice` returns `False`) by closing the idle
+handle and reporting `MmppNoInputDevice`, and yields
+`portMIDIListenerSource opts source` on the device-active success
+path. CI-safe tests exercise the `NoInputDevice` branch (via the
+existing invalid-device-id idiom) and confirm it composes with
+`manifestMIDIIngressOps` surfacing as `MmioiSourceOpenFailed
+MmppNoInputDevice`; the device-active success path stays off CI
+and is the next manual / device-backed smoke.
 
 ## The question
 
