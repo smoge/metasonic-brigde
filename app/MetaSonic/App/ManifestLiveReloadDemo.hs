@@ -567,7 +567,12 @@ renderHostPreservingIssueTag issue = case issue of
   HpariDrainFailedTerminal{}         ->
     "drain-failed (terminal)"
   HpariReloadRejected{}              ->
-    "reload-rejected (graphs not preserving-compatible)"
+    -- This constructor is the retryable old-owner-still-installed
+    -- shape, not specifically a graph-shape incompatibility.
+    -- mapPreservingReloadReport (ManifestReloadHost.hs) collapses
+    -- SessionEnqueueRejected, StepRuntimeFailed, and StepRejected
+    -- all into HprfOldOwnerStillInstalled → HpariReloadRejected.
+    "reload-rejected (old owner still installed)"
   HpariReloadRejectedResumeFailed{}  ->
     "reload-rejected; resume-failed"
   HpariReloadFailedTerminal{}        ->
