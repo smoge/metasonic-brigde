@@ -35,6 +35,8 @@ import           MetaSonic.App.ManifestReloadCli
                                              renderManifestReloadHostStrategy,
                                              runManifestHostStrategyReloadSmokeFile,
                                              runManifestStoppedAudioReloadSmokeFile)
+import           MetaSonic.App.ManifestLiveReloadDemo
+                                            (runManifestLiveReloadDemo)
 import           MetaSonic.App.ManifestMIDIReloadSmoke
                                             (runManifestMIDIReloadSmoke)
 import           MetaSonic.App.ManifestReloadHost
@@ -44,7 +46,8 @@ import           MetaSonic.App.SessionMidiSmoke (runSessionMidiSmoke)
 import           MetaSonic.App.SessionOscArbitrationSmoke
                                              (runSessionOscArbitrationSmoke)
 import           MetaSonic.App.SnapshotCheck (runSnapshotCheck)
-import           MetaSonic.OSC.Listen       (parseListenerPort)
+import           MetaSonic.OSC.Listen       (defaultListenerConfig,
+                                             parseListenerPort)
 import           MetaSonic.App.Survey       (printFusionSummary,
                                              runFusionSurvey)
 import           MetaSonic.App.SwapBench    (runSwapBench)
@@ -203,6 +206,13 @@ data RunMode
     -- start audio, does not run a hot-swap, and does not claim
     -- reload semantics. Exits non-zero only when no input-capable
     -- PortMIDI device opens.
+  | ManifestLiveReloadDemo
+    -- ^ Experimental audible manifest reload path
+    -- (--manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW).
+    -- Starts real audio from OLD, opens manifest-aware OSC ingress,
+    -- waits for Enter, then reloads to NEW through
+    -- reloadManifestHostWithStrategy. This is opt-in only; the normal
+    -- demo path is unchanged.
   deriving (Eq, Show)
 
 data Options = Options
@@ -346,6 +356,40 @@ parseArgs = go defaultOptions
         "Missing strategy for --manifest-host-reload-smoke"
         <> "\nStrategies: "
         <> intercalate ", " manifestReloadHostStrategyNames
+    go opts ("--manifest-live-reload-demo" : strategyText : path : xs)
+      | null strategyText || "--" `prefixOf` strategyText =
+          Left $
+            "Missing strategy for --manifest-live-reload-demo"
+            <> "\nStrategies: "
+            <> intercalate ", " manifestReloadHostStrategyNames
+      | null path || "--" `prefixOf` path =
+          Left "Missing manifest JSON file for --manifest-live-reload-demo"
+      | otherwise =
+          case parseManifestReloadHostStrategy strategyText of
+            Just strategy ->
+              go opts { optMode = ManifestLiveReloadDemo
+                      , optManifestReloadFile = Just path
+                      , optManifestReloadHostStrategy = Just strategy
+                      } xs
+            Nothing ->
+              Left (invalidManifestLiveReloadStrategy strategyText)
+    go _ ("--manifest-live-reload-demo" : strategyText : [])
+      | null strategyText || "--" `prefixOf` strategyText =
+          Left $
+            "Missing strategy for --manifest-live-reload-demo"
+            <> "\nStrategies: "
+            <> intercalate ", " manifestReloadHostStrategyNames
+      | otherwise =
+          case parseManifestReloadHostStrategy strategyText of
+            Just _ ->
+              Left "Missing manifest JSON file for --manifest-live-reload-demo"
+            Nothing ->
+              Left (invalidManifestLiveReloadStrategy strategyText)
+    go _ ("--manifest-live-reload-demo" : []) =
+      Left $
+        "Missing strategy for --manifest-live-reload-demo"
+        <> "\nStrategies: "
+        <> intercalate ", " manifestReloadHostStrategyNames
     go opts ("--manifest-midi-reload-smoke" : path : xs)
       | null path || "--" `prefixOf` path =
           Left "Missing manifest JSON file for --manifest-midi-reload-smoke"
@@ -419,6 +463,13 @@ parseArgs = go defaultOptions
 
     invalidManifestHostStrategy strategyText =
       "Invalid strategy for --manifest-host-reload-smoke: "
+      <> strategyText
+      <> " (expected one of: "
+      <> intercalate ", " manifestReloadHostStrategyNames
+      <> ")"
+
+    invalidManifestLiveReloadStrategy strategyText =
+      "Invalid strategy for --manifest-live-reload-demo: "
       <> strategyText
       <> " (expected one of: "
       <> intercalate ", " manifestReloadHostStrategyNames
@@ -511,6 +562,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-session-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --manifest-stopped-audio-reload-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --manifest-host-reload-smoke STRATEGY MANIFEST.json DEMO"
+  , "  " <> prog <> " --manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW"
   , "  " <> prog <> " --manifest-midi-reload-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
@@ -632,6 +684,17 @@ usage prog = unlines
   , "                   explicit fallback ran, then exits. No PortAudio"
   , "                   device is opened and the normal demo path is not"
   , "                   affected."
+  , "  --manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW"
+  , "                   Experimental audible manifest reload demo."
+  , "                   STRATEGY is one of: "
+      <> intercalate ", " manifestReloadHostStrategyNames
+  , "                   Starts real audio from OLD, opens manifest-aware"
+  , "                   OSC ingress, waits for Enter, reloads to NEW"
+  , "                   through reloadManifestHostWithStrategy, then"
+  , "                   waits for Enter before cleanup. Uses"
+  , "                   --session-osc-port N for the OSC bind port."
+  , "                   This is opt-in only; normal demo execution is"
+  , "                   unchanged."
   , "  --manifest-midi-reload-smoke MANIFEST.json DEMO"
   , "                   Manual device-backed MIDI smoke for the manifest"
   , "                   MIDI ingress projection. Reads MANIFEST.json,"
@@ -681,6 +744,7 @@ usage prog = unlines
   , "                   window is 10 seconds; demo targets are ignored."
   , "  --session-osc-port N"
   , "                   UDP port for --session-osc-arbitration-smoke."
+  , "                   Also used by --manifest-live-reload-demo."
   , "                   Default is 7001. Ignored by other modes."
   , "  --plugin-list    Print the build-linked static plugin registry"
   , "                   used by KStaticPlugin and exit. No audio, no TUI."
@@ -715,6 +779,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-session-smoke manifest.json send-return"
   , "  " <> prog <> " --manifest-stopped-audio-reload-smoke manifest.json send-return"
   , "  " <> prog <> " --manifest-host-reload-smoke try-preserving manifest.json send-return"
+  , "  " <> prog <> " --manifest-live-reload-demo try-preserving manifest.json named-control named-control"
   , "  " <> prog <> " --manifest-midi-reload-smoke manifest.json send-return --midi-device 2"
   ]
 
@@ -856,6 +921,23 @@ main = do
           die (renderManifestReloadCliIssue issue)
         Right output ->
           putStr output
+    ManifestLiveReloadDemo -> do
+      manifestPath <- maybe
+        (die "Missing manifest JSON file for --manifest-live-reload-demo")
+        pure
+        (optManifestReloadFile opts)
+      strategy <- maybe
+        (die "Missing strategy for --manifest-live-reload-demo")
+        pure
+        (optManifestReloadHostStrategy opts)
+      (oldDemo, newDemo) <- either die pure $
+        resolveManifestLiveReloadTargets opts
+      runManifestLiveReloadDemo
+        strategy
+        manifestPath
+        oldDemo
+        newDemo
+        (defaultListenerConfig (optSessionOscPort opts))
     ManifestMIDIReloadSmoke -> do
       manifestPath <- maybe
         (die "Missing manifest JSON file for --manifest-midi-reload-smoke")
@@ -959,6 +1041,55 @@ resolveManifestReloadDiagnosticTarget flagName usageShape opts =
       Left $
         "Internal error: target resolution produced "
         <> show (length demos) <> " demos for " <> flagName <> "."
+
+    formatResolveError err =
+      err <> "\nAuthored demos: " <> intercalate ", " authoredDemoKeys
+
+resolveManifestLiveReloadTargets :: Options -> Either String (Demo, Demo)
+resolveManifestLiveReloadTargets opts =
+  case optTargets opts of
+    [oldKey, newKey] -> do
+      oldDemo <- resolveAuthored oldKey
+      newDemo <- resolveAuthored newKey
+      Right (oldDemo, newDemo)
+    [] ->
+      Left $
+        "Specify OLD and NEW demos: "
+        <> "--manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW"
+        <> "\nAuthored demos: "
+        <> intercalate ", " authoredDemoKeys
+    targets ->
+      Left $
+        "Specify exactly two demos for --manifest-live-reload-demo; got "
+        <> show (length targets)
+        <> ": "
+        <> intercalate ", " targets
+        <> "\nAuthored demos: "
+        <> intercalate ", " authoredDemoKeys
+  where
+    authoredDemoKeys =
+      [ demoKey d
+      | d <- demoTable
+      , Just _ <- [demoAuthoring d]
+      ]
+
+    resolveAuthored key = do
+      demos <- first formatResolveError (resolveTargets [key])
+      case demos of
+        [demo]
+          | Just _ <- demoAuthoring demo ->
+              Right demo
+          | otherwise ->
+              Left $
+                "Demo '" <> demoKey demo <> "' has no authoring metadata; "
+                <> "--manifest-live-reload-demo requires authored demos."
+                <> "\nAuthored demos: "
+                <> intercalate ", " authoredDemoKeys
+        _ ->
+          Left $
+            "Internal error: target resolution produced "
+            <> show (length demos)
+            <> " demos for --manifest-live-reload-demo."
 
     formatResolveError err =
       err <> "\nAuthored demos: " <> intercalate ", " authoredDemoKeys
@@ -1214,6 +1345,7 @@ runDemo opts demo
     || optMode opts == ManifestSessionSmoke
     || optMode opts == ManifestStoppedAudioReloadSmoke
     || optMode opts == ManifestHostStrategyReloadSmoke
+    || optMode opts == ManifestLiveReloadDemo
     || optMode opts == ManifestMIDIReloadSmoke =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
@@ -1299,6 +1431,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: ManifestStoppedAudioReloadSmoke should be handled by main, never reach here"
     ManifestHostStrategyReloadSmoke ->
       error "runSingleDemo: ManifestHostStrategyReloadSmoke should be handled by main, never reach here"
+    ManifestLiveReloadDemo ->
+      error "runSingleDemo: ManifestLiveReloadDemo should be handled by main, never reach here"
     ManifestMIDIReloadSmoke ->
       error "runSingleDemo: ManifestMIDIReloadSmoke should be handled by main, never reach here"
 
