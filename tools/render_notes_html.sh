@@ -158,7 +158,7 @@ tr:nth-child(even) {
 HTML
 
 mapfile -d '' notes < <(
-  find "$notes_dir" -maxdepth 1 -type f -name '*.md' -print0 | sort -z
+  find "$notes_dir" -maxdepth 1 -type f -name '*.md' -print0 | LC_ALL=C sort -z
 )
 
 html_escape() {
