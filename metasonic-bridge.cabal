@@ -241,6 +241,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.FFI.C0c
       MetaSonic.Spec.FFI.C0d
       MetaSonic.Spec.FFI.C1c
+      MetaSonic.Spec.FFI.FusedRender
       MetaSonic.Spec.FFI.HotSwap
       MetaSonic.Spec.FFI.T9
       MetaSonic.Spec.FFI.TemplateLifecycle
