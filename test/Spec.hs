@@ -39,6 +39,7 @@ import           MetaSonic.Spec.FFI.C0d   (c0dGlobalScheduleBandTests)
 import           MetaSonic.Spec.FFI.C1c   (c1cWorkerScheduleTests)
 import           MetaSonic.Spec.FFI.HotSwap (hotSwapTests)
 import           MetaSonic.Spec.FFI.T9    (t9DirectEqualsReductionTests)
+import           MetaSonic.Spec.FFI.TemplateLifecycle (templateLifecycleTests)
 import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session
@@ -73,6 +74,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , crossCuttingTests
   , hotSwapTests
   , busRoutingTests
+  , templateLifecycleTests
   , t9DirectEqualsReductionTests
   , c0aLoaderMetadataTests
   , c0bGlobalScheduleTests
