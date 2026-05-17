@@ -32,7 +32,12 @@ appDemoCatalogTests =
   testGroup "App demo manifest reload catalog"
   [ testCase "catalog includes only authored demos" $ do
       catalog <- catalogOrFail demoTable
-      map mrcDemoKey catalog @?= ["named-control", "send-return"]
+      map mrcDemoKey catalog @?=
+        [ "named-control"
+        , "send-return"
+        , "preserve-cutoff-dark"
+        , "preserve-cutoff-bright"
+        ]
 
   , testCase "catalog filters unauthored demo rows directly" $ do
       let unauthored = Demo
@@ -63,8 +68,48 @@ appDemoCatalogTests =
       catalog <- catalogOrFail demoTable
       namedControl <- entryOrFail "named-control" catalog
       sendReturn <- entryOrFail "send-return" catalog
+      preserveDark <- entryOrFail "preserve-cutoff-dark" catalog
+      preserveBright <- entryOrFail "preserve-cutoff-bright" catalog
       templateNames (mrcTemplateGraph namedControl) @?= ["named-control"]
       templateNames (mrcTemplateGraph sendReturn) @?= ["voice", "fx"]
+      templateNames (mrcTemplateGraph preserveDark) @?= ["drone"]
+      templateNames (mrcTemplateGraph preserveBright) @?= ["drone"]
+
+  , testCase "preserving demo pair manifests match their authoring reports" $ do
+      catalog <- catalogOrFail demoTable
+      preserveDark <- entryOrFail "preserve-cutoff-dark" catalog
+      preserveBright <- entryOrFail "preserve-cutoff-bright" catalog
+      mrcManifest preserveDark
+        @?= manifestFromReport "preserve-cutoff-dark"
+              preserveCutoffDarkAuthoring
+      mrcManifest preserveBright
+        @?= manifestFromReport "preserve-cutoff-bright"
+              preserveCutoffBrightAuthoring
+
+  , testCase "preserving demo pair plans through built-in catalog" $ do
+      catalog <- catalogOrFail demoTable
+      preserveDark <- entryOrFail "preserve-cutoff-dark" catalog
+      preserveBright <- entryOrFail "preserve-cutoff-bright" catalog
+      let doc = AuthoringManifestDoc
+            manifestSchemaVersion
+            (map mrcManifest catalog)
+          planFor key = ManifestReloadRequest
+            { mrrDemoKey        = key
+            , mrrSwapLabel      = SwapLabel key
+            , mrrResourcePolicy = defaultManifestResourcePolicy
+            }
+      case planManifestReload doc catalog (planFor "preserve-cutoff-dark") of
+        Left issue ->
+          assertFailure
+            ("expected preserve-cutoff-dark plan, got: " <> show issue)
+        Right plan ->
+          mrlpTemplateGraph plan @?= mrcTemplateGraph preserveDark
+      case planManifestReload doc catalog (planFor "preserve-cutoff-bright") of
+        Left issue ->
+          assertFailure
+            ("expected preserve-cutoff-bright plan, got: " <> show issue)
+        Right plan ->
+          mrlpTemplateGraph plan @?= mrcTemplateGraph preserveBright
 
   , testCase "catalog output is consumable by manifest reload planner" $ do
       catalog <- catalogOrFail demoTable

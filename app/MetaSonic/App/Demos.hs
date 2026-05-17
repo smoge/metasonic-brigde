@@ -26,6 +26,10 @@ module MetaSonic.App.Demos
   , namedControlGraph
   , namedControlAuthoring
   , sendReturnAuthoring
+  , preserveCutoffDarkAuthoring
+  , preserveCutoffBrightAuthoring
+  , dronePreserveSawDark
+  , dronePreserveSawBright
   ) where
 
 import           Data.Maybe                (catMaybes)
@@ -426,6 +430,89 @@ sendReturnAuthoring :: AuthoringReport
 sendReturnAuthoring = ensembleReport sendReturnEnsemble
 
 ------------------------------------------------------------
+-- Preserving hot-swap demo pair
+------------------------------------------------------------
+--
+-- Two audible app-side drone graphs that swap under the
+-- @try-preserving@ strategy and emit @MrhsrPreserving@. Both
+-- compile to a single "drone" template with the same migration
+-- keys ("carrier" on the sawOsc, "lpf" on the LPF). Only the LPF
+-- cutoff baseline differs: 'dronePreserveSawDark' opens at 600 Hz,
+-- 'dronePreserveSawBright' at 2400 Hz. A saw carrier (rather than
+-- the sine carrier used by 'MetaSonic.Pattern.Corpus.hotSwapEdit')
+-- has enough harmonic content above 600 Hz that the LPF cutoff
+-- change is audibly unmistakable.
+--
+-- The matching authoring reports declare one OSC control each,
+-- bound DIRECTLY to the LPF's @cutoff@ input (migration key "lpf",
+-- slot 0 — see KLPF in Types.hs). The binding intentionally does
+-- NOT route through 'Auth.control' / KSmooth, because KSmooth is
+-- 'PreserveUnsupported' in 'preservingHotSwapNodeClass'
+-- (RTGraphAdapter.hs) and would make the preserving reload reject.
+-- The trade-off is that OSC writes arrive unsmoothed — acceptable
+-- for a manual preserving demo. Smooth authored controls across
+-- preserving reload are a separate slice unless KSmooth becomes
+-- preservable.
+
+dronePreserveSawDark :: SynthGraph
+dronePreserveSawDark = runSynth $ do
+  carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
+  filtered <- tagged "lpf"     (lpf carrier (Param 600.0) (Param 0.7))
+  shaped   <- gain filtered (Param 0.2)
+  out 0 shaped
+
+dronePreserveSawBright :: SynthGraph
+dronePreserveSawBright = runSynth $ do
+  carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
+  filtered <- tagged "lpf"     (lpf carrier (Param 2400.0) (Param 0.7))
+  shaped   <- gain filtered (Param 0.2)
+  out 0 shaped
+
+-- | OSC control declaration for the dark preserving entry:
+-- display name "cutoff", direct binding to KLPF slot 0 via
+-- migration key "lpf", default matching the graph baseline.
+-- Unsmoothed (see header note).
+preserveCutoffControlDark :: Report.ReportedControl
+preserveCutoffControlDark = Report.ReportedControl
+  { Report.rcName        = "cutoff"
+  , Report.rcDefault     = 600.0
+  , Report.rcRange       = (200.0, 6000.0)
+  , Report.rcSmoothingHz = 0.0
+  , Report.rcCC          = Nothing
+  , Report.rcKey         = MigrationKey "lpf"
+  , Report.rcSlot        = 0
+  }
+
+-- | OSC control declaration for the bright preserving entry.
+-- Same binding shape as 'preserveCutoffControlDark' but the default
+-- matches the bright graph baseline.
+preserveCutoffControlBright :: Report.ReportedControl
+preserveCutoffControlBright = preserveCutoffControlDark
+  { Report.rcDefault = 2400.0 }
+
+preserveCutoffDarkAuthoring :: AuthoringReport
+preserveCutoffDarkAuthoring = emptyAuthoringReport
+  { Report.arTemplates =
+      [ Report.ReportedTemplate
+          { Report.rtName = "drone"
+          , Report.rtRole = Auth.VoiceTemplate
+          }
+      ]
+  , Report.arControls = [preserveCutoffControlDark]
+  }
+
+preserveCutoffBrightAuthoring :: AuthoringReport
+preserveCutoffBrightAuthoring = emptyAuthoringReport
+  { Report.arTemplates =
+      [ Report.ReportedTemplate
+          { Report.rtName = "drone"
+          , Report.rtRole = Auth.VoiceTemplate
+          }
+      ]
+  , Report.arControls = [preserveCutoffControlBright]
+  }
+
+------------------------------------------------------------
 
 data Demo = Demo
   { demoKey       :: String
@@ -498,6 +585,14 @@ demoTable =
          "Send/return (voice → BusOut 16 │ fx: BusIn 16 → LPF → Out, Phase 8.E/G)"
          (MultiTemplate sendReturnDemo)
          sendReturnAuthoring
+  , demoWithAuth "preserve-cutoff-dark"
+         "Preserving hot-swap source (saw drone @ LPF 600 Hz; OSC cutoff /v0/lpf/0)"
+         (MultiTemplate [("drone", dronePreserveSawDark)])
+         preserveCutoffDarkAuthoring
+  , demoWithAuth "preserve-cutoff-bright"
+         "Preserving hot-swap target (saw drone @ LPF 2400 Hz; OSC cutoff /v0/lpf/0)"
+         (MultiTemplate [("drone", dronePreserveSawBright)])
+         preserveCutoffBrightAuthoring
   , demoNoAuth "midi-poly"
          "Live MIDI poly synth (8 voices; CC7 → master, pitch-bend ±2)"
          (MidiPoly 8 midiPolySynth)
