@@ -209,40 +209,105 @@ import           MetaSonic.Bridge.Templates (BufferFootprint (..),
 import           MetaSonic.Types
 
 
-{- Note [Process-global FFI serialization guard]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{- Note [FFI lock: PortAudio lifecycle]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Conservative Haskell-side serialization guard for process-global state
-inside the C++/q_io runtime — not a claim that individual @Ptr RTGraph@
-handles are shared across Haskell threads.
+PortAudio's @Pa_Initialize@ / @Pa_Terminate@ maintain a process-global
+refcount backing the audio device session. The C side has no
+per-handle isolation around this state, so two concurrent
+@rt_graph_start_audio@ / @rt_graph_stop_audio@ calls on different
+@Ptr RTGraph@ handles could race on the refcount transition. The
+original SIGABRT investigation in commit @5629532@ named PortAudio
+refcount as one of three suspects but never exonerated it.
 
-The test suite intermittently aborts with glibc heap-corruption signals
-(@double free in tcache@, @unsorted double linked list corrupted@) when
-tasty runs many @withRTGraph@-bracketed tests in parallel on a threaded
-RTS. Each test owns its own @Ptr RTGraph@, so this is cross-handle, not
-intra-handle. The candidates for shared state below the FFI boundary are
-q_lib static lookup tables, the @ScheduleWorkerPool@ teardown path, and
-PortAudio refcount semantics.
+The 15-run ASan+UBSan validation pass in @d6bbfa2@ covered parallel
+render / swap / per-handle teardown activity but did not exercise
+audio start/stop under scheduling contention — those calls are off
+the test-default path. This suspect therefore remains unproven and
+the lock stays on the affected calls.
 
-Until the underlying race is identified and fixed in C++, lifecycle-
-sensitive entrypoints take a single process-global 'ffiLock'. The cost
-is serialization across handles for the wrapped calls; the gain is a
-deterministic test suite. Pure metadata reads
-(@c_rt_graph_capacity@, plugin registry, swap generation counters,
-test-only introspection getters) are intentionally unwrapped.
+Guarded calls: @c_rt_graph_start_audio@, @c_rt_graph_stop_audio@,
+@c_rt_graph_clear@ (which routes through @stop_audio_stream@ on the
+C side). @c_rt_graph_wait_started@ is deliberately exempt — see its
+import site.
 
-If the C++ teardown race is fixed or the worker pool is isolated per
-handle, this can be narrowed to a per-handle lock or removed entirely.
+Drop this lock when either:
+
+  (a) a focused parallel audio-cycle test runs clean under ASan, or
+  (b) the C side adds a process-level mutex around the refcount.
+
+Evidence trail:
+@notes\/2026-05-16-b-ffi-serialization-guard-and-audible-osc-runbook.md@.
 -}
 
--- | Process-global serialization for lifecycle-sensitive FFI calls.
--- See Note [Process-global FFI serialization guard].
+
+{- Note [FFI lock: ScheduleWorkerPool teardown]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The per-@Ptr RTGraph@ @ScheduleWorkerPool@ spawns OS threads when
+@worker_pool_size > 1@. The C++ teardown path
+(@g->worker_pool.stop_workers()@ at @tinysynth/rt_graph.cpp:8740@,
+also called transitively by @rt_graph_clear@ via
+@reset_to_default_state@ and by @rt_graph_test_set_worker_pool_size@
+via @ScheduleWorkerPool::set_size@ at @rt_graph.cpp:2374@) joins those
+threads. The @5629532@ investigation flagged "bad join interleavings
+across handles" as the most plausible remaining failure mode.
+
+The @d6bbfa2@ ASan validation ran with the test-default worker pool
+size (1, no extra threads), so the teardown join path was not
+exercised under contention. This suspect remains unproven.
+
+Guarded calls: @c_rt_graph_destroy@, @c_rt_graph_clear@,
+@c_rt_graph_test_set_worker_pool_size@. The setter is grouped here
+because @set_size@ internally calls @stop_workers@; leaving it
+unlocked while @destroy@ stays locked would expose the same join
+path through a back door.
+
+Drop this lock when either:
+
+  (a) a focused parallel destroy / clear / set-size test with
+      @worker_pool_size > 1@ runs clean under ASan, or
+  (b) the C side guarantees thread-safe teardown.
+
+Evidence trail:
+@notes\/2026-05-16-b-ffi-serialization-guard-and-audible-osc-runbook.md@.
+-}
+
+
+{- Note [Retired suspect: MIDI dangling-lifetime guard]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Originally the third unproven suspect named in @5629532@:
+@cycfi::q::midi_device::list()@ returned @midi_device@ objects that
+borrowed @impl@ by reference into a static accumulator, so a later
+@list()@ call clear()ed that accumulator and dangled every prior
+@midi_device@. The transitive reach through @rt_session_midi_source_open@
+made the failure appear under render-time FFI calls, which is why
+the original process-global guard pinned them.
+
+Fixed at the C++ level in commit @e5ed3d9@ via the local shadow
+header @tinysynth/q_io/midi_device.hpp@: @midi_device@ now owns
+@impl@ by value, so the dangling-reference pattern can no longer
+arise from the type contract. The @d6bbfa2@ ASan validation
+exercised this surface across idle, CPU-stressed, and deprioritized
+load (15 runs total, no reports).
+
+Documenting the retirement here so future readers see why this
+third suspect is no longer cited as a reason for any remaining
+lock, and why render-time and per-handle swap-protocol calls are
+no longer wrapped.
+-}
+
+-- | Process-global serialization for the two remaining unproven
+-- suspects. See Notes above for the per-suspect rationale and
+-- drop conditions.
 {-# NOINLINE ffiLock #-}
 ffiLock :: MVar ()
 ffiLock = unsafePerformIO (newMVar ())
 
 -- | Take 'ffiLock' for the duration of an FFI call. Used by the
--- @c_rt_graph_*@ wrappers below to gate lifecycle-sensitive entries.
+-- five @c_rt_graph_*@ wrappers that still guard the PortAudio
+-- lifecycle and @ScheduleWorkerPool@ teardown suspects.
 withFfiLock :: IO a -> IO a
 withFfiLock action = withMVar ffiLock $ \_ -> action
 
@@ -478,14 +543,17 @@ foreign import ccall unsafe "rt_graph_create"
 foreign import ccall safe "rt_graph_destroy"
   c_rt_graph_destroy_raw :: Ptr RTGraph -> IO ()
 
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
+-- | Locked wrapper. See Note [FFI lock: ScheduleWorkerPool teardown].
 c_rt_graph_destroy :: Ptr RTGraph -> IO ()
 c_rt_graph_destroy g = withFfiLock (c_rt_graph_destroy_raw g)
 
 foreign import ccall safe "rt_graph_clear"
   c_rt_graph_clear_raw :: Ptr RTGraph -> IO ()
 
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
+-- | Locked wrapper. See Notes [FFI lock: PortAudio lifecycle] and
+-- [FFI lock: ScheduleWorkerPool teardown] (rt_graph_clear routes
+-- through stop_audio_stream and reset_to_default_state on the C
+-- side, so it appears under both suspects).
 c_rt_graph_clear :: Ptr RTGraph -> IO ()
 c_rt_graph_clear g = withFfiLock (c_rt_graph_clear_raw g)
 
@@ -617,11 +685,7 @@ foreign import ccall unsafe "rt_graph_connect"
   c_rt_graph_connect :: Ptr RTGraph -> CInt -> CInt -> CInt -> CInt -> IO ()
 
 foreign import ccall unsafe "rt_graph_process"
-  c_rt_graph_process_raw :: Ptr RTGraph -> CInt -> IO ()
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_process :: Ptr RTGraph -> CInt -> IO ()
-c_rt_graph_process g n = withFfiLock (c_rt_graph_process_raw g n)
+  c_rt_graph_process :: Ptr RTGraph -> CInt -> IO ()
 
 foreign import ccall unsafe "rt_graph_capacity"
   c_rt_graph_capacity :: Ptr RTGraph -> IO CInt
@@ -635,7 +699,7 @@ foreign import ccall unsafe "rt_graph_audio_running"
 foreign import ccall safe "rt_graph_start_audio"
   c_rt_graph_start_audio_raw :: Ptr RTGraph -> CInt -> CInt -> IO CInt
 
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
+-- | Locked wrapper. See Note [FFI lock: PortAudio lifecycle].
 c_rt_graph_start_audio :: Ptr RTGraph -> CInt -> CInt -> IO CInt
 c_rt_graph_start_audio g chans dev =
   withFfiLock (c_rt_graph_start_audio_raw g chans dev)
@@ -651,59 +715,36 @@ foreign import ccall safe "rt_graph_wait_started"
 foreign import ccall safe "rt_graph_stop_audio"
   c_rt_graph_stop_audio_raw :: Ptr RTGraph -> IO ()
 
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
+-- | Locked wrapper. See Note [FFI lock: PortAudio lifecycle].
 c_rt_graph_stop_audio :: Ptr RTGraph -> IO ()
 c_rt_graph_stop_audio g = withFfiLock (c_rt_graph_stop_audio_raw g)
 
 -- | Allocate an empty next-world swap for the target. Low-level ABI:
 -- callers own the returned pointer until cancel or successful publish.
 foreign import ccall safe "rt_graph_prepare_swap"
-  c_rt_graph_prepare_swap_raw :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_prepare_swap :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
-c_rt_graph_prepare_swap g = withFfiLock (c_rt_graph_prepare_swap_raw g)
+  c_rt_graph_prepare_swap :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
 
 -- | Move an offline builder graph's swappable world into a prepared
 -- swap for the target. Potentially walks graph metadata and allocates
 -- the migration plan, so this import is safe.
 foreign import ccall safe "rt_graph_prepare_swap_from_graph"
-  c_rt_graph_prepare_swap_from_graph_raw
+  c_rt_graph_prepare_swap_from_graph
     :: Ptr RTGraph -> Ptr RTGraph -> IO (Ptr RTGraphSwap)
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_prepare_swap_from_graph
-  :: Ptr RTGraph -> Ptr RTGraph -> IO (Ptr RTGraphSwap)
-c_rt_graph_prepare_swap_from_graph tgt src =
-  withFfiLock (c_rt_graph_prepare_swap_from_graph_raw tgt src)
 
 -- | Dispose an unpublished or collected swap off-audio.
 foreign import ccall safe "rt_graph_cancel_swap"
-  c_rt_graph_cancel_swap_raw :: Ptr RTGraph -> Ptr RTGraphSwap -> IO ()
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_cancel_swap :: Ptr RTGraph -> Ptr RTGraphSwap -> IO ()
-c_rt_graph_cancel_swap g s = withFfiLock (c_rt_graph_cancel_swap_raw g s)
+  c_rt_graph_cancel_swap :: Ptr RTGraph -> Ptr RTGraphSwap -> IO ()
 
 -- | Publish a prepared swap to be installed at the next block
 -- boundary. Returns 1 on success, 0 if the target already has a swap
 -- pending/installing/retired.
 foreign import ccall unsafe "rt_graph_publish_swap"
-  c_rt_graph_publish_swap_raw :: Ptr RTGraph -> Ptr RTGraphSwap -> IO CInt
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_publish_swap :: Ptr RTGraph -> Ptr RTGraphSwap -> IO CInt
-c_rt_graph_publish_swap g s = withFfiLock (c_rt_graph_publish_swap_raw g s)
+  c_rt_graph_publish_swap :: Ptr RTGraph -> Ptr RTGraphSwap -> IO CInt
 
 -- | Collect an installed retired swap, if any. Returned pointer must
 -- be disposed with c_rt_graph_cancel_swap.
 foreign import ccall unsafe "rt_graph_collect_retired_swap"
-  c_rt_graph_collect_retired_swap_raw :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_collect_retired_swap :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
-c_rt_graph_collect_retired_swap g =
-  withFfiLock (c_rt_graph_collect_retired_swap_raw g)
+  c_rt_graph_collect_retired_swap :: Ptr RTGraph -> IO (Ptr RTGraphSwap)
 
 foreign import ccall unsafe "rt_graph_swap_generation"
   c_rt_graph_swap_generation :: Ptr RTGraph -> IO CInt
@@ -769,12 +810,7 @@ foreign import ccall unsafe "rt_graph_plugin_state_size_bytes"
 -- (default), behaviour is unchanged. Test-only — not for use in
 -- normal rendering or live audio paths.
 foreign import ccall unsafe "rt_graph_test_set_reduction_capture"
-  c_rt_graph_test_set_reduction_capture_raw :: Ptr RTGraph -> CInt -> IO ()
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_test_set_reduction_capture :: Ptr RTGraph -> CInt -> IO ()
-c_rt_graph_test_set_reduction_capture g flag =
-  withFfiLock (c_rt_graph_test_set_reduction_capture_raw g flag)
+  c_rt_graph_test_set_reduction_capture :: Ptr RTGraph -> CInt -> IO ()
 
 -- | §4.E.2.C0c test surface: toggle the serial executor that consumes
 -- the per-block global schedule. When non-zero, metadata-bearing
@@ -783,14 +819,8 @@ c_rt_graph_test_set_reduction_capture g flag =
 -- for the whole block. Test-only — not for normal rendering or live
 -- audio paths.
 foreign import ccall unsafe "rt_graph_test_set_global_schedule_execution"
-  c_rt_graph_test_set_global_schedule_execution_raw
+  c_rt_graph_test_set_global_schedule_execution
     :: Ptr RTGraph -> CInt -> IO ()
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_test_set_global_schedule_execution
-  :: Ptr RTGraph -> CInt -> IO ()
-c_rt_graph_test_set_global_schedule_execution g flag =
-  withFfiLock (c_rt_graph_test_set_global_schedule_execution_raw g flag)
 
 -- | §4.E.2.C1 test surface: configure the RTGraph-owned worker pool.
 -- Values <= 1 keep the schedule executor purely serial; values > 1
@@ -799,7 +829,9 @@ c_rt_graph_test_set_global_schedule_execution g flag =
 foreign import ccall unsafe "rt_graph_test_set_worker_pool_size"
   c_rt_graph_test_set_worker_pool_size_raw :: Ptr RTGraph -> CInt -> IO ()
 
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
+-- | Locked wrapper. See Note [FFI lock: ScheduleWorkerPool teardown].
+-- set_size internally calls stop_workers (rt_graph.cpp:2374), the
+-- same join path that gates destroy / clear.
 c_rt_graph_test_set_worker_pool_size :: Ptr RTGraph -> CInt -> IO ()
 c_rt_graph_test_set_worker_pool_size g size =
   withFfiLock (c_rt_graph_test_set_worker_pool_size_raw g size)
@@ -945,12 +977,7 @@ foreign import ccall unsafe "rt_graph_test_global_schedule_band_entry_count"
 -- the offline test path; production code reads buses via the realtime
 -- callback.
 foreign import ccall unsafe "rt_graph_read_bus"
-  c_rt_graph_read_bus_raw :: Ptr RTGraph -> CInt -> CInt -> Ptr CFloat -> IO CInt
-
--- | Locked wrapper. See Note [Process-global FFI serialization guard].
-c_rt_graph_read_bus :: Ptr RTGraph -> CInt -> CInt -> Ptr CFloat -> IO CInt
-c_rt_graph_read_bus g bus n buf =
-  withFfiLock (c_rt_graph_read_bus_raw g bus n buf)
+  c_rt_graph_read_bus :: Ptr RTGraph -> CInt -> CInt -> Ptr CFloat -> IO CInt
 
 -- ----------------------------------------------------------------
 -- Multi-template ABI bindings (§2.D.3)
