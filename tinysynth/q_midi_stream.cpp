@@ -13,9 +13,9 @@
 // calling Pm_Close. The upstream version called
 // Pm_Close(reinterpret_cast<PortMidiStream*>(_impl)) unconditionally,
 // which on hosts where Pm_OpenInput failed (no /dev/snd/seq access,
-// busy device, ghost device left over from a prior list() call --
-// see the patch in q_midi_device.cpp) crashes with a segfault on
-// some PortMIDI builds. The guard is one line and matches the same
+// busy device, or backend-reported device that cannot actually be
+// opened) crashes with a segfault on some PortMIDI builds. The guard
+// is one line and matches the same
 // _impl-null check Q already does in next() at line ~50.
 //
 // When upstream Q lands the same guard, this file can go away in

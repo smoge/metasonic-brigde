@@ -7,6 +7,18 @@ copyright: "2026 Bernardo Barros"
 synopsis: MetaSonic bridge between Haskell graph compiler and RT engine
 category: Audio
 
+# Build flags for diagnostic tooling. AddressSanitizer + UBSan target
+# the parallel-test heap corruption seen in commit 5629532 and again
+# while landing the serial-default test gate. Off by default; enable
+# via `stack build --flag metasonic-bridge:asan` or the matching
+# `just stack-test-parallel-asan` recipe. See justfile for env-var
+# tuning.
+flags:
+  asan:
+    description: Compile and link the C++ runtime with AddressSanitizer + UBSan.
+    default: false
+    manual: true
+
 dependencies:
   - base >= 4.14 && < 5
   - bytestring
@@ -126,6 +138,15 @@ library:
     - portmidi
     - asound
 
+  when:
+    - condition: flag(asan)
+      cxx-options:
+        - -fsanitize=address,undefined
+        - -fno-omit-frame-pointer
+        - -g
+      ld-options:
+        - -fsanitize=address,undefined
+
 # Thin app that imports the library. No C++ here
 
 executables:
@@ -235,3 +256,7 @@ tests:
       - tasty-hunit
       - tasty-quickcheck
       - QuickCheck
+    when:
+      - condition: flag(asan)
+        ld-options:
+          - -fsanitize=address,undefined

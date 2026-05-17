@@ -15,6 +15,11 @@ license:        GPL-3.0-only
 license-file:   LICENSE
 build-type:     Simple
 
+flag asan
+  description: Compile and link the C++ runtime with AddressSanitizer + UBSan.
+  manual: True
+  default: False
+
 library
   exposed-modules:
       MetaSonic.Types
@@ -123,6 +128,9 @@ library
     , vty
     , vty-crossplatform
   default-language: Haskell2010
+  if flag(asan)
+    cxx-options: -fsanitize=address,undefined -fno-omit-frame-pointer -g
+    ld-options: -fsanitize=address,undefined
 
 executable metasonic-bridge
   main-is: Main.hs
@@ -259,3 +267,5 @@ test-suite metasonic-bridge-test
     , vty
     , vty-crossplatform
   default-language: Haskell2010
+  if flag(asan)
+    ld-options: -fsanitize=address,undefined

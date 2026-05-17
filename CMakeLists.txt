@@ -98,6 +98,7 @@ if(METASONIC_BUILD_TESTS)
         tests/midi_voice_processor_test.cpp
         tests/midi_demo_test.cpp
         tests/session_midi_source_test.cpp
+        tests/q_midi_device_test.cpp
     )
 
     target_link_libraries(tinysynth_tests PRIVATE

@@ -30,11 +30,11 @@
 // process, and serialize open/close calls. This is enough for the demo
 // runner's intended use: one producer worker feeding one RTGraph.
 //
-// Why: Q's midi_device objects borrow process-global listing storage
-// (see tinysynth/q_midi_device.cpp). Supporting concurrent opens safely
-// would need a process-wide guard around list() -> probe ->
-// q::midi_input_stream construction, or the cleaner upstream fix where
-// midi_device owns its impl by value.
+// Why: q_io / PortMIDI stream open and close still touch
+// process-global backend state, and the demo owns one producer worker
+// feeding one RTGraph. midi_device listing results are self-contained
+// now; the remaining single-session contract is about the live stream
+// lifecycle, not listing-object lifetime.
 //
 // Graceful no-device behavior: the worker walks
 // q::midi_device::list() and only constructs a q::midi_input_stream

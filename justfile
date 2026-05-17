@@ -10,6 +10,18 @@ default:
 stack-build:
     stack build
 
+# AddressSanitizer + UBSan diagnostic build, isolated from the
+# default .stack-work cache. Switching the asan flag in and out of
+# the same .stack-work corrupted the link step: stale ASan-
+# instrumented cxx-source .o files survived into a later
+# unsanitized link and surfaced as undefined __asan_* references.
+# Pinning the diagnostic lane to .stack-work-asan keeps both
+# caches consistent and removes the need for stack clean between
+# runs. .stack-work-asan/ is ignored like the default .stack-work/
+# cache.
+stack-build-asan:
+    stack build --work-dir .stack-work-asan --flag metasonic-bridge:asan
+
 metasonic name="":
     stack exec -- metasonic-bridge {{name}}
 
@@ -66,6 +78,18 @@ stack-test:
 
 stack-test-parallel:
     stack test
+
+# Run the full suite under AddressSanitizer + UBSan with parallel
+# Tasty enabled. Targets the heap-corruption race the serial-default
+# gate currently masks. detect_leaks=0 keeps GHC's GC retention from
+# generating noise; fast_unwind_on_malloc=0 trades speed for accurate
+# allocation-site stacks at corruption time. Uses the isolated
+# .stack-work-asan cache so it never contaminates the default build
+# (see stack-build-asan for the rationale).
+stack-test-parallel-asan:
+    ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:fast_unwind_on_malloc=0:print_stacktrace=1 \
+    UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+    stack test --work-dir .stack-work-asan --flag metasonic-bridge:asan
 
 notes-html:
     ./tools/render_notes_html.sh
