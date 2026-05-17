@@ -238,6 +238,10 @@ Drop this lock when either:
 
 Evidence trail:
 @notes\/2026-05-16-b-ffi-serialization-guard-and-audible-osc-runbook.md@.
+The 10-run varied-load pass in @5a66054@ validated the narrowed
+lock boundary itself (no aborts under idle / CPU-stress / niced
+load) but did not exercise the audio start/stop path either, so
+it does not exonerate this suspect.
 -}
 
 
@@ -271,6 +275,10 @@ Drop this lock when either:
 
 Evidence trail:
 @notes\/2026-05-16-b-ffi-serialization-guard-and-audible-osc-runbook.md@.
+The 10-run varied-load pass in @5a66054@ validated the narrowed
+lock boundary itself (no aborts under idle / CPU-stress / niced
+load) but ran with the test-default worker pool size (1), so it
+does not exonerate this suspect either.
 -}
 
 
