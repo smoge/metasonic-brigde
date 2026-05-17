@@ -20,13 +20,7 @@
 -- only used by these tests and travel here too; the broader
 -- 'compileBoth' / 't9CorpusGraphs' / 't9CorpusTemplates' still come
 -- from the parent module.
-module MetaSonic.Spec.FFI.C0a
-  ( c0aLoaderMetadataTests
-  , expectedScheduleStepItems
-  , readScheduleSteps
-  , assertLoaderShipsScheduleRG
-  , assertLoaderShipsScheduleTG
-  ) where
+module MetaSonic.Spec.FFI.C0a (c0aLoaderMetadataTests) where
 
 import           Control.Monad              (forM, forM_, when)
 import           Data.List                  (sort)

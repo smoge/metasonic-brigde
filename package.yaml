@@ -246,6 +246,7 @@ tests:
       - MetaSonic.Spec.FFI.C0c
       - MetaSonic.Spec.FFI.C0d
       - MetaSonic.Spec.FFI.C1c
+      - MetaSonic.Spec.FFI.HotSwap
       - MetaSonic.Spec.FFI.T9
       - MetaSonic.Spec.Feature
       - MetaSonic.Spec.PatternOSCBuffer
