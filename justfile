@@ -62,6 +62,9 @@ osc-tool-test:
     python3 tools/test_send_osc.py
 
 stack-test:
+    stack test --test-arguments '--num-threads=1'
+
+stack-test-parallel:
     stack test
 
 notes-html:
