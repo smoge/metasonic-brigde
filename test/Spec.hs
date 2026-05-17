@@ -31,6 +31,7 @@ import           MetaSonic.Spec.AppManifestReloadSupervisor
 import           MetaSonic.Spec.AppManifestReloadUIIngress
 import           MetaSonic.Spec.Core
 import           MetaSonic.Spec.FFI
+import           MetaSonic.Spec.FFI.C0c   (c0cScheduleExecutorTests)
 import           MetaSonic.Spec.FFI.C0d   (c0dGlobalScheduleBandTests)
 import           MetaSonic.Spec.FFI.C1c   (c1cWorkerScheduleTests)
 import           MetaSonic.Spec.Feature

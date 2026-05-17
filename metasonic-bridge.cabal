@@ -235,6 +235,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.Core
       MetaSonic.Spec.Driver
       MetaSonic.Spec.FFI
+      MetaSonic.Spec.FFI.C0c
       MetaSonic.Spec.FFI.C0d
       MetaSonic.Spec.FFI.C1c
       MetaSonic.Spec.Feature
