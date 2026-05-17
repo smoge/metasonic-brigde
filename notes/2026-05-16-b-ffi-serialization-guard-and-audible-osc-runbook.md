@@ -393,3 +393,78 @@ Next evidence pass before any lock or default change: 10+ clean
 runs of `just stack-test-parallel-asan` under varied machine load
 (idle vs. concurrent CPU-bound work vs. `nice` deprioritized),
 documented in this same note as a separate section.
+
+### Extended pass: varied load
+
+Date: 2026-05-17
+
+Status: ten additional runs of `just stack-test-parallel-asan`
+against `e5ed3d9`, spread across three load conditions. This
+addresses the load-dependence of the original race: five idle
+passes is not statistically different from one idle pass, and the
+crash captured in `5629532` only fired when test threads were
+competing for cores. Ten clean runs across three regimes is the
+first evidence that speaks to that failure mode.
+
+Host kernel, sanitizer environment, and work-dir isolation are
+unchanged from the previous section. The only variation is the
+load profile per run.
+
+| #  | Started (local)        | Load condition                                | Tasty time | Wall | Result |
+|----|------------------------|-----------------------------------------------|-----------:|-----:|--------|
+| 1  | 2026-05-17T18:51:11-03:00 | idle                                          | 0.62s      | 2s   | PASS   |
+| 2  | 2026-05-17T18:51:13-03:00 | idle                                          | 0.63s      | 1s   | PASS   |
+| 3  | 2026-05-17T18:51:14-03:00 | idle                                          | 0.66s      | 1s   | PASS   |
+| 4  | 2026-05-17T18:51:15-03:00 | idle                                          | 0.61s      | 1s   | PASS   |
+| 5  | 2026-05-17T18:51:17-03:00 | concurrent `stress-ng --cpu 14 --timeout 30s` | 4.86s      | 7s   | PASS   |
+| 6  | 2026-05-17T18:51:47-03:00 | concurrent `stress-ng --cpu 14 --timeout 30s` | 3.43s      | 5s   | PASS   |
+| 7  | 2026-05-17T18:52:17-03:00 | concurrent `stress-ng --cpu 14 --timeout 30s` | 3.31s      | 5s   | PASS   |
+| 8  | 2026-05-17T18:52:47-03:00 | `nice -n 19 just stack-test-parallel-asan`    | 0.74s      | 1s   | PASS   |
+| 9  | 2026-05-17T18:52:48-03:00 | `nice -n 19 just stack-test-parallel-asan`    | 0.74s      | 2s   | PASS   |
+| 10 | 2026-05-17T18:52:50-03:00 | `nice -n 19 just stack-test-parallel-asan`    | 0.92s      | 1s   | PASS   |
+
+All 10 runs: 1141 Tasty tests, no AddressSanitizer aborts, no
+UndefinedBehaviorSanitizer reports.
+
+The CPU-stress runs' Tasty time (3.3–4.9s) is ~5–8× the idle
+baseline (~0.6s), confirming the stressor actually competed with
+Tasty workers for the 14 cores (`nproc` on this host) rather than
+running on idle headroom. That is the scheduling pressure
+condition the original `5629532` race depended on; the lifetime
+fix in `e5ed3d9` did not regress under it.
+
+### Verdict (after 5 idle + 10 varied-load runs)
+
+Fifteen total clean ASan+UBSan runs against `e5ed3d9` across idle,
+contended, and deprioritized conditions. This is the first evidence
+pass that meaningfully addresses the load-dependent failure mode
+the `5629532` lock was patching.
+
+What this now establishes:
+
+- The MIDI-lifetime fix in `e5ed3d9` is stable under sustained
+  parallel sanitizer load on this host kernel.
+- The C++ runtime, exercised through the entire Haskell test
+  corpus, does not surface any other ASan-detectable corruption
+  under the same scheduling pressure that previously fired the
+  `5629532` SIGABRT.
+
+What this still does **not** establish:
+
+- That `ScheduleWorkerPool` teardown and PortAudio refcount
+  semantics (the other two suspects named in `5629532`) are
+  race-free. The current test corpus may not stress those code
+  paths under enough scheduling pressure to fire any latent race.
+- That the same result holds on a different host kernel, glibc
+  version, or CPU count.
+
+### Next slice (separate commit)
+
+With this evidence in place, the next slice is the lock-narrowing
+or removal decision. That belongs in its own commit, with its own
+failure-mode argument referencing this section and the inline
+`Note [Process-global FFI serialization guard]` in
+[src/MetaSonic/Bridge/FFI.hs](../src/MetaSonic/Bridge/FFI.hs).
+Relaxing the `just stack-test` serial default to parallel is a
+further separate commit after that, contingent on the lock change
+holding green.
