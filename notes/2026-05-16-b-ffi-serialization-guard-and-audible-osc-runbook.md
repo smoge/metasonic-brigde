@@ -333,3 +333,63 @@ convention going.
   arc retrospective; Wave 5 introduces `--manifest-live-reload-demo`.
 - [notes/2026-05-16-a-manifest-midi-smoke-operator-recap.md](2026-05-16-a-manifest-midi-smoke-operator-recap.md) —
   sibling operator pass on the MIDI side.
+
+## ASan Validation Against e5ed3d9
+
+Date: 2026-05-17
+
+Status: first sanitizer-evidence pass after `e5ed3d9`
+(`Make midi_device own impl by value; add ASan diagnostic lane`).
+Five consecutive runs of `just stack-test-parallel-asan` against the
+fixed C++ side. Five clean runs is enough to say the MIDI lifetime
+fix did not immediately regress under the known sanitizer lane; it
+is **not** enough to claim the process-global FFI guard from
+`5629532` is obsolete. Lock narrowing would need 10+ clean runs
+under varied load and is a separate, later commit with its own
+failure-mode argument.
+
+### Environment
+
+- Host kernel: `Linux 6.17.10-100.fc41.x86_64 #1 SMP PREEMPT_DYNAMIC Mon Dec  1 16:10:21 UTC 2025 x86_64 GNU/Linux`
+- Stack flag: `metasonic-bridge:asan` (`-fsanitize=address,undefined`)
+- Sanitizer options:
+  `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:fast_unwind_on_malloc=0:print_stacktrace=1`
+  / `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`
+- Work-dir: `.stack-work-asan` (isolated from default `.stack-work`)
+- Tasty parallelism: defaults to `numCapabilities`
+
+### Runs
+
+| # | Started (local)        | Result | Tasty (count / time)    | Wall  |
+|---|------------------------|--------|-------------------------|-------|
+| 1 | 2026-05-17T18:40:09-03:00 | PASS   | 1141 tests in 0.85s     | 2s    |
+| 2 | 2026-05-17T18:40:11-03:00 | PASS   | 1141 tests in 0.82s     | 2s    |
+| 3 | 2026-05-17T18:40:13-03:00 | PASS   | 1141 tests in 0.71s     | 1s    |
+| 4 | 2026-05-17T18:40:14-03:00 | PASS   | 1141 tests in 0.83s     | 2s    |
+| 5 | 2026-05-17T18:40:15-03:00 | PASS   | 1141 tests in 0.71s     | 2s    |
+
+No AddressSanitizer aborts. No UndefinedBehaviorSanitizer reports.
+Test count constant across runs.
+
+### Verdict
+
+The MIDI-lifetime fix in `e5ed3d9` survives parallel Tasty execution
+under ASan + UBSan over five consecutive runs on this host. That
+result is consistent with the documented mechanism: `midi_device`
+now owns its `impl` by value (via the local shadow header
+[tinysynth/q_io/midi_device.hpp](../tinysynth/q_io/midi_device.hpp)),
+so the old "later `list()` call dangles every prior `midi_device`"
+pattern can no longer arise from the type contract.
+
+What this evidence does **not** establish:
+
+- That the other two suspects originally named in `5629532`
+  (`ScheduleWorkerPool` teardown, PortAudio refcount semantics)
+  are race-free under parallel test load.
+- That the process-global FFI lock from `5629532` is removable.
+- That the serial-default gate from `a6cba56` can be relaxed.
+
+Next evidence pass before any lock or default change: 10+ clean
+runs of `just stack-test-parallel-asan` under varied machine load
+(idle vs. concurrent CPU-bound work vs. `nice` deprioritized),
+documented in this same note as a separate section.
