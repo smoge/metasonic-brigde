@@ -2963,44 +2963,7 @@ compileBoth name g = do
                 >> error "unreachable"
   pure (rtUn, rtF)
 
-t9DirectEqualsReductionTests :: TestTree
-t9DirectEqualsReductionTests =
-  let nframes = 256
-      blocks  = 4   -- enough to cover BusInDelayed's prev-pool path
-                    -- (block 2 picks up block 1's folded writes via
-                    -- the swap; later blocks expose any state-
-                    -- continuity drift in oscillators / filters).
-  in testGroup "T-9: direct ≡ reduction"
-       [ testGroup "single template, unfused loader"
-           [ testCase name $ do
-               (rtUn, _) <- compileBoth name g
-               assertDirectEqualsReductionRG
-                 name loadRuntimeGraph rtUn nframes blocks
-           | (name, g) <- t9CorpusGraphs
-           ]
-
-       , testGroup "single template, fused loader"
-           [ testCase name $ do
-               (_, rtF) <- compileBoth name g
-               assertDirectEqualsReductionRG
-                 name loadRuntimeGraphFused rtF nframes blocks
-           | (name, g) <- t9CorpusGraphs
-           ]
-
-       , testGroup "multi-template, unfused loader"
-           [ testCase name $
-               assertDirectEqualsReductionTG
-                 name loadTemplateGraph tg nframes blocks
-           | (name, tg) <- t9CorpusTemplates
-           ]
-
-       , testGroup "multi-template, fused loader"
-           [ testCase name $
-               assertDirectEqualsReductionTG
-                 name loadTemplateGraphFused tg nframes blocks
-           | (name, tg) <- t9CorpusTemplates
-           ]
-       ]
+-- T-9 direct ≡ reduction tests now live in "MetaSonic.Spec.FFI.T9".
 
 ------------------------------------------------------------
 -- Phase 4.E.2.C0a: layer-aware loader metadata
