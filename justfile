@@ -74,18 +74,27 @@ osc-tool-test:
     python3 tools/test_send_osc.py
 
 stack-test:
-    stack test --test-arguments '--num-threads=1'
-
-stack-test-parallel:
     stack test
 
+# Explicit serial-default escape hatch. Tasty's default parallelism
+# (numCapabilities) is normally fine after the lock-narrowing work
+# in 5a66054 + the MIDI lifetime fix in e5ed3d9 + ASan validation
+# (see notes/2026-05-17-c-default-test-lane-relaxed.md). Use this
+# recipe if you want to bisect a new heap-corruption signal against
+# parallelism specifically, or as the safe lane when adding tests
+# that drive process-global C state the remaining FFI locks do not
+# cover (PortAudio lifecycle, ScheduleWorkerPool teardown).
+stack-test-serial:
+    stack test --test-arguments '--num-threads=1'
+
 # Run the full suite under AddressSanitizer + UBSan with parallel
-# Tasty enabled. Targets the heap-corruption race the serial-default
-# gate currently masks. detect_leaks=0 keeps GHC's GC retention from
-# generating noise; fast_unwind_on_malloc=0 trades speed for accurate
-# allocation-site stacks at corruption time. Uses the isolated
-# .stack-work-asan cache so it never contaminates the default build
-# (see stack-build-asan for the rationale).
+# Tasty enabled. Used as the diagnostic lane against the two
+# still-unproven FFI-lock suspects (PortAudio lifecycle,
+# ScheduleWorkerPool teardown). detect_leaks=0 keeps GHC's GC
+# retention from generating noise; fast_unwind_on_malloc=0 trades
+# speed for accurate allocation-site stacks at corruption time.
+# Uses the isolated .stack-work-asan cache so it never contaminates
+# the default build (see stack-build-asan for the rationale).
 stack-test-parallel-asan:
     ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:fast_unwind_on_malloc=0:print_stacktrace=1 \
     UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
