@@ -262,6 +262,7 @@ tests:
       - MetaSonic.Spec.Session.FanInService
       - MetaSonic.Spec.Session.Host
       - MetaSonic.Spec.Session.LiveHotSwap
+      - MetaSonic.Spec.Session.OSCProducer
       - MetaSonic.Spec.Session.Owner
       - MetaSonic.Spec.Session.PatternProducer
       - MetaSonic.Spec.Session.PreservingHotSwap
