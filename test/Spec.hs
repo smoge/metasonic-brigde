@@ -49,6 +49,7 @@ import           MetaSonic.Spec.Session.ArbitrationGateway
                    (sessionArbitrationGatewayTests)
 import           MetaSonic.Spec.Session.Command (sessionCommandTests)
 import           MetaSonic.Spec.Session.ControlTarget (controlTargetTests)
+import           MetaSonic.Spec.Session.FanInHost (sessionFanInHostTests)
 import           MetaSonic.Spec.Session.Host (sessionHostTests)
 import           MetaSonic.Spec.Session.LiveHotSwap
                    (sessionLiveHotSwapOrchestrationTests)
