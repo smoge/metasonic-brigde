@@ -4,6 +4,7 @@ module MetaSonic.Spec.SessionShared
   , totalTemplateNodes
   , withInstalledAdapter
   , duplicateFirstTwoTemplates
+  , compileTemplateGraphOrFail
   ) where
 
 import qualified Data.Text                       as T
@@ -13,7 +14,9 @@ import           Test.Tasty.HUnit                (assertFailure)
 
 import           MetaSonic.Bridge.Compile        (rgNodes)
 import           MetaSonic.Bridge.FFI            (RTGraph, withRTGraph)
+import           MetaSonic.Bridge.Source         (SynthGraph)
 import           MetaSonic.Bridge.Templates      (TemplateGraph (..),
+                                                  compileTemplateGraph,
                                                   tgTemplates, tplGraph,
                                                   tplName)
 import           MetaSonic.Session.Queue         (ProducerId (..), ProducerKind)
@@ -66,3 +69,16 @@ duplicateFirstTwoTemplates base =
            }
     _ ->
       error "expected at least two templates for duplicate-name test"
+
+-- | Compile a list of @(name, SynthGraph)@ pairs into a
+-- 'TemplateGraph', aborting the test loudly via 'assertFailure'
+-- if 'compileTemplateGraph' rejects the input. Used by hot-swap
+-- and preserving-migration cases that need a freshly-compiled
+-- target graph (e.g. the 'hotSwapEditAfterTemplates' corpus).
+compileTemplateGraphOrFail :: [(String, SynthGraph)] -> IO TemplateGraph
+compileTemplateGraphOrFail entries =
+  case compileTemplateGraph entries of
+    Left err ->
+      assertFailure ("expected TemplateGraph, got: " <> err)
+    Right tg ->
+      pure tg

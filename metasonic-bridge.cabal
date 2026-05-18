@@ -252,6 +252,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.Session.ControlTarget
       MetaSonic.Spec.Session.Report
       MetaSonic.Spec.Session.Resolve
+      MetaSonic.Spec.Session.RTGraphAdapterHotSwap
       MetaSonic.Spec.Session.RTGraphAdapterInstall
       MetaSonic.Spec.Session.State
       MetaSonic.Spec.Session.Step
