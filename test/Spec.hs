@@ -43,6 +43,7 @@ import           MetaSonic.Spec.FFI.T9    (t9DirectEqualsReductionTests)
 import           MetaSonic.Spec.FFI.TemplateLifecycle (templateLifecycleTests)
 import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.Feature.AuthoringDSL (authoringDslTests)
+import           MetaSonic.Spec.Feature.AuthoringReport (authoringReportTests)
 import           MetaSonic.Spec.Feature.StaticPlugin (staticPluginSkeletonTests)
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session.Arbitration (sessionArbitrationTests)

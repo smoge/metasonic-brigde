@@ -253,6 +253,7 @@ tests:
       - MetaSonic.Spec.FFI.TemplateLifecycle
       - MetaSonic.Spec.Feature
       - MetaSonic.Spec.Feature.AuthoringDSL
+      - MetaSonic.Spec.Feature.AuthoringReport
       - MetaSonic.Spec.Feature.StaticPlugin
       - MetaSonic.Spec.PatternOSCBuffer
       - MetaSonic.Spec.Session.Arbitration
