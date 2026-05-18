@@ -267,6 +267,7 @@ tests:
       - MetaSonic.Spec.Session.PreservingHotSwap
       - MetaSonic.Spec.Session.Queue
       - MetaSonic.Spec.Session.Runner
+      - MetaSonic.Spec.Session.UIProducer
       - MetaSonic.Spec.Session.Report
       - MetaSonic.Spec.Session.Resolve
       - MetaSonic.Spec.Session.RTGraphAdapterHotSwap

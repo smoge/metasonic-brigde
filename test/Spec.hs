@@ -61,6 +61,7 @@ import           MetaSonic.Spec.Session.PreservingHotSwap
                    (sessionPreservingHotSwapSpecTests)
 import           MetaSonic.Spec.Session.Queue (sessionQueueTests)
 import           MetaSonic.Spec.Session.Runner (sessionRunnerTests)
+import           MetaSonic.Spec.Session.UIProducer (sessionUIProducerTests)
 import           MetaSonic.Spec.Session.Report (sessionReportTests)
 import           MetaSonic.Spec.Session.Resolve (sessionResolveTests)
 import           MetaSonic.Spec.Session.RTGraphAdapterHotSwap
