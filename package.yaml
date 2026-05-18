@@ -257,6 +257,7 @@ tests:
       - MetaSonic.Spec.Session.Command
       - MetaSonic.Spec.Session.ControlTarget
       - MetaSonic.Spec.Session.Owner
+      - MetaSonic.Spec.Session.Queue
       - MetaSonic.Spec.Session.Report
       - MetaSonic.Spec.Session.Resolve
       - MetaSonic.Spec.Session.RTGraphAdapterHotSwap

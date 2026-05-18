@@ -47,6 +47,7 @@ import           MetaSonic.Spec.Session
 import           MetaSonic.Spec.Session.Command (sessionCommandTests)
 import           MetaSonic.Spec.Session.ControlTarget (controlTargetTests)
 import           MetaSonic.Spec.Session.Owner (sessionOwnerTests)
+import           MetaSonic.Spec.Session.Queue (sessionQueueTests)
 import           MetaSonic.Spec.Session.Report (sessionReportTests)
 import           MetaSonic.Spec.Session.Resolve (sessionResolveTests)
 import           MetaSonic.Spec.Session.RTGraphAdapterHotSwap

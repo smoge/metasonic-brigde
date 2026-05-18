@@ -5,6 +5,8 @@ module MetaSonic.Spec.SessionShared
   , withInstalledAdapter
   , duplicateFirstTwoTemplates
   , compileTemplateGraphOrFail
+  , queueOrFail
+  , enqueueOrFail
   ) where
 
 import qualified Data.Text                       as T
@@ -19,7 +21,14 @@ import           MetaSonic.Bridge.Templates      (TemplateGraph (..),
                                                   compileTemplateGraph,
                                                   tgTemplates, tplGraph,
                                                   tplName)
-import           MetaSonic.Session.Queue         (ProducerId (..), ProducerKind)
+import           MetaSonic.Session.Command       (SessionCommand)
+import           MetaSonic.Session.Queue         (ProducerId (..), ProducerKind,
+                                                  QueuedSessionCommand,
+                                                  SessionCommandQueue,
+                                                  SessionEnqueueResult (..),
+                                                  SessionQueueOptions,
+                                                  enqueueSessionCommand,
+                                                  newSessionCommandQueue)
 import           MetaSonic.Session.RTGraphAdapter (RTGraphAdapterOptions,
                                                    newRTGraphAdapter)
 import           MetaSonic.Session.Runtime       (SessionRuntimeAdapter)
@@ -82,3 +91,30 @@ compileTemplateGraphOrFail entries =
       assertFailure ("expected TemplateGraph, got: " <> err)
     Right tg ->
       pure tg
+
+-- | Construct a 'SessionCommandQueue' from 'SessionQueueOptions',
+-- aborting the test via 'assertFailure' on rejected options
+-- (capacity validation). Used across the Queue, Arbitration,
+-- ArbitrationGateway, Host, and FanIn cohorts.
+queueOrFail :: SessionQueueOptions -> IO SessionCommandQueue
+queueOrFail opts =
+  case newSessionCommandQueue opts of
+    Left issue ->
+      assertFailure ("expected queue, got: " <> show issue)
+    Right queue ->
+      pure queue
+
+-- | Enqueue a command and assert success, returning the updated
+-- queue and the resulting 'QueuedSessionCommand'. Capacity-full
+-- or arbitration-rejected enqueues abort via 'assertFailure'.
+enqueueOrFail
+  :: ProducerId
+  -> SessionCommand
+  -> SessionCommandQueue
+  -> IO (SessionCommandQueue, QueuedSessionCommand)
+enqueueOrFail producer cmd queue =
+  case enqueueSessionCommand producer cmd queue of
+    (queue', SessionEnqueued queued) ->
+      pure (queue', queued)
+    (_queue', other) ->
+      assertFailure ("expected enqueue success, got: " <> show other)
