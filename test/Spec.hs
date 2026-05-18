@@ -50,6 +50,8 @@ import           MetaSonic.Spec.Session.ArbitrationGateway
 import           MetaSonic.Spec.Session.Command (sessionCommandTests)
 import           MetaSonic.Spec.Session.ControlTarget (controlTargetTests)
 import           MetaSonic.Spec.Session.Owner (sessionOwnerTests)
+import           MetaSonic.Spec.Session.PatternProducer
+                   (sessionPatternProducerTests)
 import           MetaSonic.Spec.Session.Queue (sessionQueueTests)
 import           MetaSonic.Spec.Session.Report (sessionReportTests)
 import           MetaSonic.Spec.Session.Resolve (sessionResolveTests)

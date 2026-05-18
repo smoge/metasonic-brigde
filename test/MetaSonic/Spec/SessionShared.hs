@@ -9,6 +9,9 @@ module MetaSonic.Spec.SessionShared
   , enqueueOrFail
   , fanInQueuedOrFail
   , gatewayQueuedOrFail
+  , patternProducerOrFail
+  , missingVoiceEvents
+  , missingVoiceEventsAt
   , freqTag
   , levelTag
   ) where
@@ -25,11 +28,17 @@ import           MetaSonic.Bridge.Templates      (TemplateGraph (..),
                                                   compileTemplateGraph,
                                                   tgTemplates, tplGraph,
                                                   tplName)
-import           MetaSonic.Pattern               (ControlTag (..))
+import           MetaSonic.Pattern               (ControlTag (..),
+                                                  PatternEvent (..), SamplePos (..),
+                                                  TemplateName (..), VoiceKey (..))
 import           MetaSonic.Session.ArbitrationGateway
                                                  (SessionArbitrationGatewayEnqueueResult (..))
 import           MetaSonic.Session.Command       (SessionCommand)
 import           MetaSonic.Session.FanIn         (SessionFanInEnqueueResult (..))
+import           MetaSonic.Session.PatternProducer
+                                                 (PatternProducerOptions,
+                                                  PatternProducerState,
+                                                  newPatternProducerState)
 import           MetaSonic.Session.Queue         (ProducerId (..), ProducerKind,
                                                   QueuedSessionCommand,
                                                   SessionCommandQueue,
@@ -156,6 +165,34 @@ gatewayQueuedOrFail result =
     SagArbitrationRejected issue ->
       assertFailure ("expected arbitration gateway enqueue success, got: "
                      <> show issue)
+
+-- | Construct a 'PatternProducerState' from
+-- 'PatternProducerOptions', aborting via 'assertFailure' on rejected
+-- options (negative or zero block sizes). Used by the Pattern
+-- producer cohort and by the scripted runner / Pattern host cohorts.
+patternProducerOrFail :: PatternProducerOptions -> IO PatternProducerState
+patternProducerOrFail opts =
+  case newPatternProducerState opts of
+    Left issue ->
+      assertFailure ("expected Pattern producer state, got: " <> show issue)
+    Right state ->
+      pure state
+
+-- | Build a 'PEVoiceOn' event sequence whose voices reference an
+-- unknown template ("missing"), one per integer position. Pattern
+-- producer and Runner cohorts use these as backlog/rejection
+-- fixtures: every voice attempt fails template lookup downstream.
+missingVoiceEvents :: Int -> [(SamplePos, PatternEvent)]
+missingVoiceEvents n =
+  missingVoiceEventsAt [0 .. n - 1]
+
+missingVoiceEventsAt :: [Int] -> [(SamplePos, PatternEvent)]
+missingVoiceEventsAt positions =
+  [ ( SamplePos pos
+    , PEVoiceOn (TemplateName "missing") (VoiceKey ("v" <> show pos)) []
+    )
+  | pos <- positions
+  ]
 
 -- | Shared control tags used across session arbitration, UI, and
 -- producer cohorts. Slot 0 of the 'MigrationKey'-named control on a

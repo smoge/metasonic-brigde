@@ -259,6 +259,7 @@ tests:
       - MetaSonic.Spec.Session.Command
       - MetaSonic.Spec.Session.ControlTarget
       - MetaSonic.Spec.Session.Owner
+      - MetaSonic.Spec.Session.PatternProducer
       - MetaSonic.Spec.Session.Queue
       - MetaSonic.Spec.Session.Report
       - MetaSonic.Spec.Session.Resolve
