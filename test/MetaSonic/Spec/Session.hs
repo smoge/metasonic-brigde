@@ -5,11 +5,9 @@ module MetaSonic.Spec.Session where
 
 import qualified Data.Map.Strict           as M
 import qualified Data.Text                 as T
-import           Data.List                 (isInfixOf, sort)
+import           Data.List                 (sort)
 import           Control.Concurrent        (forkIO, newEmptyMVar, putMVar,
                                             takeMVar)
-import           Control.Exception         (SomeException, displayException,
-                                            evaluate, try)
 import           Control.Monad             (forM, forM_)
 import           Data.Maybe                (listToMaybe, mapMaybe)
 import           Data.IORef                (modifyIORef', newIORef, readIORef,
@@ -19,10 +17,7 @@ import           System.Timeout            (timeout)
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
-import           MetaSonic.Bridge.Buffer
-import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.FFI
-import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.ControlTarget
@@ -34,7 +29,6 @@ import           MetaSonic.Session.Arbitration
 import           MetaSonic.Session.ArbitrationGateway
 import           MetaSonic.Session.Command
 import           MetaSonic.Session.Resolve
-import           MetaSonic.Session.Report
 import           MetaSonic.Session.Runtime
 import           MetaSonic.Session.State
 import           MetaSonic.Session.Step
@@ -49,7 +43,6 @@ import           MetaSonic.Session.FanInService
 import           MetaSonic.Session.OSCProducer
 import qualified MetaSonic.Session.OSCListener as OSCS
 import           MetaSonic.Session.UIProducer
-import           MetaSonic.Types
 import           MetaSonic.Spec.Core
 import           MetaSonic.Spec.SessionShared
 
@@ -67,255 +60,8 @@ constantAdapter outcome =
   SessionRuntimeAdapter $ \_ -> pure outcome
 
 sessionRTGraphAdapterTests :: TestTree
-sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
-  [ testCase "session install removes auto-spawn and leaves a reservable slot" $ do
-      let tg         = patternTemplates droneVibrato
-          totalNodes = totalTemplateNodes tg
-      withRTGraph (totalNodes + 8) 64 $ \rt -> do
-        result <- installSessionGraph rt tg defaultRTGraphAdapterOptions
-        case result of
-          Left issue ->
-            assertFailure ("expected session graph install, got: " <> show issue)
-          Right st -> do
-            rtgasTemplateIds st
-              @?= M.fromList [(TemplateName "drone", 0)]
-            rtgasPrewarmCounts st
-              @?= M.fromList [(TemplateName "drone", 1)]
-            case M.lookup (TemplateName "drone") (rtgasAutoSpawnedSlots st) of
-              Nothing ->
-                assertFailure "expected recorded auto-spawn slot for drone"
-              Just autoSlot -> do
-                status <- c_rt_graph_instance_status rt (fromIntegral autoSlot)
-                status @?= (-1)
-
-            count <- c_rt_graph_instance_count rt
-            statuses <- forM [0 .. count - 1] $ \slot ->
-              c_rt_graph_instance_status rt slot
-            assertBool
-              ("expected no live logical voices after install, got statuses "
-               <> show statuses)
-              (all (== (-1)) statuses)
-
-            slot <- c_rt_graph_realtime_reserve rt 0
-            assertBool ("expected reserve to claim prewarmed slot, got "
-                        <> show slot)
-                       (slot >= 0)
-            c_rt_graph_realtime_cancel rt slot
-
-  , testCase "configured prewarm count is claimed through realtime reserve" $ do
-      let tg         = patternTemplates droneVibrato
-          totalNodes = totalTemplateNodes tg
-          opts       = defaultRTGraphAdapterOptions
-            { raoPerTemplatePolyphony =
-                M.singleton (TemplateName "drone") 3
-            }
-      withRTGraph (totalNodes + 16) 64 $ \rt -> do
-        result <- installSessionGraph rt tg opts
-        case result of
-          Left issue ->
-            assertFailure ("expected session graph install, got: " <> show issue)
-          Right st -> do
-            rtgasPrewarmCounts st
-              @?= M.fromList [(TemplateName "drone", 3)]
-            slots <- forM [1 .. 3 :: Int] $ \_ ->
-              c_rt_graph_realtime_reserve rt 0
-            assertBool ("expected three successful reservations, got "
-                        <> show slots)
-                       (all (>= 0) slots)
-            fourth <- c_rt_graph_realtime_reserve rt 0
-            fourth @?= (-1)
-            forM_ slots (c_rt_graph_realtime_cancel rt)
-
-  , testCase "duplicate template names are rejected before install" $ do
-      let base = patternTemplates arpeggioSendReturn
-          duplicated = duplicateFirstTwoTemplates base
-      withRTGraph 16 64 $ \rt -> do
-        result <- installSessionGraph
-                    rt
-                    duplicated
-                    defaultRTGraphAdapterOptions
-        result @?= Left (SasiDuplicateTemplateName (TemplateName "dup"))
-        templateCount <- c_rt_graph_template_count rt
-        instanceCount <- c_rt_graph_instance_count rt
-        templateCount @?= 1
-        instanceCount @?= 1
-
-  , testCase "adapter constructor installs graph and starts voice through adapter" $ do
-      let tg         = patternTemplates droneVibrato
-          totalNodes = totalTemplateNodes tg
-      withRTGraph (totalNodes + 8) 64 $ \rt -> do
-        result <- newRTGraphAdapter rt tg defaultRTGraphAdapterOptions
-        case result of
-          Left issue ->
-            assertFailure ("expected RTGraph adapter, got: " <> show issue)
-          Right adapter -> do
-            slot <- c_rt_graph_realtime_reserve rt 0
-            assertBool ("expected constructor to prewarm reservable slot, got "
-                        <> show slot)
-                       (slot >= 0)
-            c_rt_graph_realtime_cancel rt slot
-
-            outcome <- sraRun adapter
-              (PlanVoiceStart (TemplateName "drone") (VoiceKey "v1") [])
-            case outcome of
-              Right (RuntimeCommitted (CommitVoiceStarted binding)) -> do
-                vbVoiceKey binding @?= VoiceKey "v1"
-                vbTemplateName binding @?= TemplateName "drone"
-                assertBool ("expected runtime slot, got " <> show (vbSlotId binding))
-                           (vbSlotId binding >= 0)
-              other ->
-                assertFailure ("expected committed voice start, got: " <> show other)
-
-  , testCase "step voice-start success commits reserved slot binding" $ do
-      let tg  = patternTemplates droneVibrato
-          st0 = initialSessionState tg
-          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0")
-                  [(ControlTag (MigrationKey "lpf") 0, 1200.0)]
-      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
-        result <- stepSessionCommand adapter cmd st0
-        case result of
-          StepCommitted st1 Nothing ->
-            case M.lookup (VoiceKey "v0") (ssVoices st1) of
-              Just binding -> do
-                vbTemplateName binding @?= TemplateName "drone"
-                assertBool ("expected runtime slot, got "
-                            <> show (vbSlotId binding))
-                           (vbSlotId binding >= 0)
-                c_rt_graph_process rt 1
-                status <- c_rt_graph_instance_status
-                            rt
-                            (fromIntegral (vbSlotId binding))
-                status @?= instanceStatusLive
-              Nothing ->
-                assertFailure "expected committed voice binding"
-          other ->
-            assertFailure ("expected StepCommitted, got: " <> show other)
-
-  , testCase "fromPatternEvent voice-on drives real RTGraph adapter" $ do
-      let tg  = patternTemplates droneVibrato
-          st0 = initialSessionState tg
-          ev  = PEVoiceOn
-                  (TemplateName "drone")
-                  (VoiceKey "pv0")
-                  [(ControlTag (MigrationKey "lpf") 0, 900.0)]
-          cmd = fromPatternEvent ev
-      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
-        result <- stepSessionCommand adapter cmd st0
-        case result of
-          StepCommitted st1 Nothing ->
-            case M.lookup (VoiceKey "pv0") (ssVoices st1) of
-              Just binding -> do
-                c_rt_graph_process rt 1
-                status <- c_rt_graph_instance_status
-                            rt
-                            (fromIntegral (vbSlotId binding))
-                status @?= instanceStatusLive
-              Nothing ->
-                assertFailure "expected committed PatternEvent voice binding"
-          other ->
-            assertFailure
-              ("expected PatternEvent-backed RTGraph commit, got: " <> show other)
-
-  , testCase "step voice-start with empty pool reports allocation failure" $ do
-      let tg  = patternTemplates droneVibrato
-          st0 = initialSessionState tg
-          cmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
-      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
-        held <- c_rt_graph_realtime_reserve rt 0
-        assertBool ("expected setup reservation, got " <> show held) (held >= 0)
-        result <- stepSessionCommand adapter cmd st0
-        result @?= StepRuntimeFailed SriVoiceAllocationFailed
-        c_rt_graph_realtime_cancel rt held
-
-  , testCase "step voice-start invalid initial control cancels reservation" $ do
-      let tg      = patternTemplates droneVibrato
-          st0     = initialSessionState tg
-          badTag  = ControlTag (MigrationKey "missing") 0
-          cmd     = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0")
-                      [(badTag, 1.0)]
-          issue   = CtiUnknownNodeTag
-                      (TemplateName "drone")
-                      (MigrationKey "missing")
-      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
-        result <- stepSessionCommand adapter cmd st0
-        result @?= StepRuntimeFailed (SriControlTargetRejected issue)
-        -- defaultRTGraphAdapterOptions prewarms exactly one slot, so
-        -- this reserve can only succeed if the failed start canceled
-        -- its reservation back to Available.
-        slot <- c_rt_graph_realtime_reserve rt 0
-        assertBool ("expected canceled reservation to be reusable, got "
-                    <> show slot)
-                   (slot >= 0)
-        c_rt_graph_realtime_cancel rt slot
-
-  , testCase "step voice-stop queues release and clears session binding" $ do
-      let tg       = patternTemplates droneVibrato
-          st0      = initialSessionState tg
-          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
-          stopCmd  = CmdVoiceOff (VoiceKey "v0")
-      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
-        started <- stepSessionCommand adapter startCmd st0
-        case started of
-          StepCommitted st1 Nothing -> do
-            case M.lookup (VoiceKey "v0") (ssVoices st1) of
-              Nothing ->
-                assertFailure "expected committed voice binding"
-              Just binding -> do
-                c_rt_graph_process rt 1
-                stopped <- stepSessionCommand adapter stopCmd st1
-                case stopped of
-                  StepCommitted st2 Nothing -> do
-                    ssVoices st2 @?= M.empty
-                    -- Voice-stop success means the release was queued;
-                    -- this test intentionally does not assert post-drain
-                    -- runtime slot status.
-                    assertBool ("expected stopped binding slot, got "
-                                <> show (vbSlotId binding))
-                               (vbSlotId binding >= 0)
-                  other ->
-                    assertFailure
-                      ("expected stopped voice commit, got: " <> show other)
-          other ->
-            assertFailure ("expected start commit, got: " <> show other)
-
-  , testCase "step control-write to known target is accepted" $ do
-      let tg       = patternTemplates droneVibrato
-          st0      = initialSessionState tg
-          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
-          writeCmd = CmdControlWrite
-                       (VoiceKey "v0")
-                       (ControlTag (MigrationKey "lpf") 0)
-                       1800.0
-      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
-        started <- stepSessionCommand adapter startCmd st0
-        case started of
-          StepCommitted st1 Nothing -> do
-            c_rt_graph_process rt 1
-            written <- stepSessionCommand adapter writeCmd st1
-            written @?= StepControlAccepted
-          other ->
-            assertFailure ("expected start commit, got: " <> show other)
-
-  , testCase "step control-write to unknown target is rejected" $ do
-      let tg       = patternTemplates droneVibrato
-          st0      = initialSessionState tg
-          startCmd = CmdVoiceOn (TemplateName "drone") (VoiceKey "v0") []
-          badTag   = ControlTag (MigrationKey "missing") 0
-          writeCmd = CmdControlWrite (VoiceKey "v0") badTag 1800.0
-          issue    = CtiUnknownNodeTag
-                       (TemplateName "drone")
-                       (MigrationKey "missing")
-      withInstalledAdapter tg defaultRTGraphAdapterOptions $ \rt adapter -> do
-        started <- stepSessionCommand adapter startCmd st0
-        case started of
-          StepCommitted st1 Nothing -> do
-            c_rt_graph_process rt 1
-            written <- stepSessionCommand adapter writeCmd st1
-            written @?= StepRuntimeFailed (SriControlTargetRejected issue)
-          other ->
-            assertFailure ("expected start commit, got: " <> show other)
-
-  , testCase "step hot-swap of empty session installs new graph" $ do
+sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph adapter hot-swap"
+  [ testCase "step hot-swap of empty session installs new graph" $ do
       let oldGraph = patternTemplates droneVibrato
           newGraph = patternTemplates polyphonicStab
           st0      = initialSessionState oldGraph
@@ -605,18 +351,6 @@ sessionRTGraphAdapterTests = testGroup "Session Prep E: RTGraph session install"
           other ->
             assertFailure ("expected first start commit, got: " <> show other)
   ]
-  where
-    totalTemplateNodes tg =
-      sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
-
-    withInstalledAdapter tg opts action =
-      withRTGraph (totalTemplateNodes tg + 16) 64 $ \rt -> do
-        result <- newRTGraphAdapter rt tg opts
-        case result of
-          Left issue ->
-            assertFailure ("expected RTGraph adapter, got: " <> show issue)
-          Right adapter ->
-            action rt adapter
 
 ------------------------------------------------------------
 -- Session Prep F: single-threaded runtime owner
@@ -806,18 +540,6 @@ sessionOwnerTests = testGroup "Session Prep F: runtime owner"
           assertFailure ("expected non-terminal admission rejection, got: "
                          <> show other)
   ]
-
-duplicateFirstTwoTemplates :: TemplateGraph -> TemplateGraph
-duplicateFirstTwoTemplates base =
-  case tgTemplates base of
-    (a : b : rest) ->
-      base { tgTemplates =
-               a { tplName = "dup" }
-             : b { tplName = "dup" }
-             : rest
-           }
-    _ ->
-      error "expected at least two templates for duplicate-name test"
 
 ------------------------------------------------------------
 -- Session Prep G: producer queue and owner drain

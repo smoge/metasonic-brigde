@@ -48,6 +48,8 @@ import           MetaSonic.Spec.Session.Command (sessionCommandTests)
 import           MetaSonic.Spec.Session.ControlTarget (controlTargetTests)
 import           MetaSonic.Spec.Session.Report (sessionReportTests)
 import           MetaSonic.Spec.Session.Resolve (sessionResolveTests)
+import           MetaSonic.Spec.Session.RTGraphAdapterInstall
+                   (sessionRTGraphAdapterInstallTests)
 import           MetaSonic.Spec.Session.State (sessionStateTests)
 import           MetaSonic.Spec.Session.Step (sessionStepTests)
 import           MetaSonic.Spec.SessionManifestReload
@@ -95,6 +97,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , sessionStateTests
   , sessionStepTests
   , controlTargetTests
+  , sessionRTGraphAdapterInstallTests
   , sessionRTGraphAdapterTests
   , sessionOwnerTests
   , sessionQueueTests
