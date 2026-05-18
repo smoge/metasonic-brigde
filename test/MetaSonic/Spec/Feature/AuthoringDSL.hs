@@ -29,7 +29,7 @@ import qualified MetaSonic.OSC.Wire        as OSC
 import qualified MetaSonic.Authoring       as Auth
 import           MetaSonic.Authoring.Report
 import           MetaSonic.Types
-import           MetaSonic.Spec.Core
+import           MetaSonic.Spec.CoreShared
 
 import qualified Data.ByteString.Char8     as OBSC
 

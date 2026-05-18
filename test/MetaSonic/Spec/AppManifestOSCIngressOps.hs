@@ -47,7 +47,7 @@ import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.OSCProducer    (OSCProducerEnqueueResult (..),
                                                    defaultOSCProducerOptions)
 import           MetaSonic.Session.RTGraphAdapter (defaultRTGraphAdapterOptions)
-import           MetaSonic.Spec.Core              (sendUdpLoopback)
+import           MetaSonic.Spec.CoreShared              (sendUdpLoopback)
 
 
 appManifestOSCIngressOpsTests :: TestTree

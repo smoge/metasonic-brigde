@@ -23,7 +23,7 @@ import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR      (lowerGraph)
 import           MetaSonic.Bridge.Source  (gain, runSynth, sinOsc)
 
-import           MetaSonic.Spec.Core      (chainGraph, divergentLayerGraph,
+import           MetaSonic.Spec.CoreShared      (chainGraph, divergentLayerGraph,
                                            simpleGraph)
 import           MetaSonic.Spec.FFI       (assertGlobalScheduleBandsWellFormed,
                                            compileBoth, expectedGlobalRG,

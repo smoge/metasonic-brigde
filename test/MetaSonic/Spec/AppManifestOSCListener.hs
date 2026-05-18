@@ -33,7 +33,7 @@ import           MetaSonic.Session.OSCProducer    (OSCProducerEnqueueResult (..)
 import           MetaSonic.Session.Queue          (QueuedSessionCommand (..),
                                                    SessionEnqueueResult (..))
 import           MetaSonic.Session.RTGraphAdapter (defaultRTGraphAdapterOptions)
-import           MetaSonic.Spec.Core              (sendUdpLoopback)
+import           MetaSonic.Spec.CoreShared              (sendUdpLoopback)
 
 
 appManifestOSCListenerTests :: TestTree

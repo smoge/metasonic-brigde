@@ -110,7 +110,7 @@ import           MetaSonic.Session.Queue          (ProducerId (..),
                                                    ProducerKind (..),
                                                    SessionEnqueueResult (..))
 import           MetaSonic.Session.State          (SessionState (..))
-import           MetaSonic.Spec.Core              (sendUdpLoopback)
+import           MetaSonic.Spec.CoreShared              (sendUdpLoopback)
 
 
 appManifestOSCReloadE2ETests :: TestTree

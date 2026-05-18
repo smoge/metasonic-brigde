@@ -28,7 +28,7 @@
 -- megafile split; the first cut into 'crossCuttingTests' itself
 -- that does not depend on shared parent helpers (the cases only use
 -- public 'MetaSonic.Bridge.*' entry points plus 'PtrCFloat' from
--- "MetaSonic.Spec.Core"). The 'sizeOfFloat' local binding mirrors
+-- "MetaSonic.Spec.CoreShared"). The 'sizeOfFloat' local binding mirrors
 -- the parent's where-clause attached to 'crossCuttingTests'.
 module MetaSonic.Spec.FFI.BusRouting (busRoutingTests) where
 
@@ -45,7 +45,7 @@ import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR      (lowerGraph)
 import           MetaSonic.Bridge.Source
 
-import           MetaSonic.Spec.Core      (PtrCFloat)
+import           MetaSonic.Spec.CoreShared      (PtrCFloat)
 
 
 busRoutingTests :: TestTree

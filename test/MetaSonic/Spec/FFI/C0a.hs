@@ -43,7 +43,7 @@ import           MetaSonic.Bridge.IR        (lowerGraph)
 import           MetaSonic.Bridge.Templates (TemplateGraph, tgTemplates,
                                              tplGraph, tplName)
 
-import           MetaSonic.Spec.Core        (chainGraph, divergentLayerGraph,
+import           MetaSonic.Spec.CoreShared        (chainGraph, divergentLayerGraph,
                                              simpleGraph)
 import           MetaSonic.Spec.FFI         (compileBoth, t9CorpusGraphs,
                                              t9CorpusTemplates)

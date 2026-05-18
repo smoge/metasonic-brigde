@@ -24,7 +24,7 @@ import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR      (lowerGraph)
 import           MetaSonic.Bridge.Source  (gain, runSynth, sinOsc)
 
-import           MetaSonic.Spec.Core      (chainGraph)
+import           MetaSonic.Spec.CoreShared      (chainGraph)
 import           MetaSonic.Spec.FFI       (assertDirectEqualsSchedulePoolRG,
                                            assertSchedulePoolDirectEqualsReductionRG,
                                            assertSchedulePoolDirectEqualsReductionTG,

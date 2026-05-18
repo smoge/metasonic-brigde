@@ -20,7 +20,7 @@ import           MetaSonic.Bridge.IR
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Bridge.Templates
 import           MetaSonic.Types
-import           MetaSonic.Spec.Core
+import           MetaSonic.Spec.CoreShared
 
 crossCuttingTests :: TestTree
 crossCuttingTests = testGroup "End-to-end FFI"

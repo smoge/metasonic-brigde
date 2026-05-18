@@ -27,7 +27,7 @@ import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR      (lowerGraph)
 import           MetaSonic.Bridge.Source  (env, out, runSynth)
 
-import           MetaSonic.Spec.Core      (chainGraph, divergentLayerGraph)
+import           MetaSonic.Spec.CoreShared      (chainGraph, divergentLayerGraph)
 import           MetaSonic.Spec.FFI       (assertDirectEqualsScheduleRG,
                                            assertDirectEqualsScheduleTG,
                                            assertScheduleDirectEqualsReductionRG,

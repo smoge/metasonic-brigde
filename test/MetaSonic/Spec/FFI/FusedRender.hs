@@ -28,7 +28,7 @@
 -- 'assertFusedEquivalent' — were used only by the moved cases and
 -- travel with the slice. 'stripRegionKernels' stays in the parent
 -- (also imported by "MetaSonic.Spec.FFI.TemplateLifecycle"); promoting
--- it to "MetaSonic.Spec.Core" is a separate cleanup decision.
+-- it to "MetaSonic.Spec.CoreShared" is a separate cleanup decision.
 module MetaSonic.Spec.FFI.FusedRender (fusedRenderTests) where
 
 import           Control.Exception        (try)
@@ -48,7 +48,7 @@ import           MetaSonic.Bridge.IR      (lowerGraph)
 import           MetaSonic.Bridge.Source
 import           MetaSonic.Types
 
-import           MetaSonic.Spec.Core      (PtrCFloat,
+import           MetaSonic.Spec.CoreShared      (PtrCFloat,
                                            genFusableRenderableGraph,
                                            shrinkSynthGraph)
 import           MetaSonic.Spec.FFI       (stripRegionKernels)

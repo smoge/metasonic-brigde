@@ -32,7 +32,7 @@ import qualified MetaSonic.OSC.Wire              as OSC
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
 import           MetaSonic.Types
-import           MetaSonic.Spec.Core
+import           MetaSonic.Spec.CoreShared
 import           MetaSonic.Spec.Driver
 
 import qualified Data.ByteString           as OBS

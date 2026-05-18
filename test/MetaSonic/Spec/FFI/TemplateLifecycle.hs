@@ -33,7 +33,7 @@
 -- Extracted from "MetaSonic.Spec.FFI" as the ninth slice of the
 -- megafile split. The cases depend on the public
 -- 'MetaSonic.Bridge.*' surface plus 'stripRegionKernels' from the
--- parent module and 'PtrCFloat' from "MetaSonic.Spec.Core".
+-- parent module and 'PtrCFloat' from "MetaSonic.Spec.CoreShared".
 -- 'sizeOfFloat' mirrors the parent's where-clause pattern.
 module MetaSonic.Spec.FFI.TemplateLifecycle (templateLifecycleTests) where
 
@@ -58,7 +58,7 @@ import           MetaSonic.Bridge.Templates (compileTemplateGraph,
                                              compileTemplateGraphFused,
                                              tgTemplates, tplGraph, tplName)
 
-import           MetaSonic.Spec.Core      (PtrCFloat)
+import           MetaSonic.Spec.CoreShared      (PtrCFloat)
 import           MetaSonic.Spec.FFI       (stripRegionKernels)
 
 

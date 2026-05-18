@@ -28,7 +28,7 @@ import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.IR      (lowerGraph)
 import           MetaSonic.Bridge.Templates (tgTemplates, tplGraph)
 
-import           MetaSonic.Spec.Core      (chainGraph, divergentLayerGraph,
+import           MetaSonic.Spec.CoreShared      (chainGraph, divergentLayerGraph,
                                            simpleGraph)
 import           MetaSonic.Spec.FFI       (compileBoth, envPluckGraph,
                                            expectedGlobalRG, expectedGlobalTG,

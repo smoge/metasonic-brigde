@@ -3,7 +3,7 @@
 -- This is the UDP wrapper above the OSC producer adapter. It only
 -- enqueues into 'SessionFanInHost' (or the arbitrated service path);
 -- draining stays caller-driven. Loopback packet fixtures live in
--- "MetaSonic.Spec.Core".
+-- "MetaSonic.Spec.CoreShared".
 module MetaSonic.Spec.Session.OSCListener
   ( sessionOSCListenerTests
   ) where
@@ -38,7 +38,7 @@ import           MetaSonic.Session.Owner            (SessionOwnerStatus (..),
 import           MetaSonic.Session.Queue
 import           MetaSonic.Session.State            (ssVoices)
 import           MetaSonic.Session.Step             (SessionStepResult (..))
-import           MetaSonic.Spec.Core                (messageBytesSwapLpfFloat,
+import           MetaSonic.Spec.CoreShared                (messageBytesSwapLpfFloat,
                                                      messageBytesV0LpfFloat,
                                                      sendUdpLoopback)
 import           MetaSonic.Spec.SessionShared       (fanInQueuedOrFail,

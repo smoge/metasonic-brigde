@@ -43,7 +43,7 @@ import           MetaSonic.Bridge.Templates (compileTemplateGraph,
                                              compileTemplateGraphFused,
                                              tgTemplates, tplGraph)
 
-import           MetaSonic.Spec.Core      (runtimeGraphBuilderCapacity,
+import           MetaSonic.Spec.CoreShared      (runtimeGraphBuilderCapacity,
                                            templateGraphBuilderCapacity)
 import           MetaSonic.Spec.FFI       (processAndReadBuses)
 
