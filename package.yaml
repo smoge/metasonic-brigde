@@ -255,6 +255,7 @@ tests:
       - MetaSonic.Spec.PatternOSCBuffer
       - MetaSonic.Spec.Session
       - MetaSonic.Spec.Session.Command
+      - MetaSonic.Spec.Session.Resolve
       - MetaSonic.Spec.SessionManifestReload
       - MetaSonic.Spec.SessionMIDI
       - MetaSonic.Spec.SessionShared
