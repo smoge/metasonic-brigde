@@ -7,6 +7,8 @@ module MetaSonic.Spec.SessionShared
   , compileTemplateGraphOrFail
   , queueOrFail
   , enqueueOrFail
+  , fanInQueuedOrFail
+  , gatewayQueuedOrFail
   , freqTag
   , levelTag
   ) where
@@ -24,7 +26,10 @@ import           MetaSonic.Bridge.Templates      (TemplateGraph (..),
                                                   tgTemplates, tplGraph,
                                                   tplName)
 import           MetaSonic.Pattern               (ControlTag (..))
+import           MetaSonic.Session.ArbitrationGateway
+                                                 (SessionArbitrationGatewayEnqueueResult (..))
 import           MetaSonic.Session.Command       (SessionCommand)
+import           MetaSonic.Session.FanIn         (SessionFanInEnqueueResult (..))
 import           MetaSonic.Session.Queue         (ProducerId (..), ProducerKind,
                                                   QueuedSessionCommand,
                                                   SessionCommandQueue,
@@ -121,6 +126,36 @@ enqueueOrFail producer cmd queue =
       pure (queue', queued)
     (_queue', other) ->
       assertFailure ("expected enqueue success, got: " <> show other)
+
+-- | Unwrap a 'SessionFanInEnqueueResult' from a fan-in host enqueue,
+-- aborting via 'assertFailure' on any rejection. Shared with the
+-- arbitration-gateway gating helper below and used by the FanIn host,
+-- FanIn service, and downstream pattern/host cohorts.
+fanInQueuedOrFail
+  :: SessionFanInEnqueueResult
+  -> IO QueuedSessionCommand
+fanInQueuedOrFail result =
+  case sfierResult result of
+    SessionEnqueued queued ->
+      pure queued
+    other ->
+      assertFailure ("expected fan-in enqueue success, got: " <> show other)
+
+-- | Unwrap a 'SessionArbitrationGatewayEnqueueResult'. Arbitration
+-- rejections abort loudly; accepted gateway dispatches defer to
+-- 'fanInQueuedOrFail'. Used by the arbitration-gateway cohort plus
+-- pattern-producer arbitrated-enqueue paths in remaining session
+-- spec modules.
+gatewayQueuedOrFail
+  :: SessionArbitrationGatewayEnqueueResult
+  -> IO QueuedSessionCommand
+gatewayQueuedOrFail result =
+  case result of
+    SagEnqueueAttempted fanInResult ->
+      fanInQueuedOrFail fanInResult
+    SagArbitrationRejected issue ->
+      assertFailure ("expected arbitration gateway enqueue success, got: "
+                     <> show issue)
 
 -- | Shared control tags used across session arbitration, UI, and
 -- producer cohorts. Slot 0 of the 'MigrationKey'-named control on a

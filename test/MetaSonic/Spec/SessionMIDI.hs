@@ -32,16 +32,6 @@ import           MetaSonic.Session.State
 import           MetaSonic.Session.Step
 import           MetaSonic.Spec.SessionShared
 
-fanInQueuedOrFail
-  :: SessionFanInEnqueueResult
-  -> IO QueuedSessionCommand
-fanInQueuedOrFail result =
-  case sfierResult result of
-    SessionEnqueued queued ->
-      pure queued
-    other ->
-      assertFailure ("expected fan-in enqueue success, got: " <> show other)
-
 ------------------------------------------------------------
 -- Session MIDI producer adapter
 --
