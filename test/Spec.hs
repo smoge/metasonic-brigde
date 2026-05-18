@@ -48,6 +48,7 @@ import           MetaSonic.Spec.Session.Command (sessionCommandTests)
 import           MetaSonic.Spec.Session.Report (sessionReportTests)
 import           MetaSonic.Spec.Session.Resolve (sessionResolveTests)
 import           MetaSonic.Spec.Session.State (sessionStateTests)
+import           MetaSonic.Spec.Session.Step (sessionStepTests)
 import           MetaSonic.Spec.SessionManifestReload
 import           MetaSonic.Spec.SessionMIDI
 

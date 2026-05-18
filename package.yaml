@@ -258,6 +258,7 @@ tests:
       - MetaSonic.Spec.Session.Report
       - MetaSonic.Spec.Session.Resolve
       - MetaSonic.Spec.Session.State
+      - MetaSonic.Spec.Session.Step
       - MetaSonic.Spec.SessionManifestReload
       - MetaSonic.Spec.SessionMIDI
       - MetaSonic.Spec.SessionShared
