@@ -246,6 +246,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.FFI.T9
       MetaSonic.Spec.FFI.TemplateLifecycle
       MetaSonic.Spec.Feature
+      MetaSonic.Spec.Feature.StaticPlugin
       MetaSonic.Spec.PatternOSCBuffer
       MetaSonic.Spec.Session.Arbitration
       MetaSonic.Spec.Session.ArbitrationGateway
