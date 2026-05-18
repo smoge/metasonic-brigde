@@ -103,13 +103,13 @@ The current checkout is much broader:
 
 The rough line split is:
 
-| Area | Lines | Share |
-| --- | ---: | ---: |
-| `src/` Haskell library | 22,738 | 26.6% |
-| `tinysynth/` C++ runtime | 15,137 | 17.7% |
+| Area                          |  Lines | Share |
+|-------------------------------|-------:|------:|
+| `src/` Haskell library        | 22,738 | 26.6% |
+| `tinysynth/` C++ runtime      | 15,137 | 17.7% |
 | `app/` CLI and operator tools | 15,974 | 18.7% |
-| `test/` Haskell tests | 31,739 | 37.1% |
-| Total | 85,588 | 100% |
+| `test/` Haskell tests         | 31,739 | 37.1% |
+| Total                         | 85,588 |  100% |
 
 This is no longer a small proof of concept. It is a research workbench and
 runtime-control substrate.
@@ -288,9 +288,16 @@ pace with the compiler code. The compiler split into focused modules; several
 test files are now megafiles:
 
 - `test/MetaSonic/Spec/Core.hs`: 5,181 lines.
-- `test/MetaSonic/Spec/Session.hs`: 5,352 lines.
-- `test/MetaSonic/Spec/FFI.hs`: 3,914 lines.
-- `test/MetaSonic/Spec/Feature.hs`: 2,836 lines.
+- `test/MetaSonic/Spec/Session.hs`: 5,352 lines (split into
+  twenty-two `MetaSonic.Spec.Session.*` submodules plus
+  `MetaSonic.Spec.SessionShared`; see
+  `notes/2026-05-18-a-session-megafile-split-recap.md`).
+- `test/MetaSonic/Spec/FFI.hs`: 3,914 lines (split into ten
+  `MetaSonic.Spec.FFI.*` submodules; see
+  `notes/2026-05-17-b-ffi-megafile-split-recap.md`).
+- `test/MetaSonic/Spec/Feature.hs`: 2,836 lines (split into ten
+  `MetaSonic.Spec.Feature.*` submodules; see
+  `notes/2026-05-18-b-feature-megafile-split-recap.md`).
 
 That is not a correctness failure, but it is a maintainability signal. The
 test suite is no longer just evidence of rigor; it is also carrying unrefactored
@@ -495,9 +502,10 @@ instead built a stricter control plane around precompiled runtime objects.
 
 6. Split the test megafiles.
 
-   Treat `Core.hs`, `Session.hs`, `FFI.hs`, and `Feature.hs` the way the
-   compiler was treated: split by ownership boundary and behavior class, while
-   preserving the same Tasty entrypoint.
+   `Session.hs`, `FFI.hs`, and `Feature.hs` have already been split
+   this way; `Core.hs` remains as the outstanding hygiene target.
+   Split by ownership boundary and behavior class while preserving
+   the same Tasty entrypoint.
 
 7. Use dependencies as package-boundary evidence.
 
