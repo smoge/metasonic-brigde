@@ -12,6 +12,7 @@ module MetaSonic.Spec.SessionShared
   , patternProducerOrFail
   , missingVoiceEvents
   , missingVoiceEventsAt
+  , constantAdapter
   , freqTag
   , levelTag
   ) where
@@ -48,7 +49,9 @@ import           MetaSonic.Session.Queue         (ProducerId (..), ProducerKind,
                                                   newSessionCommandQueue)
 import           MetaSonic.Session.RTGraphAdapter (RTGraphAdapterOptions,
                                                    newRTGraphAdapter)
-import           MetaSonic.Session.Runtime       (SessionRuntimeAdapter)
+import           MetaSonic.Session.Runtime       (SessionRuntimeAdapter (..),
+                                                  SessionRuntimeIssue,
+                                                  SessionRuntimeSuccess)
 
 
 testProducer :: ProducerKind -> String -> ProducerId
@@ -193,6 +196,17 @@ missingVoiceEventsAt positions =
     )
   | pos <- positions
   ]
+
+-- | Mock 'SessionRuntimeAdapter' that ignores its plan and returns a
+-- pre-baked outcome. Used by 'sessionStepTests' to assert what
+-- 'stepSessionCommand' does for each outcome, and by the preserving
+-- hot-swap cohort to model a successful preserve install path.
+constantAdapter
+  :: Applicative m
+  => Either SessionRuntimeIssue SessionRuntimeSuccess
+  -> SessionRuntimeAdapter m
+constantAdapter outcome =
+  SessionRuntimeAdapter $ \_ -> pure outcome
 
 -- | Shared control tags used across session arbitration, UI, and
 -- producer cohorts. Slot 0 of the 'MigrationKey'-named control on a

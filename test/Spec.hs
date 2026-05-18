@@ -53,6 +53,8 @@ import           MetaSonic.Spec.Session.Host (sessionHostTests)
 import           MetaSonic.Spec.Session.Owner (sessionOwnerTests)
 import           MetaSonic.Spec.Session.PatternProducer
                    (sessionPatternProducerTests)
+import           MetaSonic.Spec.Session.PreservingHotSwap
+                   (sessionPreservingHotSwapSpecTests)
 import           MetaSonic.Spec.Session.Queue (sessionQueueTests)
 import           MetaSonic.Spec.Session.Runner (sessionRunnerTests)
 import           MetaSonic.Spec.Session.Report (sessionReportTests)

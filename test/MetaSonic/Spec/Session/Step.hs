@@ -27,9 +27,9 @@
 --     'stepSessionCommand' end-to-end.
 --
 -- Extracted from "MetaSonic.Spec.Session" as the fifth slice of
--- the Session megafile split. 'constantAdapter' stays in the
--- parent module — it is also used by a later cohort in
--- "MetaSonic.Spec.Session" and is imported from there.
+-- the Session megafile split. 'constantAdapter' lives in
+-- "MetaSonic.Spec.SessionShared" alongside the preserving hot-swap
+-- cohort that also consumes it.
 module MetaSonic.Spec.Session.Step (sessionStepTests) where
 
 import qualified Data.ByteString.Char8          as OBSC
@@ -56,7 +56,7 @@ import           MetaSonic.Session.Runtime
 import           MetaSonic.Session.State
 import           MetaSonic.Session.Step
 
-import           MetaSonic.Spec.Session         (constantAdapter)
+import           MetaSonic.Spec.SessionShared   (constantAdapter)
 
 
 sessionStepTests :: TestTree
