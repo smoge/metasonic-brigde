@@ -250,6 +250,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.Feature.AuthoringManifest
       MetaSonic.Spec.Feature.AuthoringReport
       MetaSonic.Spec.Feature.Capability
+      MetaSonic.Spec.Feature.FusionProgramExecutor
       MetaSonic.Spec.Feature.FusionProgramScaffold
       MetaSonic.Spec.Feature.Planner
       MetaSonic.Spec.Feature.StaticPlugin

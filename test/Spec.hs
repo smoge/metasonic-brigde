@@ -46,6 +46,8 @@ import           MetaSonic.Spec.Feature.AuthoringDSL (authoringDslTests)
 import           MetaSonic.Spec.Feature.AuthoringManifest (authoringManifestTests)
 import           MetaSonic.Spec.Feature.AuthoringReport (authoringReportTests)
 import           MetaSonic.Spec.Feature.Capability (capabilityTableTests)
+import           MetaSonic.Spec.Feature.FusionProgramExecutor
+                   (fusionProgramExecutorTests)
 import           MetaSonic.Spec.Feature.FusionProgramScaffold
                    (fusionProgramScaffoldTests)
 import           MetaSonic.Spec.Feature.Planner (plannerTests)
