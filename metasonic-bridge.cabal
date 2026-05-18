@@ -248,6 +248,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.Feature
       MetaSonic.Spec.PatternOSCBuffer
       MetaSonic.Spec.Session
+      MetaSonic.Spec.Session.Arbitration
       MetaSonic.Spec.Session.Command
       MetaSonic.Spec.Session.ControlTarget
       MetaSonic.Spec.Session.Owner

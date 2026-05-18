@@ -44,6 +44,7 @@ import           MetaSonic.Spec.FFI.TemplateLifecycle (templateLifecycleTests)
 import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session
+import           MetaSonic.Spec.Session.Arbitration (sessionArbitrationTests)
 import           MetaSonic.Spec.Session.Command (sessionCommandTests)
 import           MetaSonic.Spec.Session.ControlTarget (controlTargetTests)
 import           MetaSonic.Spec.Session.Owner (sessionOwnerTests)

@@ -7,6 +7,8 @@ module MetaSonic.Spec.SessionShared
   , compileTemplateGraphOrFail
   , queueOrFail
   , enqueueOrFail
+  , freqTag
+  , levelTag
   ) where
 
 import qualified Data.Text                       as T
@@ -16,11 +18,12 @@ import           Test.Tasty.HUnit                (assertFailure)
 
 import           MetaSonic.Bridge.Compile        (rgNodes)
 import           MetaSonic.Bridge.FFI            (RTGraph, withRTGraph)
-import           MetaSonic.Bridge.Source         (SynthGraph)
+import           MetaSonic.Bridge.Source         (MigrationKey (..), SynthGraph)
 import           MetaSonic.Bridge.Templates      (TemplateGraph (..),
                                                   compileTemplateGraph,
                                                   tgTemplates, tplGraph,
                                                   tplName)
+import           MetaSonic.Pattern               (ControlTag (..))
 import           MetaSonic.Session.Command       (SessionCommand)
 import           MetaSonic.Session.Queue         (ProducerId (..), ProducerKind,
                                                   QueuedSessionCommand,
@@ -118,3 +121,14 @@ enqueueOrFail producer cmd queue =
       pure (queue', queued)
     (_queue', other) ->
       assertFailure ("expected enqueue success, got: " <> show other)
+
+-- | Shared control tags used across session arbitration, UI, and
+-- producer cohorts. Slot 0 of the 'MigrationKey'-named control on a
+-- node — paired with 'VoiceKey' values to form 'ControlTarget's.
+freqTag :: ControlTag
+freqTag =
+  ControlTag (MigrationKey "freq") 0
+
+levelTag :: ControlTag
+levelTag =
+  ControlTag (MigrationKey "level") 0
