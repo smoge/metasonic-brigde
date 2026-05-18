@@ -256,6 +256,7 @@ tests:
       - MetaSonic.Spec.Feature.AuthoringManifest
       - MetaSonic.Spec.Feature.AuthoringReport
       - MetaSonic.Spec.Feature.Capability
+      - MetaSonic.Spec.Feature.FusionProgramBlockExecutor
       - MetaSonic.Spec.Feature.FusionProgramExecutor
       - MetaSonic.Spec.Feature.FusionProgramScaffold
       - MetaSonic.Spec.Feature.Planner
