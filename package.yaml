@@ -251,7 +251,6 @@ tests:
       - MetaSonic.Spec.FFI.HotSwap
       - MetaSonic.Spec.FFI.T9
       - MetaSonic.Spec.FFI.TemplateLifecycle
-      - MetaSonic.Spec.Feature
       - MetaSonic.Spec.Feature.AuthoringDSL
       - MetaSonic.Spec.Feature.AuthoringManifest
       - MetaSonic.Spec.Feature.AuthoringReport
@@ -259,6 +258,7 @@ tests:
       - MetaSonic.Spec.Feature.FusionProgramBlockExecutor
       - MetaSonic.Spec.Feature.FusionProgramExecutor
       - MetaSonic.Spec.Feature.FusionProgramScaffold
+      - MetaSonic.Spec.Feature.FusionProgramSuperExecutor
       - MetaSonic.Spec.Feature.Planner
       - MetaSonic.Spec.Feature.StaticPlugin
       - MetaSonic.Spec.PatternOSCBuffer

@@ -1,20 +1,21 @@
-{-# LANGUAGE LambdaCase #-}
+-- | Phase 7.I super-mode executor: bit-exact equivalence with RNodeLoop.
+--
+-- The super-mode executor consumes the same emitted
+-- 'FusionProgram' the other generated executors do, so these tests
+-- hand-author the same shapes as the 7.D / 7.G / 7.H suites but
+-- flip 'rrExec' to 'ExecGeneratedSuper'. Two programs match the
+-- v1 recognizer set (GainOut and AddGainOut) and exercise the
+-- fast path; one longer tail exercises the fallback to the
+-- block-major executor. Bit-exact match against the stripped
+-- node-loop baseline pins both paths.
+module MetaSonic.Spec.Feature.FusionProgramSuperExecutor
+  ( fusionProgramSuperExecutorTests
+  ) where
 
--- | Authoring, planner, static-plugin, and fusion-program feature tests.
-module MetaSonic.Spec.Feature where
-
-import qualified Data.ByteString.Lazy.Char8 as BL
-import qualified Data.Map.Strict           as M
-import qualified Data.Set                  as S
-import           Data.List                 (isInfixOf, sort)
-import           Control.Exception         (try)
-import           Control.Monad             (forM_)
-import           Data.Maybe                (isJust, listToMaybe)
-import           Data.Word                 (Word8)
 import           Foreign.C.Types           (CFloat (..))
 import           Foreign.Marshal.Alloc     (allocaBytes)
 import           Foreign.Marshal.Array     (peekArray)
-import           Foreign.Ptr               (castPtr)
+import           Foreign.Ptr               (Ptr, castPtr)
 
 import           Test.Tasty
 import           Test.Tasty.HUnit
@@ -22,33 +23,9 @@ import           Test.Tasty.HUnit
 import           MetaSonic.Bridge.Compile
 import           MetaSonic.Bridge.Compile.FusionProgram
 import           MetaSonic.Bridge.FFI
-import           MetaSonic.Bridge.IR
-import           MetaSonic.Bridge.Planner
+import           MetaSonic.Bridge.IR       (lowerGraph)
 import           MetaSonic.Bridge.Source
-import           MetaSonic.Bridge.Templates
-import qualified MetaSonic.OSC.Dispatch    as OSC
-import qualified MetaSonic.OSC.Wire        as OSC
-import qualified MetaSonic.Authoring       as Auth
-import           MetaSonic.Authoring.Manifest
-import           MetaSonic.Authoring.Report
 import           MetaSonic.Types
-import           MetaSonic.Spec.Core
-
-import qualified Data.ByteString.Char8     as OBSC
-
-------------------------------------------------------------
--- §7.I super-mode executor: bit-exact equivalence with RNodeLoop
-------------------------------------------------------------
---
--- The super-mode executor consumes the same emitted
--- 'FusionProgram' the other generated executors do, so these
--- tests hand-author the same shapes as the 7.D / 7.G / 7.H
--- suites but flip 'rrExec' to 'ExecGeneratedSuper'. Two
--- programs match the v1 recognizer set (GainOut and
--- AddGainOut) and exercise the fast path; one longer tail
--- exercises the fallback to the block-major executor. Bit-
--- exact match against the stripped node-loop baseline pins
--- both paths.
 
 fusionProgramSuperExecutorTests :: TestTree
 fusionProgramSuperExecutorTests =
@@ -112,7 +89,7 @@ fusionProgramSuperExecutorTests =
             allocaBytes (nframes * 4) $ \bp -> do
               _ <- c_rt_graph_read_bus rt 0
                      (fromIntegral nframes) (castPtr bp)
-              peekArray nframes (bp :: PtrCFloat)
+              peekArray nframes (bp :: Ptr CFloat)
 
       baseSamples <- render baseline
       genSamples  <- render generated
@@ -192,7 +169,7 @@ fusionProgramSuperExecutorTests =
             allocaBytes (nframes * 4) $ \bp -> do
               _ <- c_rt_graph_read_bus rt 0
                      (fromIntegral nframes) (castPtr bp)
-              peekArray nframes (bp :: PtrCFloat)
+              peekArray nframes (bp :: Ptr CFloat)
 
       baseSamples <- render baseline
       genSamples  <- render generated
@@ -283,7 +260,7 @@ fusionProgramSuperExecutorTests =
             allocaBytes (nframes * 4) $ \bp -> do
               _ <- c_rt_graph_read_bus rt 0
                      (fromIntegral nframes) (castPtr bp)
-              peekArray nframes (bp :: PtrCFloat)
+              peekArray nframes (bp :: Ptr CFloat)
 
       baseSamples <- render baseline
       genSamples  <- render generated
@@ -395,7 +372,7 @@ fusionProgramSuperExecutorTests =
             allocaBytes (nframes * 4) $ \bp -> do
               _ <- c_rt_graph_read_bus rt 0
                      (fromIntegral nframes) (castPtr bp)
-              peekArray nframes (bp :: PtrCFloat)
+              peekArray nframes (bp :: Ptr CFloat)
 
       blockSamples <- render blockRG
       superSamples <- render superRG

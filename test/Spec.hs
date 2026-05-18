@@ -41,7 +41,6 @@ import           MetaSonic.Spec.FFI.FusedRender (fusedRenderTests)
 import           MetaSonic.Spec.FFI.HotSwap (hotSwapTests)
 import           MetaSonic.Spec.FFI.T9    (t9DirectEqualsReductionTests)
 import           MetaSonic.Spec.FFI.TemplateLifecycle (templateLifecycleTests)
-import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.Feature.AuthoringDSL (authoringDslTests)
 import           MetaSonic.Spec.Feature.AuthoringManifest (authoringManifestTests)
 import           MetaSonic.Spec.Feature.AuthoringReport (authoringReportTests)
@@ -52,6 +51,8 @@ import           MetaSonic.Spec.Feature.FusionProgramExecutor
                    (fusionProgramExecutorTests)
 import           MetaSonic.Spec.Feature.FusionProgramScaffold
                    (fusionProgramScaffoldTests)
+import           MetaSonic.Spec.Feature.FusionProgramSuperExecutor
+                   (fusionProgramSuperExecutorTests)
 import           MetaSonic.Spec.Feature.Planner (plannerTests)
 import           MetaSonic.Spec.Feature.StaticPlugin (staticPluginSkeletonTests)
 import           MetaSonic.Spec.PatternOSCBuffer
