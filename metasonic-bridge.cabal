@@ -248,6 +248,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.Feature
       MetaSonic.Spec.PatternOSCBuffer
       MetaSonic.Spec.Session
+      MetaSonic.Spec.Session.Command
       MetaSonic.Spec.SessionManifestReload
       MetaSonic.Spec.SessionMIDI
       MetaSonic.Spec.SessionShared

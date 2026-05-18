@@ -44,6 +44,7 @@ import           MetaSonic.Spec.FFI.TemplateLifecycle (templateLifecycleTests)
 import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session
+import           MetaSonic.Spec.Session.Command (sessionCommandTests)
 import           MetaSonic.Spec.SessionManifestReload
 import           MetaSonic.Spec.SessionMIDI
 
