@@ -43,7 +43,6 @@ import           MetaSonic.Spec.FFI.T9    (t9DirectEqualsReductionTests)
 import           MetaSonic.Spec.FFI.TemplateLifecycle (templateLifecycleTests)
 import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.PatternOSCBuffer
-import           MetaSonic.Spec.Session
 import           MetaSonic.Spec.Session.Arbitration (sessionArbitrationTests)
 import           MetaSonic.Spec.Session.ArbitrationGateway
                    (sessionArbitrationGatewayTests)
@@ -54,6 +53,7 @@ import           MetaSonic.Spec.Session.FanInService (sessionFanInServiceTests)
 import           MetaSonic.Spec.Session.Host (sessionHostTests)
 import           MetaSonic.Spec.Session.LiveHotSwap
                    (sessionLiveHotSwapOrchestrationTests)
+import           MetaSonic.Spec.Session.OSCListener (sessionOSCListenerTests)
 import           MetaSonic.Spec.Session.OSCProducer (sessionOSCProducerTests)
 import           MetaSonic.Spec.Session.Owner (sessionOwnerTests)
 import           MetaSonic.Spec.Session.PatternProducer

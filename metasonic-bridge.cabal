@@ -247,7 +247,6 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.FFI.TemplateLifecycle
       MetaSonic.Spec.Feature
       MetaSonic.Spec.PatternOSCBuffer
-      MetaSonic.Spec.Session
       MetaSonic.Spec.Session.Arbitration
       MetaSonic.Spec.Session.ArbitrationGateway
       MetaSonic.Spec.Session.Command
@@ -256,6 +255,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.Session.FanInService
       MetaSonic.Spec.Session.Host
       MetaSonic.Spec.Session.LiveHotSwap
+      MetaSonic.Spec.Session.OSCListener
       MetaSonic.Spec.Session.OSCProducer
       MetaSonic.Spec.Session.Owner
       MetaSonic.Spec.Session.PatternProducer

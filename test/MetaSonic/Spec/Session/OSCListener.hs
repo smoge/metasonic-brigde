@@ -1,50 +1,49 @@
-{-# LANGUAGE LambdaCase #-}
-
--- | Session command, runtime ownership, queue, host, UI, and OSC producer tests.
-module MetaSonic.Spec.Session where
+-- | Session OSC listener adapter tests.
+--
+-- This is the UDP wrapper above the OSC producer adapter. It only
+-- enqueues into 'SessionFanInHost' (or the arbitrated service path);
+-- draining stays caller-driven. Loopback packet fixtures live in
+-- "MetaSonic.Spec.Core".
+module MetaSonic.Spec.Session.OSCListener
+  ( sessionOSCListenerTests
+  ) where
 
 import qualified Data.Map.Strict           as M
-import qualified Data.Text                 as T
-import           Control.Concurrent        (forkIO, newEmptyMVar, putMVar,
-                                            takeMVar)
-import           Control.Monad             (forM_)
-import           Data.IORef                (modifyIORef', newIORef, readIORef,
-                                            writeIORef)
+import qualified Data.ByteString           as OBS
+import qualified Data.ByteString.Char8     as OBSC
+import           Control.Concurrent        (newEmptyMVar, putMVar, takeMVar)
+import           Data.IORef                (modifyIORef', newIORef, readIORef)
 import           System.Timeout            (timeout)
 
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
-import           MetaSonic.Bridge.Source
-import qualified MetaSonic.OSC.Dispatch    as OSC
-import qualified MetaSonic.OSC.Wire        as OSC
-import           MetaSonic.Pattern
-import           MetaSonic.Pattern.Corpus
+import           MetaSonic.Bridge.Source            (MigrationKey (..))
+import qualified MetaSonic.OSC.Dispatch             as OSC
+import           MetaSonic.Pattern                  (ControlTag (..),
+                                                     Pattern (..),
+                                                     TemplateName (..),
+                                                     VoiceKey (..))
+import           MetaSonic.Pattern.Corpus           (droneVibrato)
 import           MetaSonic.Session.Arbitration
 import           MetaSonic.Session.ArbitrationGateway
-import           MetaSonic.Session.Command
-import           MetaSonic.Session.Runtime
-import           MetaSonic.Session.State
-import           MetaSonic.Session.Step
-import           MetaSonic.Session.Owner
-import           MetaSonic.Session.Queue
+import           MetaSonic.Session.Command          (SessionCommand (..),
+                                                     SessionIssue (..))
 import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.FanInService
 import           MetaSonic.Session.OSCProducer
-import qualified MetaSonic.Session.OSCListener as OSCS
-import           MetaSonic.Session.UIProducer
-import           MetaSonic.Spec.Core
-import           MetaSonic.Spec.SessionShared
-
-import qualified Data.ByteString           as OBS
-import qualified Data.ByteString.Char8     as OBSC
-
-------------------------------------------------------------
--- Session OSC listener adapter
---
--- This is the UDP wrapper above the OSC producer adapter. It only
--- enqueues into SessionFanInHost; draining stays caller-driven.
-------------------------------------------------------------
+import qualified MetaSonic.Session.OSCListener      as OSCS
+import           MetaSonic.Session.Owner            (SessionOwnerStatus (..),
+                                                     SessionOwnerStepResult (..))
+import           MetaSonic.Session.Queue
+import           MetaSonic.Session.State            (ssVoices)
+import           MetaSonic.Session.Step             (SessionStepResult (..))
+import           MetaSonic.Spec.Core                (messageBytesSwapLpfFloat,
+                                                     messageBytesV0LpfFloat,
+                                                     sendUdpLoopback)
+import           MetaSonic.Spec.SessionShared       (fanInQueuedOrFail,
+                                                     gatewayQueuedOrFail,
+                                                     testProducer)
 
 sessionOSCListenerTests :: TestTree
 sessionOSCListenerTests =
