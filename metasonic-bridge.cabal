@@ -233,6 +233,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestReloadUIIngress
       MetaSonic.Spec.AppDemos
       MetaSonic.Spec.Core
+      MetaSonic.Spec.Core.CCBuilder
       MetaSonic.Spec.Core.MigrationKeys
       MetaSonic.Spec.Core.NodeIndex
       MetaSonic.Spec.CoreShared
