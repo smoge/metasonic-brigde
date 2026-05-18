@@ -45,6 +45,7 @@ import           MetaSonic.Spec.Feature
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session
 import           MetaSonic.Spec.Session.Command (sessionCommandTests)
+import           MetaSonic.Spec.Session.Report (sessionReportTests)
 import           MetaSonic.Spec.Session.Resolve (sessionResolveTests)
 import           MetaSonic.Spec.SessionManifestReload
 import           MetaSonic.Spec.SessionMIDI
