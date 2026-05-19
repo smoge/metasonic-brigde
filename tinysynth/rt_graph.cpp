@@ -828,20 +828,36 @@ Hann table and the scale are namespace-scope constants
 initialized before main(), so the audio thread never pays
 the table-build cost.
 */
-struct SpectralFreezeState {
+// Shared overlap-add STFT ring state. Used by every spectral kind that
+// runs at the v1 fixed window contract (N=1024, hop=256, Hann window,
+// mono). Kinds compose this struct alongside any kind-specific spectrum
+// storage (see SpectralFreezeState below) rather than inheriting from
+// it — the runtime keeps `NodeState` as a `std::variant` of plain
+// structs, and the hop pipeline is shared by template-on-callable
+// (`run_stft_block` in the helpers section), not by runtime
+// polymorphism.
+struct StftRings {
   static constexpr int kN = 1024;
   static constexpr int kHop = 256;
   static constexpr int kOverlaps = kN / kHop; // 4
+  static constexpr int kBins = kN / 2 + 1;    // unique real-FFT bins
 
   // Pre-zeroed at configure_node; reset never reallocates.
   std::array<float, kN> input_ring{};
   std::array<float, kN + kHop> output_ring{};
-  std::array<float, 2 * kN> spectrum_work{};             // FFT scratch
-  std::array<float, 2 * (kN / 2 + 1)> frozen_spectrum{}; // last analysis hop
+  std::array<float, 2 * kN> spectrum_work{}; // FFT scratch
   int input_write_head = 0;
   int output_read_head = 0;
   long long samples_in = 0; // monotonic; hop boundaries at samples_in % kHop == 0
   long long samples_out = 0;
+};
+
+struct SpectralFreezeState {
+  StftRings stft{};
+  // Last completed analysis hop, stored as the Hermitian half
+  // (bins 0..kN/2). Persists across frozen hops so freeze replay
+  // continues to reconstruct the same spectrum.
+  std::array<float, 2 * (StftRings::kN / 2 + 1)> frozen_spectrum{};
   bool frozen_valid = false;
 };
 
@@ -5174,8 +5190,11 @@ static void process_record_buf_mono(
 // hop`. We precompute it once at construction.
 namespace {
 
-constexpr int kSpectralFreezeN = SpectralFreezeState::kN;
-constexpr int kSpectralFreezeHop = SpectralFreezeState::kHop;
+// Aliases retained for the namespace-scope Hann / WOLA constants
+// below, which were written against these names. The canonical
+// definition now lives on StftRings; both spectral kinds share it.
+constexpr int kSpectralFreezeN = StftRings::kN;
+constexpr int kSpectralFreezeHop = StftRings::kHop;
 
 // Hann window of length N, computed at static-init time.
 // Value at index i is 0.5 * (1 - cos(2π i / (N - 1))).
@@ -5233,6 +5252,134 @@ const HannWindow kHannWindow{};
 const double kSpectralResynthesisScale =
     static_cast<double>(kSpectralFreezeHop) / kHannWindow.sum_of_squares;
 
+// Counter deltas a single STFT block produced. The helper returns
+// these so each kind can apply them to its own counter pair
+// without coupling the helper to RTGraph internals.
+struct StftBlockTicks {
+  long long analysis = 0;
+  long long resynth = 0;
+};
+
+// Outcome of one hop-boundary callable invocation. The callable
+// populates `rings.spectrum_work` with the full FFT-domain
+// spectrum that will be IFFT'd and overlap-added, and reports
+// whether it ran an analysis FFT so the host kind's
+// analysis-count advances exactly when the design contract says
+// it should. Freeze sets `analysis_fired = false` on frozen hops.
+struct StftHopOutcome {
+  bool analysis_fired = false;
+};
+
+// Common "window the most recent N samples of the input ring and
+// run the forward FFT into spectrum_work" step. Pulled out of
+// process_spectral_freeze so any future spectral kind that needs
+// an analysis spectrum (LPF, robot voice, pitch shift) writes
+// this prologue once. Does not touch counters — the caller's hop
+// callable returns analysis_fired = true if it invoked this and
+// run_stft_block applies the tick.
+static void window_and_fft_input_ring(StftRings &rings) noexcept {
+  const int start = rings.input_write_head;
+  auto &spec = rings.spectrum_work;
+  for (int i = 0; i < StftRings::kN; ++i) {
+    const int src_idx = (start + i) % StftRings::kN;
+    const float sample = rings.input_ring[static_cast<std::size_t>(src_idx)];
+    const float w = kHannWindow.data[static_cast<std::size_t>(i)];
+    spec[static_cast<std::size_t>(2 * i)] = sample * w;
+    spec[static_cast<std::size_t>(2 * i + 1)] = 0.0f;
+  }
+  cycfi::q::fft<static_cast<std::size_t>(StftRings::kN)>(spec.data());
+}
+
+// Run one audio-callback block through the shared STFT pipeline.
+// Owns frame stepping, input-ring write, output-ring read+zero,
+// hop-boundary detection, IFFT, and WOLA overlap-add. The
+// per-hop spectrum preparation is left to the caller-supplied
+// `hop_op`, whose signature is
+//
+//   StftHopOutcome hop_op(StftRings &rings, int fi)
+//
+// where `fi` is the index within the current block at which the
+// hop boundary fired (so the callable can sample any
+// per-sample-accurate side inputs at the same position the
+// freeze kernel reads `freeze_flag[fi]`). The callable must
+// leave `rings.spectrum_work` populated with the full
+// length-N complex spectrum to invert; `window_and_fft_input_ring`
+// is the standard way to produce it.
+//
+// Operation order per frame is the same one the original
+// process_spectral_freeze used and the existing freeze tests
+// pin: (1) write the input sample into the input ring, (2) read
+// the next output sample and zero its ring slot, (3) increment
+// samples_in / samples_out, (4) test the hop-boundary
+// predicate. If a hop fires, the callable runs (possibly
+// invoking the forward FFT), then IFFT + WOLA add into the
+// output ring starting at the current `output_read_head`. The
+// scale factor used for WOLA is the namespace-scope
+// kSpectralResynthesisScale.
+template <typename HopOp>
+static StftBlockTicks run_stft_block(
+    StftRings &rings,
+    std::span<const float> sig_in,
+    double sig_default,
+    std::span<float> out,
+    int nframes,
+    HopOp hop_op
+) noexcept {
+  StftBlockTicks ticks{};
+  const float scale = static_cast<float>(kSpectralResynthesisScale);
+
+  for (int fi = 0; fi < nframes; ++fi) {
+    const float in_sample =
+        sig_in.empty() ? static_cast<float>(sig_default) : sig_in[static_cast<std::size_t>(fi)];
+
+    // 1. Write into input ring.
+    rings.input_ring[static_cast<std::size_t>(rings.input_write_head)] = in_sample;
+    rings.input_write_head = (rings.input_write_head + 1) % StftRings::kN;
+
+    // 2. Read from output ring, then zero the slot (so the
+    //    next IFFT pass that lands here starts from 0).
+    const int read_idx = rings.output_read_head;
+    out[static_cast<std::size_t>(fi)] =
+        rings.output_ring[static_cast<std::size_t>(read_idx)];
+    rings.output_ring[static_cast<std::size_t>(read_idx)] = 0.0f;
+    rings.output_read_head = (rings.output_read_head + 1) % StftRings::kN;
+
+    // 3. Tick sample counters and decide whether this is an
+    //    analysis hop boundary. samples_in >= kN gates pre-roll:
+    //    the first kN samples accumulate into the input ring
+    //    without firing a hop, matching the design contract's
+    //    "frames 0..N-1 of the output are silent by construction".
+    ++rings.samples_in;
+    ++rings.samples_out;
+
+    const bool hop_boundary =
+        (rings.samples_in % StftRings::kHop) == 0 && rings.samples_in >= StftRings::kN;
+    if (!hop_boundary)
+      continue;
+
+    // 4. Callable populates spectrum_work and reports whether an
+    //    analysis FFT happened.
+    const StftHopOutcome outcome = hop_op(rings, fi);
+    if (outcome.analysis_fired)
+      ++ticks.analysis;
+
+    // 5. IFFT + WOLA overlap-add. Always runs (freeze still
+    //    resynthesizes while the analysis side is suspended).
+    cycfi::q::ifft<static_cast<std::size_t>(StftRings::kN)>(rings.spectrum_work.data());
+    ++ticks.resynth;
+
+    const int add_start = rings.output_read_head;
+    for (int i = 0; i < StftRings::kN; ++i) {
+      const int dst = (add_start + i) % StftRings::kN;
+      const float w = kHannWindow.data[static_cast<std::size_t>(i)];
+      const float reconstructed = rings.spectrum_work[static_cast<std::size_t>(2 * i)];
+      rings.output_ring[static_cast<std::size_t>(dst)] += reconstructed * w * scale;
+    }
+  }
+
+  return ticks;
+}
+
 } // namespace
 
 static void process_spectral_freeze(
@@ -5253,152 +5400,73 @@ static void process_spectral_freeze(
   const double sig_default = node.controls[0];
   const double freeze_default = node.controls[1];
 
-  constexpr int kN = kSpectralFreezeN;
-  constexpr int kHop = kSpectralFreezeHop;
-  constexpr int kBins = kN / 2 + 1; // unique real-FFT bins
-  // kHannWindow / kSpectralResynthesisScale are namespace-scope
-  // constants initialized before the audio callback can invoke
-  // this kernel, so the audio thread never pays the table-build
-  // cost or the local-static thread-safe init guard.
-  const HannWindow &win = kHannWindow;
-  const float scale = static_cast<float>(kSpectralResynthesisScale);
+  constexpr int kBins = StftRings::kBins;
 
-  long long analysis_ticks = 0;
-  long long resynth_ticks = 0;
+  // Hop-boundary callable. Populates rings.spectrum_work with the
+  // spectrum to invert. On pass-through hops it runs the analysis
+  // FFT through the shared window_and_fft_input_ring helper and
+  // persists bins 0..N/2 to frozen_spectrum; on frozen hops it
+  // reconstructs the full conjugate-symmetric spectrum from that
+  // stored Hermitian half and skips the forward FFT (so the
+  // analysis counter stays put while resynthesis keeps ticking,
+  // matching the design contract's "counters diverge in freeze
+  // mode"). Reading freeze_flag once at the hop boundary is the
+  // Q-1 hop-latching contract; the port stays
+  // PortSampleAccurate at the C ABI.
+  auto hop_op = [&](StftRings &rings, int fi) noexcept -> StftHopOutcome {
+    const double freeze_raw =
+        freeze_in.empty() ? freeze_default : static_cast<double>(freeze_in[static_cast<std::size_t>(fi)]);
+    const bool freezing = std::isfinite(freeze_raw) && freeze_raw >= 0.5;
 
-  for (int fi = 0; fi < nframes; ++fi) {
-    const float in_sample = sig_in.empty() ? static_cast<float>(sig_default) : sig_in[fi];
+    auto &spec = rings.spectrum_work;
 
-    // 1. Write into input ring.
-    st->input_ring[static_cast<std::size_t>(st->input_write_head)] = in_sample;
-    st->input_write_head = (st->input_write_head + 1) % kN;
-
-    // 2. Read from output ring, then zero the slot (so the
-    //    next IFFT pass that lands here starts from 0).
-    const int read_idx = st->output_read_head;
-    out[static_cast<std::size_t>(fi)] =
-        st->output_ring[static_cast<std::size_t>(read_idx)];
-    st->output_ring[static_cast<std::size_t>(read_idx)] = 0.0f;
-    st->output_read_head = (st->output_read_head + 1) % kN;
-
-    // 3. Tick sample counters and decide whether this is an
-    //    analysis hop boundary.
-    ++st->samples_in;
-    ++st->samples_out;
-
-    const bool hop_boundary = (st->samples_in % kHop) == 0 && st->samples_in >= kN;
-    if (!hop_boundary)
-      continue;
-
-    // ---- Hop-boundary processing ----
-    //
-    // Pass-through path: window + FFT the most recent N
-    // samples, persist the resulting spectrum to
-    // frozen_spectrum (bins 0..N/2 only — the upper half is
-    // conjugate-symmetric for real input), then IFFT and
-    // overlap-add the synthesis frame into the output ring.
-    //
-    // Freeze path: skip the analysis FFT. Reconstruct the
-    // full spectrum from the stored Hermitian half, IFFT,
-    // and overlap-add. The analysis_count stays put while
-    // resynthesis_count keeps ticking — the counters
-    // diverge in freeze mode.
-    //
-    // Read freeze_flag once at the hop boundary (Q-1
-    // settled: PortSampleAccurate at the port, but the
-    // kernel hop-latches internally). Use the input sample
-    // at fi when the hop fires; fall back to the default
-    // when nothing is wired.
-    {
-      const double freeze_raw =
-          freeze_in.empty() ? freeze_default : static_cast<double>(freeze_in[fi]);
-      const bool freezing = std::isfinite(freeze_raw) && freeze_raw >= 0.5;
-
-      auto &spec = st->spectrum_work;
-
-      if (!freezing) {
-        // Analysis: window + FFT the most recent N samples.
-        const int start = st->input_write_head;
-        for (int i = 0; i < kN; ++i) {
-          const int src_idx = (start + i) % kN;
-          const float sample = st->input_ring[static_cast<std::size_t>(src_idx)];
-          const float w = win.data[static_cast<std::size_t>(i)];
-          spec[static_cast<std::size_t>(2 * i)] = sample * w;
-          spec[static_cast<std::size_t>(2 * i + 1)] = 0.0f;
-        }
-        cycfi::q::fft<static_cast<std::size_t>(kN)>(spec.data());
-        ++analysis_ticks;
-
-        // Persist bins 0..N/2 (kBins entries) for later
-        // freeze playback. The N/2+1..N-1 bins are
-        // reconstructed by conjugation from bins 1..N/2-1
-        // for real-input FFTs.
-        for (int k = 0; k < kBins; ++k) {
-          st->frozen_spectrum[static_cast<std::size_t>(2 * k)] =
-              spec[static_cast<std::size_t>(2 * k)];
-          st->frozen_spectrum[static_cast<std::size_t>(2 * k + 1)] =
-              spec[static_cast<std::size_t>(2 * k + 1)];
-        }
-        st->frozen_valid = true;
-      } else {
-        // Freeze path. Skip analysis; reconstruct the full
-        // spectrum from the stored Hermitian half. If
-        // frozen_valid is false (freeze flag was on before
-        // any analysis hop ever fired), emit silence — the
-        // spectrum is zero, and zero through IFFT is zero.
-        if (!st->frozen_valid) {
-          // spec is whatever was left from a prior pass;
-          // zero it so the IFFT below emits silence into
-          // the output ring.
-          std::fill(spec.begin(), spec.end(), 0.0f);
-        } else {
-          // Copy bins 0..N/2 from frozen_spectrum into
-          // spec, then reconstruct bins N/2+1..N-1 by
-          // conjugation.
-          for (int k = 0; k < kBins; ++k) {
-            spec[static_cast<std::size_t>(2 * k)] =
-                st->frozen_spectrum[static_cast<std::size_t>(2 * k)];
-            spec[static_cast<std::size_t>(2 * k + 1)] =
-                st->frozen_spectrum[static_cast<std::size_t>(2 * k + 1)];
-          }
-          for (int k = kBins; k < kN; ++k) {
-            // bin k mirrors bin N-k with conjugated imag part.
-            const int mirror = kN - k;
-            spec[static_cast<std::size_t>(2 * k)] =
-                spec[static_cast<std::size_t>(2 * mirror)];
-            spec[static_cast<std::size_t>(2 * k + 1)] =
-                -spec[static_cast<std::size_t>(2 * mirror + 1)];
-          }
-        }
+    if (!freezing) {
+      // Pass-through hop: shared analysis FFT, then persist
+      // bins 0..N/2 (kBins entries) for later freeze playback.
+      // The N/2+1..N-1 bins are reconstructed by conjugation
+      // from bins 1..N/2-1 for real-input FFTs.
+      window_and_fft_input_ring(rings);
+      for (int k = 0; k < kBins; ++k) {
+        st->frozen_spectrum[static_cast<std::size_t>(2 * k)] =
+            spec[static_cast<std::size_t>(2 * k)];
+        st->frozen_spectrum[static_cast<std::size_t>(2 * k + 1)] =
+            spec[static_cast<std::size_t>(2 * k + 1)];
       }
+      st->frozen_valid = true;
+      return StftHopOutcome{/*analysis_fired=*/true};
+    }
 
-      cycfi::q::ifft<static_cast<std::size_t>(kN)>(spec.data());
-      ++resynth_ticks;
-
-      // Overlap-add into output_ring starting at the current
-      // output_read_head. The synthesis frame's relative
-      // offset 0 lands at the next output sample to be
-      // emitted, so input sample at offset j of the analysis
-      // window becomes output sample (analysis_time + j),
-      // i.e. exactly N samples after it was input. With
-      // 75% overlap the same input sample is reconstructed
-      // by 4 overlapping windows, all of which target the
-      // same output position thanks to the matched
-      // window/hop arithmetic — that's the COLA invariant.
-      // Steady-state latency: N samples, matching the
-      // kindLatency declaration on the Haskell side.
-      const int add_start = st->output_read_head;
-      for (int i = 0; i < kN; ++i) {
-        const int dst = (add_start + i) % kN;
-        const float w = win.data[static_cast<std::size_t>(i)];
-        const float reconstructed = spec[static_cast<std::size_t>(2 * i)]; // real part
-        st->output_ring[static_cast<std::size_t>(dst)] += reconstructed * w * scale;
+    // Frozen hop. Skip analysis; reconstruct the full spectrum
+    // from the stored Hermitian half. If frozen_valid is false
+    // (freeze flag was on before any analysis hop ever fired),
+    // emit silence — the spectrum is zero, and zero through
+    // IFFT is zero.
+    if (!st->frozen_valid) {
+      std::fill(spec.begin(), spec.end(), 0.0f);
+    } else {
+      for (int k = 0; k < kBins; ++k) {
+        spec[static_cast<std::size_t>(2 * k)] =
+            st->frozen_spectrum[static_cast<std::size_t>(2 * k)];
+        spec[static_cast<std::size_t>(2 * k + 1)] =
+            st->frozen_spectrum[static_cast<std::size_t>(2 * k + 1)];
+      }
+      for (int k = kBins; k < StftRings::kN; ++k) {
+        // bin k mirrors bin N-k with conjugated imag part.
+        const int mirror = StftRings::kN - k;
+        spec[static_cast<std::size_t>(2 * k)] =
+            spec[static_cast<std::size_t>(2 * mirror)];
+        spec[static_cast<std::size_t>(2 * k + 1)] =
+            -spec[static_cast<std::size_t>(2 * mirror + 1)];
       }
     }
-  }
+    return StftHopOutcome{/*analysis_fired=*/false};
+  };
 
-  g.spectral_analysis_count += analysis_ticks;
-  g.spectral_resynthesis_count += resynth_ticks;
+  const StftBlockTicks ticks =
+      run_stft_block(st->stft, sig_in, sig_default, out, nframes, hop_op);
+
+  g.spectral_analysis_count += ticks.analysis;
+  g.spectral_resynthesis_count += ticks.resynth;
 }
 
 static void process_static_plugin(
