@@ -2,14 +2,15 @@
 
 Date: 2026-05-19
 
-Status: pre-implementation contract. This is the "small design note"
-the
+Status: implemented contract (closeout in §11). This was the
+"small design note" the
 [Phase 6.D latency follow-up decision](2026-05-11-e-phase-6d-latency-followup-decision.md)
-asked for before a second spectral kind goes into the runtime. The
+asked for before a second spectral kind went into the runtime;
+both implementation slices have since landed (see §11). The
 companion v1 contract for the first spectral kind is
 [Phase 6.D minimal spectral kind](2026-05-11-d-phase-6d-spectral-design.md);
-this note adopts the same shape and only resolves the questions the
-v1 note explicitly left open for the next kind.
+this note adopts the same shape and only resolves the questions
+the v1 note explicitly left open for the next kind.
 
 Read this before writing any runtime code. The intent is for the
 implementation slice to mirror this note line-for-line, the same way
@@ -386,3 +387,55 @@ to catch.
       becomes plausible by implementation time).
 - [ ] §7 sites table still mirrors the new-kind checklist in
       [AGENTS.md §Haskell/C++ Boundary](../AGENTS.md).
+
+## 11. Closeout
+
+Status: arc closed (2026-05-19). Both implementation slices
+landed and the closing validation gate is recorded here so the
+contract note is durable without reopening the arc.
+
+- `351fc59` extracted the shared STFT helper from
+  `KSpectralFreeze` (no new kind; freeze counters / audio
+  remain byte-equivalent).
+- `768a060` added `KSpectralLpf` end-to-end against that
+  helper.
+- `8521507` synced the ROADMAP §6.D paragraph from "next
+  direction" to closure record.
+- `78b31d1` dropped plugin hosting from the §6.D parked list
+  (already landed under §6.E; the parked-list entry was
+  pre-dating the §6.E surface and read as stale once 8521507
+  framed the §6.D paragraph as a status sync).
+
+Closing validation gate, run on the post-`78b31d1` tree:
+
+- `just check-offline` green: 1161 Haskell tests, 313 C++
+  tests, no failures.
+- `just metasonic --corpus-survey`: §6.D declared-latency
+  block reports both kinds in lockstep against the
+  `spectral-freeze-pad` row
+  (`texture: KSpectralFreeze@1=1024 samples`,
+  `lpf-bed: KSpectralLpf@1=1024 samples`), uncompensated skew
+  `(none)` so the
+  [latency-compensation reopen gate](2026-05-11-e-phase-6d-latency-followup-decision.md)
+  stays untriggered.
+- `just metasonic --fusion-survey`: declared-latency footprint
+  shows the single `KSpectralFreeze` row from the
+  `corpus:shape/spectral-freeze-tail` probe. `KSpectralLpf` is
+  absent on purpose — §6 of this note explicitly declined to
+  add a `shape/spectral-lpf-tail` shape probe, on the grounds
+  that the aggregate's job is "find anything with declared
+  latency at all" and a duplicate row reading the same value
+  is not new information.
+
+The closing gate is `just check-offline`, not `just cpp-test`.
+The latter is excluded by intent: it runs the live-audio CTest
+path, which is known to hang on this checkout, so it would not
+make a reliable closeout signal. If a future arc needs the
+device-backed lane in CI, it should be its own
+hardware-gated slice, not a retroactive condition on this one.
+
+Parked items remain parked, unchanged from §8: latency
+compensation, block-rate region promotion, `SpectrumConn` /
+spectrum-stream graphs, multichannel STFT, variable / runtime
+N or hop. The contract-note Q-deferrals in §9 also remain in
+the form they were resolved at implementation time.
