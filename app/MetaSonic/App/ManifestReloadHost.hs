@@ -34,6 +34,11 @@ import           MetaSonic.App.ManifestReloadIngress
                                                    closeManifestReloadIngress,
                                                    openFreshManifestReloadIngress,
                                                    resumeManifestReloadIngress)
+import           MetaSonic.App.ManifestReloadHost.Types
+                                                  (ManifestReloadHostIssue (..),
+                                                   ManifestReloadHostStrategy (..),
+                                                   ManifestReloadHostStrategyIssue (..),
+                                                   ManifestReloadHostStrategyRan (..))
 import           MetaSonic.App.ManifestReloadOrchestration
                                                   (HostPreservingDrainFailure (..),
                                                    HostPreservingReloadFailure (..),
@@ -91,50 +96,6 @@ data ManifestReloadHostConfig target ingressIssue handle =
     , mrhcAudioOptions      :: !SessionFanInAudioOptions
     , mrhcOwnerOptions      :: !SessionOwnerOptions
     }
-
--- | Unified issue type for the host command slots.
-data ManifestReloadHostIssue ingressIssue
-  = MrhiPlanning !MR.ManifestReloadIssue
-  | MrhiIngress !ingressIssue
-  | MrhiDrainStopped !SessionFanInDrainResult
-  | MrhiDrainLeftQueued !SessionFanInDrainResult
-  | MrhiAudio !SessionFanInAudioIssue
-  | MrhiReload !SessionFanInReloadIssue
-  | MrhiPreservingReloadRejected !ManifestPreservingHotSwapReport
-  | MrhiPreservingReloadStopped !ManifestPreservingHotSwapReport
-  | MrhiPreservingReloadUnexpected !ManifestPreservingHotSwapReport
-  deriving stock (Eq, Show)
-
--- | Explicit host-level manifest reload strategy.
---
--- 'TryPreservingThenStoppedAudio' falls back only from preserving
--- rejection paths that prove the old owner is still installed and old
--- ingress has resumed. It never falls back after preserving has
--- already changed the live owner.
-data ManifestReloadHostStrategy
-  = RequirePreserving
-  | TryPreservingThenStoppedAudio
-  | StoppedAudioOnly
-  deriving stock (Eq, Show)
-
--- | Strategy-level failure with both causes preserved when explicit
--- fallback was attempted.
-data ManifestReloadHostStrategyIssue issue
-  = MrhsiPreservingFailed !(HostPreservingReloadIssue issue)
-  | MrhsiStoppedAudioFailed !(HostStoppedAudioReloadIssue issue)
-  | MrhsiFallbackStoppedAudioFailed
-      !(HostPreservingReloadIssue issue)
-      !(HostStoppedAudioReloadIssue issue)
-  deriving stock (Eq, Show)
-
--- | Successful strategy outcome, including which install path actually
--- ran.
-data ManifestReloadHostStrategyRan issue
-  = MrhsrPreserving
-  | MrhsrStoppedAudio
-  | MrhsrStoppedAudioAfterPreservingRejected
-      !(HostPreservingReloadIssue issue)
-  deriving stock (Eq, Show)
 
 -- | Build stopped-audio orchestration slots backed by the real session
 -- host pieces.

@@ -141,7 +141,9 @@ executable metasonic-bridge
       MetaSonic.App.FusionCostModel
       MetaSonic.App.ManifestReloadBinding
       MetaSonic.App.ManifestReloadCli
+      MetaSonic.App.ManifestReloadEvent
       MetaSonic.App.ManifestReloadHost
+      MetaSonic.App.ManifestReloadHost.Types
       MetaSonic.App.ManifestLiveReloadDemo
       MetaSonic.App.ManifestMIDIIngressOps
       MetaSonic.App.ManifestMIDIListener
@@ -154,6 +156,7 @@ executable metasonic-bridge
       MetaSonic.App.ManifestReloadMIDIBinding
       MetaSonic.App.ManifestReloadMIDIIngress
       MetaSonic.App.ManifestReloadOrchestration
+      MetaSonic.App.ManifestReloadOrchestration.Types
       MetaSonic.App.ManifestReloadOSCBinding
       MetaSonic.App.ManifestReloadOSCIngress
       MetaSonic.App.ManifestReloadSupervisor
@@ -195,7 +198,9 @@ test-suite metasonic-bridge-test
       MetaSonic.App.Demos
       MetaSonic.App.ManifestReloadBinding
       MetaSonic.App.ManifestReloadCli
+      MetaSonic.App.ManifestReloadEvent
       MetaSonic.App.ManifestReloadHost
+      MetaSonic.App.ManifestReloadHost.Types
       MetaSonic.App.ManifestLiveReloadDemo
       MetaSonic.App.ManifestMIDIIngressOps
       MetaSonic.App.ManifestMIDIListener
@@ -208,6 +213,7 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestReloadMIDIBinding
       MetaSonic.App.ManifestReloadMIDIIngress
       MetaSonic.App.ManifestReloadOrchestration
+      MetaSonic.App.ManifestReloadOrchestration.Types
       MetaSonic.App.ManifestReloadOSCBinding
       MetaSonic.App.ManifestReloadOSCIngress
       MetaSonic.App.ManifestReloadSupervisor
