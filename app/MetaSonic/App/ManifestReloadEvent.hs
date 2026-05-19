@@ -22,12 +22,16 @@
 -- pattern-match on the inner constructors directly
 -- (e.g. @MrePreservingReloadRejected (HpariDrainRejectedResumeFailed drainErr resumeErr)@).
 --
--- This module is types-only by design. The first slice lands the
--- contract for review without committing to an IO threading shape:
--- the next slice will add an @onReloadEvent :: ManifestReloadEvent
--- issue -> IO ()@ hook field to the orchestrator config and wire
--- the existing @reloadManifestHostWithStrategy@ entrypoints as
--- no-op-hook wrappers around an @-WithEvents@ inner.
+-- The orchestration layer
+-- ("MetaSonic.App.ManifestReloadOrchestration") and the host layer
+-- ("MetaSonic.App.ManifestReloadHost") each expose
+-- @...WithEvents@ entrypoints that emit these events at the
+-- corresponding stage boundaries. The host config carries a
+-- @mrhcOnEvent@ field that the @WithEvents@ entrypoints read; the
+-- legacy entrypoints override that field with
+-- 'noManifestReloadEvents' before delegating, so callers that
+-- have not opted in to the event stream stay silent regardless of
+-- what they pass.
 
 module MetaSonic.App.ManifestReloadEvent
   ( ManifestReloadEvent (..)
