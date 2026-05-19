@@ -162,6 +162,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , playBufMonoTests
   , recordBufMonoSkeletonTests
   , spectralFreezeSkeletonTests
+  , spectralLpfTests
   , staticPluginSkeletonTests
   , authoringDslTests
   , authoringReportTests

@@ -87,12 +87,13 @@ TEST_CASE("kind_from_tag accepts every defined tag") {
     CHECK(rt_graph_kind_supported(21) == 1); // RecordBufMono
     CHECK(rt_graph_kind_supported(22) == 1); // SpectralFreeze
     CHECK(rt_graph_kind_supported(23) == 1); // StaticPlugin
+    CHECK(rt_graph_kind_supported(24) == 1); // SpectralLpf
 }
 
 TEST_CASE("kind_from_tag rejects unknown tags") {
     CHECK(rt_graph_kind_supported(0) == 0);
     CHECK(rt_graph_kind_supported(4) == 0);  // intentional gap
-    CHECK(rt_graph_kind_supported(24) == 0); // first unallocated past StaticPlugin
+    CHECK(rt_graph_kind_supported(25) == 0); // first unallocated past SpectralLpf
     CHECK(rt_graph_kind_supported(99) == 0);
     CHECK(rt_graph_kind_supported(-1) == 0);
 }

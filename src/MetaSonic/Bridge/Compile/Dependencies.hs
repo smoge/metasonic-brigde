@@ -493,10 +493,14 @@ isBufferWriterKind _              = False
 -- region containing a spectral kind is a Barrier, exactly the
 -- same shape as 'regionHasBufferWriter'.
 --
--- Today only 'KSpectralFreeze' qualifies; future spectral
--- kinds get added here.
+-- 'KSpectralFreeze' and 'KSpectralLpf' both qualify; the
+-- two kinds share an STFT pipeline (and the same hop-burst
+-- workload) and should land on the same scheduler side of
+-- the barrier predicate. Future spectral kinds add a row
+-- here.
 isSpectralKind :: NodeKind -> Bool
 isSpectralKind KSpectralFreeze = True
+isSpectralKind KSpectralLpf    = True
 isSpectralKind _               = False
 
 -- | §6.D slice 2: whether a region contains any spectral

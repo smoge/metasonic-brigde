@@ -344,7 +344,10 @@ layeredEnsembleEvents =
 -- contract without requiring a runtime pattern driver.
 
 spectralFreezePadTemplates :: [(String, SynthGraph)]
-spectralFreezePadTemplates = [("texture", spectralFreezePadGraph)]
+spectralFreezePadTemplates =
+  [ ("texture", spectralFreezePadGraph)
+  , ("lpf-bed", spectralLpfBedGraph)
+  ]
 
 spectralFreezePad :: Pattern
 spectralFreezePad = Pattern
@@ -357,6 +360,19 @@ spectralFreezePadGraph = runSynth $ do
   carrier <- tagged "carrier" (sinOsc (Param 110.0) (Param 0.0))
   frozen  <- tagged "freeze"  (spectralFreeze carrier (Param 0.0))
   shaped  <- tagged "outgain" (gain frozen (Param 0.35))
+  out 0 shaped
+
+-- §6.D second spectral kind: a saw-into-spectral-LPF bed paired
+-- with the freeze pad above. Sharing the corpus row keeps the
+-- declared-latency surface contiguous for --corpus-survey
+-- without forcing decisions about what "an LPF row" would do in
+-- pattern terms; the bed exists so both spectral kinds appear in
+-- a single survey aggregate.
+spectralLpfBedGraph :: SynthGraph
+spectralLpfBedGraph = runSynth $ do
+  carrier  <- tagged "carrier" (sawOsc (Param 110.0) (Param 0.0))
+  filtered <- tagged "lpf"     (spectralLpf carrier (Param 800.0))
+  shaped   <- tagged "outgain" (gain filtered (Param 0.35))
   out 0 shaped
 
 spectralFreezePadEvents :: [(SamplePos, PatternEvent)]

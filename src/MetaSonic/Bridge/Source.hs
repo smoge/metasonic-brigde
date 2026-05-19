@@ -65,6 +65,7 @@ module MetaSonic.Bridge.Source
   , playBufMono
   , recordBufMono
   , spectralFreeze
+  , spectralLpf
   , staticPlugin
   , tagged
   , cc
@@ -664,6 +665,23 @@ data UGen
     -- metadata control @plugin_id@ in control slot 0. The
     -- fixed v1 profile is @[Pure]@ and declares no inherent
     -- latency.
+  | SpectralLpf !Connection !Connection
+    -- ^ Mono STFT brick-wall lowpass (§6.D second kind).
+    -- Reuses every piece of the 'SpectralFreeze' windowing
+    -- machinery; the only kind-specific work is to zero
+    -- spectrum bins whose center frequency exceeds the
+    -- hop-latched cutoff before the IFFT. Arguments in
+    -- declared order: the audio signal to filter, and the
+    -- cutoff in Hz. The kernel clamps the cutoff to
+    -- @[0, SR/2]@ at hop time and rounds to the nearest
+    -- bin, so cutoff @>= SR/2@ is a no-op modulo windowing
+    -- and cutoff @<= 0@ passes only DC.
+    --
+    -- All windowing state is per-instance; 'inferEff' is
+    -- @[Pure]@ for the same reason as 'SpectralFreeze' —
+    -- spectral kinds extend the runtime's compute
+    -- capability, not its resource model. Declared
+    -- steady-state latency: N=1024 samples ('kindLatency').
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -1193,6 +1211,42 @@ spectralFreeze signalIn freezeFlag =
   insertNodeC "spectralFreeze"
     (SpectralFreeze signalIn freezeFlag)
 
+-- | Allocate a 'SpectralLpf' node — mono STFT brick-wall lowpass
+-- (§6.D second spectral kind).
+--
+-- The kind reuses the same windowing machinery as 'spectralFreeze'
+-- (N=1024, hop=256, Hann, mono); the only kind-specific work is to
+-- zero spectrum bins whose center frequency exceeds the cutoff
+-- before the IFFT. All windowing state is per-instance.
+--
+-- Inputs (in declared order):
+--
+--   - @signal_in@: the audio signal to filter. Buffered into the
+--     per-instance analysis ring every sample.
+--   - @cutoff_hz@: the lowpass cutoff frequency. The kernel reads
+--     this once per analysis hop, clamps to @[0, SR/2]@, and
+--     rounds to the nearest bin; cutoffs at or above Nyquist are
+--     a true no-op (pass-through modulo windowing), cutoffs at or
+--     below zero pass only DC. The port is 'PortSampleAccurate'
+--     for the same Q-1 reasoning as the freeze flag — the kernel
+--     hop-latches internally even though the port description
+--     does not yet name a hop-latched read pattern.
+--
+-- Declared steady-state latency: N=1024 samples
+-- ('kindLatency'), same as 'spectralFreeze'. Effect: @[Pure]@.
+--
+-- > runSynth $ do
+-- >   src      <- sawOsc 110.0 0.0
+-- >   filtered <- spectralLpf src (Param 800.0)
+-- >   out 0 filtered
+spectralLpf
+  :: Connection  -- ^ signal_in (the audio signal to filter)
+  -> Connection  -- ^ cutoff_hz (clamped to [0, SR/2] at hop time)
+  -> SynthM Connection
+spectralLpf signalIn cutoffHz =
+  insertNodeC "spectralLpf"
+    (SpectralLpf signalIn cutoffHz)
+
 -- | Allocate a fixed-shape 'StaticPlugin' node (§6.E slice 1).
 --
 -- The current profile is 'identityPlugin': two audio inputs, one
@@ -1396,6 +1450,12 @@ ugenView = \case
              [ maybe (-1.0) (fromIntegral . spiPluginId)
                      (staticPluginInfo ref)
              ]
+  SpectralLpf sigIn cf ->
+    UGenView KSpectralLpf
+             [sigIn, cf]
+             [ connDefault sigIn
+             , connDefault cf
+             ]
 
 
 {- Note [Per-UGen projections]
@@ -1504,6 +1564,7 @@ inferEff (RecordBufMono buf _ _)    = [BufWrite (bufferId buf)]
 -- spectrum-stream kind that needs a real Eff axis is forced to add
 -- its own row rather than silently falling through.
 inferEff (SpectralFreeze _ _)       = [Pure]
+inferEff (SpectralLpf _ _)          = [Pure]
 inferEff (StaticPlugin ref _ _)     =
   maybe [Pure] spiEffects (staticPluginInfo ref)
 inferEff _                          = [Pure]
@@ -1548,6 +1609,7 @@ dependencies = \case
   RecordBufMono _ sigIn lp -> deps [sigIn, lp]
   SpectralFreeze sigIn fr -> deps [sigIn, fr]
   StaticPlugin _ in0 in1 -> deps [in0, in1]
+  SpectralLpf sigIn cf   -> deps [sigIn, cf]
   where
     deps = foldr step []
     step (Audio nid _) acc = nid : acc

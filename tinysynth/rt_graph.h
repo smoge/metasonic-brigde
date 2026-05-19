@@ -899,6 +899,22 @@ long long rt_graph_test_spectral_analysis_count(const RTGraph *g);
 // spectral kernel has run, or if g is null.
 long long rt_graph_test_spectral_resynthesis_count(const RTGraph *g);
 
+// [T:read-only] Phase §6.D second-spectral-kind test surface:
+// LPF-specific analysis FFT counter. Mirrors
+// rt_graph_test_spectral_analysis_count but ticks only for
+// process_spectral_lpf, so tests on a graph carrying both
+// freeze and lpf kinds can assert the two counter pairs
+// advance independently. Returns 0 if no LPF kernel has run,
+// or if g is null.
+long long rt_graph_test_spectral_lpf_analysis_count(const RTGraph *g);
+
+// [T:read-only] Phase §6.D second-spectral-kind test surface:
+// LPF-specific resynthesis IFFT counter. Counterpart to the
+// LPF analysis counter; same one-tick-per-IFFT contract as
+// the freeze pair. Returns 0 if no LPF kernel has run, or if
+// g is null.
+long long rt_graph_test_spectral_lpf_resynthesis_count(const RTGraph *g);
+
 // [T:read-only] Phase §6.E slice 2 test surface: total number of
 // audio-thread dispatches into a registered static plugin's
 // process callback since g was created. Increments once per

@@ -312,6 +312,24 @@ data NodeKind
     -- v1 profile, and the kind declares no inherent latency
     -- ('kindLatency' returns 'Nothing'). Effects remain
     -- per-UGen; the fixed identity profile is @[Pure]@.
+  | KSpectralLpf
+    -- ^ Mono float32 STFT brick-wall lowpass (§6.D, second
+    -- spectral kind). Reuses every piece of the
+    -- 'KSpectralFreeze' windowing plumbing unchanged
+    -- (N=1024, hop=256, Hann window, mono); the only kind-
+    -- specific work is to zero spectrum bins whose center
+    -- frequency exceeds the hop-latched cutoff before the
+    -- IFFT. Audio inputs in declared order:
+    -- @[signal_in, cutoff_hz]@. Controls
+    -- @[signal_in_default, cutoff_hz_default]@. The kernel
+    -- internally samples @cutoff_hz@ once per analysis hop
+    -- and clamps it to @[0, SR/2]@ before converting to a
+    -- bin index; the port itself stays 'PortSampleAccurate'
+    -- for the same Q-1 reasoning as 'KSpectralFreeze'.
+    -- 'inferEff' is @[Pure]@: the kind owns its own
+    -- per-instance ring buffers, nothing crosses an instance
+    -- boundary. Declared steady-state latency: N=1024
+    -- samples (same as 'KSpectralFreeze', see 'kindLatency').
   deriving stock    (Eq, Show, Generic, Enum, Bounded)
   deriving anyclass (NFData)
 
@@ -494,6 +512,13 @@ kindSpec = \case
   -- [plugin_id]. SampleRate floor because the host invokes the
   -- plugin per audio block and delivers one output sample per frame.
   KStaticPlugin -> KindSpec 23 SampleRate 2 1 "staticPlugin"
+  -- Spectral lowpass (§6.D second kind): same per-instance STFT
+  -- machinery as KSpectralFreeze (N=1024, hop=256, Hann, mono).
+  -- 2 audio inputs (signal_in, cutoff_hz), 2 controls
+  -- [signal_in_default, cutoff_hz_default]. SampleRate floor for
+  -- the same reason as KSpectralFreeze: output is one sample per
+  -- audio frame, hop-granular work is internal.
+  KSpectralLpf -> KindSpec 24 SampleRate  2 2 "spectralLpf"
 
   -- Consumers / stateless transforms: floor is CompileRate. They have
   -- no intrinsic rate of their own; 'propagateRates' lifts them to
@@ -541,6 +566,7 @@ kindTag = ksTag . kindSpec
 kindLatency :: NodeKind -> Maybe Int
 kindLatency = \case
   KSpectralFreeze -> Just 1024
+  KSpectralLpf    -> Just 1024
   _               -> Nothing
 
 
@@ -648,6 +674,7 @@ kindCapabilities = \case
   KRecordBufMono  -> [CapStatefulOp,   CapResourceAccess]
   KSpectralFreeze -> [CapStatefulOp,   CapLatencyBearing]
   KStaticPlugin   -> [CapHardBarrier]
+  KSpectralLpf    -> [CapStatefulOp,   CapLatencyBearing]
 
 
 {- Note [Rate discipline]
@@ -899,6 +926,19 @@ portInfo k (PortIndex i) = case k of
   KStaticPlugin -> case i of
     0 -> Just (PortInfo PortSampleAccurate "in0")
     1 -> Just (PortInfo PortSampleAccurate "in1")
+    _ -> Nothing
+  KSpectralLpf -> case i of
+    -- signal_in: every sample is buffered into the analysis
+    -- ring, identical contract to KSpectralFreeze port 0.
+    0 -> Just (PortInfo PortSampleAccurate "signal_in")
+    -- cutoff_hz: kernel internally hop-latches the cutoff at
+    -- analysis-hop boundaries. Same Q-1 reasoning as
+    -- KSpectralFreeze's freeze_flag — the port stays
+    -- PortSampleAccurate because no existing
+    -- PortConsumptionRate classification honestly describes
+    -- hop-granular reads, and PortBlockLatched specifically
+    -- means host audio block boundaries.
+    1 -> Just (PortInfo PortSampleAccurate "cutoff_hz")
     _ -> Nothing
   where
     -- Oscillator family: port 0 = freq (sample-accurate FM when

@@ -161,6 +161,8 @@ module MetaSonic.Bridge.FFI
   , -- * §6.D spectral counters
     c_rt_graph_test_spectral_analysis_count
   , c_rt_graph_test_spectral_resynthesis_count
+  , c_rt_graph_test_spectral_lpf_analysis_count
+  , c_rt_graph_test_spectral_lpf_resynthesis_count
   , -- * §6.E plugin dispatch counters
     c_rt_graph_test_plugin_call_count
   , c_rt_graph_test_invalid_plugin_call_count
@@ -1420,6 +1422,14 @@ foreign import ccall unsafe "rt_graph_test_spectral_analysis_count"
 
 foreign import ccall unsafe "rt_graph_test_spectral_resynthesis_count"
   c_rt_graph_test_spectral_resynthesis_count
+    :: Ptr RTGraph -> IO CLLong
+
+foreign import ccall unsafe "rt_graph_test_spectral_lpf_analysis_count"
+  c_rt_graph_test_spectral_lpf_analysis_count
+    :: Ptr RTGraph -> IO CLLong
+
+foreign import ccall unsafe "rt_graph_test_spectral_lpf_resynthesis_count"
+  c_rt_graph_test_spectral_lpf_resynthesis_count
     :: Ptr RTGraph -> IO CLLong
 
 foreign import ccall unsafe "rt_graph_test_plugin_call_count"

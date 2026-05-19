@@ -339,6 +339,7 @@ NodeKind must align with the integer tags emitted by the compiler.
   kindTag KRecordBufMono = 21          RecordBufMono = 21
   kindTag KSpectralFreeze = 22         SpectralFreeze = 22
   kindTag KStaticPlugin = 23           StaticPlugin = 23
+  kindTag KSpectralLpf  = 24           SpectralLpf  = 24
 
   Bus model: Out, BusOut, BusIn, and BusInDelayed all operate on the
   same bus pool, owned by the Server (see Note [§2.C: server-global
@@ -401,6 +402,7 @@ enum class NodeKind : int {
   RecordBufMono = 21,
   SpectralFreeze = 22,
   StaticPlugin = 23,
+  SpectralLpf = 24,
 };
 
 // Sink-terminal classifier. Both 'Out' and 'BusOut' are pure sinks
@@ -465,6 +467,8 @@ enum class NodeKind : int {
     return NodeKind::SpectralFreeze;
   case 23:
     return NodeKind::StaticPlugin;
+  case 24:
+    return NodeKind::SpectralLpf;
   default:
     return std::nullopt;
   }
@@ -861,6 +865,16 @@ struct SpectralFreezeState {
   bool frozen_valid = false;
 };
 
+// Second spectral kind (§6.D slice 2). The brick-wall lowpass
+// needs nothing past the shared STFT rings: cutoff_hz is read
+// fresh at every hop boundary from the audio input buffer, and
+// there is no kind-specific spectrum storage. Kept as a separate
+// state type (rather than reusing SpectralFreezeState) so the
+// NodeState variant cleanly discriminates the two kinds.
+struct SpectralLpfState {
+  StftRings stft{};
+};
+
 struct StaticPluginState {
   int plugin_id = -1;
   const metasonic::PluginSpec *spec = nullptr;
@@ -883,7 +897,8 @@ using NodeState = std::variant<
     PlayBufMonoState,
     RecordBufMonoState,
     SpectralFreezeState,
-    StaticPluginState>;
+    StaticPluginState,
+    SpectralLpfState>;
 
 constexpr int kMigrationKeyMaxBytes = 16;
 
@@ -1654,6 +1669,18 @@ static void configure_spec(NodeSpec &spec, NodeKind kind) {
     spec.default_controls = {-1.0};
     spec.input_refs.resize(2); // [in0, in1]
     break;
+
+  case NodeKind::SpectralLpf:
+    // Mono STFT brick-wall lowpass (§6.D second spectral kind).
+    // Same shape as SpectralFreeze: two controls
+    // [signal_in_default, cutoff_hz_default] (one per audio
+    // input, matching Haskell's ksControlArity = 2); two audio
+    // inputs [signal_in, cutoff_hz]. No resource id, no frozen
+    // control at instance reset — all windowing state is held
+    // on SpectralLpfState.
+    spec.default_controls = {0.0, 0.0};
+    spec.input_refs.resize(2); // [signal_in, cutoff_hz]
+    break;
   }
 
   // Step C (d): fused_inputs is parallel to input_refs. Sizing it
@@ -1793,6 +1820,17 @@ init_node_state(NodeInstanceState &node, const NodeSpec &spec, int max_frames) {
     // steady state.
     target_outputs = 1;
     node.state = SpectralFreezeState{};
+    break;
+  }
+
+  case NodeKind::SpectralLpf: {
+    // §6.D second spectral kind. Per-instance state is just
+    // the shared StftRings (composed inside SpectralLpfState).
+    // Value-initialization zeroes both ring arrays plus the
+    // FFT scratch and resets the heads and sample counters —
+    // allocation-free, mirroring the freeze reset.
+    target_outputs = 1;
+    node.state = SpectralLpfState{};
     break;
   }
 
@@ -2798,6 +2836,15 @@ struct RTGraph {
   long long spectral_analysis_count = 0;
   long long spectral_resynthesis_count = 0;
 
+  // Phase §6.D slice 2 follow-up (second spectral kind): a
+  // separate counter pair for the brick-wall LPF kernel so
+  // tests can assert "this graph hit N freeze FFTs and M lpf
+  // FFTs" without counter contamination across kinds. Same
+  // contract as the freeze pair (handle-lifetime, audio-thread
+  // exclusive writers, one tick per FFT / IFFT call).
+  long long spectral_lpf_analysis_count = 0;
+  long long spectral_lpf_resynthesis_count = 0;
+
   // Phase §6.E slice 2: static-plugin dispatch counters.
   // Same handle-lifetime contract as the buffer / spectral
   // counters. plugin_call_count ticks once per process_static_plugin
@@ -2887,6 +2934,13 @@ static void record_migration_skip(
     // window would either glitch (replay an in-flight
     // overlap fragment) or restart silent. v1 opts out;
     // freezing/swapping is a future series.
+    return false;
+
+  case NodeKind::SpectralLpf:
+    // §6.D second kind. Same windowing state and the same
+    // mid-window-glitch concern as SpectralFreeze; opts out
+    // for the same reason. Migration may be revisited along
+    // with the freeze decision in a future series.
     return false;
 
   case NodeKind::StaticPlugin:
@@ -3069,6 +3123,7 @@ template <class State>
   case NodeKind::PlayBufMono:
   case NodeKind::RecordBufMono:
   case NodeKind::SpectralFreeze:
+  case NodeKind::SpectralLpf:
   case NodeKind::StaticPlugin:
     return StateMigrationResult::Unsupported;
   }
@@ -5469,6 +5524,82 @@ static void process_spectral_freeze(
   g.spectral_resynthesis_count += ticks.resynth;
 }
 
+// §6.D slice 2: brick-wall spectral lowpass. Pulls the shared
+// run_stft_block helper for frame stepping; the hop callable
+// runs the analysis FFT through window_and_fft_input_ring, reads
+// the hop-frame cutoff_hz from the audio input buffer (Q-1
+// hop-latching applied internally), converts to a bin index,
+// and zeroes every bin whose center frequency exceeds the
+// cutoff plus its conjugate-symmetric mirror so the IFFT stays
+// real-valued. Counters tick into the LPF-specific counter pair
+// so a single graph carrying both freeze and lpf kinds can be
+// asserted against without contamination.
+static void process_spectral_lpf(
+    RTGraph &g, GraphInstance &inst, std::size_t node_idx, int nframes
+) noexcept {
+  auto &node = inst.nodes[node_idx];
+  auto out = output_span(node, PortIndex{0}, nframes);
+
+  auto *st = std::get_if<SpectralLpfState>(&node.state);
+  assert(st && "SpectralLpf node has non-SpectralLpf state");
+  if (!st) {
+    std::fill(out.begin(), out.end(), 0.0f);
+    return;
+  }
+
+  const auto sig_in = resolve_input(g, inst, node_idx, PortIndex{0}, nframes);
+  const auto cutoff_in = resolve_input(g, inst, node_idx, PortIndex{1}, nframes);
+  const double sig_default = node.controls[0];
+  const double cutoff_default = node.controls[1];
+
+  const float sample_rate = g.sample_rate;
+  const double nyquist = 0.5 * static_cast<double>(sample_rate);
+
+  auto hop_op = [&](StftRings &rings, int fi) noexcept -> StftHopOutcome {
+    // Hop-latched cutoff. The port stays PortSampleAccurate at
+    // the C ABI but the kernel only reads at hop boundaries, so
+    // sub-hop cutoff modulation does not change the frequency
+    // mask within a hop (which would otherwise produce
+    // window-edge clicks).
+    const double cutoff_raw =
+        cutoff_in.empty() ? cutoff_default
+                          : static_cast<double>(cutoff_in[static_cast<std::size_t>(fi)]);
+    const double cutoff_finite = std::isfinite(cutoff_raw) ? cutoff_raw : 0.0;
+    const double cutoff_clamped = std::clamp(cutoff_finite, 0.0, nyquist);
+    const int cutoff_bin = std::clamp(
+        static_cast<int>(std::lround(cutoff_clamped * StftRings::kN / sample_rate)),
+        0,
+        StftRings::kN / 2);
+
+    // Shared analysis FFT: writes the windowed input ring into
+    // rings.spectrum_work.
+    window_and_fft_input_ring(rings);
+
+    // Brick-wall mask. Zero every bin k satisfying
+    // min(k, N - k) > cutoff_bin: that's bins
+    // [cutoff_bin + 1, N - cutoff_bin - 1] in the linear layout.
+    // The empty range when cutoff_bin == N/2 is a true Nyquist
+    // no-op modulo windowing (no bin gets zeroed); the
+    // cutoff_bin == 0 case zeroes all but DC, the "below zero
+    // mutes" branch.
+    auto &spec = rings.spectrum_work;
+    const int hi_lo = cutoff_bin + 1;
+    const int hi_hi = StftRings::kN - cutoff_bin - 1;
+    for (int k = hi_lo; k <= hi_hi; ++k) {
+      spec[static_cast<std::size_t>(2 * k)] = 0.0f;
+      spec[static_cast<std::size_t>(2 * k + 1)] = 0.0f;
+    }
+
+    return StftHopOutcome{/*analysis_fired=*/true};
+  };
+
+  const StftBlockTicks ticks =
+      run_stft_block(st->stft, sig_in, sig_default, out, nframes, hop_op);
+
+  g.spectral_lpf_analysis_count += ticks.analysis;
+  g.spectral_lpf_resynthesis_count += ticks.resynth;
+}
+
 static void process_static_plugin(
     RTGraph &g, GraphInstance &inst, std::size_t i, int nframes
 ) noexcept {
@@ -6733,6 +6864,9 @@ static inline void dispatch_node(
     break;
   case NodeKind::SpectralFreeze:
     process_spectral_freeze(g, inst, i, nframes);
+    break;
+  case NodeKind::SpectralLpf:
+    process_spectral_lpf(g, inst, i, nframes);
     break;
   case NodeKind::StaticPlugin:
     process_static_plugin(g, inst, i, nframes);
@@ -10924,6 +11058,18 @@ long long rt_graph_test_spectral_resynthesis_count(const RTGraph *g) {
   if (g == nullptr)
     return 0;
   return g->spectral_resynthesis_count;
+}
+
+long long rt_graph_test_spectral_lpf_analysis_count(const RTGraph *g) {
+  if (g == nullptr)
+    return 0;
+  return g->spectral_lpf_analysis_count;
+}
+
+long long rt_graph_test_spectral_lpf_resynthesis_count(const RTGraph *g) {
+  if (g == nullptr)
+    return 0;
+  return g->spectral_lpf_resynthesis_count;
 }
 
 // §6.E slice 2: static-plugin dispatch counters. plugin_call_count

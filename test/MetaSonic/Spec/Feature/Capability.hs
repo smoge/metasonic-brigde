@@ -105,3 +105,4 @@ representativeUGen = \case
   KRecordBufMono  -> RecordBufMono (Buffer 0) (Param 0) (Param 0)
   KSpectralFreeze -> SpectralFreeze (Param 0) (Param 0)
   KStaticPlugin   -> StaticPlugin identityPlugin (Param 0) (Param 0)
+  KSpectralLpf    -> SpectralLpf (Param 0) (Param 0)

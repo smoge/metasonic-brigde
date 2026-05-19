@@ -136,8 +136,12 @@ patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
       , testCase "spectralFreezePad: template carries KSpectralFreeze Barrier" $ do
           let tg = patternTemplates spectralFreezePad
               names = map tplName (tgTemplates tg)
-          names @?= ["texture"]
-          case tgTemplates tg of
+          -- §6.D second-kind contract: the row carries both
+          -- spectral templates so the survey aggregate is
+          -- contiguous; the "texture" template still pins the
+          -- freeze kernel as the barrier-classified one.
+          names @?= ["texture", "lpf-bed"]
+          case filter ((== "texture") . tplName) (tgTemplates tg) of
             [tpl] -> do
               let rg = tplGraph tpl
                   kinds = map rnKind (rgNodes rg)
@@ -159,7 +163,7 @@ patternCorpusTests = testGroup "Phase 6.A.2: pattern corpus"
                 ("expected spectral region Barrier; segments = "
                  <> show (length segments))
                 freezeInBarrier
-            _ -> assertFailure "expected exactly one texture template"
+            _ -> assertFailure "expected exactly one 'texture' template"
       ]
 
   , testGroup "driver-stub feasibility"
@@ -2741,4 +2745,360 @@ spectralFreezeSkeletonTests =
            <> "a1=" <> show a1 <> " a2=" <> show a2
            <> " a3=" <> show a3)
           (a3 > a2)
+  ]
+
+spectralLpfTests :: TestTree
+spectralLpfTests =
+  testGroup "Phase 6.D second spectral kind: SpectralLpf surface"
+  [ testCase "inferEff produces Pure" $ do
+      -- §6.D: spectral kinds (both freeze and lpf) own their
+      -- windowing state per instance, nothing crosses a graph
+      -- boundary. The lpf row must stay Pure for the same
+      -- reason as freeze.
+      let g = runSynth $ do
+            src      <- sinOsc 440.0 0.0
+            filtered <- spectralLpf src (Param 1000.0)
+            out 0 filtered
+          ir = case lowerGraph g of
+                 Right ir' -> ir'
+                 Left err  -> error err
+          lpfEffs =
+            [ eff
+            | n   <- giNodes ir
+            , eff <- irEffects n
+            , irKind n == KSpectralLpf
+            ]
+      lpfEffs @?= [Pure]
+
+  , testCase "kindSpec / portInfo / kindLatency agree on shape" $ do
+      ksTag          (kindSpec KSpectralLpf) @?= 24
+      ksRate         (kindSpec KSpectralLpf) @?= SampleRate
+      ksAudioArity   (kindSpec KSpectralLpf) @?= 2
+      ksControlArity (kindSpec KSpectralLpf) @?= 2
+      ksLabel        (kindSpec KSpectralLpf) @?= "spectralLpf"
+      portInfo KSpectralLpf (PortIndex 0)
+        @?= Just (PortInfo PortSampleAccurate "signal_in")
+      portInfo KSpectralLpf (PortIndex 1)
+        @?= Just (PortInfo PortSampleAccurate "cutoff_hz")
+      portInfo KSpectralLpf (PortIndex 2) @?= Nothing
+
+  , testCase "kindLatency declares N=1024 for KSpectralLpf" $ do
+      kindLatency KSpectralLpf    @?= Just 1024
+      -- Freeze continues to declare the same latency; this is
+      -- a regression guard for the shared latency contract.
+      kindLatency KSpectralFreeze @?= Just 1024
+
+  , testCase "ugenView arities match kindSpec for SpectralLpf" $ do
+      let view = ugenView
+            (SpectralLpf (Param 0.0) (Param 1000.0))
+      length (uvInputs view)   @?= 2
+      length (uvControls view) @?= 2
+
+  , testCase "spectralLpf graph compiles and renders without crashing" $ do
+      let nframes = 64
+          graph = runSynth $ do
+            src      <- sinOsc 440.0 0.0
+            filtered <- spectralLpf src (Param 1000.0)
+            out 0 filtered
+      tg <- case compileTemplateGraph [("lpf", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+
+  , testCase "pre-roll is silent below numerical noise" $ do
+      -- Same pre-roll contract as freeze: frames 0..N-1 are
+      -- value-initialized zero because no analysis hop has
+      -- fired yet. Independent of the cutoff.
+      let nframes = 1024
+          graph = runSynth $ do
+            src      <- sinOsc 440.0 0.0
+            filtered <- spectralLpf src (Param 4000.0)
+            out 0 filtered
+      tg <- case compileTemplateGraph [("lpf", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+              peak = maximum (map abs rcvs)
+          assertBool
+            ("pre-roll must be silent (peak < 1e-3); got "
+             <> show peak)
+            (peak < 1.0e-3)
+
+  , testCase "counter math: analysis and resynthesis tick on every hop" $ do
+      -- Mirror of the freeze counter-math test. LPF always
+      -- runs analysis (no freeze gate), so both counters
+      -- advance once per hop in lockstep.
+      let n       = 1024 :: Int
+          hop     = 256  :: Int
+          totalF  = 4 * n
+          nframes = totalF
+          graph = runSynth $ do
+            src      <- sinOsc 440.0 0.0
+            filtered <- spectralLpf src (Param 4000.0)
+            out 0 filtered
+      tg <- case compileTemplateGraph [("lpf", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        analysis <- c_rt_graph_test_spectral_lpf_analysis_count    rt
+        resynth  <- c_rt_graph_test_spectral_lpf_resynthesis_count rt
+        let expected = fromIntegral
+              ((totalF - n) `div` hop + 1) :: CLLong
+        analysis @?= expected
+        resynth  @?= expected
+        -- Freeze counters must stay at zero — no contamination
+        -- across kinds.
+        fa <- c_rt_graph_test_spectral_analysis_count    rt
+        fr <- c_rt_graph_test_spectral_resynthesis_count rt
+        fa @?= 0
+        fr @?= 0
+
+  , testCase "warmed-up impulse at cutoff = SR/2 emerges N samples after injection (Nyquist no-op)" $ do
+      -- Set cutoff = Nyquist (SR/2 = 24000 Hz at the runtime
+      -- sample rate). The bin-mask range is empty
+      -- (cutoff_bin = N/2 means the loop runs from N/2+1 to
+      -- N/2-1, which is empty). The kernel becomes a true
+      -- pass-through modulo windowing — same shape as freeze
+      -- pass-through, including the N-sample latency.
+      let n        = 1024 :: Int
+          totalF   = 4 * n
+          impulseF = 2 * n
+          nframes  = totalF
+          graph = runSynth $ do
+            sig      <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 0)
+            filtered <- spectralLpf sig (Param 24000.0)
+            out 0 filtered
+      tg <- case compileTemplateGraph [("lpf", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt totalF
+        bufferId buf @?= 0
+        let impulseFrames =
+              [ if i == impulseF then 1.0 else 0.0
+              | i <- [0 .. totalF - 1]
+              ]
+        loadBuffer rt buf impulseFrames
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs = map (\(CFloat x) -> x) rendered
+              indexed = zip [0 :: Int ..] (map abs rcvs)
+              (peakIdx, peakAmp) =
+                foldr (\p@(_, a) q@(_, b) -> if a > b then p else q)
+                      (0, 0) indexed
+              expectedPeak = impulseF + n
+              tolerance    = 16 :: Int
+          assertBool
+            ("Nyquist-cutoff output must carry the impulse; peak amp = "
+             <> show peakAmp)
+            (peakAmp > 1.0e-3)
+          assertBool
+            ("Nyquist-cutoff impulse peak must land near frame "
+             <> show expectedPeak <> "; observed peak at frame "
+             <> show peakIdx)
+            (abs (peakIdx - expectedPeak) <= tolerance)
+
+  , testCase "pass-band: warmed-up sine well below cutoff passes within numerical noise" $ do
+      -- 110 Hz sine, cutoff = 4 kHz. At SR=48 kHz / N=1024:
+      -- bin(110)  = round(110*1024/48000)  = 2
+      -- bin(4000) = round(4000*1024/48000) = 85
+      -- Bin 2 is well below the mask boundary, so the lpf is a
+      -- no-op modulo windowing and the steady-state amplitude
+      -- recovers unity, same tolerance as the freeze
+      -- pass-through reconstruction test.
+      let n       = 1024 :: Int
+          totalF  = 4 * n
+          nframes = totalF
+          graph = runSynth $ do
+            src      <- sinOsc 110.0 0.0
+            filtered <- spectralLpf src (Param 4000.0)
+            out 0 filtered
+      tg <- case compileTemplateGraph [("lpf", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs       = map (\(CFloat x) -> x) rendered
+              steady     = drop (2 * n) rcvs
+              steadyPeak = maximum (map abs steady)
+          assertBool
+            ("pass-band sine must reach unity (±5%); peak = "
+             <> show steadyPeak)
+            (steadyPeak > 0.95 && steadyPeak < 1.05)
+
+  , testCase "stop-band: warmed-up sine well above cutoff is attenuated" $ do
+      -- 4 kHz sine, cutoff = 500 Hz. At SR=48 kHz / N=1024:
+      -- bin(4000) = 85
+      -- bin(500)  = round(500*1024/48000) = 11
+      -- Bin 85 sits inside the masked range, so the kernel
+      -- zeroes the analyzed-bin's contribution before IFFT
+      -- and the steady-state output drops below 1e-2.
+      let n       = 1024 :: Int
+          totalF  = 4 * n
+          nframes = totalF
+          graph = runSynth $ do
+            src      <- sinOsc 4000.0 0.0
+            filtered <- spectralLpf src (Param 500.0)
+            out 0 filtered
+      tg <- case compileTemplateGraph [("lpf", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        allocaBytes (nframes * 4) $ \bp -> do
+          _ <- c_rt_graph_read_bus rt 0
+                 (fromIntegral nframes) (castPtr bp)
+          rendered <- peekArray nframes (bp :: PtrCFloat)
+          let rcvs       = map (\(CFloat x) -> x) rendered
+              steady     = drop (2 * n) rcvs
+              steadyPeak = maximum (map abs steady)
+          assertBool
+            ("stop-band sine must be attenuated below 1e-2; peak = "
+             <> show steadyPeak)
+            (steadyPeak < 1.0e-2)
+
+  , testCase "cutoff is hop-latched (no mid-hop FFT runs on sub-hop control change)" $ do
+      -- The contract is: the kernel runs analysis exactly once
+      -- per hop, regardless of how the cutoff_hz buffer varies
+      -- within a hop. Run a single hop's worth of frames with
+      -- a cutoff buffer that toggles every sample, then assert
+      -- spectral_lpf_analysis_count advanced exactly by the
+      -- expected hop math — not once per cutoff change.
+      let n         = 1024 :: Int
+          hop       = 256  :: Int
+          totalF    = n + 2 * hop      -- hops at samples_in = 1024, 1280, 1536
+          nframes   = totalF
+          -- Cutoff toggles every frame between 4000 Hz and 50 Hz.
+          -- If the kernel re-read cutoff_hz per sample and
+          -- ran FFTs accordingly, the counter would explode;
+          -- with hop-latching it must equal floor((totalF -
+          -- N) / hop) + 1 = 3.
+          toggleBuf =
+            [ if odd i then 50.0 else 4000.0
+            | i <- [0 .. nframes - 1]
+            ]
+          graph = runSynth $ do
+            sig      <- sinOsc 440.0 0.0
+            cf       <- playBufMono (Buffer 0) (Param 1.0) (Param 0) (Param 0)
+            filtered <- spectralLpf sig cf
+            out 0 filtered
+      tg <- case compileTemplateGraph [("lpf", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        buf <- allocBuffer rt nframes
+        bufferId buf @?= 0
+        loadBuffer rt buf toggleBuf
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        analysis <- c_rt_graph_test_spectral_lpf_analysis_count rt
+        let expected = fromIntegral
+              ((totalF - n) `div` hop + 1) :: CLLong
+        analysis @?= expected
+
+  , testCase "spectral region is a scheduler Barrier" $ do
+      let graph = runSynth $ do
+            src      <- sinOsc 440.0 0.0
+            filtered <- spectralLpf src (Param 4000.0)
+            out 0 filtered
+      rg <- case lowerGraph graph >>= compileRuntimeGraph of
+              Right r  -> pure r
+              Left err -> assertFailure err >> error "unreachable"
+      let segments = segmentByBarrier rg
+          regionHasLpfKind r =
+            any (\nodeIx -> case [ rnKind n
+                                 | n <- rgNodes rg
+                                 , rnIndex n == nodeIx ] of
+                              [KSpectralLpf] -> True
+                              _              -> False)
+                (rrNodes r)
+          lpfInBarrier = any
+            (\seg -> case seg of
+                Barrier r     -> regionHasLpfKind r
+                FreeSegment _ -> False)
+            segments
+          lpfInFree = any
+            (\seg -> case seg of
+                FreeSegment rs -> any regionHasLpfKind rs
+                Barrier _      -> False)
+            segments
+      assertBool
+        ("spectral lpf region must appear in a Barrier; segments = "
+         <> show (length segments))
+        lpfInBarrier
+      assertBool
+        "spectral lpf region must never appear inside a FreeSegment"
+        (not lpfInFree)
+
+  , testCase "shared-helper smoke: freeze and lpf coexist on disjoint voices" $ do
+      -- A graph carrying both spectral kinds. Renders enough
+      -- frames for both to advance their counter pairs
+      -- independently — if the §6.D slice 1 shared helper had
+      -- accidentally aliased state between kinds, one of the
+      -- counter pairs would either stay at zero or advance
+      -- twice.
+      let n       = 1024 :: Int
+          hop     = 256  :: Int
+          totalF  = 4 * n
+          nframes = totalF
+          graph = runSynth $ do
+            srcA   <- sinOsc 220.0 0.0
+            srcB   <- sawOsc 110.0 0.0
+            frozen <- spectralFreeze srcA (Param 0.0)
+            lpfed  <- spectralLpf    srcB (Param 4000.0)
+            mixed  <- add frozen lpfed
+            out 0 mixed
+      tg <- case compileTemplateGraph [("dual", graph)] of
+        Right t  -> pure t
+        Left err -> assertFailure err >> error "unreachable"
+      let totalNodes =
+            sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
+      withRTGraph totalNodes nframes $ \rt -> do
+        loadTemplateGraph rt tg
+        c_rt_graph_process rt (fromIntegral nframes)
+        let expected = fromIntegral
+              ((totalF - n) `div` hop + 1) :: CLLong
+        fa <- c_rt_graph_test_spectral_analysis_count    rt
+        fr <- c_rt_graph_test_spectral_resynthesis_count rt
+        la <- c_rt_graph_test_spectral_lpf_analysis_count    rt
+        lr <- c_rt_graph_test_spectral_lpf_resynthesis_count rt
+        fa @?= expected
+        fr @?= expected
+        la @?= expected
+        lr @?= expected
   ]
