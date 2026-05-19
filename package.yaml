@@ -245,6 +245,7 @@ tests:
       - MetaSonic.Spec.Core.FusionAlgebra
       - MetaSonic.Spec.Core.MigrationKeys
       - MetaSonic.Spec.Core.NodeIndex
+      - MetaSonic.Spec.Core.RateMetadata
       - MetaSonic.Spec.Core.RatePropagation
       - MetaSonic.Spec.Core.RegionScheduling
       - MetaSonic.Spec.Core.SelectRegionKernels
