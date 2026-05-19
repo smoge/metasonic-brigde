@@ -56,9 +56,9 @@ appManifestReloadCliTests =
           assertContains "  post-reload fan-in:" output
           assertContains "    queue depth: 0" output
           assertContains "    graph installed: yes" output
-          assertContains "  audio started: no" output
-          assertContains "  audio stopped by helper: no" output
-          assertContains "  listener restart executed: no" output
+          assertContains
+            "  audio lifecycle: not exercised (planner-only smoke path)"
+            output
           assertContains
             "  command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (not executed)"
             output
@@ -89,16 +89,20 @@ appManifestReloadCliTests =
           assertContains "  strategy: try-preserving" output
           assertContains "  initial demo: named-control" output
           assertContains "  target demo: send-return" output
-          -- 'strategy result:' renders the compact two-level tag form,
-          -- not the raw Show of the strategy outcome. The slash form is
-          -- pinned so a regression to raw Show (which would expand the
-          -- inner ManifestPreservingHotSwapReport payload through every
-          -- RuntimeNode field) fails the test.
+          -- 'strategy result:' renders the typed operator-friendly
+          -- form (kebab-case phase tags), not the raw Show of the
+          -- strategy outcome. The parenthesized constructor tail is
+          -- explicitly excluded so a regression to raw Show — which
+          -- would expand the inner ManifestPreservingHotSwapReport
+          -- payload through every RuntimeNode field — fails the test.
           assertContains
-            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected/Hpari"
+            "  strategy result: success: preserving rejected ("
+            output
+          assertContains
+            "), stopped-audio fallback installed"
             output
           assertNotContains
-            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected ("
+            "MrhsrStoppedAudioAfterPreservingRejected ("
             output
           assertContains "    graph installed: yes" output
           assertContains "  ingress: open demo=send-return" output
@@ -118,29 +122,18 @@ appManifestReloadCliTests =
           -- @mrhcOnEvent@ hook. Try-preserving against an empty owner
           -- must run preserving → reject → admit → stopped-audio →
           -- commit → succeed; assert the events block carries each of
-          -- those transitions.
+          -- those transitions, with the typed kebab-case payload tags
+          -- shared with the live-reload demo.
           assertContainsInOrder
             [ "  reload events:"
             , "    - strategy started: try-preserving"
             , "    - preserving phase started"
-            , "    - preserving phase rejected: Hpari"
-            , "    - fallback admitted: Hpari"
+            , "    - preserving phase rejected: reload-rejected"
+            , "    - fallback admitted: reload-rejected"
             , "    - stopped-audio phase started"
             , "    - stopped-audio phase committed"
-            , "    - strategy succeeded: MrhsrStoppedAudioAfterPreservingRejected"
+            , "    - strategy succeeded: preserving rejected ("
             , "  fake audio events:"
-            ]
-            output
-          -- The rejected/admitted lines render two constructor levels:
-          -- the outer Hpari* wrapper plus the inner Mrhi* leaf, so the
-          -- operator sees both the failing stage and the actual cause.
-          -- The slash separator follows the Hpari prefix on the same
-          -- line in both the rejection and the admission events.
-          assertContainsInOrder
-            [ "    - preserving phase rejected: Hpari"
-            , "/Mrhi"
-            , "    - fallback admitted: Hpari"
-            , "/Mrhi"
             ]
             output
           -- Strategy frame brackets the run; no fallback-declined event
@@ -168,13 +161,13 @@ appManifestReloadCliTests =
         Right output -> do
           assertContains "Manifest host strategy reload smoke" output
           assertContains "  strategy: stopped-audio-only" output
-          -- MrhsrStoppedAudio has no payload, so the compact form is a
-          -- single tag with no slash. Pin both the tag and the lack of
-          -- a trailing parenthesis (regression guard for raw Show).
-          assertContains "  strategy result: success: MrhsrStoppedAudio" output
-          assertNotContains
-            "  strategy result: success: MrhsrStoppedAudio ("
+          -- 'MrhsrStoppedAudio' has no payload; the typed renderer
+          -- prints "stopped-audio installed ...". Pin the prose
+          -- and the absence of the Mrhsr* show.
+          assertContains
+            "  strategy result: success: stopped-audio installed"
             output
+          assertNotContains "MrhsrStoppedAudio" output
           assertContains "    graph installed: yes" output
           assertContains "  ingress: open demo=send-return" output
           assertContains "  fake audio events:" output
@@ -191,7 +184,7 @@ appManifestReloadCliTests =
             , "    - strategy started: stopped-audio-only"
             , "    - stopped-audio phase started"
             , "    - stopped-audio phase committed"
-            , "    - strategy succeeded: MrhsrStoppedAudio"
+            , "    - strategy succeeded: stopped-audio installed"
             , "  fake audio events:"
             ]
             output
@@ -218,31 +211,27 @@ appManifestReloadCliTests =
              <> renderManifestReloadCliIssue issue)
         Right output -> do
           assertContains "  strategy: require-preserving" output
-          -- The failed-strategy result line renders the compact
-          -- two-level tag (outer Mrhsi wrapper plus inner Hpari stage).
+          -- The failed-strategy result line renders the typed phrase
+          -- "preserving: <stage-tag>"; no Mrhsi* show payload should
+          -- leak.
           assertContains
-            "  strategy result: failed: MrhsiPreservingFailed/Hpari"
+            "  strategy result: failed: preserving: "
             output
-          assertNotContains
-            "  strategy result: failed: MrhsiPreservingFailed ("
-            output
+          assertNotContains "MrhsiPreservingFailed" output
           assertContains "    graph installed: no" output
           assertContains "  ingress: open demo=named-control" output
           assertContains "  selector command projection:" output
           -- Require-preserving against an empty owner rejects in the
           -- preserving phase and surfaces a strategy failure. There is
-          -- no fallback step. The rejected line uses the two-level
-          -- Hpari/Mrhi form; the strategy-failed line carries the
-          -- outer Mrhsi wrapper plus the inner Hpari stage, which is
-          -- enough for an operator to triage without scanning the
-          -- preceding phase event.
+          -- no fallback step. The rejection event and the strategy
+          -- failure line share the same typed phase-tag vocabulary
+          -- (reload-rejected, drain-rejected, etc.).
           assertContainsInOrder
             [ "  reload events:"
             , "    - strategy started: require-preserving"
             , "    - preserving phase started"
-            , "    - preserving phase rejected: Hpari"
-            , "/Mrhi"
-            , "    - strategy failed: MrhsiPreservingFailed/Hpari"
+            , "    - preserving phase rejected: reload-rejected"
+            , "    - strategy failed: preserving: reload-rejected"
             , "  fake audio events:"
             ]
             output
@@ -382,7 +371,7 @@ appManifestReloadCliTests =
              <> renderManifestReloadCliIssue issue)
         Right output -> do
           assertContains
-            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected/Hpari"
+            "  strategy result: success: preserving rejected ("
             output
           assertContains "  ingress: open demo=send-return" output
           assertContains "oscPort=" output

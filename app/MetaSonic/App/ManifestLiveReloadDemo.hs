@@ -16,17 +16,13 @@
 
 module MetaSonic.App.ManifestLiveReloadDemo
   ( runManifestLiveReloadDemo
-    -- * Strategy-outcome renderer (exported for regression tests)
-  , renderOutcome
-  , renderStrategyRan
-  , renderStrategyFailure
-  , renderHostPreservingIssueTag
-  , renderHostStoppedAudioIssueTag
   ) where
 
 import           Control.Concurrent             (threadDelay)
 import           Control.Exception              (finally)
 import           Control.Monad                  (forM, forM_, unless, void)
+import           Data.IORef                     (modifyIORef', newIORef,
+                                                 readIORef)
 import qualified Data.Map.Strict                as M
 import qualified Data.Set                       as S
 import qualified Data.Text                      as T
@@ -47,24 +43,26 @@ import           MetaSonic.App.ManifestOSCListener
                                                  ListenerInfo (..),
                                                  defaultManifestOSCListenerHooks)
 import           MetaSonic.App.ManifestReloadBinding
-                                                (ManifestUIVoiceSelection (..))
+                                                (ManifestUIVoiceSelection (..),
+                                                 muitControls,
+                                                 muitDemoKey,
+                                                 muitVoiceSelection)
+import           MetaSonic.App.ManifestReloadMIDIBinding
+                                                (mmitControls)
 import           MetaSonic.App.ManifestReloadCli
                                                 (planManifestReloadForDemo,
                                                  readManifestReloadDocFile,
                                                  renderManifestReloadCliIssue,
-                                                 renderManifestReloadHostStrategy)
+                                                 renderManifestReloadHostStrategy,
+                                                 renderSmokeReloadEvent,
+                                                 renderStrategyOutcome)
 import           MetaSonic.App.ManifestReloadEvent
-                                                (noManifestReloadEvents)
+                                                (ManifestReloadEvent)
 import           MetaSonic.App.ManifestReloadHost
                                                 (ManifestReloadHostConfig (..),
                                                  ManifestReloadHostIssue,
                                                  ManifestReloadHostStrategy,
-                                                 ManifestReloadHostStrategyIssue (..),
-                                                 ManifestReloadHostStrategyRan (..),
-                                                 reloadManifestHostWithStrategy)
-import           MetaSonic.App.ManifestReloadOrchestration
-                                                (HostPreservingReloadIssue (..),
-                                                 HostStoppedAudioReloadIssue (..))
+                                                 reloadManifestHostWithStrategyWithEvents)
 import           MetaSonic.App.ManifestReloadIngress
                                                 (ManifestReloadIngressManager,
                                                  ManifestReloadIngressOps (..),
@@ -198,6 +196,7 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
              putStrLn "  then press Enter to reload."
              void getLine
 
+             reloadEvents <- newIORef []
              let config = ManifestReloadHostConfig
                    { mrhcService =
                        service
@@ -214,18 +213,22 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
                    , mrhcOwnerOptions =
                        defaultSessionOwnerOptions
                    , mrhcOnEvent =
-                       noManifestReloadEvents
+                       \ev ->
+                         modifyIORef' reloadEvents (<> [ev])
                    }
              outcome <-
-               reloadManifestHostWithStrategy
+               reloadManifestHostWithStrategyWithEvents
                  liveReloadProducer
                  strategy
                  config
                  doc
                  catalog
                  (requestFor newDemo)
+             capturedEvents <- readIORef reloadEvents
              putStrLn ""
-             putStrLn $ "  strategy outcome: " <> renderOutcome outcome
+             putStrLn $ "  strategy outcome: " <> renderStrategyOutcome outcome
+             putStrLn "  reload events:"
+             mapM_ putStrLn (renderLiveReloadEvents capturedEvents)
              afterReload <- readSessionFanInService service
              postReloadVoices <- case outcome of
                Right _
@@ -433,8 +436,14 @@ printIngressSnapshot
   -> IO ()
 printIngressSnapshot manager = do
   snapshot <- readManifestReloadIngressManager manager
-  putStrLn $ "  OSC ingress: " <> renderIngressSnapshot snapshot
+  putStrLn $ "  ingress: " <> renderIngressSnapshot snapshot
 
+-- | Mirrors @renderSmokeIngressSnapshot@ in
+-- 'MetaSonic.App.ManifestReloadCli' so the host-reload-smoke and
+-- the live-reload-demo report the combined ingress projection in
+-- the same shape (UI / OSC / MIDI counts + defaultVoice + bound
+-- OSC port). The underlying 'ManifestReloadIngressTarget' carries
+-- all three slices regardless of which CLI is reading it.
 renderIngressSnapshot
   :: ManifestReloadIngressSnapshot
        ManifestReloadIngressTarget
@@ -446,9 +455,16 @@ renderIngressSnapshot snapshot =
       "closed"
     MrisOpen target handle ->
       "open demo="
-      <> motDemoKey (mitOSC target)
+      <> muitDemoKey (mitUI target)
+      <> " ui-controls="
+      <> show (length (muitControls (mitUI target)))
       <> " osc-controls="
       <> show (length (motControls (mitOSC target)))
+      <> " midi-cc="
+      <> show (length (mmitControls (mitMIDI target)))
+      <> " defaultVoice="
+      <> unVoiceKey
+           (muvsDefaultVoice (muitVoiceSelection (mitUI target)))
       <> " oscPort="
       <> show (liBoundPort (moihInfo handle))
 
@@ -512,112 +528,19 @@ renderEnqueue result =
     SessionEnqueueRejected _producer cmd issue ->
       "rejected " <> show cmd <> " issue=" <> show issue
 
--- | Render a strategy outcome as one short line. The structured value
--- carried by 'reloadManifestHostWithStrategy' is still available to
--- programmatic consumers via the 'Either'; this renderer is the
--- operator-facing summary only. Earlier versions used a raw 'show',
--- which on a single failed preserving install printed a multi-KB
--- TemplateGraph dump and made the demo's most informative line
--- unreadable at the terminal.
-renderOutcome
-  :: Either
-       (ManifestReloadHostStrategyIssue
-          (ManifestReloadHostIssue ManifestOSCIngressOpsIssue))
-       (ManifestReloadHostStrategyRan
-          (ManifestReloadHostIssue ManifestOSCIngressOpsIssue))
-  -> String
-renderOutcome outcome = case outcome of
-  Right ran     -> "success: " <> renderStrategyRan ran
-  Left  failure -> "failed: "  <> renderStrategyFailure failure
-
--- | Polymorphic in the issue type so output-regression tests can pass
--- a stand-in payload (e.g. a 'String' containing the banned substrings)
--- without fabricating real reload state.
-renderStrategyRan :: ManifestReloadHostStrategyRan issue -> String
-renderStrategyRan ran = case ran of
-  MrhsrPreserving ->
-    "preserving installed (audio kept, voices preserved)"
-  MrhsrStoppedAudio ->
-    "stopped-audio installed (audio restarted with new owner)"
-  MrhsrStoppedAudioAfterPreservingRejected prevIssue ->
-    "preserving rejected ("
-    <> renderHostPreservingIssueTag prevIssue
-    <> "), stopped-audio fallback installed"
-
--- | Polymorphic in the issue type; see 'renderStrategyRan'.
-renderStrategyFailure :: ManifestReloadHostStrategyIssue issue -> String
-renderStrategyFailure failure = case failure of
-  MrhsiPreservingFailed prev ->
-    "preserving: " <> renderHostPreservingIssueTag prev
-  MrhsiStoppedAudioFailed stopped ->
-    "stopped-audio: " <> renderHostStoppedAudioIssueTag stopped
-  MrhsiFallbackStoppedAudioFailed prev stopped ->
-    "preserving (" <> renderHostPreservingIssueTag prev
-    <> "); stopped-audio fallback ("
-    <> renderHostStoppedAudioIssueTag stopped <> ")"
-
--- | Short tag classifying which phase of a preserving reload failed.
--- The carried @issue@ payloads are intentionally elided — the tag
--- identifies the failure shape; the structured value is still in
--- scope via the orchestrator's 'Either' for programmatic consumers.
-renderHostPreservingIssueTag :: HostPreservingReloadIssue issue -> String
-renderHostPreservingIssueTag issue = case issue of
-  HpariPlanRejected{}                ->
-    "plan-rejected"
-  HpariQuiesceRejected{}             ->
-    "quiesce-rejected"
-  HpariQuiesceRejectedResumeFailed{} ->
-    "quiesce-rejected; resume-failed"
-  HpariDrainRejected{}               ->
-    "drain-rejected"
-  HpariDrainRejectedResumeFailed{}   ->
-    "drain-rejected; resume-failed"
-  HpariDrainFailedTerminal{}         ->
-    "drain-failed (terminal)"
-  HpariReloadRejected{}              ->
-    -- This constructor is the retryable old-owner-still-installed
-    -- shape, not specifically a graph-shape incompatibility.
-    -- mapPreservingReloadReport (ManifestReloadHost.hs) collapses
-    -- SessionEnqueueRejected, StepRuntimeFailed, and StepRejected
-    -- all into HprfOldOwnerStillInstalled → HpariReloadRejected.
-    "reload-rejected (old owner still installed)"
-  HpariReloadRejectedResumeFailed{}  ->
-    "reload-rejected; resume-failed"
-  HpariReloadFailedTerminal{}        ->
-    "reload-failed (terminal)"
-  HpariIngressRestartFailed{}        ->
-    "ingress-restart-failed"
-
--- | Short tag classifying which phase of a stopped-audio reload
--- failed. Same elision rationale as 'renderHostPreservingIssueTag'.
-renderHostStoppedAudioIssueTag :: HostStoppedAudioReloadIssue issue -> String
-renderHostStoppedAudioIssueTag issue = case issue of
-  HsariPlanRejected{}                        ->
-    "plan-rejected"
-  HsariQuiesceRejected{}                     ->
-    "quiesce-rejected"
-  HsariQuiesceRejectedResumeFailed{}         ->
-    "quiesce-rejected; resume-failed"
-  HsariDrainRejected{}                       ->
-    "drain-rejected"
-  HsariDrainRejectedResumeFailed{}           ->
-    "drain-rejected; resume-failed"
-  HsariDrainFailedTerminal{}                 ->
-    "drain-failed (terminal)"
-  HsariStopOldAudioFailed{}                  ->
-    "stop-old-audio-failed"
-  HsariReloadRejectedOldOwnerRestarted{}     ->
-    "reload-rejected (old owner restarted)"
-  HsariReloadRejectedOldOwnerRestartFailed{} ->
-    "reload-rejected (old owner restart-failed)"
-  HsariReloadRejectedOldOwnerResumeFailed{}  ->
-    "reload-rejected (old owner resume-failed)"
-  HsariReloadFailedNoOwner{}                 ->
-    "reload-failed (no owner)"
-  HsariAudioRestartFailed{}                  ->
-    "audio-restart-failed"
-  HsariListenerRestartFailed{}               ->
-    "listener-restart-failed"
+-- | Render the per-run reload-event timeline as a compact bullet
+-- list, mirroring the @--manifest-host-reload-smoke@ surface so
+-- operators read the same vocabulary in both CLIs.
+renderLiveReloadEvents
+  :: [ManifestReloadEvent
+        (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)]
+  -> [String]
+renderLiveReloadEvents events =
+  case events of
+    [] ->
+      ["    (none)"]
+    _ ->
+      map renderSmokeReloadEvent events
 
 liveOSCListenerHooks :: ManifestOSCListenerHooks
 liveOSCListenerHooks = defaultManifestOSCListenerHooks

@@ -17,7 +17,7 @@ import           Data.List                              (isInfixOf)
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
-import           MetaSonic.App.ManifestLiveReloadDemo   (renderHostPreservingIssueTag,
+import           MetaSonic.App.ManifestReloadCli        (renderHostPreservingIssueTag,
                                                          renderHostStoppedAudioIssueTag,
                                                          renderStrategyRan)
 import           MetaSonic.App.ManifestReloadHost       (ManifestReloadHostStrategyRan (..))

@@ -26,12 +26,22 @@ module MetaSonic.App.ManifestReloadCli
   , runManifestHostStrategyReloadSmokeResultWithListenerConfig
   , renderManifestReloadCliIssue
   , renderManifestStoppedAudioReloadSmoke
+    -- * Operator-facing typed renderers for strategy outcomes
+    -- and reload-event payloads. Shared by every manifest-reload
+    -- CLI surface so the @strategy result:@ line and the
+    -- @reload events:@ block speak the same vocabulary.
+  , renderStrategyRan
+  , renderStrategyFailure
+  , renderStrategyOutcome
+  , renderHostPreservingIssueTag
+  , renderHostStoppedAudioIssueTag
+  , renderHostIssueTag
+  , renderSmokeReloadEvent
   ) where
 
 import           Control.Exception                (IOException, finally, try)
 import           Control.Monad                    (void)
 import           Data.Bifunctor                   (first)
-import           Data.Char                        (isAlphaNum)
 import           Data.IORef                       (IORef, modifyIORef',
                                                    newIORef, readIORef)
 import           Data.List                        (find, intercalate)
@@ -61,11 +71,14 @@ import           MetaSonic.App.ManifestReloadEvent
                                                   (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
                                                   (ManifestReloadHostConfig (..),
-                                                   ManifestReloadHostIssue,
+                                                   ManifestReloadHostIssue (..),
                                                    ManifestReloadHostStrategy (..),
-                                                   ManifestReloadHostStrategyIssue,
-                                                   ManifestReloadHostStrategyRan,
+                                                   ManifestReloadHostStrategyIssue (..),
+                                                   ManifestReloadHostStrategyRan (..),
                                                    reloadManifestHostWithStrategyWithEvents)
+import           MetaSonic.App.ManifestReloadOrchestration
+                                                  (HostPreservingReloadIssue (..),
+                                                   HostStoppedAudioReloadIssue (..))
 import           MetaSonic.App.ManifestOSCIngressOps
                                                   (ManifestOSCIngressHandle (..),
                                                    ManifestOSCIngressOpsIssue,
@@ -736,9 +749,7 @@ renderManifestStoppedAudioReloadSmoke smoke =
               else "no"
        , "  listener/producer restart required: "
          <> if msarrListenersMustRestart report then "yes" else "no"
-       , "  audio started: no"
-       , "  audio stopped by helper: no"
-       , "  listener restart executed: no"
+       , "  audio lifecycle: not exercised (planner-only smoke path)"
        , renderManifestReloadCommand (MR.manifestReloadCommand plan)
        ]
   where
@@ -814,6 +825,125 @@ renderManifestHostStrategyReloadSmoke smoke =
     afterSnapshot =
       mshsAfter smoke
 
+-- | Shared typed renderer for a successful strategy outcome. Used
+-- by both the @--manifest-host-reload-smoke@ @strategy result:@
+-- line and the @reload events:@ block's @strategy succeeded:@
+-- line. Polymorphic in @issue@ so output-regression tests can
+-- pass a stand-in payload without fabricating real reload state.
+renderStrategyRan :: ManifestReloadHostStrategyRan issue -> String
+renderStrategyRan ran = case ran of
+  MrhsrPreserving ->
+    "preserving installed (audio kept, voices preserved)"
+  MrhsrStoppedAudio ->
+    "stopped-audio installed (audio restarted with new owner)"
+  MrhsrStoppedAudioAfterPreservingRejected prevIssue ->
+    "preserving rejected ("
+    <> renderHostPreservingIssueTag prevIssue
+    <> "), stopped-audio fallback installed"
+
+-- | Shared typed renderer for a failed strategy outcome. Same role
+-- as 'renderStrategyRan' on the failure branch.
+renderStrategyFailure :: ManifestReloadHostStrategyIssue issue -> String
+renderStrategyFailure failure = case failure of
+  MrhsiPreservingFailed prev ->
+    "preserving: " <> renderHostPreservingIssueTag prev
+  MrhsiStoppedAudioFailed stopped ->
+    "stopped-audio: " <> renderHostStoppedAudioIssueTag stopped
+  MrhsiFallbackStoppedAudioFailed prev stopped ->
+    "preserving (" <> renderHostPreservingIssueTag prev
+    <> "); stopped-audio fallback ("
+    <> renderHostStoppedAudioIssueTag stopped <> ")"
+
+-- | Short kebab-case tag classifying which phase of a preserving
+-- reload failed. The carried @issue@ payloads are intentionally
+-- elided — the tag identifies the failure shape; the structured
+-- value is still in scope via the orchestrator's 'Either' for
+-- programmatic consumers.
+renderHostPreservingIssueTag :: HostPreservingReloadIssue issue -> String
+renderHostPreservingIssueTag issue = case issue of
+  HpariPlanRejected{}                ->
+    "plan-rejected"
+  HpariQuiesceRejected{}             ->
+    "quiesce-rejected"
+  HpariQuiesceRejectedResumeFailed{} ->
+    "quiesce-rejected; resume-failed"
+  HpariDrainRejected{}               ->
+    "drain-rejected"
+  HpariDrainRejectedResumeFailed{}   ->
+    "drain-rejected; resume-failed"
+  HpariDrainFailedTerminal{}         ->
+    "drain-failed (terminal)"
+  HpariReloadRejected{}              ->
+    -- This constructor is the retryable old-owner-still-installed
+    -- shape, not specifically a graph-shape incompatibility.
+    -- mapPreservingReloadReport (ManifestReloadHost.hs) collapses
+    -- SessionEnqueueRejected, StepRuntimeFailed, and StepRejected
+    -- all into HprfOldOwnerStillInstalled → HpariReloadRejected.
+    "reload-rejected (old owner still installed)"
+  HpariReloadRejectedResumeFailed{}  ->
+    "reload-rejected; resume-failed"
+  HpariReloadFailedTerminal{}        ->
+    "reload-failed (terminal)"
+  HpariIngressRestartFailed{}        ->
+    "ingress-restart-failed"
+
+-- | Short kebab-case tag classifying which phase of a stopped-audio
+-- reload failed. Same elision rationale as
+-- 'renderHostPreservingIssueTag'.
+renderHostStoppedAudioIssueTag :: HostStoppedAudioReloadIssue issue -> String
+renderHostStoppedAudioIssueTag issue = case issue of
+  HsariPlanRejected{}                        ->
+    "plan-rejected"
+  HsariQuiesceRejected{}                     ->
+    "quiesce-rejected"
+  HsariQuiesceRejectedResumeFailed{}         ->
+    "quiesce-rejected; resume-failed"
+  HsariDrainRejected{}                       ->
+    "drain-rejected"
+  HsariDrainRejectedResumeFailed{}           ->
+    "drain-rejected; resume-failed"
+  HsariDrainFailedTerminal{}                 ->
+    "drain-failed (terminal)"
+  HsariStopOldAudioFailed{}                  ->
+    "stop-old-audio-failed"
+  HsariReloadRejectedOldOwnerRestarted{}     ->
+    "reload-rejected (old owner restarted)"
+  HsariReloadRejectedOldOwnerRestartFailed{} ->
+    "reload-rejected (old owner restart-failed)"
+  HsariReloadRejectedOldOwnerResumeFailed{}  ->
+    "reload-rejected (old owner resume-failed)"
+  HsariReloadFailedNoOwner{}                 ->
+    "reload-failed (no owner)"
+  HsariAudioRestartFailed{}                  ->
+    "audio-restart-failed"
+  HsariListenerRestartFailed{}               ->
+    "listener-restart-failed"
+
+-- | Short kebab-case tag classifying a bare 'ManifestReloadHostIssue'.
+-- Carried by the resume-old-ingress recovery event when an old-ingress
+-- reopen attempt fails inside an active phase; sharing this renderer
+-- with the Hpari / Hsari tags keeps the reload-events block uniform.
+renderHostIssueTag :: Show ingressIssue => ManifestReloadHostIssue ingressIssue -> String
+renderHostIssueTag issue = case issue of
+  MrhiPlanning{}                  ->
+    "planning"
+  MrhiIngress{}                   ->
+    "ingress"
+  MrhiDrainStopped{}              ->
+    "drain-stopped"
+  MrhiDrainLeftQueued{}           ->
+    "drain-left-queued"
+  MrhiAudio{}                     ->
+    "audio"
+  MrhiReload{}                    ->
+    "reload"
+  MrhiPreservingReloadRejected{}  ->
+    "preserving-reload-rejected"
+  MrhiPreservingReloadStopped{}   ->
+    "preserving-reload-stopped"
+  MrhiPreservingReloadUnexpected{} ->
+    "preserving-reload-unexpected"
+
 renderStrategyOutcome
   :: Either
        (ManifestReloadHostStrategyIssue
@@ -824,16 +954,15 @@ renderStrategyOutcome
 renderStrategyOutcome outcome =
   -- The outcome carries the same data the reload-events block already
   -- surfaces, plus a deeply-nested 'ManifestPreservingHotSwapReport'
-  -- payload on the preserving-rejected path. Rendering raw 'show'
-  -- expands that payload through every RuntimeNode / RuntimeGraph
-  -- field and produces a multi-kilobyte single line; trim to the
-  -- compact two-level tag form used by the reload-events block so
-  -- the smoke output stays uniformly readable.
+  -- payload on the preserving-rejected path. The typed renderers
+  -- ('renderStrategyRan' / 'renderStrategyFailure') trim that to a
+  -- single operator-friendly line and share their vocabulary with
+  -- the reload-events block below.
   case outcome of
     Left issue ->
-      "failed: " <> headTag issue
+      "failed: " <> renderStrategyFailure issue
     Right ran ->
-      "success: " <> headTag ran
+      "success: " <> renderStrategyRan ran
 
 renderSmokeIngressSnapshot
   :: ManifestReloadIngressSnapshot
@@ -905,85 +1034,31 @@ renderSmokeReloadEvent event =
       "    - strategy started: "
       <> renderManifestReloadHostStrategy strategy
     MreStrategySucceeded ran ->
-      "    - strategy succeeded: " <> headTag ran
+      "    - strategy succeeded: " <> renderStrategyRan ran
     MreStrategyFailed issue ->
-      "    - strategy failed: " <> headTag issue
+      "    - strategy failed: " <> renderStrategyFailure issue
     MrePreservingReloadStarted ->
       "    - preserving phase started"
     MrePreservingReloadCommitted ->
       "    - preserving phase committed"
     MrePreservingReloadRejected issue ->
-      "    - preserving phase rejected: " <> headTag issue
+      "    - preserving phase rejected: " <> renderHostPreservingIssueTag issue
     MreStoppedAudioReloadStarted ->
       "    - stopped-audio phase started"
     MreStoppedAudioReloadCommitted ->
       "    - stopped-audio phase committed"
     MreStoppedAudioReloadRejected issue ->
-      "    - stopped-audio phase rejected: " <> headTag issue
+      "    - stopped-audio phase rejected: " <> renderHostStoppedAudioIssueTag issue
     MreResumeOldIngressStarted ->
       "    - resume old ingress: started"
     MreResumeOldIngressSucceeded ->
       "    - resume old ingress: succeeded"
     MreResumeOldIngressFailed issue ->
-      "    - resume old ingress: failed (" <> headTag issue <> ")"
+      "    - resume old ingress: failed (" <> renderHostIssueTag issue <> ")"
     MreFallbackAdmitted issue ->
-      "    - fallback admitted: " <> headTag issue
+      "    - fallback admitted: " <> renderHostPreservingIssueTag issue
     MreFallbackDeclined issue ->
-      "    - fallback declined: " <> headTag issue
-
--- | Render the leading two constructor names from 'show' output as
--- @Outer/Inner@, dropping the rest of the payload. The two-level form
--- preserves the inner stage tag for nested issues
--- (e.g. @HpariReloadRejected/MrhiPreservingReloadRejected@) so each
--- event line carries the operator-relevant cause, not just the outer
--- wrapper, while still fitting on one line. Falls back to a single
--- tag when the payload has no further constructor (e.g.
--- @MrhsrPreserving@) or when 'show' output cannot be parsed into a
--- second identifier (defensive — does not happen for derived
--- 'Show' on the event-payload types in scope here).
-headTag :: Show a => a -> String
-headTag x =
-  case takeIdent shown of
-    ("", _) ->
-      -- 'show' did not start with an identifier (e.g. a parenthesized
-      -- top-level value). Return the raw show so the operator sees
-      -- *something*, even if it is not a constructor tag.
-      shown
-    (outer, rest) ->
-      case nextIdent rest of
-        Just inner ->
-          outer <> "/" <> inner
-        Nothing ->
-          outer
-  where
-    shown = show x
-
-    takeIdent :: String -> (String, String)
-    takeIdent = span isIdentChar
-
-    isIdentChar :: Char -> Bool
-    isIdentChar c =
-      isAlphaNum c || c == '\'' || c == '_'
-
-    -- After the outer identifier, skip whitespace and at most one
-    -- opening paren around the payload, then take the next identifier
-    -- if any. The single-paren skip handles derived 'Show' output for
-    -- constructors whose payload constructor itself has arguments
-    -- (e.g. @Outer (Inner arg)@); constructors with no arguments
-    -- render without parens (e.g. @Outer Inner@) and the same parser
-    -- handles both.
-    nextIdent :: String -> Maybe String
-    nextIdent s =
-      case dropWhile (== ' ') s of
-        ""         -> Nothing
-        '(' : rest -> takeFirstIdent (dropWhile (== ' ') rest)
-        rest       -> takeFirstIdent rest
-
-    takeFirstIdent :: String -> Maybe String
-    takeFirstIdent s =
-      case takeIdent s of
-        ("",    _) -> Nothing
-        (ident, _) -> Just ident
+      "    - fallback declined: " <> renderHostPreservingIssueTag issue
 
 renderManifestReloadStrategyCommand :: SessionCommand -> String
 renderManifestReloadStrategyCommand command =
