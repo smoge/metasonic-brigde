@@ -239,6 +239,7 @@ tests:
       - MetaSonic.Spec.AppManifestReloadUIIngress
       - MetaSonic.Spec.AppDemos
       - MetaSonic.Spec.Core
+      - MetaSonic.Spec.Core.BusRouting
       - MetaSonic.Spec.Core.CCBuilder
       - MetaSonic.Spec.Core.Dependencies
       - MetaSonic.Spec.Core.MigrationKeys
