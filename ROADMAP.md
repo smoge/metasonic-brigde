@@ -3648,7 +3648,10 @@ Still gated:
   work. Remaining work in this arc is a
   resource/allocation recovery event stream (gated on a concrete
   consumer), operator UX polish on the manual smokes, and
-  hardware-gated CI for the device-backed paths.
+  hardware-gated CI for the device-backed paths. Host strategy
+  smoke and live reload demo now share a typed prose reload-event
+  vocabulary (`f595542` / `aca37ed`); remaining UX polish, if any,
+  is the MIDI/device smoke lane.
 - [ ] Failure/event semantics across compile, allocation, and stale
   producer commands. The install/reload-strategy timeline is now
   covered by the `ManifestReloadEvent` ADT in
