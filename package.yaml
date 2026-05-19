@@ -246,6 +246,7 @@ tests:
       - MetaSonic.Spec.Core.MigrationKeys
       - MetaSonic.Spec.Core.NodeIndex
       - MetaSonic.Spec.Core.RatePropagation
+      - MetaSonic.Spec.Core.SelectRegionKernels
       - MetaSonic.Spec.Core.TemplateGraph
       - MetaSonic.Spec.CoreShared
       - MetaSonic.Spec.Driver
