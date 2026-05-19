@@ -169,4 +169,3 @@ plannerTests =
 
     isFanoutEscape ReasonFanoutEscape{} = True
     isFanoutEscape _                    = False
-
