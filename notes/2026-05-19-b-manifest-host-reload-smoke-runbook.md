@@ -172,12 +172,77 @@ threading it through a `KSmooth`:
 - `preserve-cutoff-bright` — saw drone @ `LPF 2400 Hz`, same OSC
   surface.
 
-That pair is the right shape for a future manual run that targets
-`MrhsrPreserving` on real audio. This runbook does not pin a
-known-good output for that path because the live demo has not been
-driven against the pair manually yet; the fake-audio smoke and the
-`MetaSonic.Spec.AppManifestOSCReloadE2E` end-to-end tests already
-cover the orchestrator branch on the CI side.
+That pair was driven manually against real audio on the post-`aca37ed`
+tree, after the smoke-vocabulary slice. The run committed the
+preserving phase without a stopped-audio fallback, held
+`audio running: yes` and `active voices: 1` across the transition, and
+accepted OSC at `/v0/lpf/0` against the auto-spawned voice both before
+(`value=900.0`) and after (`value=2600.0`) the swap. As with the
+fallback run, this validates the audio lifecycle and the OSC
+decode/route layer only — audible output was not independently
+verified.
+
+Manifest was generated with:
+
+```
+stack exec -- metasonic-bridge --authoring-manifest \
+    preserve-cutoff-dark preserve-cutoff-bright \
+    > /tmp/metasonic-preserve-cutoff.json
+```
+
+then driven through:
+
+```
+stack exec -- metasonic-bridge --manifest-live-reload-demo \
+    try-preserving /tmp/metasonic-preserve-cutoff.json \
+    preserve-cutoff-dark preserve-cutoff-bright
+```
+
+Observed transcript (ALSA device-probing warnings during start
+omitted):
+
+```
+initial OSC surface:
+  /<voice>/lpf/0  name="cutoff"
+target OSC surface:
+  /<voice>/lpf/0  name="cutoff"
+
+initial fan-in:
+  audio running: yes
+  queue depth: 0
+  owner status: SessionOwnerReady
+  reload status: SessionFanInNormalOperation
+  active voices: 1
+ingress: open demo=preserve-cutoff-dark ui-controls=1 osc-controls=1 midi-cc=0 defaultVoice=v0 oscPort=7001
+addressable OSC surface:
+  /v0/lpf/0  (name="cutoff")
+
+osc accept: CmdControlWrite voice=v0 tag=ControlTag {ctNodeTag = MigrationKey {unMigrationKey = "lpf"}, ctSlot = 0} value=900.0
+
+strategy outcome: success: preserving installed (audio kept, voices preserved)
+reload events:
+  - strategy started: try-preserving
+  - preserving phase started
+  - preserving phase committed
+  - strategy succeeded: preserving installed (audio kept, voices preserved)
+post-reload fan-in:
+  audio running: yes
+  queue depth: 0
+  owner status: SessionOwnerReady
+  reload status: SessionFanInNormalOperation
+  active voices: 1
+OSC ingress: open demo=preserve-cutoff-bright ui-controls=1 osc-controls=1 midi-cc=0 defaultVoice=v0 oscPort=7001
+addressable OSC surface:
+  /v0/lpf/0  (name="cutoff")
+
+osc accept: CmdControlWrite voice=v0 tag=ControlTag {ctNodeTag = MigrationKey {unMigrationKey = "lpf"}, ctSlot = 0} value=2600.0
+```
+
+OSC port `7001` rebinds cleanly after the process exits with code `0`,
+so the run does not leak the listener. The fake-audio smoke and the
+`MetaSonic.Spec.AppManifestOSCReloadE2E` end-to-end tests cover the
+orchestrator's preserving branch on the CI side; the transcript above
+is what an operator should see on the live path.
 
 ## Things this runbook deliberately does not cover
 
@@ -195,6 +260,3 @@ cover the orchestrator branch on the CI side.
   developer-local scratch input; replacing it with a versioned
   fixture is a separate decision (and would mean nailing down
   which authoring manifest is the canonical smoke input).
-- A known-good output for the true preserving path on real audio.
-  Would require a manifest exposing an OLD/NEW pair with shared
-  migration keys on a live control; not pinned yet.
