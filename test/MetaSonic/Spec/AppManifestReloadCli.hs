@@ -89,8 +89,16 @@ appManifestReloadCliTests =
           assertContains "  strategy: try-preserving" output
           assertContains "  initial demo: named-control" output
           assertContains "  target demo: send-return" output
+          -- 'strategy result:' renders the compact two-level tag form,
+          -- not the raw Show of the strategy outcome. The slash form is
+          -- pinned so a regression to raw Show (which would expand the
+          -- inner ManifestPreservingHotSwapReport payload through every
+          -- RuntimeNode field) fails the test.
           assertContains
-            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected"
+            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected/Hpari"
+            output
+          assertNotContains
+            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected ("
             output
           assertContains "    graph installed: yes" output
           assertContains "  ingress: open demo=send-return" output
@@ -160,7 +168,13 @@ appManifestReloadCliTests =
         Right output -> do
           assertContains "Manifest host strategy reload smoke" output
           assertContains "  strategy: stopped-audio-only" output
+          -- MrhsrStoppedAudio has no payload, so the compact form is a
+          -- single tag with no slash. Pin both the tag and the lack of
+          -- a trailing parenthesis (regression guard for raw Show).
           assertContains "  strategy result: success: MrhsrStoppedAudio" output
+          assertNotContains
+            "  strategy result: success: MrhsrStoppedAudio ("
+            output
           assertContains "    graph installed: yes" output
           assertContains "  ingress: open demo=send-return" output
           assertContains "  fake audio events:" output
@@ -204,7 +218,14 @@ appManifestReloadCliTests =
              <> renderManifestReloadCliIssue issue)
         Right output -> do
           assertContains "  strategy: require-preserving" output
-          assertContains "  strategy result: failed: MrhsiPreservingFailed" output
+          -- The failed-strategy result line renders the compact
+          -- two-level tag (outer Mrhsi wrapper plus inner Hpari stage).
+          assertContains
+            "  strategy result: failed: MrhsiPreservingFailed/Hpari"
+            output
+          assertNotContains
+            "  strategy result: failed: MrhsiPreservingFailed ("
+            output
           assertContains "    graph installed: no" output
           assertContains "  ingress: open demo=named-control" output
           assertContains "  selector command projection:" output
@@ -361,7 +382,7 @@ appManifestReloadCliTests =
              <> renderManifestReloadCliIssue issue)
         Right output -> do
           assertContains
-            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected"
+            "  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected/Hpari"
             output
           assertContains "  ingress: open demo=send-return" output
           assertContains "oscPort=" output

@@ -822,11 +822,18 @@ renderStrategyOutcome
          (ManifestReloadHostIssue ManifestOSCIngressOpsIssue))
   -> String
 renderStrategyOutcome outcome =
+  -- The outcome carries the same data the reload-events block already
+  -- surfaces, plus a deeply-nested 'ManifestPreservingHotSwapReport'
+  -- payload on the preserving-rejected path. Rendering raw 'show'
+  -- expands that payload through every RuntimeNode / RuntimeGraph
+  -- field and produces a multi-kilobyte single line; trim to the
+  -- compact two-level tag form used by the reload-events block so
+  -- the smoke output stays uniformly readable.
   case outcome of
     Left issue ->
-      "failed: " <> show issue
+      "failed: " <> headTag issue
     Right ran ->
-      "success: " <> show ran
+      "success: " <> headTag ran
 
 renderSmokeIngressSnapshot
   :: ManifestReloadIngressSnapshot
