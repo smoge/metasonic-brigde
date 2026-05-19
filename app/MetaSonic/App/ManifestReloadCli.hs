@@ -57,14 +57,14 @@ import           MetaSonic.App.ManifestReloadMIDIBinding
 import           MetaSonic.App.ManifestReloadOSCBinding
                                                   (motControls)
 import           MetaSonic.App.ManifestReloadEvent
-                                                  (noManifestReloadEvents)
+                                                  (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
                                                   (ManifestReloadHostConfig (..),
                                                    ManifestReloadHostIssue,
                                                    ManifestReloadHostStrategy (..),
                                                    ManifestReloadHostStrategyIssue,
                                                    ManifestReloadHostStrategyRan,
-                                                   reloadManifestHostWithStrategy)
+                                                   reloadManifestHostWithStrategyWithEvents)
 import           MetaSonic.App.ManifestOSCIngressOps
                                                   (ManifestOSCIngressHandle (..),
                                                    ManifestOSCIngressOpsIssue,
@@ -164,6 +164,13 @@ data ManifestHostStrategyReloadSmokeResult =
                                 ManifestReloadIngressTarget
                                 ManifestOSCIngressHandle)
     , mshsAudioEvents     :: ![ManifestHostStrategySmokeAudioEvent]
+    , mshsReloadEvents    :: ![ManifestReloadEvent
+                                (ManifestReloadHostIssue
+                                  ManifestOSCIngressOpsIssue)]
+      -- ^ Operator timeline emitted by
+      -- 'reloadManifestHostWithStrategyWithEvents'. Captured by the
+      -- smoke's @mrhcOnEvent@ hook in arrival order; the renderer
+      -- presents this as the @reload events:@ block.
     } deriving (Show)
 
 data ManifestHostStrategySmokeAudioEvent
@@ -454,6 +461,7 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
 
     runSmokeWithIngressBody events ingressManager targetPlan
         initialEntry oldTarget newTarget service = do
+      reloadEvents <- newIORef []
       let audioFFI =
             manifestHostStrategySmokeAudioFFI events
           config = ManifestReloadHostConfig
@@ -472,7 +480,7 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
             , mrhcOwnerOptions =
                 defaultSessionOwnerOptions
             , mrhcOnEvent =
-                noManifestReloadEvents
+                appendSmokeReloadEvent reloadEvents
             }
       audioStarted <-
         startSessionFanInHostAudioWith
@@ -485,7 +493,7 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
         Right () -> do
           before <- readSessionFanInService service
           outcome <-
-            reloadManifestHostWithStrategy
+            reloadManifestHostWithStrategyWithEvents
               manifestHostStrategySmokeProducer
               strategy
               config
@@ -496,6 +504,7 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
           ingressSnapshot <-
             readManifestReloadIngressManager ingressManager
           audioEvents <- readIORef events
+          capturedReloadEvents <- readIORef reloadEvents
           pure (Right ManifestHostStrategyReloadSmokeResult
             { mshsInitialEntry =
                 initialEntry
@@ -513,6 +522,8 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
                 ingressSnapshot
             , mshsAudioEvents =
                 audioEvents
+            , mshsReloadEvents =
+                capturedReloadEvents
             })
 
 renderManifestReloadCliIssue :: ManifestReloadCliIssue -> String
@@ -786,8 +797,10 @@ renderManifestHostStrategyReloadSmoke smoke =
          <> show (M.size (ssVoices (sfisOwnerState afterSnapshot)))
        , "  ingress: "
          <> renderSmokeIngressSnapshot (mshsIngressSnapshot smoke)
-       , "  fake audio events:"
+       , "  reload events:"
        ]
+    <> renderSmokeReloadEvents (mshsReloadEvents smoke)
+    <> [ "  fake audio events:" ]
     <> renderSmokeAudioEvents (mshsAudioEvents smoke)
     <> [ renderManifestReloadStrategyCommand (MR.manifestReloadCommand plan) ]
   where
@@ -857,6 +870,64 @@ renderSmokeAudioEvents events =
           "    - ready timeoutMs=" <> show timeoutMs
         MhssaStop ->
           "    - stop"
+
+-- | Compact operator-facing renderer for the smoke's captured
+-- 'ManifestReloadEvent' timeline. Each event becomes one bullet line
+-- with a short label, plus the leading constructor tag of any payload
+-- (extracted from 'show' so the line stays single-row even when the
+-- inner failure carries nested issues).
+renderSmokeReloadEvents
+  :: [ManifestReloadEvent
+        (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)]
+  -> [String]
+renderSmokeReloadEvents events =
+  case events of
+    [] ->
+      ["    (none)"]
+    _ ->
+      map renderSmokeReloadEvent events
+
+renderSmokeReloadEvent
+  :: ManifestReloadEvent
+       (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
+  -> String
+renderSmokeReloadEvent event =
+  case event of
+    MreStrategyStarted strategy ->
+      "    - strategy started: "
+      <> renderManifestReloadHostStrategy strategy
+    MreStrategySucceeded ran ->
+      "    - strategy succeeded: " <> headTag ran
+    MreStrategyFailed issue ->
+      "    - strategy failed: " <> headTag issue
+    MrePreservingReloadStarted ->
+      "    - preserving phase started"
+    MrePreservingReloadCommitted ->
+      "    - preserving phase committed"
+    MrePreservingReloadRejected issue ->
+      "    - preserving phase rejected: " <> headTag issue
+    MreStoppedAudioReloadStarted ->
+      "    - stopped-audio phase started"
+    MreStoppedAudioReloadCommitted ->
+      "    - stopped-audio phase committed"
+    MreStoppedAudioReloadRejected issue ->
+      "    - stopped-audio phase rejected: " <> headTag issue
+    MreResumeOldIngressStarted ->
+      "    - resume old ingress: started"
+    MreResumeOldIngressSucceeded ->
+      "    - resume old ingress: succeeded"
+    MreResumeOldIngressFailed issue ->
+      "    - resume old ingress: failed (" <> headTag issue <> ")"
+    MreFallbackAdmitted issue ->
+      "    - fallback admitted: " <> headTag issue
+    MreFallbackDeclined issue ->
+      "    - fallback declined: " <> headTag issue
+
+-- | Extract the leading constructor name from 'show' output, dropping
+-- any space-separated payload. Used to keep reload-event lines compact
+-- when the payload's own 'show' would span several lines.
+headTag :: Show a => a -> String
+headTag = takeWhile (\c -> c /= ' ' && c /= '\n') . show
 
 renderManifestReloadStrategyCommand :: SessionCommand -> String
 renderManifestReloadStrategyCommand command =
@@ -966,6 +1037,15 @@ appendSmokeAudioEvent
   -> ManifestHostStrategySmokeAudioEvent
   -> IO ()
 appendSmokeAudioEvent ref event =
+  modifyIORef' ref (<> [event])
+
+appendSmokeReloadEvent
+  :: IORef [ManifestReloadEvent
+              (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)]
+  -> ManifestReloadEvent
+       (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
+  -> IO ()
+appendSmokeReloadEvent ref event =
   modifyIORef' ref (<> [event])
 
 manifestHostStrategySmokeIngressTargetPolicy

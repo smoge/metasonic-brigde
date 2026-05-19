@@ -106,6 +106,27 @@ appManifestReloadCliTests =
           assertContains "ui-controls=" output
           assertContains "osc-controls=" output
           assertContains "midi-cc=" output
+          -- The reload-events timeline is wired through the host's
+          -- @mrhcOnEvent@ hook. Try-preserving against an empty owner
+          -- must run preserving → reject → admit → stopped-audio →
+          -- commit → succeed; assert the events block carries each of
+          -- those transitions.
+          assertContainsInOrder
+            [ "  reload events:"
+            , "    - strategy started: try-preserving"
+            , "    - preserving phase started"
+            , "    - preserving phase rejected: Hpari"
+            , "    - fallback admitted: Hpari"
+            , "    - stopped-audio phase started"
+            , "    - stopped-audio phase committed"
+            , "    - strategy succeeded: MrhsrStoppedAudioAfterPreservingRejected"
+            , "  fake audio events:"
+            ]
+            output
+          -- Strategy frame brackets the run; no fallback-declined event
+          -- should fire on the admitted-fallback path.
+          assertNotContains "    - fallback declined" output
+          assertNotContains "    - strategy failed" output
 
   , testCase "host strategy smoke renders stopped-audio-only outcome" $ do
       targetDemo <- demoOrFail "send-return"
@@ -136,6 +157,21 @@ appManifestReloadCliTests =
           assertContains
             "  selector command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (selector-controlled)"
             output
+          -- Stopped-audio-only is the simplest event timeline: no
+          -- preserving phase, no fallback admission, just the
+          -- stopped-audio bracket plus the strategy frame.
+          assertContainsInOrder
+            [ "  reload events:"
+            , "    - strategy started: stopped-audio-only"
+            , "    - stopped-audio phase started"
+            , "    - stopped-audio phase committed"
+            , "    - strategy succeeded: MrhsrStoppedAudio"
+            , "  fake audio events:"
+            ]
+            output
+          assertNotContains "    - preserving phase" output
+          assertNotContains "    - fallback admitted" output
+          assertNotContains "    - strategy failed" output
 
   , testCase "host strategy smoke renders preserving-required failure as diagnostic output" $ do
       targetDemo <- demoOrFail "send-return"
@@ -160,6 +196,21 @@ appManifestReloadCliTests =
           assertContains "    graph installed: no" output
           assertContains "  ingress: open demo=named-control" output
           assertContains "  selector command projection:" output
+          -- Require-preserving against an empty owner rejects in the
+          -- preserving phase and surfaces a strategy failure. There is
+          -- no fallback step.
+          assertContainsInOrder
+            [ "  reload events:"
+            , "    - strategy started: require-preserving"
+            , "    - preserving phase started"
+            , "    - preserving phase rejected: Hpari"
+            , "    - strategy failed: MrhsiPreservingFailed"
+            , "  fake audio events:"
+            ]
+            output
+          assertNotContains "    - fallback" output
+          assertNotContains "    - stopped-audio phase" output
+          assertNotContains "    - strategy succeeded" output
 
   , testCase "missing manifest file reports read failure" $ do
       result <-
@@ -432,3 +483,22 @@ assertNotContains needle haystack =
   assertBool
     ("expected output not to contain " <> show needle <> "\n\noutput:\n" <> haystack)
     (not (needle `isInfixOf` haystack))
+
+assertContainsInOrder :: [String] -> String -> Assertion
+assertContainsInOrder needles haystack =
+  go haystack needles
+  where
+    go _ [] =
+      pure ()
+    go remaining (needle : rest) =
+      case scanForSuffix needle remaining of
+        Nothing ->
+          assertFailure
+            ("expected output to contain "
+             <> show needle
+             <> " after the previous timeline entry\n\nremaining output:\n"
+             <> remaining
+             <> "\n\nfull output:\n"
+             <> haystack)
+        Just suffix ->
+          go suffix rest

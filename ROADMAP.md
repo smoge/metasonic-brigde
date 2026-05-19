@@ -3605,8 +3605,21 @@ Still gated:
   resource/allocation recovery event stream (gated on a concrete
   consumer), operator UX polish on the manual smokes, and
   hardware-gated CI for the device-backed paths.
-- [ ] Failure/event semantics across compile, allocation, install, and
-  stale producer commands.
+- [ ] Failure/event semantics across compile, allocation, and stale
+  producer commands. The install/reload-strategy timeline is now
+  covered by the `ManifestReloadEvent` ADT in
+  `MetaSonic.App.ManifestReloadEvent` plus the `*WithEvents`
+  orchestrator and host entrypoints: strategy lifecycle, preserving
+  phase, stopped-audio phase, resume-old-ingress recovery, and
+  fallback admission. Library/host legacy entrypoints delegate with
+  `noManifestReloadEvents` and stay silent; the first concrete
+  operator-visible consumer is the `--manifest-host-reload-smoke`
+  CLI, which renders a compact `reload events:` block beside its
+  fake audio events and is regression-protected by ordered timeline
+  assertions in `MetaSonic.Spec.AppManifestReloadCli`. Compile-error
+  surfacing, allocation/resource recovery streaming, and stale
+  producer command semantics remain open and consumer-gated — see
+  [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md).
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
 
