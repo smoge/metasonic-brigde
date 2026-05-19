@@ -113,12 +113,17 @@ Property predicates (`propDenseIndices`, `propTopoOrder`,
 new module; nothing was promoted to `CoreShared` because the
 predicates are property-tree-private.
 
-**`CoreShared` is the load-bearing fixture surface.** Every extracted
-cohort imports `MetaSonic.Spec.CoreShared` (open) for one or more of
-the fixtures or helpers above. Promoting helpers here (rather than
-keeping them in Core.hs alongside `unitTests`) lets cohort modules
-import only the shared surface they need without pulling the
-residual `unitTests` tree into their dependency graph.
+**`CoreShared` holds shared fixtures and helpers for cohorts that
+need them.** Three of the twelve cohort modules currently import it
+(`RatePropagation`, `RegionScheduling`, `Properties`); the rest are
+self-contained because their fixtures are either kind-table walks
+(`Capability`-style enumeration over `[minBound .. maxBound]`) or
+small inline graphs that don't reach for the shared
+`demoGraphs` / generator surface. Promoting helpers here (rather than
+keeping them in Core.hs alongside `unitTests`) means a cohort that
+needs the generator or a demo fixture can pull just the shared
+surface without dragging the residual `unitTests` tree into its
+dependency graph.
 
 **Two oversized testGroups were split mid-extraction.** The
 "Rate propagation" testGroup in the parent secretly contained the
