@@ -123,6 +123,18 @@ appManifestReloadCliTests =
             , "  fake audio events:"
             ]
             output
+          -- The rejected/admitted lines render two constructor levels:
+          -- the outer Hpari* wrapper plus the inner Mrhi* leaf, so the
+          -- operator sees both the failing stage and the actual cause.
+          -- The slash separator follows the Hpari prefix on the same
+          -- line in both the rejection and the admission events.
+          assertContainsInOrder
+            [ "    - preserving phase rejected: Hpari"
+            , "/Mrhi"
+            , "    - fallback admitted: Hpari"
+            , "/Mrhi"
+            ]
+            output
           -- Strategy frame brackets the run; no fallback-declined event
           -- should fire on the admitted-fallback path.
           assertNotContains "    - fallback declined" output
@@ -198,13 +210,18 @@ appManifestReloadCliTests =
           assertContains "  selector command projection:" output
           -- Require-preserving against an empty owner rejects in the
           -- preserving phase and surfaces a strategy failure. There is
-          -- no fallback step.
+          -- no fallback step. The rejected line uses the two-level
+          -- Hpari/Mrhi form; the strategy-failed line carries the
+          -- outer Mrhsi wrapper plus the inner Hpari stage, which is
+          -- enough for an operator to triage without scanning the
+          -- preceding phase event.
           assertContainsInOrder
             [ "  reload events:"
             , "    - strategy started: require-preserving"
             , "    - preserving phase started"
             , "    - preserving phase rejected: Hpari"
-            , "    - strategy failed: MrhsiPreservingFailed"
+            , "/Mrhi"
+            , "    - strategy failed: MrhsiPreservingFailed/Hpari"
             , "  fake audio events:"
             ]
             output

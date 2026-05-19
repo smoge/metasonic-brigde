@@ -31,6 +31,7 @@ module MetaSonic.App.ManifestReloadCli
 import           Control.Exception                (IOException, finally, try)
 import           Control.Monad                    (void)
 import           Data.Bifunctor                   (first)
+import           Data.Char                        (isAlphaNum)
 import           Data.IORef                       (IORef, modifyIORef',
                                                    newIORef, readIORef)
 import           Data.List                        (find, intercalate)
@@ -923,11 +924,59 @@ renderSmokeReloadEvent event =
     MreFallbackDeclined issue ->
       "    - fallback declined: " <> headTag issue
 
--- | Extract the leading constructor name from 'show' output, dropping
--- any space-separated payload. Used to keep reload-event lines compact
--- when the payload's own 'show' would span several lines.
+-- | Render the leading two constructor names from 'show' output as
+-- @Outer/Inner@, dropping the rest of the payload. The two-level form
+-- preserves the inner stage tag for nested issues
+-- (e.g. @HpariReloadRejected/MrhiPreservingReloadRejected@) so each
+-- event line carries the operator-relevant cause, not just the outer
+-- wrapper, while still fitting on one line. Falls back to a single
+-- tag when the payload has no further constructor (e.g.
+-- @MrhsrPreserving@) or when 'show' output cannot be parsed into a
+-- second identifier (defensive — does not happen for derived
+-- 'Show' on the event-payload types in scope here).
 headTag :: Show a => a -> String
-headTag = takeWhile (\c -> c /= ' ' && c /= '\n') . show
+headTag x =
+  case takeIdent shown of
+    ("", _) ->
+      -- 'show' did not start with an identifier (e.g. a parenthesized
+      -- top-level value). Return the raw show so the operator sees
+      -- *something*, even if it is not a constructor tag.
+      shown
+    (outer, rest) ->
+      case nextIdent rest of
+        Just inner ->
+          outer <> "/" <> inner
+        Nothing ->
+          outer
+  where
+    shown = show x
+
+    takeIdent :: String -> (String, String)
+    takeIdent = span isIdentChar
+
+    isIdentChar :: Char -> Bool
+    isIdentChar c =
+      isAlphaNum c || c == '\'' || c == '_'
+
+    -- After the outer identifier, skip whitespace and at most one
+    -- opening paren around the payload, then take the next identifier
+    -- if any. The single-paren skip handles derived 'Show' output for
+    -- constructors whose payload constructor itself has arguments
+    -- (e.g. @Outer (Inner arg)@); constructors with no arguments
+    -- render without parens (e.g. @Outer Inner@) and the same parser
+    -- handles both.
+    nextIdent :: String -> Maybe String
+    nextIdent s =
+      case dropWhile (== ' ') s of
+        ""         -> Nothing
+        '(' : rest -> takeFirstIdent (dropWhile (== ' ') rest)
+        rest       -> takeFirstIdent rest
+
+    takeFirstIdent :: String -> Maybe String
+    takeFirstIdent s =
+      case takeIdent s of
+        ("",    _) -> Nothing
+        (ident, _) -> Just ident
 
 renderManifestReloadStrategyCommand :: SessionCommand -> String
 renderManifestReloadStrategyCommand command =
