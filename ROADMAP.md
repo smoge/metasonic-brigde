@@ -1460,9 +1460,13 @@ Open follow-up queue:
    smaller spectral and latency slices make their requirements
    concrete.
 
-Next 6.D implementation direction: write a small contract note for a
-second fixed-size spectral kind (likely a frequency-domain filter
-variant such as `KSpectralLpf`) before adding runtime code.
+Next 6.D implementation direction: land `KSpectralLpf` as the second
+fixed-size spectral kind, scoped by
+[Phase 6.D second spectral kind contract](notes/2026-05-19-c-phase-6d-second-spectral-kind-contract.md).
+Implementation is split for reviewability: first extract the
+shared STFT/Hann/WOLA helper out of `KSpectralFreeze` with no new
+kind (freeze output and counters remain byte-equivalent), then add
+`KSpectralLpf` end-to-end against that helper.
 
 ### Phase 6.E — Plugin Hosting
 
