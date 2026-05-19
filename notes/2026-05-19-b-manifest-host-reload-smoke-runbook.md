@@ -130,17 +130,20 @@ stack exec -- metasonic-bridge --manifest-live-reload-demo \
     try-preserving manifest.json named-control named-control
 ```
 
-What the run confirmed against real hardware that the
-fake-audio smoke cannot:
+What the run confirmed about the live PortAudio/ALSA path that
+the fake-audio smoke cannot:
 
 - PortAudio start / wait / stop through `defaultSessionFanInAudioFFI`
   on ALSA. The device-probing warnings printed during start were
   harmless; the host reported `audio running: yes` and held it across
-  the reload.
+  the reload. The run did not independently verify audible output
+  — only that the audio lifecycle returned success at each stage.
 - Real UDP OSC ingress bound on `oscPort=7001`. Packets to
   `/v0/vol/1` and `/v0/cutoff/1` were accepted before the reload;
   `/v0/vol/1` was accepted again after the reload, proving the
-  swapped target's OSC projection was live.
+  swapped target's OSC projection was live at the decode/route
+  layer (not, again, that the resulting control writes were
+  audibly applied).
 - The typed `reload events:` block rendered character-for-character
   identically to the fake-audio smoke output above (same event order,
   same kebab-case stage tags, same `preserving rejected (...)` /
@@ -150,16 +153,31 @@ fake-audio smoke cannot:
 
 Notable: a `named-control → named-control` self-reload still took the
 fallback path (`preserving rejected (reload-rejected (old owner still
-installed)), stopped-audio fallback installed`). The reason is the
-same as the fake-audio smoke's fallback: the live demo's auto-spawned
-initial voice carries no migration metadata the preserving command
-can land against, so the orchestrator collapses to stopped-audio
-fallback. A true `MrhsrPreserving` outcome on real audio still
-requires an OLD/NEW pair whose live controls share migration keys
-(the `hotSwapEdit` shape from the test suite) on a manifest that
-exposes them. The runbook does not pin a known-good output for that
-path because it has not been driven through the live demo manually
-yet; the fake-audio smoke covers the orchestrator branch.
+installed)), stopped-audio fallback installed`). The reason is not a
+missing migration key on the auto-spawned voice — the authored
+controls do carry migration metadata. It is that `named-control`'s
+authored controls route through `KSmooth` nodes (one per named
+control, see `Saw → LPF[cutoff] → Gain[vol=CC10] → Out` in
+`MetaSonic.App.Demos`), and `KSmooth` is `PreserveUnsupported` in
+`MetaSonic.Session.RTGraphAdapter.preserveSupport`. The preserving
+command therefore cannot land state across the swap, the orchestrator
+collapses to stopped-audio fallback, and the new voice restarts from
+defaults.
+
+The app already has a preserving-compatible demo pair that side-steps
+this by binding the OSC cutoff control directly to `KLPF` rather than
+threading it through a `KSmooth`:
+
+- `preserve-cutoff-dark` — saw drone @ `LPF 600 Hz`, OSC at `/v0/lpf/0`.
+- `preserve-cutoff-bright` — saw drone @ `LPF 2400 Hz`, same OSC
+  surface.
+
+That pair is the right shape for a future manual run that targets
+`MrhsrPreserving` on real audio. This runbook does not pin a
+known-good output for that path because the live demo has not been
+driven against the pair manually yet; the fake-audio smoke and the
+`MetaSonic.Spec.AppManifestOSCReloadE2E` end-to-end tests already
+cover the orchestrator branch on the CI side.
 
 ## Things this runbook deliberately does not cover
 
