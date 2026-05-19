@@ -1456,9 +1456,11 @@ Open follow-up queue:
    aggregate has a non-empty number to report. Mirrors the
    `--fusion-survey` `printEdgeRateDistribution` section.
 6. Keep block-rate promotion, spectrum-stream types, multichannel
-   STFT, variable N / hop, and plugin hosting parked until the
-   smaller spectral and latency slices make their requirements
-   concrete.
+   STFT, and variable N / hop parked until the smaller spectral
+   and latency slices make their requirements concrete. (Plugin
+   hosting was on this list at the time the item was first
+   written; it is no longer parked here — §6.E below records the
+   landed `KStaticPlugin` Identity slices.)
 
 Second spectral kind landed. `KSpectralLpf` is in tree as of
 `768a060`, scoped by
