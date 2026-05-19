@@ -1460,13 +1460,51 @@ Open follow-up queue:
    smaller spectral and latency slices make their requirements
    concrete.
 
-Next 6.D implementation direction: land `KSpectralLpf` as the second
-fixed-size spectral kind, scoped by
+Second spectral kind landed. `KSpectralLpf` is in tree as of
+`768a060`, scoped by
 [Phase 6.D second spectral kind contract](notes/2026-05-19-c-phase-6d-second-spectral-kind-contract.md).
-Implementation is split for reviewability: first extract the
-shared STFT/Hann/WOLA helper out of `KSpectralFreeze` with no new
-kind (freeze output and counters remain byte-equivalent), then add
-`KSpectralLpf` end-to-end against that helper.
+Two-slice implementation:
+
+1. `351fc59` extracted the shared STFT helper (`StftRings`,
+   `run_stft_block`, `window_and_fft_input_ring`,
+   namespace-scope Hann / WOLA constants) from
+   `KSpectralFreeze` with no new kind. `SpectralFreezeState`
+   recast as composition over `StftRings`; per-frame order
+   preserved exactly so freeze counter math, impulse-delay,
+   sine reconstruction, freeze-sustain, and hop-boundary
+   latch tests remained byte-equivalent.
+2. `768a060` added `KSpectralLpf` (tag 24) end-to-end against
+   that helper: Haskell metadata + DSL builder, scheduler
+   barrier predicate extended, runtime `SpectralLpfState`
+   composing the same `StftRings`, brick-wall bin mask in
+   `process_spectral_lpf` (preserves DC through `cutoff_bin`,
+   zeroes the high band plus its Hermitian mirrors, Nyquist
+   passes as a true no-op modulo windowing), independent
+   `spectral_lpf_analysis_count` / `_resynthesis_count`
+   counter pair through `rt_graph.h` + `Bridge.FFI`, paired
+   `"lpf-bed"` template on the existing `spectral-freeze-pad`
+   corpus row, and 13 contract-mirroring tests including a
+   shared-helper smoke that runs both spectral kinds on
+   disjoint voices and asserts the counter pairs advance
+   independently.
+
+Parked items remain parked — the second kind earned its keep as
+the "second user proves shared STFT infrastructure" trigger and
+explicitly does not motivate any of these:
+
+- Latency compensation (still descriptive-only;
+  [Phase 6.D latency follow-up decision](notes/2026-05-11-e-phase-6d-latency-followup-decision.md)
+  reopen gate is unchanged — a second latency-bearing kind on
+  its own does not satisfy it).
+- Block-rate region promotion. Both spectral kinds remain
+  `SampleRate` at the graph interface; hop-granular work stays
+  internal to the kernel.
+- Spectrum-streaming types (SC's `PV_*` model). A
+  `SpectrumConn` parallel to `Connection` is still the
+  pre-condition for chained spectral kinds and stays deferred.
+- Multichannel STFT. Mono only, same as v1.
+- Variable / runtime N or hop. Both kinds hardcode
+  N=1024 / hop=256.
 
 ### Phase 6.E — Plugin Hosting
 
