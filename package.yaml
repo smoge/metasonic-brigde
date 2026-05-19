@@ -242,6 +242,7 @@ tests:
       - MetaSonic.Spec.Core.BusRouting
       - MetaSonic.Spec.Core.CCBuilder
       - MetaSonic.Spec.Core.Dependencies
+      - MetaSonic.Spec.Core.FusionAlgebra
       - MetaSonic.Spec.Core.MigrationKeys
       - MetaSonic.Spec.Core.NodeIndex
       - MetaSonic.Spec.Core.RatePropagation
