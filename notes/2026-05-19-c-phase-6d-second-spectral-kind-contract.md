@@ -16,6 +16,33 @@ Read this before writing any runtime code. The intent is for the
 implementation slice to mirror this note line-for-line, the same way
 the freeze series mirrored its design.
 
+### Reader's note (added at closeout)
+
+Sections §§0-10 below are the **original pre-implementation
+contract**, preserved verbatim, with one exception: **§4 has been
+rewritten** to describe the actual landed extraction seam, because
+the implementation diverged from the pre-implementation
+recommendation in a way that a future spectral kind should *not*
+copy. The rejected pre-implementation shape was a `StftState` base
+struct shared by `SpectralFreezeState` and `SpectralLpfState`; the
+landed shape is composition over `StftRings` plus a
+template-on-callable `run_stft_block` helper. The decision is
+recorded in §4.
+
+Everything else in §§0-10 should be read as the **pre-implementation
+state** at the time the contract was written. In particular:
+
+- §0's "next free tag is 24" and "no shared helper has been factored
+  out yet" bullets are pre-implementation facts. Code now has
+  `KSpectralLpf -> KindSpec 24 ...` and the shared
+  `StftRings` / `run_stft_block` / `window_and_fft_input_ring`
+  helpers live in `tinysynth/rt_graph.cpp`.
+- §7's sites table is the pre-implementation plan; the landed
+  commits (§11) carry the actual realized site list.
+
+§11 is the closeout: the four arc commits, the closing validation
+gate, and the explicit `just cpp-test` exclusion.
+
 ## 0. Anchors
 
 - The first spectral kind is `KSpectralFreeze` at tag `22`
@@ -141,40 +168,79 @@ struct SpectralLpfState {
 Per-voice memory: `kN * 4 + (kN+kHop) * 4 + 2*kN * 4 ≈ 16 KiB`,
 vs. ~21 KiB for `KSpectralFreeze`. Same order of magnitude.
 
-## 4. Shared helper decision
+## 4. Shared helper seam (rewritten at closeout to the landed shape)
 
-The freeze design (§4) said the shared analysis/resynthesis
-machinery should be extracted **once a second user motivates it**.
-This is that moment. The recommendation:
+The freeze design (§4 of the v1 note) said the shared
+analysis/resynthesis machinery should be extracted **once a second
+user motivates it**. The LPF slice is that moment. The
+**pre-implementation** recommendation in this section was a
+`StftState` base struct shared by `SpectralFreezeState` and
+`SpectralLpfState`, with a `process_stft_hop` static helper
+parameterized on the per-hop spectrum transform.
 
-Do extract, narrowly. Specifically, factor out:
+The **landed** shape rejected the inheritance/base-struct seam and
+uses composition + template-on-callable instead. Reasoning:
+`NodeState` is a `std::variant` of plain structs, with no
+inheritance in the runtime today. A `StftState` base would have
+introduced either a vtable indirection on the audio thread (if
+virtual) or a new inheritance precedent for one shared user; the
+codebase's nearest existing reuse pattern is templated/static
+helpers, not runtime polymorphism. Composition keeps both kinds as
+plain `std::variant`-friendly POD-shaped states and lets the audio
+thread inline through the template.
 
-- The Hann window table (already a namespace-scope constant
-  `kHannWindow` after freeze post-hardening, plus the matching
-  `kSpectralResynthesisScale` WOLA constant — share, don't
-  duplicate).
-- A `process_stft_hop` static helper templated or
-  function-pointer-parameterized on the per-hop spectrum
-  transform. Signature shape (illustrative):
-  `template <typename SpectrumOp> void process_stft_hop(StftState& s, SpectrumOp op)`
-  where `StftState` is a base struct holding the rings + heads
-  shared by `SpectralFreezeState` and `SpectralLpfState`.
+**What landed** (`tinysynth/rt_graph.cpp`, `351fc59`):
 
-Do **not** extract, in this slice:
+- `StftRings` — the shared ring state. Owns `input_ring`,
+  `output_ring` (sized `kN+kHop`), `spectrum_work` (FFT scratch),
+  `input_write_head`, `output_read_head`, `samples_in`,
+  `samples_out`, plus the kind-shared constants `kN=1024`,
+  `kHop=256`, `kOverlaps=4`, `kBins=N/2+1`.
+- `SpectralFreezeState` and `SpectralLpfState` compose this:
+  - `SpectralFreezeState { StftRings stft; frozen_spectrum; frozen_valid; }`
+  - `SpectralLpfState   { StftRings stft; }` (no freeze-specific
+    fields)
+- `kHannWindow` and `kSpectralResynthesisScale` stay as
+  namespace-scope constants — same shape and reasoning as before
+  freeze post-hardening; no duplication.
+- `template <typename HopOp> StftBlockTicks run_stft_block(rings, sig_in, sig_default, out, nframes, hop_op)`
+  is the frame-stepping helper. It owns input-ring write,
+  output-ring read+zero, `samples_{in,out}` increment, hop-boundary
+  detection, IFFT, and WOLA overlap-add. The caller supplies a
+  `HopOp` callable invoked at each hop boundary; that callable
+  populates `rings.spectrum_work` with the spectrum to invert and
+  returns `StftHopOutcome { analysis_fired }`. Freeze sets
+  `analysis_fired = false` on frozen hops so the freeze counter
+  stays in sync with the design contract; LPF always reports
+  `analysis_fired = true`.
+- `window_and_fft_input_ring(rings)` is a small static helper that
+  performs the "window the most recent N samples + forward FFT into
+  `spectrum_work`" step. Both hop callables call it directly
+  rather than each duplicating the analysis prologue.
 
-- The freeze-specific spectrum storage (`frozen_spectrum`,
-  `frozen_valid`). That stays in the freeze state.
-- A general FFT-size knob. Both kinds still hardcode N=1024 /
-  hop=256; extracting a runtime knob with one user remains a
-  premature abstraction — the same reasoning that kept the
-  freeze-side ring/head machinery inside its struct in v1.
+**What stays per-kind**:
 
-The narrow extraction is what makes the LPF slice *prove*
-infrastructure reuse: a third spectral kind should reuse the
-helper without further refactoring. If `KSpectralLpf` ends up
-re-implementing the rings + heads instead of using the shared
-helper, the second-kind goal is not actually met and the slice
-should be reopened.
+- Freeze keeps `frozen_spectrum` (Hermitian half) and
+  `frozen_valid` on `SpectralFreezeState` — they are
+  freeze-specific spectrum storage, never touched by LPF.
+- LPF computes its bin mask inline in its hop callable from the
+  per-hop cutoff and the runtime sample rate, so it carries no
+  extra state past `StftRings`.
+
+**What deliberately did not get factored out**, preserved from the
+original §4:
+
+- A general FFT-size knob. Both kinds still hardcode
+  N=1024 / hop=256; extracting a runtime knob with one user remains
+  a premature abstraction.
+
+**For a future spectral kind**: compose `StftRings` into the new
+state struct, write a hop callable returning `StftHopOutcome`,
+delegate frame stepping to `run_stft_block`. Do not reintroduce a
+base struct, vtable, or function-pointer indirection on the audio
+thread. If a future kind needs a different windowing contract
+(non-Hann window, different N, multichannel), the right move is a
+parallel ring type, not a runtime knob on `StftRings`.
 
 Note: the freeze hop-boundary semantics (analysis runs at
 `samples_in % hop == 0`, resynthesis runs at the same cadence)
