@@ -159,10 +159,10 @@ controls do carry migration metadata. It is that `named-control`'s
 authored controls route through `KSmooth` nodes (one per named
 control, see `Saw → LPF[cutoff] → Gain[vol=CC10] → Out` in
 `MetaSonic.App.Demos`), and `KSmooth` is `PreserveUnsupported` in
-`MetaSonic.Session.RTGraphAdapter.preserveSupport`. The preserving
-command therefore cannot land state across the swap, the orchestrator
-collapses to stopped-audio fallback, and the new voice restarts from
-defaults.
+`MetaSonic.Session.RTGraphAdapter.preservingHotSwapNodeClass`. The
+preserving command therefore cannot land state across the swap, the
+orchestrator collapses to stopped-audio fallback, and the new voice
+restarts from defaults.
 
 The app already has a preserving-compatible demo pair that side-steps
 this by binding the OSC cutoff control directly to `KLPF` rather than
