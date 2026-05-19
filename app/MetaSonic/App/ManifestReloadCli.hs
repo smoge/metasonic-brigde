@@ -56,6 +56,8 @@ import           MetaSonic.App.ManifestReloadMIDIBinding
                                                    mmitControls)
 import           MetaSonic.App.ManifestReloadOSCBinding
                                                   (motControls)
+import           MetaSonic.App.ManifestReloadEvent
+                                                  (noManifestReloadEvents)
 import           MetaSonic.App.ManifestReloadHost
                                                   (ManifestReloadHostConfig (..),
                                                    ManifestReloadHostIssue,
@@ -469,6 +471,8 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
                 manifestHostStrategySmokeAudioOptions
             , mrhcOwnerOptions =
                 defaultSessionOwnerOptions
+            , mrhcOnEvent =
+                noManifestReloadEvents
             }
       audioStarted <-
         startSessionFanInHostAudioWith

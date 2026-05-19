@@ -25,10 +25,17 @@ module MetaSonic.App.ManifestReloadHost
   , manifestReloadHostOps
   , manifestPreservingReloadHostOps
   , reloadManifestStoppedAudioHost
+  , reloadManifestStoppedAudioHostWithEvents
   , reloadManifestPreservingHost
+  , reloadManifestPreservingHostWithEvents
   , reloadManifestHostWithStrategy
+  , reloadManifestHostWithStrategyWithEvents
+  , runReloadHostStrategyWithEvents
   ) where
 
+import           MetaSonic.App.ManifestReloadEvent
+                                                  (ManifestReloadEvent (..),
+                                                   noManifestReloadEvents)
 import           MetaSonic.App.ManifestReloadIngress
                                                   (ManifestReloadIngressManager,
                                                    closeManifestReloadIngress,
@@ -48,8 +55,8 @@ import           MetaSonic.App.ManifestReloadOrchestration
                                                    HostStoppedAudioReloadFailure (..),
                                                    HostStoppedAudioReloadIssue,
                                                    HostStoppedAudioReloadOps (..),
-                                                   orchestrateHostPreservingReload,
-                                                   orchestrateHostStoppedAudioReload)
+                                                   orchestrateHostPreservingReloadWithEvents,
+                                                   orchestrateHostStoppedAudioReloadWithEvents)
 import           MetaSonic.Authoring.Manifest    (AuthoringManifestDoc)
 import           MetaSonic.Session.FanIn         (SessionFanInAudioFFI,
                                                    SessionFanInAudioIssue,
@@ -95,6 +102,17 @@ data ManifestReloadHostConfig target ingressIssue handle =
       -- 'defaultSessionFanInAudioFFI'; tests pass fakes.
     , mrhcAudioOptions      :: !SessionFanInAudioOptions
     , mrhcOwnerOptions      :: !SessionOwnerOptions
+    , mrhcOnEvent           :: !(ManifestReloadEvent
+                                   (ManifestReloadHostIssue ingressIssue)
+                                 -> IO ())
+      -- ^ Operator-facing event sink invoked by the
+      -- @reload...WithEvents@ entrypoints at each strategy /
+      -- phase / recovery / fallback boundary. The non-@WithEvents@
+      -- entrypoints discard this field by overriding it with
+      -- 'noManifestReloadEvents' before delegating, so legacy
+      -- callers stay silent regardless of what they pass here.
+      -- Construction sites that do not want events should set
+      -- this to 'noManifestReloadEvents'.
     }
 
 -- | Build stopped-audio orchestration slots backed by the real session
@@ -301,7 +319,12 @@ preparePlan doc catalog request =
     Right plan ->
       Right plan
 
--- | Run one host-facing stopped-audio manifest reload attempt.
+-- | Run one host-facing stopped-audio manifest reload attempt. No-op
+-- on the event channel: 'mrhcOnEvent' is overridden with
+-- 'noManifestReloadEvents' before delegating, so this entrypoint is
+-- silent regardless of what the caller supplied. Use
+-- 'reloadManifestStoppedAudioHostWithEvents' for the variant that
+-- honors the config's event sink.
 reloadManifestStoppedAudioHost
   :: ManifestReloadHostConfig target ingressIssue handle
   -> AuthoringManifestDoc
@@ -311,12 +334,36 @@ reloadManifestStoppedAudioHost
           (HostStoppedAudioReloadIssue
             (ManifestReloadHostIssue ingressIssue))
           ())
-reloadManifestStoppedAudioHost config doc catalog request =
-  orchestrateHostStoppedAudioReload
+reloadManifestStoppedAudioHost config =
+  reloadManifestStoppedAudioHostWithEvents
+    (config { mrhcOnEvent = noManifestReloadEvents })
+
+-- | Run one host-facing stopped-audio manifest reload attempt,
+-- emitting structured 'ManifestReloadEvent' transitions through
+-- the @mrhcOnEvent@ hook supplied in the config. The orchestrator
+-- emits the phase + resume-recovery events; this wrapper adds no
+-- strategy events (no strategy is in play for a single-phase
+-- reload).
+reloadManifestStoppedAudioHostWithEvents
+  :: ManifestReloadHostConfig target ingressIssue handle
+  -> AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> MR.ManifestReloadRequest
+  -> IO (Either
+          (HostStoppedAudioReloadIssue
+            (ManifestReloadHostIssue ingressIssue))
+          ())
+reloadManifestStoppedAudioHostWithEvents config doc catalog request =
+  orchestrateHostStoppedAudioReloadWithEvents
+    (mrhcOnEvent config)
     (manifestReloadHostOps config doc catalog)
     request
 
--- | Run one host-facing preserving manifest reload attempt.
+-- | Run one host-facing preserving manifest reload attempt. No-op
+-- on the event channel; see 'reloadManifestStoppedAudioHost' for
+-- the silencing rationale, and
+-- 'reloadManifestPreservingHostWithEvents' for the variant that
+-- emits structured events.
 reloadManifestPreservingHost
   :: ProducerId
   -> ManifestReloadHostConfig target ingressIssue handle
@@ -327,12 +374,37 @@ reloadManifestPreservingHost
           (HostPreservingReloadIssue
             (ManifestReloadHostIssue ingressIssue))
           ())
-reloadManifestPreservingHost producer config doc catalog request =
-  orchestrateHostPreservingReload
+reloadManifestPreservingHost producer config =
+  reloadManifestPreservingHostWithEvents
+    producer
+    (config { mrhcOnEvent = noManifestReloadEvents })
+
+-- | Run one host-facing preserving manifest reload attempt, emitting
+-- structured 'ManifestReloadEvent' transitions through the
+-- @mrhcOnEvent@ hook supplied in the config. The orchestrator emits
+-- the phase + resume-recovery events; this wrapper adds no strategy
+-- events.
+reloadManifestPreservingHostWithEvents
+  :: ProducerId
+  -> ManifestReloadHostConfig target ingressIssue handle
+  -> AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> MR.ManifestReloadRequest
+  -> IO (Either
+          (HostPreservingReloadIssue
+            (ManifestReloadHostIssue ingressIssue))
+          ())
+reloadManifestPreservingHostWithEvents producer config doc catalog request =
+  orchestrateHostPreservingReloadWithEvents
+    (mrhcOnEvent config)
     (manifestPreservingReloadHostOps producer config doc catalog)
     request
 
--- | Run one manifest reload through an explicit host strategy.
+-- | Run one manifest reload through an explicit host strategy. No-op
+-- on the event channel; see 'reloadManifestStoppedAudioHost' for
+-- the silencing rationale, and
+-- 'reloadManifestHostWithStrategyWithEvents' for the variant that
+-- emits structured events.
 --
 -- The producer id is used only by preserving-capable modes. In
 -- 'TryPreservingThenStoppedAudio', stopped-audio fallback is attempted
@@ -350,49 +422,131 @@ reloadManifestHostWithStrategy
             (ManifestReloadHostIssue ingressIssue))
           (ManifestReloadHostStrategyRan
             (ManifestReloadHostIssue ingressIssue)))
-reloadManifestHostWithStrategy producer strategy config doc catalog request =
+reloadManifestHostWithStrategy producer strategy config =
+  reloadManifestHostWithStrategyWithEvents
+    producer
+    strategy
+    (config { mrhcOnEvent = noManifestReloadEvents })
+
+-- | Run one manifest reload through an explicit host strategy,
+-- emitting structured 'ManifestReloadEvent' transitions through
+-- the @mrhcOnEvent@ hook supplied in the config.
+--
+-- The event timeline for one call is:
+--
+--   1. 'MreStrategyStarted' carrying the requested strategy.
+--   2. Preserving / stopped-audio phase events (and any resume
+--      recovery events) emitted by the orchestrator layer.
+--   3. For 'TryPreservingThenStoppedAudio', after a preserving
+--      rejection: 'MreFallbackAdmitted' if
+--      'preservingAllowsStoppedAudioFallback' returned 'True',
+--      'MreFallbackDeclined' otherwise. The fallback admission
+--      event fires immediately before the stopped-audio phase
+--      begins; the decline event fires when the strategy
+--      surfaces the preserving rejection without a fallback
+--      attempt.
+--   4. 'MreStrategySucceeded' carrying the
+--      'ManifestReloadHostStrategyRan' on success, or
+--      'MreStrategyFailed' carrying the
+--      'ManifestReloadHostStrategyIssue' on failure.
+reloadManifestHostWithStrategyWithEvents
+  :: ProducerId
+  -> ManifestReloadHostStrategy
+  -> ManifestReloadHostConfig target ingressIssue handle
+  -> AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> MR.ManifestReloadRequest
+  -> IO (Either
+          (ManifestReloadHostStrategyIssue
+            (ManifestReloadHostIssue ingressIssue))
+          (ManifestReloadHostStrategyRan
+            (ManifestReloadHostIssue ingressIssue)))
+reloadManifestHostWithStrategyWithEvents producer strategy config doc catalog request =
+  runReloadHostStrategyWithEvents
+    (mrhcOnEvent config)
+    strategy
+    (reloadManifestPreservingHostWithEvents producer config doc catalog request)
+    (reloadManifestStoppedAudioHostWithEvents config doc catalog request)
+
+-- | Pure-strategy core of 'reloadManifestHostWithStrategyWithEvents'
+-- exposed for focused event-order tests. Given an 'onEvent' sink,
+-- a 'ManifestReloadHostStrategy', and the two phase actions
+-- (preserving and stopped-audio) already bound against whatever
+-- ops/config the caller wants, runs the strategy and emits the
+-- 'MreStrategyStarted' / 'MreFallback{Admitted,Declined}' /
+-- 'MreStrategy{Succeeded,Failed}' transitions. Phase and resume
+-- events come from the supplied actions; this helper adds only the
+-- strategy-level frame.
+runReloadHostStrategyWithEvents
+  :: (ManifestReloadEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
+  -> ManifestReloadHostStrategy
+  -> IO (Either
+           (HostPreservingReloadIssue
+              (ManifestReloadHostIssue ingressIssue))
+           ())
+     -- ^ Preserving phase action. The orchestrator-level
+     -- 'MrePreservingReload*' / 'MreResumeOldIngress*' events are
+     -- expected to come from inside this action.
+  -> IO (Either
+           (HostStoppedAudioReloadIssue
+              (ManifestReloadHostIssue ingressIssue))
+           ())
+     -- ^ Stopped-audio phase action. The orchestrator-level
+     -- 'MreStoppedAudioReload*' / 'MreResumeOldIngress*' events
+     -- are expected to come from inside this action.
+  -> IO (Either
+          (ManifestReloadHostStrategyIssue
+            (ManifestReloadHostIssue ingressIssue))
+          (ManifestReloadHostStrategyRan
+            (ManifestReloadHostIssue ingressIssue)))
+runReloadHostStrategyWithEvents onEvent strategy runPreserving runStopped = do
+  onEvent (MreStrategyStarted strategy)
   case strategy of
     RequirePreserving -> do
       preserving <- runPreserving
-      pure $ case preserving of
+      case preserving of
         Left issue ->
-          Left (MrhsiPreservingFailed issue)
+          strategyFailed (MrhsiPreservingFailed issue)
         Right () ->
-          Right MrhsrPreserving
+          strategySucceeded MrhsrPreserving
     TryPreservingThenStoppedAudio -> do
       preserving <- runPreserving
       case preserving of
         Right () ->
-          pure (Right MrhsrPreserving)
+          strategySucceeded MrhsrPreserving
         Left preservingIssue
-          | preservingAllowsStoppedAudioFallback preservingIssue ->
+          | preservingAllowsStoppedAudioFallback preservingIssue -> do
+              onEvent (MreFallbackAdmitted preservingIssue)
               runFallback preservingIssue
-          | otherwise ->
-              pure (Left (MrhsiPreservingFailed preservingIssue))
+          | otherwise -> do
+              onEvent (MreFallbackDeclined preservingIssue)
+              strategyFailed (MrhsiPreservingFailed preservingIssue)
     StoppedAudioOnly -> do
       stopped <- runStopped
-      pure $ case stopped of
+      case stopped of
         Left issue ->
-          Left (MrhsiStoppedAudioFailed issue)
+          strategyFailed (MrhsiStoppedAudioFailed issue)
         Right () ->
-          Right MrhsrStoppedAudio
+          strategySucceeded MrhsrStoppedAudio
   where
-    runPreserving =
-      reloadManifestPreservingHost producer config doc catalog request
+    strategySucceeded ran = do
+      onEvent (MreStrategySucceeded ran)
+      pure (Right ran)
 
-    runStopped =
-      reloadManifestStoppedAudioHost config doc catalog request
+    strategyFailed issue = do
+      onEvent (MreStrategyFailed issue)
+      pure (Left issue)
 
     runFallback preservingIssue = do
       stopped <- runStopped
-      pure $ case stopped of
+      case stopped of
         Left stoppedIssue ->
-          Left
+          strategyFailed
             (MrhsiFallbackStoppedAudioFailed
               preservingIssue
               stoppedIssue)
         Right () ->
-          Right
+          strategySucceeded
             (MrhsrStoppedAudioAfterPreservingRejected preservingIssue)
 
 mapReloadIssue

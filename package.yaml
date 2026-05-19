@@ -234,6 +234,7 @@ tests:
       - MetaSonic.Spec.AppManifestOSCReloadE2E
       - MetaSonic.Spec.AppManifestReloadBinding
       - MetaSonic.Spec.AppManifestReloadCli
+      - MetaSonic.Spec.AppManifestReloadEvent
       - MetaSonic.Spec.AppManifestReloadHost
       - MetaSonic.Spec.AppManifestReloadIngress
       - MetaSonic.Spec.AppManifestReloadIngressTarget

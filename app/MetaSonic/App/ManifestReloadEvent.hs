@@ -31,6 +31,7 @@
 
 module MetaSonic.App.ManifestReloadEvent
   ( ManifestReloadEvent (..)
+  , noManifestReloadEvents
   ) where
 
 import           MetaSonic.App.ManifestReloadHost.Types
@@ -186,3 +187,12 @@ data ManifestReloadEvent issue
     -- will follow.
   | MreFallbackDeclined !(HostPreservingReloadIssue issue)
   deriving stock (Eq, Show)
+
+-- | A 'ManifestReloadEvent' callback that discards every event. The
+-- canonical default for the @mrhcOnEvent@ field on
+-- @ManifestReloadHostConfig@ and the @onEvent@ parameter of the
+-- @-WithEvents@ orchestration functions, used by the no-events
+-- entrypoints. Polymorphic in @issue@ so the same constant works at
+-- every instantiation.
+noManifestReloadEvents :: ManifestReloadEvent issue -> IO ()
+noManifestReloadEvents _ = pure ()

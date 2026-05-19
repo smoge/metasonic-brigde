@@ -47,6 +47,8 @@ import           MetaSonic.App.ManifestMIDIListener
                                                    ManifestMIDIListenerIssue (..))
 import           MetaSonic.App.ManifestReloadBinding
                                                   (ManifestUIVoiceSelection (..))
+import           MetaSonic.App.ManifestReloadEvent
+                                                  (noManifestReloadEvents)
 import           MetaSonic.App.ManifestReloadHost
                                                   (ManifestReloadHostConfig (..),
                                                    ManifestReloadHostStrategy (..),
@@ -322,6 +324,8 @@ appManifestMIDIReloadE2ETests =
                 audioOpts
             , mrhcOwnerOptions =
                 defaultSessionOwnerOptions
+            , mrhcOnEvent =
+                noManifestReloadEvents
             }
 
       outcome <-
@@ -439,6 +443,8 @@ appManifestMIDIReloadE2ETests =
                 audioOpts
             , mrhcOwnerOptions =
                 defaultSessionOwnerOptions
+            , mrhcOnEvent =
+                noManifestReloadEvents
             }
       outcome <-
         reloadManifestHostWithStrategy

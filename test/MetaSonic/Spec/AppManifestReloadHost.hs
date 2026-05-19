@@ -13,6 +13,7 @@ import           Test.Tasty
 import           Test.Tasty.HUnit
 
 import           MetaSonic.App.Demos
+import           MetaSonic.App.ManifestReloadEvent
 import           MetaSonic.App.ManifestReloadHost
 import           MetaSonic.App.ManifestReloadIngress
 import           MetaSonic.App.ManifestReloadOrchestration
@@ -803,6 +804,8 @@ fixtureConfig fixture = ManifestReloadHostConfig
       audioOptions
   , mrhcOwnerOptions =
       defaultSessionOwnerOptions
+  , mrhcOnEvent =
+      noManifestReloadEvents
   }
 
 startFixtureAudio

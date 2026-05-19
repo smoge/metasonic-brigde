@@ -19,6 +19,8 @@ import           MetaSonic.Spec.AppManifestOSCListener
 import           MetaSonic.Spec.AppManifestOSCReloadE2E
 import           MetaSonic.Spec.AppManifestReloadBinding
 import           MetaSonic.Spec.AppManifestReloadCli
+import           MetaSonic.Spec.AppManifestReloadEvent
+                                                  (appManifestReloadEventTests)
 import           MetaSonic.Spec.AppManifestReloadHost
 import           MetaSonic.Spec.AppManifestReloadIngress
 import           MetaSonic.Spec.AppManifestReloadIngressTarget
@@ -101,6 +103,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , appManifestOSCReloadE2ETests
   , appManifestReloadBindingTests
   , appManifestReloadCliTests
+  , appManifestReloadEventTests
   , appManifestReloadHostTests
   , appManifestReloadIngressTests
   , appManifestReloadIngressTargetTests

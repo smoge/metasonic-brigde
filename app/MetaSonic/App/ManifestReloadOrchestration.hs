@@ -27,9 +27,14 @@ module MetaSonic.App.ManifestReloadOrchestration
   , HostPreservingReloadFailure (..)
   , wireManifestReloadIngress
   , orchestrateHostStoppedAudioReload
+  , orchestrateHostStoppedAudioReloadWithEvents
   , orchestrateHostPreservingReload
+  , orchestrateHostPreservingReloadWithEvents
   ) where
 
+import           MetaSonic.App.ManifestReloadEvent
+                   (ManifestReloadEvent (..),
+                    noManifestReloadEvents)
 import           MetaSonic.App.ManifestReloadIngress
                    (ManifestReloadIngressManager,
                     closeManifestReloadIngress,
@@ -66,31 +71,69 @@ wireManifestReloadIngress manager oldTarget newTarget ops =
         openFreshManifestReloadIngress manager newTarget
     }
 
--- | Run the stopped-audio reload window.
---
--- On success, the requested plan is installed, audio has restarted, and
--- ingress has reopened. On failure, the returned constructor documents
--- the boundary that failed and the cleanup policy that was attempted.
---
--- Retryable failure paths (quiesce failure, retryable drain failure,
--- pre-dispose helper rejection) attempt 'hsaroResumeOldIngress' so the
--- host returns to a live state running the previous plan.
--- Resume-failure variants (@*ResumeFailed@) report when the resume
--- itself failed and the host is left with the old owner running but no
--- live ingress. Terminal drain failures do not attempt automatic
--- ingress resume.
+-- | Run the stopped-audio reload window. No-event wrapper that
+-- preserves the slice-zero signature; see
+-- 'orchestrateHostStoppedAudioReloadWithEvents' for documentation
+-- of the failure-and-cleanup contract and for the variant that
+-- emits structured events.
 orchestrateHostStoppedAudioReload
   :: HostStoppedAudioReloadOps request plan issue
   -> request
   -> IO (Either (HostStoppedAudioReloadIssue issue) ())
-orchestrateHostStoppedAudioReload ops request = do
+orchestrateHostStoppedAudioReload =
+  orchestrateHostStoppedAudioReloadWithEvents noManifestReloadEvents
+
+-- | Run the stopped-audio reload window, emitting structured
+-- 'ManifestReloadEvent' transitions through @onEvent@ at each stage
+-- boundary.
+--
+-- The lifecycle of one call is:
+--
+--   1. 'MreStoppedAudioReloadStarted'
+--   2. On success: 'MreStoppedAudioReloadCommitted'.
+--   3. On failure: 'MreStoppedAudioReloadRejected' carrying the
+--      structured 'HostStoppedAudioReloadIssue'. The same payload
+--      is also returned in the 'Left' branch.
+--
+-- Resume-old-ingress recovery (the @hsaroResumeOldIngress@ call
+-- that runs after a retryable quiesce / drain / pre-dispose
+-- rejection) is surfaced as its own event family:
+-- 'MreResumeOldIngressStarted', then either
+-- 'MreResumeOldIngressSucceeded' or 'MreResumeOldIngressFailed'.
+-- Operators get to see the recovery attempt in real time even
+-- though the @Hsari*ResumeFailed@ constructors only fold the
+-- result into the final return value.
+--
+-- Retryable failure paths (quiesce failure, retryable drain
+-- failure, pre-dispose helper rejection) attempt
+-- 'hsaroResumeOldIngress' so the host returns to a live state
+-- running the previous plan. Resume-failure variants
+-- (@*ResumeFailed@) report when the resume itself failed and the
+-- host is left with the old owner running but no live ingress.
+-- Terminal drain failures do not attempt automatic ingress
+-- resume.
+orchestrateHostStoppedAudioReloadWithEvents
+  :: (ManifestReloadEvent issue -> IO ())
+  -> HostStoppedAudioReloadOps request plan issue
+  -> request
+  -> IO (Either (HostStoppedAudioReloadIssue issue) ())
+orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
+  onEvent MreStoppedAudioReloadStarted
   prepared <- hsaroPreparePlan ops request
   case prepared of
     Left issue ->
-      pure (Left (HsariPlanRejected issue))
+      finish (HsariPlanRejected issue)
     Right plan ->
       quiesce plan
   where
+    finish issue = do
+      onEvent (MreStoppedAudioReloadRejected issue)
+      pure (Left issue)
+
+    finishOk = do
+      onEvent MreStoppedAudioReloadCommitted
+      pure (Right ())
+
     quiesce plan = do
       result <- hsaroQuiesceIngress ops
       case result of
@@ -111,7 +154,7 @@ orchestrateHostStoppedAudioReload ops request = do
             HsariDrainRejected
             HsariDrainRejectedResumeFailed
         Left (HsadfTerminal issue) ->
-          pure (Left (HsariDrainFailedTerminal issue))
+          finish (HsariDrainFailedTerminal issue)
         Right () ->
           stopOldAudio plan
 
@@ -119,7 +162,7 @@ orchestrateHostStoppedAudioReload ops request = do
       result <- hsaroStopOldAudio ops
       case result of
         Left issue ->
-          pure (Left (HsariStopOldAudioFailed issue))
+          finish (HsariStopOldAudioFailed issue)
         Right () ->
           reloadStopped plan
 
@@ -129,7 +172,7 @@ orchestrateHostStoppedAudioReload ops request = do
         Left (HsarfOldOwnerStillInstalled issue) ->
           restartOldAudio issue
         Left (HsarfNoOwner issue) ->
-          pure (Left (HsariReloadFailedNoOwner issue))
+          finish (HsariReloadFailedNoOwner issue)
         Right () ->
           startNewAudio
 
@@ -137,8 +180,8 @@ orchestrateHostStoppedAudioReload ops request = do
       result <- hsaroRestartOldAudio ops
       case result of
         Left restartIssue ->
-          pure
-            (Left (HsariReloadRejectedOldOwnerRestartFailed issue restartIssue))
+          finish
+            (HsariReloadRejectedOldOwnerRestartFailed issue restartIssue)
         Right () ->
           resumeAfterFailure
             issue
@@ -149,7 +192,7 @@ orchestrateHostStoppedAudioReload ops request = do
       result <- hsaroStartNewAudio ops
       case result of
         Left issue ->
-          pure (Left (HsariAudioRestartFailed issue))
+          finish (HsariAudioRestartFailed issue)
         Right () ->
           reopenIngress
 
@@ -158,40 +201,82 @@ orchestrateHostStoppedAudioReload ops request = do
       case result of
         Left issue -> do
           hsaroStopNewAudio ops
-          pure (Left (HsariListenerRestartFailed issue))
+          finish (HsariListenerRestartFailed issue)
         Right () ->
-          pure (Right ())
+          finishOk
 
     resumeAfterFailure originalIssue mkResumed mkResumeFailed = do
+      onEvent MreResumeOldIngressStarted
       resumeResult <- hsaroResumeOldIngress ops
-      pure $ case resumeResult of
-        Right () ->
-          Left (mkResumed originalIssue)
-        Left resumeIssue ->
-          Left (mkResumeFailed originalIssue resumeIssue)
+      case resumeResult of
+        Right () -> do
+          onEvent MreResumeOldIngressSucceeded
+          finish (mkResumed originalIssue)
+        Left resumeIssue -> do
+          onEvent (MreResumeOldIngressFailed resumeIssue)
+          finish (mkResumeFailed originalIssue resumeIssue)
 
--- | Run the live preserving reload window.
---
--- On success, the requested plan has been submitted through the
--- preserving hot-swap path, audio was never stopped, the same owner is
--- still live, service ingress has resumed, and concrete ingress has
--- reopened for the installed graph.
---
--- Retryable failure paths attempt service resume followed by old
--- ingress resume. Terminal drain/reload failures do not automatically
--- reopen ingress because the owner/service health is no longer known.
+-- | Run the live preserving reload window. No-event wrapper that
+-- preserves the slice-zero signature; see
+-- 'orchestrateHostPreservingReloadWithEvents' for documentation of
+-- the failure-and-cleanup contract and for the variant that emits
+-- structured events.
 orchestrateHostPreservingReload
   :: HostPreservingReloadOps request plan issue
   -> request
   -> IO (Either (HostPreservingReloadIssue issue) ())
-orchestrateHostPreservingReload ops request = do
+orchestrateHostPreservingReload =
+  orchestrateHostPreservingReloadWithEvents noManifestReloadEvents
+
+-- | Run the live preserving reload window, emitting structured
+-- 'ManifestReloadEvent' transitions through @onEvent@ at each stage
+-- boundary.
+--
+-- The lifecycle of one call is:
+--
+--   1. 'MrePreservingReloadStarted'
+--   2. On success: 'MrePreservingReloadCommitted'.
+--   3. On failure: 'MrePreservingReloadRejected' carrying the
+--      structured 'HostPreservingReloadIssue'. The same payload is
+--      also returned in the 'Left' branch.
+--
+-- Resume-old-ingress recovery is surfaced as its own event family;
+-- see 'orchestrateHostStoppedAudioReloadWithEvents' for the
+-- detailed semantics. The preserving variant uses the same
+-- recovery contract for retryable quiesce, drain, and
+-- reload-rejected-old-owner-still-installed paths.
+--
+-- On success, the requested plan has been submitted through the
+-- preserving hot-swap path, audio was never stopped, the same
+-- owner is still live, service ingress has resumed, and concrete
+-- ingress has reopened for the installed graph.
+--
+-- Retryable failure paths attempt service resume followed by old
+-- ingress resume. Terminal drain/reload failures do not
+-- automatically reopen ingress because the owner/service health is
+-- no longer known.
+orchestrateHostPreservingReloadWithEvents
+  :: (ManifestReloadEvent issue -> IO ())
+  -> HostPreservingReloadOps request plan issue
+  -> request
+  -> IO (Either (HostPreservingReloadIssue issue) ())
+orchestrateHostPreservingReloadWithEvents onEvent ops request = do
+  onEvent MrePreservingReloadStarted
   prepared <- hproPreparePlan ops request
   case prepared of
     Left issue ->
-      pure (Left (HpariPlanRejected issue))
+      finish (HpariPlanRejected issue)
     Right plan ->
       quiesce plan
   where
+    finish issue = do
+      onEvent (MrePreservingReloadRejected issue)
+      pure (Left issue)
+
+    finishOk = do
+      onEvent MrePreservingReloadCommitted
+      pure (Right ())
+
     quiesce plan = do
       result <- hproQuiesceIngress ops
       case result of
@@ -212,7 +297,7 @@ orchestrateHostPreservingReload ops request = do
             HpariDrainRejected
             HpariDrainRejectedResumeFailed
         Left (HprdfTerminal issue) ->
-          pure (Left (HpariDrainFailedTerminal issue))
+          finish (HpariDrainFailedTerminal issue)
         Right () ->
           reloadPreserving plan
 
@@ -225,24 +310,27 @@ orchestrateHostPreservingReload ops request = do
             HpariReloadRejected
             HpariReloadRejectedResumeFailed
         Left (HprfTerminal issue) ->
-          pure (Left (HpariReloadFailedTerminal issue))
+          finish (HpariReloadFailedTerminal issue)
         Right () ->
           reopenNewIngress
 
     reopenNewIngress = do
       hproResumeService ops
       result <- hproReopenIngress ops
-      pure $ case result of
+      case result of
         Left issue ->
-          Left (HpariIngressRestartFailed issue)
+          finish (HpariIngressRestartFailed issue)
         Right () ->
-          Right ()
+          finishOk
 
     resumeAfterFailure originalIssue mkResumed mkResumeFailed = do
       hproResumeService ops
+      onEvent MreResumeOldIngressStarted
       resumeResult <- hproResumeOldIngress ops
-      pure $ case resumeResult of
-        Right () ->
-          Left (mkResumed originalIssue)
-        Left resumeIssue ->
-          Left (mkResumeFailed originalIssue resumeIssue)
+      case resumeResult of
+        Right () -> do
+          onEvent MreResumeOldIngressSucceeded
+          finish (mkResumed originalIssue)
+        Left resumeIssue -> do
+          onEvent (MreResumeOldIngressFailed resumeIssue)
+          finish (mkResumeFailed originalIssue resumeIssue)

@@ -53,6 +53,8 @@ import           MetaSonic.App.ManifestReloadCli
                                                  readManifestReloadDocFile,
                                                  renderManifestReloadCliIssue,
                                                  renderManifestReloadHostStrategy)
+import           MetaSonic.App.ManifestReloadEvent
+                                                (noManifestReloadEvents)
 import           MetaSonic.App.ManifestReloadHost
                                                 (ManifestReloadHostConfig (..),
                                                  ManifestReloadHostIssue,
@@ -211,6 +213,8 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
                        liveAudioOptions
                    , mrhcOwnerOptions =
                        defaultSessionOwnerOptions
+                   , mrhcOnEvent =
+                       noManifestReloadEvents
                    }
              outcome <-
                reloadManifestHostWithStrategy
