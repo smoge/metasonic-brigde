@@ -218,6 +218,7 @@ tests:
       - MetaSonic.App.ManifestReloadOSCIngress
       - MetaSonic.App.ManifestReloadSupervisor
       - MetaSonic.App.ManifestReloadUIIngress
+      - MetaSonic.Spec.AppManifestLiveReloadDemoRender
       - MetaSonic.Spec.AppManifestMIDIIngressOps
       - MetaSonic.Spec.AppManifestMIDIListener
       - MetaSonic.Spec.AppManifestMIDIPortMIDI
