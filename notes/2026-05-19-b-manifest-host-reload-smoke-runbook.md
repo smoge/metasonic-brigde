@@ -114,16 +114,69 @@ Two ordering notes that occasionally surprise readers:
   the OS handed out, so it varies per run. The smoke's regression
   test asserts only that the port is non-zero after the swap.
 
+## Cross-confirmation: live audio + real OSC
+
+The host-reload smoke runs against a fake `SessionFanInAudioFFI`,
+so it pins the orchestrator output without ever opening PortAudio.
+The companion `--manifest-live-reload-demo` CLI is the live-audio
+counterpart and, as of `f595542` / `aca37ed`, shares this runbook's
+vocabulary character-for-character for `strategy outcome:`, the
+`reload events:` block, and the combined ingress snapshot.
+
+First end-to-end validation run, captured outside CI:
+
+```
+stack exec -- metasonic-bridge --manifest-live-reload-demo \
+    try-preserving manifest.json named-control named-control
+```
+
+What the run confirmed against real hardware that the
+fake-audio smoke cannot:
+
+- PortAudio start / wait / stop through `defaultSessionFanInAudioFFI`
+  on ALSA. The device-probing warnings printed during start were
+  harmless; the host reported `audio running: yes` and held it across
+  the reload.
+- Real UDP OSC ingress bound on `oscPort=7001`. Packets to
+  `/v0/vol/1` and `/v0/cutoff/1` were accepted before the reload;
+  `/v0/vol/1` was accepted again after the reload, proving the
+  swapped target's OSC projection was live.
+- The typed `reload events:` block rendered character-for-character
+  identically to the fake-audio smoke output above (same event order,
+  same kebab-case stage tags, same `preserving rejected (...)` /
+  `stopped-audio fallback installed` outcome line).
+- `active voices: 1` before and after the reload, with `Enter` ending
+  the demo in process exit 0 and no port held.
+
+Notable: a `named-control → named-control` self-reload still took the
+fallback path (`preserving rejected (reload-rejected (old owner still
+installed)), stopped-audio fallback installed`). The reason is the
+same as the fake-audio smoke's fallback: the live demo's auto-spawned
+initial voice carries no migration metadata the preserving command
+can land against, so the orchestrator collapses to stopped-audio
+fallback. A true `MrhsrPreserving` outcome on real audio still
+requires an OLD/NEW pair whose live controls share migration keys
+(the `hotSwapEdit` shape from the test suite) on a manifest that
+exposes them. The runbook does not pin a known-good output for that
+path because it has not been driven through the live demo manually
+yet; the fake-audio smoke covers the orchestrator branch.
+
 ## Things this runbook deliberately does not cover
 
 - Resource/allocation recovery event streaming. Still
   consumer-gated; see
   [ManifestReloadEvent Partial Coverage](2026-05-19-a-manifest-reload-event-partial-coverage.md)
   for the open work.
-- A device-backed live reload. That path is
-  `--manifest-live-reload-demo`, not this smoke; the smoke's fake
-  audio FFI is intentional.
+- The `--manifest-live-reload-demo` CLI's audio + interaction
+  surface beyond the cross-confirmation above. The demo's own
+  pre- / post-reload service snapshots, OSC accept log, and prompt
+  flow live in its source; this runbook captures only the
+  shared-vocabulary slice (strategy outcome + reload events +
+  ingress snapshot).
 - A real committed fixture. `manifest.json` at the repo root is a
   developer-local scratch input; replacing it with a versioned
   fixture is a separate decision (and would mean nailing down
   which authoring manifest is the canonical smoke input).
+- A known-good output for the true preserving path on real audio.
+  Would require a manifest exposing an OLD/NEW pair with shared
+  migration keys on a live control; not pinned yet.
