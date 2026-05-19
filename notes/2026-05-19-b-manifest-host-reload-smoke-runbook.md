@@ -36,10 +36,11 @@ projection. The two timelines:
 - `reload events:` is the `ManifestReloadEvent` stream emitted by
   the orchestrator at every strategy / phase / recovery / fallback
   boundary. Each bullet is one transition; rejected and admitted
-  lines render the outer wrapper plus the inner stage tag as
-  `Outer/Inner` so the failing stage and the actual cause both fit
-  on one line (e.g.
-  `HpariReloadRejected/MrhiPreservingReloadRejected`).
+  lines render the typed kebab-case stage tag of the failure
+  payload, with any nested cause inlined in the same line (e.g.
+  `reload-rejected (old owner still installed)`). The same
+  vocabulary is shared with the `--manifest-live-reload-demo`
+  timeline so operators read one surface across both CLIs.
 - `fake audio events:` is the captured call sequence against the
   fake audio FFI. On the try-preserving fallback path the
   stopped-audio phase stops old audio and starts new audio, so this
@@ -48,20 +49,23 @@ projection. The two timelines:
 
 `strategy result:` carries the same outcome as the final
 `strategy succeeded:` / `strategy failed:` line in the reload-events
-block, in the same compact two-level form (e.g.
-`success: MrhsrStoppedAudioAfterPreservingRejected/HpariReloadRejected`).
+block, in the same typed prose form (e.g.
+`success: preserving rejected (reload-rejected (old owner still installed)), stopped-audio fallback installed`).
 The redundancy is deliberate: it gives operators a single-line
 summary they can grep without scanning into the events block.
 
 ## Known-good fallback output (named-control, try-preserving)
 
-Run on 2026-05-19 against a single-demo `manifest.json` for
-`named-control`. The initial owner is whatever catalog entry the
-smoke can pick that is not the target — at this revision that is
-`send-return`. The preserving path is rejected at the reload stage
-(`HpariReloadRejected`) because the smoke's initial owner has no
-voices to migrate, the fallback is admitted, and the stopped-audio
-phase commits cleanly.
+Recorded against a single-demo `manifest.json` for `named-control`.
+The initial owner is whatever catalog entry the smoke can pick that
+is not the target — at this revision that is `send-return`. The
+preserving path is rejected at the reload stage
+(`reload-rejected (old owner still installed)`) because the smoke's
+initial owner has no voices to migrate, the fallback is admitted,
+and the stopped-audio phase commits cleanly. Captured on the
+post-`f595542` tree, after the smoke-vocabulary standardization
+slice retired the `Outer/Inner` show-parsed tags in favor of the
+typed prose form.
 
 ```
 Manifest host strategy reload smoke
@@ -71,7 +75,7 @@ Manifest host strategy reload smoke
   swap label: manifest:named-control
   fake audio lifecycle: yes (no PortAudio device opened)
   ...
-  strategy result: success: MrhsrStoppedAudioAfterPreservingRejected/HpariReloadRejected
+  strategy result: success: preserving rejected (reload-rejected (old owner still installed)), stopped-audio fallback installed
   post-reload fan-in:
     queue depth: 0
     owner status: SessionOwnerReady
@@ -85,11 +89,11 @@ Manifest host strategy reload smoke
     - preserving phase started
     - resume old ingress: started
     - resume old ingress: succeeded
-    - preserving phase rejected: HpariReloadRejected/MrhiPreservingReloadRejected
-    - fallback admitted: HpariReloadRejected/MrhiPreservingReloadRejected
+    - preserving phase rejected: reload-rejected (old owner still installed)
+    - fallback admitted: reload-rejected (old owner still installed)
     - stopped-audio phase started
     - stopped-audio phase committed
-    - strategy succeeded: MrhsrStoppedAudioAfterPreservingRejected/HpariReloadRejected
+    - strategy succeeded: preserving rejected (reload-rejected (old owner still installed)), stopped-audio fallback installed
   fake audio events:
     - start channels=2 device=-1
     - ready timeoutMs=100

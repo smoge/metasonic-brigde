@@ -1010,9 +1010,13 @@ renderSmokeAudioEvents events =
 
 -- | Compact operator-facing renderer for the smoke's captured
 -- 'ManifestReloadEvent' timeline. Each event becomes one bullet line
--- with a short label, plus the leading constructor tag of any payload
--- (extracted from 'show' so the line stays single-row even when the
--- inner failure carries nested issues).
+-- with a short label, plus the typed kebab-case stage tag of any
+-- payload (via 'renderHostPreservingIssueTag' /
+-- 'renderHostStoppedAudioIssueTag' / 'renderHostIssueTag' /
+-- 'renderStrategyRan' / 'renderStrategyFailure'). The same
+-- vocabulary is shared with the @strategy result:@ line and the
+-- @--manifest-live-reload-demo@'s timeline so operators read one
+-- surface across both CLIs.
 renderSmokeReloadEvents
   :: [ManifestReloadEvent
         (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)]
