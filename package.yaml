@@ -244,6 +244,7 @@ tests:
       - MetaSonic.Spec.Core.Dependencies
       - MetaSonic.Spec.Core.MigrationKeys
       - MetaSonic.Spec.Core.NodeIndex
+      - MetaSonic.Spec.Core.TemplateGraph
       - MetaSonic.Spec.CoreShared
       - MetaSonic.Spec.Driver
       - MetaSonic.Spec.FFI
