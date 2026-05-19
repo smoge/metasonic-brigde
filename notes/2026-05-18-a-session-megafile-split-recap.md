@@ -29,30 +29,30 @@ explicit helper module instead of hiding them in a parent megafile.
 `test/MetaSonic/Spec/Session.hs` has been deleted. The final
 registered `MetaSonic.Spec.Session.*` test surface is:
 
-| Module                                             | Group label                                             | Cases |
-|----------------------------------------------------|---------------------------------------------------------|-------|
-| `MetaSonic.Spec.Session.Command`                   | `Session Prep A: command vocabulary`                    | 5     |
-| `MetaSonic.Spec.Session.Resolve`                   | `Session Prep A: resolve rebuild`                       | 5     |
-| `MetaSonic.Spec.Session.Report`                    | `Session Prep A: lifecycle reports`                     | 4     |
-| `MetaSonic.Spec.Session.State`                     | `Session Prep B/C: admission, commits, and handshake`   | 20    |
-| `MetaSonic.Spec.Session.Step`                      | `Session Prep D: runtime adapter shell`                 | 9     |
-| `MetaSonic.Spec.Session.ControlTarget`             | `Session Prep E: control target resolver`               | 5     |
-| `MetaSonic.Spec.Session.RTGraphAdapterInstall`     | `Session Prep E: RTGraph adapter install`               | 11    |
-| `MetaSonic.Spec.Session.RTGraphAdapterHotSwap`     | `Session Prep E: RTGraph adapter hot-swap`              | 9     |
-| `MetaSonic.Spec.Session.Owner`                     | `Session Prep F: runtime owner`                         | 9     |
-| `MetaSonic.Spec.Session.Queue`                     | `Session Prep G: producer queue`                        | 8     |
-| `MetaSonic.Spec.Session.Arbitration`               | `Session producer arbitration policy`                   | 6     |
-| `MetaSonic.Spec.Session.ArbitrationGateway`        | `Session producer arbitration gateway`                  | 4     |
-| `MetaSonic.Spec.Session.PatternProducer`           | `Session Prep H: Pattern producer`                      | 14    |
-| `MetaSonic.Spec.Session.Runner`                    | `Session Prep I: scripted runner`                       | 4     |
-| `MetaSonic.Spec.Session.Host`                      | `Session Prep J: Pattern session host`                  | 4     |
-| `MetaSonic.Spec.Session.PreservingHotSwap`         | `Session Prep L: preserving hot-swap semantics`         | 4     |
-| `MetaSonic.Spec.Session.LiveHotSwap`               | `Session Prep O: live preserving hot-swap orchestration` | 8    |
-| `MetaSonic.Spec.Session.FanInHost`                 | `Session Prep P: producer fan-in host`                  | 5     |
-| `MetaSonic.Spec.Session.FanInService`              | `Session fan-in drain service`                          | 11    |
-| `MetaSonic.Spec.Session.UIProducer`                | `Session UI producer adapter`                           | 9     |
-| `MetaSonic.Spec.Session.OSCProducer`               | `Session OSC producer adapter`                          | 9     |
-| `MetaSonic.Spec.Session.OSCListener`               | `Session OSC listener adapter`                          | 8     |
+| Module                                          | Group label                                             | Cases |
+|-------------------------------------------------|---------------------------------------------------------|-------|
+| `MetaSonic.Spec.Session.Command`                | `Session Prep A: command vocabulary`                    | 5     |
+| `MetaSonic.Spec.Session.Resolve`                | `Session Prep A: resolve rebuild`                       | 5     |
+| `MetaSonic.Spec.Session.Report`                 | `Session Prep A: lifecycle reports`                     | 4     |
+| `MetaSonic.Spec.Session.State`                  | `Session Prep B/C: admission, commits, and handshake`   | 20    |
+| `MetaSonic.Spec.Session.Step`                   | `Session Prep D: runtime adapter shell`                 | 9     |
+| `MetaSonic.Spec.Session.ControlTarget`          | `Session Prep E: control target resolver`               | 5     |
+| `MetaSonic.Spec.Session.RTGraphAdapterInstall`  | `Session Prep E: RTGraph adapter install`               | 11    |
+| `MetaSonic.Spec.Session.RTGraphAdapterHotSwap`  | `Session Prep E: RTGraph adapter hot-swap`              | 9     |
+| `MetaSonic.Spec.Session.Owner`                  | `Session Prep F: runtime owner`                         | 9     |
+| `MetaSonic.Spec.Session.Queue`                  | `Session Prep G: producer queue`                        | 8     |
+| `MetaSonic.Spec.Session.Arbitration`            | `Session producer arbitration policy`                   | 6     |
+| `MetaSonic.Spec.Session.ArbitrationGateway`     | `Session producer arbitration gateway`                  | 4     |
+| `MetaSonic.Spec.Session.PatternProducer`        | `Session Prep H: Pattern producer`                      | 14    |
+| `MetaSonic.Spec.Session.Runner`                 | `Session Prep I: scripted runner`                       | 4     |
+| `MetaSonic.Spec.Session.Host`                   | `Session Prep J: Pattern session host`                  | 4     |
+| `MetaSonic.Spec.Session.PreservingHotSwap`      | `Session Prep L: preserving hot-swap semantics`         | 4     |
+| `MetaSonic.Spec.Session.LiveHotSwap`            | `Session Prep O: live preserving hot-swap orchestration` | 8     |
+| `MetaSonic.Spec.Session.FanInHost`              | `Session Prep P: producer fan-in host`                  | 5     |
+| `MetaSonic.Spec.Session.FanInService`           | `Session fan-in drain service`                          | 11    |
+| `MetaSonic.Spec.Session.UIProducer`             | `Session UI producer adapter`                           | 9     |
+| `MetaSonic.Spec.Session.OSCProducer`            | `Session OSC producer adapter`                          | 9     |
+| `MetaSonic.Spec.Session.OSCListener`            | `Session OSC listener adapter`                          | 8     |
 
 The table totals 171 Session cases. The full suite remains at
 1141 tests; no test was deliberately added or removed by the
