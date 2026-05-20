@@ -22,17 +22,24 @@
 -- 'realStoppedAudioInWindowReload' is the production wiring for
 -- the in-window slot — it drives
 -- 'orchestrateHostStoppedAudioReloadWithEvents' with
--- @hsaroPreparePlan = const (pure (Right plan))@ so the
--- supervisor's plan is the source of truth at the seam. This
--- helper is **not** directly exercised by the tests in this
--- module: every test overrides @sahsoInWindowReload@ with a
--- fake to pin specific failure variants without staging a real
--- 'SessionFanInService'. The next slice (real strategy wiring)
--- owes an integration test that fails if
--- 'realStoppedAudioInWindowReload' ever re-enters catalog / doc
--- planning instead of taking the plan-native short-circuit
--- (i.e., that a forced doc/catalog/policy drift does not
--- influence which plan gets installed).
+-- @hsaroPreparePlan = const (pure (Right requested))@ so the
+-- supervisor's plan is the source of truth at the seam, and
+-- re-projects both @mrhcOldIngressTarget@ and
+-- @mrhcNewIngressTarget@ from the supplied @(fallback,
+-- requested)@ plans so target selection cannot drift across a
+-- long reload sequence.
+--
+-- The factory-composition tests below override
+-- @sahsoInWindowReload@ with a fake so they can pin specific
+-- 'HostStoppedAudioReloadIssue' variants without staging real
+-- session-layer state. The separate 'realInWindowReloadTests'
+-- group exercises 'realStoppedAudioInWindowReload' directly
+-- end-to-end: it opens a real (empty-graph) 'SessionFanInService'
+-- via 'realStoppedAudioHostStackOps' and asserts the supplied
+-- plan is installed even though the helper passes empty
+-- doc / catalog through 'manifestReloadHostOps' — proof that the
+-- @hsaroPreparePlan@ override is the only thing keeping
+-- planning from being re-derived from drifted inputs.
 --
 -- See notes/2026-05-14-k-host-reload-supervisor.md \xa7219 slice 4.
 module MetaSonic.Spec.AppManifestReloadHostStack
@@ -526,7 +533,7 @@ realProductionHelperTests :: TestTree
 realProductionHelperTests =
   testGroup "realStoppedAudioHostStackOps partial-cleanup paths"
   [ testCase
-      "successful open returns Right and close is a no-op on the stack"
+      "successful open returns Right; close releases the service and runs one ingress close"
       $ do
       ingressCloseCalls <- newIORef (0 :: Int)
       let inputs = mkProductionInputs

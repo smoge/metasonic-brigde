@@ -1,4 +1,5 @@
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE RankNTypes         #-}
 {-# LANGUAGE TypeApplications   #-}
 
 -- |
@@ -61,9 +62,14 @@ module MetaSonic.App.ManifestReloadHostStack
   ) where
 
 import           Control.Exception                           (SomeException,
-                                                              try)
+                                                              mask,
+                                                              onException,
+                                                              throwIO, try)
 import           Control.Monad                               (void)
 import           Data.Bifunctor                              (first)
+import           Data.Foldable                               (for_)
+import           Data.Maybe                                  (catMaybes,
+                                                              listToMaybe)
 import           Data.Text                                   (Text)
 import qualified Data.Text                                   as T
 
@@ -439,6 +445,26 @@ realStoppedAudioHostStackOps inputs = StoppedAudioHostStackOps
 
 
 -- | Forward open path for 'realStoppedAudioHostStackOps'.
+--
+-- Exception-safety: every acquired resource is wrapped in an
+-- 'onException' handler before the next step runs, so an
+-- exception (sync or async) from a downstream allocation closes
+-- every still-owned upstream resource. The outer 'mask' is the
+-- gate that makes the post-acquisition / pre-handler windows
+-- unobservable to async exceptions — without it, an async
+-- exception landing between @openSessionFanInServiceHooks@
+-- returning @Right service@ and the outer @onException@ being
+-- installed would leak the service. 'restore' is used around the
+-- blocking IO calls so the caller's masking state is preserved
+-- inside the long-running operations themselves.
+--
+-- Note: the small window between @mrioOpenIngress@ returning
+-- @Right initialHandle@ and @newManifestReloadIngressManager@
+-- wrapping it can still drop the raw handle on async interrupt
+-- (the ops bundle exposes no standalone handle-close primitive,
+-- only the manager-level close). This matches the existing demo
+-- path's contract; closing that gap would require extending
+-- 'ManifestReloadIngressOps' with a raw-handle close.
 realOpen
   :: Show ingressIssue
   => RealStoppedAudioHostStackInputs ingressIssue handle
@@ -446,47 +472,69 @@ realOpen
   -> IO (Either
           (StoppedAudioHostStackOpenIssue ingressIssue)
           (StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle))
-realOpen inputs plan =
+realOpen inputs plan = mask $ \restore ->
   case manifestReloadIngressTargetFromPlan
          (rsahsiIngressTargetPolicy inputs)
          plan of
     Left projIssue ->
       pure (Left (SahsoiIngressTargetProjectionFailed projIssue))
     Right target -> do
-      serviceResult <- openSessionFanInServiceHooks
+      serviceResult <- restore $ openSessionFanInServiceHooks
         (rsahsiServiceHooks inputs)
         (MR.mrlpTemplateGraph plan)
         (rsahsiServiceOptions inputs)
       case serviceResult of
         Left issue ->
           pure (Left (SahsoiServiceSetupFailed issue))
-        Right service -> do
-          let ingressOps = rsahsiBuildIngressOps
-                inputs
-                (sessionFanInServiceHost service)
-          ingressResult <- mrioOpenIngress ingressOps target
-          case ingressResult of
-            Left issue ->
-              rollbackIngressOpen
-                (SahsoiIngressOpenFailed issue)
-                service
-            Right initialHandle -> do
-              ingressManager <- newManifestReloadIngressManager
-                ingressOps
-                target
-                initialHandle
-              audioResult <- startSessionFanInHostAudioWith
-                (rsahsiAudioFFI inputs)
-                (sessionFanInServiceHost service)
-                (rsahsiAudioOptions inputs)
-              case audioResult of
-                Left issue ->
-                  rollbackAudioStart
-                    (SahsoiAudioStartFailed issue)
-                    service
-                    ingressManager
-                Right () ->
-                  pure $ Right (mkStack inputs target service ingressManager)
+        Right service ->
+          openIngressAndStartAudio restore inputs target service
+            `onException` closeSessionFanInService service
+
+
+-- | Inner half of 'realOpen'. Runs with the outer 'mask' active so
+-- the @onException@ handlers it installs cannot race against an
+-- async exception landing after a resource is acquired but
+-- before the handler is in scope.
+openIngressAndStartAudio
+  :: Show ingressIssue
+  => (forall a. IO a -> IO a)
+  -> RealStoppedAudioHostStackInputs ingressIssue handle
+  -> ManifestReloadIngressTarget
+  -> SessionFanInService
+  -> IO (Either
+          (StoppedAudioHostStackOpenIssue ingressIssue)
+          (StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle))
+openIngressAndStartAudio restore inputs target service = do
+  let ingressOps = rsahsiBuildIngressOps
+        inputs
+        (sessionFanInServiceHost service)
+  ingressResult <- restore $ mrioOpenIngress ingressOps target
+  case ingressResult of
+    Left issue ->
+      rollbackIngressOpen
+        (SahsoiIngressOpenFailed issue)
+        service
+    Right initialHandle -> do
+      ingressManager <- newManifestReloadIngressManager
+        ingressOps
+        target
+        initialHandle
+      let withIngressCleanup body =
+            body
+              `onException` void (closeManifestReloadIngress ingressManager)
+      withIngressCleanup $ do
+        audioResult <- restore $ startSessionFanInHostAudioWith
+          (rsahsiAudioFFI inputs)
+          (sessionFanInServiceHost service)
+          (rsahsiAudioOptions inputs)
+        case audioResult of
+          Left issue ->
+            rollbackAudioStart
+              (SahsoiAudioStartFailed issue)
+              service
+              ingressManager
+          Right () ->
+            pure $ Right (mkStack inputs target service ingressManager)
 
 
 -- | Build the 'StoppedAudioHostStack' value from a fully-acquired
@@ -531,9 +579,15 @@ rollbackIngressOpen primary service = do
       primary
 
 
--- | Rollback path when audio start fails. Both ingress manager and
--- service must be closed; ingress manager close is itself Either,
--- so a 'Left' from it surfaces through the cleanup-display.
+-- | Rollback path when audio start fails. Both ingress manager
+-- and service must be closed; both are attempted regardless of
+-- whether an earlier step failed, so a throw from
+-- 'closeManifestReloadIngress' cannot leave the service open.
+-- The strongest / first diagnostic is surfaced through
+-- 'SahsoiPartialCleanupFailed'. Priority order: ingress-close
+-- threw, then ingress-close returned 'Left', then service-close
+-- threw. If both succeeded, the original 'primary' issue is
+-- returned untouched.
 rollbackAudioStart
   :: Show ingressIssue
   => StoppedAudioHostStackOpenIssue ingressIssue
@@ -541,40 +595,56 @@ rollbackAudioStart
   -> ManifestReloadIngressManager ManifestReloadIngressTarget ingressIssue handle
   -> IO (Either (StoppedAudioHostStackOpenIssue ingressIssue) a)
 rollbackAudioStart primary service ingressManager = do
-  result <- try @SomeException $ do
-    ingressClosed <- closeManifestReloadIngress ingressManager
-    closeSessionFanInService service
-    pure ingressClosed
-  pure $ Left $ case result of
-    Left ex ->
+  ingressResult <- try @SomeException
+    (closeManifestReloadIngress ingressManager)
+  serviceResult <- try @SomeException
+    (closeSessionFanInService service)
+  pure $ Left $ case (ingressResult, serviceResult) of
+    (Right (Right ()), Right ()) ->
+      primary
+    (Left ex, _) ->
       SahsoiPartialCleanupFailed
         primary
-        (T.pack ("rollback threw: " <> show ex))
-    Right (Left ingressErr) ->
+        (T.pack ("ingress close threw: " <> show ex))
+    (Right (Left ingressErr), _) ->
       SahsoiPartialCleanupFailed
         primary
         (T.pack ("ingress close: " <> show ingressErr))
-    Right (Right ()) ->
-      primary
+    (_, Left ex) ->
+      SahsoiPartialCleanupFailed
+        primary
+        (T.pack ("service close threw: " <> show ex))
 
 
 -- | Forward close path for 'realStoppedAudioHostStackOps'.
 --
--- Reverse order: stop audio → close ingress → close service. Each
--- step's failure is best-effort (the supervisor adapter wraps the
--- whole close in @mask_@); a partial close is acceptable because
--- the supervisor will not reuse the stack. The audio-stop +
--- ingress-close 'Left' values are discarded here; if a future
--- contract needs to surface them, do so by extending the close
--- helper, not by adding a clean-close 'Either' channel that
--- existing callers would need to thread through.
+-- Reverse order: stop audio → close ingress → close service.
+-- Every step is attempted regardless of whether an earlier step
+-- threw. The audio-stop + ingress-close 'Left' return values are
+-- still swallowed (the adapter has no Either channel to consume
+-- them), but exceptions are captured per step so a throw from
+-- one step cannot skip the later ones. After all steps run, the
+-- first exception encountered is re-thrown — the supervisor
+-- adapter wraps the close in @mask_@ and treats the throw as a
+-- terminal cleanup failure, which matches the §238 #9 "close
+-- before propagation" invariant.
 realClose
   :: StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle
   -> IO ()
 realClose stack = do
   let config = sahsConfig stack
-  _ <- stopSessionFanInHostAudioWith
-         (mrhcAudioFFI config)
-         (sessionFanInServiceHost (mrhcService config))
-  void (closeManifestReloadIngress (mrhcIngressManager config))
-  closeSessionFanInService (mrhcService config)
+      service = mrhcService config
+  audioEx <- attemptUnit $ void $ stopSessionFanInHostAudioWith
+    (mrhcAudioFFI config)
+    (sessionFanInServiceHost service)
+  ingressEx <- attemptUnit $ void $
+    closeManifestReloadIngress (mrhcIngressManager config)
+  serviceEx <- attemptUnit $ closeSessionFanInService service
+  for_ (listToMaybe (catMaybes [audioEx, ingressEx, serviceEx])) throwIO
+  where
+    attemptUnit :: IO () -> IO (Maybe SomeException)
+    attemptUnit action = do
+      r <- try @SomeException action
+      pure $ case r of
+        Left ex  -> Just ex
+        Right () -> Nothing
