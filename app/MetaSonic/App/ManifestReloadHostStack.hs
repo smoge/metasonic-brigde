@@ -59,6 +59,9 @@ module MetaSonic.App.ManifestReloadHostStack
   , realStoppedAudioInWindowReload
   , RealStoppedAudioHostStackInputs (..)
   , realStoppedAudioHostStackOps
+    -- * Supervised stopped-audio entry
+  , SupervisedStoppedAudioReloadResult (..)
+  , runSupervisedStoppedAudioReload
   ) where
 
 import           Control.Exception                           (SomeException,
@@ -89,8 +92,11 @@ import           MetaSonic.App.ManifestReloadOrchestration   (orchestrateHostSto
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                                              (HostStoppedAudioReloadIssue (..),
                                                               HostStoppedAudioReloadOps (..))
+import           MetaSonic.App.ManifestReloadSupervisor      (SupervisedReloadOutcome (..),
+                                                              reloadSupervised)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
-                                                             (HostStackFactory (..))
+                                                             (HostStackFactory (..),
+                                                              withHostStackSupervisorAdapter)
 import           MetaSonic.Authoring.Manifest                (AuthoringManifestDoc (..),
                                                               manifestSchemaVersion)
 import           MetaSonic.Session.FanIn                     (SessionFanInAudioFFI,
@@ -648,3 +654,82 @@ realClose stack = do
       pure $ case r of
         Left ex  -> Just ex
         Right () -> Nothing
+
+
+-- | Outcome of one supervised stopped-audio manifest reload
+-- attempt.
+--
+-- This is a narrow projection of the supervisor's generic
+-- 'SupervisedReloadOutcome' specialized to the
+-- 'StoppedAudioHostStackIssue' error surface. Keeping the type
+-- narrow at the CLI seam preserves the rebuild cause through
+-- the result rather than folding it into a one-shot
+-- @Either ManifestReloadHostStrategyIssue ()@ shape that would
+-- discard which half (in-window vs rebuild) drove the outcome.
+data SupervisedStoppedAudioReloadResult ingressIssue
+  = SsasrrCommitted
+    -- ^ Requested plan installed end-to-end through the
+    -- in-window path; no rebuild needed.
+  | SsasrrRebuildRecovered
+      !(StoppedAudioHostStackIssue ingressIssue)
+    -- ^ Requested plan's in-window reload failed terminally;
+    -- the rebuild from the fallback plan succeeded. The host
+    -- is now running the fallback plan again. Payload is the
+    -- in-window failure that triggered recovery.
+  | SsasrrEscalated
+      !(StoppedAudioHostStackIssue ingressIssue)
+      !(StoppedAudioHostStackIssue ingressIssue)
+    -- ^ Both the in-window reload and the rebuild from the
+    -- fallback plan failed. The host has no live stack.
+    -- Payload is (in-window failure, rebuild failure) in that
+    -- order so the supervisor's escalation diagnostics are
+    -- preserved through the result.
+  deriving stock (Eq, Show)
+
+
+-- | Drive one supervised stopped-audio manifest reload attempt
+-- end-to-end against live session-layer primitives.
+--
+-- Owns the full stack lifecycle: opens the initial stack via
+-- 'mkStoppedAudioHostStackFactory'+'realStoppedAudioHostStackOps'
+-- against the supplied @fallback@ plan, brackets it under
+-- 'withHostStackSupervisorAdapter', runs 'reloadSupervised'
+-- against the @(fallback, requested)@ plan pair, and closes
+-- the stack on exit (the adapter's bracket-style cleanup runs
+-- whichever stack is active when the continuation exits, even
+-- on async exception).
+--
+-- The initial stack is opened against the @fallback@ plan
+-- because the supervisor's contract is that the supplied
+-- fallback is the "currently-running plan" at reload entry. If
+-- the initial open itself fails (projection-issue, service
+-- setup, ingress open, audio start, or a partial-cleanup
+-- rollback), the failure surfaces as 'Left' before the
+-- supervisor even runs — wrapped in
+-- 'StoppedAudioHostStackIssue' for shape uniformity with the
+-- supervised path's rebuild issues.
+runSupervisedStoppedAudioReload
+  :: Show ingressIssue
+  => RealStoppedAudioHostStackInputs ingressIssue handle
+  -> MR.ManifestReloadPlan  -- ^ fallback (currently-running plan)
+  -> MR.ManifestReloadPlan  -- ^ requested (new plan)
+  -> IO (Either
+          (StoppedAudioHostStackIssue ingressIssue)
+          (SupervisedStoppedAudioReloadResult ingressIssue))
+runSupervisedStoppedAudioReload inputs fallback requested = do
+  let ops     = realStoppedAudioHostStackOps inputs
+      factory = mkStoppedAudioHostStackFactory ops
+  openResult <- hsfOpenStack factory fallback
+  case openResult of
+    Left issue ->
+      pure (Left issue)
+    Right initialStack -> do
+      outcome <- withHostStackSupervisorAdapter factory initialStack $
+        \supOps -> reloadSupervised supOps fallback requested
+      pure $ Right $ case outcome of
+        SupervisedReloadCommitted ->
+          SsasrrCommitted
+        SupervisedReloadRejectedRecovered e ->
+          SsasrrRebuildRecovered e
+        SupervisedReloadEscalated e1 e2 ->
+          SsasrrEscalated e1 e2

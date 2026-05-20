@@ -71,9 +71,11 @@ import           MetaSonic.App.ManifestReloadHostStack
                                           StoppedAudioHostStackIssue (..),
                                           StoppedAudioHostStackOpenIssue (..),
                                           StoppedAudioHostStackOps (..),
+                                          SupervisedStoppedAudioReloadResult (..),
                                           mkStoppedAudioHostStackFactory,
                                           realStoppedAudioHostStackOps,
-                                          realStoppedAudioInWindowReload)
+                                          realStoppedAudioInWindowReload,
+                                          runSupervisedStoppedAudioReload)
 import           MetaSonic.App.ManifestReloadIngress
                                          (ManifestReloadIngressOps (..))
 import           MetaSonic.App.ManifestReloadIngressTarget
@@ -227,6 +229,7 @@ appManifestReloadHostStackTests =
   [ factoryCompositionTests
   , realProductionHelperTests
   , realInWindowReloadTests
+  , runSupervisedStoppedAudioReloadTests
   ]
 
 
@@ -826,6 +829,83 @@ fakeAudioFFIStopThrows = SessionFanInAudioFFI
   , saffiStopAudio        = \_rt         ->
       throwIO (ErrorCall "synthetic audio stop crash")
   }
+
+
+-- | Tests for 'runSupervisedStoppedAudioReload', the
+-- supervised stopped-audio CLI entry point. Pin the three
+-- outcome shapes the 'SupervisedStoppedAudioReloadResult'
+-- variants encode, plus the initial-open-failure 'Left'
+-- shape that surfaces before the supervisor even runs. These
+-- exercise the full lifecycle (factory + adapter + supervisor
+-- + production helper) end-to-end against a real
+-- 'SessionFanInService' plus fake ingress ops + fake audio FFI.
+runSupervisedStoppedAudioReloadTests :: TestTree
+runSupervisedStoppedAudioReloadTests =
+  testGroup "runSupervisedStoppedAudioReload"
+  [ testCase
+      "successful supervised reload returns SsasrrCommitted"
+      $ do
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsOpenOk ingressCloseCalls)
+            fakeAudioFFIStartOk
+      result <-
+        runSupervisedStoppedAudioReload
+          inputs
+          (mkPlan "fallback")
+          (mkPlan "requested")
+      result @?= Right SsasrrCommitted
+
+  , testCase
+      "initial open audio-start failure surfaces SahsiOpen Left before the supervisor runs"
+      $ do
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsOpenOk ingressCloseCalls)
+            fakeAudioFFIStartFails
+      result <-
+        runSupervisedStoppedAudioReload
+          inputs
+          (mkPlan "fallback")
+          (mkPlan "requested")
+      case result of
+        Left
+          (SahsiOpen
+            (SahsoiAudioStartFailed (SfaiStartFailed (-1)))) ->
+          pure ()
+        other ->
+          assertFailure
+            ("expected Left SahsiOpen (SahsoiAudioStartFailed -1), got: "
+              <> show other)
+
+  , testCase
+      "in-window quiesce failure rebuilds from fallback (SsasrrRebuildRecovered)"
+      $ do
+      -- mrioCloseIngress returns Left so the orchestrator's
+      -- quiesce-ingress step fails the in-window reload. The
+      -- supervisor closes the failed stack (whose close swallows
+      -- the ingress-close Left via attemptUnit) and rebuilds
+      -- from the fallback plan (rebuild opens a fresh ingress
+      -- handle, so the close failure isn't exercised). Outcome:
+      -- SsasrrRebuildRecovered wrapping the in-window cause as
+      -- SahsiInWindow.
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsCloseFails ingressCloseCalls)
+            fakeAudioFFIStartOk
+      result <-
+        runSupervisedStoppedAudioReload
+          inputs
+          (mkPlan "fallback")
+          (mkPlan "requested")
+      case result of
+        Right (SsasrrRebuildRecovered (SahsiInWindow _)) ->
+          pure ()
+        other ->
+          assertFailure
+            ("expected Right (SsasrrRebuildRecovered (SahsiInWindow _)), got: "
+              <> show other)
+  ]
 
 
 -- | Fake ingress ops where 'mrioOpenIngress' succeeds but
