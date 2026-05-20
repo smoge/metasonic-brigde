@@ -696,11 +696,15 @@ runSupervisedTryPreservingLiveReload listenerCfg oldPlan newPlan oldTarget _newT
         , rsahsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
         }
-      producer = ProducerId
-        { producerKind = ProducerOSC
-        , producerName = T.pack "manifest-live-reload-demo"
-        }
-      ops     = realTryPreservingHostStackOps producer inputs
+      -- Reuse the same producer identity the direct path passes
+      -- to 'reloadManifestHostWithStrategyWithEvents' so the
+      -- preserving hot-swap's enqueue is admitted under the same
+      -- producer-kind regardless of which route is selected.
+      -- Today plans use 'FifoOnly' so this is mostly diagnostic,
+      -- but it matters once manifest arbitration grows beyond
+      -- FIFO; a route-flip should not silently change which
+      -- producer enqueued the hot-swap command.
+      ops     = realTryPreservingHostStackOps liveReloadProducer inputs
       factory = mkTryPreservingHostStackFactory ops
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory oldPlan)

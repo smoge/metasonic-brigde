@@ -449,17 +449,19 @@ remaining open polish in this arc) is a separate question.
   [ManifestReloadEvent Partial Coverage](2026-05-19-a-manifest-reload-event-partial-coverage.md)
   for the open work.
 - The `--manifest-live-reload-demo` CLI's audio + interaction
-  surface for the preserving strategies (`require-preserving` /
-  `try-preserving`). The demo's own pre- / post-reload service
-  snapshots, OSC accept log, and prompt flow live in its
-  source; for the preserving paths this runbook captures only
-  the shared-vocabulary slice (strategy outcome + reload events
-  + ingress snapshot). The supervised stopped-audio path IS
-  recorded end-to-end (snapshots + OSC accept log + prompt
-  flow) in the "Supervised `StoppedAudioOnly` live-reload
-  demo (slice 2)" section below; that's the route under active
-  validation. Preserving will move under the same coverage
-  shape only once the migration slice opens.
+  surface for `require-preserving`. The demo's own pre- /
+  post-reload service snapshots, OSC accept log, and prompt
+  flow live in its source; for `require-preserving` this
+  runbook captures only the shared-vocabulary slice (strategy
+  outcome + reload events + ingress snapshot). The supervised
+  `StoppedAudioOnly` and `TryPreservingThenStoppedAudio` paths
+  ARE recorded end-to-end (operator wrapper marker checks +
+  snapshots + OSC accept log + prompt flow) in the
+  "Supervised `StoppedAudioOnly` live-reload demo (slice 2)"
+  and "Supervised `TryPreservingThenStoppedAudio` live-reload
+  demo (slice 5)" sections below — both routes are under
+  active validation. `require-preserving` will move under the
+  same coverage shape only once the migration slice opens.
 - Fixtures for non-preserving smoke targets. The preserving live-
   reload path has a committed fixture at
   [examples/manifests/preserve-cutoff.json](../examples/manifests/preserve-cutoff.json),
@@ -527,10 +529,15 @@ The output proves the supervised route is live (not the direct
 path) by these markers:
 
 - `  strategy: stopped-audio-only`
-- `  route: supervised (reloadSupervised + HostStackFactory)`
-  — the new `route:` line is the load-bearing signal that the
-  supervised lifecycle was selected. Its absence means the
-  direct path ran.
+- `  route: supervised (stopped-audio; reloadSupervised + HostStackFactory)`
+  — the `route:` line is the load-bearing signal that the
+  supervised lifecycle was selected. The `stopped-audio;`
+  flavor tag (added 2026-05-20 alongside the
+  try-preserving route flip) distinguishes this route from
+  the supervised try-preserving route's rendering. Absence of
+  the whole supervised string means the direct path ran;
+  presence of the try-preserving tag instead means the wrong
+  flavor route was selected.
 - Initial OSC ingress opens on a non-zero port (audible via
   sending OSC to `preserve-cutoff-dark`'s control surface).
 - After pressing Enter, the timeline includes the genuine
@@ -576,7 +583,7 @@ Manifest live reload demo (experimental).
 
   manifest path: examples/manifests/preserve-cutoff.json
   strategy: stopped-audio-only
-  route: supervised (reloadSupervised + HostStackFactory)
+  route: supervised (stopped-audio; reloadSupervised + HostStackFactory)
   initial demo: preserve-cutoff-dark
   target demo: preserve-cutoff-bright
   normal demo path: unchanged
@@ -654,7 +661,7 @@ probe block above:
 
 | # | Marker the run must prove | Source | Verbatim line / probe output |
 |---|---|---|---|
-| 1 | Supervised route selected | transcript | `route: supervised (reloadSupervised + HostStackFactory)` |
+| 1 | Supervised route selected | transcript | `route: supervised (stopped-audio; reloadSupervised + HostStackFactory)` |
 | 2 | Real audio + real OSC opened | transcript | `audio running: yes`, `oscPort=17001` |
 | 3 | Pre-reload OSC accept | transcript | `osc accept: CmdControlWrite voice=v0 ... value=0.75` |
 | 4 | Stopped-audio phase ran under the supervisor | transcript | `supervised outcome: committed (new plan installed)` + `stopped-audio phase started` / `stopped-audio phase committed` reload events |

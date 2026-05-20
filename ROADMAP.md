@@ -3631,11 +3631,16 @@ committed` event pair, and released the OSC port cleanly on
 exit; transcript at
 [notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md).
 Hardware-gated CI for this route is a separate slice and is
-intentionally still open. Preserving and
-`TryPreservingThenStoppedAudio` fallback stay on the direct
-`reloadManifestHostWithStrategy` path; they will move only
-after the supervised stopped-audio route accumulates further
-hardware exposure.
+intentionally still open. `TryPreservingThenStoppedAudio` has
+since also migrated onto the supervised stack via
+`realTryPreservingHostStackOps` (composes preserving +
+stopped-audio fallback under the existing
+`preservingAllowsStoppedAudioFallback` gate; tier-2
+hardware-confirmed 2026-05-20 by two marker-clean runs of
+`just manifest-supervised-try-preserving-live-smoke`).
+`RequirePreserving` still stays on the direct
+`reloadManifestHostWithStrategy` path; its migration would
+open against the same evidence bar as the two landed slices.
 The preserving-live sibling path has also landed behind explicit host
 APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
 runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`
