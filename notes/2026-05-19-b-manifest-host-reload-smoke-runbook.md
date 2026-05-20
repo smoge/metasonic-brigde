@@ -8,6 +8,39 @@ which records the API shape and the consumer-gating decisions. This
 note records what the smoke prints, how to read it, and the
 known-good output for the fallback path. Not a design pin.
 
+## Blessed operator flow: preserving live reload
+
+The canonical preserving manifest live-reload path is a single
+command sequence against a committed fixture:
+
+```
+stack exec -- metasonic-bridge --manifest-live-reload-demo \
+    try-preserving examples/manifests/preserve-cutoff.json \
+    preserve-cutoff-dark preserve-cutoff-bright
+```
+
+Expected outcome (full transcript and OSC packet flow in
+[Cross-confirmation: live audio + real OSC](#cross-confirmation-live-audio--real-osc)):
+
+- `strategy outcome:` reports `success: preserving installed
+  (audio kept, voices preserved)` — no stopped-audio fallback.
+- `reload events:` ends with `strategy succeeded: preserving
+  installed (audio kept, voices preserved)`. No
+  `preserving phase rejected` line, no fallback admission.
+- `audio running: yes` and `active voices: 1` hold across the
+  reload.
+- OSC `/v0/lpf/0` is accepted both before (against the dark
+  600 Hz baseline) and after (against the bright 2400 Hz
+  baseline).
+
+The fixture is regenerable byte-for-byte from the demo source
+via `--authoring-manifest preserve-cutoff-dark
+preserve-cutoff-bright` and drift-protected by
+`MetaSonic.Spec.AppManifestPreservingFixture`. The host-reload
+smoke (`--manifest-host-reload-smoke`) is the fake-audio CI
+counterpart documented below; the live-reload command above is
+the operator-facing path.
+
 ## Invocation
 
 ```
@@ -182,21 +215,28 @@ fallback run, this validates the audio lifecycle and the OSC
 decode/route layer only — audible output was not independently
 verified.
 
-Manifest was generated with:
+The committed fixture at
+[examples/manifests/preserve-cutoff.json](../examples/manifests/preserve-cutoff.json)
+is the canonical input. Drive it through:
+
+```
+stack exec -- metasonic-bridge --manifest-live-reload-demo \
+    try-preserving examples/manifests/preserve-cutoff.json \
+    preserve-cutoff-dark preserve-cutoff-bright
+```
+
+The fixture is regenerable byte-for-byte with:
 
 ```
 stack exec -- metasonic-bridge --authoring-manifest \
     preserve-cutoff-dark preserve-cutoff-bright \
-    > /tmp/metasonic-preserve-cutoff.json
+    > examples/manifests/preserve-cutoff.json
 ```
 
-then driven through:
-
-```
-stack exec -- metasonic-bridge --manifest-live-reload-demo \
-    try-preserving /tmp/metasonic-preserve-cutoff.json \
-    preserve-cutoff-dark preserve-cutoff-bright
-```
+`MetaSonic.Spec.AppManifestPreservingFixture` asserts the
+on-disk file stays byte-identical to that command's output — a
+silent drift between the demo source and the fixture fails
+`just stack-test` before it can mislead an operator.
 
 Observed transcript (ALSA device-probing warnings during start
 omitted):
@@ -256,7 +296,11 @@ is what an operator should see on the live path.
   flow live in its source; this runbook captures only the
   shared-vocabulary slice (strategy outcome + reload events +
   ingress snapshot).
-- A real committed fixture. `manifest.json` at the repo root is a
-  developer-local scratch input; replacing it with a versioned
-  fixture is a separate decision (and would mean nailing down
-  which authoring manifest is the canonical smoke input).
+- Fixtures for non-preserving smoke targets. The preserving live-
+  reload path has a committed fixture at
+  [examples/manifests/preserve-cutoff.json](../examples/manifests/preserve-cutoff.json),
+  regression-protected by
+  `MetaSonic.Spec.AppManifestPreservingFixture`. Root
+  `manifest.json` remains developer-local scratch — adding
+  committed fixtures for other smoke targets (named-control,
+  send-return, …) is its own decision per smoke entrypoint.

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "demos": [
+    {
+      "demo": "preserve-cutoff-dark",
+      "templates": [
+        {
+          "name": "drone",
+          "role": "voice"
+        }
+      ],
+      "buses": [],
+      "controls": [
+        {
+          "name": "cutoff",
+          "default": 600,
+          "rangeMin": 200,
+          "rangeMax": 6000,
+          "smoothingHz": 0,
+          "cc": null,
+          "key": "lpf",
+          "slot": 0
+        }
+      ]
+    },
+    {
+      "demo": "preserve-cutoff-bright",
+      "templates": [
+        {
+          "name": "drone",
+          "role": "voice"
+        }
+      ],
+      "buses": [],
+      "controls": [
+        {
+          "name": "cutoff",
+          "default": 2400,
+          "rangeMin": 200,
+          "rangeMax": 6000,
+          "smoothingHz": 0,
+          "cc": null,
+          "key": "lpf",
+          "slot": 0
+        }
+      ]
+    }
+  ]
+}

@@ -3746,8 +3746,13 @@ Still gated:
   consumer), operator UX polish on the manual smokes, and
   hardware-gated CI for the device-backed paths. Host strategy
   smoke and live reload demo now share a typed prose reload-event
-  vocabulary (`f595542` / `aca37ed`); remaining UX polish, if any,
-  is the MIDI/device smoke lane.
+  vocabulary (`f595542` / `aca37ed`). The preserving live-reload
+  path has a blessed committed fixture at
+  [examples/manifests/preserve-cutoff.json](examples/manifests/preserve-cutoff.json),
+  drift-protected by `MetaSonic.Spec.AppManifestPreservingFixture`,
+  with the canonical command sequence pinned in the smoke runbook
+  and the `--manifest-live-reload-demo` CLI help; remaining UX
+  polish, if any, is the MIDI/device smoke lane.
 - [ ] Failure/event semantics across compile, allocation, and stale
   producer commands. The install/reload-strategy timeline is now
   covered by the `ManifestReloadEvent` ADT in

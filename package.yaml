@@ -235,6 +235,7 @@ tests:
       - MetaSonic.Spec.AppManifestOSCIngressOps
       - MetaSonic.Spec.AppManifestOSCListener
       - MetaSonic.Spec.AppManifestOSCReloadE2E
+      - MetaSonic.Spec.AppManifestPreservingFixture
       - MetaSonic.Spec.AppManifestReloadBinding
       - MetaSonic.Spec.AppManifestReloadCli
       - MetaSonic.Spec.AppManifestReloadEvent

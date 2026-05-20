@@ -685,7 +685,7 @@ usage prog = unlines
   , "                   device is opened and the normal demo path is not"
   , "                   affected."
   , "  --manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW"
-  , "                   Experimental audible manifest reload demo."
+  , "                   Audible manifest reload demo."
   , "                   STRATEGY is one of: "
       <> intercalate ", " manifestReloadHostStrategyNames
   , "                   Starts real audio from OLD, opens manifest-aware"
@@ -693,7 +693,13 @@ usage prog = unlines
   , "                   through reloadManifestHostWithStrategy, then"
   , "                   waits for Enter before cleanup. Uses"
   , "                   --session-osc-port N for the OSC bind port."
-  , "                   This is opt-in only; normal demo execution is"
+  , "                   Blessed preserving path:"
+  , "                     examples/manifests/preserve-cutoff.json"
+  , "                     OLD=preserve-cutoff-dark NEW=preserve-cutoff-bright"
+  , "                   under try-preserving (commits without"
+  , "                   stopped-audio fallback; full runbook at"
+  , "                   notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)."
+  , "                   This mode is opt-in only; normal demo execution is"
   , "                   unchanged."
   , "  --manifest-midi-reload-smoke MANIFEST.json DEMO"
   , "                   Manual device-backed MIDI smoke for the manifest"
@@ -780,6 +786,8 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-stopped-audio-reload-smoke manifest.json send-return"
   , "  " <> prog <> " --manifest-host-reload-smoke try-preserving manifest.json send-return"
   , "  " <> prog <> " --manifest-live-reload-demo try-preserving manifest.json named-control named-control"
+  , "  " <> prog <> " --manifest-live-reload-demo try-preserving examples/manifests/preserve-cutoff.json preserve-cutoff-dark preserve-cutoff-bright"
+  , "       (blessed preserving path; commits without stopped-audio fallback)"
   , "  " <> prog <> " --manifest-midi-reload-smoke manifest.json send-return --midi-device 2"
   ]
 
