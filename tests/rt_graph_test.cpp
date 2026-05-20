@@ -15,9 +15,11 @@
 #include <doctest/doctest.h>
 
 #include "rt_graph.h"
+#include "rt_graph_plugins.h"
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <numbers>
@@ -117,6 +119,44 @@ TEST_CASE("static plugin registry exposes identity") {
     CHECK(rt_graph_plugin_audio_out_count(-1) == -1);
     CHECK(rt_graph_plugin_latency_samples(-1) == -1);
     CHECK(rt_graph_plugin_state_size_bytes(-1) == -1);
+}
+
+// Phase 6.E v2 §5 test #13: register_plugin enforces
+// `state_size_bytes ∈ [0, kMaxPluginState]` at registration time so
+// the runtime registry never carries an out-of-spec row. Each
+// rejection case can share a name because the bounds check fires
+// before the duplicate-name check in register_plugin
+// (rt_graph_plugins.cpp). The accept case uses a unique name.
+TEST_CASE("register_plugin rejects out-of-range state_size_bytes") {
+    auto noop_process = [](void *, int, const float * const *,
+                           float * const *) noexcept { return 0; };
+
+    metasonic::PluginSpec spec{};
+    spec.name = "phase-6e-v2-bounds-reject";
+    spec.audio_in_count = 1;
+    spec.audio_out_count = 1;
+    spec.latency_samples = 0;
+    spec.process = noop_process;
+
+    SUBCASE("just past upper bound") {
+        spec.state_size_bytes = metasonic::kMaxPluginState + 1;
+        CHECK(metasonic::register_plugin(&spec) == -1);
+    }
+    SUBCASE("negative one") {
+        spec.state_size_bytes = -1;
+        CHECK(metasonic::register_plugin(&spec) == -1);
+    }
+    SUBCASE("INT_MIN") {
+        spec.state_size_bytes = INT_MIN;
+        CHECK(metasonic::register_plugin(&spec) == -1);
+    }
+    SUBCASE("at upper bound is accepted") {
+        spec.name = "phase-6e-v2-bounds-accept";
+        spec.state_size_bytes = metasonic::kMaxPluginState;
+        const int id = metasonic::register_plugin(&spec);
+        CHECK(id >= 0);
+        CHECK(rt_graph_plugin_state_size_bytes(id) == metasonic::kMaxPluginState);
+    }
 }
 
 // ----------------------------------------------------------------
