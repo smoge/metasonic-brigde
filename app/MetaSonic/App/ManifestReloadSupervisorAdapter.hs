@@ -60,14 +60,20 @@ data HostStackFactory plan stack e = HostStackFactory
     -- propagate per the §238 #9 cleanup invariant — the adapter
     -- ensures @hsfCloseStack@ ran before any exception from the
     -- in-window op escapes 'withHostStackSupervisorAdapter'.
-  , hsfInWindowReload  :: !(stack -> plan -> IO (Either e ()))
+  , hsfInWindowReload  :: !(stack -> plan -> plan -> IO (Either e ()))
     -- ^ Drive a stopped-audio in-window reload against an
-    -- already-open stack. @Right ()@ means the same stack is now
-    -- running the requested plan (the reload mutated the stack
-    -- in place; the supervisor does not need to close-then-open).
-    -- @Left e@ means terminal in-window failure: the supervisor
-    -- closes this stack and rebuilds from the captured fallback
-    -- plan via 'hsfCloseStack' + 'hsfOpenStack'.
+    -- already-open stack. Takes the @fallback@ plan (the plan the
+    -- stack is currently running) followed by the @requested@
+    -- plan. The fallback is forwarded so the producer can
+    -- re-derive plan-dependent state at the reload boundary
+    -- (e.g. project the currently-bound ingress target from the
+    -- fallback) rather than reading a cached field on the stack.
+    -- @Right ()@ means the same stack is now running the
+    -- requested plan (the reload mutated the stack in place; the
+    -- supervisor does not need to close-then-open). @Left e@
+    -- means terminal in-window failure: the supervisor closes
+    -- this stack and rebuilds from the captured fallback plan
+    -- via 'hsfCloseStack' + 'hsfOpenStack'.
   }
 
 
@@ -138,7 +144,7 @@ withHostStackSupervisorAdapter factory initialStack k = mask $ \restore -> do
             writeIORef stackRef (Just newStack)
             pure (Right ())
 
-      inWindowOps plan = do
+      inWindowOps fallback requested = do
         mStack <- readIORef stackRef
         case mStack of
           Nothing ->
@@ -155,7 +161,7 @@ withHostStackSupervisorAdapter factory initialStack k = mask $ \restore -> do
               "supervisor contract violation — sopsInWindowReload " <>
               "must only run while the previous open() succeeded."
           Just stack ->
-            hsfInWindowReload factory stack plan
+            hsfInWindowReload factory stack fallback requested
 
       supOps = SupervisorOps
         { sopsInWindowReload = inWindowOps

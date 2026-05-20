@@ -89,7 +89,7 @@ mkFakeFactory state = HostStackFactory
           record state (OpenCalled plan newId)
           pure (Right newId)
   , hsfCloseStack = record state . CloseCalled
-  , hsfInWindowReload = \stackId plan -> do
+  , hsfInWindowReload = \stackId _fallback plan -> do
       record state (InWindowCalled stackId plan)
       ffsInWindow state plan
   }
@@ -337,7 +337,7 @@ appManifestReloadSupervisorAdapterTests =
                 modifyIORef' observedRef (const (Just ms))
                 pure (Right (42 :: Int))
             , hsfCloseStack     = \_ -> pure ()
-            , hsfInWindowReload = \_ _ ->
+            , hsfInWindowReload = \_ _ _ ->
                 pure (Left (InWindowFailure "force-recovery"))
             }
       _ <-
@@ -364,7 +364,7 @@ appManifestReloadSupervisorAdapterTests =
             , hsfCloseStack = \_ -> do
                 ms <- getMaskingState
                 modifyIORef' observedRef (++ [ms])
-            , hsfInWindowReload = \_ _ ->
+            , hsfInWindowReload = \_ _ _ ->
                 pure (Left (InWindowFailure "trigger-close"))
             }
       _ <-
@@ -415,7 +415,7 @@ appManifestReloadSupervisorAdapterTests =
                 recordCall (OpenCalled plan newId)
                 pure (Right newId)
             , hsfCloseStack = recordCall . CloseCalled
-            , hsfInWindowReload = \stackId plan -> do
+            , hsfInWindowReload = \stackId _fallback plan -> do
                 recordCall (InWindowCalled stackId plan)
                 putMVar inWindowReached ()
                 takeMVar mayReturn
@@ -505,7 +505,7 @@ appManifestReloadSupervisorAdapterTests =
           factory = HostStackFactory
             { hsfOpenStack = \_ -> pure (Right 42)
             , hsfCloseStack = \_ -> pure ()
-            , hsfInWindowReload = \_ _ -> pure (Right ())
+            , hsfInWindowReload = \_ _ _ -> pure (Right ())
             }
       withHostStackSupervisorAdapter factory 1 $ \_ops -> do
         ms <- getMaskingState

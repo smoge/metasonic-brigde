@@ -212,7 +212,7 @@ appManifestReloadSupervisorTests =
       let record c = modifyIORef' log_ (++ [c])
           ops :: SupervisorOps String FakeFailure
           ops = SupervisorOps
-            { sopsInWindowReload = \p -> do
+            { sopsInWindowReload = \_fallback p -> do
                 record (InWindowReloadCalled p)
                 throwIO (ErrorCall "synthetic in-window crash")
             , sopsCloseStack = record CloseStackCalled
@@ -285,7 +285,7 @@ mkRecordingOps inWindow openStack = do
   log_ <- newIORef []
   let record c = modifyIORef' log_ (++ [c])
       ops = SupervisorOps
-        { sopsInWindowReload = \p -> do
+        { sopsInWindowReload = \_fallback p -> do
             record (InWindowReloadCalled p)
             inWindow p
         , sopsCloseStack = record CloseStackCalled

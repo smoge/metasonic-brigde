@@ -31,11 +31,17 @@ import           Control.Exception (onException)
 -- | Injected slots the supervisor drives. The supervisor itself does
 -- no IO beyond sequencing these.
 data SupervisorOps plan e = SupervisorOps
-  { sopsInWindowReload :: !(plan -> IO (Either e ()))
+  { sopsInWindowReload :: !(plan -> plan -> IO (Either e ()))
     -- ^ Attempt the in-window stopped-audio reload against the
-    -- currently active stack. Right () on full success (new owner
-    -- installed, audio restarted, listeners reopened). Left e on any
-    -- terminal in-window failure.
+    -- currently active stack. Takes the @fallback@ plan (the
+    -- previously-current plan; the one the stack is currently
+    -- running) followed by the @requested@ plan. The fallback is
+    -- threaded through so the producer can re-derive any
+    -- plan-dependent state at the reload boundary (e.g. project
+    -- the current ingress target from the fallback rather than
+    -- reading a cached field on the stack). Right () on full
+    -- success (new owner installed, audio restarted, listeners
+    -- reopened). Left e on any terminal in-window failure.
   , sopsCloseStack     :: !(IO ())
     -- ^ Dispose the current host/audio/listener stack. Invoked exactly
     -- once before rebuild after an in-window failure.
@@ -83,7 +89,7 @@ reloadSupervised ops fallback requested = do
   -- async) and then rethrows; on a normal 'Left e' return it does
   -- not fire, so the explicit close on the recovery path below is
   -- not double-called.
-  attempt <- sopsInWindowReload ops requested
+  attempt <- sopsInWindowReload ops fallback requested
                 `onException` sopsCloseStack ops
   case attempt of
     Right () ->

@@ -147,7 +147,7 @@ mkFakeOps traceRef plans = StoppedAudioHostStackOps
         Left e   -> pure (Left e)
         Right () -> pure (Right stubStack)
   , sahsoClose = \_stack -> record CloseCalled
-  , sahsoInWindowReload = \_stack plan -> do
+  , sahsoInWindowReload = \_stack _fallback plan -> do
       record (InWindowCalled (MR.mrlpDemoKey plan))
       fspInWindowBehavior plans plan
   }
@@ -413,7 +413,7 @@ factoryCompositionTests =
                 recordCall (OpenCalled (MR.mrlpDemoKey plan))
                 pure (Right stubStack)
             , sahsoClose = \_stack -> recordCall CloseCalled
-            , sahsoInWindowReload = \_stack plan -> do
+            , sahsoInWindowReload = \_stack _fallback plan -> do
                 recordCall (InWindowCalled (MR.mrlpDemoKey plan))
                 putMVar readyToBlock ()
                 takeMVar mayReturn
@@ -758,8 +758,14 @@ realInWindowReloadTests =
           -- "initial" so any code path that re-derived a plan
           -- from doc/catalog (which is empty) would fail to find
           -- a matching demo and surface MrhiPlanning.
-          let newPlan = mkPlan "after-reload"
-          reloadResult <- realStoppedAudioInWindowReload stack newPlan
+          let initialPlan = mkPlan "initial"
+              newPlan     = mkPlan "after-reload"
+          reloadResult <-
+            realStoppedAudioInWindowReload
+              testIngressTargetPolicy
+              stack
+              initialPlan
+              newPlan
           sahsoClose ops stack
           case reloadResult of
             Right () ->
