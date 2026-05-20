@@ -18,6 +18,8 @@ import           Test.Tasty
 import           Test.Tasty.HUnit
 
 import           MetaSonic.App.ManifestLiveReloadDemo   (LiveReloadRoute (..),
+                                                         SupervisedFactoryFlavor (..),
+                                                         renderLiveReloadRoute,
                                                          selectLiveReloadRoute)
 import           MetaSonic.App.ManifestReloadCli        (renderHostPreservingIssueTag,
                                                          renderHostStoppedAudioIssueTag,
@@ -62,31 +64,50 @@ appManifestLiveReloadDemoRenderTests =
       assertNoLeak line
       assertShortLine 300 line
 
-    -- §219 slice 4 routing: the audible
-    -- @--manifest-live-reload-demo@ now dispatches the
-    -- 'StoppedAudioOnly' strategy through the supervised
-    -- lifecycle (factory + adapter + 'reloadSupervised').
-    -- Preserving and TryPreservingThenStoppedAudio stay on the
-    -- direct path; their migration is its own slice and opens
-    -- against the evidence bar in
-    -- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
+    -- §219 routing: the audible @--manifest-live-reload-demo@
+    -- dispatches StoppedAudioOnly through
+    -- 'realStoppedAudioHostStackOps' and
+    -- TryPreservingThenStoppedAudio through
+    -- 'realTryPreservingHostStackOps' (composed preserving +
+    -- stopped-audio fallback). RequirePreserving stays on the
+    -- direct path; migrating it is a separate slice.
     --
     -- 'selectLiveReloadRoute' is a pure selector. Pinning each
     -- strategy's route here catches a class of regressions
     -- where a refactor silently changes which strategies use
     -- the supervised lifecycle, without staging real audio or
-    -- depending on hardware. The actual audible behavior of
-    -- the supervised path is gated on the operator running the
+    -- depending on hardware. The actual audible behavior of the
+    -- supervised paths is gated on the operator running the
     -- demo manually per the slice-2 runbook.
 
-  , testCase "selectLiveReloadRoute StoppedAudioOnly dispatches through the supervised lifecycle"
-      $ selectLiveReloadRoute StoppedAudioOnly @?= LiveReloadSupervised
+  , testCase "selectLiveReloadRoute StoppedAudioOnly -> supervised stopped-audio"
+      $ selectLiveReloadRoute StoppedAudioOnly
+          @?= LiveReloadSupervised SfStoppedAudio
+
+  , testCase "selectLiveReloadRoute TryPreservingThenStoppedAudio -> supervised try-preserving"
+      $ selectLiveReloadRoute TryPreservingThenStoppedAudio
+          @?= LiveReloadSupervised SfTryPreserving
 
   , testCase "selectLiveReloadRoute RequirePreserving stays on the direct path"
       $ selectLiveReloadRoute RequirePreserving @?= LiveReloadDirect
 
-  , testCase "selectLiveReloadRoute TryPreservingThenStoppedAudio stays on the direct path"
-      $ selectLiveReloadRoute TryPreservingThenStoppedAudio @?= LiveReloadDirect
+    -- The tier-2 smoke wrappers (tools/manifest_supervised_*_live_smoke.sh)
+    -- grep on the exact 'route:' string in the demo preamble.
+    -- These tests pin those strings so a refactor of
+    -- 'renderLiveReloadRoute' breaks here loudly instead of
+    -- silently breaking the wrapper marker check.
+
+  , testCase "renderLiveReloadRoute LiveReloadDirect"
+      $ renderLiveReloadRoute LiveReloadDirect
+          @?= "direct (reloadManifestHostWithStrategy)"
+
+  , testCase "renderLiveReloadRoute LiveReloadSupervised SfStoppedAudio"
+      $ renderLiveReloadRoute (LiveReloadSupervised SfStoppedAudio)
+          @?= "supervised (stopped-audio; reloadSupervised + HostStackFactory)"
+
+  , testCase "renderLiveReloadRoute LiveReloadSupervised SfTryPreserving"
+      $ renderLiveReloadRoute (LiveReloadSupervised SfTryPreserving)
+          @?= "supervised (try-preserving; reloadSupervised + HostStackFactory)"
   ]
 
 -- | Carried-issue stand-in: a payload whose textual content includes

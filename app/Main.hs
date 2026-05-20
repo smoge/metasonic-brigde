@@ -211,18 +211,22 @@ data RunMode
     -- (--manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW).
     -- Starts real audio from OLD, opens manifest-aware OSC ingress,
     -- waits for Enter, then reloads to NEW. The reload dispatch
-    -- splits on STRATEGY: stopped-audio-only routes through the
-    -- supervised stack (reloadSupervised + HostStackFactory +
-    -- realStoppedAudioHostStackOps) so a terminal in-window failure
-    -- triggers a rebuild from the captured fallback plan
-    -- (hardware-confirmed on 2026-05-20; see the runbook).
-    -- require-preserving and try-preserving stay on the direct
-    -- reloadManifestHostWithStrategy path; migrating them is its
-    -- own slice and opens against the evidence bar in
-    -- notes/2026-05-20-a-supervised-route-tier3-decision.md.
-    -- The runtime preamble prints a "route:" line so the operator can see
-    -- which path was selected. This whole command is opt-in;
-    -- the normal demo path is unchanged.
+    -- splits on STRATEGY:
+    -- * stopped-audio-only routes through the supervised stack
+    --   (reloadSupervised + HostStackFactory +
+    --   realStoppedAudioHostStackOps); hardware-confirmed
+    --   2026-05-20.
+    -- * try-preserving routes through the supervised stack with
+    --   realTryPreservingHostStackOps (composes preserving +
+    --   stopped-audio fallback under the existing
+    --   preservingAllowsStoppedAudioFallback gate).
+    -- * require-preserving stays on the direct
+    --   reloadManifestHostWithStrategy path; migrating it is its
+    --   own slice and opens against the evidence bar in
+    --   notes/2026-05-20-a-supervised-route-tier3-decision.md.
+    -- The runtime preamble prints a "route:" line so the operator
+    -- can see which path was selected. This whole command is
+    -- opt-in; the normal demo path is unchanged.
   deriving (Eq, Show)
 
 data Options = Options
@@ -707,15 +711,20 @@ usage prog = unlines
   , "                   Starts real audio from OLD, opens manifest-aware"
   , "                   OSC ingress, waits for Enter, reloads to NEW,"
   , "                   then waits for Enter before cleanup. The reload"
-  , "                   dispatch splits on STRATEGY: stopped-audio-only"
-  , "                   routes through the supervised stack"
-  , "                   (reloadSupervised + HostStackFactory +"
-  , "                   realStoppedAudioHostStackOps); require-preserving"
-  , "                   and try-preserving stay on the direct"
-  , "                   reloadManifestHostWithStrategy path. The runtime"
-  , "                   preamble prints a 'route:' line so the operator"
-  , "                   can see which path was selected. Uses"
-  , "                   --session-osc-port N for the OSC bind port."
+  , "                   dispatch splits on STRATEGY:"
+  , "                     stopped-audio-only ->"
+  , "                       supervised stack with"
+  , "                       realStoppedAudioHostStackOps;"
+  , "                     try-preserving ->"
+  , "                       supervised stack with"
+  , "                       realTryPreservingHostStackOps (composes"
+  , "                       preserving + stopped-audio fallback);"
+  , "                     require-preserving ->"
+  , "                       direct reloadManifestHostWithStrategy"
+  , "                       path."
+  , "                   The runtime preamble prints a 'route:' line so"
+  , "                   the operator can see which path was selected."
+  , "                   Uses --session-osc-port N for the OSC bind port."
   , "                   Blessed preserving path:"
   , "                     examples/manifests/preserve-cutoff.json"
   , "                     OLD=preserve-cutoff-dark NEW=preserve-cutoff-bright"

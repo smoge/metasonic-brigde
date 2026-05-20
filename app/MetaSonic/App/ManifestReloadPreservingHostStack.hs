@@ -28,12 +28,16 @@
 --   * 'mkPreservingHostStackFactory' — smart constructor producing a
 --     'HostStackFactory' the supervisor adapter can drive directly.
 --
--- This slice does NOT route any CLI strategy through the supervisor;
--- it lands the production wiring + the policy + the fake-IO tests so
--- the next slice can flip @selectLiveReloadRoute@ for
--- @TryPreservingThenStoppedAudio@ once the deterministic coverage is
--- in. See notes\/2026-05-14-k-host-reload-supervisor.md row 9 (when
--- it lands).
+-- This module is consumed by
+-- "MetaSonic.App.ManifestReloadTryPreservingHostStack", which
+-- composes 'realPreservingInWindowReload' with
+-- 'realStoppedAudioInWindowReload' under the existing
+-- 'preservingAllowsStoppedAudioFallback' gate and is the factory
+-- that @--manifest-live-reload-demo try-preserving@ now drives.
+-- 'realPreservingInWindowReload' is not exposed as a standalone
+-- CLI route today — preserving-without-fallback would correspond
+-- to @RequirePreserving@, which stays on the direct path until
+-- its own migration slice opens.
 module MetaSonic.App.ManifestReloadPreservingHostStack
   ( -- * Types
     PreservingHostStack

@@ -145,8 +145,10 @@ check-offline:
 # `check-offline` or any default CI gate — default gates stay
 # deterministic and device-free. Run this manually on a host
 # with a working audio backend when verifying the supervised
-# route (e.g. before migrating preserving / try-preserving onto
-# the supervisor).
+# stopped-audio route (e.g. as the no-regression confirmation
+# run after touching shared supervisor / adapter code, paired
+# with `manifest-supervised-try-preserving-live-smoke` for the
+# try-preserving route).
 #
 # Default port is 17001 to avoid colliding with the everyday
 # 7001 workspace if a smoke gets stuck. Override with
@@ -157,6 +159,37 @@ check-offline:
 # script; see tools/manifest_supervised_live_smoke.sh.
 manifest-supervised-live-smoke port="17001": stack-build
     PORT={{port}} ./tools/manifest_supervised_live_smoke.sh
+
+# Opt-in live operator smoke for the supervised
+# --manifest-live-reload-demo try-preserving route. Drives the
+# audible reload end-to-end against the committed
+# preserve-cutoff fixture, where preserving commits without
+# stopped-audio fallback. Injects OSC pre- and post-reload,
+# runs post-exit `ss` + active Python bind probes, and verifies
+# the try-preserving acceptance markers.
+#
+# Same shape as `manifest-supervised-live-smoke`, but exercises
+# the supervised stack with `realTryPreservingHostStackOps`
+# (composes preserving + stopped-audio fallback) instead of
+# `realStoppedAudioHostStackOps`. Marker checks swap the two
+# stopped-audio-phase markers for the corresponding preserving-
+# phase markers; the route-line marker pins the distinct route
+# rendering.
+#
+# Like the stopped-audio counterpart, this is a LIVE / DEVICE
+# smoke and is INTENTIONALLY NOT a member of `check-offline` or
+# any default CI gate.
+#
+# Default port is 17002 (vs 17001 for stopped-audio) so the two
+# smokes do not collide if run in sequence and a stale post-exit
+# state on one port does not affect the other. Override with
+# `just manifest-supervised-try-preserving-live-smoke port=N`.
+#
+# Other parameters (manifest fixture, old/new demo keys, work
+# dir for artifacts) are env-var configurable in the wrapper
+# script; see tools/manifest_supervised_try_preserving_live_smoke.sh.
+manifest-supervised-try-preserving-live-smoke port="17002": stack-build
+    PORT={{port}} ./tools/manifest_supervised_try_preserving_live_smoke.sh
 
 # §4.B kernel microbench. Configures and builds in a separate
 # RelWithDebInfo tree so the numbers aren't dominated by

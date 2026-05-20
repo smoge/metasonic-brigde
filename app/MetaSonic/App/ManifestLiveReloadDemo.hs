@@ -16,13 +16,25 @@
 --   'realStoppedAudioHostStackOps') so a terminal in-window failure
 --   triggers a rebuild from the captured fallback plan instead of
 --   leaving the host without a live stack. This is the
---   'LiveReloadSupervised' arm of 'selectLiveReloadRoute' and is
---   driven by 'runSupervisedLiveReload' below.
+--   @'LiveReloadSupervised' 'SfStoppedAudio'@ arm of
+--   'selectLiveReloadRoute' and is driven by
+--   'runSupervisedStoppedAudioLiveReload' below.
 --
--- * @RequirePreserving@ and @TryPreservingThenStoppedAudio@ stay on
---   the direct 'reloadManifestHostWithStrategy' path
---   ('LiveReloadDirect'). Migrating them to the supervised
---   stack is its own slice and opens against the evidence bar in
+-- * @TryPreservingThenStoppedAudio@ routes through the supervised
+--   stack with 'realTryPreservingHostStackOps' (composes preserving
+--   + stopped-audio fallback under the existing
+--   'preservingAllowsStoppedAudioFallback' gate). This is the
+--   @'LiveReloadSupervised' 'SfTryPreserving'@ arm and is driven by
+--   'runSupervisedTryPreservingLiveReload' below. A preserving
+--   rejection that the gate does not admit produces a real
+--   'SupervisedReloadRequestRejected' outcome — the stack stays
+--   serving the fallback plan; the operator branch prints the
+--   cause and prompts for cleanup without claiming a rebuild ran.
+--
+-- * @RequirePreserving@ stays on the direct
+--   'reloadManifestHostWithStrategy' path ('LiveReloadDirect').
+--   Migrating it to the supervised stack is its own slice and
+--   opens against the evidence bar in
 --   @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
 --
 -- The runtime preamble prints a @route:@ line so the operator can
@@ -41,7 +53,9 @@
 module MetaSonic.App.ManifestLiveReloadDemo
   ( runManifestLiveReloadDemo
   , LiveReloadRoute (..)
+  , SupervisedFactoryFlavor (..)
   , selectLiveReloadRoute
+  , renderLiveReloadRoute
   ) where
 
 import           Control.Concurrent             (threadDelay)
@@ -97,6 +111,10 @@ import           MetaSonic.App.ManifestReloadHostStack
                                                  StoppedAudioHostStackIssue,
                                                  mkStoppedAudioHostStackFactory,
                                                  realStoppedAudioHostStackOps)
+import           MetaSonic.App.ManifestReloadTryPreservingHostStack
+                                                (TryPreservingHostStackIssue,
+                                                 mkTryPreservingHostStackFactory,
+                                                 realTryPreservingHostStackOps)
 import           MetaSonic.App.ManifestReloadSupervisor
                                                 (SupervisedReloadOutcome (..),
                                                  reloadSupervised)
@@ -156,14 +174,14 @@ import           MetaSonic.Session.State        (SessionState (..))
 -- | Which live-reload path drives the audible reload demo for
 -- a given strategy.
 --
--- 'StoppedAudioOnly' now goes through the supervised stack
--- (factory + adapter + 'reloadSupervised'), the same lifecycle
--- the @--manifest-host-reload-smoke@ CLI smoke uses. The
--- supervised route is hardware-confirmed once (2026-05-20 run
--- recorded in the runbook). Preserving and
--- 'TryPreservingThenStoppedAudio' stay on the existing direct
--- path; migrating them is its own slice and opens against the
--- evidence bar in
+-- Two strategies dispatch through the supervised lifecycle now:
+-- 'StoppedAudioOnly' uses 'realStoppedAudioHostStackOps' (landed
+-- earlier and hardware-confirmed 2026-05-20), and
+-- 'TryPreservingThenStoppedAudio' uses
+-- 'realTryPreservingHostStackOps' (composed preserving +
+-- stopped-audio fallback). 'RequirePreserving' stays on the
+-- existing direct path; migrating it is a separate slice and
+-- opens against the evidence bar in
 -- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
 -- Selection is pure so it can be exercised by deterministic
 -- tests without staging real audio.
@@ -171,13 +189,28 @@ data LiveReloadRoute
   = LiveReloadDirect
     -- ^ Drive 'reloadManifestHostWithStrategyWithEvents'
     -- against a 'ManifestReloadHostConfig' opened by this
-    -- module. Used for 'RequirePreserving' and
-    -- 'TryPreservingThenStoppedAudio'.
-  | LiveReloadSupervised
+    -- module. Used for 'RequirePreserving'.
+  | LiveReloadSupervised !SupervisedFactoryFlavor
     -- ^ Drive 'reloadSupervised' under
-    -- 'withHostStackSupervisorAdapter' against a stack opened
-    -- by 'realStoppedAudioHostStackOps'. Used for
-    -- 'StoppedAudioOnly'.
+    -- 'withHostStackSupervisorAdapter'. The 'SupervisedFactoryFlavor'
+    -- selects which HostStackFactory carries the in-window
+    -- lifecycle.
+  deriving stock (Eq, Show)
+
+
+-- | Which supervised factory carries the in-window lifecycle for
+-- a 'LiveReloadSupervised' route.
+data SupervisedFactoryFlavor
+  = SfStoppedAudio
+    -- ^ 'realStoppedAudioHostStackOps'. The in-window slot can
+    -- only produce 'InWindowReloadCommitted' or
+    -- 'InWindowReloadTerminal'.
+  | SfTryPreserving
+    -- ^ 'realTryPreservingHostStackOps' (composes preserving +
+    -- stopped-audio fallback). The in-window slot can produce
+    -- all three 'InWindowReloadOutcome' variants, so the
+    -- supervisor can return 'SupervisedReloadRequestRejected'
+    -- for live-stack rejections.
   deriving stock (Eq, Show)
 
 
@@ -185,9 +218,9 @@ data LiveReloadRoute
 -- path it dispatches through.
 selectLiveReloadRoute :: ManifestReloadHostStrategy -> LiveReloadRoute
 selectLiveReloadRoute strategy = case strategy of
-  StoppedAudioOnly              -> LiveReloadSupervised
+  StoppedAudioOnly              -> LiveReloadSupervised SfStoppedAudio
+  TryPreservingThenStoppedAudio -> LiveReloadSupervised SfTryPreserving
   RequirePreserving             -> LiveReloadDirect
-  TryPreservingThenStoppedAudio -> LiveReloadDirect
 
 
 -- | Run an experimental audible manifest reload demo.
@@ -242,8 +275,14 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
   hFlush stdout
 
   case route of
-    LiveReloadSupervised ->
-      runSupervisedLiveReload
+    LiveReloadSupervised SfStoppedAudio ->
+      runSupervisedStoppedAudioLiveReload
+        listenerCfg
+        oldPlan newPlan
+        oldTarget newTarget
+        oldDemo newDemo
+    LiveReloadSupervised SfTryPreserving ->
+      runSupervisedTryPreservingLiveReload
         listenerCfg
         oldPlan newPlan
         oldTarget newTarget
@@ -258,11 +297,17 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
         oldDemo newDemo
 
 
+-- | Render a 'LiveReloadRoute' as the @route:@ line shown in the
+-- demo preamble. The exact strings are pinned by deterministic
+-- tests because operator tier-2 smoke wrappers grep on them.
 renderLiveReloadRoute :: LiveReloadRoute -> String
 renderLiveReloadRoute = \case
-  LiveReloadDirect     -> "direct (reloadManifestHostWithStrategy)"
-  LiveReloadSupervised ->
-    "supervised (reloadSupervised + HostStackFactory)"
+  LiveReloadDirect ->
+    "direct (reloadManifestHostWithStrategy)"
+  LiveReloadSupervised SfStoppedAudio ->
+    "supervised (stopped-audio; reloadSupervised + HostStackFactory)"
+  LiveReloadSupervised SfTryPreserving ->
+    "supervised (try-preserving; reloadSupervised + HostStackFactory)"
 
 
 -- | Direct-path body extracted unchanged from the original
@@ -437,7 +482,7 @@ runDirectLiveReloadBody strategy listenerCfg doc catalog
 -- intentionally unused. Likewise @_newDemo@ is unused — the
 -- request payload is synthesized from @newPlan@ inside the
 -- helper.
-runSupervisedLiveReload
+runSupervisedStoppedAudioLiveReload
   :: ListenerConfig
   -> MR.ManifestReloadPlan
   -> MR.ManifestReloadPlan
@@ -446,7 +491,7 @@ runSupervisedLiveReload
   -> Demo
   -> Demo
   -> IO ()
-runSupervisedLiveReload listenerCfg oldPlan newPlan oldTarget _newTarget
+runSupervisedStoppedAudioLiveReload listenerCfg oldPlan newPlan oldTarget _newTarget
     _oldDemo _newDemo = do
   reloadEvents <- newIORef []
   let buildIngressOps host =
@@ -605,6 +650,212 @@ runSupervisedLiveReload listenerCfg oldPlan newPlan oldTarget _newTarget
       -- avoid pulling rendering helpers across module
       -- boundaries.
       show
+
+
+-- | Supervised live-reload body for 'TryPreservingThenStoppedAudio'.
+-- Mirrors 'runSupervisedStoppedAudioLiveReload' but wires
+-- 'realTryPreservingHostStackOps' + 'mkTryPreservingHostStackFactory',
+-- which compose 'realPreservingInWindowReload' with
+-- 'realStoppedAudioInWindowReload' under the
+-- 'preservingAllowsStoppedAudioFallback' gate. The supervisor sees
+-- a single classified in-window slot; the gate decision and the
+-- fallback composition happen inside the slot.
+--
+-- 'SupervisedReloadRequestRejected' is a real reachable outcome
+-- here (unlike the stopped-audio route): when preserving rejects
+-- with a live-stack cause that is not fallback-eligible, the
+-- stack stays on the fallback plan and the supervisor returns
+-- request-rejected. The operator branch below prints that
+-- explicitly so the timeline reads correctly.
+runSupervisedTryPreservingLiveReload
+  :: ListenerConfig
+  -> MR.ManifestReloadPlan
+  -> MR.ManifestReloadPlan
+  -> ManifestReloadIngressTarget
+  -> ManifestReloadIngressTarget
+  -> Demo
+  -> Demo
+  -> IO ()
+runSupervisedTryPreservingLiveReload listenerCfg oldPlan newPlan oldTarget _newTarget
+    _oldDemo _newDemo = do
+  reloadEvents <- newIORef []
+  let buildIngressOps host =
+        manifestOSCIngressOps
+          liveOSCListenerHooks
+          defaultOSCProducerOptions
+          host
+          listenerCfg
+      inputs = RealStoppedAudioHostStackInputs
+        { rsahsiBuildIngressOps     = buildIngressOps
+        , rsahsiIngressTargetPolicy = liveIngressTargetPolicy
+        , rsahsiAudioFFI            = defaultSessionFanInAudioFFI
+        , rsahsiAudioOptions        = liveAudioOptions
+        , rsahsiOwnerOptions        = defaultSessionOwnerOptions
+        , rsahsiServiceOptions      = defaultSessionFanInServiceOptions
+        , rsahsiServiceHooks        = defaultSessionFanInServiceHooks
+        , rsahsiOnEvent             =
+            \ev -> modifyIORef' reloadEvents (<> [ev])
+        }
+      producer = ProducerId
+        { producerKind = ProducerOSC
+        , producerName = T.pack "manifest-live-reload-demo"
+        }
+      ops     = realTryPreservingHostStackOps producer inputs
+      factory = mkTryPreservingHostStackFactory ops
+  mask $ \restore -> do
+    openResult <- restore (hsfOpenStack factory oldPlan)
+    case openResult of
+      Left issue ->
+        die
+          ("Supervised initial open failed: "
+            <> renderSupervisedIssue issue)
+      Right initialStack -> do
+        let initialService = mrhcService (sahsConfig initialStack)
+            initialIngressManager =
+              mrhcIngressManager (sahsConfig initialStack)
+        _outcome <-
+          withHostStackSupervisorAdapter factory initialStack $
+            \supOps -> restore $ do
+              initialVoices <-
+                autoStartTemplates "initial" initialService oldPlan
+              warnIfMissingVoices initialService initialVoices
+              printServiceSnapshot "initial fan-in" initialService
+              printIngressSnapshot initialIngressManager
+              printAddressableSurface initialService oldTarget
+              putStrLn ""
+              putStrLn "  Audio is running. Send OSC to the initial surface,"
+              putStrLn "  then press Enter to run the supervised reload."
+              void getLine
+              out <- reloadSupervised supOps oldPlan newPlan
+              capturedEvents <- readIORef reloadEvents
+              putStrLn ""
+              putStrLn $
+                "  supervised outcome: " <> renderSupervisedOutcomeShort out
+              putStrLn "  reload events:"
+              mapM_ putStrLn (renderLiveReloadEvents capturedEvents)
+              case out of
+                SupervisedReloadCommitted -> do
+                  -- Same stack value, new plan running. Snapshot
+                  -- reads off the original stack are safe whether
+                  -- the commit came from preserving or from the
+                  -- stopped-audio fallback path (both leave the
+                  -- stack live).
+                  afterReload <-
+                    readSessionFanInService initialService
+                  postReloadVoices <-
+                    if M.null (ssVoices (sfisOwnerState afterReload))
+                      then autoStartTemplates
+                             "post-reload"
+                             initialService
+                             newPlan
+                      else pure []
+                  warnIfMissingVoices initialService postReloadVoices
+                  printServiceSnapshot
+                    "post-reload fan-in"
+                    initialService
+                  ingressSnapshot <-
+                    readManifestReloadIngressManager initialIngressManager
+                  putStrLn $
+                    "  OSC ingress: "
+                      <> renderIngressSnapshot ingressSnapshot
+                  case ingressSnapshot of
+                    MrisOpen liveTarget _ -> do
+                      printAddressableSurface initialService liveTarget
+                      putStrLn ""
+                      putStrLn $
+                        "  Send OSC to the surface for demo="
+                          <> motDemoKey (mitOSC liveTarget)
+                          <> ", then press Enter"
+                      putStrLn
+                        "  to stop audio and close ingress."
+                    MrisClosed -> do
+                      putStrLn
+                        "  addressable OSC surface: \
+                        \(none — ingress is closed)"
+                      putStrLn
+                        "  Ingress is closed; press Enter to stop \
+                        \audio."
+                  void getLine
+                SupervisedReloadRequestRejected cause -> do
+                  -- Preserving rejected the request with a cause
+                  -- that 'preservingAllowsStoppedAudioFallback'
+                  -- declined (PlanRejected, QuiesceRejected, or
+                  -- DrainRejected after a successful resume). The
+                  -- stack is still serving the fallback plan;
+                  -- snapshots off 'initialService' are safe but
+                  -- the new plan never installed.
+                  afterReject <-
+                    readSessionFanInService initialService
+                  putStrLn ""
+                  putStrLn
+                    "  The supervised reload was rejected without \
+                    \mutating"
+                  putStrLn
+                    "  the live stack. The host is still running the \
+                    \previous"
+                  putStrLn "  plan. Cause:"
+                  putStrLn ("    " <> renderSupervisedIssue cause)
+                  printServiceSnapshot
+                    "post-reject fan-in"
+                    initialService
+                  ingressSnapshot <-
+                    readManifestReloadIngressManager initialIngressManager
+                  putStrLn $
+                    "  OSC ingress: "
+                      <> renderIngressSnapshot ingressSnapshot
+                  -- ssVoices read is best-effort for parity with
+                  -- the committed branch; we do not auto-restart
+                  -- because the old owner was never replaced.
+                  unless (M.null (ssVoices (sfisOwnerState afterReject)))
+                    (pure ())
+                  putStrLn ""
+                  putStrLn
+                    "  Press Enter to stop audio and exit."
+                  void getLine
+                SupervisedReloadRejectedRecovered cause -> do
+                  putStrLn ""
+                  putStrLn
+                    "  The supervised reload failed in-window and was \
+                    \rebuilt"
+                  putStrLn
+                    "  from the fallback plan. The host is running the \
+                    \previous"
+                  putStrLn "  plan again. In-window cause:"
+                  putStrLn ("    " <> renderSupervisedIssue cause)
+                  putStrLn ""
+                  putStrLn "  Press Enter to stop audio and exit."
+                  void getLine
+                SupervisedReloadEscalated inWindow rebuild -> do
+                  putStrLn ""
+                  putStrLn
+                    "  The supervised reload escalated: both the \
+                    \in-window"
+                  putStrLn
+                    "  reload AND the rebuild from the fallback failed."
+                  putStrLn "  In-window cause:"
+                  putStrLn ("    " <> renderSupervisedIssue inWindow)
+                  putStrLn "  Rebuild cause:"
+                  putStrLn ("    " <> renderSupervisedIssue rebuild)
+                  putStrLn ""
+                  putStrLn
+                    "  No live stack remains; press Enter to exit."
+                  void getLine
+        pure ()
+  where
+    renderSupervisedOutcomeShort = \case
+      SupervisedReloadCommitted ->
+        "committed (new plan installed)"
+      SupervisedReloadRequestRejected _ ->
+        "request-rejected (stack still on fallback plan)"
+      SupervisedReloadRejectedRecovered _ ->
+        "rejected-recovered (rebuilt from fallback)"
+      SupervisedReloadEscalated _ _ ->
+        "escalated (no live stack)"
+
+    renderSupervisedIssue
+      :: TryPreservingHostStackIssue ManifestOSCIngressOpsIssue
+      -> String
+    renderSupervisedIssue = show
 
 
 readManifestDocOrDie :: FilePath -> IO AuthoringManifestDoc

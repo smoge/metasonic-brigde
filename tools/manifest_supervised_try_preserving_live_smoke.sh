@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Opt-in operator smoke for the supervised
-# --manifest-live-reload-demo stopped-audio-only route.
+# --manifest-live-reload-demo try-preserving route.
 #
 # This script is intentionally NOT a default CI gate. It opens
 # real PortAudio and binds a real UDP socket; it must run on a
@@ -9,13 +9,22 @@
 # device, etc.). Default CI gates live in `just check-offline`
 # and stay deterministic / device-free.
 #
+# Counterpart to tools/manifest_supervised_live_smoke.sh which
+# exercises the stopped-audio supervised route. The two
+# wrappers are intentionally separate (not parametrized) so a
+# regression on one route's marker set cannot mask the other's,
+# and so transcript / probe-log artifacts do not collide when
+# both smokes run in sequence.
+#
 # What this smoke does:
 #
 #   1. Confirms the configured UDP port is currently free.
 #   2. Launches `metasonic-bridge --manifest-live-reload-demo
-#      stopped-audio-only` against the configured manifest +
-#      demo pair, with stdin from a fifo so the wrapper can
-#      drive the two interactive Enter prompts.
+#      try-preserving` against the configured manifest + demo
+#      pair (default the blessed preserve-cutoff fixture, where
+#      preserving commits without stopped-audio fallback), with
+#      stdin from a fifo so the wrapper can drive the two
+#      interactive Enter prompts.
 #   3. Waits for the first "press Enter to run the supervised
 #      reload" prompt, injects an OSC write to /v0/lpf/0, then
 #      sends Enter to trigger the supervised reload.
@@ -29,32 +38,34 @@
 #        * an active Python `socket.bind(('localhost', PORT))`
 #          probe that exits 0 only on a successful rebind.
 #
-# Marker checks at the end verify the six acceptance markers
-# the slice-2 runbook
-# (notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)
-# names: supervised route selected; real audio + ingress;
-# pre-reload OSC accept; stopped-audio phase ran under the
-# supervisor; post-reload ingress targets the new demo + OSC
+# Marker checks at the end verify the supervised try-preserving
+# route's acceptance markers: supervised try-preserving route
+# selected (specific route-line rendering, distinct from
+# stopped-audio); real audio + ingress; pre-reload OSC accept;
+# preserving phase started AND committed under the supervisor
+# (NOT stopped-audio phase — that's the stopped-audio route's
+# fingerprint); post-reload ingress targets the new demo + OSC
 # accept; cleanup releases resources. The script exits 0 only
 # if every marker is observed.
 #
 # Configurable env vars (also accessible via `just
-# manifest-supervised-live-smoke port=N`):
+# manifest-supervised-try-preserving-live-smoke port=N`):
 #
-#   PORT       UDP port for OSC ingress (default 17001).
-#              17001 instead of the operator default 7001 so a
-#              stuck smoke does not collide with an everyday
-#              workspace.
+#   PORT       UDP port for OSC ingress (default 17002).
+#              17002 instead of 17001 so this smoke does not
+#              collide with a concurrent stopped-audio smoke or
+#              its leftover post-exit state.
 #   MANIFEST   Manifest fixture path (default
 #              examples/manifests/preserve-cutoff.json — the
-#              blessed slice-2 fixture).
+#              blessed fixture; preserving commits without
+#              fallback).
 #   OLD_DEMO   Initial demo key (default preserve-cutoff-dark).
 #   NEW_DEMO   Target demo key (default preserve-cutoff-bright).
 #   WORK_DIR   Where to put transcript + probe-log artifacts
 #              (default $TMPDIR or /tmp).
 #
 # Exit codes:
-#   0  all six acceptance markers observed
+#   0  every acceptance marker observed
 #   1  pre-flight failed, the demo did not produce the
 #      expected output within the per-prompt timeout, the
 #      post-exit probes failed, or at least one marker was
@@ -66,15 +77,15 @@
 
 set -u
 
-PORT="${PORT:-17001}"
+PORT="${PORT:-17002}"
 MANIFEST="${MANIFEST:-examples/manifests/preserve-cutoff.json}"
 OLD_DEMO="${OLD_DEMO:-preserve-cutoff-dark}"
 NEW_DEMO="${NEW_DEMO:-preserve-cutoff-bright}"
 
 WORK_DIR="${WORK_DIR:-${TMPDIR:-/tmp}}"
-TRANSCRIPT="$WORK_DIR/manifest-supervised-live-transcript.txt"
-PROBE_LOG="$WORK_DIR/manifest-supervised-live-probe.txt"
-STDIN_FIFO="$WORK_DIR/manifest-supervised-live-stdin"
+TRANSCRIPT="$WORK_DIR/manifest-supervised-try-preserving-live-transcript.txt"
+PROBE_LOG="$WORK_DIR/manifest-supervised-try-preserving-live-probe.txt"
+STDIN_FIFO="$WORK_DIR/manifest-supervised-try-preserving-live-stdin"
 
 # tools/send_osc.py is the project's existing OSC sender (used
 # by the osc-send / osc-arbitration recipes too). Using it here
@@ -103,7 +114,7 @@ mkfifo "$STDIN_FIFO"
 exec 3<>"$STDIN_FIFO"
 
 cat <<EOF
-=== manifest-supervised-live-smoke ===
+=== manifest-supervised-try-preserving-live-smoke ===
 port:        $PORT
 manifest:    $MANIFEST
 old demo:    $OLD_DEMO
@@ -142,7 +153,7 @@ fi
 
 stdbuf -oL -eL stack exec -- metasonic-bridge \
   --session-osc-port "$PORT" \
-  --manifest-live-reload-demo stopped-audio-only \
+  --manifest-live-reload-demo try-preserving \
   "$MANIFEST" \
   "$OLD_DEMO" "$NEW_DEMO" \
   < "$STDIN_FIFO" \
@@ -286,8 +297,8 @@ check_marker() {
   fi
 }
 
-check_marker "1.  supervised route selected" \
-  "$TRANSCRIPT" "route: supervised (stopped-audio; reloadSupervised + HostStackFactory)"
+check_marker "1.  supervised try-preserving route selected" \
+  "$TRANSCRIPT" "route: supervised (try-preserving; reloadSupervised + HostStackFactory)"
 check_marker "2a. audio running" \
   "$TRANSCRIPT" "audio running: yes"
 check_marker "2b. OSC ingress bound on configured port" \
@@ -296,10 +307,10 @@ check_marker "3.  pre-reload OSC accept (value=0.75)" \
   "$TRANSCRIPT" "value=0.75"
 check_marker "4a. supervised outcome committed" \
   "$TRANSCRIPT" "supervised outcome: committed (new plan installed)"
-check_marker "4b. stopped-audio phase started" \
-  "$TRANSCRIPT" "stopped-audio phase started"
-check_marker "4c. stopped-audio phase committed" \
-  "$TRANSCRIPT" "stopped-audio phase committed"
+check_marker "4b. preserving phase started" \
+  "$TRANSCRIPT" "preserving phase started"
+check_marker "4c. preserving phase committed" \
+  "$TRANSCRIPT" "preserving phase committed"
 check_marker "5a. post-reload ingress on new demo" \
   "$TRANSCRIPT" "OSC ingress: open demo=$NEW_DEMO"
 check_marker "5b. post-reload OSC accept (value=0.25)" \

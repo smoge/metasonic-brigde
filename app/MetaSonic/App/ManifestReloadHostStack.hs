@@ -17,10 +17,15 @@
 -- the runbook at @notes/2026-05-19-b-manifest-host-reload-
 -- smoke-runbook.md@). The @StoppedAudioOnly@ strategy now
 -- dispatches through this factory + 'reloadSupervised' in
--- both operator-facing entrypoints. @RequirePreserving@ and
--- @TryPreservingThenStoppedAudio@ stay on the direct
--- 'reloadManifestHostWithStrategy' path; migrating them is
--- its own slice and opens against the evidence bar in
+-- both operator-facing entrypoints.
+-- @TryPreservingThenStoppedAudio@ uses the sibling
+-- "MetaSonic.App.ManifestReloadTryPreservingHostStack" factory,
+-- which composes the preserving in-window helper with
+-- 'realStoppedAudioInWindowReload' from this module under the
+-- existing 'preservingAllowsStoppedAudioFallback' gate.
+-- @RequirePreserving@ stays on the direct
+-- 'reloadManifestHostWithStrategy' path; migrating it is its
+-- own slice and opens against the evidence bar in
 -- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
 --
 -- The 'StoppedAudioHostStack' newtype wraps the per-active

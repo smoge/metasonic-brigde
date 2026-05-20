@@ -49,11 +49,14 @@
 -- events 'MreFallbackAdmitted' and 'MreFallbackDeclined' because
 -- the decision is local to the in-window composition.
 --
--- Routing: 'selectLiveReloadRoute' still maps
--- @TryPreservingThenStoppedAudio@ to the direct path. The flip
--- onto this factory lands in the step-4 slice, gated on tier-2
--- marker-clean runs per
--- notes\/2026-05-20-a-supervised-route-tier3-decision.md.
+-- Routing: 'selectLiveReloadRoute' maps
+-- @TryPreservingThenStoppedAudio@ to the supervised lifecycle
+-- backed by this factory; the flip landed alongside the tier-2
+-- evidence captured for the new route. The @--manifest-host-
+-- reload-smoke@ CLI smoke at "MetaSonic.App.ManifestReloadCli"
+-- still dispatches @TryPreservingThenStoppedAudio@ through the
+-- direct path — that CLI is non-device and the cost of migrating
+-- it is not on the critical path for the audible-route work.
 module MetaSonic.App.ManifestReloadTryPreservingHostStack
   ( -- * Types
     TryPreservingHostStack
