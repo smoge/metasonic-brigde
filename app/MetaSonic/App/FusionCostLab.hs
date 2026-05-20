@@ -126,8 +126,8 @@ import           MetaSonic.App.FusionCostModel
                                              shapeKeyOf, variantName)
 import qualified MetaSonic.Pattern.Corpus   as Corpus
 
-import           MetaSonic.Types            (NodeIndex, NodeKind (..),
-                                             kindLatency)
+import           MetaSonic.Bridge.Compile.Latency (nodeDeclaredLatency)
+import           MetaSonic.Types            (NodeIndex, NodeKind (..))
 
 
 ------------------------------------------------------------
@@ -545,7 +545,7 @@ extractFeatures rg =
                          (map rrFootprint regions)
       busFp      = rfBuses resources
       bufFp      = rfBuffers resources
-      latencies  = [ lat | n <- nodes, Just lat <- [kindLatency (rnKind n)] ]
+      latencies  = [ lat | n <- nodes, Just lat <- [nodeDeclaredLatency n] ]
       consumers  = map rnConsumerCount nodes
       fanouts    = length [ () | n <- nodes, rnConsumerCount n > 1 ]
   in FusionCaseFeatures

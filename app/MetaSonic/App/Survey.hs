@@ -2206,7 +2206,7 @@ renderEdgeRateRow (sr, pp, b) =
 -- decision evidence.
 printDeclaredLatency :: [SurveyRow] -> IO ()
 printDeclaredLatency rows = do
-  putStrLn "─── Declared-latency footprint (§6.D, kindLatency-bearing nodes) ───"
+  putStrLn "─── Declared-latency footprint (§6.D / §6.E, declared per node) ───"
   let entries =
         [ (srDemo r, srTemplate r, d)
         | r <- rows

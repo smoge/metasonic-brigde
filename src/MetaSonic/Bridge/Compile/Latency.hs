@@ -6,15 +6,19 @@
 -- Module      : MetaSonic.Bridge.Compile.Latency
 -- Description : Descriptive declared-latency analysis for RuntimeGraph.
 --
--- This module is deliberately read-only. It consumes the existing
--- 'kindLatency' metadata on compiled 'RuntimeGraph's and reports where
--- inherent node latency appears. No scheduler pass consumes the result
--- in 6.D; compensation remains a later decision.
+-- This module is deliberately read-only. It consumes
+-- 'nodeDeclaredLatency', which is per-instance for 'KStaticPlugin'
+-- (consulting the plugin catalog through the frozen @plugin_id@ in
+-- 'rnControls') and kind-level via 'kindLatency' for every other
+-- kind. It reports where inherent node latency appears. No scheduler
+-- pass consumes the result in 6.D / 6.E; compensation remains a
+-- later decision.
 
 module MetaSonic.Bridge.Compile.Latency
   ( DeclaredNodeLatency (..)
   , InputLatency (..)
   , LatencySkew (..)
+  , nodeDeclaredLatency
   , declaredLatencyFootprint
   , nodeOutputLatencies
   , inputLatencySkews
@@ -22,10 +26,12 @@ module MetaSonic.Bridge.Compile.Latency
 
 import           Control.DeepSeq     (NFData)
 import qualified Data.Map.Strict     as M
-import           Data.Maybe          (mapMaybe)
+import           Data.Maybe          (listToMaybe, mapMaybe)
 import           GHC.Generics        (Generic)
 
 import           MetaSonic.Bridge.Compile.Types
+import           MetaSonic.Bridge.Source (finitePluginId, spiLatencySamples,
+                                         staticPluginInfoById)
 import           MetaSonic.Types
 
 -- | One compiled node whose kind declares inherent steady-state
@@ -58,13 +64,41 @@ data LatencySkew = LatencySkew
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
--- | Every node in the graph whose 'NodeKind' advertises inherent
--- latency through 'kindLatency'.
+-- | Per-instance declared latency for a 'RuntimeNode'.
+--
+-- For 'KStaticPlugin', resolves the frozen @plugin_id@ from
+-- @rnControls@ through the catalog: a positive @spiLatencySamples@
+-- becomes 'Just', and zero stays 'Nothing'. For every other kind,
+-- defers to 'kindLatency'.
+--
+-- The "zero latency is reported as 'Nothing', not 'Just 0'"
+-- invariant matches 'kindLatency', so existing consumers can swap
+-- to this accessor without re-shaping their filter logic. An
+-- unresolvable plugin_id (empty controls, non-finite, out-of-range
+-- value, or missing catalog row) returns 'Nothing'.
+nodeDeclaredLatency :: RuntimeNode -> Maybe Int
+nodeDeclaredLatency n =
+  case rnKind n of
+    KStaticPlugin -> do
+      pidD <- listToMaybe (rnControls n)
+      pid  <- finitePluginId pidD
+      info <- staticPluginInfoById pid
+      let lat = spiLatencySamples info
+      if lat > 0 then Just lat else Nothing
+    other -> kindLatency other
+
+-- | Every node in the graph whose declared latency is positive.
+--
+-- Latency for 'KStaticPlugin' is per-instance (catalog row keyed
+-- by the node's frozen @plugin_id@); kind-level for every other
+-- kind. The trailing @lat > 0@ filter is redundant under
+-- 'nodeDeclaredLatency' (which itself returns 'Nothing' for zero)
+-- but stays as a belt-and-suspenders guard.
 declaredLatencyFootprint :: RuntimeGraph -> [DeclaredNodeLatency]
 declaredLatencyFootprint rg =
   [ DeclaredNodeLatency (rnIndex n) (rnKind n) lat
   | n <- rgNodes rg
-  , Just lat <- [kindLatency (rnKind n)]
+  , Just lat <- [nodeDeclaredLatency n]
   , lat > 0
   ]
 
@@ -81,7 +115,7 @@ nodeOutputLatencies rg =
     step acc n =
       let inputLats = map ilLatency (dynamicInputLatencies acc n)
           upstream  = if null inputLats then 0 else maximum inputLats
-          own       = maybe 0 id (kindLatency (rnKind n))
+          own       = maybe 0 id (nodeDeclaredLatency n)
       in M.insert (rnIndex n) (upstream + own) acc
 
 -- | Nodes whose dynamic inputs arrive at different cumulative
