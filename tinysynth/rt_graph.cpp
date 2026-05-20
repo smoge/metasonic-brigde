@@ -5674,13 +5674,16 @@ static void process_static_plugin(
   };
   float *outputs[1] = {out.data()};
 
-  // The plugin state pointer is null for v1 Identity (state_size_bytes = 0).
-  // Stateful plugins will plumb a per-instance state buffer through
-  // StaticPluginState in a later slice; for now, the contract is "process never
-  // reads through a null state when the spec declared zero state bytes."
-  const int rc = st->spec->process(
-      /*state=*/nullptr, nframes, inputs, outputs
-  );
+  // Phase 6.E v2 §4.4: stateful plugins receive a pointer to their
+  // host-owned, zero-initialized per-instance storage; Identity
+  // (state_size_bytes = 0) keeps the nullptr branch so its
+  // audio-thread behavior stays bit-equivalent to v1. spec->init is
+  // intentionally never called in v2 — a plugin whose correct
+  // initial state is anything other than all-zeros is blocked on
+  // the init-seam follow-up (notes/2026-05-19-d §4 / §9 Q-4).
+  void *state_ptr =
+      (st->spec->state_size_bytes > 0) ? st->storage.data() : nullptr;
+  const int rc = st->spec->process(state_ptr, nframes, inputs, outputs);
 
   ++g.plugin_call_count;
 
