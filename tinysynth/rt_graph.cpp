@@ -887,11 +887,10 @@ struct StaticPluginState {
   // zero-valid and implicit-lifetime / trivially copyable, so a
   // zero-initialized blob is the correct initial value.
   //
-  // This prep slice only declares the storage. The dispatcher
-  // change in `process_static_plugin` that actually passes
-  // `&storage[0]` to `spec->process` (instead of the current
-  // unconditional `nullptr`) lands in the follow-up slice that
-  // also adds the one-tap-delay plugin TU.
+  // `process_static_plugin` passes `storage.data()` to
+  // `spec->process` when `spec->state_size_bytes > 0`, and keeps
+  // `nullptr` for zero-state plugins (Identity) so its
+  // audio-thread output stays bit-equivalent to v1.
   //
   // `metasonic::` qualifier matches the existing
   // `metasonic::PluginSpec` / `metasonic::plugin_at` references in

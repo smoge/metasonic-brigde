@@ -124,6 +124,10 @@ TEST_CASE("static plugin registry exposes identity") {
 TEST_CASE("static plugin registry exposes one-tap-delay") {
     const int id = rt_graph_plugin_find("one-tap-delay");
     REQUIRE(id >= 0);
+    // Contract pins plugin id 1 (identityPlugin = 0, oneTapDelayPlugin = 1)
+    // per notes/2026-05-19-d §2. The C ABI assertion is what catches
+    // registration-order drift before the Haskell catalog row lands.
+    CHECK(id == 1);
 
     const char *name = rt_graph_plugin_name(id);
     REQUIRE(name != nullptr);
@@ -133,6 +137,48 @@ TEST_CASE("static plugin registry exposes one-tap-delay") {
     CHECK(rt_graph_plugin_latency_samples(id) == 1);
     CHECK(rt_graph_plugin_state_size_bytes(id) > 0);
     CHECK(rt_graph_plugin_state_size_bytes(id) <= metasonic::kMaxPluginState);
+}
+
+// Phase 6.E v2 §4.4 dispatch smoke. The registry and bounds-check
+// tests above validate metadata — they don't exercise the runtime
+// branch at rt_graph.cpp `process_static_plugin` that picks
+// `st->storage.data()` over nullptr when `state_size_bytes > 0`.
+// If that branch regressed back to `state = nullptr`,
+// one_tap_delay_process would hit its `state == nullptr` guard,
+// return 1, and tick `invalid_plugin_call_count` — but every
+// metadata test would still pass. This smoke proves the dispatch
+// succeeded by asserting `plugin_call_count == 1` together with
+// `invalid_plugin_call_count == 0`.
+TEST_CASE("KStaticPlugin dispatch passes storage pointer for stateful plugins") {
+    const int one_tap_id = rt_graph_plugin_find("one-tap-delay");
+    REQUIRE(one_tap_id >= 0);
+
+    auto *g = rt_graph_create(/*capacity*/ 2, /*max_frames*/ 16);
+    REQUIRE(g != nullptr);
+
+    // Add a KStaticPlugin node (tag 23) to template 0 (the auto-created
+    // template) and freeze its plugin_id metadata via the template-level
+    // default *before* spawning the instance — init_node_state reads
+    // spec.default_controls[0] at instance reset and freezes the spec
+    // pointer on StaticPluginState.
+    rt_graph_template_add_node(g, /*template_id*/ 0, /*node_index*/ 0,
+                               /*kind=KStaticPlugin*/ 23);
+    rt_graph_template_set_default(g, /*template_id*/ 0, /*node_index*/ 0,
+                                  /*control_index*/ 0,
+                                  static_cast<double>(one_tap_id));
+    const int slot = rt_graph_template_instance_add(g, /*template_id*/ 0);
+    REQUIRE(slot >= 0);
+
+    // One block, unwired inputs. one_tap_delay_process treats null
+    // inputs as zero (null-as-zero contract, §2), so the only way for
+    // it to fail and tick invalid_plugin_call_count is the null-state
+    // guard — which only fires if the dispatcher passed state=nullptr.
+    rt_graph_process(g, /*nframes*/ 16);
+
+    CHECK(rt_graph_test_plugin_call_count(g) == 1);
+    CHECK(rt_graph_test_invalid_plugin_call_count(g) == 0);
+
+    rt_graph_destroy(g);
 }
 
 // Phase 6.E v2 §5 test #13: register_plugin enforces
