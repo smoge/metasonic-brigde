@@ -304,7 +304,7 @@ oneTapDelayPluginTests = testGroup "Phase 6.E v2: one-tap-delay plugin"
       finitePluginId 1                     @?= Just 1
       finitePluginId (0 / 0)               @?= Nothing  -- NaN
       finitePluginId (1 / 0)               @?= Nothing  -- +Inf
-      finitePluginId (-1 / 0)              @?= Nothing  -- -Inf
+      finitePluginId (- (1 / 0))           @?= Nothing  -- -Inf
       finitePluginId (-1)                  @?= Nothing
       finitePluginId 0.5                   @?= Nothing
       finitePluginId 1.5                   @?= Nothing
@@ -486,6 +486,15 @@ oneTapDelayPluginTests = testGroup "Phase 6.E v2: one-tap-delay plugin"
           [ if i == nframes - 1 then 1.0 else 0.0 | i <- [0 .. nframes - 1] ]
         slotB <- c_rt_graph_template_instance_add rt 0
         assertBool "second voice spawned" (slotB >= 0)
+        -- The graph only declares busOut 0, so the loader's
+        -- bus-pool sizing pass only grew the server up to bus 0.
+        -- rt_graph_instance_set_control mutates the per-instance
+        -- control but does not resize the bus pool; without an
+        -- explicit ensure-bus, voice B's writes would land in a
+        -- non-existent bus and rt_graph_read_bus would return 0
+        -- samples — which 'readBus' now catches via its
+        -- "wrote == n" assertion.
+        c_rt_graph_ensure_bus rt 1
         -- busOut sits at the last node index; its control 0 is the
         -- destination bus. Override only voice B so the two voices
         -- write to distinct buses.
@@ -552,11 +561,18 @@ oneTapDelayPluginTests = testGroup "Phase 6.E v2: one-tap-delay plugin"
     totalNodes tg =
       sum (map (length . rgNodes . tplGraph) (tgTemplates tg))
 
+    -- | Read exactly @n@ samples from a bus. Asserts the read count
+    -- equals @n@: c_rt_graph_read_bus returns 0 for a bus that
+    -- doesn't exist, which would otherwise let a test silently see
+    -- the caller's zero-initialized scratch buffer instead of the
+    -- bus's actual contents — a false negative on any "bus N is
+    -- silent" assertion.
     readBus :: Ptr RTGraph -> Int -> Int -> IO [Float]
     readBus rt bus n =
       allocaBytes (n * 4) $ \bp -> do
-        _ <- c_rt_graph_read_bus rt (fromIntegral bus)
-                                    (fromIntegral n) (castPtr bp)
+        wrote <- c_rt_graph_read_bus rt (fromIntegral bus)
+                                        (fromIntegral n) (castPtr bp)
+        wrote @?= fromIntegral n
         xs <- peekArray n (bp :: Ptr CFloat)
         pure [ x | CFloat x <- xs ]
 

@@ -191,10 +191,12 @@ data Connection
 
 -- | Symbolic reference to a statically registered plugin.
 --
--- The fixed §6.E slice exposes only 'identityPlugin' through the
--- builder path, but the constructor is kept visible so validation can
--- reject unknown names deliberately instead of making "only known
--- values are constructible" the whole contract.
+-- The §6.E plugin catalog ('staticPluginCatalog') is the source of
+-- truth for which references the builder path accepts; today that's
+-- 'identityPlugin' and 'oneTapDelayPlugin'. The constructor is kept
+-- visible so validation can reject unknown names deliberately
+-- instead of making "only known values are constructible" the whole
+-- contract.
 newtype PluginRef = PluginRef
   { pluginRefName :: String
   } deriving stock    (Eq, Ord, Show, Generic)
@@ -715,13 +717,15 @@ data UGen
     -- model. Declared steady-state latency: N=1024 samples
     -- ('kindLatency').
   | StaticPlugin !PluginRef !Connection !Connection
-    -- ^ Fixed-shape static plugin host (§6.E slice 1).
-    -- The first profile is 'identityPlugin': two audio
-    -- inputs, one audio output, and no plugin parameters.
-    -- The plugin reference lowers to the frozen host
-    -- metadata control @plugin_id@ in control slot 0. The
-    -- fixed v1 profile is @[Pure]@ and declares no inherent
-    -- latency.
+    -- ^ Fixed-shape static plugin host (§6.E).
+    -- Every catalog row has the same arity: two audio
+    -- inputs, one audio output, no plugin parameters.
+    -- Per-plugin facts — declared latency, effects — live on
+    -- the 'StaticPluginInfo' row in 'staticPluginCatalog' and
+    -- are surfaced to the compiler through 'inferEff' and
+    -- 'nodeDeclaredLatency'. The 'PluginRef' lowers to the
+    -- frozen host metadata control @plugin_id@ in control
+    -- slot 0.
   | SpectralLpf !Connection !Connection
     -- ^ Mono STFT brick-wall lowpass (§6.D second kind).
     -- Reuses every piece of the 'SpectralFreeze' windowing
@@ -1304,14 +1308,17 @@ spectralLpf signalIn cutoffHz =
   insertNodeC "spectralLpf"
     (SpectralLpf signalIn cutoffHz)
 
--- | Allocate a fixed-shape 'StaticPlugin' node (§6.E slice 1).
+-- | Allocate a fixed-shape 'StaticPlugin' node (§6.E).
 --
--- The current profile is 'identityPlugin': two audio inputs, one
--- output, no plugin parameters, no inherent latency, and @[Pure]@
--- effects. The 'PluginRef' is compiled to a frozen @plugin_id@
--- control slot. Unknown references are rejected by validation before
--- lowering; the runtime never resolves plugin names on the audio
--- thread.
+-- Every catalog row has the same arity: two audio inputs, one
+-- output, no plugin parameters. Per-plugin facts — declared
+-- latency, effects — come from the 'StaticPluginInfo' row in
+-- 'staticPluginCatalog'; today that's 'identityPlugin'
+-- (zero-latency, @[Pure]@) and 'oneTapDelayPlugin' (one-sample
+-- latency, @[Pure]@). The 'PluginRef' lowers to a frozen
+-- @plugin_id@ control slot. Unknown references are rejected by
+-- validation before lowering; the runtime never resolves plugin
+-- names on the audio thread.
 staticPlugin
   :: PluginRef
   -> Connection  -- ^ input 0
