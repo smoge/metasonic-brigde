@@ -17,10 +17,13 @@ import           Data.List                              (isInfixOf)
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
+import           MetaSonic.App.ManifestLiveReloadDemo   (LiveReloadRoute (..),
+                                                         selectLiveReloadRoute)
 import           MetaSonic.App.ManifestReloadCli        (renderHostPreservingIssueTag,
                                                          renderHostStoppedAudioIssueTag,
                                                          renderStrategyRan)
-import           MetaSonic.App.ManifestReloadHost       (ManifestReloadHostStrategyRan (..))
+import           MetaSonic.App.ManifestReloadHost       (ManifestReloadHostStrategy (..),
+                                                         ManifestReloadHostStrategyRan (..))
 import           MetaSonic.App.ManifestReloadOrchestration
                                                         (HostPreservingReloadIssue (..),
                                                          HostStoppedAudioReloadIssue (..))
@@ -58,6 +61,31 @@ appManifestLiveReloadDemoRenderTests =
           line = renderStrategyRan ran
       assertNoLeak line
       assertShortLine 300 line
+
+    -- §219 slice 4 routing: the audible
+    -- @--manifest-live-reload-demo@ now dispatches the
+    -- 'StoppedAudioOnly' strategy through the supervised
+    -- lifecycle (factory + adapter + 'reloadSupervised').
+    -- Preserving and TryPreservingThenStoppedAudio stay on the
+    -- direct path while the supervised stopped-audio route
+    -- accumulates hardware exercise.
+    --
+    -- 'selectLiveReloadRoute' is a pure selector. Pinning each
+    -- strategy's route here catches a class of regressions
+    -- where a refactor silently changes which strategies use
+    -- the supervised lifecycle, without staging real audio or
+    -- depending on hardware. The actual audible behavior of
+    -- the supervised path is gated on the operator running the
+    -- demo manually per the slice-2 runbook.
+
+  , testCase "selectLiveReloadRoute StoppedAudioOnly dispatches through the supervised lifecycle"
+      $ selectLiveReloadRoute StoppedAudioOnly @?= LiveReloadSupervised
+
+  , testCase "selectLiveReloadRoute RequirePreserving stays on the direct path"
+      $ selectLiveReloadRoute RequirePreserving @?= LiveReloadDirect
+
+  , testCase "selectLiveReloadRoute TryPreservingThenStoppedAudio stays on the direct path"
+      $ selectLiveReloadRoute TryPreservingThenStoppedAudio @?= LiveReloadDirect
   ]
 
 -- | Carried-issue stand-in: a payload whose textual content includes

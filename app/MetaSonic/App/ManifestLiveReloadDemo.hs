@@ -1,3 +1,6 @@
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE LambdaCase         #-}
+
 -- |
 -- Module      : MetaSonic.App.ManifestLiveReloadDemo
 -- Description : Experimental audible manifest reload demo.
@@ -16,10 +19,12 @@
 
 module MetaSonic.App.ManifestLiveReloadDemo
   ( runManifestLiveReloadDemo
+  , LiveReloadRoute (..)
+  , selectLiveReloadRoute
   ) where
 
 import           Control.Concurrent             (threadDelay)
-import           Control.Exception              (finally)
+import           Control.Exception              (finally, mask)
 import           Control.Monad                  (forM, forM_, unless, void)
 import           Data.IORef                     (modifyIORef', newIORef,
                                                  readIORef)
@@ -61,8 +66,20 @@ import           MetaSonic.App.ManifestReloadEvent
 import           MetaSonic.App.ManifestReloadHost
                                                 (ManifestReloadHostConfig (..),
                                                  ManifestReloadHostIssue,
-                                                 ManifestReloadHostStrategy,
+                                                 ManifestReloadHostStrategy (..),
                                                  reloadManifestHostWithStrategyWithEvents)
+import           MetaSonic.App.ManifestReloadHostStack
+                                                (RealStoppedAudioHostStackInputs (..),
+                                                 StoppedAudioHostStack (..),
+                                                 StoppedAudioHostStackIssue,
+                                                 mkStoppedAudioHostStackFactory,
+                                                 realStoppedAudioHostStackOps)
+import           MetaSonic.App.ManifestReloadSupervisor
+                                                (SupervisedReloadOutcome (..),
+                                                 reloadSupervised)
+import           MetaSonic.App.ManifestReloadSupervisorAdapter
+                                                (HostStackFactory (..),
+                                                 withHostStackSupervisorAdapter)
 import           MetaSonic.App.ManifestReloadIngress
                                                 (ManifestReloadIngressManager,
                                                  ManifestReloadIngressOps (..),
@@ -96,6 +113,7 @@ import           MetaSonic.Session.FanIn        (SessionFanInAudioOptions (..),
                                                  startSessionFanInHostAudioWith,
                                                  stopSessionFanInHostAudioWith)
 import           MetaSonic.Session.FanInService (SessionFanInService,
+                                                 defaultSessionFanInServiceHooks,
                                                  defaultSessionFanInServiceOptions,
                                                  enqueueSessionFanInServiceCommand,
                                                  readSessionFanInService,
@@ -110,6 +128,40 @@ import           MetaSonic.Session.Queue        (ProducerId (..),
                                                  QueuedSessionCommand (..),
                                                  SessionEnqueueResult (..))
 import           MetaSonic.Session.State        (SessionState (..))
+
+
+-- | Which live-reload path drives the audible reload demo for
+-- a given strategy.
+--
+-- 'StoppedAudioOnly' now goes through the supervised stack
+-- (factory + adapter + 'reloadSupervised'), the same lifecycle
+-- the @--manifest-host-reload-smoke@ CLI smoke uses. Preserving
+-- and 'TryPreservingThenStoppedAudio' stay on the existing
+-- direct path until the supervised stopped-audio route has
+-- accumulated hardware exercise. Selection is pure so it can
+-- be exercised by deterministic tests without staging real
+-- audio.
+data LiveReloadRoute
+  = LiveReloadDirect
+    -- ^ Drive 'reloadManifestHostWithStrategyWithEvents'
+    -- against a 'ManifestReloadHostConfig' opened by this
+    -- module. Used for 'RequirePreserving' and
+    -- 'TryPreservingThenStoppedAudio'.
+  | LiveReloadSupervised
+    -- ^ Drive 'reloadSupervised' under
+    -- 'withHostStackSupervisorAdapter' against a stack opened
+    -- by 'realStoppedAudioHostStackOps'. Used for
+    -- 'StoppedAudioOnly'.
+  deriving stock (Eq, Show)
+
+
+-- | Pure selector mapping each strategy to the live-reload
+-- path it dispatches through.
+selectLiveReloadRoute :: ManifestReloadHostStrategy -> LiveReloadRoute
+selectLiveReloadRoute strategy = case strategy of
+  StoppedAudioOnly              -> LiveReloadSupervised
+  RequirePreserving             -> LiveReloadDirect
+  TryPreservingThenStoppedAudio -> LiveReloadDirect
 
 
 -- | Run an experimental audible manifest reload demo.
@@ -133,10 +185,13 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
   oldTarget <- targetOrDie oldPlan
   newTarget <- targetOrDie newPlan
 
+  let route = selectLiveReloadRoute strategy
+
   putStrLn "Manifest live reload demo (experimental)."
   putStrLn ""
   putStrLn $ "  manifest path: " <> manifestPath
   putStrLn $ "  strategy: " <> renderManifestReloadHostStrategy strategy
+  putStrLn $ "  route: " <> renderLiveReloadRoute route
   putStrLn $ "  initial demo: " <> demoKey oldDemo
   putStrLn $ "  target demo: " <> demoKey newDemo
   putStrLn "  normal demo path: unchanged"
@@ -149,6 +204,48 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
   putStrLn "  strategy selector. It is still opt-in and experimental."
   putStrLn ""
   hFlush stdout
+
+  case route of
+    LiveReloadSupervised ->
+      runSupervisedLiveReload
+        listenerCfg
+        oldPlan newPlan
+        oldTarget newTarget
+        oldDemo newDemo
+    LiveReloadDirect ->
+      runDirectLiveReloadBody
+        strategy
+        listenerCfg
+        doc catalog
+        oldPlan newPlan
+        oldTarget newTarget
+        oldDemo newDemo
+
+
+renderLiveReloadRoute :: LiveReloadRoute -> String
+renderLiveReloadRoute = \case
+  LiveReloadDirect     -> "direct (reloadManifestHostWithStrategy)"
+  LiveReloadSupervised ->
+    "supervised (reloadSupervised + HostStackFactory)"
+
+
+-- | Direct-path body extracted unchanged from the original
+-- 'runManifestLiveReloadDemo' so the existing preserving and
+-- try-preserving behavior is preserved verbatim.
+runDirectLiveReloadBody
+  :: ManifestReloadHostStrategy
+  -> ListenerConfig
+  -> AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> MR.ManifestReloadPlan
+  -> MR.ManifestReloadPlan
+  -> ManifestReloadIngressTarget
+  -> ManifestReloadIngressTarget
+  -> Demo
+  -> Demo
+  -> IO ()
+runDirectLiveReloadBody strategy listenerCfg doc catalog
+    oldPlan newPlan oldTarget newTarget _oldDemo newDemo = do
 
   result <-
     withSessionFanInService
@@ -265,6 +362,199 @@ runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
                  putStrLn "  Press Enter to stop audio."
              void getLine)
             `finally` cleanup
+
+
+-- | Supervised live-reload body for 'StoppedAudioOnly'. Mirrors
+-- the direct-path body's interactive shape (preamble auto-start,
+-- snapshot prints, Enter prompts, post-reload snapshot prints,
+-- cleanup) but uses the production
+-- 'realStoppedAudioHostStackOps' + factory + adapter +
+-- 'reloadSupervised' lifecycle instead of opening the
+-- 'SessionFanInService' / ingress manager / audio FFI by hand.
+--
+-- Exception-safety: an outer 'mask' covers the gap between
+-- 'hsfOpenStack' returning @Right initialStack@ and
+-- 'withHostStackSupervisorAdapter' installing its bracket. The
+-- outer 'restore' is threaded inside the adapter callback so the
+-- interactive blocking calls ('getLine', 'reloadSupervised')
+-- run interruptible while still being covered by the adapter's
+-- @finally closeOps@ — a throw at any point closes the active
+-- stack before propagating.
+--
+-- Snapshot reads after 'reloadSupervised' returns are only safe
+-- on 'SupervisedReloadCommitted' (the same 'initialStack' value
+-- now runs the new plan). On 'SupervisedReloadRejectedRecovered'
+-- the original 'initialStack' has been closed by the supervisor's
+-- rebuild and post-reload snapshot reads against the closed
+-- stack would race against the just-released owner; the
+-- supervised body therefore branches and prints the outcome
+-- diagnostics for the non-committed cases instead of attempting
+-- to address them as if they were live.
+--
+-- The 'ManifestReloadIngressTarget' parameters mirror the
+-- direct path's signature so the dispatcher in
+-- 'runManifestLiveReloadDemo' can call either route with the
+-- same arguments. Only @oldTarget@ is consulted directly here
+-- (for the pre-reload addressable-surface print); @newTarget@
+-- is re-projected fresh inside 'realStoppedAudioInWindowReload'
+-- from @newPlan@ at the reload boundary, so the parameter is
+-- intentionally unused. Likewise @_newDemo@ is unused — the
+-- request payload is synthesized from @newPlan@ inside the
+-- helper.
+runSupervisedLiveReload
+  :: ListenerConfig
+  -> MR.ManifestReloadPlan
+  -> MR.ManifestReloadPlan
+  -> ManifestReloadIngressTarget
+  -> ManifestReloadIngressTarget
+  -> Demo
+  -> Demo
+  -> IO ()
+runSupervisedLiveReload listenerCfg oldPlan newPlan oldTarget _newTarget
+    _oldDemo _newDemo = do
+  reloadEvents <- newIORef []
+  let buildIngressOps host =
+        manifestOSCIngressOps
+          liveOSCListenerHooks
+          defaultOSCProducerOptions
+          host
+          listenerCfg
+      inputs = RealStoppedAudioHostStackInputs
+        { rsahsiBuildIngressOps     = buildIngressOps
+        , rsahsiIngressTargetPolicy = liveIngressTargetPolicy
+        , rsahsiAudioFFI            = defaultSessionFanInAudioFFI
+        , rsahsiAudioOptions        = liveAudioOptions
+        , rsahsiOwnerOptions        = defaultSessionOwnerOptions
+        , rsahsiServiceOptions      = defaultSessionFanInServiceOptions
+        , rsahsiServiceHooks        = defaultSessionFanInServiceHooks
+        , rsahsiOnEvent             =
+            \ev -> modifyIORef' reloadEvents (<> [ev])
+        }
+      ops     = realStoppedAudioHostStackOps inputs
+      factory = mkStoppedAudioHostStackFactory ops
+  mask $ \restore -> do
+    openResult <- restore (hsfOpenStack factory oldPlan)
+    case openResult of
+      Left issue ->
+        die
+          ("Supervised initial open failed: "
+            <> renderSupervisedIssue issue)
+      Right initialStack -> do
+        let initialService = mrhcService (sahsConfig initialStack)
+            initialIngressManager =
+              mrhcIngressManager (sahsConfig initialStack)
+        _outcome <-
+          withHostStackSupervisorAdapter factory initialStack $
+            \supOps -> restore $ do
+              initialVoices <-
+                autoStartTemplates "initial" initialService oldPlan
+              warnIfMissingVoices initialService initialVoices
+              printServiceSnapshot "initial fan-in" initialService
+              printIngressSnapshot initialIngressManager
+              printAddressableSurface initialService oldTarget
+              putStrLn ""
+              putStrLn "  Audio is running. Send OSC to the initial surface,"
+              putStrLn "  then press Enter to run the supervised reload."
+              void getLine
+              out <- reloadSupervised supOps oldPlan newPlan
+              capturedEvents <- readIORef reloadEvents
+              putStrLn ""
+              putStrLn $
+                "  supervised outcome: " <> renderSupervisedOutcomeShort out
+              putStrLn "  reload events:"
+              mapM_ putStrLn (renderLiveReloadEvents capturedEvents)
+              case out of
+                SupervisedReloadCommitted -> do
+                  -- The same 'initialStack' now runs the new plan;
+                  -- snapshots off it are still valid.
+                  afterReload <-
+                    readSessionFanInService initialService
+                  postReloadVoices <-
+                    if M.null (ssVoices (sfisOwnerState afterReload))
+                      then autoStartTemplates
+                             "post-reload"
+                             initialService
+                             newPlan
+                      else pure []
+                  warnIfMissingVoices initialService postReloadVoices
+                  printServiceSnapshot
+                    "post-reload fan-in"
+                    initialService
+                  ingressSnapshot <-
+                    readManifestReloadIngressManager initialIngressManager
+                  putStrLn $
+                    "  OSC ingress: "
+                      <> renderIngressSnapshot ingressSnapshot
+                  case ingressSnapshot of
+                    MrisOpen liveTarget _ -> do
+                      printAddressableSurface initialService liveTarget
+                      putStrLn ""
+                      putStrLn $
+                        "  Send OSC to the surface for demo="
+                          <> motDemoKey (mitOSC liveTarget)
+                          <> ", then press Enter"
+                      putStrLn
+                        "  to stop audio and close ingress."
+                    MrisClosed -> do
+                      putStrLn
+                        "  addressable OSC surface: \
+                        \(none — ingress is closed)"
+                      putStrLn
+                        "  Ingress is closed; press Enter to stop \
+                        \audio."
+                  void getLine
+                SupervisedReloadRejectedRecovered cause -> do
+                  putStrLn ""
+                  putStrLn
+                    "  The supervised reload failed in-window and was \
+                    \rebuilt"
+                  putStrLn
+                    "  from the fallback plan. The host is running the \
+                    \previous"
+                  putStrLn "  plan again. In-window cause:"
+                  putStrLn ("    " <> renderSupervisedIssue cause)
+                  putStrLn ""
+                  putStrLn "  Press Enter to stop audio and exit."
+                  void getLine
+                SupervisedReloadEscalated inWindow rebuild -> do
+                  putStrLn ""
+                  putStrLn
+                    "  The supervised reload escalated: both the \
+                    \in-window"
+                  putStrLn
+                    "  reload AND the rebuild from the fallback failed."
+                  putStrLn "  In-window cause:"
+                  putStrLn ("    " <> renderSupervisedIssue inWindow)
+                  putStrLn "  Rebuild cause:"
+                  putStrLn ("    " <> renderSupervisedIssue rebuild)
+                  putStrLn ""
+                  putStrLn
+                    "  No live stack remains; press Enter to exit."
+                  void getLine
+        -- '_outcome' is intentionally not destructured beyond
+        -- what the interactive body already printed; the
+        -- bracket's finalizer is what closes the active stack
+        -- on exit.
+        pure ()
+  where
+    renderSupervisedOutcomeShort = \case
+      SupervisedReloadCommitted ->
+        "committed (new plan installed)"
+      SupervisedReloadRejectedRecovered _ ->
+        "rejected-recovered (rebuilt from fallback)"
+      SupervisedReloadEscalated _ _ ->
+        "escalated (no live stack)"
+
+    renderSupervisedIssue
+      :: StoppedAudioHostStackIssue ManifestOSCIngressOpsIssue
+      -> String
+    renderSupervisedIssue =
+      -- Compact one-line tag. Mirrors what the CLI smoke uses
+      -- in 'renderSupervisedHostStackIssue' but kept local to
+      -- avoid pulling rendering helpers across module
+      -- boundaries.
+      show
+
 
 readManifestDocOrDie :: FilePath -> IO AuthoringManifestDoc
 readManifestDocOrDie path = do

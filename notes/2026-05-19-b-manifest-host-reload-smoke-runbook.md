@@ -462,3 +462,66 @@ remaining open polish in this arc) is a separate question.
   `manifest.json` remains developer-local scratch — adding
   committed fixtures for other smoke targets (named-control,
   send-return, …) is its own decision per smoke entrypoint.
+
+## Supervised `StoppedAudioOnly` live-reload demo (slice 2)
+
+`--manifest-live-reload-demo stopped-audio-only` now routes
+through the supervised lifecycle (factory + adapter +
+`reloadSupervised` + `realStoppedAudioHostStackOps`), the same
+machinery the `--manifest-host-reload-smoke` CLI uses. Preserving
+and `try-preserving` remain on the direct
+`reloadManifestHostWithStrategy` path until the supervised
+stopped-audio route accumulates hardware exercise.
+
+The routing decision is exposed as a pure
+`selectLiveReloadRoute :: ManifestReloadHostStrategy ->
+LiveReloadRoute` selector in
+[`MetaSonic.App.ManifestLiveReloadDemo`](../app/MetaSonic/App/ManifestLiveReloadDemo.hs)
+and pinned by three deterministic test cases in
+`MetaSonic.Spec.AppManifestLiveReloadDemoRender`. Those tests
+verify the routing decision /without/ staging real audio. The
+audible behavior below stays manual.
+
+### Manual run command
+
+```sh
+stack exec -- metasonic-bridge --manifest-live-reload-demo \
+  stopped-audio-only examples/manifests/preserve-cutoff.json \
+  preserve-cutoff-dark preserve-cutoff-bright
+```
+
+(Substitute `preserve-cutoff-dark` / `preserve-cutoff-bright`
+with any pair of demo keys present in the manifest.)
+
+### What the supervised live transcript must prove
+
+The output proves the supervised route is live (not the direct
+path) by these markers:
+
+- `  strategy: stopped-audio-only`
+- `  route: supervised (reloadSupervised + HostStackFactory)`
+  — the new `route:` line is the load-bearing signal that the
+  supervised lifecycle was selected. Its absence means the
+  direct path ran.
+- Initial OSC ingress opens on a non-zero port (audible via
+  sending OSC to `preserve-cutoff-dark`'s control surface).
+- After pressing Enter, the timeline includes the genuine
+  orchestrator events: `stopped-audio phase started`,
+  `stopped-audio phase committed`.
+- `supervised outcome: committed (new plan installed)` — the
+  supervised lifecycle's outcome line, distinct from the direct
+  path's `strategy result:` wording.
+- Post-reload OSC accepts on the `preserve-cutoff-bright`
+  surface (e.g. `/v0/lpf/0` writes are routed).
+- After the final Enter, audio stops and the OSC port is
+  released (a subsequent invocation should bind cleanly).
+
+### Real run transcript
+
+_To be appended after a successful manual run. Capture stdout
+verbatim (or the load-bearing subset that proves the markers
+above). Once landed here, the §219 slice-4 routing transitions
+from "needs hardware exercise" to "hardware-confirmed once;
+hardware-gated CI still open" in
+[ROADMAP.md](../ROADMAP.md) and
+[notes/2026-05-14-k-host-reload-supervisor.md](2026-05-14-k-host-reload-supervisor.md)._
