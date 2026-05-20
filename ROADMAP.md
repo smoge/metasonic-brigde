@@ -3596,15 +3596,29 @@ factory composition, six production-helper partial-cleanup paths
 audio-stop-throws-during-realClose), and one direct integration
 test for `realStoppedAudioInWindowReload`'s plan-native
 short-circuit.
-What remains is the routing only: wire `StoppedAudioOnly`
-(currently direct at `reloadManifestHostWithStrategy`) through
-`reloadSupervised` + `mkStoppedAudioHostStackFactory` +
-`realStoppedAudioHostStackOps`, likely with a narrow
-`SupervisedStoppedAudioReloadResult` / -Issue type so the
-supervisor's rebuild causes don't have to fit into the existing
-`ManifestReloadHostStrategyIssue`. Preserving and
-`TryPreservingThenStoppedAudio` fallback stay direct until the
-supervised stopped-audio path is stable.
+Routing landed in commit `93e755c`: the `StoppedAudioOnly` CLI
+strategy now dispatches through
+`runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig`,
+which inlines the same supervised lifecycle that the library
+`runSupervisedStoppedAudioReload` exposes (the CLI inlines so
+it can read the pre-reload ingress snapshot off the initial
+stack before the adapter takes ownership). The narrow
+`SupervisedStoppedAudioReloadResult` (committed / recovered /
+escalated, parameterized over `StoppedAudioHostStackIssue`)
+preserves the supervisor's rebuild causes through the result
+rather than collapsing into `ManifestReloadHostStrategyIssue`.
+Initial-open failures that hit the helper's
+partial-cleanup-also-failed path surface through a dedicated
+`MrciSupervisedPartialCleanupFailed` CLI variant so the
+operator sees both the primary cause AND the rollback
+diagnostic. Both the library entry and the CLI inline path
+wrap the open-to-adapter handoff in `mask` + `restore` so the
+adapter's `finally closeOps` covers any throw after the
+initial stack is in hand. Preserving and
+`TryPreservingThenStoppedAudio` fallback stay on the direct
+`reloadManifestHostWithStrategy` path; they will move only
+after the supervised stopped-audio route gets hardware
+exercise.
 The preserving-live sibling path has also landed behind explicit host
 APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
 runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`

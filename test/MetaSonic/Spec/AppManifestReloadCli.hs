@@ -3,6 +3,7 @@ module MetaSonic.Spec.AppManifestReloadCli where
 
 import qualified Data.ByteString.Lazy.Char8       as BL
 import           Data.Char                        (isDigit)
+import qualified Data.Text                        as T
 import           Data.List                        (isInfixOf, stripPrefix)
 
 import           Test.Tasty
@@ -160,8 +161,11 @@ appManifestReloadCliTests =
              <> renderManifestReloadCliIssue issue)
         Right output -> do
           -- §219 slice 4 routing: StoppedAudioOnly now goes
-          -- through 'runSupervisedStoppedAudioReload' instead of
-          -- the direct 'reloadManifestHostWithStrategy' dispatch.
+          -- through the supervised lifecycle (factory + adapter
+          -- + 'reloadSupervised') inlined in
+          -- 'runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig'
+          -- instead of the direct
+          -- 'reloadManifestHostWithStrategy' dispatch.
           -- The supervised renderer is shaped to keep the
           -- operator-facing header / strategy / result /
           -- audio-events / reload-events lines identical to the
@@ -451,6 +455,33 @@ appManifestReloadCliTests =
           Right output ->
             assertFailure
               ("expected real OSC bind failure, got success:\n" <> output)
+
+  , testCase
+      "MrciSupervisedPartialCleanupFailed render preserves both primary cause and cleanup diagnostic"
+      $ do
+      -- Regression test for the §219 slice-4 partial-cleanup
+      -- diagnostic preservation. The previous CLI mapping
+      -- collapsed 'SahsoiPartialCleanupFailed' back to its
+      -- primary cause, hiding the rollback-also-failed signal
+      -- that warns the operator the host stack may be in an
+      -- unknown state. After the fix in this slice, the
+      -- mapping surfaces a dedicated
+      -- 'MrciSupervisedPartialCleanupFailed' variant and the
+      -- renderer prints BOTH the primary cause text AND the
+      -- cleanup diagnostic, plus an explicit
+      -- "host stack may be in an unknown state" advisory line.
+      let primary  = MrciCatalogFailed "synthetic primary failure"
+          issue    =
+            MrciSupervisedPartialCleanupFailed
+              primary
+              (T.pack "synthetic cleanup diagnostic")
+          rendered = renderManifestReloadCliIssue issue
+      assertContains "synthetic primary failure" rendered
+      assertContains "synthetic cleanup diagnostic" rendered
+      assertContains
+        "rollback after the failure above"
+        rendered
+      assertContains "unknown state" rendered
   ]
 
 -- | Pull the numeric value following @oscPort=@ out of the smoke's

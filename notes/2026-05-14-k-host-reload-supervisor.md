@@ -126,17 +126,40 @@ half against the live session-layer primitives:
   short-circuit (asserts no `MrhiPlanning` when running
   against empty doc / catalog).
 
-What remains in slice 4 is therefore the routing only: wire
-the `StoppedAudioOnly` strategy in the CLI (currently direct
-at [`ManifestReloadHost.hs`](../app/MetaSonic/App/ManifestReloadHost.hs#L524))
-through `reloadSupervised` + `mkStoppedAudioHostStackFactory`
-+ `realStoppedAudioHostStackOps`. Preserving and
-`TryPreservingThenStoppedAudio` fallback stay direct until
-the supervised stopped-audio path is stable. The routing
-slice will likely need a narrow
-`SupervisedStoppedAudioReloadResult` / -Issue type rather
-than forcing `SupervisedReloadOutcome`'s rebuild causes into
-the existing `ManifestReloadHostStrategyIssue` shape.
+Slice 4 closed with commit `93e755c`: the `StoppedAudioOnly`
+CLI strategy now dispatches through
+`runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig`,
+which inlines the same supervised lifecycle that
+`MetaSonic.App.ManifestReloadHostStack.runSupervisedStoppedAudioReload`
+exposes at the library layer (the CLI inlines so it can read
+the pre-reload ingress snapshot off the initial stack before
+the adapter takes ownership). Preserving and
+`TryPreservingThenStoppedAudio` fallback still go through
+the direct `reloadManifestHostWithStrategy` path; they will
+move only after the supervised stopped-audio route gets
+hardware exercise.
+
+The error surface uses a narrow
+`SupervisedStoppedAudioReloadResult` (committed / recovered /
+escalated, parameterized over `StoppedAudioHostStackIssue`)
+so the supervisor's rebuild causes flow through the result
+rather than collapsing into the older
+`ManifestReloadHostStrategyIssue` shape. Initial-open failures
+that hit the helper's partial-cleanup-also-failed path
+surface through a dedicated
+`MrciSupervisedPartialCleanupFailed` CLI issue variant so the
+operator sees both the primary cause AND the rollback
+diagnostic — the helper's "host stack may be in an unknown
+state" signal is not silently flattened back to the primary
+cause.
+
+Both the library entry and the CLI inline path are
+exception-safe across the open-to-adapter handoff: the
+'mask' begins before `hsfOpenStack` runs, and the outer
+'restore' is used inside the adapter callback around
+`readManifestReloadIngressManager` / `reloadSupervised` so
+the adapter's `finally closeOps` covers a throw at any point
+after the initial stack is in hand.
 
 Resource/allocation recovery events stay parked behind a
 real consumer per the

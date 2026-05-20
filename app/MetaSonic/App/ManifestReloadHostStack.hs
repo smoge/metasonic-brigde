@@ -716,16 +716,34 @@ runSupervisedStoppedAudioReload
   -> IO (Either
           (StoppedAudioHostStackIssue ingressIssue)
           (SupervisedStoppedAudioReloadResult ingressIssue))
-runSupervisedStoppedAudioReload inputs fallback requested = do
+runSupervisedStoppedAudioReload inputs fallback requested = mask $ \restore -> do
+  -- Outer 'mask': closes the async-exception window between
+  -- 'hsfOpenStack' returning @Right initialStack@ and
+  -- 'withHostStackSupervisorAdapter' installing its own
+  -- bracket. Without it, an async exception landing there would
+  -- leak the just-opened stack — the helper acquired
+  -- session / ingress / audio but no finalizer is in scope yet
+  -- to dispose them.
+  --
+  -- 'restore' is used around the blocking calls so the
+  -- caller's masking state is preserved /inside/ them:
+  --   * 'hsfOpenStack' itself uses 'mask' + 'restore'
+  --     internally (via 'realOpen'); we restore here so its
+  --     internal pattern works as designed.
+  --   * 'reloadSupervised' is invoked inside the adapter
+  --     callback under 'restore' so the supervisor's
+  --     'onException' wrappers can fire on async interrupts
+  --     and the inner blocking IO is interruptible.
   let ops     = realStoppedAudioHostStackOps inputs
       factory = mkStoppedAudioHostStackFactory ops
-  openResult <- hsfOpenStack factory fallback
+  openResult <- restore (hsfOpenStack factory fallback)
   case openResult of
     Left issue ->
       pure (Left issue)
     Right initialStack -> do
-      outcome <- withHostStackSupervisorAdapter factory initialStack $
-        \supOps -> reloadSupervised supOps fallback requested
+      outcome <-
+        withHostStackSupervisorAdapter factory initialStack $
+          \supOps -> restore (reloadSupervised supOps fallback requested)
       pure $ Right $ case outcome of
         SupervisedReloadCommitted ->
           SsasrrCommitted
