@@ -35,7 +35,8 @@ import           Data.IORef        (IORef, atomicModifyIORef', newIORef,
                                     readIORef, writeIORef)
 
 import           MetaSonic.App.ManifestReloadSupervisor
-                                   (SupervisorOps (..))
+                                   (InWindowReloadOutcome,
+                                    SupervisorOps (..))
 
 
 -- | Producer-owned interface to a closeable / reopenable host stack.
@@ -60,20 +61,22 @@ data HostStackFactory plan stack e = HostStackFactory
     -- propagate per the §238 #9 cleanup invariant — the adapter
     -- ensures @hsfCloseStack@ ran before any exception from the
     -- in-window op escapes 'withHostStackSupervisorAdapter'.
-  , hsfInWindowReload  :: !(stack -> plan -> plan -> IO (Either e ()))
-    -- ^ Drive a stopped-audio in-window reload against an
-    -- already-open stack. Takes the @fallback@ plan (the plan the
-    -- stack is currently running) followed by the @requested@
-    -- plan. The fallback is forwarded so the producer can
-    -- re-derive plan-dependent state at the reload boundary
-    -- (e.g. project the currently-bound ingress target from the
-    -- fallback) rather than reading a cached field on the stack.
-    -- @Right ()@ means the same stack is now running the
-    -- requested plan (the reload mutated the stack in place; the
-    -- supervisor does not need to close-then-open). @Left e@
-    -- means terminal in-window failure: the supervisor closes
-    -- this stack and rebuilds from the captured fallback plan
-    -- via 'hsfCloseStack' + 'hsfOpenStack'.
+  , hsfInWindowReload  :: !(stack -> plan -> plan -> IO (InWindowReloadOutcome e))
+    -- ^ Drive an in-window reload against an already-open stack.
+    -- Takes the @fallback@ plan (the plan the stack is currently
+    -- running) followed by the @requested@ plan. The fallback is
+    -- forwarded so the producer can re-derive plan-dependent
+    -- state at the reload boundary (e.g. project the
+    -- currently-bound ingress target from the fallback) rather
+    -- than reading a cached field on the stack.
+    --
+    -- The producer classifies the outcome via
+    -- 'InWindowReloadOutcome' (see its Haddock for the variant
+    -- contracts). The adapter does not interpret the outcome; it
+    -- forwards the value to the supervisor, which decides
+    -- whether to close-then-rebuild ('InWindowReloadTerminal')
+    -- or leave the stack alone ('InWindowReloadCommitted',
+    -- 'InWindowReloadRejectedLiveFallback').
   }
 
 

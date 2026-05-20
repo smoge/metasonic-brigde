@@ -756,6 +756,20 @@ runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
             let supResult = case outcome of
                   SupervisedReloadCommitted ->
                     SsasrrCommitted
+                  SupervisedReloadRequestRejected _ ->
+                    -- Unreachable: stopped-audio cannot produce
+                    -- 'InWindowReloadRejectedLiveFallback' (see
+                    -- 'sahsoInWindowReload' Haddock + the matching
+                    -- error in 'runSupervisedStoppedAudioReload').
+                    -- The preserving migration that introduces a
+                    -- producer for this variant must also grow a
+                    -- proper 'SupervisedStoppedAudioReloadResult'
+                    -- constructor and the CLI rendering for it.
+                    error
+                      "manifestSupervisedStoppedAudioReloadSmoke: \
+                      \stopped-audio path produced \
+                      \SupervisedReloadRequestRejected — contract \
+                      \violation."
                   SupervisedReloadRejectedRecovered e ->
                     SsasrrRebuildRecovered e
                   SupervisedReloadEscalated e1 e2 ->

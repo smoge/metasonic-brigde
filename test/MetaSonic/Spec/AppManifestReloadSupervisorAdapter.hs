@@ -38,8 +38,9 @@ import           Test.Tasty
 import           Test.Tasty.HUnit
 
 import           MetaSonic.App.ManifestReloadSupervisor
-                                   (SupervisedReloadOutcome (..),
-                                    SupervisorOps (..), reloadSupervised)
+                                   (InWindowReloadOutcome (..),
+                                    SupervisedReloadOutcome (..),
+                                    reloadSupervised)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                    (HostStackFactory (..),
                                     withHostStackSupervisorAdapter)
@@ -68,7 +69,7 @@ data FakeFactoryState plan = FakeFactoryState
   { ffsTrace        :: !(IORef [AdapterCall plan])
   , ffsNextStackId  :: !(IORef Int)
   , ffsOpenBehavior :: !(plan -> IO (Either AdapterFailure ()))
-  , ffsInWindow     :: !(plan -> IO (Either AdapterFailure ()))
+  , ffsInWindow     :: !(plan -> IO (InWindowReloadOutcome AdapterFailure))
   }
 
 
@@ -112,7 +113,7 @@ record state c = modifyIORef' (ffsTrace state) (++ [c])
 -- ref tracks transitions correctly.
 newFakeFactoryState
   :: (plan -> IO (Either AdapterFailure ()))
-  -> (plan -> IO (Either AdapterFailure ()))
+  -> (plan -> IO (InWindowReloadOutcome AdapterFailure))
   -> IO (FakeFactoryState plan)
 newFakeFactoryState openBehavior inWindowBehavior = do
   traceRef   <- newIORef []
@@ -140,15 +141,26 @@ openFails :: String -> plan -> IO (Either AdapterFailure ())
 openFails msg _ = pure (Left (OpenFailure msg))
 
 
-inWindowOk :: plan -> IO (Either AdapterFailure ())
-inWindowOk _ = pure (Right ())
+inWindowOk :: plan -> IO (InWindowReloadOutcome AdapterFailure)
+inWindowOk _ = pure InWindowReloadCommitted
 
 
-inWindowFails :: String -> plan -> IO (Either AdapterFailure ())
-inWindowFails msg _ = pure (Left (InWindowFailure msg))
+-- | Producer signals a terminal in-window failure: the supervisor
+-- closes the stack and rebuilds from the fallback plan.
+inWindowFails :: String -> plan -> IO (InWindowReloadOutcome AdapterFailure)
+inWindowFails msg _ = pure (InWindowReloadTerminal (InWindowFailure msg))
 
 
-inWindowThrows :: String -> plan -> IO (Either AdapterFailure ())
+-- | Producer signals a request-rejected outcome: the stack is still
+-- live serving the fallback plan. The supervisor returns
+-- 'SupervisedReloadRequestRejected' and does NOT close/rebuild.
+inWindowRejectsLiveFallback
+  :: String -> plan -> IO (InWindowReloadOutcome AdapterFailure)
+inWindowRejectsLiveFallback msg _ =
+  pure (InWindowReloadRejectedLiveFallback (InWindowFailure msg))
+
+
+inWindowThrows :: String -> plan -> IO (InWindowReloadOutcome AdapterFailure)
 inWindowThrows msg _ = throwIO (ErrorCall msg)
 
 
@@ -290,6 +302,32 @@ appManifestReloadSupervisorAdapterTests =
       [() | OpenCalled _ _ <- trace] @?= []
 
   , testCase
+      "in-window rejected-live-fallback keeps the same stack: no close, no reopen"
+      $ do
+      -- Adapter-level pinning of the classified contract: when the
+      -- producer signals 'InWindowReloadRejectedLiveFallback', the
+      -- adapter must NOT close/open the stack — the ref keeps
+      -- pointing at the original stack id (1) and the same stack
+      -- is closed exactly once on bracket exit. This is the
+      -- adapter mirror of the supervisor-level test in
+      -- 'AppManifestReloadSupervisor'; the two together pin both
+      -- the supervisor's branching and the adapter's ref handling.
+      state <- newFakeFactoryState (openFails "should-not-be-called")
+                                   (inWindowRejectsLiveFallback "preserving-reload-rejected")
+      outcome <-
+        withHostStackSupervisorAdapter (mkFakeFactory state) 1 $ \ops ->
+          reloadSupervised ops planA planB
+      trace <- readIORef (ffsTrace state)
+
+      outcome @?=
+        SupervisedReloadRequestRejected (InWindowFailure "preserving-reload-rejected")
+      trace @?=
+        [ InWindowCalled 1 planB
+        , CloseCalled 1     -- only the bracket's-finally close
+        ]
+      [() | OpenCalled _ _ <- trace] @?= []
+
+  , testCase
       "active-stack ref tracks rebuild: in-window operates on the new stack"
       $ do
       -- Drive a recovery cycle, then a SECOND reload against the
@@ -298,8 +336,8 @@ appManifestReloadSupervisorAdapterTests =
       -- Catches a regression where the adapter's IORef would lose
       -- track of the rebuild result.
       let inWindowSecond plan
-            | plan == "second-request" = pure (Right ())
-            | otherwise                = pure (Left (InWindowFailure "first"))
+            | plan == "second-request" = pure InWindowReloadCommitted
+            | otherwise                = pure (InWindowReloadTerminal (InWindowFailure "first"))
       state <- newFakeFactoryState openOk inWindowSecond
       withHostStackSupervisorAdapter (mkFakeFactory state) 1 $ \ops -> do
         -- First reload: in-window fails on planB; rebuild from
@@ -338,7 +376,7 @@ appManifestReloadSupervisorAdapterTests =
                 pure (Right (42 :: Int))
             , hsfCloseStack     = \_ -> pure ()
             , hsfInWindowReload = \_ _ _ ->
-                pure (Left (InWindowFailure "force-recovery"))
+                pure (InWindowReloadTerminal (InWindowFailure "force-recovery"))
             }
       _ <-
         withHostStackSupervisorAdapter factory 1 $ \ops ->
@@ -365,7 +403,7 @@ appManifestReloadSupervisorAdapterTests =
                 ms <- getMaskingState
                 modifyIORef' observedRef (++ [ms])
             , hsfInWindowReload = \_ _ _ ->
-                pure (Left (InWindowFailure "trigger-close"))
+                pure (InWindowReloadTerminal (InWindowFailure "trigger-close"))
             }
       _ <-
         withHostStackSupervisorAdapter factory 1 $ \ops ->
@@ -419,7 +457,7 @@ appManifestReloadSupervisorAdapterTests =
                 recordCall (InWindowCalled stackId plan)
                 putMVar inWindowReached ()
                 takeMVar mayReturn
-                pure (Right ())
+                pure InWindowReloadCommitted
             }
 
       workerTid <- forkIO $ do
@@ -505,7 +543,7 @@ appManifestReloadSupervisorAdapterTests =
           factory = HostStackFactory
             { hsfOpenStack = \_ -> pure (Right 42)
             , hsfCloseStack = \_ -> pure ()
-            , hsfInWindowReload = \_ _ _ -> pure (Right ())
+            , hsfInWindowReload = \_ _ _ -> pure InWindowReloadCommitted
             }
       withHostStackSupervisorAdapter factory 1 $ \_ops -> do
         ms <- getMaskingState

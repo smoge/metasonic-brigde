@@ -539,6 +539,19 @@ runSupervisedLiveReload listenerCfg oldPlan newPlan oldTarget _newTarget
                         "  Ingress is closed; press Enter to stop \
                         \audio."
                   void getLine
+                SupervisedReloadRequestRejected _cause ->
+                  -- Unreachable for the stopped-audio supervised
+                  -- route: 'realStoppedAudioInWindowReload' cannot
+                  -- produce 'InWindowReloadRejectedLiveFallback'.
+                  -- The preserving migration will lift this route
+                  -- selector to a path that *can* produce the
+                  -- variant; at that point this branch needs a
+                  -- real "the request was rejected, stack still on
+                  -- fallback plan" operator narrative.
+                  error
+                    "ManifestLiveReloadDemo: supervised stopped-audio \
+                    \route produced SupervisedReloadRequestRejected — \
+                    \contract violation."
                 SupervisedReloadRejectedRecovered cause -> do
                   putStrLn ""
                   putStrLn
@@ -576,6 +589,8 @@ runSupervisedLiveReload listenerCfg oldPlan newPlan oldTarget _newTarget
     renderSupervisedOutcomeShort = \case
       SupervisedReloadCommitted ->
         "committed (new plan installed)"
+      SupervisedReloadRequestRejected _ ->
+        "request-rejected (stack still on fallback plan)"
       SupervisedReloadRejectedRecovered _ ->
         "rejected-recovered (rebuilt from fallback)"
       SupervisedReloadEscalated _ _ ->

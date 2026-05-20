@@ -86,7 +86,8 @@ import           MetaSonic.App.ManifestReloadBinding
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                          (HostStoppedAudioReloadIssue (..))
 import           MetaSonic.App.ManifestReloadSupervisor
-                                         (SupervisedReloadOutcome (..),
+                                         (InWindowReloadOutcome (..),
+                                          SupervisedReloadOutcome (..),
                                           reloadSupervised)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                          (withHostStackSupervisorAdapter)
@@ -131,10 +132,9 @@ data FakeStackPlan = FakeStackPlan
             -> IO (Either (StoppedAudioHostStackOpenIssue String) ()))
   , fspInWindowBehavior
       :: !(MR.ManifestReloadPlan
-            -> IO (Either
+            -> IO (InWindowReloadOutcome
                     (HostStoppedAudioReloadIssue
-                      (ManifestReloadHostIssue String))
-                    ()))
+                      (ManifestReloadHostIssue String))))
   }
 
 
@@ -207,20 +207,29 @@ openFailsAudioStart _ =
 
 -- | Convenient in-window behaviors keyed to specific named
 -- failure variants the supervisor design note pins (§238).
-inWindowOk :: MR.ManifestReloadPlan -> IO (Either (HostStoppedAudioReloadIssue (ManifestReloadHostIssue String)) ())
-inWindowOk _ = pure (Right ())
+--
+-- All failure helpers produce 'InWindowReloadTerminal'. Stopped-audio
+-- by construction never produces 'InWindowReloadRejectedLiveFallback'
+-- (see the Haddock on 'sahsoInWindowReload'); preserving /
+-- try-preserving fixtures live in their own helpers when they land.
+type FakeInWindowOutcome =
+  InWindowReloadOutcome
+    (HostStoppedAudioReloadIssue (ManifestReloadHostIssue String))
 
-inWindowOwnerSetupFailed :: MR.ManifestReloadPlan -> IO (Either (HostStoppedAudioReloadIssue (ManifestReloadHostIssue String)) ())
+inWindowOk :: MR.ManifestReloadPlan -> IO FakeInWindowOutcome
+inWindowOk _ = pure InWindowReloadCommitted
+
+inWindowOwnerSetupFailed :: MR.ManifestReloadPlan -> IO FakeInWindowOutcome
 inWindowOwnerSetupFailed _ =
-  pure (Left (HsariReloadFailedNoOwner (MrhiIngress "owner-setup")))
+  pure (InWindowReloadTerminal (HsariReloadFailedNoOwner (MrhiIngress "owner-setup")))
 
-inWindowAudioRestartFailed :: MR.ManifestReloadPlan -> IO (Either (HostStoppedAudioReloadIssue (ManifestReloadHostIssue String)) ())
+inWindowAudioRestartFailed :: MR.ManifestReloadPlan -> IO FakeInWindowOutcome
 inWindowAudioRestartFailed _ =
-  pure (Left (HsariAudioRestartFailed (MrhiAudio (SfaiStartFailed (-1)))))
+  pure (InWindowReloadTerminal (HsariAudioRestartFailed (MrhiAudio (SfaiStartFailed (-1)))))
 
-inWindowListenerRestartFailed :: MR.ManifestReloadPlan -> IO (Either (HostStoppedAudioReloadIssue (ManifestReloadHostIssue String)) ())
+inWindowListenerRestartFailed :: MR.ManifestReloadPlan -> IO FakeInWindowOutcome
 inWindowListenerRestartFailed _ =
-  pure (Left (HsariListenerRestartFailed (MrhiIngress "listener-restart")))
+  pure (InWindowReloadTerminal (HsariListenerRestartFailed (MrhiIngress "listener-restart")))
 
 
 appManifestReloadHostStackTests :: TestTree
@@ -429,7 +438,7 @@ factoryCompositionTests =
                 recordCall (InWindowCalled (MR.mrlpDemoKey plan))
                 putMVar readyToBlock ()
                 takeMVar mayReturn
-                pure (Right ())
+                pure InWindowReloadCommitted
             }
           factory = mkStoppedAudioHostStackFactory fakeOps
 
@@ -488,8 +497,8 @@ factoryCompositionTests =
           planD = mkPlan "fourth"
           inWindowFailsOnD plan
             | MR.mrlpDemoKey plan == MR.mrlpDemoKey planD =
-                pure (Left (HsariReloadFailedNoOwner (MrhiIngress "d-failed")))
-            | otherwise = pure (Right ())
+                pure (InWindowReloadTerminal (HsariReloadFailedNoOwner (MrhiIngress "d-failed")))
+            | otherwise = pure InWindowReloadCommitted
 
       traceRef <- newIORef []
       let ops = mkFakeOps traceRef FakeStackPlan
@@ -967,18 +976,28 @@ realInWindowReloadTests =
               newPlan
           sahsoClose ops stack
           case reloadResult of
-            Right () ->
+            InWindowReloadCommitted ->
               -- Successful reload proves the override took effect:
               -- with empty doc/catalog and no override, planning
               -- would have failed before this point.
               pure ()
-            Left (HsariReloadFailedNoOwner (MrhiPlanning _)) ->
+            InWindowReloadTerminal (HsariReloadFailedNoOwner (MrhiPlanning _)) ->
               assertFailure
                 "realStoppedAudioInWindowReload re-derived plan \
                 \from doc/catalog (observed MrhiPlanning); the \
                 \plan-native override is broken or bypassed"
-            Left other ->
+            InWindowReloadTerminal other ->
               assertFailure
-                ("expected Right (), got an unrelated downstream Left: "
+                ("expected InWindowReloadCommitted, got an \
+                 \unrelated downstream terminal failure: "
+                  <> show other)
+            InWindowReloadRejectedLiveFallback other ->
+              -- Stopped-audio cannot produce this variant by
+              -- construction; if the production helper ever does,
+              -- that's the regression this branch catches.
+              assertFailure
+                ("realStoppedAudioInWindowReload produced \
+                 \InWindowReloadRejectedLiveFallback, but the \
+                 \stopped-audio path cannot return that variant: "
                   <> show other)
   ]

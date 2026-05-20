@@ -48,10 +48,10 @@ appManifestReloadSupervisorTests =
       outcome @?= SupervisedReloadCommitted
       calls @?= [InWindowReloadCalled planB]
 
-  , testCase "in-window failure closes stack and rebuilds from fallback" $ do
+  , testCase "in-window terminal failure closes stack and rebuilds from fallback" $ do
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeOwnerSetupFailed)
+          (inWindowTerminalWith FakeOwnerSetupFailed)
           openStackOk
       outcome <- reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -62,10 +62,29 @@ appManifestReloadSupervisorTests =
         , OpenStackCalled planA
         ]
 
+  , testCase "in-window rejected-live-fallback returns RequestRejected and skips close/open" $ do
+      -- The classified-outcome contract: when the producer signals
+      -- 'InWindowReloadRejectedLiveFallback', the stack is still
+      -- serving the fallback plan, so the supervisor must NOT call
+      -- 'sopsCloseStack' or 'sopsOpenStack'. This is the load-bearing
+      -- assertion that distinguishes the preserving / try-preserving
+      -- routes from the stopped-audio path under the same supervisor
+      -- entrypoint.
+      (ops, log_) <-
+        mkRecordingOps
+          (inWindowRejectsLiveFallbackWith FakeOwnerSetupFailed)
+          openStackUnused
+      outcome <- reloadSupervised ops planA planB
+      calls <- readIORef log_
+      outcome @?= SupervisedReloadRequestRejected FakeOwnerSetupFailed
+      calls @?= [InWindowReloadCalled planB]
+      CloseStackCalled `elem` calls @?= False
+      any isOpenCall calls @?= False
+
   , testCase "rebuild targets fallback plan, never the failed requested plan" $ do
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeAudioRestartFailed)
+          (inWindowTerminalWith FakeAudioRestartFailed)
           openStackOk
       _ <- reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -75,7 +94,7 @@ appManifestReloadSupervisorTests =
   , testCase "audio-restart failure recovers through the same path as owner-setup failure" $ do
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeAudioRestartFailed)
+          (inWindowTerminalWith FakeAudioRestartFailed)
           openStackOk
       outcome <- reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -89,7 +108,7 @@ appManifestReloadSupervisorTests =
   , testCase "listener-restart failure recovers through the same path" $ do
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeListenerRestartFailed)
+          (inWindowTerminalWith FakeListenerRestartFailed)
           openStackOk
       outcome <- reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -103,7 +122,7 @@ appManifestReloadSupervisorTests =
   , testCase "rebuild failure escalates with both causes preserved" $ do
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeAudioRestartFailed)
+          (inWindowTerminalWith FakeAudioRestartFailed)
           (openStackFailsWith FakeRebuildFailed)
       outcome <- reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -118,7 +137,7 @@ appManifestReloadSupervisorTests =
   , testCase "escalation does not retry: exactly one rebuild attempt" $ do
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeOwnerSetupFailed)
+          (inWindowTerminalWith FakeOwnerSetupFailed)
           (openStackFailsWith FakeRebuildFailed)
       _ <- reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -130,7 +149,7 @@ appManifestReloadSupervisorTests =
   , testCase "close stack is called exactly once between failure and rebuild" $ do
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeOwnerSetupFailed)
+          (inWindowTerminalWith FakeOwnerSetupFailed)
           openStackOk
       _ <- reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -167,8 +186,8 @@ appManifestReloadSupervisorTests =
           planD = "fourth" :: String
       (ops, log_) <- mkRecordingOps
         (\p -> if p == planD
-                 then pure (Left FakeAudioRestartFailed)
-                 else pure (Right ()))
+                 then pure (InWindowReloadTerminal FakeAudioRestartFailed)
+                 else pure InWindowReloadCommitted)
         openStackOk
 
       -- A -> B commits.
@@ -233,8 +252,9 @@ appManifestReloadSupervisorTests =
       -- The trace must show CloseStackCalled *after* the in-window
       -- attempt and *before* the exception propagated out. The
       -- recovery rebuild (OpenStackCalled) must NOT have run — an
-      -- exception during in-window is not the same as a Left e
-      -- recovery, so we propagate without attempting rebuild.
+      -- exception during in-window is not the same as an
+      -- 'InWindowReloadTerminal' return, so we propagate without
+      -- attempting rebuild.
       calls @?=
         [ InWindowReloadCalled planB
         , CloseStackCalled
@@ -242,18 +262,18 @@ appManifestReloadSupervisorTests =
       any isOpenCall calls @?= False
 
   , testCase
-      "no exception path: onException wrapper does not fire on Left e"
+      "no exception path: onException wrapper does not fire on a classified return"
       $ do
-      -- Companion to the test above: confirm that a normal Left e
-      -- return from sopsInWindowReload does NOT trigger the
-      -- onException cleanup. The supervisor must call sopsCloseStack
-      -- exactly once (on the recovery path), not twice (once from
-      -- onException, once explicitly). Counts the trace by calling
-      -- sopsCloseStack only once and asserting the recovery
+      -- Companion to the test above: confirm that a normal
+      -- 'InWindowReloadTerminal' return from sopsInWindowReload does
+      -- NOT trigger the onException cleanup. The supervisor must call
+      -- sopsCloseStack exactly once (on the recovery path), not twice
+      -- (once from onException, once explicitly). Counts the trace by
+      -- calling sopsCloseStack only once and asserting the recovery
       -- sequence is unchanged.
       (ops, log_) <-
         mkRecordingOps
-          (inWindowFailsWith FakeOwnerSetupFailed)
+          (inWindowTerminalWith FakeOwnerSetupFailed)
           openStackOk
       _ <- evaluate =<< reloadSupervised ops planA planB
       calls <- readIORef log_
@@ -274,7 +294,7 @@ isOpenCall _                   = False
 
 -- | Build an IORef-backed 'SupervisorOps' that records every call.
 mkRecordingOps
-  :: (plan -> IO (Either FakeFailure ()))
+  :: (plan -> IO (InWindowReloadOutcome FakeFailure))
      -- ^ Behavior for 'sopsInWindowReload'.
   -> (plan -> IO (Either FakeFailure ()))
      -- ^ Behavior for 'sopsOpenStack'.
@@ -296,11 +316,22 @@ mkRecordingOps inWindow openStack = do
   pure (ops, log_)
 
 
-inWindowOk :: plan -> IO (Either FakeFailure ())
-inWindowOk _ = pure (Right ())
+inWindowOk :: plan -> IO (InWindowReloadOutcome FakeFailure)
+inWindowOk _ = pure InWindowReloadCommitted
 
-inWindowFailsWith :: FakeFailure -> plan -> IO (Either FakeFailure ())
-inWindowFailsWith err _ = pure (Left err)
+-- | The producer signals a terminal in-window failure: the stack may
+-- be in an unknown state, so the supervisor closes it and rebuilds
+-- from the fallback. This is the post-classification name for the
+-- old 'inWindowFailsWith'.
+inWindowTerminalWith :: FakeFailure -> plan -> IO (InWindowReloadOutcome FakeFailure)
+inWindowTerminalWith err _ = pure (InWindowReloadTerminal err)
+
+-- | The producer signals a request-rejected outcome: the stack is
+-- still live and serving the fallback plan. The supervisor must NOT
+-- close-then-rebuild — it surfaces 'SupervisedReloadRequestRejected'
+-- with the cause and skips all stack-mutation calls.
+inWindowRejectsLiveFallbackWith :: FakeFailure -> plan -> IO (InWindowReloadOutcome FakeFailure)
+inWindowRejectsLiveFallbackWith err _ = pure (InWindowReloadRejectedLiveFallback err)
 
 openStackOk :: plan -> IO (Either FakeFailure ())
 openStackOk _ = pure (Right ())
@@ -308,6 +339,11 @@ openStackOk _ = pure (Right ())
 openStackFailsWith :: FakeFailure -> plan -> IO (Either FakeFailure ())
 openStackFailsWith err _ = pure (Left err)
 
+-- | Marker for tests asserting 'sopsOpenStack' is never invoked. If
+-- the test fires it, the failure message points at the test rather
+-- than dumping a generic pattern-match. Used by the RejectedLiveFallback
+-- supervisor test (and any future tests where the open-on-recovery
+-- branch must be unreachable).
 openStackUnused :: plan -> IO (Either FakeFailure ())
 openStackUnused _ =
   assertFailure "sopsOpenStack should not be called on the happy path"

@@ -100,7 +100,9 @@ import           MetaSonic.App.ManifestReloadOrchestration   (orchestrateHostSto
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                                              (HostStoppedAudioReloadIssue (..),
                                                               HostStoppedAudioReloadOps (..))
-import           MetaSonic.App.ManifestReloadSupervisor      (SupervisedReloadOutcome (..),
+import           MetaSonic.App.ManifestReloadSupervisor      (InWindowReloadOutcome (..),
+                                                              SupervisedReloadOutcome (..),
+                                                              inWindowOutcomeFromEither,
                                                               reloadSupervised)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                                              (HostStackFactory (..),
@@ -190,10 +192,9 @@ data StoppedAudioHostStackOps target ingressIssue handle =
         :: !(StoppedAudioHostStack target ingressIssue handle
               -> MR.ManifestReloadPlan
               -> MR.ManifestReloadPlan
-              -> IO (Either
+              -> IO (InWindowReloadOutcome
                       (HostStoppedAudioReloadIssue
-                        (ManifestReloadHostIssue ingressIssue))
-                      ()))
+                        (ManifestReloadHostIssue ingressIssue))))
       -- ^ Drive a stopped-audio in-window reload against the
       -- currently-open stack. Takes the @fallback@ plan (the
       -- plan the stack is currently running) followed by the
@@ -202,6 +203,17 @@ data StoppedAudioHostStackOps target ingressIssue handle =
       -- fallback to re-project 'mrhcOldIngressTarget' fresh on
       -- every call); tests can return any specific failure
       -- variant.
+      --
+      -- Stopped-audio cannot produce
+      -- 'InWindowReloadRejectedLiveFallback' by construction —
+      -- audio stops before the reinstall, so there is no \"old
+      -- owner still installed\" branch. Production uses
+      -- 'inWindowOutcomeFromEither' to lift the orchestrator's
+      -- @Either e ()@ result; the @Left@ side always becomes
+      -- 'InWindowReloadTerminal'. Tests that want to cover the
+      -- 'RejectedLiveFallback' branch should target the
+      -- preserving / try-preserving paths instead, where the
+      -- classification is real.
     }
 
 
@@ -311,15 +323,14 @@ realStoppedAudioInWindowReload
   -> StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle
   -> MR.ManifestReloadPlan
   -> MR.ManifestReloadPlan
-  -> IO (Either
+  -> IO (InWindowReloadOutcome
           (HostStoppedAudioReloadIssue
-            (ManifestReloadHostIssue ingressIssue))
-          ())
+            (ManifestReloadHostIssue ingressIssue)))
 realStoppedAudioInWindowReload policy stack fallback requested =
   case manifestReloadIngressTargetFromPlan policy requested of
     Left _projIssue ->
       pure
-        (Left
+        (InWindowReloadTerminal
           (HsariReloadFailedNoOwner
             (MrhiPlanning
               (MR.MriUnknownManifestDemo (MR.mrlpDemoKey requested)))))
@@ -327,7 +338,7 @@ realStoppedAudioInWindowReload policy stack fallback requested =
       case manifestReloadIngressTargetFromPlan policy fallback of
         Left _projIssue ->
           pure
-            (Left
+            (InWindowReloadTerminal
               (HsariReloadFailedNoOwner
                 (MrhiPlanning
                   (MR.MriUnknownManifestDemo (MR.mrlpDemoKey fallback)))))
@@ -337,10 +348,11 @@ realStoppedAudioInWindowReload policy stack fallback requested =
                 { mrhcOldIngressTarget = oldTarget
                 , mrhcNewIngressTarget = newTarget
                 }
-          in orchestrateHostStoppedAudioReloadWithEvents
-               (mrhcOnEvent freshConfig)
-               (planNativeOps freshConfig)
-               syntheticRequest
+          in inWindowOutcomeFromEither
+               <$> orchestrateHostStoppedAudioReloadWithEvents
+                     (mrhcOnEvent freshConfig)
+                     (planNativeOps freshConfig)
+                     syntheticRequest
   where
     -- manifestReloadHostOps builds the orchestrator slot bundle
     -- using doc/catalog only inside hsaroPreparePlan; overriding
@@ -378,9 +390,8 @@ mkStoppedAudioHostStackFactory ops = HostStackFactory
   { hsfOpenStack      = fmap (first SahsiOpen) . sahsoOpen ops
   , hsfCloseStack     = sahsoClose ops
   , hsfInWindowReload = \stack fallback requested ->
-      fmap
-        (first SahsiInWindow)
-        (sahsoInWindowReload ops stack fallback requested)
+      fmap SahsiInWindow
+        <$> sahsoInWindowReload ops stack fallback requested
   }
 
 
@@ -755,6 +766,22 @@ runSupervisedStoppedAudioReload inputs fallback requested = mask $ \restore -> d
       pure $ Right $ case outcome of
         SupervisedReloadCommitted ->
           SsasrrCommitted
+        SupervisedReloadRequestRejected _ ->
+          -- Unreachable: the stopped-audio path's
+          -- 'realStoppedAudioInWindowReload' never produces
+          -- 'InWindowReloadRejectedLiveFallback' (audio stops before
+          -- reinstall, so there is no "old owner still installed"
+          -- branch to surface). If a future change wires a producer
+          -- that *can* return that variant through this entrypoint,
+          -- this branch should grow a proper 'SupervisedStoppedAudio
+          -- ReloadResult' constructor instead of staying an 'error' —
+          -- the supervisor's classified contract is not the place to
+          -- silently collapse it.
+          error
+            "runSupervisedStoppedAudioReload: stopped-audio path \
+            \produced SupervisedReloadRequestRejected — contract \
+            \violation (the path cannot produce \
+            \InWindowReloadRejectedLiveFallback by construction)."
         SupervisedReloadRejectedRecovered e ->
           SsasrrRebuildRecovered e
         SupervisedReloadEscalated e1 e2 ->
