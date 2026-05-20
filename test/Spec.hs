@@ -13,6 +13,8 @@ import           MetaSonic.Spec.AppFusionCostLab     (appFusionCostLabTests)
 import           MetaSonic.Spec.AppManifestMIDIIngressOps
 import           MetaSonic.Spec.AppManifestMIDIListener
 import           MetaSonic.Spec.AppManifestLiveReloadDemoRender
+import           MetaSonic.Spec.AppManifestLiveSession
+                                                  (appManifestLiveSessionTests)
 import           MetaSonic.Spec.AppManifestMIDIPortMIDI
 import           MetaSonic.Spec.AppManifestMIDIReloadE2E
 import           MetaSonic.Spec.AppManifestOSCIngressOps
@@ -106,6 +108,7 @@ main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
   [ appDemoCatalogTests
   , appManifestLiveReloadDemoRenderTests
+  , appManifestLiveSessionTests
   , appManifestMIDIIngressOpsTests
   , appManifestMIDIListenerTests
   , appManifestMIDIPortMIDITests

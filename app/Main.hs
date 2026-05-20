@@ -37,10 +37,12 @@ import           MetaSonic.App.ManifestReloadCli
                                              runManifestStoppedAudioReloadSmokeFile)
 import           MetaSonic.App.ManifestLiveReloadDemo
                                             (runManifestLiveReloadDemo)
+import           MetaSonic.App.ManifestLiveSession
+                                            (runManifestLiveSession)
 import           MetaSonic.App.ManifestMIDIReloadSmoke
                                             (runManifestMIDIReloadSmoke)
 import           MetaSonic.App.ManifestReloadHost
-                                            (ManifestReloadHostStrategy)
+                                            (ManifestReloadHostStrategy (..))
 import           MetaSonic.App.Osc          (runOscListen)
 import           MetaSonic.App.SessionMidiSmoke (runSessionMidiSmoke)
 import           MetaSonic.App.SessionOscArbitrationSmoke
@@ -228,6 +230,15 @@ data RunMode
     -- The runtime preamble prints a "route:" line so the operator
     -- can see which path was selected. This whole command is
     -- opt-in; the normal demo path is unchanged.
+  | ManifestLiveSession
+    -- ^ Phase 8 v0 manifest-backed live session shell
+    -- (--manifest-live-session MANIFEST.json DEMO [--strategy S]).
+    -- Open-ended counterpart to ManifestLiveReloadDemo: starts
+    -- audio on DEMO through the manifest pipeline + supervised
+    -- lifecycle, then accepts stdin commands (demo:KEY to trigger
+    -- a supervised reload, <Enter> for status, <Ctrl-D> to exit).
+    -- Default strategy is require-preserving. The first real
+    -- consumer of the supervisor migration arc.
   deriving (Eq, Show)
 
 data Options = Options
@@ -403,6 +414,36 @@ parseArgs = go defaultOptions
     go _ ("--manifest-live-reload-demo" : []) =
       Left $
         "Missing strategy for --manifest-live-reload-demo"
+        <> "\nStrategies: "
+        <> intercalate ", " manifestReloadHostStrategyNames
+    go opts ("--manifest-live-session" : path : xs)
+      | null path || "--" `prefixOf` path =
+          Left "Missing manifest JSON file for --manifest-live-session"
+      | otherwise =
+          go opts { optMode = ManifestLiveSession
+                  , optManifestReloadFile = Just path
+                  } xs
+    go _ ("--manifest-live-session" : []) =
+      Left "Missing manifest JSON file for --manifest-live-session"
+    go opts ("--strategy" : strategyText : xs)
+      | null strategyText || "--" `prefixOf` strategyText =
+          Left $
+            "Missing value for --strategy"
+            <> "\nStrategies: "
+            <> intercalate ", " manifestReloadHostStrategyNames
+      | otherwise =
+          case parseManifestReloadHostStrategy strategyText of
+            Just strategy ->
+              go opts { optManifestReloadHostStrategy = Just strategy } xs
+            Nothing ->
+              Left $
+                "Invalid strategy for --strategy: " <> strategyText
+                <> " (expected one of: "
+                <> intercalate ", " manifestReloadHostStrategyNames
+                <> ")"
+    go _ ("--strategy" : []) =
+      Left $
+        "Missing value for --strategy"
         <> "\nStrategies: "
         <> intercalate ", " manifestReloadHostStrategyNames
     go opts ("--manifest-midi-reload-smoke" : path : xs)
@@ -988,6 +1029,25 @@ main = do
         oldDemo
         newDemo
         (defaultListenerConfig (optSessionOscPort opts))
+    ManifestLiveSession -> do
+      manifestPath <- maybe
+        (die "Missing manifest JSON file for --manifest-live-session")
+        pure
+        (optManifestReloadFile opts)
+      let strategy =
+            maybe RequirePreserving
+                  id
+                  (optManifestReloadHostStrategy opts)
+      demo <- either die pure $
+        resolveManifestReloadDiagnosticTarget
+          "--manifest-live-session"
+          "--manifest-live-session MANIFEST.json DEMO_KEY [--strategy S]"
+          opts
+      runManifestLiveSession
+        strategy
+        manifestPath
+        demo
+        (defaultListenerConfig (optSessionOscPort opts))
     ManifestMIDIReloadSmoke -> do
       manifestPath <- maybe
         (die "Missing manifest JSON file for --manifest-midi-reload-smoke")
@@ -1396,6 +1456,7 @@ runDemo opts demo
     || optMode opts == ManifestStoppedAudioReloadSmoke
     || optMode opts == ManifestHostStrategyReloadSmoke
     || optMode opts == ManifestLiveReloadDemo
+    || optMode opts == ManifestLiveSession
     || optMode opts == ManifestMIDIReloadSmoke =
       error "runDemo: reporting modes should be handled by main, never reach here"
   | otherwise = case demoBody demo of
@@ -1483,6 +1544,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: ManifestHostStrategyReloadSmoke should be handled by main, never reach here"
     ManifestLiveReloadDemo ->
       error "runSingleDemo: ManifestLiveReloadDemo should be handled by main, never reach here"
+    ManifestLiveSession ->
+      error "runSingleDemo: ManifestLiveSession should be handled by main, never reach here"
     ManifestMIDIReloadSmoke ->
       error "runSingleDemo: ManifestMIDIReloadSmoke should be handled by main, never reach here"
 

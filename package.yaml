@@ -174,7 +174,9 @@ executables:
       - MetaSonic.App.ManifestReloadHostStack
       - MetaSonic.App.ManifestReloadPreservingHostStack
       - MetaSonic.App.ManifestReloadTryPreservingHostStack
+      - MetaSonic.App.ManifestLiveCommon
       - MetaSonic.App.ManifestLiveReloadDemo
+      - MetaSonic.App.ManifestLiveSession
       - MetaSonic.App.ManifestMIDIIngressOps
       - MetaSonic.App.ManifestMIDIListener
       - MetaSonic.App.ManifestMIDIPortMIDI
@@ -224,7 +226,9 @@ tests:
       - MetaSonic.App.ManifestReloadHostStack
       - MetaSonic.App.ManifestReloadPreservingHostStack
       - MetaSonic.App.ManifestReloadTryPreservingHostStack
+      - MetaSonic.App.ManifestLiveCommon
       - MetaSonic.App.ManifestLiveReloadDemo
+      - MetaSonic.App.ManifestLiveSession
       - MetaSonic.App.ManifestMIDIIngressOps
       - MetaSonic.App.ManifestMIDIListener
       - MetaSonic.App.ManifestMIDIPortMIDI
@@ -243,6 +247,7 @@ tests:
       - MetaSonic.App.ManifestReloadSupervisorAdapter
       - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.Spec.AppManifestLiveReloadDemoRender
+      - MetaSonic.Spec.AppManifestLiveSession
       - MetaSonic.Spec.AppManifestMIDIIngressOps
       - MetaSonic.Spec.AppManifestMIDIListener
       - MetaSonic.Spec.AppManifestMIDIPortMIDI

@@ -224,6 +224,36 @@ manifest-supervised-try-preserving-live-smoke port="17002": stack-build
 manifest-supervised-require-preserving-live-smoke port="17003": stack-build
     PORT={{port}} ./tools/manifest_supervised_require_preserving_live_smoke.sh
 
+# Opt-in live operator smoke for the Phase 8 v0 manifest-backed
+# live session shell, driven against the require-preserving
+# supervised route. Distinct from the three live-reload-demo
+# wrappers above: this exercises the open-ended session shell
+# (`--manifest-live-session MANIFEST DEMO --strategy
+# require-preserving`) instead of the two-shot OLD/NEW
+# live-reload demo. Same marker shape (audio + ingress +
+# pre/post-reload OSC + clean exit + bind probes) plus a
+# session-specific status-snapshot marker that exercises the
+# stdin <Enter> = status command, and the same load-bearing
+# negative marker (no "stopped-audio phase" lines) the
+# require-preserving demo wrapper carries.
+#
+# Like the other live-audio wrappers, this is a LIVE / DEVICE
+# smoke and is INTENTIONALLY NOT a member of `check-offline` or
+# any default CI gate.
+#
+# Default port is 17004 (vs 17001-17003 for the three demo
+# wrappers) so the four smokes do not collide if run in
+# sequence and a stale post-exit state on one port does not
+# affect the others. Override with
+# `just manifest-live-session-require-preserving-smoke port=N`.
+#
+# Other parameters (manifest fixture, initial/target demo keys,
+# work dir for artifacts) are env-var configurable in the
+# wrapper script; see
+# tools/manifest_live_session_require_preserving_smoke.sh.
+manifest-live-session-require-preserving-smoke port="17004": stack-build
+    PORT={{port}} ./tools/manifest_live_session_require_preserving_smoke.sh
+
 # §4.B kernel microbench. Configures and builds in a separate
 # RelWithDebInfo tree so the numbers aren't dominated by
 # libstdc++ assertion overhead from the Debug `cpp-build`.
