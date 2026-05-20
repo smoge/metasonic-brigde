@@ -197,6 +197,8 @@ test-suite metasonic-bridge-test
   main-is: Spec.hs
   other-modules:
       MetaSonic.App.Demos
+      MetaSonic.App.FusionCostLab
+      MetaSonic.App.FusionCostModel
       MetaSonic.App.ManifestReloadBinding
       MetaSonic.App.ManifestReloadCli
       MetaSonic.App.ManifestReloadEvent
@@ -241,6 +243,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestReloadSupervisor
       MetaSonic.Spec.AppManifestReloadUIIngress
       MetaSonic.Spec.AppDemos
+      MetaSonic.Spec.AppFusionCostLab
       MetaSonic.Spec.Core
       MetaSonic.Spec.Core.BusRouting
       MetaSonic.Spec.Core.CCBuilder

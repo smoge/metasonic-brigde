@@ -9,6 +9,7 @@ module Main (main) where
 import           Test.Tasty
 
 import           MetaSonic.Spec.AppDemos
+import           MetaSonic.Spec.AppFusionCostLab     (appFusionCostLabTests)
 import           MetaSonic.Spec.AppManifestMIDIIngressOps
 import           MetaSonic.Spec.AppManifestMIDIListener
 import           MetaSonic.Spec.AppManifestLiveReloadDemoRender
@@ -57,7 +58,8 @@ import           MetaSonic.Spec.Feature.FusionProgramScaffold
 import           MetaSonic.Spec.Feature.FusionProgramSuperExecutor
                    (fusionProgramSuperExecutorTests)
 import           MetaSonic.Spec.Feature.Planner (plannerTests)
-import           MetaSonic.Spec.Feature.StaticPlugin (staticPluginSkeletonTests)
+import           MetaSonic.Spec.Feature.StaticPlugin (oneTapDelayPluginTests,
+                                                      staticPluginSkeletonTests)
 import           MetaSonic.Spec.PatternOSCBuffer
 import           MetaSonic.Spec.Session.Arbitration (sessionArbitrationTests)
 import           MetaSonic.Spec.Session.ArbitrationGateway
@@ -164,6 +166,8 @@ main = defaultMain $ testGroup "MetaSonic"
   , spectralFreezeSkeletonTests
   , spectralLpfTests
   , staticPluginSkeletonTests
+  , oneTapDelayPluginTests
+  , appFusionCostLabTests
   , authoringDslTests
   , authoringReportTests
   , authoringManifestTests

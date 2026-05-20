@@ -203,6 +203,8 @@ tests:
       - app
     other-modules:
       - MetaSonic.App.Demos
+      - MetaSonic.App.FusionCostLab
+      - MetaSonic.App.FusionCostModel
       - MetaSonic.App.ManifestReloadBinding
       - MetaSonic.App.ManifestReloadCli
       - MetaSonic.App.ManifestReloadEvent
@@ -247,6 +249,7 @@ tests:
       - MetaSonic.Spec.AppManifestReloadSupervisor
       - MetaSonic.Spec.AppManifestReloadUIIngress
       - MetaSonic.Spec.AppDemos
+      - MetaSonic.Spec.AppFusionCostLab
       - MetaSonic.Spec.Core
       - MetaSonic.Spec.Core.BusRouting
       - MetaSonic.Spec.Core.CCBuilder
