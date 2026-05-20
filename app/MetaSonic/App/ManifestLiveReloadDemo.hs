@@ -21,9 +21,10 @@
 --
 -- * @RequirePreserving@ and @TryPreservingThenStoppedAudio@ stay on
 --   the direct 'reloadManifestHostWithStrategy' path
---   ('LiveReloadDirect'). They will move to the supervised stack
---   only after the stopped-audio supervised route has accumulated
---   hardware exercise.
+--   ('LiveReloadDirect'). Migrating them to the supervised
+--   stack is its own slice, gated on further supervised-route
+--   hardware exposure plus the CI-gating decision for the
+--   supervised path.
 --
 -- The runtime preamble prints a @route:@ line so the operator can
 -- see which path was selected. The routing decision itself is a
