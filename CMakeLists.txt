@@ -9,6 +9,7 @@ add_library(tinysynth_rt STATIC
     tinysynth/rt_graph.cpp
     tinysynth/rt_graph_plugins.cpp
     tinysynth/plugins/identity.cpp
+    tinysynth/plugins/one_tap_delay.cpp
     tinysynth/voice_allocator.cpp
     tinysynth/midi_voice_processor.cpp
     tinysynth/midi_demo.cpp

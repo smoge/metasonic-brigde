@@ -7,6 +7,7 @@
 namespace metasonic {
 
 const PluginSpec *identity_plugin_spec() noexcept;
+const PluginSpec *one_tap_delay_plugin_spec() noexcept;
 
 namespace {
 
@@ -20,12 +21,20 @@ void ensure_builtin_plugins_registered() noexcept {
   if (g_builtin_plugins_registered) return;
   g_builtin_plugins_registered = true;
   (void)register_plugin(identity_plugin_spec());
+  (void)register_plugin(one_tap_delay_plugin_spec());
 }
 
 } // namespace
 
 int register_plugin(const PluginSpec *spec) noexcept {
   if (spec == nullptr || spec->name == nullptr) return -1;
+  // Phase 6.E v2 §4.2 bounds check: reject metadata that would
+  // either silently take the zero-state-pass-nullptr branch in
+  // process_static_plugin (negative state_size_bytes) or overflow
+  // StaticPluginState::storage[kMaxPluginState] (oversized state).
+  if (spec->state_size_bytes < 0 || spec->state_size_bytes > kMaxPluginState) {
+    return -1;
+  }
   if (g_plugin_count >= kMaxPlugins) return -1;
   if (plugin_find(spec->name) >= 0) return -1;
 
