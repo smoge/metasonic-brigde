@@ -3823,9 +3823,11 @@ Still gated:
   `MetaSonic.App.ManifestReloadSupervisorAdapter` +
   `MetaSonic.App.ManifestReloadHostStack`; real-host
   `StoppedAudioHostStackOps` and the supervised
-  `StoppedAudioOnly` CLI route are landed, with hardware
-  exercise still required before moving preserving /
-  try-preserving fallback onto the supervisor path), and the
+  `StoppedAudioOnly` CLI route are landed and
+  hardware-confirmed once on 2026-05-20, with the preserving /
+  try-preserving fallback migration gated on further
+  supervised-route hardware exposure plus the CI-gating
+  decision for that path), and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a

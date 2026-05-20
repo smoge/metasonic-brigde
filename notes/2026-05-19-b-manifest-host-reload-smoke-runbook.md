@@ -610,16 +610,37 @@ Manifest live reload demo (experimental).
   osc accept: CmdControlWrite voice=v0 tag=ControlTag {ctNodeTag = MigrationKey {unMigrationKey = "lpf"}, ctSlot = 0} value=0.25
 ```
 
-Acceptance checklist against the transcript above:
+After the second Enter the demo exits and the wrapper runs
+the post-exit probes. Those probes are not part of the demo's
+own stdout — they are the wrapper's evidence that the
+listener socket actually released:
 
-| # | Marker the transcript must prove | Verbatim line |
-|---|---|---|
-| 1 | Supervised route selected | `route: supervised (reloadSupervised + HostStackFactory)` |
-| 2 | Real audio + real OSC opened | `audio running: yes`, `oscPort=17001` |
-| 3 | Pre-reload OSC accept | `osc accept: CmdControlWrite voice=v0 ... value=0.75` |
-| 4 | Stopped-audio phase ran under the supervisor | `supervised outcome: committed (new plan installed)` + `stopped-audio phase started` / `stopped-audio phase committed` reload events |
-| 5 | Post-reload ingress targets the new demo | `OSC ingress: open demo=preserve-cutoff-bright ... oscPort=17001`, then `osc accept: CmdControlWrite voice=v0 ... value=0.25` against the new surface |
-| 6 | Cleanup releases resources | demo exited 0; `ss -lun` showed no UDP listener on port 17001; an active bind probe from a fresh Python process (`socket.socket(AF_INET, SOCK_DGRAM).bind(('localhost', 17001))`) succeeded, proving the listener really released the socket. (An `oscsend` send does NOT prove this — UDP datagrams to an unbound port still succeed at the network layer; the OS just drops them. The active bind is the load-bearing probe here.) |
+```text
+[wrapper] demo exit=0
+[wrapper] ss snapshot: no UDP listener on port 17001
+[wrapper] active bind probe: port 17001 rebound successfully
+```
+
+`ss -lun` is a passive snapshot of the kernel's UDP listener
+table after the demo exits. The active bind probe is a fresh
+Python process that calls
+`socket.socket(AF_INET, SOCK_DGRAM).bind(('localhost', 17001))`
+and exits 0 only on a successful bind — load-bearing because
+an `oscsend` send does NOT prove the socket released (UDP
+datagrams to an unbound port still succeed at the network
+layer; the OS just drops them).
+
+Acceptance checklist against the transcript and the wrapper
+probe block above:
+
+| # | Marker the run must prove | Source | Verbatim line / probe output |
+|---|---|---|---|
+| 1 | Supervised route selected | transcript | `route: supervised (reloadSupervised + HostStackFactory)` |
+| 2 | Real audio + real OSC opened | transcript | `audio running: yes`, `oscPort=17001` |
+| 3 | Pre-reload OSC accept | transcript | `osc accept: CmdControlWrite voice=v0 ... value=0.75` |
+| 4 | Stopped-audio phase ran under the supervisor | transcript | `supervised outcome: committed (new plan installed)` + `stopped-audio phase started` / `stopped-audio phase committed` reload events |
+| 5 | Post-reload ingress targets the new demo | transcript | `OSC ingress: open demo=preserve-cutoff-bright ... oscPort=17001`, then `osc accept: CmdControlWrite voice=v0 ... value=0.25` against the new surface |
+| 6 | Cleanup releases resources | post-exit probe | `[wrapper] demo exit=0` + `[wrapper] ss snapshot: no UDP listener on port 17001` + `[wrapper] active bind probe: port 17001 rebound successfully` |
 
 With this run on record, the §219 slice-4 routing has
 transitioned from "needs hardware exercise" to
