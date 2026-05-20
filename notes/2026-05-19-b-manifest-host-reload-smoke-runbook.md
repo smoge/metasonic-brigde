@@ -360,6 +360,88 @@ demo's `rcCC` field — including dropping CC 74 — fails the
 "preserve-cutoff manifest projects MIDI CC 74 on both demos"
 test before it can mislead an operator reading this section.
 
+### Loopback confirmation (ALSA Midi Through, 2026-05-20)
+
+First end-to-end run of the section above, captured outside CI
+against the ALSA Midi Through loopback rather than a hardware
+controller. PortMIDI device id=1 (`name="Midi Through Port-0"`)
+sits on ALSA seq port `14:0`; a 30-byte SMF carrying one CC 74
+event (channel 1, value 100 = `0xB0 0x4A 0x64`) was injected via
+`aplaymidi -p 14:0` after the smoke header printed. Verbatim
+transcript:
+
+```
+Manifest MIDI device smoke.
+
+  manifest path: examples/manifests/preserve-cutoff.json
+  demo: preserve-cutoff-dark
+  device: 1 (explicit)
+  window: 6 second(s)
+  default MIDI voice: v0
+
+  bound CC table:
+    - cc=74 tag=lpf/0 name="cutoff" default=600.0 range=[200.0, 6000.0]
+
+  no reload executed: this smoke exercises the open / decode /
+  manifest CC routing path only.
+
+  Send manifest-bound CCs now (and any other MIDI you want to
+  observe routed through the ingress projection).
+
+  ingress: opened. Listening...
+  accept: CmdControlWrite voice=v0 tag=lpf/0 value=4766.929133858268
+  drain: items=1 queue_depth=0 stopped=Nothing
+
+  summary:
+    accepted: 1
+    drained: 1
+    enqueue-rejected: 0
+    unbound-cc rejects: 0
+    other ingress rejects: 0
+    ignored non-CC events: 0
+Manifest MIDI device smoke complete.
+```
+
+What the run confirmed about the real PortMIDI / ALSA path that
+unit tests do not:
+
+- `default MIDI voice:` line on a real device open matches the
+  policy alignment from `6fa21ea`. The smoke header was
+  `default MIDI voice: fx` before that commit and would have
+  contradicted the `accept: ... voice=v0` line.
+- Bound-CC table renders the fixture's CC 74 row exactly as this
+  section promises, including the 600 Hz default for the dark
+  variant and the `[200.0, 6000.0]` range. The bright variant's
+  identical-shape promise (default = 2400.0) is implied by the
+  byte-equal fixture test and was not re-verified on hardware.
+- CC value scaling: 100/127 across `[200.0, 6000.0]` resolves to
+  ≈ 4766.93, matching the printed accept value to within
+  Double precision. The manifest layer is doing linear range
+  scaling correctly.
+- Single-event flow: `accept` then `drain: items=1`, summary
+  reports `accepted: 1 drained: 1`. No rejects, no ignored
+  events, exit code 0.
+
+What this run did **not** verify, and what real-hardware
+confirmation against a physical MIDI controller still owes:
+
+- Multi-event behavior under sustained traffic (knob sweeps,
+  rapid CC streams). Loopback injection from a static SMF file
+  cannot exercise the per-event ingress drain timing the way a
+  controller-held physical knob can.
+- Channel filtering against a controller that defaults to a
+  non-channel-1 transmit channel. The SMF used here is hard-
+  coded to channel 1; the manifest's channel filter behavior
+  is unit-tested but not yet hardware-confirmed.
+- Real-hardware open path beyond the loopback driver. Q /
+  PortMIDI's open against a hot-plugged USB MIDI device or a
+  bus-detached interface is unexercised here.
+
+The loopback confirmation is enough to declare the runbook's
+accepted-event line empirically correct at the routing layer;
+hardware-gated CI for the device-backed paths (the ROADMAP's
+remaining open polish in this arc) is a separate question.
+
 ## Things this runbook deliberately does not cover
 
 - Resource/allocation recovery event streaming. Still
