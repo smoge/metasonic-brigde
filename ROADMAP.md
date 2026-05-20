@@ -1583,21 +1583,117 @@ Three shapes were considered:
   re-shapes survey / inspector code that currently keys on
   `NodeKind`.
 
-The decision-note deliverable is done; the immediate follow-up is the
-small Haskell catalog scaffold for the existing `identity` row.
+The decision-note deliverable landed alongside the small Haskell
+catalog scaffold for the existing `identity` row: `MetaSonic.Bridge.Source`
+exposes `StaticPluginInfo`, `staticPluginCatalog`, and `staticPluginInfo`.
+The `identity` row carries plugin id 0, arity 2 -> 1, zero declared
+latency, and `[Pure]` effects; `staticPluginId`, validation, `ugenView`,
+and `inferEff` route through that table. The forcing-function second
+plugin landed in §6.E.4 below.
 
-Follow-up scaffold: `MetaSonic.Bridge.Source` now exposes
-`StaticPluginInfo`, `staticPluginCatalog`, and `staticPluginInfo`.
-The lone `identity` row carries plugin id 0, arity 2 -> 1, zero
-declared latency, and `[Pure]` effects; `staticPluginId`, validation,
-`ugenView`, and `inferEff` route through that table.
+### [x] Phase 6.E.4 — Second static plugin: `oneTapDelayPlugin`
 
-Until a real second plugin (probably a small stateful one such as a one-tap
-delay) demands it, broader plugin-host work stays parked. Out-of-scope
-for 6.E.3 specifically: LV2 / VST3 / CLAP adapter kinds, dynamic
-loading / plugin discovery, plugin-owned UI, MIDI-in plugins, and any
-new C ABI surface. Those reopen only after the metadata shape has been
-exercised by a second static plugin.
+The second-user slice the §6.E.3 decision note named as its forcing
+function. `oneTapDelayPlugin` is a two-input, one-sample-delayed sum:
+the smallest new plugin behavior that exercises every piece of the v1
+hosting protocol Identity left untested — a second catalog row coexisting
+with Identity, real per-instance plugin state plumbed through
+`StaticPluginState`, declared per-plugin latency surfacing through a
+plugin-aware accessor, and counter-confirmed dispatch independence
+across plugin ids on the same `KStaticPlugin` kind.
+
+Contract:
+- [Phase 6.E.4 second-static-plugin contract](notes/2026-05-19-d-phase-6e4-second-static-plugin-contract.md)
+  — pins the catalog row shape, the host-owned inline state
+  contract (zero-valid + implicit-lifetime), the §4.2
+  `register_plugin` bounds check, the §3 plugin-aware latency
+  accessor, and the §5 test set. See its top-of-note "Implemented
+  status" section for the landed commits.
+
+Landed:
+- Second catalog row in `MetaSonic.Bridge.Source`: `oneTapDelayPlugin`
+  at plugin id 1, arity 2 -> 1, `spiLatencySamples = 1`, `[Pure]`
+  effects, label `"one-tap-delay"`. Pure-Haskell catalog now has two
+  rows; the C++ registry is in lockstep via
+  `ensure_builtin_plugins_registered`.
+- Host-owned per-instance state on `StaticPluginState`:
+  `alignas(std::max_align_t) std::array<std::byte, kMaxPluginState>`
+  inline storage, free-riding on the spectral-state variant footprint
+  (compile-time `static_assert` guards the invariant). `kMaxPluginState`
+  declared in `tinysynth/rt_graph_plugins.h` inside `namespace metasonic`.
+- C++ runtime registration and build wiring:
+  `tinysynth/plugins/one_tap_delay.cpp` (null-as-zero on each input,
+  mirrors `identity.cpp`), registered after `identity_plugin_spec()`
+  in `ensure_builtin_plugins_registered`; both `package.yaml`
+  `cxx-sources` and `CMakeLists.txt` carry the new TU.
+- §4.2 bounds check in `register_plugin`:
+  `state_size_bytes ∉ [0, kMaxPluginState]` returns `-1` at
+  registration time so the runtime registry never carries an
+  out-of-spec row.
+- Dispatcher branch in `process_static_plugin`: passes
+  `st->storage.data()` when `state_size_bytes > 0`, keeps `nullptr`
+  for Identity (zero-state plugins) so its audio-thread behavior
+  stays bit-equivalent to v1. `spec->init` is never called in v2 —
+  the contract pins zero-valid + implicit-lifetime / trivially
+  copyable plugin state.
+- Plugin-aware latency: `nodeDeclaredLatency :: RuntimeNode -> Maybe Int`
+  in `MetaSonic.Bridge.Compile.Latency`. Reads the frozen
+  `plugin_id` from `rnControls` via `finitePluginId` (a bounds-ordered
+  parser exported from `Bridge.Source` alongside `maxExactPluginId`
+  and `staticPluginInfoById`) and consults `staticPluginCatalog`.
+  Three consumers migrated: `declaredLatencyFootprint`,
+  `nodeOutputLatencies`, and `FusionCostLab.extractFeatures`. User-
+  facing wording refreshed in `Survey.hs`'s latency-footprint header
+  and the `Compile/Latency.hs` module-header comment.
+- Test surface (C++ + Haskell):
+  - C++ doctest gains the `register_plugin` bounds-check cases for
+    just-past-upper-bound, `-1`, `INT_MIN`, and the inclusive
+    upper-bound accept; a "registry exposes one-tap-delay" smoke
+    pinning plugin id 1, arity 2 -> 1, latency 1, non-zero state
+    bytes; and a "KStaticPlugin dispatch passes storage pointer
+    for stateful plugins" smoke that builds a real one-tap-delay
+    node via the template ABI and asserts `plugin_call_count == 1
+    ∧ invalid_plugin_call_count == 0`. The accept-case spec is a
+    function-local `static` so `register_plugin`'s stored pointer
+    doesn't dangle.
+  - Haskell `oneTapDelayPluginTests` in
+    `test/MetaSonic/Spec/Feature/StaticPlugin.hs` covers the §5
+    catalog row, `inferEff`, runtime-registry agreement,
+    `nodeDeclaredLatency` happy + malformed paths, `declaredLatencyFootprint`,
+    `plugin_call_count` ticking, single-block and cross-block
+    impulse delay (via `playBufMono`-loaded impulse buffers),
+    null-as-zero, per-instance state independence across two plugin
+    nodes and across two voices, Identity / one-tap-delay
+    coexistence, and kind-level metadata unchanged.
+  - New `test/MetaSonic/Spec/AppFusionCostLab.hs` test module pins
+    `fcfLatencyNodes` / `fcfMaxLatency` on a one-tap-delay graph
+    `(1, 1)` and an Identity-only graph `(0, 0)` — the regression
+    the `FusionCostLab.extractFeatures` migration prevents.
+- Review-pass follow-ups: the `c_rt_graph_ensure_bus rt 1` call and
+  the `readBus` "wrote == n" assertion close a false-negative path
+  for any "bus N is silent" assertion when a per-instance bus
+  override targets a bus the loader's spec-level sizing pass never
+  grew; three stale Identity-only Haddock spots in
+  `MetaSonic.Bridge.Source` refreshed to describe the catalog and
+  per-plugin metadata path.
+
+Parked behind a forcing-function plugin:
+- `spec->init` / `spec->reset` callbacks. v2 calls neither; the
+  init-seam follow-up note will decide between producer-thread
+  init via a reshaped `init_node_state` signature and RT-safe-by-
+  contract init from `process_static_plugin`. Forcing function: a
+  stateful plugin whose correct initial state is not all-zeros
+  (e.g. a sample-rate-dependent filter).
+- Per-plugin resource effects. Both catalog rows declare `[Pure]`.
+  A plugin that legitimately reads or writes a bus or buffer needs
+  the node-specific resource-metadata path the §6.E v1 design
+  flagged before non-`Pure` rows can land.
+- Plugin parameters. The fixed `staticPlugin ref in0 in1` surface
+  is preserved; parameter layout / modulation stays parked behind
+  the §6.E Q-4 decision.
+- LV2 / VST3 / CLAP adapters, dynamic loading / discovery,
+  plugin-owned UI, MIDI-in plugins, multichannel plugins, and any
+  new C ABI surface remain parked.
 
 State snapshot at the 6.A–6.D boundary:
 - [Phase 6.A–6.D state snapshot](notes/2026-05-11-g-state-snapshot-phase-6-complete.md).

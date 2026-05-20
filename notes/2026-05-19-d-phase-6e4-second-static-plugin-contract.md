@@ -2,8 +2,12 @@
 
 Date: 2026-05-19
 
-Status: pre-implementation contract. This is the "small design
-note" the
+Status: **landed**. The contract body below is preserved as the
+design record the implementation slice was reviewed against; the
+"Implemented status" section immediately below this header is the
+authoritative summary of what shipped, with the commit chain and
+the remaining deferrals. The contract was the
+"small design note" the
 [Phase 6.E.3 plugin metadata decision](2026-05-11-n-phase-6e3-plugin-metadata-decision.md)
 asked for before a second static plugin entered the runtime. The
 companion v1 contract for the first plugin kind is
@@ -12,6 +16,88 @@ this note adopts the same shape and only resolves the questions the
 v1 note explicitly left open for the next plugin. Shape mirrors
 [Phase 6.D second spectral kind contract](2026-05-19-c-phase-6d-second-spectral-kind-contract.md)
 because the same "second user proves the seam" discipline applies.
+
+The original pre-implementation framing has been retained verbatim
+below from §0 onward so future readers can reconstruct what the
+slice was being held to, what the contract considered and rejected
+(§1's alternatives, §9's Q-deferrals), and how the §7 site table
+ordered the work.
+
+## Implemented status
+
+Landed across ten commits between the contract-note merge
+(`200c4b5`) and the closeout sync, in the same §7 ordering the
+contract prescribed:
+
+| # | Commit | Slice content |
+|---|--------|---------------|
+| 1 | `7988150` | Prep: `kMaxPluginState` in `tinysynth/rt_graph_plugins.h` inside `namespace metasonic`; `StaticPluginState` gains an `alignas(std::max_align_t) std::array<std::byte, kMaxPluginState>` inline storage blob; `static_assert` pinning the §4.1 free-ride invariant against `SpectralFreezeState`. |
+| 2 | `d1a0fed` | Step 2: `tinysynth/plugins/one_tap_delay.cpp` (two-input one-sample-delayed sum, null-as-zero on each input mirroring `identity.cpp`); registered after Identity in `ensure_builtin_plugins_registered`; both `package.yaml` `cxx-sources` and `CMakeLists.txt` updated in lockstep; §4.2 bounds check on `register_plugin` (`state_size_bytes ∉ [0, kMaxPluginState]` → `-1`). |
+| 3 | `a4c8ff2` | Step 3: §5 #13 C++ doctest cases for `register_plugin` bounds (just-past-upper-bound, `-1`, `INT_MIN`, inclusive upper-bound accept). |
+| 4 | `d806e98` | Step 4 / site 14: `process_static_plugin` passes `st->storage.data()` when `state_size_bytes > 0`, keeps `nullptr` for Identity. `spec->init` remains uncalled in v2. |
+| 5 | `fc3cced` | Doctest hardening: "registry exposes one-tap-delay" smoke; accept-case `PluginSpec` moved to function-local `static` so `register_plugin`'s stored pointer outlives the test. |
+| 6 | `64c6b92` | Dispatch smoke (`KStaticPlugin` builds a real one-tap-delay node via the template ABI; asserts `plugin_call_count == 1 ∧ invalid_plugin_call_count == 0`); pins plugin id 1 in the registry smoke; refreshes the stale `StaticPluginState` comment that still pointed at a future dispatcher slice. |
+| 7 | `47e28ad` | Sites 1–3 (Haskell): `oneTapDelayPlugin :: PluginRef`, second `staticPluginCatalog` row at `spiPluginId = 1`, and `staticPluginInfoById` / `finitePluginId` / `maxExactPluginId` accessors with module-level exports. |
+| 8 | `3f07985` | Sites 4–6 / 6a / 6b: `nodeDeclaredLatency` in `Compile/Latency.hs`; three consumers migrated (`declaredLatencyFootprint`, `nodeOutputLatencies`, `FusionCostLab.extractFeatures`); user-facing wording refreshed in `Survey.hs`'s latency footprint header and the `Compile/Latency.hs` module header. |
+| 9 | `c037b50` | Sites 17 / 17a / 17b: 13 cases in `oneTapDelayPluginTests` (`Feature/StaticPlugin.hs`) + 2 cases in new `MetaSonic.Spec.AppFusionCostLab` module + test-component `other-modules` wiring (`MetaSonic.App.FusionCostLab`, `MetaSonic.App.FusionCostModel`, `MetaSonic.Spec.AppFusionCostLab`). |
+| 10 | `0152a8b` | Review pass: `c_rt_graph_ensure_bus rt 1` in test #10 before the per-instance bus override; `readBus` helper asserts the read count equals `n` (closes a false-negative path on any "bus N is silent" assertion); three stale Identity-only Haddock spots in `Bridge/Source.hs` refreshed. |
+
+Test count delta: Haskell suite 1161 → 1178 (+17); C++ doctest
+suite 314 → 317 (+3). Both build paths (`stack` via `cxx-sources`
+and the standalone `cmake` build into `build-cpp/`) compile clean
+and all assertions pass.
+
+The slice landed §7 step 1 through step 7 verbatim. Two material
+departures from the §5 / §7 sketches, both reducing scope rather
+than adding it:
+
+- §5 case #10 (two-voice state independence) ships against a
+  simpler `loadTemplateGraph + c_rt_graph_template_instance_add +
+  per-instance busOut override` pattern rather than the contract's
+  `loadTemplateGraphWithAutoSpawns + remove + realtime_reserve ×2 +
+  realtime_activate` dance. Same leak catches with less plumbing;
+  the false-negative window where voice B writes to a non-existent
+  bus is closed by the `c_rt_graph_ensure_bus` call + the `readBus`
+  length assertion landed in `0152a8b`.
+- The contract sketched §5 cases #1–#13 (Haskell side) plus #4a /
+  #5a / #8a as additions; the landed test count is 13 cases in
+  `StaticPlugin.hs` + 2 cases in `AppFusionCostLab` (15 total)
+  rather than the contract's ~16. Coverage matches; some
+  contract-numbered cases were bundled tighter inside a single
+  test where the assertions were natural neighbors.
+
+Deferrals stay parked behind a forcing-function plugin, as
+§4 / §8 / §9 already pinned:
+
+- `spec->init` / `spec->reset` callbacks (§4 / §9 Q-4). v2 calls
+  neither. The init-seam follow-up note will choose between
+  producer-thread init via a reshaped `init_node_state` signature
+  and RT-safe-by-contract init from `process_static_plugin`. Forcing
+  function: a stateful plugin whose correct initial state is not
+  all-zeros — most likely a sample-rate-dependent filter.
+- Per-plugin resource effects (§8). Both catalog rows declare
+  `[Pure]`. A bus-reading / bus-writing / buffer-touching plugin
+  needs the node-specific resource-metadata path the v1 §6.E design
+  flagged before `inferEff` for `KStaticPlugin` can honestly return
+  non-`Pure`.
+- Plugin parameters (§8 / §6.E Q-4). The fixed
+  `staticPlugin ref in0 in1` surface is preserved; parameter
+  layout / modulation stays parked.
+- Plugin state migration across hot-swap (§8).
+  `node_kind_supports_state_migration KStaticPlugin = false` stays;
+  the new per-instance `storage` blob does not opt into Phase 5.2
+  migration.
+- LV2 / VST3 / CLAP adapter kinds, dynamic loading / plugin
+  discovery, plugin-owned UI, MIDI-in plugins, and multichannel
+  plugins (§8) remain parked.
+- Per-plugin scheduling refinement (§8). `KStaticPlugin` stays
+  uniformly `CapHardBarrier`; relaxing this for stateless or
+  latency-bearing-only plugins is a §6.E.3 follow-up.
+
+Forcing-function rule: every parked item reopens only when a real
+plugin pulls the contract in a specific direction. Pinning any of
+them ahead of that user repeats the speculative-design pattern
+§6.E.3 explicitly rejected.
 
 Read this before writing any runtime code. The intent is for the
 implementation slice to mirror this note line-for-line, the same way
