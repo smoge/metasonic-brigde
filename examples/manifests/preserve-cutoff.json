@@ -17,7 +17,7 @@
           "rangeMin": 200,
           "rangeMax": 6000,
           "smoothingHz": 0,
-          "cc": null,
+          "cc": 74,
           "key": "lpf",
           "slot": 0
         }
@@ -39,7 +39,7 @@
           "rangeMin": 200,
           "rangeMax": 6000,
           "smoothingHz": 0,
-          "cc": null,
+          "cc": 74,
           "key": "lpf",
           "slot": 0
         }

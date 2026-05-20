@@ -717,6 +717,13 @@ usage prog = unlines
   , "                   execution, no reload semantics; exits non-zero only"
   , "                   when the PortMIDI factory cannot produce an"
   , "                   input-capable source."
+  , "                   Blessed fixture path:"
+  , "                     examples/manifests/preserve-cutoff.json"
+  , "                     DEMO=preserve-cutoff-dark (or -bright)"
+  , "                   binds CC 74 (GM2 filter cutoff) to the same direct"
+  , "                   KLPF write the OSC /v<voice>/lpf/0 surface targets."
+  , "                   See notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md"
+  , "                   for the expected accepted-event line."
   , "  --manifest-midi-smoke-seconds N"
   , "                   Smoke window in seconds for"
   , "                   --manifest-midi-reload-smoke. Default 10."
@@ -789,6 +796,8 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-live-reload-demo try-preserving examples/manifests/preserve-cutoff.json preserve-cutoff-dark preserve-cutoff-bright"
   , "       (blessed preserving path; commits without stopped-audio fallback)"
   , "  " <> prog <> " --manifest-midi-reload-smoke manifest.json send-return --midi-device 2"
+  , "  " <> prog <> " --manifest-midi-reload-smoke examples/manifests/preserve-cutoff.json preserve-cutoff-dark --midi-device 2"
+  , "       (blessed MIDI path; CC 74 -> KLPF cutoff write)"
   ]
 
 --------------------------------------------------------------------------------

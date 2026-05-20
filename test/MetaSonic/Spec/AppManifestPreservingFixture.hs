@@ -28,7 +28,10 @@ import           Test.Tasty.HUnit
 
 import           MetaSonic.App.Demos            (demoTable, demoKey,
                                                  demoAuthoring)
-import           MetaSonic.Authoring.Manifest   (AuthoringManifestDoc (..),
+import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
+                                                 AuthoringManifestDoc (..),
+                                                 ManifestControl (..),
+                                                 decodeManifestDoc,
                                                  encodeManifestDoc,
                                                  manifestFromReport,
                                                  manifestSchemaVersion)
@@ -82,6 +85,35 @@ appManifestPreservingFixtureTests =
          <> "> " <> fixturePath)
         generated
         onDisk
+
+  , testCase
+      "preserve-cutoff manifest projects MIDI CC 74 on both demos"
+      $ do
+      -- Pins the MIDI ingress surface the --manifest-midi-reload-smoke
+      -- runbook entry promises: both preserve-cutoff-* manifests
+      -- expose exactly one 'cutoff' control with mcCC = Just 74 and
+      -- migration key "lpf"/slot 0. Reads the on-disk fixture
+      -- (decoded through the same FromJSON path the smoke CLI uses)
+      -- rather than projecting from the demo source, so a stale
+      -- fixture would surface here AND in the byte-equal test above.
+      -- The two together pin: the source-of-truth has the binding,
+      -- the file on disk encodes it, and the decoder round-trips it.
+      raw <- BL.readFile fixturePath
+      doc <- case decodeManifestDoc raw of
+        Right d  -> pure d
+        Left err -> assertFailure
+                      ("failed to decode " <> fixturePath <> ": " <> err)
+                    >> error "unreachable"
+      let demoCC name =
+            case [ mfControls m
+                 | m <- docDemos doc, mfDemoKey m == name
+                 ] of
+              [[c]] -> Just (mcCC c, mcKey c, mcSlot c)
+              _     -> Nothing
+      demoCC "preserve-cutoff-dark"
+        @?= Just (Just 74, "lpf", 0)
+      demoCC "preserve-cutoff-bright"
+        @?= Just (Just 74, "lpf", 0)
   ]
   where
     lookupDemo k = case filter ((== k) . demoKey) demoTable of

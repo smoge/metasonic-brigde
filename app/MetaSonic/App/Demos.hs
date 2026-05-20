@@ -443,16 +443,19 @@ sendReturnAuthoring = ensembleReport sendReturnEnsemble
 -- has enough harmonic content above 600 Hz that the LPF cutoff
 -- change is audibly unmistakable.
 --
--- The matching authoring reports declare one OSC control each,
--- bound DIRECTLY to the LPF's @cutoff@ input (migration key "lpf",
--- slot 0 — see KLPF in Types.hs). The binding intentionally does
--- NOT route through 'Auth.control' / KSmooth, because KSmooth is
+-- The matching authoring reports declare one control each, bound
+-- DIRECTLY to the LPF's @cutoff@ input (migration key "lpf",
+-- slot 0 — see KLPF in Types.hs) and addressable through *two*
+-- ingress paths: OSC on @/v<voice>/lpf/0@ and MIDI on CC 74
+-- (GM2 "Brightness / Sound Controller 5", the standard filter-
+-- cutoff CC). The binding intentionally does NOT route through
+-- 'Auth.control' / KSmooth, because KSmooth is
 -- 'PreserveUnsupported' in 'preservingHotSwapNodeClass'
 -- (RTGraphAdapter.hs) and would make the preserving reload reject.
--- The trade-off is that OSC writes arrive unsmoothed — acceptable
--- for a manual preserving demo. Smooth authored controls across
--- preserving reload are a separate slice unless KSmooth becomes
--- preservable.
+-- The trade-off is that OSC / MIDI writes arrive unsmoothed —
+-- acceptable for a manual preserving demo. Smooth authored
+-- controls across preserving reload are a separate slice unless
+-- KSmooth becomes preservable.
 
 dronePreserveSawDark :: SynthGraph
 dronePreserveSawDark = runSynth $ do
@@ -468,9 +471,10 @@ dronePreserveSawBright = runSynth $ do
   shaped   <- gain filtered (Param 0.2)
   out 0 shaped
 
--- | OSC control declaration for the dark preserving entry:
--- display name "cutoff", direct binding to KLPF slot 0 via
--- migration key "lpf", default matching the graph baseline.
+-- | Control declaration for the dark preserving entry: display
+-- name "cutoff", direct binding to KLPF slot 0 via migration key
+-- "lpf", default matching the graph baseline, addressable via
+-- OSC at @/v<voice>/lpf/0@ and MIDI CC 74 (GM2 filter cutoff).
 -- Unsmoothed (see header note).
 preserveCutoffControlDark :: Report.ReportedControl
 preserveCutoffControlDark = Report.ReportedControl
@@ -478,7 +482,7 @@ preserveCutoffControlDark = Report.ReportedControl
   , Report.rcDefault     = 600.0
   , Report.rcRange       = (200.0, 6000.0)
   , Report.rcSmoothingHz = 0.0
-  , Report.rcCC          = Nothing
+  , Report.rcCC          = Just 74
   , Report.rcKey         = MigrationKey "lpf"
   , Report.rcSlot        = 0
   }

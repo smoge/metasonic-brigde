@@ -284,6 +284,82 @@ so the run does not leak the listener. The fake-audio smoke and the
 orchestrator's preserving branch on the CI side; the transcript above
 is what an operator should see on the live path.
 
+## Cross-confirmation: manual MIDI device smoke
+
+Counterpart for the MIDI/device boundary. `--manifest-midi-reload-smoke`
+opens a real PortMIDI input through `manifestPortMIDISourceFactory`,
+prints the manifest's bound CC table for the selected demo, and
+streams accepted / rejected events for a fixed window. It deliberately
+does **not** start audio, install a hot-swap, or run reload semantics
+— that surface stays on the live-reload demo above. This is the
+hardware-gated equivalent of the OSC cross-confirmation: it proves
+the manifest's MIDI projection routes through a real PortMIDI device.
+
+The same blessed fixture exposes a MIDI binding on **CC 74** (GM2
+"Brightness / Sound Controller 5", the standard filter-cutoff CC)
+mapped to the same direct-to-`KLPF` write the OSC `/v<voice>/lpf/0`
+address targets. Drive it through:
+
+```
+stack exec -- metasonic-bridge --manifest-midi-reload-smoke \
+    examples/manifests/preserve-cutoff.json preserve-cutoff-dark \
+    --midi-device N
+```
+
+Substitute `N` with an input-capable device id from
+`stack exec -- metasonic-bridge --midi-list`. The default smoke
+window is 10 seconds; use `--manifest-midi-smoke-seconds K` to
+extend.
+
+Expected output (device-table preamble varies per host; the
+binding-table and accept lines do not):
+
+```
+Manifest MIDI device smoke.
+
+  manifest path: examples/manifests/preserve-cutoff.json
+  demo: preserve-cutoff-dark
+  device: id=N name="..."
+  window: 10 second(s)
+  default MIDI voice: v0
+
+  bound CC table:
+    - cc=74 tag=lpf/0 name="cutoff" default=600.0 range=[200.0, 6000.0]
+
+  no reload executed: this smoke exercises the open / decode /
+  manifest CC routing path only.
+
+  Send manifest-bound CCs now (and any other MIDI you want to
+  observe routed through the ingress projection).
+```
+
+Send CC 74 on channel 1 with any byte value. The expected accept
+line is:
+
+```
+  accept: CmdControlWrite voice=v0 tag=lpf/0 value=<scaled-cutoff-Hz>
+```
+
+`<scaled-cutoff-Hz>` lands in the `[200.0, 6000.0]` range scaled
+from the 0–127 CC byte. Any other CC (e.g. 7) emits
+`reject: unbound cc=7` — the manifest only binds CC 74 for this
+demo. `preserve-cutoff-bright` shows the same row with
+`default=2400.0`; the binding shape is identical because both
+demos share the `cutoff` control declaration up to the default
+value.
+
+If `--midi-list` reports no input-capable device, the smoke exits
+non-zero with an explanatory message. That is the only failure
+condition: an empty event window is reported in the summary but
+is **not** a failure, because a host without active MIDI traffic
+is still a valid open of the manifest MIDI ingress.
+
+Bound-CC drift on `preserve-cutoff-*` is regression-protected by
+`MetaSonic.Spec.AppManifestPreservingFixture`: any change to the
+demo's `rcCC` field — including dropping CC 74 — fails the
+"preserve-cutoff manifest projects MIDI CC 74 on both demos"
+test before it can mislead an operator reading this section.
+
 ## Things this runbook deliberately does not cover
 
 - Resource/allocation recovery event streaming. Still
