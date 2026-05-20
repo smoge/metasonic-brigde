@@ -112,6 +112,17 @@ transcript:  $TRANSCRIPT
 probe log:   $PROBE_LOG
 EOF
 
+# Pre-flight: the iproute2 'ss' utility is required for the
+# passive snapshot probe (marker 6b). Without this check, a
+# missing 'ss' would silently make `ss -lun | grep -q ...` look
+# like "no listener" and falsely pass the marker — the active
+# bind probe would still cover the real cleanup proof, but the
+# script and docs both promise two independent probes.
+if ! command -v ss >/dev/null 2>&1; then
+  echo "[smoke] FAIL: 'ss' not found in PATH; marker 6b requires the iproute2 'ss' utility"
+  exit 1
+fi
+
 # Pre-flight: the configured port must be free.
 if python3 -c "
 import socket, sys
@@ -185,11 +196,11 @@ for i in $(seq 1 120); do
   fi
   if ! kill -0 "$DEMO_PID" 2>/dev/null; then
     echo "[smoke] FAIL: demo exited before second prompt"
-    break
+    exit 1
   fi
   if [ "$i" -eq 120 ]; then
     echo "[smoke] FAIL: timeout waiting for second prompt"
-    break
+    exit 1
   fi
 done
 
@@ -213,9 +224,23 @@ echo "[smoke] demo exit=$DEMO_EXIT" | tee -a "$PROBE_LOG"
 
 # Post-exit probes.
 sleep 1
-if ss -lun | grep -q ":$PORT "; then
+
+# Capture ss's output and exit code separately, then grep the
+# captured text. A bare `ss -lun | grep -q ...` would mask an
+# `ss` failure as "no listener" — grep just sees an empty
+# stream and exits 1, which the original code interpreted as
+# "snapshot clean." With the snapshot captured, we surface a
+# nonzero `ss` exit as its own failure before we trust the
+# grep result.
+SS_SNAPSHOT="$(ss -lun)"
+SS_RC=$?
+if [ "$SS_RC" -ne 0 ]; then
+  echo "[smoke] FAIL: 'ss -lun' exited $SS_RC" | tee -a "$PROBE_LOG"
+  exit 1
+fi
+if printf '%s\n' "$SS_SNAPSHOT" | grep -q ":$PORT "; then
   echo "[smoke] FAIL: ss snapshot shows UDP listener still bound on port $PORT" | tee -a "$PROBE_LOG"
-  ss -lun | grep ":$PORT " | head -3 | tee -a "$PROBE_LOG"
+  printf '%s\n' "$SS_SNAPSHOT" | grep ":$PORT " | head -3 | tee -a "$PROBE_LOG"
   exit 1
 else
   echo "[smoke] ss snapshot: no UDP listener on port $PORT" | tee -a "$PROBE_LOG"
