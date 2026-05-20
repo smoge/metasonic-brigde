@@ -4,9 +4,8 @@
 -- Module      : MetaSonic.App.ManifestReloadHostStack
 -- Description : Production HostStackFactory for the stopped-audio host path.
 --
--- This module composes the existing stopped-audio host reload
--- helpers ('reloadManifestStoppedAudioHostWithEvents') and a
--- producer-supplied open / close pair into a
+-- This module composes a producer-supplied open / close pair plus
+-- a plan-native in-window reload helper into a
 -- 'HostStackFactory MR.ManifestReloadPlan ...' the supervisor
 -- adapter can drive. It is the §219 slice 4 prerequisite the
 -- supervisor design note named: defining what a "closeable /
@@ -14,13 +13,18 @@
 -- yet routing the existing 'reloadManifestHostWithStrategy' path
 -- through 'reloadSupervised'.
 --
--- The 'StoppedAudioHostStack' record bundles the per-active
--- 'ManifestReloadHostConfig' plus the plan currently installed on
--- that config. The 'StoppedAudioHostStackOps' record carries the
--- three IO actions a 'HostStackFactory' needs: open / close /
+-- The 'StoppedAudioHostStack' newtype wraps the per-active
+-- 'ManifestReloadHostConfig'; plan ownership stays at the
+-- supervisor's caller (threaded as @fallback@ on each call).
+-- The 'StoppedAudioHostStackOps' record carries the three IO
+-- actions a 'HostStackFactory' needs: open / close /
 -- in-window-reload. 'realStoppedAudioInWindowReload' is the
--- production wiring for the in-window slot against the existing
--- helper. Open / close are left producer-supplied because the real
+-- production wiring for the in-window slot: it drives
+-- 'orchestrateHostStoppedAudioReloadWithEvents' directly with
+-- @hsaroPreparePlan@ overridden to @const (pure (Right plan))@,
+-- so the supervisor's supplied plan is the source of truth at
+-- the seam (no silent re-planning from doc/catalog/policy drift).
+-- Open / close are left producer-supplied because the real
 -- wiring (next slice) needs to choose between mirroring
 -- 'withSessionFanInService' as imperative primitives versus
 -- promoting it via a worker-thread bracket — that decision is its

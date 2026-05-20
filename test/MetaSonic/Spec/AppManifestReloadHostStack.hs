@@ -17,10 +17,22 @@
 -- @sahsoInWindowReload@ never forces it (the in-window slot is
 -- overridden in every test) and the supervisor adapter never
 -- forces it either (it only passes the @stack@ value around,
--- never inspecting its config). The 'realStoppedAudioInWindowReload'
--- helper that production wiring will use lives in the module
--- under test; its real-session-layer composition is exercised by
--- the next slice (real strategy wiring), not here.
+-- never inspecting its config).
+--
+-- 'realStoppedAudioInWindowReload' is the production wiring for
+-- the in-window slot — it drives
+-- 'orchestrateHostStoppedAudioReloadWithEvents' with
+-- @hsaroPreparePlan = const (pure (Right plan))@ so the
+-- supervisor's plan is the source of truth at the seam. This
+-- helper is **not** directly exercised by the tests in this
+-- module: every test overrides @sahsoInWindowReload@ with a
+-- fake to pin specific failure variants without staging a real
+-- 'SessionFanInService'. The next slice (real strategy wiring)
+-- owes an integration test that fails if
+-- 'realStoppedAudioInWindowReload' ever re-enters catalog / doc
+-- planning instead of taking the plan-native short-circuit
+-- (i.e., that a forced doc/catalog/policy drift does not
+-- influence which plan gets installed).
 --
 -- See notes/2026-05-14-k-host-reload-supervisor.md \xa7219 slice 4.
 module MetaSonic.Spec.AppManifestReloadHostStack
@@ -102,8 +114,11 @@ data FakeStackPlan = FakeStackPlan
 -- | Build a fake 'StoppedAudioHostStackOps' that records every
 -- call to a shared trace. The open slot, on Right, mints a stack
 -- whose 'sahsConfig' is a deferred 'error' (never forced by the
--- supervisor adapter or the fake in-window slot); the installed
--- plan field is recorded so tests can inspect it if desired.
+-- supervisor adapter or the fake in-window slot). The plan that
+-- triggered each call is captured in the trace via its demo key
+-- so tests can assert which plan drove which slot — the stack
+-- itself carries no plan field; plan ownership lives at the
+-- supervisor's caller.
 mkFakeOps
   :: IORef [StackCall]
   -> FakeStackPlan
