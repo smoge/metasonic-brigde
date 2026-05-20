@@ -516,12 +516,106 @@ path) by these markers:
 - After the final Enter, audio stops and the OSC port is
   released (a subsequent invocation should bind cleanly).
 
-### Real run transcript
+### Real run transcript (2026-05-20)
 
-_To be appended after a successful manual run. Capture stdout
-verbatim (or the load-bearing subset that proves the markers
-above). Once landed here, the §219 slice-4 routing transitions
-from "needs hardware exercise" to "hardware-confirmed once;
-hardware-gated CI still open" in
+Captured on a Fedora 41 host (Linux 6.17.10) with PipeWire +
+wireplumber as the audio backend (PortAudio falls back through
+ALSA's `default` PCM into PipeWire). The OSC port was bound on
+`localhost:17001` via the `--session-osc-port 17001` override
+so this run does not collide with the operator's everyday
+`7001` workspace.
+
+PortAudio prints a long block of `ALSA lib pcm_*` "Unknown PCM"
+warnings during device enumeration before settling on the
+default sink. Those are PortAudio probing every entry in the
+host's `alsa.conf` and are noise, not failure — the demo's
+`audio running: yes` line that follows them is the
+load-bearing signal that the device actually opened. The ALSA
+preamble is elided in the transcript below; everything else is
+verbatim.
+
+OSC was injected at both interactive prompts using `oscsend`
+(liblo) so the transcript also proves the listener routes real
+packets pre- and post-reload:
+
+```text
+oscsend localhost 17001 /v0/lpf/0 f 0.75   # before first Enter
+oscsend localhost 17001 /v0/lpf/0 f 0.25   # before second Enter
+```
+
+```text
+Manifest live reload demo (experimental).
+
+  manifest path: examples/manifests/preserve-cutoff.json
+  strategy: stopped-audio-only
+  route: supervised (reloadSupervised + HostStackFactory)
+  initial demo: preserve-cutoff-dark
+  target demo: preserve-cutoff-bright
+  normal demo path: unchanged
+  ingress: manifest-aware OSC only
+
+  initial OSC surface:
+    /<voice>/lpf/0  name="cutoff"
+  target OSC surface:
+    /<voice>/lpf/0  name="cutoff"
+
+  This path starts real audio and runs the manifest host
+  strategy selector. It is still opt-in and experimental.
+
+[...PortAudio ALSA enumeration warnings elided...]
+
+  initial: auto-starting one instance per template...
+    drone -> enqueued CmdVoiceOn (TemplateName {unTemplateName = "drone"}) (VoiceKey {unVoiceKey = "v0"}) []
+  initial fan-in:
+    audio running: yes
+    queue depth: 0
+    owner status: SessionOwnerReady
+    reload status: SessionFanInNormalOperation
+    active voices: 1
+  ingress: open demo=preserve-cutoff-dark ui-controls=1 osc-controls=1 midi-cc=1 defaultVoice=v0 oscPort=17001
+  addressable OSC surface:
+    /v0/lpf/0  (name="cutoff")
+
+  Audio is running. Send OSC to the initial surface,
+  then press Enter to run the supervised reload.
+  osc accept: CmdControlWrite voice=v0 tag=ControlTag {ctNodeTag = MigrationKey {unMigrationKey = "lpf"}, ctSlot = 0} value=0.75
+
+  supervised outcome: committed (new plan installed)
+  reload events:
+    - stopped-audio phase started
+    - stopped-audio phase committed
+  post-reload: auto-starting one instance per template...
+    drone -> enqueued CmdVoiceOn (TemplateName {unTemplateName = "drone"}) (VoiceKey {unVoiceKey = "v0"}) []
+  post-reload fan-in:
+    audio running: yes
+    queue depth: 0
+    owner status: SessionOwnerReady
+    reload status: SessionFanInNormalOperation
+    active voices: 1
+  OSC ingress: open demo=preserve-cutoff-bright ui-controls=1 osc-controls=1 midi-cc=1 defaultVoice=v0 oscPort=17001
+  addressable OSC surface:
+    /v0/lpf/0  (name="cutoff")
+
+  Send OSC to the surface for demo=preserve-cutoff-bright, then press Enter
+  to stop audio and close ingress.
+  osc accept: CmdControlWrite voice=v0 tag=ControlTag {ctNodeTag = MigrationKey {unMigrationKey = "lpf"}, ctSlot = 0} value=0.25
+```
+
+Acceptance checklist against the transcript above:
+
+| # | Marker the transcript must prove | Verbatim line |
+|---|---|---|
+| 1 | Supervised route selected | `route: supervised (reloadSupervised + HostStackFactory)` |
+| 2 | Real audio + real OSC opened | `audio running: yes`, `oscPort=17001` |
+| 3 | Pre-reload OSC accept | `osc accept: CmdControlWrite voice=v0 ... value=0.75` |
+| 4 | Stopped-audio phase ran under the supervisor | `supervised outcome: committed (new plan installed)` + `stopped-audio phase started` / `stopped-audio phase committed` reload events |
+| 5 | Post-reload ingress targets the new demo | `OSC ingress: open demo=preserve-cutoff-bright ... oscPort=17001`, then `osc accept: CmdControlWrite voice=v0 ... value=0.25` against the new surface |
+| 6 | Cleanup releases resources | demo exited 0; a follow-up `oscsend localhost 17001 ...` invocation (rebinding port 17001) succeeded without `EADDRINUSE`, proving the listener released the socket |
+
+With this run on record, the §219 slice-4 routing has
+transitioned from "needs hardware exercise" to
+"hardware-confirmed once; hardware-gated CI still open" in
 [ROADMAP.md](../ROADMAP.md) and
-[notes/2026-05-14-k-host-reload-supervisor.md](2026-05-14-k-host-reload-supervisor.md)._
+[notes/2026-05-14-k-host-reload-supervisor.md](2026-05-14-k-host-reload-supervisor.md).
+Hardware-gated CI for this route is a separate slice and is
+intentionally not opened here.

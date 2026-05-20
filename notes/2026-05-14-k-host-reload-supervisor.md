@@ -136,10 +136,21 @@ exposes at the library layer (the CLI inlines so it can read
 the pre-reload ingress snapshot off the original initial stack
 /inside the adapter callback/ before `reloadSupervised` runs —
 the read is covered by the adapter's `finally closeOps`).
+The supervised route is hardware-confirmed once: a 2026-05-20
+manual run of `--manifest-live-reload-demo stopped-audio-only`
+against `examples/manifests/preserve-cutoff.json` opened real
+PortAudio + real OSC ingress, accepted OSC writes on
+`/v0/lpf/0` both pre- and post-reload, committed the
+supervised reload with the expected
+`stopped-audio phase started` / `stopped-audio phase
+committed` event pair, and released the OSC port cleanly on
+exit; full transcript at
+[notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](2026-05-19-b-manifest-host-reload-smoke-runbook.md).
+Hardware-gated CI for this route stays open as its own slice.
 Preserving and `TryPreservingThenStoppedAudio` fallback still
 go through the direct `reloadManifestHostWithStrategy` path;
 they will move only after the supervised stopped-audio route
-gets hardware exercise.
+accumulates further hardware exposure.
 
 The error surface uses a narrow
 `SupervisedStoppedAudioReloadResult` (committed / recovered /

@@ -3619,11 +3619,23 @@ operator sees both the primary cause AND the rollback
 diagnostic. Both the library entry and the CLI inline path
 wrap the open-to-adapter handoff in `mask` + `restore` so the
 adapter's `finally closeOps` covers any throw after the
-initial stack is in hand. Preserving and
+initial stack is in hand. The supervised route is
+hardware-confirmed once: a 2026-05-20 manual run of
+`--manifest-live-reload-demo stopped-audio-only` against the
+committed `examples/manifests/preserve-cutoff.json` fixture
+opened real PortAudio + real OSC ingress, accepted OSC writes
+on `/v0/lpf/0` both pre- and post-reload, committed the
+supervised reload with the expected
+`stopped-audio phase started` / `stopped-audio phase
+committed` event pair, and released the OSC port cleanly on
+exit; transcript at
+[notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md).
+Hardware-gated CI for this route is a separate slice and is
+intentionally still open. Preserving and
 `TryPreservingThenStoppedAudio` fallback stay on the direct
 `reloadManifestHostWithStrategy` path; they will move only
-after the supervised stopped-audio route gets hardware
-exercise.
+after the supervised stopped-audio route accumulates further
+hardware exposure.
 The preserving-live sibling path has also landed behind explicit host
 APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
 runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`
@@ -3809,12 +3821,11 @@ Still gated:
   host supervisor / recovery policy contract (design now
   realized as `MetaSonic.App.ManifestReloadSupervisor` +
   `MetaSonic.App.ManifestReloadSupervisorAdapter` +
-  `MetaSonic.App.ManifestReloadHostStack`; the remaining slice
-  in that lane is implementing real-host
-  `StoppedAudioHostStackOps` against the live
-  `SessionFanInService` + ingress manager + audio FFI bundle
-  and routing the `StoppedAudioOnly` strategy through
-  `reloadSupervised` + the factory), and the
+  `MetaSonic.App.ManifestReloadHostStack`; real-host
+  `StoppedAudioHostStackOps` and the supervised
+  `StoppedAudioOnly` CLI route are landed, with hardware
+  exercise still required before moving preserving /
+  try-preserving fallback onto the supervisor path), and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a
