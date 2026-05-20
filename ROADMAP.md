@@ -3571,8 +3571,9 @@ both the open/close half and the in-window half against the
 live session-layer primitives, and the `StoppedAudioOnly` CLI
 strategy now dispatches through it (see the routing summary
 below):
-`StoppedAudioHostStack` newtype around `ManifestReloadHostConfig`,
-injectable `StoppedAudioHostStackOps` for open / close /
+a route-agnostic `ReloadHostStack` newtype around
+`ManifestReloadHostConfig`, injectable `StoppedAudioHostStackOps`
+(stopped-audio-strategy-specific) for open / close /
 in-window-reload, the plan-native + target-fresh
 `realStoppedAudioInWindowReload` (drives
 `orchestrateHostStoppedAudioReloadWithEvents` with
@@ -3582,7 +3583,7 @@ re-projects both `mrhcOldIngressTarget` and
 `mrhcNewIngressTarget` from the `(fallback, requested)` plans so
 target selection cannot drift across a long reload sequence),
 and the production-wiring `realStoppedAudioHostStackOps` +
-`RealStoppedAudioHostStackInputs` that compose
+`RealReloadHostStackInputs` that compose
 `openSessionFanInService` + a per-host ingress-ops factory +
 `startSessionFanInHostAudioWith`. Exception-hardened: `realOpen`
 brackets every acquired resource under `mask` + `onException`,

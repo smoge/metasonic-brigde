@@ -2,9 +2,13 @@
 
 Date: 2026-05-14
 
-Status: design + supervisor primitive + real-host adapter landed.
-Real stopped-audio host wiring (§219 slice 4) is the next step.
-The contract body below remains the design record the
+Status: design + supervisor primitive + real-host adapter +
+real stopped-audio host wiring + preserving and try-preserving
+supervised host-stacks + `TryPreservingThenStoppedAudio` route
+flip onto the supervisor all landed. Only `RequirePreserving`
+remains on the direct `reloadManifestHostWithStrategy` path;
+its migration is its own slice (see ROADMAP §3634). The
+contract body below remains the design record the
 implementation slices were reviewed against; the "Implemented
 status" section immediately below this header is the
 authoritative summary of what shipped.
@@ -36,6 +40,20 @@ are historical and remain accurate as commit records — they are
 not the current contract any new producer should implement
 against.
 
+Row 12 (`ad2c7e2`) renames the substrate types in
+`MetaSonic.App.ManifestReloadHostStack` from route-prefixed
+('StoppedAudio*') to neutral ('Reload*') names. References to
+`StoppedAudioHostStack` / `StoppedAudioHostStackOpenIssue` /
+`RealStoppedAudioHostStackInputs` / `Sahsoi*` constructors /
+`rsahsi*` fields inside rows 7–11 are historical and accurate
+as commit records — they are not the current types. The
+current substrate names are `ReloadHostStack` /
+`ReloadHostStackOpenIssue` / `RealReloadHostStackInputs` /
+`Rhsoi*` / `rrhsi*`. Strategy-specific names
+(`StoppedAudioHostStackOps`, `StoppedAudioHostStackIssue`,
+`Sahsi*` constructors, and the `Preserving*` /
+`TryPreserving*` counterparts) are unchanged.
+
 | # | Commit | Slice content |
 |---|--------|---------------|
 | 1 | `f34522e` (earlier, pre-session) | §219 slice 1.5 baseline: `MetaSonic.App.ManifestReloadSupervisor` primitive — `SupervisorOps plan e` with `sopsInWindowReload` / `sopsCloseStack` / `sopsOpenStack`, `reloadSupervised` capturing `fallback` as a per-call local. Outcome variants `SupervisedReloadCommitted | SupervisedReloadRejectedRecovered e | SupervisedReloadEscalated e e`. 9 fake-IO test cases in `MetaSonic.Spec.AppManifestReloadSupervisor`. |
@@ -49,6 +67,7 @@ against.
 | 9 | `a441009` (extended by `be8eb8d` + `4e58322`) | §219 slice 5 step 2: preserving-aware supervised host-stack. New module `MetaSonic.App.ManifestReloadPreservingHostStack` with `PreservingHostStackOps`, `PreservingHostStackIssue`, `realPreservingHostStackOps`, `realPreservingInWindowReload`, `mkPreservingHostStackFactory`, and `classifyPreservingOutcome`. The classifier maps the 10 `HostPreservingReloadIssue` constructors: the four resume-ok variants (PlanRejected / QuiesceRejected / DrainRejected / ReloadRejected) → `RejectedLiveFallback`; the six terminal / resume-failed / ingress-restart-failed variants → `Terminal`. Open and close are reused from `MetaSonic.App.ManifestReloadHostStack` via newly-exported `realOpen` / `realClose`. Tests: 10-row policy table over every constructor; factory-composition table across all four supervisor branches; A→B→C→D! regression; direct-integration test for `realPreservingInWindowReload` that observes the orchestrator's event stream and asserts both that the planning-rejection failure mode is absent (override-removed regression) AND that the downstream `ManifestPreservingHotSwapReport` carries the requested plan's demoKey + swapLabel (fallback-swap regression). The `be8eb8d` follow-up added the direct-integration test + shared the stopped-audio fixtures; the `4e58322` follow-up strengthened the test to catch fallback-swap by extracting the report identity from the rejection event. Suite: 1216 → 1235. No live behavior change; selectLiveReloadRoute unchanged. |
 | 10 | `8833898` (extended by `2bb36d9`) | §219 slice 5 step 3: try-preserving supervised host-stack. New module `MetaSonic.App.ManifestReloadTryPreservingHostStack` composing `realPreservingInWindowReload` with `realStoppedAudioInWindowReload` under the existing `preservingAllowsStoppedAudioFallback` gate. Three pure cores: `decideTryPreservingNext` (which next step from a preserving outcome), `composeFallbackOutcome` (stopped-audio result + preserving issue → final outcome), and `fallbackEventForDecision` (which `MreFallback{Admitted,Declined}` event to emit per decision). The IO function `realTryPreservingInWindowReload` is a thin shell over the pure cores plus `mapM_ onEvent` for the fallback event. Three-variant `TryPreservingInWindowIssue` (`TpiwiPreservingFallbackDeclined`, `TpiwiPreservingTerminal`, `TpiwiFallbackStoppedAudioFailed`). The `2bb36d9` follow-up fixed an asymmetry where `TpnTerminal` emitted no event — the direct strategy emits `MreFallbackDeclined` for both live-stack-not-eligible AND terminal preserving outcomes; the supervised path now matches. Tests: 11-row `decideTryPreservingNext` table, 2-row `composeFallbackOutcome` table, 4-row `fallbackEventForDecision` table, 6-branch factory composition + A→D! regression. Suite: 1235 → 1258. No live behavior change; selectLiveReloadRoute unchanged. |
 | 11 | `ed3409f` (+ tier-2 evidence 2026-05-20) | §219 slice 5 step 4: route `--manifest-live-reload-demo try-preserving` through the supervised stack. `LiveReloadRoute` gains a `SupervisedFactoryFlavor` parameter (`SfStoppedAudio` / `SfTryPreserving`); `selectLiveReloadRoute TryPreservingThenStoppedAudio` flips to `LiveReloadSupervised SfTryPreserving`. `runSupervisedLiveReload` renamed `runSupervisedStoppedAudioLiveReload` so the name no longer lies; new `runSupervisedTryPreservingLiveReload` sibling wires `realTryPreservingHostStackOps` + `mkTryPreservingHostStackFactory` and has a real operator branch for `SupervisedReloadRequestRejected` (preserving rejected without admitting fallback; stack stays serving fallback plan). `renderLiveReloadRoute` exported + pinned by three rendering tests so the tier-2 wrapper marker-1 grep cannot silently break. `RequirePreserving` stays direct. New tier-2 wrapper `tools/manifest_supervised_try_preserving_live_smoke.sh` + `just manifest-supervised-try-preserving-live-smoke` recipe with distinct artifact names + default port 17002; marker 4b/4c swap `stopped-audio phase started/committed` for `preserving phase started/committed`. The stopped-audio wrapper's marker 1 also updated to match the new `(stopped-audio;` flavor tag in the route rendering. Tier-2 evidence captured 2026-05-20 on host RME ADI-2 Pro / PipeWire: two marker-clean runs of the try-preserving wrapper + one no-regression run of the stopped-audio wrapper, all 12/12. Suite: 1258 → 1261. |
+| 12 | `ad2c7e2` | Substrate naming neutralization. The substrate stack value, its open-issue ADT, and the production-input record in `MetaSonic.App.ManifestReloadHostStack` were route-prefixed (`StoppedAudioHostStack` / `StoppedAudioHostStackOpenIssue` / `RealStoppedAudioHostStackInputs`) because they landed in the stopped-audio slice first; after rows 9–10 the preserving and try-preserving modules carried `type Preserving... = StoppedAudio...` / `type TryPreserving... = StoppedAudio...` aliases purely to document the role. Renamed substrate: `StoppedAudioHostStack` → `ReloadHostStack` (field `sahsConfig` → `rhsConfig`), `StoppedAudioHostStackOpenIssue` → `ReloadHostStackOpenIssue` (constructors `Sahsoi*` → `Rhsoi*`), `RealStoppedAudioHostStackInputs` → `RealReloadHostStackInputs` (fields `rsahsi*` → `rrhsi*`). Strategy-specific names kept verbatim: `StoppedAudioHostStackOps` / `StoppedAudioHostStackIssue` / `Sahsi*` constructors and their `Preserving*` / `TryPreserving*` counterparts. Aliases dropped from the companion modules; substrate types now imported directly from `MetaSonic.App.ManifestReloadHostStack` and that module's export list is reorganized into substrate / shared open-close / stopped-audio strategy sections. Pure rename — no behavior change, no test changes. Suite stays at 1261. |
 
 Test count: the supervisor lane contributes 13 cases in
 `MetaSonic.Spec.AppManifestReloadSupervisor` (nine pre-session
@@ -67,7 +86,7 @@ A→B→C→D! factory-layer regression), 6 cases of
 `realStoppedAudioHostStackOps` partial-cleanup paths (forward
 success, ingress-open Left, audio-start Left with clean
 rollback, audio-start Left with ingress-close-Left surfacing
-`SahsoiPartialCleanupFailed`, ingress-close-throws-during-
+`RhsoiPartialCleanupFailed`, ingress-close-throws-during-
 rollback still runs service close, audio-stop-throws-during-
 realClose still runs ingress + service close — the last two
 pin the §7d3da25 exception-safety fix), and 1 case for
@@ -97,6 +116,8 @@ following spec modules:
   SfTryPreserving`.
 
 Total suite at the row-11 close (`ed3409f`): 1261 cases.
+Row 12 (`ad2c7e2`) is a pure rename and adds no tests; suite
+stays at 1261.
 
 §238 test-checklist coverage: 11/11 — all 9 originally listed
 plus the two additions explicitly named by the design ("A→B→C
@@ -105,11 +126,16 @@ partial stack before surfacing").
 
 ### What remains
 
-§219 slice 4 ("Add the real stopped-audio host command, using
-the supervisor as its outer wrapper") is mostly landed and
-slice 5 (manual CLI smoke against a working device) has not
-been started. Slices 1 and 3 from the supervisor's dependency
-list (j-note slices 1 and 2) are independently landed in the
+§219 slices 4 ("real stopped-audio host command using the
+supervisor as its outer wrapper") and 5 (manual CLI smoke
+against a working device, opened as opt-in tier-2 wrappers
+and gated by the 2026-05-20 tier-3 decision note) are both
+landed; see rows 7–11 above and the tier-2 evidence record
+in [2026-05-19-b-manifest-host-reload-smoke-runbook.md](2026-05-19-b-manifest-host-reload-smoke-runbook.md).
+The remaining migration is `RequirePreserving`, which still
+goes through the direct `reloadManifestHostWithStrategy`
+path. Slices 1 and 3 from the supervisor's dependency list
+(j-note slices 1 and 2) are independently landed in the
 session layer: `startSessionFanInHostAudio` /
 `stopSessionFanInHostAudio` on `SessionFanInHost`, and
 `quiesceAndDrainSessionFanInService` on `SessionFanInService`.
@@ -118,18 +144,28 @@ session layer: `startSessionFanInHostAudio` /
 
 `MetaSonic.App.ManifestReloadHostStack` has shipped both the
 production `HostStackFactory` shape AND the open / close
-half against the live session-layer primitives:
+half against the live session-layer primitives. Per row 12
+the substrate types are route-agnostic; the stopped-audio
+strategy lives in the same module under route-prefixed
+names:
 
-- `StoppedAudioHostStack target ingressIssue handle` newtype
+- `ReloadHostStack target ingressIssue handle` newtype
   around `ManifestReloadHostConfig` (no stack-level plan
   field; the supervisor's caller owns currentPlan externally).
+  Route-agnostic — every supervised route threads the same
+  value through the supervisor adapter.
+- `ReloadHostStackOpenIssue ingressIssue` — substrate
+  open-time failure ADT covering five real-failure causes
+  (service setup, audio start, ingress open,
+  ingress-target-projection, partial-cleanup-failed).
+  Also route-agnostic; threads through every route's open slot.
 - `StoppedAudioHostStackOps target ingressIssue handle` with
   injectable open / close / in-window-reload slots, plus a
-  `StoppedAudioHostStackOpenIssue` ADT covering five
-  real-failure causes (service setup, audio start, ingress
-  open, ingress-target-projection, partial-cleanup-failed)
-  and a unified `StoppedAudioHostStackIssue` sum that
-  threads through `HostStackFactory`'s @e@.
+  unified `StoppedAudioHostStackIssue` sum that threads
+  through `HostStackFactory`'s @e@. Stopped-audio-specific;
+  preserving and try-preserving have analogous
+  `PreservingHostStackOps` / `TryPreservingHostStackOps`
+  records in their companion modules.
 - `realStoppedAudioInWindowReload` — plan-native, target-fresh
   production wiring. Drives
   `orchestrateHostStoppedAudioReloadWithEvents` with
@@ -143,7 +179,7 @@ half against the live session-layer primitives:
   `HostStackFactory.hsfInWindowReload :: stack -> plan ->
   plan -> ...`, `realStoppedAudioInWindowReload :: policy ->
   stack -> plan -> plan -> ...`).
-- `realStoppedAudioHostStackOps` + `RealStoppedAudioHostStackInputs`
+- `realStoppedAudioHostStackOps` + `RealReloadHostStackInputs`
   — production open / close against `openSessionFanInService`,
   the ingress-ops factory (per-host so OSC/MIDI listener
   closures bind to the freshly-opened host on each rebuild),
@@ -191,11 +227,13 @@ Hardware-backed CI for this route is deferred (not rejected)
 by
 [2026-05-20-a-supervised-route-tier3-decision.md](2026-05-20-a-supervised-route-tier3-decision.md);
 that note also lists the reopen triggers that would put
-tier 3 back on the slate. Preserving and
-`TryPreservingThenStoppedAudio` fallback still go through
-the direct `reloadManifestHostWithStrategy` path; their
-migration is its own slice and opens against that note's
-bar (deterministic route tests plus a minimum of two
+tier 3 back on the slate. `TryPreservingThenStoppedAudio`
+has since migrated onto the supervisor against the same
+bar (row 11 above; tier-2 evidence captured 2026-05-20).
+`RequirePreserving` still goes through the direct
+`reloadManifestHostWithStrategy` path; its migration is
+its own slice and opens against that note's bar
+(deterministic route tests plus a minimum of two
 marker-clean tier-2 runs attached to the PR, two different
 hosts / audio backends preferred when available).
 
