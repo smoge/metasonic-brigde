@@ -31,6 +31,7 @@
 
 module MetaSonic.App.ManifestMIDIReloadSmoke
   ( runManifestMIDIReloadSmoke
+  , smokeIngressTargetPolicy
   ) where
 
 import           Control.Concurrent             (threadDelay)
@@ -460,5 +461,16 @@ smokeIngressTargetPolicy = ManifestReloadIngressTargetPolicy
   , mritpUIRetainedValues =
       M.empty
   , mritpMIDIDefaultVoice =
-      VoiceKey "fx"
+      VoiceKey "v0"
+      -- MIDI default voice aligned with the UI default. Earlier
+      -- iterations hardcoded "fx" to favor send-return-shaped
+      -- demos, but that mismatched every voice-only template
+      -- (the smoke's printed accept line would name a voice the
+      -- selected demo does not own — including preserve-cutoff,
+      -- the blessed operator fixture). Routing MIDI to the same
+      -- voice OSC and the UI target makes the two ingress paths
+      -- promise the same thing for the same demo. If a future
+      -- smoke needs to target a different voice (e.g. an fx
+      -- template), the right move is a per-demo policy resolver,
+      -- not flipping this hardcode back to "fx".
   }

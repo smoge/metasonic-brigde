@@ -28,6 +28,10 @@ import           Test.Tasty.HUnit
 
 import           MetaSonic.App.Demos            (demoTable, demoKey,
                                                  demoAuthoring)
+import           MetaSonic.App.ManifestMIDIReloadSmoke
+                                                 (smokeIngressTargetPolicy)
+import           MetaSonic.App.ManifestReloadIngressTarget
+                                                 (ManifestReloadIngressTargetPolicy (..))
 import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
                                                  AuthoringManifestDoc (..),
                                                  ManifestControl (..),
@@ -35,6 +39,9 @@ import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
                                                  encodeManifestDoc,
                                                  manifestFromReport,
                                                  manifestSchemaVersion)
+import           MetaSonic.App.ManifestReloadBinding
+                                                 (ManifestUIVoiceSelection (..))
+import           MetaSonic.Pattern              (VoiceKey (..))
 
 fixturePath :: FilePath
 fixturePath = "examples/manifests/preserve-cutoff.json"
@@ -114,6 +121,24 @@ appManifestPreservingFixtureTests =
         @?= Just (Just 74, "lpf", 0)
       demoCC "preserve-cutoff-bright"
         @?= Just (Just 74, "lpf", 0)
+
+  , testCase
+      "--manifest-midi-reload-smoke policy targets the same voice as the UI/OSC default"
+      $ do
+      -- Pins the smoke's printed "default MIDI voice:" line and
+      -- the accepted CmdControlWrite voice= line against the
+      -- runbook's blessed-flow promise (v0). An earlier policy
+      -- hardcoded mritpMIDIDefaultVoice = VoiceKey "fx", which
+      -- mismatched every voice-only template (including the
+      -- preserve-cutoff fixture). The two ingress paths should
+      -- target the same voice on the same demo unless an
+      -- explicit per-demo resolver lands; this test fails if
+      -- that hardcode flips back to "fx" or to anything other
+      -- than the UI default.
+      let policy = smokeIngressTargetPolicy
+          uiDefault = muvsDefaultVoice (mritpUIVoiceSelection policy)
+      mritpMIDIDefaultVoice policy @?= VoiceKey "v0"
+      mritpMIDIDefaultVoice policy @?= uiDefault
   ]
   where
     lookupDemo k = case filter ((== k) . demoKey) demoTable of
