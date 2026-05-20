@@ -9,6 +9,8 @@
 
 module MetaSonic.Spec.AppManifestReloadSupervisor where
 
+import           Control.Exception                (ErrorCall (..), evaluate,
+                                                   throwIO, try)
 import           Data.IORef                       (IORef, modifyIORef',
                                                    newIORef, readIORef)
 
@@ -193,6 +195,72 @@ appManifestReloadSupervisorTests =
       -- supervisor mistakenly carried planA as a stable history
       -- field, it would surface here.
       planA `notElem` openCalls @?= True
+
+  , testCase
+      "exception during in-window reload closes the previous stack before propagating"
+      $ do
+      -- §238 test-checklist line: "async exception during recovery
+      -- closes any partial stack before surfacing." The supervisor
+      -- wraps sopsInWindowReload in onException sopsCloseStack so
+      -- the previous (still-live) stack is closed before the
+      -- exception escapes. Without that wrap, an in-window throw
+      -- would leak the previous stack and violate invariant §4
+      -- ("exactly one active stack at a time").
+      log_ <- newIORef []
+      let record c = modifyIORef' log_ (++ [c])
+          ops :: SupervisorOps String FakeFailure
+          ops = SupervisorOps
+            { sopsInWindowReload = \p -> do
+                record (InWindowReloadCalled p)
+                throwIO (ErrorCall "synthetic in-window crash")
+            , sopsCloseStack = record CloseStackCalled
+            , sopsOpenStack = \p -> do
+                record (OpenStackCalled p)
+                pure (Right ())
+            }
+      result <- try (reloadSupervised ops planA planB)
+      calls <- readIORef log_
+      case result :: Either ErrorCall (SupervisedReloadOutcome FakeFailure) of
+        Left (ErrorCall msg) ->
+          msg @?= "synthetic in-window crash"
+        Right outcome ->
+          assertFailure $
+            "expected the in-window exception to propagate, got: "
+            <> show outcome
+
+      -- The trace must show CloseStackCalled *after* the in-window
+      -- attempt and *before* the exception propagated out. The
+      -- recovery rebuild (OpenStackCalled) must NOT have run — an
+      -- exception during in-window is not the same as a Left e
+      -- recovery, so we propagate without attempting rebuild.
+      calls @?=
+        [ InWindowReloadCalled planB
+        , CloseStackCalled
+        ]
+      any isOpenCall calls @?= False
+
+  , testCase
+      "no exception path: onException wrapper does not fire on Left e"
+      $ do
+      -- Companion to the test above: confirm that a normal Left e
+      -- return from sopsInWindowReload does NOT trigger the
+      -- onException cleanup. The supervisor must call sopsCloseStack
+      -- exactly once (on the recovery path), not twice (once from
+      -- onException, once explicitly). Counts the trace by calling
+      -- sopsCloseStack only once and asserting the recovery
+      -- sequence is unchanged.
+      (ops, log_) <-
+        mkRecordingOps
+          (inWindowFailsWith FakeOwnerSetupFailed)
+          openStackOk
+      _ <- evaluate =<< reloadSupervised ops planA planB
+      calls <- readIORef log_
+      length [() | CloseStackCalled <- calls] @?= 1
+      calls @?=
+        [ InWindowReloadCalled planB
+        , CloseStackCalled
+        , OpenStackCalled planA
+        ]
   ]
 
 

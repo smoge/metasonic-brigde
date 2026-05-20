@@ -25,6 +25,8 @@ module MetaSonic.App.ManifestReloadSupervisor
   , reloadSupervised
   ) where
 
+import           Control.Exception (onException)
+
 
 -- | Injected slots the supervisor drives. The supervisor itself does
 -- no IO beyond sequencing these.
@@ -75,11 +77,23 @@ reloadSupervised
   -> plan
   -> IO (SupervisedReloadOutcome e)
 reloadSupervised ops fallback requested = do
+  -- §238 test-checklist invariant: an exception during the in-window
+  -- reload must not leak the still-live previous stack. 'onException'
+  -- runs 'sopsCloseStack' when 'sopsInWindowReload' throws (sync or
+  -- async) and then rethrows; on a normal 'Left e' return it does
+  -- not fire, so the explicit close on the recovery path below is
+  -- not double-called.
   attempt <- sopsInWindowReload ops requested
+                `onException` sopsCloseStack ops
   case attempt of
     Right () ->
       pure SupervisedReloadCommitted
     Left originalErr -> do
+      -- Recovery path. 'sopsCloseStack' is best-effort: if it throws,
+      -- the in-window failure escapes without a rebuild attempt — the
+      -- caller is responsible for process-level escalation. The new
+      -- stack constructed by 'sopsOpenStack' is required by contract
+      -- to clean up any partial state internally before propagating.
       sopsCloseStack ops
       rebuild <- sopsOpenStack ops fallback
       pure $ case rebuild of
