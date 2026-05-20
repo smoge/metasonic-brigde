@@ -38,6 +38,9 @@ module MetaSonic.Session.FanInService
     -- * Scoped service
   , withSessionFanInService
   , withSessionFanInServiceHooks
+  , openSessionFanInService
+  , openSessionFanInServiceHooks
+  , closeSessionFanInService
   , enqueueSessionFanInServiceCommand
   , enqueueArbitratedSessionFanInServiceCommand
   , quiesceAndDrainSessionFanInService
@@ -52,7 +55,8 @@ import           Control.Concurrent        (MVar, ThreadId,
                                             takeMVar, tryPutMVar, tryTakeMVar,
                                             withMVar)
 import           Control.DeepSeq           (NFData)
-import           Control.Exception         (finally, mask_)
+import           Control.Exception         (finally, mask, mask_,
+                                            onException)
 import           Control.Monad             (void, when)
 import           Data.IORef                (IORef, newIORef, readIORef,
                                             writeIORef)
@@ -76,12 +80,13 @@ import           MetaSonic.Session.FanIn    (SessionFanInDrainResult (..),
                                              SessionFanInOptions,
                                              SessionFanInSetupIssue,
                                              SessionFanInSnapshot (..),
+                                             closeSessionFanInHost,
                                              defaultSessionFanInOptions,
                                              defaultSessionFanInHostHooks,
                                              drainSessionFanInHost,
                                              enqueueSessionFanInCommand,
-                                             readSessionFanInHost,
-                                             withSessionFanInHostHooks)
+                                             openSessionFanInHostHooks,
+                                             readSessionFanInHost)
 import           MetaSonic.Session.Queue    (ProducerId,
                                              SessionDrainResult (..),
                                              SessionEnqueueIssue (..),
@@ -194,13 +199,51 @@ withSessionFanInService =
 -- control; blocked teardown is worse than force-killing this service
 -- worker. The underlying fan-in host and owner bracket are released
 -- only after the worker finalizer reports completion.
+--
+-- Composed from 'openSessionFanInServiceHooks' and
+-- 'closeSessionFanInService' under 'mask' + 'finally' so the close
+-- runs even if the action throws an async exception.
 withSessionFanInServiceHooks
   :: SessionFanInServiceHooks
   -> TemplateGraph
   -> SessionFanInServiceOptions
   -> (SessionFanInService -> IO a)
   -> IO (Either SessionFanInServiceSetupIssue a)
-withSessionFanInServiceHooks hooks graph opts action = do
+withSessionFanInServiceHooks hooks graph opts action =
+  mask $ \restore -> do
+    openResult <- openSessionFanInServiceHooks hooks graph opts
+    case openResult of
+      Left issue ->
+        pure (Left issue)
+      Right service ->
+        (Right <$> restore (action service))
+          `finally` closeSessionFanInService service
+
+-- | Open a fan-in service outside a bracket. Pair with
+-- 'closeSessionFanInService'.
+--
+-- 'withSessionFanInServiceHooks' is the preferred entry for
+-- scope-bracket usage. This pair exists so callers that need separate
+-- open/close primitives (e.g., supervised host stacks) can drive the
+-- lifecycle imperatively without promoting the bracket via a worker
+-- thread. If worker construction fails after the host is opened, the
+-- host is closed before the failure is rethrown so the owner cannot
+-- leak.
+openSessionFanInService
+  :: TemplateGraph
+  -> SessionFanInServiceOptions
+  -> IO (Either SessionFanInServiceSetupIssue SessionFanInService)
+openSessionFanInService =
+  openSessionFanInServiceHooks defaultSessionFanInServiceHooks
+
+-- | Open a fan-in service with explicit hooks. See
+-- 'openSessionFanInService'.
+openSessionFanInServiceHooks
+  :: SessionFanInServiceHooks
+  -> TemplateGraph
+  -> SessionFanInServiceOptions
+  -> IO (Either SessionFanInServiceSetupIssue SessionFanInService)
+openSessionFanInServiceHooks hooks graph opts = mask_ $ do
   wake <- newEmptyMVar
   accepting <- newIORef True
   ingress <- newMVar SessionFanInServiceIngressOpen
@@ -218,29 +261,39 @@ withSessionFanInServiceHooks hooks graph opts action = do
       hostHooks = defaultSessionFanInHostHooks
         { sfihhOnEnqueued = signalWorker
         }
-  result <-
-    withSessionFanInHostHooks
-      hostHooks
-      graph
-      (sfsoFanInOptions opts)
-      $ \host -> do
-          gateway <- traverse
-            newSessionArbitrationGateway
-            (sfsoArbitrationGatewayOptions opts)
-          mask_ $
-            startSessionFanInServiceWorker hooks control host >>= putMVar workerVar
-          let service = SessionFanInService
-                { sfsvcHost = host
-                , sfsvcGateway = gateway
-                , sfsvcHooks = hooks
-                , sfsvcControl = control
-                }
-          action service `finally` stopSessionFanInServiceWorker control
-  case result of
+  hostResult <- openSessionFanInHostHooks
+    hostHooks
+    graph
+    (sfsoFanInOptions opts)
+  case hostResult of
     Left issue ->
       pure (Left (SfsisiFanIn issue))
-    Right value ->
-      pure (Right value)
+    Right host ->
+      flip onException (closeSessionFanInHost host) $ do
+        gateway <- traverse
+          newSessionArbitrationGateway
+          (sfsoArbitrationGatewayOptions opts)
+        worker <- startSessionFanInServiceWorker hooks control host
+        putMVar workerVar worker
+        pure $ Right SessionFanInService
+          { sfsvcHost = host
+          , sfsvcGateway = gateway
+          , sfsvcHooks = hooks
+          , sfsvcControl = control
+          }
+
+-- | Close a fan-in service opened by 'openSessionFanInService' /
+-- 'openSessionFanInServiceHooks'.
+--
+-- Stops the background drain worker first (cooperative exit, then
+-- forced after the fixed 50 ms grace) and only then closes the host
+-- so the worker cannot re-pull from a released owner. Runs under
+-- 'mask_' so async exceptions cannot interrupt the worker/host
+-- handoff. Safe to call more than once.
+closeSessionFanInService :: SessionFanInService -> IO ()
+closeSessionFanInService service = mask_ $ do
+  stopSessionFanInServiceWorker (sfsvcControl service)
+  closeSessionFanInHost (sfsvcHost service)
 
 -- | Enqueue one command through the service-owned fan-in host.
 --

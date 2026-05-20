@@ -53,6 +53,9 @@ module MetaSonic.Session.FanIn
     -- * Scoped host
   , withSessionFanInHost
   , withSessionFanInHostHooks
+  , openSessionFanInHost
+  , openSessionFanInHostHooks
+  , closeSessionFanInHost
   , enqueueSessionFanInCommand
   , drainSessionFanInHost
   , readSessionFanInHost
@@ -60,7 +63,7 @@ module MetaSonic.Session.FanIn
   ) where
 
 import           Control.Concurrent.MVar         (MVar, modifyMVar, newMVar)
-import           Control.Exception               (finally, mask,
+import           Control.Exception               (finally, mask, mask_,
                                                   onException)
 import           Control.DeepSeq                 (NFData)
 import           Control.Monad                   (forM_)
@@ -267,11 +270,44 @@ withSessionFanInHostHooks
   -> (SessionFanInHost -> IO a)
   -> IO (Either SessionFanInSetupIssue a)
 withSessionFanInHostHooks hooks graph opts action =
+  mask $ \restore -> do
+    openResult <- openSessionFanInHostHooks hooks graph opts
+    case openResult of
+      Left issue ->
+        pure (Left issue)
+      Right host ->
+        (Right <$> restore (action host))
+          `finally` closeSessionFanInHost host
+
+-- | Open a fan-in host outside a bracket. Pair with
+-- 'closeSessionFanInHost'.
+--
+-- 'withSessionFanInHostHooks' is still the preferred entry for
+-- scope-bracket usage. This pair exists so callers that need separate
+-- open/close primitives (e.g., supervised host stacks) can drive the
+-- lifecycle imperatively without promoting the bracket via a worker
+-- thread. The open path acquires the owner under 'mask_' so an async
+-- exception cannot leak an acquired owner before the host handle
+-- becomes visible to the caller.
+openSessionFanInHost
+  :: TemplateGraph
+  -> SessionFanInOptions
+  -> IO (Either SessionFanInSetupIssue SessionFanInHost)
+openSessionFanInHost =
+  openSessionFanInHostHooks defaultSessionFanInHostHooks
+
+-- | Open a fan-in host with explicit hooks. See 'openSessionFanInHost'.
+openSessionFanInHostHooks
+  :: SessionFanInHostHooks
+  -> TemplateGraph
+  -> SessionFanInOptions
+  -> IO (Either SessionFanInSetupIssue SessionFanInHost)
+openSessionFanInHostHooks hooks graph opts =
   case newSessionCommandQueue (sfioQueueOptions opts) of
     Left issue ->
       pure (Left (SfisiQueue issue))
     Right queue ->
-      mask $ \restore -> do
+      mask_ $ do
         ownerResult <-
           acquireSessionOwner graph (sfioOwnerOptions opts)
         case ownerResult of
@@ -292,14 +328,22 @@ withSessionFanInHostHooks hooks graph opts action =
               , sfihsLastStatus =
                   SessionOwnerReady
               }
-            let host = SessionFanInHost
-                  { sfihState =
-                      stateVar
-                  , sfihHooks =
-                      hooks
-                  }
-            Right <$> restore (action host)
-              `finally` releaseSessionFanInHostOwners host
+            pure $ Right SessionFanInHost
+              { sfihState =
+                  stateVar
+              , sfihHooks =
+                  hooks
+              }
+
+-- | Close a fan-in host opened by 'openSessionFanInHost' /
+-- 'openSessionFanInHostHooks'.
+--
+-- Releases the current owner generation if present. Runs under
+-- 'mask_' so the read-then-release window cannot be interrupted by an
+-- async exception. Safe to call more than once.
+closeSessionFanInHost :: SessionFanInHost -> IO ()
+closeSessionFanInHost host =
+  mask_ (releaseSessionFanInHostOwners host)
 
 -- | Enqueue one producer command under the host lock.
 enqueueSessionFanInCommand
