@@ -39,7 +39,7 @@ contract prescribed:
 | 6 | `64c6b92` | Dispatch smoke (`KStaticPlugin` builds a real one-tap-delay node via the template ABI; asserts `plugin_call_count == 1 ∧ invalid_plugin_call_count == 0`); pins plugin id 1 in the registry smoke; refreshes the stale `StaticPluginState` comment that still pointed at a future dispatcher slice. |
 | 7 | `47e28ad` | Sites 1–3 (Haskell): `oneTapDelayPlugin :: PluginRef`, second `staticPluginCatalog` row at `spiPluginId = 1`, and `staticPluginInfoById` / `finitePluginId` / `maxExactPluginId` accessors with module-level exports. |
 | 8 | `3f07985` | Sites 4–6 / 6a / 6b: `nodeDeclaredLatency` in `Compile/Latency.hs`; three consumers migrated (`declaredLatencyFootprint`, `nodeOutputLatencies`, `FusionCostLab.extractFeatures`); user-facing wording refreshed in `Survey.hs`'s latency footprint header and the `Compile/Latency.hs` module header. |
-| 9 | `c037b50` | Sites 17 / 17a / 17b: 13 cases in `oneTapDelayPluginTests` (`Feature/StaticPlugin.hs`) + 2 cases in new `MetaSonic.Spec.AppFusionCostLab` module + test-component `other-modules` wiring (`MetaSonic.App.FusionCostLab`, `MetaSonic.App.FusionCostModel`, `MetaSonic.Spec.AppFusionCostLab`). |
+| 9 | `c037b50` | Sites 17 / 17a / 17b: 15 cases in `oneTapDelayPluginTests` (`Feature/StaticPlugin.hs`) + 2 cases in new `MetaSonic.Spec.AppFusionCostLab` module + test-component `other-modules` wiring (`MetaSonic.App.FusionCostLab`, `MetaSonic.App.FusionCostModel`, `MetaSonic.Spec.AppFusionCostLab`). |
 | 10 | `0152a8b` | Review pass: `c_rt_graph_ensure_bus rt 1` in test #10 before the per-instance bus override; `readBus` helper asserts the read count equals `n` (closes a false-negative path on any "bus N is silent" assertion); three stale Identity-only Haddock spots in `Bridge/Source.hs` refreshed. |
 
 Test count delta: Haskell suite 1161 → 1178 (+17); C++ doctest
@@ -48,8 +48,7 @@ and the standalone `cmake` build into `build-cpp/`) compile clean
 and all assertions pass.
 
 The slice landed §7 step 1 through step 7 verbatim. Two material
-departures from the §5 / §7 sketches, both reducing scope rather
-than adding it:
+departures from the §5 / §7 sketches:
 
 - §5 case #10 (two-voice state independence) ships against a
   simpler `loadTemplateGraph + c_rt_graph_template_instance_add +
@@ -59,12 +58,22 @@ than adding it:
   the false-negative window where voice B writes to a non-existent
   bus is closed by the `c_rt_graph_ensure_bus` call + the `readBus`
   length assertion landed in `0152a8b`.
-- The contract sketched §5 cases #1–#13 (Haskell side) plus #4a /
-  #5a / #8a as additions; the landed test count is 13 cases in
-  `StaticPlugin.hs` + 2 cases in `AppFusionCostLab` (15 total)
-  rather than the contract's ~16. Coverage matches; some
-  contract-numbered cases were bundled tighter inside a single
-  test where the assertions were natural neighbors.
+- The contract sketched ~16 §5 cases — 14 Haskell cases in
+  `StaticPlugin.hs` (1, 2, 3, 4, 4a, 5, 6, 7, 8, 8a, 9, 10, 11,
+  12), one Haskell case in `AppFusionCostLab` (5a), and one C++
+  doctest case (#13). The landed Haskell count is 15 +
+  2 = 17 cases: two of the contract's bundled cases ended up
+  split into two `testCase`s each for clarity. §5 #4a became
+  `finitePluginId rejects NaN / Inf / negative / non-integral /
+  out-of-range` plus `nodeDeclaredLatency rejects malformed
+  plugin_id values` (the contract had these as one bundled
+  case + synthetic-RuntimeNode companion); §5 #5a became
+  `fcfLatencyNodes / fcfMaxLatency count one-tap-delay` plus
+  `... are zero on an Identity-only graph` (the Identity
+  baseline is the regression-prevention half the contract
+  named in prose but didn't list as its own case). Every
+  contract-numbered case has a corresponding assertion in the
+  landed group; no §5 coverage is missing.
 
 Deferrals stay parked behind a forcing-function plugin, as
 §4 / §8 / §9 already pinned:
