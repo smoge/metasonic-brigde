@@ -3743,16 +3743,25 @@ Still gated:
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a
   resource/allocation recovery event stream (gated on a concrete
-  consumer), operator UX polish on the manual smokes, and
-  hardware-gated CI for the device-backed paths. Host strategy
-  smoke and live reload demo now share a typed prose reload-event
-  vocabulary (`f595542` / `aca37ed`). The preserving live-reload
-  path has a blessed committed fixture at
+  consumer) and hardware confirmation / hardware-gated CI for the
+  device-backed paths. Host strategy smoke and live reload demo
+  share a typed prose reload-event vocabulary
+  (`f595542` / `aca37ed`). The preserving live-reload path has a
+  blessed committed fixture at
   [examples/manifests/preserve-cutoff.json](examples/manifests/preserve-cutoff.json),
   drift-protected by `MetaSonic.Spec.AppManifestPreservingFixture`,
   with the canonical command sequence pinned in the smoke runbook
-  and the `--manifest-live-reload-demo` CLI help; remaining UX
-  polish, if any, is the MIDI/device smoke lane.
+  and the `--manifest-live-reload-demo` CLI help. The MIDI/device
+  smoke lane is now blessed against the same fixture: CC 74
+  binds to the same direct-`KLPF` cutoff write OSC `/v0/lpf/0`
+  targets (`666997a`), `--manifest-midi-reload-smoke`'s MIDI
+  default voice is aligned with the UI/OSC default (`6fa21ea`),
+  the runbook documents the canonical command + expected
+  bound-CC table + accepted-event line, and an exported
+  `smokeIngressTargetPolicy` is build-time pinned by the
+  preserving-fixture test group. What remains here is real
+  hardware confirmation and the same hardware-gated CI question
+  the device-backed paths share.
 - [ ] Failure/event semantics across compile, allocation, and stale
   producer commands. The install/reload-strategy timeline is now
   covered by the `ManifestReloadEvent` ADT in
