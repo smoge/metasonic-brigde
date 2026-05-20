@@ -191,6 +191,39 @@ manifest-supervised-live-smoke port="17001": stack-build
 manifest-supervised-try-preserving-live-smoke port="17002": stack-build
     PORT={{port}} ./tools/manifest_supervised_try_preserving_live_smoke.sh
 
+# Opt-in live operator smoke for the supervised
+# --manifest-live-reload-demo require-preserving route. Drives
+# the audible reload end-to-end against the committed
+# preserve-cutoff fixture (preserving commits on it, same as the
+# try-preserving smoke). Injects OSC pre- and post-reload, runs
+# post-exit `ss` + active Python bind probes, and verifies the
+# require-preserving acceptance markers — including a load-
+# bearing negative marker that no "stopped-audio phase" lines
+# appear in the transcript, proving the require-preserving
+# supervised path does not compose with stopped-audio fallback.
+#
+# Same shape as the stopped-audio and try-preserving smokes,
+# but exercises the supervised stack with
+# `realPreservingHostStackOps` (preserving-only) instead of
+# `realStoppedAudioHostStackOps` or
+# `realTryPreservingHostStackOps`.
+#
+# Like the other two counterparts, this is a LIVE / DEVICE
+# smoke and is INTENTIONALLY NOT a member of `check-offline` or
+# any default CI gate.
+#
+# Default port is 17003 (vs 17001 for stopped-audio and 17002
+# for try-preserving) so the three smokes do not collide if run
+# in sequence and a stale post-exit state on one port does not
+# affect the others. Override with
+# `just manifest-supervised-require-preserving-live-smoke port=N`.
+#
+# Other parameters (manifest fixture, old/new demo keys, work
+# dir for artifacts) are env-var configurable in the wrapper
+# script; see tools/manifest_supervised_require_preserving_live_smoke.sh.
+manifest-supervised-require-preserving-live-smoke port="17003": stack-build
+    PORT={{port}} ./tools/manifest_supervised_require_preserving_live_smoke.sh
+
 # §4.B kernel microbench. Configures and builds in a separate
 # RelWithDebInfo tree so the numbers aren't dominated by
 # libstdc++ assertion overhead from the Debug `cpp-build`.

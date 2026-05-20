@@ -65,12 +65,12 @@ appManifestLiveReloadDemoRenderTests =
       assertShortLine 300 line
 
     -- §219 routing: the audible @--manifest-live-reload-demo@
-    -- dispatches StoppedAudioOnly through
-    -- 'realStoppedAudioHostStackOps' and
-    -- TryPreservingThenStoppedAudio through
-    -- 'realTryPreservingHostStackOps' (composed preserving +
-    -- stopped-audio fallback). RequirePreserving stays on the
-    -- direct path; migrating it is a separate slice.
+    -- now dispatches all three strategies through the supervised
+    -- lifecycle — StoppedAudioOnly through
+    -- 'realStoppedAudioHostStackOps', TryPreservingThenStoppedAudio
+    -- through 'realTryPreservingHostStackOps' (composed
+    -- preserving + stopped-audio fallback), and RequirePreserving
+    -- through 'realPreservingHostStackOps' (preserving-only).
     --
     -- 'selectLiveReloadRoute' is a pure selector. Pinning each
     -- strategy's route here catches a class of regressions
@@ -88,8 +88,9 @@ appManifestLiveReloadDemoRenderTests =
       $ selectLiveReloadRoute TryPreservingThenStoppedAudio
           @?= LiveReloadSupervised SfTryPreserving
 
-  , testCase "selectLiveReloadRoute RequirePreserving stays on the direct path"
-      $ selectLiveReloadRoute RequirePreserving @?= LiveReloadDirect
+  , testCase "selectLiveReloadRoute RequirePreserving -> supervised require-preserving"
+      $ selectLiveReloadRoute RequirePreserving
+          @?= LiveReloadSupervised SfRequirePreserving
 
     -- The tier-2 smoke wrappers (tools/manifest_supervised_*_live_smoke.sh)
     -- grep on the exact 'route:' string in the demo preamble.
@@ -108,6 +109,10 @@ appManifestLiveReloadDemoRenderTests =
   , testCase "renderLiveReloadRoute LiveReloadSupervised SfTryPreserving"
       $ renderLiveReloadRoute (LiveReloadSupervised SfTryPreserving)
           @?= "supervised (try-preserving; reloadSupervised + HostStackFactory)"
+
+  , testCase "renderLiveReloadRoute LiveReloadSupervised SfRequirePreserving"
+      $ renderLiveReloadRoute (LiveReloadSupervised SfRequirePreserving)
+          @?= "supervised (require-preserving; reloadSupervised + HostStackFactory)"
   ]
 
 -- | Carried-issue stand-in: a payload whose textual content includes

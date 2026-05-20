@@ -220,10 +220,11 @@ data RunMode
     --   realTryPreservingHostStackOps (composes preserving +
     --   stopped-audio fallback under the existing
     --   preservingAllowsStoppedAudioFallback gate).
-    -- * require-preserving stays on the direct
-    --   reloadManifestHostWithStrategy path; migrating it is its
-    --   own slice and opens against the evidence bar in
-    --   notes/2026-05-20-a-supervised-route-tier3-decision.md.
+    -- * require-preserving routes through the supervised stack
+    --   with realPreservingHostStackOps (preserving-only — no
+    --   stopped-audio fallback composition); every
+    --   InWindowReloadRejectedLiveFallback classification
+    --   surfaces as SupervisedReloadRequestRejected.
     -- The runtime preamble prints a "route:" line so the operator
     -- can see which path was selected. This whole command is
     -- opt-in; the normal demo path is unchanged.
