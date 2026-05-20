@@ -3554,8 +3554,22 @@ treat `SfriOwnerSetupFailed` as a terminal no-owner state. The outer
 recovery-policy contract — supervisor rebuilds only from the plan that
 was running at reload entry (captured as a per-reload local, not
 accumulated state), single bounded recovery attempt, single active
-stack invariant, escalate on second failure — is pinned separately in
-[Manifest Reload Host Supervisor And Recovery Policy](notes/2026-05-14-k-host-reload-supervisor.md).
+stack invariant, escalate on second failure — is pinned in
+[Manifest Reload Host Supervisor And Recovery Policy](notes/2026-05-14-k-host-reload-supervisor.md)
+and has now landed as a supervisor primitive + real-host adapter
+seam: `MetaSonic.App.ManifestReloadSupervisor` (`reloadSupervised`
+with onException cleanup) plus
+`MetaSonic.App.ManifestReloadSupervisorAdapter` (`HostStackFactory`
++ `withHostStackSupervisorAdapter`, fully async-safe under
+`mask`/`mask_` on every transition). Both halves are
+deterministically tested through 21 fake-IO cases that cover the
+full §238 test-checklist including A→B→C→D! no-remembered-history
+and `forkIO`/`throwTo` cleanup-under-exception invariants. What
+remains is the real stopped-audio host wiring — building a
+production `HostStackFactory ManifestReloadPlan ...` against the
+live `SessionFanInService` + ingress manager + audio FFI bundle
+and routing the existing `reloadManifestHostWithStrategy` path
+through `reloadSupervised`.
 The preserving-live sibling path has also landed behind explicit host
 APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
 runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`
@@ -3738,7 +3752,11 @@ Still gated:
   `--manifest-midi-reload-smoke`) that exercises the
   `hasDevice == True` PortMIDI branch end-to-end and prints
   per-event ingress activity, host orchestration design note,
-  host supervisor / recovery policy design note, and the
+  host supervisor / recovery policy contract (design now
+  realized as `MetaSonic.App.ManifestReloadSupervisor` +
+  `MetaSonic.App.ManifestReloadSupervisorAdapter`; real
+  stopped-audio host wiring through `reloadSupervised` is the
+  remaining slice in that lane), and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a

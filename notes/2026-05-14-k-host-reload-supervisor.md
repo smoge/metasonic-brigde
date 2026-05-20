@@ -2,10 +2,71 @@
 
 Date: 2026-05-14
 
-Status: design note only. This is the lifecycle-supervisor companion to
+Status: design + supervisor primitive + real-host adapter landed.
+Real stopped-audio host wiring (§219 slice 4) is the next step.
+The contract body below remains the design record the
+implementation slices were reviewed against; the "Implemented
+status" section immediately below this header is the
+authoritative summary of what shipped.
+
+This is the lifecycle-supervisor companion to
 `2026-05-14-j-host-stopped-audio-manifest-reload-orchestration.md`. The
 j-note pins the in-window orchestration sequence; this note pins the outer
 recovery policy when an in-window operation fails terminally.
+
+## Implemented status
+
+Landed across six commits in the §219 ordering, all under
+deterministic fake-IO test coverage (no PortAudio, no real
+listeners, no live audio host):
+
+| # | Commit | Slice content |
+|---|--------|---------------|
+| 1 | `f34522e` (earlier, pre-session) | §219 slice 1.5 baseline: `MetaSonic.App.ManifestReloadSupervisor` primitive — `SupervisorOps plan e` with `sopsInWindowReload` / `sopsCloseStack` / `sopsOpenStack`, `reloadSupervised` capturing `fallback` as a per-call local. Outcome variants `SupervisedReloadCommitted | SupervisedReloadRejectedRecovered e | SupervisedReloadEscalated e e`. 9 fake-IO test cases in `MetaSonic.Spec.AppManifestReloadSupervisor`. |
+| 2 | `ef6bd80` | §238 #9 cleanup invariant: `reloadSupervised` wraps `sopsInWindowReload` in `onException sopsCloseStack` so a throw from the in-window op closes the still-live previous stack before propagating. Two paired tests pin the change (throw during in-window closes the live stack; normal `Left e` recovery does not double-fire the wrapper). |
+| 3 | `7b8a2c6` | §238 #2 regression: A→B→C→D! "no remembered history" test. Two committed reloads then a failed third reload; the rebuild target must be the plan running at this reload's entry (C), not earlier history (B or A). Belt-and-suspenders against a future "previousGood" history-accumulation refactor. |
+| 4 | `8892eb4` | §219 next-layer-outward: new module `MetaSonic.App.ManifestReloadSupervisorAdapter` with `HostStackFactory plan stack e` (3 slots: open / close / in-window) and `withHostStackSupervisorAdapter`, an `IORef`-backed bracket that exposes a `SupervisorOps` the supervisor can drive. 6 fake-IO test cases covering close-before-open, fallback rebuild, escalation, and active-stack-ref bookkeeping. |
+| 5 | `5616d9a` | Async-exception windows in the adapter halves: `openOps` now `mask $ \restore -> ...` so the "Right newStack → writeIORef" publication is uninterruptible; `closeActiveStack` now `mask_` so the "atomicModifyIORef → hsfCloseStack" handoff is atomic. Three new tests: two `getMaskingState` observations + one `forkIO`/`throwTo` injection test asserting no minted stack id is left without a matching close on the recovery path. |
+| 6 | `d990c33` | Outer setup-window mask: `withHostStackSupervisorAdapter factory initialStack k = mask $ \restore -> do ... ; restore (k supOps) `finally` closeOps`. Closes the §103 window between `newIORef (Just initialStack)` and the `finally` install where an async exception would have leaked the already-open initialStack. New test pins that `restore` correctly hands the caller's masking state to the continuation. |
+
+Test count: the supervisor lane contributes 11 cases in
+`MetaSonic.Spec.AppManifestReloadSupervisor` (including the
+A→B→C→D! regression and the exception/no-double-fire pair) and 10
+cases in `MetaSonic.Spec.AppManifestReloadSupervisorAdapter`
+(six structural + two `getMaskingState` + one throwTo injection
++ one outer-restore passthrough). Both modules are wired into
+`test/Spec.hs` and the package.yaml test-component
+`other-modules`. Total suite at this lane's close: 1194 cases.
+
+§238 test-checklist coverage: 11/11 — all 9 originally listed
+plus the two additions explicitly named by the design ("A→B→C
+regression" and "async exception during recovery closes any
+partial stack before surfacing").
+
+### What remains
+
+§219 slice 4 ("Add the real stopped-audio host command, using
+the supervisor as its outer wrapper") and slice 5 (manual CLI
+smoke against a working device) have not been started. Slices 1
+and 3 from the supervisor's dependency list (j-note slices 1
+and 2) are independently landed in the session layer:
+`startSessionFanInHostAudio` / `stopSessionFanInHostAudio` on
+`SessionFanInHost`, and `quiesceAndDrainSessionFanInService` on
+`SessionFanInService`. `reloadManifestSessionStoppedAudio` (the
+helper the supervisor's in-window reload will call) also lives
+in `MetaSonic.Session.ManifestReload.Runtime`.
+
+The slice-4 wiring step is therefore: implement a production
+`HostStackFactory ManifestReloadPlan SomeError` against the
+real `SessionFanInService` + ingress manager + audio FFI
+bundle, build `withHostStackSupervisorAdapter` over it, and
+route the existing `reloadManifestHostWithStrategy` /
+`reloadManifestStoppedAudioHost` paths through
+`reloadSupervised`. Resource/allocation recovery events stay
+parked behind a real consumer per the
+[Manifest Reload Ingress v1 Closeout](2026-05-15-d-manifest-reload-ingress-v1-closeout.md);
+the supervisor's escalation outcome (`SupervisedReloadEscalated`)
+is the consumer hook waiting for that wiring decision.
 
 ## Summary
 
