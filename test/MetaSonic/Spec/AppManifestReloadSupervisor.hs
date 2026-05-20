@@ -147,6 +147,52 @@ appManifestReloadSupervisorTests =
       outcome @?= SupervisedReloadCommitted
       CloseStackCalled `elem` calls @?= False
       any isOpenCall calls @?= False
+
+  , testCase
+      "A->B->C: failure from C falls back to C, never to B or A (no remembered history)"
+      $ do
+      -- §238 test-checklist regression for the "previousGood lags"
+      -- bug the design note explicitly calls out. The supervisor
+      -- holds no stable `previouslyGood` field; `fallback` is a
+      -- per-reload local, passed in at each call. Walks two
+      -- successful reloads (A->B then B->C), then drives a failed
+      -- reload from C with C itself as the captured fallback. The
+      -- rebuild must target C — not B (one step back), not A (two
+      -- steps back). If a future refactor adds a stable history
+      -- field, this test fails when the supervisor reaches for the
+      -- wrong fallback.
+      let planC = "third" :: String
+      (ops, log_) <- mkRecordingOps
+        (\p -> if p == planC
+                 then pure (Left FakeAudioRestartFailed)
+                 else pure (Right ()))
+        openStackOk
+
+      -- A -> B (success). Caller passes A as the running plan,
+      -- B as the requested. On success, B becomes the new
+      -- currentPlan from the caller's perspective.
+      outcomeAB <- reloadSupervised ops planA planB
+      outcomeAB @?= SupervisedReloadCommitted
+
+      -- B -> C (success). Caller passes B (the just-committed
+      -- plan), not A. This is the contract: the caller tracks
+      -- currentPlan; the supervisor never accumulates it.
+      outcomeBC <- reloadSupervised ops planB planC
+      -- planC fails per the in-window fake above.
+      outcomeBC @?= SupervisedReloadRejectedRecovered FakeAudioRestartFailed
+
+      -- Rebuild target must be planB (the plan running at this
+      -- reload's entry), NOT planA (older history) and NOT planC
+      -- (the failed requested plan).
+      calls <- readIORef log_
+      let openCalls = [p | OpenStackCalled p <- calls]
+      openCalls @?= [planB]
+
+      -- Belt-and-suspenders: ensure planA never appears in any
+      -- open-stack call across this whole sequence. If a future
+      -- supervisor mistakenly carried planA as a stable history
+      -- field, it would surface here.
+      planA `notElem` openCalls @?= True
   ]
 
 
