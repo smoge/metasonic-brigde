@@ -22,9 +22,8 @@
 -- * @RequirePreserving@ and @TryPreservingThenStoppedAudio@ stay on
 --   the direct 'reloadManifestHostWithStrategy' path
 --   ('LiveReloadDirect'). Migrating them to the supervised
---   stack is its own slice, gated on further supervised-route
---   hardware exposure plus the CI-gating decision for the
---   supervised path.
+--   stack is its own slice and opens against the evidence bar in
+--   @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
 --
 -- The runtime preamble prints a @route:@ line so the operator can
 -- see which path was selected. The routing decision itself is a
@@ -163,11 +162,11 @@ import           MetaSonic.Session.State        (SessionState (..))
 -- supervised route is hardware-confirmed once (2026-05-20 run
 -- recorded in the runbook). Preserving and
 -- 'TryPreservingThenStoppedAudio' stay on the existing direct
--- path; migrating them is its own slice, gated on further
--- supervised-route hardware exposure and the CI-gating
--- decision for the supervised path. Selection is pure so it
--- can be exercised by deterministic tests without staging
--- real audio.
+-- path; migrating them is its own slice and opens against the
+-- evidence bar in
+-- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
+-- Selection is pure so it can be exercised by deterministic
+-- tests without staging real audio.
 data LiveReloadRoute
   = LiveReloadDirect
     -- ^ Drive 'reloadManifestHostWithStrategyWithEvents'

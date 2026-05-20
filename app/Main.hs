@@ -218,9 +218,9 @@ data RunMode
     -- (hardware-confirmed on 2026-05-20; see the runbook).
     -- require-preserving and try-preserving stay on the direct
     -- reloadManifestHostWithStrategy path; migrating them is its
-    -- own slice and is deferred until further hardware exposure
-    -- + a CI-gating decision on the supervised path. The runtime
-    -- preamble prints a "route:" line so the operator can see
+    -- own slice and opens against the evidence bar in
+    -- notes/2026-05-20-a-supervised-route-tier3-decision.md.
+    -- The runtime preamble prints a "route:" line so the operator can see
     -- which path was selected. This whole command is opt-in;
     -- the normal demo path is unchanged.
   deriving (Eq, Show)

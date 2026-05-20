@@ -478,9 +478,8 @@ machinery the `--manifest-host-reload-smoke` CLI uses. The
 supervised route is hardware-confirmed once (transcript
 below). Preserving and `try-preserving` remain on the direct
 `reloadManifestHostWithStrategy` path; their migration is its
-own slice and is deferred until further supervised-route
-hardware exposure plus the CI-gating decision for the
-supervised path.
+own slice and opens against the evidence bar in
+[2026-05-20-a-supervised-route-tier3-decision.md](2026-05-20-a-supervised-route-tier3-decision.md).
 
 The routing decision is exposed as a pure
 `selectLiveReloadRoute :: ManifestReloadHostStrategy ->

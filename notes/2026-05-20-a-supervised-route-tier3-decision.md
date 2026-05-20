@@ -87,13 +87,21 @@ if any of the following land:
   stopped-audio; next: preserving, try-preserving). Beyond
   that, "operators run N marker-clean smokes per PR"
   becomes infeasible and CI must take it over.
-- **Real-time-loop hot-swap routes appear.** A supervised
-  path lands that is **not** stopped-audio — e.g., a
-  preserving-style route that performs the plan install
-  with audio running. Marker checks then become
-  device-timing sensitive and "operator ran it once"
-  loses statistical power; the regression class needs
-  automated re-runs across cold/warm starts.
+- **Timing-sensitive marker failures appear.** A supervised
+  route's marker checks start failing intermittently in a
+  way that traces to device timing rather than logic —
+  e.g., a cold-vs-warm-start flake, a re-run that passes
+  with no code change, or marker order varying across runs.
+  This failure mode is most plausible on supervised paths
+  that install a plan with audio running (preserving /
+  try-preserving), but the trigger here is the **observed
+  flake**, not the path category — preserving and
+  try-preserving are explicitly unlocked by this decision
+  and do not by themselves fire this trigger. If a
+  timing-sensitive failure does appear on any supervised
+  route, "one operator ran it once" loses statistical power
+  and the regression class needs automated re-runs across
+  cold / warm starts.
 - **Operator-reported regression that tier 2 caught but
   the PR author skipped.** Process failure. The fix is to
   remove the opt-in and make tier 2 mandatory in CI for

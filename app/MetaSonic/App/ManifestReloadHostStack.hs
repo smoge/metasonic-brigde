@@ -20,9 +20,8 @@
 -- both operator-facing entrypoints. @RequirePreserving@ and
 -- @TryPreservingThenStoppedAudio@ stay on the direct
 -- 'reloadManifestHostWithStrategy' path; migrating them is
--- its own slice, gated on further supervised-route hardware
--- exposure and the CI-gating decision for the supervised
--- path.
+-- its own slice and opens against the evidence bar in
+-- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
 --
 -- The 'StoppedAudioHostStack' newtype wraps the per-active
 -- 'ManifestReloadHostConfig'; plan ownership stays at the

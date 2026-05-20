@@ -468,9 +468,9 @@ runManifestHostStrategyReloadSmokeWithListenerConfig
     -- supervisor + factory now (hardware-confirmed once on
     -- 2026-05-20; see the runbook). Preserving and
     -- TryPreservingThenStoppedAudio stay on the direct path
-    -- below; their migration is its own slice, deferred until
-    -- further supervised-route hardware exposure plus the
-    -- CI-gating decision for that path.
+    -- below; their migration is its own slice and opens
+    -- against the evidence bar in
+    -- notes/2026-05-20-a-supervised-route-tier3-decision.md.
     fmap renderManifestSupervisedStoppedAudioReloadSmoke
       <$> runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
             listenerCfg

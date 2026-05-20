@@ -67,9 +67,9 @@ appManifestLiveReloadDemoRenderTests =
     -- 'StoppedAudioOnly' strategy through the supervised
     -- lifecycle (factory + adapter + 'reloadSupervised').
     -- Preserving and TryPreservingThenStoppedAudio stay on the
-    -- direct path; their migration is its own slice, deferred
-    -- until further supervised-route hardware exposure plus the
-    -- CI-gating decision for that path.
+    -- direct path; their migration is its own slice and opens
+    -- against the evidence bar in
+    -- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
     --
     -- 'selectLiveReloadRoute' is a pure selector. Pinning each
     -- strategy's route here catches a class of regressions

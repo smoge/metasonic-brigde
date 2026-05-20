@@ -146,12 +146,17 @@ supervised reload with the expected
 committed` event pair, and released the OSC port cleanly on
 exit; full transcript at
 [notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](2026-05-19-b-manifest-host-reload-smoke-runbook.md).
-Hardware-gated CI for this route stays open as its own slice
-(CI-gating decision still pending). Preserving and
-`TryPreservingThenStoppedAudio` fallback still go through the
-direct `reloadManifestHostWithStrategy` path; their migration
-is its own slice, gated on further supervised-route hardware
-exposure plus the CI-gating decision above.
+Hardware-backed CI for this route is deferred (not rejected)
+by
+[2026-05-20-a-supervised-route-tier3-decision.md](2026-05-20-a-supervised-route-tier3-decision.md);
+that note also lists the reopen triggers that would put
+tier 3 back on the slate. Preserving and
+`TryPreservingThenStoppedAudio` fallback still go through
+the direct `reloadManifestHostWithStrategy` path; their
+migration is its own slice and opens against that note's
+bar (deterministic route tests plus a minimum of two
+marker-clean tier-2 runs attached to the PR, two different
+hosts / audio backends preferred when available).
 
 The error surface uses a narrow
 `SupervisedStoppedAudioReloadResult` (committed / recovered /
