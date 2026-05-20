@@ -634,7 +634,7 @@ mkProductionInputs
   -> SessionFanInAudioFFI
   -> RealStoppedAudioHostStackInputs String ()
 mkProductionInputs ingressOps audioFFI = RealStoppedAudioHostStackInputs
-  { rsahsiIngressOps          = ingressOps
+  { rsahsiBuildIngressOps     = const ingressOps
   , rsahsiIngressTargetPolicy = testIngressTargetPolicy
   , rsahsiAudioFFI            = audioFFI
   , rsahsiAudioOptions        = testAudioOptions

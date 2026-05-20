@@ -90,6 +90,7 @@ import           MetaSonic.Authoring.Manifest                (AuthoringManifestD
 import           MetaSonic.Session.FanIn                     (SessionFanInAudioFFI,
                                                               SessionFanInAudioIssue,
                                                               SessionFanInAudioOptions,
+                                                              SessionFanInHost,
                                                               startSessionFanInHostAudioWith,
                                                               stopSessionFanInHostAudioWith)
 import           MetaSonic.Session.FanInService              (SessionFanInService,
@@ -381,8 +382,16 @@ mkStoppedAudioHostStackFactory ops = HostStackFactory
 -- both reuse the helper.
 data RealStoppedAudioHostStackInputs ingressIssue handle =
   RealStoppedAudioHostStackInputs
-    { rsahsiIngressOps
-        :: !(ManifestReloadIngressOps ManifestReloadIngressTarget ingressIssue handle)
+    { rsahsiBuildIngressOps
+        :: !(SessionFanInHost
+              -> ManifestReloadIngressOps ManifestReloadIngressTarget ingressIssue handle)
+      -- ^ Build the ingress ops bundle against the just-opened
+      -- 'SessionFanInHost'. Production OSC / MIDI ingress ops
+      -- close over the host (the listener thread forwards to it),
+      -- so they must be re-built fresh on every 'sahsoOpen' — the
+      -- supervisor opens a new service on each rebuild, and the
+      -- old host is gone by then. The factory makes that
+      -- per-stack lifetime explicit.
     , rsahsiIngressTargetPolicy
         :: !ManifestReloadIngressTargetPolicy
     , rsahsiAudioFFI
@@ -452,9 +461,10 @@ realOpen inputs plan =
         Left issue ->
           pure (Left (SahsoiServiceSetupFailed issue))
         Right service -> do
-          ingressResult <- mrioOpenIngress
-            (rsahsiIngressOps inputs)
-            target
+          let ingressOps = rsahsiBuildIngressOps
+                inputs
+                (sessionFanInServiceHost service)
+          ingressResult <- mrioOpenIngress ingressOps target
           case ingressResult of
             Left issue ->
               rollbackIngressOpen
@@ -462,7 +472,7 @@ realOpen inputs plan =
                 service
             Right initialHandle -> do
               ingressManager <- newManifestReloadIngressManager
-                (rsahsiIngressOps inputs)
+                ingressOps
                 target
                 initialHandle
               audioResult <- startSessionFanInHostAudioWith
