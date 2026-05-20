@@ -154,47 +154,49 @@ appManifestReloadSupervisorTests =
       "A->B->C: failure from C falls back to C, never to B or A (no remembered history)"
       $ do
       -- §238 test-checklist regression for the "previousGood lags"
-      -- bug the design note explicitly calls out. The supervisor
-      -- holds no stable `previouslyGood` field; `fallback` is a
-      -- per-reload local, passed in at each call. Walks two
-      -- successful reloads (A->B then B->C), then drives a failed
-      -- reload from C with C itself as the captured fallback. The
-      -- rebuild must target C — not B (one step back), not A (two
-      -- steps back). If a future refactor adds a stable history
-      -- field, this test fails when the supervisor reaches for the
-      -- wrong fallback.
-      let planC = "third" :: String
+      -- bug the design note explicitly calls out: "two consecutive
+      -- successful reloads (A -> B -> C) leave the supervisor
+      -- running C with no remembered A; a later failed reload from
+      -- C falls back to C, not to A or B." The supervisor holds no
+      -- stable `previouslyGood` field; `fallback` is a per-reload
+      -- local, passed in at each call. If a future refactor adds
+      -- accumulated state, the supervisor would lag a step behind
+      -- and rebuild from B (or earlier) instead of C — exactly the
+      -- regression this test guards against.
+      let planC = "third"  :: String
+          planD = "fourth" :: String
       (ops, log_) <- mkRecordingOps
-        (\p -> if p == planC
+        (\p -> if p == planD
                  then pure (Left FakeAudioRestartFailed)
                  else pure (Right ()))
         openStackOk
 
-      -- A -> B (success). Caller passes A as the running plan,
-      -- B as the requested. On success, B becomes the new
-      -- currentPlan from the caller's perspective.
+      -- A -> B commits.
       outcomeAB <- reloadSupervised ops planA planB
       outcomeAB @?= SupervisedReloadCommitted
 
-      -- B -> C (success). Caller passes B (the just-committed
-      -- plan), not A. This is the contract: the caller tracks
-      -- currentPlan; the supervisor never accumulates it.
+      -- B -> C commits. Caller threads currentPlan forward — the
+      -- supervisor never accumulates history.
       outcomeBC <- reloadSupervised ops planB planC
-      -- planC fails per the in-window fake above.
-      outcomeBC @?= SupervisedReloadRejectedRecovered FakeAudioRestartFailed
+      outcomeBC @?= SupervisedReloadCommitted
 
-      -- Rebuild target must be planB (the plan running at this
-      -- reload's entry), NOT planA (older history) and NOT planC
-      -- (the failed requested plan).
+      -- C -> D fails. Fallback at reload entry is planC (the plan
+      -- currently running per the caller's bookkeeping). Rebuild
+      -- must target planC — not planB (one step back), not planA
+      -- (two steps back), not planD (the failed requested plan).
+      outcomeCD <- reloadSupervised ops planC planD
+      outcomeCD @?= SupervisedReloadRejectedRecovered FakeAudioRestartFailed
+
       calls <- readIORef log_
       let openCalls = [p | OpenStackCalled p <- calls]
-      openCalls @?= [planB]
+      openCalls @?= [planC]
 
-      -- Belt-and-suspenders: ensure planA never appears in any
-      -- open-stack call across this whole sequence. If a future
-      -- supervisor mistakenly carried planA as a stable history
-      -- field, it would surface here.
+      -- Belt-and-suspenders: assert planA / planB never appear in
+      -- any rebuild target across the whole A->B->C->D! sequence.
+      -- A future "previousGood" history field would silently reach
+      -- for one of them here.
       planA `notElem` openCalls @?= True
+      planB `notElem` openCalls @?= True
 
   , testCase
       "exception during in-window reload closes the previous stack before propagating"
