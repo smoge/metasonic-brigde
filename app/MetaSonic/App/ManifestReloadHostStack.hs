@@ -32,10 +32,11 @@
 --
 -- Tests inject fake @sahsoOpen@ / @sahsoClose@ / @sahsoInWindowReload@
 -- and verify the factory composes with 'withHostStackSupervisorAdapter'
--- + 'reloadSupervised' across the seven scenarios named in the
--- supervisor §238 checklist (success, owner-setup failure recovery,
--- audio-restart recovery, listener/ingress-open recovery, rebuild
--- escalation, no overlapping stacks, async cleanup).
+-- + 'reloadSupervised' across the seven slice-4 scenarios named in
+-- the supervisor §238 checklist (success, owner-setup failure
+-- recovery, audio-restart recovery, listener/ingress-open recovery,
+-- rebuild escalation, no overlapping stacks, async cleanup) plus the
+-- A→B→C→D! no-remembered-history regression.
 --
 -- See notes/2026-05-14-k-host-reload-supervisor.md \xa7219 slice 4.
 module MetaSonic.App.ManifestReloadHostStack
