@@ -66,6 +66,7 @@ module MetaSonic.App.ManifestReloadTryPreservingHostStack
   , TryPreservingNext (..)
   , decideTryPreservingNext
   , composeFallbackOutcome
+  , fallbackEventForDecision
     -- * Production wiring
   , realTryPreservingHostStackOps
   , realTryPreservingInWindowReload
@@ -273,12 +274,46 @@ composeFallbackOutcome preservingIssue = \case
       \(the stopped-audio path cannot return that variant)."
 
 
+-- | Map a 'TryPreservingNext' decision to the event the supervised
+-- try-preserving helper must emit at the fallback decision point.
+--
+-- This mirrors the direct path's strategy dispatch in
+-- 'runReloadHostStrategyWithEvents' verbatim: every preserving
+-- failure that is /not/ admitted to stopped-audio fallback —
+-- whether the underlying classification was
+-- 'InWindowReloadRejectedLiveFallback' (live stack, not eligible
+-- per 'preservingAllowsStoppedAudioFallback') or
+-- 'InWindowReloadTerminal' (preserving reached a terminal
+-- owner / service state) — emits 'MreFallbackDeclined'. Operators
+-- reading the timeline see one event per supervised reload that
+-- declines fallback, regardless of which classification path the
+-- failure took.
+--
+-- The earlier draft of this module accidentally split the event
+-- emission so that 'TpnTerminal' produced no event; this helper
+-- closes that gap and the policy is now table-pinned alongside
+-- 'decideTryPreservingNext'.
+fallbackEventForDecision
+  :: TryPreservingNext ingressIssue
+  -> Maybe (ManifestReloadEvent (ManifestReloadHostIssue ingressIssue))
+fallbackEventForDecision = \case
+  TpnCommitted ->
+    Nothing
+  TpnRunFallback issue ->
+    Just (MreFallbackAdmitted issue)
+  TpnDeclineFallback issue ->
+    Just (MreFallbackDeclined issue)
+  TpnTerminal issue ->
+    Just (MreFallbackDeclined issue)
+
+
 -- | Production in-window reload wiring for the try-preserving
 -- lane. Composes 'realPreservingInWindowReload' with
 -- 'realStoppedAudioInWindowReload' under the pure decision rule
--- 'decideTryPreservingNext'. Emits 'MreFallbackAdmitted' /
--- 'MreFallbackDeclined' for the fallback decision; the route layer
--- emits 'MreStrategy*'.
+-- 'decideTryPreservingNext', and emits the fallback decision event
+-- via 'fallbackEventForDecision' before constructing the combined
+-- outcome. The route layer emits 'MreStrategy*'; this helper owns
+-- only the two 'MreFallback*' events.
 realTryPreservingInWindowReload
   :: Show ingressIssue
   => (ManifestReloadEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
@@ -292,16 +327,16 @@ realTryPreservingInWindowReload
 realTryPreservingInWindowReload onEvent producer policy stack fallback requested = do
   preservingOutcome <-
     realPreservingInWindowReload producer policy stack fallback requested
-  case decideTryPreservingNext preservingOutcome of
+  let decision = decideTryPreservingNext preservingOutcome
+  mapM_ onEvent (fallbackEventForDecision decision)
+  case decision of
     TpnCommitted ->
       pure InWindowReloadCommitted
     TpnRunFallback preservingIssue -> do
-      onEvent (MreFallbackAdmitted preservingIssue)
       stoppedOutcome <-
         realStoppedAudioInWindowReload policy stack fallback requested
       pure (composeFallbackOutcome preservingIssue stoppedOutcome)
-    TpnDeclineFallback preservingIssue -> do
-      onEvent (MreFallbackDeclined preservingIssue)
+    TpnDeclineFallback preservingIssue ->
       pure
         (InWindowReloadRejectedLiveFallback
           (TpiwiPreservingFallbackDeclined preservingIssue))

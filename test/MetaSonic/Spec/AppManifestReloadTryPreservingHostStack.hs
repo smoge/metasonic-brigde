@@ -57,6 +57,8 @@ import           MetaSonic.App.ManifestReloadSupervisor
                                     reloadSupervised)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                    (withHostStackSupervisorAdapter)
+import           MetaSonic.App.ManifestReloadEvent
+                                   (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadTryPreservingHostStack
                                    (TryPreservingHostStackIssue (..),
                                     TryPreservingHostStackOps (..),
@@ -64,6 +66,7 @@ import           MetaSonic.App.ManifestReloadTryPreservingHostStack
                                     TryPreservingNext (..),
                                     composeFallbackOutcome,
                                     decideTryPreservingNext,
+                                    fallbackEventForDecision,
                                     mkTryPreservingHostStackFactory)
 import           MetaSonic.Bridge.Templates (TemplateGraph (..))
 import           MetaSonic.Pattern        (SwapLabel (..))
@@ -199,7 +202,49 @@ appManifestReloadTryPreservingHostStackTests =
   testGroup "App manifest reload try-preserving host stack"
   [ decideTryPreservingNextTests
   , composeFallbackOutcomeTests
+  , fallbackEventForDecisionTests
   , factoryCompositionTests
+  ]
+
+
+-- | Pure-core event-emission table. Mirrors the direct path's
+-- 'runReloadHostStrategyWithEvents' semantics: every preserving
+-- failure that is not admitted to stopped-audio fallback —
+-- whether the underlying classification was
+-- 'InWindowReloadRejectedLiveFallback' (live stack, not eligible)
+-- or 'InWindowReloadTerminal' (preserving reached a terminal
+-- state) — emits 'MreFallbackDeclined'. The direct-path test
+-- 'strategy fallback declined: preserving HpariDrainFailedTerminal
+-- stays surfaced' in 'AppManifestReloadEvent' pins the same
+-- timeline at the strategy layer; this table pins it at the
+-- supervised-helper layer so the two paths cannot drift.
+fallbackEventForDecisionTests :: TestTree
+fallbackEventForDecisionTests =
+  testGroup "fallbackEventForDecision policy (pure)"
+  [ testCase "TpnCommitted -> no event" $
+      fallbackEventForDecision
+        (TpnCommitted :: TryPreservingNext String)
+        @?= Nothing
+  , testCase "TpnRunFallback -> MreFallbackAdmitted" $
+      let issue = HpariReloadRejected (MrhiIngress "trigger")
+      in fallbackEventForDecision (TpnRunFallback issue)
+           @?= Just (MreFallbackAdmitted issue)
+  , testCase "TpnDeclineFallback -> MreFallbackDeclined" $
+      let issue = HpariQuiesceRejected (MrhiIngress "live-but-not-eligible")
+      in fallbackEventForDecision (TpnDeclineFallback issue)
+           @?= Just (MreFallbackDeclined issue)
+  , testCase "TpnTerminal -> MreFallbackDeclined (matches direct path)" $
+      -- Closes the gap reviewer flagged: the previous draft did
+      -- not emit any event on terminal preserving outcomes, so
+      -- operator timelines lost the fallback-declined marker
+      -- when preserving reached a terminal state.
+      -- 'runReloadHostStrategyWithEvents' has always emitted
+      -- MreFallbackDeclined for terminal preserving failures
+      -- (see AppManifestReloadEvent's HpariDrainFailedTerminal
+      -- test); the supervised path now matches.
+      let issue = HpariDrainFailedTerminal (MrhiIngress "terminal")
+      in fallbackEventForDecision (TpnTerminal issue)
+           @?= Just (MreFallbackDeclined issue)
   ]
 
 
