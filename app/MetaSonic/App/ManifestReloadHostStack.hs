@@ -41,19 +41,21 @@ module MetaSonic.App.ManifestReloadHostStack
   , StoppedAudioHostStackIssue (..)
   , mkStoppedAudioHostStackFactory
   , realStoppedAudioInWindowReload
-  , planToManifestReloadRequest
   ) where
 
 import           Data.Bifunctor                              (first)
 
-import           MetaSonic.App.ManifestReloadHost            (ManifestReloadHostConfig,
-                                                              reloadManifestStoppedAudioHostWithEvents)
+import           MetaSonic.App.ManifestReloadHost            (ManifestReloadHostConfig (..),
+                                                              manifestReloadHostOps)
 import           MetaSonic.App.ManifestReloadHost.Types      (ManifestReloadHostIssue)
+import           MetaSonic.App.ManifestReloadOrchestration   (orchestrateHostStoppedAudioReloadWithEvents)
 import           MetaSonic.App.ManifestReloadOrchestration.Types
-                                                             (HostStoppedAudioReloadIssue)
+                                                             (HostStoppedAudioReloadIssue,
+                                                              HostStoppedAudioReloadOps (..))
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                                              (HostStackFactory (..))
-import           MetaSonic.Authoring.Manifest                (AuthoringManifestDoc)
+import           MetaSonic.Authoring.Manifest                (AuthoringManifestDoc (..),
+                                                              manifestSchemaVersion)
 import           MetaSonic.Session.FanIn                     (SessionFanInAudioIssue)
 import           MetaSonic.Session.FanInService              (SessionFanInServiceSetupIssue)
 import qualified MetaSonic.Session.ManifestReload            as MR
@@ -66,15 +68,22 @@ import qualified MetaSonic.Session.ManifestReload            as MR
 --
 -- @sahsConfig@ carries the live runtime references (the
 -- 'SessionFanInService', the ingress manager, the audio FFI, the
--- ingress targets, and the event hook). @sahsInstalledPlan@ tracks
--- the plan currently installed on that config — the supervisor's
--- per-call @fallback@ refers to this value when the in-window
--- reload of a NEW plan fails and the supervisor needs to rebuild
--- against the plan that was running at reload entry.
-data StoppedAudioHostStack target ingressIssue handle =
+-- ingress targets, and the event hook).
+--
+-- Note that this record carries NO @currentPlan@-style field. The
+-- supervisor's contract is that the caller of 'reloadSupervised'
+-- threads @currentPlan@ externally — passing it as @fallback@ on
+-- each call, capturing the @requested@ plan as the new
+-- @currentPlan@ on success. Tracking a plan field on the stack
+-- itself would either silently drift (if not updated after a
+-- successful in-window reload) or duplicate state the caller
+-- already owns; either way it would mislead a routing slice that
+-- read the stack for the next fallback. Keep plan ownership at
+-- the caller and rebuilds use whichever plan the supervisor was
+-- told to remember.
+newtype StoppedAudioHostStack target ingressIssue handle =
   StoppedAudioHostStack
-    { sahsConfig        :: !(ManifestReloadHostConfig target ingressIssue handle)
-    , sahsInstalledPlan :: !MR.ManifestReloadPlan
+    { sahsConfig :: ManifestReloadHostConfig target ingressIssue handle
     }
 
 
@@ -165,50 +174,73 @@ data StoppedAudioHostStackIssue ingressIssue
   deriving stock (Eq, Show)
 
 
--- | Production in-window reload wiring against the existing
--- 'reloadManifestStoppedAudioHostWithEvents' helper.
+-- | Production in-window reload wiring, plan-native.
 --
--- This is the default value 'sahsoInWindowReload' carries in
--- production: drive the orchestrator against the stack's
--- 'ManifestReloadHostConfig', translating the supervisor's plan
--- argument into a 'ManifestReloadRequest' under the caller's
--- static 'ManifestResourcePolicy'.
+-- The supervisor's 'plan' argument is the source of truth: it has
+-- already been validated by the caller. This helper drives the
+-- existing 'orchestrateHostStoppedAudioReloadWithEvents' against
+-- the stack's 'ManifestReloadHostConfig' with the orchestrator's
+-- @hsaroPreparePlan@ slot overridden to
+-- @const (pure (Right plan))@, so the orchestrator installs the
+-- exact plan the supervisor handed in.
 --
--- Tests override this slot with a fake to pin specific failure
--- variants without staging real session-layer state.
+-- The naive shape that calls 'reloadManifestStoppedAudioHostWithEvents'
+-- (which re-derives a plan from doc + catalog + the supplied
+-- request) would let doc / catalog / static resource-policy drift
+-- between the caller's validation step and the supervisor's
+-- invocation: a plan validated at time T could be rejected at
+-- T+1, or worse, silently swapped for a different demo. Going
+-- through @hsaroPreparePlan = const (pure (Right plan))@ pins
+-- "install this exact plan" at the seam.
+--
+-- The request value passed to the orchestrator is synthesized
+-- from the plan for ergonomics (operator-facing event payloads
+-- carry the demo key + swap label) but the orchestrator never
+-- consults it for planning — the override short-circuits that.
+-- The 'AuthoringManifestDoc' / catalog handed into
+-- 'manifestReloadHostOps' are also unused after the override;
+-- empty placeholders flow through to slots the supervisor never
+-- forces.
+--
+-- Tests override 'sahsoInWindowReload' with a fake to pin
+-- specific 'HostStoppedAudioReloadIssue' variants without
+-- staging real session-layer state.
 realStoppedAudioInWindowReload
-  :: AuthoringManifestDoc
-  -> [MR.ManifestReloadCatalogEntry]
-  -> MR.ManifestResourcePolicy
-  -> StoppedAudioHostStack target ingressIssue handle
+  :: StoppedAudioHostStack target ingressIssue handle
   -> MR.ManifestReloadPlan
   -> IO (Either
           (HostStoppedAudioReloadIssue
             (ManifestReloadHostIssue ingressIssue))
           ())
-realStoppedAudioInWindowReload doc catalog policy stack plan =
-  reloadManifestStoppedAudioHostWithEvents
-    (sahsConfig stack)
-    doc
-    catalog
-    (planToManifestReloadRequest policy plan)
+realStoppedAudioInWindowReload stack plan =
+  orchestrateHostStoppedAudioReloadWithEvents
+    (mrhcOnEvent config)
+    planNativeOps
+    syntheticRequest
+  where
+    config = sahsConfig stack
 
+    -- manifestReloadHostOps builds the orchestrator slot bundle
+    -- using doc/catalog only inside hsaroPreparePlan; overriding
+    -- that slot makes doc/catalog dead inputs, so empty
+    -- placeholders flow safely through.
+    planNativeOps =
+      (manifestReloadHostOps config emptyDoc [])
+        { hsaroPreparePlan = const (pure (Right plan))
+        }
 
--- | Translate a 'ManifestReloadPlan' back into a
--- 'ManifestReloadRequest' suitable for
--- 'reloadManifestStoppedAudioHostWithEvents'. The supervisor's
--- 'plan' value is the source of truth for demo key + swap label;
--- the resource policy is a caller-supplied static, since plans
--- don't carry it after planning.
-planToManifestReloadRequest
-  :: MR.ManifestResourcePolicy
-  -> MR.ManifestReloadPlan
-  -> MR.ManifestReloadRequest
-planToManifestReloadRequest policy plan = MR.ManifestReloadRequest
-  { MR.mrrDemoKey        = MR.mrlpDemoKey plan
-  , MR.mrrSwapLabel      = MR.mrlpSwapLabel plan
-  , MR.mrrResourcePolicy = policy
-  }
+    -- Synthesized for event-payload ergonomics; not consulted by
+    -- the overridden preparePlan slot.
+    syntheticRequest = MR.ManifestReloadRequest
+      { MR.mrrDemoKey        = MR.mrlpDemoKey plan
+      , MR.mrrSwapLabel      = MR.mrlpSwapLabel plan
+      , MR.mrrResourcePolicy = MR.defaultManifestResourcePolicy
+      }
+
+    emptyDoc = AuthoringManifestDoc
+      { docSchemaVersion = manifestSchemaVersion
+      , docDemos         = []
+      }
 
 
 -- | Build a 'HostStackFactory' from a fully-specified ops bundle.
@@ -221,9 +253,8 @@ mkStoppedAudioHostStackFactory
        (StoppedAudioHostStack target ingressIssue handle)
        (StoppedAudioHostStackIssue ingressIssue)
 mkStoppedAudioHostStackFactory ops = HostStackFactory
-  { hsfOpenStack = \plan ->
-      fmap (first SahsiOpen) (sahsoOpen ops plan)
-  , hsfCloseStack = sahsoClose ops
+  { hsfOpenStack      = fmap (first SahsiOpen) . sahsoOpen ops
+  , hsfCloseStack     = sahsoClose ops
   , hsfInWindowReload = \stack plan ->
       fmap (first SahsiInWindow) (sahsoInWindowReload ops stack plan)
   }

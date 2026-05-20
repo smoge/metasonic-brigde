@@ -114,7 +114,7 @@ mkFakeOps traceRef plans = StoppedAudioHostStackOps
       result <- fspOpenBehavior plans plan
       case result of
         Left e   -> pure (Left e)
-        Right () -> pure (Right (mkStubStack plan))
+        Right () -> pure (Right stubStack)
   , sahsoClose = \_stack -> record CloseCalled
   , sahsoInWindowReload = \_stack plan -> do
       record (InWindowCalled (MR.mrlpDemoKey plan))
@@ -124,14 +124,15 @@ mkFakeOps traceRef plans = StoppedAudioHostStackOps
     record c = modifyIORef' traceRef (++ [c])
 
 
--- | Stub stack: real 'sahsInstalledPlan', deferred 'sahsConfig'.
-mkStubStack :: MR.ManifestReloadPlan -> TestStack
-mkStubStack plan = StoppedAudioHostStack
+-- | Deferred-config stub stack. The supervisor adapter passes the
+-- value around without inspecting it; the fake @sahsoInWindowReload@
+-- never forces the config field; so the placeholder never blows up.
+stubStack :: TestStack
+stubStack = StoppedAudioHostStack
   { sahsConfig =
       error
         "test placeholder: sahsConfig is intentionally undefined; \
         \fakes override sahsoInWindowReload so the config is never read"
-  , sahsInstalledPlan = plan
   }
 
 
@@ -193,7 +194,7 @@ appManifestReloadHostStackTests =
             }
           factory = mkStoppedAudioHostStackFactory ops
       outcome <-
-        withHostStackSupervisorAdapter factory (mkStubStack planA) $ \supOps ->
+        withHostStackSupervisorAdapter factory stubStack $ \supOps ->
           reloadSupervised supOps planA planB
       trace <- readIORef traceRef
 
@@ -217,7 +218,7 @@ appManifestReloadHostStackTests =
             }
           factory = mkStoppedAudioHostStackFactory ops
       outcome <-
-        withHostStackSupervisorAdapter factory (mkStubStack planA) $ \supOps ->
+        withHostStackSupervisorAdapter factory stubStack $ \supOps ->
           reloadSupervised supOps planA planB
       trace <- readIORef traceRef
 
@@ -247,7 +248,7 @@ appManifestReloadHostStackTests =
             }
           factory = mkStoppedAudioHostStackFactory ops
       outcome <-
-        withHostStackSupervisorAdapter factory (mkStubStack planA) $ \supOps ->
+        withHostStackSupervisorAdapter factory stubStack $ \supOps ->
           reloadSupervised supOps planA planB
       trace <- readIORef traceRef
 
@@ -273,7 +274,7 @@ appManifestReloadHostStackTests =
             }
           factory = mkStoppedAudioHostStackFactory ops
       outcome <-
-        withHostStackSupervisorAdapter factory (mkStubStack planA) $ \supOps ->
+        withHostStackSupervisorAdapter factory stubStack $ \supOps ->
           reloadSupervised supOps planA planB
       trace <- readIORef traceRef
 
@@ -299,7 +300,7 @@ appManifestReloadHostStackTests =
             }
           factory = mkStoppedAudioHostStackFactory ops
       outcome <-
-        withHostStackSupervisorAdapter factory (mkStubStack planA) $ \supOps ->
+        withHostStackSupervisorAdapter factory stubStack $ \supOps ->
           reloadSupervised supOps planA planB
       trace <- readIORef traceRef
 
@@ -337,7 +338,7 @@ appManifestReloadHostStackTests =
             }
           factory = mkStoppedAudioHostStackFactory ops
       _ <-
-        withHostStackSupervisorAdapter factory (mkStubStack planA) $ \supOps ->
+        withHostStackSupervisorAdapter factory stubStack $ \supOps ->
           reloadSupervised supOps planA planB
       trace <- readIORef traceRef
 
@@ -370,7 +371,7 @@ appManifestReloadHostStackTests =
           fakeOps = StoppedAudioHostStackOps
             { sahsoOpen = \plan -> do
                 recordCall (OpenCalled (MR.mrlpDemoKey plan))
-                pure (Right (mkStubStack plan))
+                pure (Right stubStack)
             , sahsoClose = \_stack -> recordCall CloseCalled
             , sahsoInWindowReload = \_stack plan -> do
                 recordCall (InWindowCalled (MR.mrlpDemoKey plan))
@@ -383,7 +384,7 @@ appManifestReloadHostStackTests =
       workerTid <- forkIO $ do
         result <-
           try
-            (withHostStackSupervisorAdapter factory (mkStubStack planA) $ \supOps ->
+            (withHostStackSupervisorAdapter factory stubStack $ \supOps ->
                 void (reloadSupervised supOps planA planB))
         putMVar workerDone result
 
@@ -413,4 +414,62 @@ appManifestReloadHostStackTests =
       -- No rebuild open ran (recovery path was preempted by the
       -- exception before sopsOpenStack was reached).
       [p | OpenCalled p <- trace] @?= []
+
+  , testCase
+      "A->B->C->D! factory-layer: failure from C falls back to C, never to B or A"
+      $ do
+      -- Re-pins the supervisor's §238 #2 "no remembered history"
+      -- invariant at the production-shaped factory layer. The
+      -- stack value carries no plan field (see the
+      -- 'StoppedAudioHostStack' Haddock); plan ownership is the
+      -- caller's. The caller threads currentPlan -> fallback
+      -- forward on each successful reload. After A->B->C both
+      -- commit, a failed C->D must rebuild from C (the plan
+      -- the caller is tracking as current), not from B (one
+      -- step back) or A (two steps back).
+      --
+      -- If a future refactor reintroduces a stack-level current-
+      -- plan field that lags behind, this test catches the
+      -- regression at the factory layer where it would actually
+      -- surface in production wiring.
+      let planC = mkPlan "third"
+          planD = mkPlan "fourth"
+          inWindowFailsOnD plan
+            | MR.mrlpDemoKey plan == MR.mrlpDemoKey planD =
+                pure (Left (HsariReloadFailedNoOwner (MrhiIngress "d-failed")))
+            | otherwise = pure (Right ())
+
+      traceRef <- newIORef []
+      let ops = mkFakeOps traceRef FakeStackPlan
+            { fspOpenBehavior = openOk
+            , fspInWindowBehavior = inWindowFailsOnD
+            }
+          factory = mkStoppedAudioHostStackFactory ops
+
+      withHostStackSupervisorAdapter factory stubStack $ \supOps -> do
+        -- A -> B commits.
+        outcomeAB <- reloadSupervised supOps planA planB
+        outcomeAB @?= SupervisedReloadCommitted
+
+        -- B -> C commits. The caller threads currentPlan forward;
+        -- the factory accumulates no per-stack history.
+        outcomeBC <- reloadSupervised supOps planB planC
+        outcomeBC @?= SupervisedReloadCommitted
+
+        -- C -> D fails. The caller-supplied fallback is planC.
+        -- Rebuild must target planC.
+        outcomeCD <- reloadSupervised supOps planC planD
+        outcomeCD @?=
+          SupervisedReloadRejectedRecovered
+            (SahsiInWindow
+              (HsariReloadFailedNoOwner (MrhiIngress "d-failed")))
+
+      trace <- readIORef traceRef
+      let openedKeys = [k | OpenCalled k <- trace]
+      -- The only OpenCalled in the whole sequence is from the
+      -- C->D! rebuild, and it must target C — not B (one step
+      -- back) and not A (two steps back).
+      openedKeys @?= [MR.mrlpDemoKey planC]
+      MR.mrlpDemoKey planA `notElem` openedKeys @?= True
+      MR.mrlpDemoKey planB `notElem` openedKeys @?= True
   ]
