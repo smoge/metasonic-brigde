@@ -3562,7 +3562,7 @@ with onException cleanup) plus
 `MetaSonic.App.ManifestReloadSupervisorAdapter` (`HostStackFactory`
 + `withHostStackSupervisorAdapter`, fully async-safe under
 `mask`/`mask_` on every transition). Both halves are
-deterministically tested through 21 fake-IO cases that cover the
+deterministically tested through 22 fake-IO cases that cover the
 full §238 test-checklist including A→B→C→D! no-remembered-history
 and `forkIO`/`throwTo` cleanup-under-exception invariants. What
 remains is the real stopped-audio host wiring — building a
