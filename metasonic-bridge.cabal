@@ -14,6 +14,8 @@ copyright:      2026 Bernardo Barros
 license:        GPL-3.0-only
 license-file:   LICENSE
 build-type:     Simple
+extra-source-files:
+    examples/manifests/preserve-cutoff.json
 
 flag asan
   description: Compile and link the C++ runtime with AddressSanitizer + UBSan.
