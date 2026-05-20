@@ -476,9 +476,11 @@ through the supervised lifecycle (factory + adapter +
 `reloadSupervised` + `realStoppedAudioHostStackOps`), the same
 machinery the `--manifest-host-reload-smoke` CLI uses. The
 supervised route is hardware-confirmed once (transcript
-below). Preserving and `try-preserving` remain on the direct
-`reloadManifestHostWithStrategy` path; their migration is its
-own slice and opens against the evidence bar in
+below). `try-preserving` is now also supervised via a sibling
+factory; see the next section. `require-preserving` remains
+on the direct `reloadManifestHostWithStrategy` path; its
+migration is its own slice and opens against the evidence bar
+in
 [2026-05-20-a-supervised-route-tier3-decision.md](2026-05-20-a-supervised-route-tier3-decision.md).
 
 The routing decision is exposed as a pure
@@ -486,8 +488,10 @@ The routing decision is exposed as a pure
 LiveReloadRoute` selector in
 [`MetaSonic.App.ManifestLiveReloadDemo`](../app/MetaSonic/App/ManifestLiveReloadDemo.hs)
 and pinned by three deterministic test cases in
-`MetaSonic.Spec.AppManifestLiveReloadDemoRender`. Those tests
-verify the routing decision /without/ staging real audio. The
+`MetaSonic.Spec.AppManifestLiveReloadDemoRender`. Three
+additional rendering tests pin the per-flavor `route:` strings
+the tier-2 smoke wrappers grep on. Those tests verify the
+routing and rendering /without/ staging real audio. The
 audible behavior below stays manual.
 
 ### Manual run command
@@ -710,3 +714,83 @@ deterministic route tests plus a minimum of two marker-clean
 tier-2 runs attached to the PR (two different hosts / audio
 backends preferred when available). The reopen triggers for
 tier 3 are listed in that note.
+
+## Supervised `TryPreservingThenStoppedAudio` live-reload demo (slice 5)
+
+`--manifest-live-reload-demo try-preserving` now routes
+through the supervised lifecycle with a sibling factory:
+`realTryPreservingHostStackOps` composes
+`realPreservingInWindowReload` with
+`realStoppedAudioInWindowReload` under the existing
+`preservingAllowsStoppedAudioFallback` gate, and the
+supervisor sees one classified in-window slot covering all
+three `InWindowReloadOutcome` variants. The route flip landed
+2026-05-20 alongside the two marker-clean tier-2 runs
+recorded below.
+
+Routing tests at
+`MetaSonic.Spec.AppManifestLiveReloadDemoRender` pin
+`selectLiveReloadRoute TryPreservingThenStoppedAudio` to
+`LiveReloadSupervised SfTryPreserving` and pin
+`renderLiveReloadRoute` for that flavor to
+`supervised (try-preserving; reloadSupervised +
+HostStackFactory)` — the tier-2 wrapper's marker-1 grep
+depends on this exact string.
+
+### Wrapper
+
+`tools/manifest_supervised_try_preserving_live_smoke.sh`,
+exposed as `just manifest-supervised-try-preserving-live-smoke`.
+Parallel to the stopped-audio wrapper but distinct in three
+ways:
+
+* **Default port** is 17002 (vs 17001 for stopped-audio), so
+  the two smokes can run in sequence without colliding and a
+  stuck post-exit state on one port does not affect the
+  other.
+* **Artifact names** are
+  `manifest-supervised-try-preserving-live-{transcript,probe}.txt`
+  (vs the stopped-audio names), avoiding stale transcript
+  confusion when both smokes run on the same workstation.
+* **Marker checks 4b/4c** look for `preserving phase started`
+  and `preserving phase committed` (the event renderings for
+  `MrePreservingReloadStarted` / `MrePreservingReloadCommitted`)
+  instead of the stopped-audio-phase markers. On the blessed
+  preserve-cutoff fixture, preserving commits without
+  fallback so no `MreStoppedAudioReload*` events fire.
+
+Marker 1 looks for the specific try-preserving route string
+above; the rest (audio + ingress + OSC accept + post-reload +
+exit + ss + active bind probe) are identical to the
+stopped-audio wrapper.
+
+### Tier-2 evidence record (2026-05-20)
+
+Two marker-clean runs of
+`just manifest-supervised-try-preserving-live-smoke` on host
+RME ADI-2 Pro / PipeWire, plus one no-regression confirmation
+run of `just manifest-supervised-live-smoke` on the same host.
+Transcripts + probe logs captured locally for the PR record
+(not committed because the per-run timestamps differ
+trivially):
+
+* `try-preserving-run-1-transcript.txt` /
+  `try-preserving-run-1-probe.txt` — 12/12 markers passed.
+  Confirms one observation of the new route under
+  marker-clean conditions.
+* `try-preserving-run-2-transcript.txt` /
+  `try-preserving-run-2-probe.txt` — 12/12 markers passed.
+  Second observation, per the tier-3 decision note's "minimum
+  two runs to count as evidence" rule.
+* `stopped-audio-confirmation-transcript.txt` /
+  `stopped-audio-confirmation-probe.txt` — 12/12 markers
+  passed on the stopped-audio wrapper, confirming the
+  shared-helper rename (`runSupervisedLiveReload` →
+  `runSupervisedStoppedAudioLiveReload`) and the
+  route-rendering change did not regress the stopped-audio
+  path's acceptance markers.
+
+Both routes share the same supervisor + adapter machinery, so
+a regression in either would propagate; running both wrappers
+in sequence is the operator gate before promoting any
+shared-machinery change.

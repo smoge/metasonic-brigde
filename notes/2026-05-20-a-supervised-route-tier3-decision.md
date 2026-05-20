@@ -17,6 +17,29 @@ try-preserving supervisor-migration slices.
 Tier 3 (hardware-backed CI) is **deferred**, not rejected.
 The reopen triggers are listed below.
 
+### Update 2026-05-20: try-preserving migration landed against this bar
+
+`TryPreservingThenStoppedAudio` migrated onto the supervised
+stack via `realTryPreservingHostStackOps` (composes preserving
++ stopped-audio fallback under the existing
+`preservingAllowsStoppedAudioFallback` gate). The evidence bar
+was met by:
+
+* `just check-offline` green at suite 1261 (deterministic
+  route + classifier + composition tests including the pure
+  `decideTryPreservingNext` / `composeFallbackOutcome` /
+  `fallbackEventForDecision` tables);
+* two marker-clean runs of the new
+  `just manifest-supervised-try-preserving-live-smoke` wrapper
+  on host RME ADI-2 Pro / PipeWire (run 1: 12/12; run 2: 12/12);
+* one no-regression confirmation run of
+  `just manifest-supervised-live-smoke` on the same host
+  (12/12), covering the shared-helper rename and the route
+  rendering change.
+
+`RequirePreserving` remains on the direct path. Its migration
+is its own slice and would land against the same bar.
+
 ## What this means in practice
 
 For each new route migrated onto the supervisor:

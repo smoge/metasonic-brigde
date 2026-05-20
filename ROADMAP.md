@@ -3821,27 +3821,38 @@ Still gated:
   host supervisor / recovery policy contract (design now
   realized as `MetaSonic.App.ManifestReloadSupervisor` +
   `MetaSonic.App.ManifestReloadSupervisorAdapter` +
-  `MetaSonic.App.ManifestReloadHostStack`; real-host
-  `StoppedAudioHostStackOps` and the supervised
-  `StoppedAudioOnly` CLI route are landed and
-  hardware-confirmed once on 2026-05-20. Evidence is now
-  classified into three tiers (see the "Evidence policy"
-  subsection at the bottom of
+  `MetaSonic.App.ManifestReloadHostStack` +
+  `MetaSonic.App.ManifestReloadPreservingHostStack` +
+  `MetaSonic.App.ManifestReloadTryPreservingHostStack`; two
+  supervised audible routes are landed and tier-2 confirmed:
+  `StoppedAudioOnly` (hardware-confirmed 2026-05-20 plus
+  follow-up no-regression run after the route-rendering flip)
+  and `TryPreservingThenStoppedAudio` (two marker-clean tier-2
+  runs of the new `just manifest-supervised-try-preserving-live-smoke`
+  wrapper on host RME ADI-2 Pro / PipeWire 2026-05-20). The
+  classified `InWindowReloadOutcome` and the four-variant
+  `SupervisedReloadOutcome` (Committed / RequestRejected /
+  RejectedRecovered / Escalated) underpin both routes through
+  one supervisor primitive. Evidence is classified into three
+  tiers (see the "Evidence policy" subsection at the bottom of
   [notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)):
   tier 1 is the default deterministic offline suite covered
   by `just check-offline`; tier 2 is the opt-in local live
-  smoke at `just manifest-supervised-live-smoke` (wrapper at
-  `tools/manifest_supervised_live_smoke.sh`, NOT a member of
-  `check-offline`, exits 0 only if all 12 acceptance markers
-  observed); tier 3 (hardware-backed CI) is **deferred, not
-  rejected** by
+  smokes at `just manifest-supervised-live-smoke` /
+  `just manifest-supervised-try-preserving-live-smoke`
+  (wrappers at `tools/manifest_supervised_live_smoke.sh` and
+  `tools/manifest_supervised_try_preserving_live_smoke.sh`,
+  NOT members of `check-offline`, exit 0 only if all 12
+  acceptance markers observed); tier 3 (hardware-backed CI)
+  is **deferred, not rejected** by
   [notes/2026-05-20-a-supervised-route-tier3-decision.md](notes/2026-05-20-a-supervised-route-tier3-decision.md).
-  The preserving / try-preserving fallback migration opens
-  against that note's bar: deterministic route tests plus a
-  minimum of two marker-clean tier-2 runs attached to the PR
-  (two different hosts / audio backends preferred when
-  available). The note also lists the reopen triggers that
-  would put tier 3 back on the slate), and the
+  `RequirePreserving` stays on the direct path; its migration
+  would open against the same bar as the two landed slices
+  did: deterministic route tests plus a minimum of two
+  marker-clean tier-2 runs (different hosts / audio backends
+  preferred when available). The decision note also lists
+  the reopen triggers that would put tier 3 back on the
+  slate), and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a
