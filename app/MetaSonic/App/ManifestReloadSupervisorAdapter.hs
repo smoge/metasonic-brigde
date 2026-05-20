@@ -84,19 +84,32 @@ data HostStackFactory plan stack e = HostStackFactory
 -- already-open initial stack.
 --
 -- The adapter owns an @IORef (Maybe stack)@ tracking the active
--- stack. The transitions are:
+-- stack. The transitions are keyed off the classified
+-- 'InWindowReloadOutcome' returned by @hsfInWindowReload@:
 --
--- - successful in-window: ref unchanged; the same stack value now
---   runs the new plan (per the @hsfInWindowReload@ contract);
--- - failed in-window (returned @Left e@): the supervisor calls
+-- - 'InWindowReloadCommitted': ref unchanged; the same stack value
+--   now runs the new plan (per the @hsfInWindowReload@ contract);
+-- - 'InWindowReloadRejectedLiveFallback': ref unchanged; the
+--   producer guarantees the old owner / ingress is still
+--   installed and the stack is safely running the fallback plan,
+--   so the supervisor short-circuits without invoking
+--   'sopsCloseStack' or 'sopsOpenStack'. The supervised call
+--   returns 'SupervisedReloadRequestRejected' with the cause;
+-- - 'InWindowReloadTerminal': the supervisor calls
 --   'sopsCloseStack' (which empties the ref via 'hsfCloseStack')
 --   and then 'sopsOpenStack' on the fallback plan (which refills
---   the ref via 'hsfOpenStack');
+--   the ref via 'hsfOpenStack'). This is the recovery path that
+--   used to be unconditional for any @Left e@ before the
+--   classified contract landed;
 -- - exception thrown by 'sopsInWindowReload': the supervisor's
 --   'Control.Exception.onException' wrapper invokes
 --   'sopsCloseStack' before propagation; the adapter's
 --   'sopsCloseStack' is idempotent on a 'Nothing' ref so the
 --   continuation-finally cleanup below does not double-close.
+--   Note that an exception is NOT the same as
+--   'InWindowReloadTerminal': it propagates without attempting
+--   the rebuild, while 'Terminal' drives close-then-open under
+--   the supervisor's own sequencing.
 --
 -- The continuation runs inside a 'finally' that closes whichever
 -- stack is still in the ref at the end. This catches the case

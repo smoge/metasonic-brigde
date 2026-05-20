@@ -16,13 +16,25 @@ recovery policy when an in-window operation fails terminally.
 
 ## Implemented status
 
-Landed across six final-effective commits in the §219 ordering,
-all under deterministic fake-IO test coverage (no PortAudio, no
-real listeners, no live audio host). The table is the
-final-effective shape — one row per landed change — so a
+Landed across the final-effective commits below in the §219
+ordering, all under deterministic fake-IO test coverage (no
+PortAudio, no real listeners, no live audio host). The table
+is the final-effective shape — one row per landed change — so a
 superseded intermediate commit (`2c89a0b`, the original
 A→B→C regression test that was over-claiming coverage) does not
 appear here; the corrected form lives in row 3 (`7b8a2c6`).
+
+Rows 1–7 below describe the supervisor / adapter / host-stack
+contract under the original @Either e ()@ in-window shape that
+shipped through the StoppedAudioOnly hardware confirmation. Row 8
+(`487fd5c`) generalizes that shape into a classified
+'InWindowReloadOutcome' for the preserving / try-preserving
+migration: the supervisor now recognizes a third
+"request-rejected, stack still serving fallback" outcome distinct
+from a terminal failure. References to @Left e@ inside rows 1–2
+are historical and remain accurate as commit records — they are
+not the current contract any new producer should implement
+against.
 
 | # | Commit | Slice content |
 |---|--------|---------------|
@@ -33,15 +45,19 @@ appear here; the corrected form lives in row 3 (`7b8a2c6`).
 | 5 | `5616d9a` | Async-exception windows in the adapter halves: `openOps` now `mask $ \restore -> ...` so the "Right newStack → writeIORef" publication is uninterruptible; `closeActiveStack` now `mask_` so the "atomicModifyIORef → hsfCloseStack" handoff is atomic. Three new tests: two `getMaskingState` observations + one `forkIO`/`throwTo` injection test asserting no minted stack id is left without a matching close on the recovery path. |
 | 6 | `d990c33` | Outer setup-window mask: `withHostStackSupervisorAdapter factory initialStack k = mask $ \restore -> do ... ; restore (k supOps) `finally` closeOps`. Closes the §103 window between `newIORef (Just initialStack)` and the `finally` install where an async exception would have leaked the already-open initialStack. New test pins that `restore` correctly hands the caller's masking state to the continuation. |
 | 7 | `514812c` | §219 slice 4 (partial): production `HostStackFactory` shape for the stopped-audio path. New module `MetaSonic.App.ManifestReloadHostStack`: `StoppedAudioHostStack` newtype around `ManifestReloadHostConfig` (no stack-level plan field — caller owns currentPlan externally), `StoppedAudioHostStackOps` with injectable open / close / in-window-reload slots, `StoppedAudioHostStackOpenIssue` (service / audio / ingress causes), unified `StoppedAudioHostStackIssue` sum, `realStoppedAudioInWindowReload` driving `orchestrateHostStoppedAudioReloadWithEvents` with `hsaroPreparePlan = const (pure (Right plan))` so the supervisor's supplied plan is the source of truth at the seam, `mkStoppedAudioHostStackFactory` smart constructor. 8 fake-IO test cases (the 7 named in §219 slice 4 plus an A→B→C→D! factory-layer regression). Supersedes intermediate `e0e4fb7` whose `sahsInstalledPlan` field would have silently drifted across successful in-window reloads, and whose `realStoppedAudioInWindowReload` re-derived plans via `preparePlan` rather than installing the supervisor's plan directly. |
+| 8 | `487fd5c` | §219 slice 5 step 1 (preserving migration prep): classify the in-window outcome. New type `InWindowReloadOutcome e = InWindowReloadCommitted \| InWindowReloadRejectedLiveFallback e \| InWindowReloadTerminal e` replaces the `Either e ()` return on `SupervisorOps.sopsInWindowReload`, `HostStackFactory.hsfInWindowReload`, and `StoppedAudioHostStackOps.sahsoInWindowReload`. `SupervisedReloadOutcome` gains `SupervisedReloadRequestRejected e` — the new short-circuit branch where the supervisor returns without invoking `sopsCloseStack` / `sopsOpenStack` because the stack is still serving the fallback plan. `reloadSupervised` body becomes a three-way case; the `onException sopsCloseStack` wrap is unchanged (synchronous exceptions are still terminal, distinct from `InWindowReloadTerminal` which drives the close-then-rebuild path under the supervisor's own sequencing). A `Functor` instance + `inWindowOutcomeFromEither` shim lifts the stopped-audio orchestrator's `Either` result into the new shape — by construction stopped-audio cannot produce `RejectedLiveFallback` (audio stops before reinstall, so there is no "old owner still installed" branch); preserving / try-preserving producers must classify their failures manually. Two new pinning tests (supervisor + adapter "in-window rejected-live-fallback returns RequestRejected and skips close/open"). Suite goes to 1218 cases. No live behavior change for the stopped-audio route; the classified shape opens the door for the row 9 preserving-aware producer. |
 
-Test count: the supervisor lane contributes 12 cases in
+Test count: the supervisor lane contributes 13 cases in
 `MetaSonic.Spec.AppManifestReloadSupervisor` (nine pre-session
 baseline + A→B→C→D! regression + the exception/no-double-fire
-pair), 10 cases in
+pair + row 8's "in-window rejected-live-fallback returns
+RequestRejected and skips close/open"), 11 cases in
 `MetaSonic.Spec.AppManifestReloadSupervisorAdapter` (six
 structural + two `getMaskingState` + one throwTo injection +
-one outer-restore passthrough), 8 cases of factory composition
-in `MetaSonic.Spec.AppManifestReloadHostStack` (success + three
+one outer-restore passthrough + row 8's "in-window
+rejected-live-fallback keeps the same stack: no close, no
+reopen"), 8 cases of factory composition in
+`MetaSonic.Spec.AppManifestReloadHostStack` (success + three
 named in-window failure-recovery shapes + rebuild escalation +
 no-overlapping-stacks transition invariant + async cleanup +
 A→B→C→D! factory-layer regression), 6 cases of
@@ -53,9 +69,10 @@ rollback still runs service close, audio-stop-throws-during-
 realClose still runs ingress + service close — the last two
 pin the §7d3da25 exception-safety fix), and 1 case for
 `realStoppedAudioInWindowReload`'s plan-native short-circuit.
-37 lane cases in total. All three modules are wired into
+39 lane cases in total. All three modules are wired into
 `test/Spec.hs` and the package.yaml test-component
-`other-modules`. Total suite at this lane's close: 1209 cases.
+`other-modules`. Total suite at this lane's last update
+(`487fd5c`): 1218 cases.
 
 §238 test-checklist coverage: 11/11 — all 9 originally listed
 plus the two additions explicitly named by the design ("A→B→C
@@ -358,7 +375,17 @@ The session layer remains unaware of the supervisor. `SessionFanInHost`
 does not know whether a supervisor is wrapping it; it just exposes its
 terminal `ReloadFailed` state for the supervisor to observe.
 
-## Sketched API Shape (not committed)
+## Sketched API Shape (not committed; superseded by the landed contract)
+
+> **Forward note.** The sketch below is the pre-implementation
+> proposal from 2026-05-14. The landed contract diverged on the
+> result shape: there is no outer `Either SupervisedReloadFailure
+> SupervisedReloadOutcome` wrapper, and after row 8 (`487fd5c`)
+> the outcome surface is the four-variant
+> `SupervisedReloadOutcome e = Committed | RequestRejected e |
+> RejectedRecovered e | Escalated e e` plus the classified
+> `InWindowReloadOutcome e` driving it. Read the sketch as
+> design history, not as the current API.
 
 ```haskell
 data SupervisedSession
