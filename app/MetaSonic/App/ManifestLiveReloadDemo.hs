@@ -156,12 +156,15 @@ import           MetaSonic.Session.State        (SessionState (..))
 --
 -- 'StoppedAudioOnly' now goes through the supervised stack
 -- (factory + adapter + 'reloadSupervised'), the same lifecycle
--- the @--manifest-host-reload-smoke@ CLI smoke uses. Preserving
--- and 'TryPreservingThenStoppedAudio' stay on the existing
--- direct path until the supervised stopped-audio route has
--- accumulated hardware exercise. Selection is pure so it can
--- be exercised by deterministic tests without staging real
--- audio.
+-- the @--manifest-host-reload-smoke@ CLI smoke uses. The
+-- supervised route is hardware-confirmed once (2026-05-20 run
+-- recorded in the runbook). Preserving and
+-- 'TryPreservingThenStoppedAudio' stay on the existing direct
+-- path; migrating them is its own slice, gated on further
+-- supervised-route hardware exposure and the CI-gating
+-- decision for the supervised path. Selection is pure so it
+-- can be exercised by deterministic tests without staging
+-- real audio.
 data LiveReloadRoute
   = LiveReloadDirect
     -- ^ Drive 'reloadManifestHostWithStrategyWithEvents'

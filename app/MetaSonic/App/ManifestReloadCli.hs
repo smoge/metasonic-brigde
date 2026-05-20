@@ -465,9 +465,12 @@ runManifestHostStrategyReloadSmokeWithListenerConfig
     listenerCfg strategy doc catalog demo = case strategy of
   StoppedAudioOnly ->
     -- §219 slice 4 routing: StoppedAudioOnly goes through the
-    -- supervisor + factory now. Preserving and
+    -- supervisor + factory now (hardware-confirmed once on
+    -- 2026-05-20; see the runbook). Preserving and
     -- TryPreservingThenStoppedAudio stay on the direct path
-    -- below until the supervised stopped-audio path is stable.
+    -- below; their migration is its own slice, deferred until
+    -- further supervised-route hardware exposure plus the
+    -- CI-gating decision for that path.
     fmap renderManifestSupervisedStoppedAudioReloadSmoke
       <$> runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
             listenerCfg

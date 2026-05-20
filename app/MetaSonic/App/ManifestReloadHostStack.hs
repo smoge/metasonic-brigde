@@ -12,13 +12,17 @@
 -- prerequisite the supervisor design note named: defining what a
 -- "closeable / reopenable host stack" is for the stopped-audio
 -- path. Routing landed in commits @93e755c@ (CLI smoke) and
--- @905edd5@ (audible @--manifest-live-reload-demo@): the
--- @StoppedAudioOnly@ strategy now dispatches through this
--- factory + 'reloadSupervised' in both operator-facing
--- entrypoints; @RequirePreserving@ and
+-- @905edd5@ (audible @--manifest-live-reload-demo@), and was
+-- hardware-confirmed once on 2026-05-20 (full transcript in
+-- the runbook at @notes/2026-05-19-b-manifest-host-reload-
+-- smoke-runbook.md@). The @StoppedAudioOnly@ strategy now
+-- dispatches through this factory + 'reloadSupervised' in
+-- both operator-facing entrypoints. @RequirePreserving@ and
 -- @TryPreservingThenStoppedAudio@ stay on the direct
--- 'reloadManifestHostWithStrategy' path until the supervised
--- stopped-audio route accumulates hardware exercise.
+-- 'reloadManifestHostWithStrategy' path; migrating them is
+-- its own slice, gated on further supervised-route hardware
+-- exposure and the CI-gating decision for the supervised
+-- path.
 --
 -- The 'StoppedAudioHostStack' newtype wraps the per-active
 -- 'ManifestReloadHostConfig'; plan ownership stays at the

@@ -449,11 +449,17 @@ remaining open polish in this arc) is a separate question.
   [ManifestReloadEvent Partial Coverage](2026-05-19-a-manifest-reload-event-partial-coverage.md)
   for the open work.
 - The `--manifest-live-reload-demo` CLI's audio + interaction
-  surface beyond the cross-confirmation above. The demo's own
-  pre- / post-reload service snapshots, OSC accept log, and prompt
-  flow live in its source; this runbook captures only the
-  shared-vocabulary slice (strategy outcome + reload events +
-  ingress snapshot).
+  surface for the preserving strategies (`require-preserving` /
+  `try-preserving`). The demo's own pre- / post-reload service
+  snapshots, OSC accept log, and prompt flow live in its
+  source; for the preserving paths this runbook captures only
+  the shared-vocabulary slice (strategy outcome + reload events
+  + ingress snapshot). The supervised stopped-audio path IS
+  recorded end-to-end (snapshots + OSC accept log + prompt
+  flow) in the "Supervised `StoppedAudioOnly` live-reload
+  demo (slice 2)" section below; that's the route under active
+  validation. Preserving will move under the same coverage
+  shape only once the migration slice opens.
 - Fixtures for non-preserving smoke targets. The preserving live-
   reload path has a committed fixture at
   [examples/manifests/preserve-cutoff.json](../examples/manifests/preserve-cutoff.json),
@@ -468,10 +474,13 @@ remaining open polish in this arc) is a separate question.
 `--manifest-live-reload-demo stopped-audio-only` now routes
 through the supervised lifecycle (factory + adapter +
 `reloadSupervised` + `realStoppedAudioHostStackOps`), the same
-machinery the `--manifest-host-reload-smoke` CLI uses. Preserving
-and `try-preserving` remain on the direct
-`reloadManifestHostWithStrategy` path until the supervised
-stopped-audio route accumulates hardware exercise.
+machinery the `--manifest-host-reload-smoke` CLI uses. The
+supervised route is hardware-confirmed once (transcript
+below). Preserving and `try-preserving` remain on the direct
+`reloadManifestHostWithStrategy` path; their migration is its
+own slice and is deferred until further supervised-route
+hardware exposure plus the CI-gating decision for the
+supervised path.
 
 The routing decision is exposed as a pure
 `selectLiveReloadRoute :: ManifestReloadHostStrategy ->
@@ -610,7 +619,7 @@ Acceptance checklist against the transcript above:
 | 3 | Pre-reload OSC accept | `osc accept: CmdControlWrite voice=v0 ... value=0.75` |
 | 4 | Stopped-audio phase ran under the supervisor | `supervised outcome: committed (new plan installed)` + `stopped-audio phase started` / `stopped-audio phase committed` reload events |
 | 5 | Post-reload ingress targets the new demo | `OSC ingress: open demo=preserve-cutoff-bright ... oscPort=17001`, then `osc accept: CmdControlWrite voice=v0 ... value=0.25` against the new surface |
-| 6 | Cleanup releases resources | demo exited 0; a follow-up `oscsend localhost 17001 ...` invocation (rebinding port 17001) succeeded without `EADDRINUSE`, proving the listener released the socket |
+| 6 | Cleanup releases resources | demo exited 0; `ss -lun` showed no UDP listener on port 17001; an active bind probe from a fresh Python process (`socket.socket(AF_INET, SOCK_DGRAM).bind(('localhost', 17001))`) succeeded, proving the listener really released the socket. (An `oscsend` send does NOT prove this — UDP datagrams to an unbound port still succeed at the network layer; the OS just drops them. The active bind is the load-bearing probe here.) |
 
 With this run on record, the §219 slice-4 routing has
 transitioned from "needs hardware exercise" to

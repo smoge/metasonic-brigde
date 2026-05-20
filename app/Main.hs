@@ -214,12 +214,14 @@ data RunMode
     -- splits on STRATEGY: stopped-audio-only routes through the
     -- supervised stack (reloadSupervised + HostStackFactory +
     -- realStoppedAudioHostStackOps) so a terminal in-window failure
-    -- triggers a rebuild from the captured fallback plan;
+    -- triggers a rebuild from the captured fallback plan
+    -- (hardware-confirmed on 2026-05-20; see the runbook).
     -- require-preserving and try-preserving stay on the direct
-    -- reloadManifestHostWithStrategy path until the supervised
-    -- stopped-audio route has accumulated hardware exercise. The
-    -- runtime preamble prints a "route:" line so the operator can
-    -- see which path was selected. This whole command is opt-in;
+    -- reloadManifestHostWithStrategy path; migrating them is its
+    -- own slice and is deferred until further hardware exposure
+    -- + a CI-gating decision on the supervised path. The runtime
+    -- preamble prints a "route:" line so the operator can see
+    -- which path was selected. This whole command is opt-in;
     -- the normal demo path is unchanged.
   deriving (Eq, Show)
 
