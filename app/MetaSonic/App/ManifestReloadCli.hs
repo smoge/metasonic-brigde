@@ -233,11 +233,15 @@ data ManifestHostStrategyReloadSmokeResult =
 -- 'runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig'
 -- below instead of calling the library entry
 -- 'runSupervisedStoppedAudioReload' so it can read the
--- pre-reload ingress snapshot off the initial stack (between
--- 'hsfOpenStack' and 'withHostStackSupervisorAdapter') and
--- carry it through the result. The two paths use the same
--- factory + adapter + supervisor primitives and share the same
--- 'mask' + 'restore' exception-safety shape.
+-- pre-reload ingress snapshot off the original initial stack
+-- /inside the adapter callback/ — between the adapter installing
+-- its bracket and 'reloadSupervised' running, so the snapshot
+-- read is covered by the adapter's @finally closeOps@. The
+-- closed-over 'initialStack' value is the same one the adapter
+-- is holding in its IORef pre-reload; reading its ingress
+-- manager there reflects the still-bound listener. The two
+-- paths use the same factory + adapter + supervisor primitives
+-- and share the same 'mask' + 'restore' exception-safety shape.
 --
 -- The narrow 'SupervisedStoppedAudioReloadResult' preserves the
 -- supervisor's rebuild causes through the outcome rather than
@@ -259,10 +263,11 @@ data ManifestSupervisedStoppedAudioReloadSmokeResult =
         :: !(ManifestReloadIngressSnapshot
               ManifestReloadIngressTarget
               ManifestOSCIngressHandle)
-      -- ^ Pre-reload ingress snapshot read from the initial
-      -- stack before the supervisor adapter took ownership. Lets
-      -- the renderer report the bound OSC port without exposing
-      -- the active stack through the adapter contract.
+      -- ^ Pre-reload ingress snapshot read from the original
+      -- initial stack inside the adapter callback, before
+      -- 'reloadSupervised' runs. Lets the renderer report the
+      -- bound OSC port without exposing the active stack
+      -- through the adapter contract.
     , mssarsAudioEvents       :: ![ManifestHostStrategySmokeAudioEvent]
     , mssarsReloadEvents      :: ![ManifestReloadEvent
                                     (ManifestReloadHostIssue
@@ -650,8 +655,9 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
 -- for the @StoppedAudioOnly@ strategy. Opens the initial stack
 -- via 'realStoppedAudioHostStackOps' against the initial entry's
 -- plan (the supervisor's @fallback@), reads the pre-reload
--- ingress snapshot off the live stack before the adapter takes
--- ownership (so the renderer can still report @oscPort=N@), runs
+-- ingress snapshot off the original initial stack inside the
+-- adapter callback before 'reloadSupervised' runs (so the
+-- renderer can still report @oscPort=N@), runs
 -- 'reloadSupervised' against @(fallback, requested)@, and lets
 -- the adapter close whichever stack is active on exit.
 runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
@@ -1129,8 +1135,9 @@ renderManifestHostStrategyReloadSmoke smoke =
 -- the active stack to the supervised callback by design, so the
 -- post-reload SessionFanInService snapshot is not reachable
 -- without breaking the encapsulation. The pre-reload ingress
--- snapshot IS read (off the initial stack before the adapter
--- takes ownership) and rendered, so @oscPort=N@ stays visible
+-- snapshot IS read (off the original initial stack inside the
+-- adapter callback, before reload/rebuild) and rendered, so
+-- @oscPort=N@ stays visible
 -- for tests that pin the real-UDP-bind path.
 renderManifestSupervisedStoppedAudioReloadSmoke
   :: ManifestSupervisedStoppedAudioReloadSmokeResult

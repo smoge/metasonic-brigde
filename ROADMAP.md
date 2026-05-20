@@ -3568,7 +3568,9 @@ and `forkIO`/`throwTo` cleanup-under-exception invariants. The
 production `HostStackFactory ManifestReloadPlan ...` shape has
 landed in `MetaSonic.App.ManifestReloadHostStack` together with
 both the open/close half and the in-window half against the
-live session-layer primitives (opt-in, not yet routed):
+live session-layer primitives, and the `StoppedAudioOnly` CLI
+strategy now dispatches through it (see the routing summary
+below):
 `StoppedAudioHostStack` newtype around `ManifestReloadHostConfig`,
 injectable `StoppedAudioHostStackOps` for open / close /
 in-window-reload, the plan-native + target-fresh
@@ -3596,13 +3598,16 @@ factory composition, six production-helper partial-cleanup paths
 audio-stop-throws-during-realClose), and one direct integration
 test for `realStoppedAudioInWindowReload`'s plan-native
 short-circuit.
-Routing landed in commit `93e755c`: the `StoppedAudioOnly` CLI
-strategy now dispatches through
+Routing landed in commit `93e755c`, and the open-to-adapter
+handoff was made async-safe in commit `ff9c412`: the
+`StoppedAudioOnly` CLI strategy now dispatches through
 `runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig`,
 which inlines the same supervised lifecycle that the library
 `runSupervisedStoppedAudioReload` exposes (the CLI inlines so
-it can read the pre-reload ingress snapshot off the initial
-stack before the adapter takes ownership). The narrow
+it can read the pre-reload ingress snapshot off the original
+initial stack /inside the adapter callback/ before
+`reloadSupervised` runs — the read is covered by the adapter's
+`finally closeOps`). The narrow
 `SupervisedStoppedAudioReloadResult` (committed / recovered /
 escalated, parameterized over `StoppedAudioHostStackIssue`)
 preserves the supervisor's rebuild causes through the result

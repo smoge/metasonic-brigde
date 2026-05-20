@@ -126,18 +126,20 @@ half against the live session-layer primitives:
   short-circuit (asserts no `MrhiPlanning` when running
   against empty doc / catalog).
 
-Slice 4 closed with commit `93e755c`: the `StoppedAudioOnly`
-CLI strategy now dispatches through
+Slice 4 closed with commit `93e755c` (routing) and `ff9c412`
+(handoff hardening + partial-cleanup preservation): the
+`StoppedAudioOnly` CLI strategy now dispatches through
 `runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig`,
 which inlines the same supervised lifecycle that
 `MetaSonic.App.ManifestReloadHostStack.runSupervisedStoppedAudioReload`
 exposes at the library layer (the CLI inlines so it can read
-the pre-reload ingress snapshot off the initial stack before
-the adapter takes ownership). Preserving and
-`TryPreservingThenStoppedAudio` fallback still go through
-the direct `reloadManifestHostWithStrategy` path; they will
-move only after the supervised stopped-audio route gets
-hardware exercise.
+the pre-reload ingress snapshot off the original initial stack
+/inside the adapter callback/ before `reloadSupervised` runs —
+the read is covered by the adapter's `finally closeOps`).
+Preserving and `TryPreservingThenStoppedAudio` fallback still
+go through the direct `reloadManifestHostWithStrategy` path;
+they will move only after the supervised stopped-audio route
+gets hardware exercise.
 
 The error surface uses a narrow
 `SupervisedStoppedAudioReloadResult` (committed / recovered /
