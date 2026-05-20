@@ -63,7 +63,8 @@ import           MetaSonic.App.ManifestReloadHostStack
                                           StoppedAudioHostStackOpenIssue (..),
                                           StoppedAudioHostStackOps (..),
                                           mkStoppedAudioHostStackFactory,
-                                          realStoppedAudioHostStackOps)
+                                          realStoppedAudioHostStackOps,
+                                          realStoppedAudioInWindowReload)
 import           MetaSonic.App.ManifestReloadIngress
                                          (ManifestReloadIngressOps (..))
 import           MetaSonic.App.ManifestReloadIngressTarget
@@ -216,6 +217,7 @@ appManifestReloadHostStackTests =
   testGroup "App manifest reload host stack"
   [ factoryCompositionTests
   , realProductionHelperTests
+  , realInWindowReloadTests
   ]
 
 
@@ -723,3 +725,55 @@ fakeAudioFFIStartFails = SessionFanInAudioFFI
   , saffiWaitAudioStarted = \_rt _to     -> pure True
   , saffiStopAudio        = \_rt         -> pure ()
   }
+
+
+-- | Direct integration test for 'realStoppedAudioInWindowReload'.
+--
+-- The helper drives 'orchestrateHostStoppedAudioReloadWithEvents'
+-- with @hsaroPreparePlan = const (pure (Right plan))@, and passes
+-- intentionally empty doc + empty catalog through
+-- 'manifestReloadHostOps'. If the override is ever removed (or
+-- accidentally bypassed in a refactor), the default 'preparePlan'
+-- would consult the empty doc / catalog and fail with
+-- 'MrhiPlanning' because no demo matches the request's
+-- 'mrlpDemoKey'. A successful reload against a non-default plan
+-- therefore proves the plan-native short-circuit is in effect.
+realInWindowReloadTests :: TestTree
+realInWindowReloadTests =
+  testGroup "realStoppedAudioInWindowReload plan-native short-circuit"
+  [ testCase
+      "supplied plan is installed despite empty doc/catalog (no MrhiPlanning)"
+      $ do
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsOpenOk ingressCloseCalls)
+            fakeAudioFFIStartOk
+          ops = realStoppedAudioHostStackOps inputs
+      openResult <- sahsoOpen ops (mkPlan "initial")
+      case openResult of
+        Left issue ->
+          assertFailure ("open failed: " <> show issue)
+        Right stack -> do
+          -- The "after-reload" plan's demo key is distinct from
+          -- "initial" so any code path that re-derived a plan
+          -- from doc/catalog (which is empty) would fail to find
+          -- a matching demo and surface MrhiPlanning.
+          let newPlan = mkPlan "after-reload"
+          reloadResult <- realStoppedAudioInWindowReload stack newPlan
+          sahsoClose ops stack
+          case reloadResult of
+            Right () ->
+              -- Successful reload proves the override took effect:
+              -- with empty doc/catalog and no override, planning
+              -- would have failed before this point.
+              pure ()
+            Left (HsariReloadFailedNoOwner (MrhiPlanning _)) ->
+              assertFailure
+                "realStoppedAudioInWindowReload re-derived plan \
+                \from doc/catalog (observed MrhiPlanning); the \
+                \plan-native override is broken or bypassed"
+            Left other ->
+              assertFailure
+                ("expected Right (), got an unrelated downstream Left: "
+                  <> show other)
+  ]
