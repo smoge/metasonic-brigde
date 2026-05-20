@@ -3564,12 +3564,29 @@ with onException cleanup) plus
 `mask`/`mask_` on every transition). Both halves are
 deterministically tested through 22 fake-IO cases that cover the
 full §238 test-checklist including A→B→C→D! no-remembered-history
-and `forkIO`/`throwTo` cleanup-under-exception invariants. What
-remains is the real stopped-audio host wiring — building a
-production `HostStackFactory ManifestReloadPlan ...` against the
-live `SessionFanInService` + ingress manager + audio FFI bundle
-and routing the existing `reloadManifestHostWithStrategy` path
-through `reloadSupervised`.
+and `forkIO`/`throwTo` cleanup-under-exception invariants. The
+production `HostStackFactory ManifestReloadPlan ...` shape has
+also landed in `MetaSonic.App.ManifestReloadHostStack` (opt-in,
+not yet routed): `StoppedAudioHostStack` newtype around
+`ManifestReloadHostConfig`, injectable
+`StoppedAudioHostStackOps` for open / close / in-window-reload,
+and a plan-native `realStoppedAudioInWindowReload` that drives
+`orchestrateHostStoppedAudioReloadWithEvents` with
+`hsaroPreparePlan` overridden to `const (pure (Right plan))`
+so the supplied plan is the source of truth at the seam (no
+silent re-planning from doc/catalog drift). Eight fake-IO
+scenarios at this layer pin success, the three named
+in-window failure-recovery shapes, rebuild escalation, the
+no-overlapping-stacks transition invariant, async cleanup,
+and an A→B→C→D! regression against the factory composition.
+What remains is the open/close half: implement
+`StoppedAudioHostStackOps` against the live
+`SessionFanInService` + ingress manager + audio FFI bundle
+(via imperative open/close primitives or a worker-thread
+promotion of `withSessionFanInService`), then route the
+existing `reloadManifestHostWithStrategy` `StoppedAudioOnly`
+path through `reloadSupervised` + this factory + the
+real-host ops.
 The preserving-live sibling path has also landed behind explicit host
 APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
 runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`
@@ -3754,9 +3771,13 @@ Still gated:
   per-event ingress activity, host orchestration design note,
   host supervisor / recovery policy contract (design now
   realized as `MetaSonic.App.ManifestReloadSupervisor` +
-  `MetaSonic.App.ManifestReloadSupervisorAdapter`; real
-  stopped-audio host wiring through `reloadSupervised` is the
-  remaining slice in that lane), and the
+  `MetaSonic.App.ManifestReloadSupervisorAdapter` +
+  `MetaSonic.App.ManifestReloadHostStack`; the remaining slice
+  in that lane is implementing real-host
+  `StoppedAudioHostStackOps` against the live
+  `SessionFanInService` + ingress manager + audio FFI bundle
+  and routing the `StoppedAudioOnly` strategy through
+  `reloadSupervised` + the factory), and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a
