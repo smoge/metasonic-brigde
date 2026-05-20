@@ -51,8 +51,8 @@ staticPluginSkeletonTests =
       pluginEffs @?= [Pure]
 
   , testCase "Haskell plugin metadata catalog exposes Identity row" $ do
-      staticPluginCatalog @?=
-        [ StaticPluginInfo
+      listToMaybe staticPluginCatalog @?=
+        Just StaticPluginInfo
             { spiRef            = identityPlugin
             , spiPluginId       = 0
             , spiAudioInputs    = 2
@@ -61,7 +61,6 @@ staticPluginSkeletonTests =
             , spiEffects        = [Pure]
             , spiLabel          = "identity"
             }
-        ]
       staticPluginInfo identityPlugin
         @?= listToMaybe staticPluginCatalog
       staticPluginId identityPlugin @?= Just 0

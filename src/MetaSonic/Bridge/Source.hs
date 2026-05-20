@@ -28,8 +28,12 @@ module MetaSonic.Bridge.Source
   , StaticPluginInfo (..)
   , staticPluginCatalog
   , staticPluginInfo
+  , staticPluginInfoById
   , identityPlugin
+  , oneTapDelayPlugin
   , staticPluginId
+  , finitePluginId
+  , maxExactPluginId
   , UGen (..)
   , NodeSpec (..)
   , SynthGraph (..)
@@ -89,6 +93,7 @@ import           Control.Monad              (void)
 import           Control.Monad.State.Strict
 import           Data.Bits                  ((.&.), (.|.), shiftR)
 import           Data.Char                  (chr, ord)
+import           Data.List                  (find)
 import qualified Data.Map.Strict            as M
 import           Data.Word                  (Word8)
 import           GHC.Generics               (Generic)
@@ -217,7 +222,13 @@ data StaticPluginInfo = StaticPluginInfo
 identityPlugin :: PluginRef
 identityPlugin = PluginRef "identity"
 
--- | Pure Haskell catalog for the fixed §6.E v1 plugin set.
+-- | Second static plugin profile (§6.E v2): two audio inputs, one
+-- audio output, one sample of declared latency. The runtime kernel
+-- is a one-sample-delayed sum (notes/2026-05-19-d §1).
+oneTapDelayPlugin :: PluginRef
+oneTapDelayPlugin = PluginRef "one-tap-delay"
+
+-- | Pure Haskell catalog for the build-linked static plugin set.
 --
 -- The C++ registry exposes the same index through
 -- @rt_graph_plugin_find@ for runtime-side cross-checks, but the pure
@@ -233,6 +244,15 @@ staticPluginCatalog =
       , spiEffects        = [Pure]
       , spiLabel          = "identity"
       }
+  , StaticPluginInfo
+      { spiRef            = oneTapDelayPlugin
+      , spiPluginId       = 1
+      , spiAudioInputs    = 2
+      , spiAudioOutputs   = 1
+      , spiLatencySamples = 1
+      , spiEffects        = [Pure]
+      , spiLabel          = "one-tap-delay"
+      }
   ]
 
 -- | Look up compiler-visible metadata for a static plugin.
@@ -242,9 +262,46 @@ staticPluginInfo ref =
     [info] -> Just info
     _      -> Nothing
 
+-- | Look up a catalog row by its frozen runtime plugin id. Catalog
+-- size is bounded (handful of rows), so a linear scan is fine.
+staticPluginInfoById :: Int -> Maybe StaticPluginInfo
+staticPluginInfoById pid =
+  find ((== pid) . spiPluginId) staticPluginCatalog
+
 -- | Frozen integer plugin id shipped to the runtime.
 staticPluginId :: PluginRef -> Maybe Int
 staticPluginId = fmap spiPluginId . staticPluginInfo
+
+-- | Exclusive upper bound on plugin ids 'finitePluginId' will
+-- accept. At exactly @2 ** 53@ the gap between adjacent
+-- representable 'Double's becomes 1.0, so the +1 successor silently
+-- rounds back — an "almost-integer" tolerance check would falsely
+-- accept indistinguishable doubles. Clamped to @maxBound :: Int@ so
+-- a hypothetical 32-bit target stays safe. Tests reference this
+-- constant rather than hard-coding @2 ** 53 - 1@.
+maxExactPluginId :: Double
+maxExactPluginId =
+  min (2 ** 53) (fromIntegral (maxBound :: Int))
+
+-- | Safely parse a frozen @plugin_id@ control slot value.
+--
+-- Returns 'Nothing' for any value that is not finite, non-negative,
+-- in range, and integral within ±1e-9 of the nearest integer. An
+-- honest plugin id is @fromIntegral i :: Double@ for @i :: Int@,
+-- which is exact for any id strictly below 'maxExactPluginId'; the
+-- epsilon catches accidental arithmetic on the control slot without
+-- false-rejecting honest ids.
+finitePluginId :: Double -> Maybe Int
+finitePluginId d
+  | isNaN d                              = Nothing
+  | isInfinite d                         = Nothing
+  | d < 0                                = Nothing
+  | d >= maxExactPluginId                = Nothing
+  | abs (d - fromIntegral asInt) > 1e-9  = Nothing
+  | otherwise                            = Just asInt
+  where
+    asInt :: Int
+    asInt = round d
 
 
 {- Note [Num/Fractional Connection]
