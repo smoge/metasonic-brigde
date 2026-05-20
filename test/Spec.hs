@@ -22,6 +22,8 @@ import           MetaSonic.Spec.AppManifestPreservingFixture
                                                   (appManifestPreservingFixtureTests)
 import           MetaSonic.Spec.AppManifestReloadHostStack
                                                   (appManifestReloadHostStackTests)
+import           MetaSonic.Spec.AppManifestReloadPreservingHostStack
+                                                  (appManifestReloadPreservingHostStackTests)
 import           MetaSonic.Spec.AppManifestReloadBinding
 import           MetaSonic.Spec.AppManifestReloadCli
 import           MetaSonic.Spec.AppManifestReloadEvent
@@ -111,6 +113,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , appManifestOSCReloadE2ETests
   , appManifestPreservingFixtureTests
   , appManifestReloadHostStackTests
+  , appManifestReloadPreservingHostStackTests
   , appManifestReloadBindingTests
   , appManifestReloadCliTests
   , appManifestReloadEventTests

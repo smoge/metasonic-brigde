@@ -67,6 +67,21 @@ module MetaSonic.App.ManifestReloadHostStack
   , realStoppedAudioInWindowReload
   , RealStoppedAudioHostStackInputs (..)
   , realStoppedAudioHostStackOps
+    -- * Shared open\/close (used by the preserving host-stack lane)
+    --
+    -- The open and close paths are route-agnostic — they spin up a
+    -- fresh @SessionFanInService@ + audio + ingress against a plan,
+    -- and tear them down in reverse. Both stopped-audio and
+    -- preserving need that lifecycle on initial open and on
+    -- terminal-failure rebuild; only the in-window slot differs.
+    -- The 'StoppedAudio' prefix is an artifact of the order in
+    -- which routes landed; a follow-up cleanup will lift it to a
+    -- neutral name. Exported here so
+    -- "MetaSonic.App.ManifestReloadPreservingHostStack" can reuse
+    -- the identical machinery without duplicating ~150 lines of
+    -- masking + exception-safety code.
+  , realOpen
+  , realClose
     -- * Supervised stopped-audio entry
   , SupervisedStoppedAudioReloadResult (..)
   , runSupervisedStoppedAudioReload
