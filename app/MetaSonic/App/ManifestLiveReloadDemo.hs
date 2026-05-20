@@ -8,8 +8,29 @@
 -- This is the first opt-in audible consumer of the manifest reload
 -- host strategy selector. It starts audio from one authored demo,
 -- opens manifest-aware OSC ingress, waits for the operator to press
--- Enter, then reloads to another authored demo through
--- 'reloadManifestHostWithStrategy'.
+-- Enter, then reloads to another authored demo. The reload dispatch
+-- splits on the host strategy:
+--
+-- * @StoppedAudioOnly@ routes through the supervised stack
+--   ('reloadSupervised' + 'HostStackFactory' +
+--   'realStoppedAudioHostStackOps') so a terminal in-window failure
+--   triggers a rebuild from the captured fallback plan instead of
+--   leaving the host without a live stack. This is the
+--   'LiveReloadSupervised' arm of 'selectLiveReloadRoute' and is
+--   driven by 'runSupervisedLiveReload' below.
+--
+-- * @RequirePreserving@ and @TryPreservingThenStoppedAudio@ stay on
+--   the direct 'reloadManifestHostWithStrategy' path
+--   ('LiveReloadDirect'). They will move to the supervised stack
+--   only after the stopped-audio supervised route has accumulated
+--   hardware exercise.
+--
+-- The runtime preamble prints a @route:@ line so the operator can
+-- see which path was selected. The routing decision itself is a
+-- pure 'selectLiveReloadRoute :: ManifestReloadHostStrategy ->
+-- LiveReloadRoute' selector, pinned by deterministic tests in
+-- 'MetaSonic.Spec.AppManifestLiveReloadDemoRender' so a refactor
+-- that silently shifts strategies between routes fails loudly.
 --
 -- The normal demo path is deliberately unchanged. This helper is for
 -- integration friction: making the planner, service, audio lifecycle,

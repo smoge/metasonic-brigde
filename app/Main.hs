@@ -210,9 +210,17 @@ data RunMode
     -- ^ Experimental audible manifest reload path
     -- (--manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW).
     -- Starts real audio from OLD, opens manifest-aware OSC ingress,
-    -- waits for Enter, then reloads to NEW through
-    -- reloadManifestHostWithStrategy. This is opt-in only; the normal
-    -- demo path is unchanged.
+    -- waits for Enter, then reloads to NEW. The reload dispatch
+    -- splits on STRATEGY: stopped-audio-only routes through the
+    -- supervised stack (reloadSupervised + HostStackFactory +
+    -- realStoppedAudioHostStackOps) so a terminal in-window failure
+    -- triggers a rebuild from the captured fallback plan;
+    -- require-preserving and try-preserving stay on the direct
+    -- reloadManifestHostWithStrategy path until the supervised
+    -- stopped-audio route has accumulated hardware exercise. The
+    -- runtime preamble prints a "route:" line so the operator can
+    -- see which path was selected. This whole command is opt-in;
+    -- the normal demo path is unchanged.
   deriving (Eq, Show)
 
 data Options = Options
@@ -679,19 +687,32 @@ usage prog = unlines
   , "                   one of: " <> intercalate ", " manifestReloadHostStrategyNames
   , "                   Reads MANIFEST.json, validates DEMO against the"
   , "                   built-in authored-demo reload catalog, starts fake"
-  , "                   host audio, runs reloadManifestHostWithStrategy,"
-  , "                   reports whether preserving, stopped-audio, or"
-  , "                   explicit fallback ran, then exits. No PortAudio"
-  , "                   device is opened and the normal demo path is not"
-  , "                   affected."
+  , "                   host audio, then dispatches: stopped-audio-only"
+  , "                   through the supervised stack (reloadSupervised +"
+  , "                   HostStackFactory) so a terminal in-window failure"
+  , "                   rebuilds from the captured fallback; require-"
+  , "                   preserving and try-preserving stay on the direct"
+  , "                   reloadManifestHostWithStrategy path. Reports"
+  , "                   whether preserving, stopped-audio (or the"
+  , "                   supervised committed / recovered / escalated"
+  , "                   outcome), or explicit fallback ran, then exits."
+  , "                   No PortAudio device is opened and the normal demo"
+  , "                   path is not affected."
   , "  --manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW"
   , "                   Audible manifest reload demo."
   , "                   STRATEGY is one of: "
       <> intercalate ", " manifestReloadHostStrategyNames
   , "                   Starts real audio from OLD, opens manifest-aware"
-  , "                   OSC ingress, waits for Enter, reloads to NEW"
-  , "                   through reloadManifestHostWithStrategy, then"
-  , "                   waits for Enter before cleanup. Uses"
+  , "                   OSC ingress, waits for Enter, reloads to NEW,"
+  , "                   then waits for Enter before cleanup. The reload"
+  , "                   dispatch splits on STRATEGY: stopped-audio-only"
+  , "                   routes through the supervised stack"
+  , "                   (reloadSupervised + HostStackFactory +"
+  , "                   realStoppedAudioHostStackOps); require-preserving"
+  , "                   and try-preserving stay on the direct"
+  , "                   reloadManifestHostWithStrategy path. The runtime"
+  , "                   preamble prints a 'route:' line so the operator"
+  , "                   can see which path was selected. Uses"
   , "                   --session-osc-port N for the OSC bind port."
   , "                   Blessed preserving path:"
   , "                     examples/manifests/preserve-cutoff.json"
