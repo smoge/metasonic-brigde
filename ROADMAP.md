@@ -3833,11 +3833,15 @@ Still gated:
   smoke at `just manifest-supervised-live-smoke` (wrapper at
   `tools/manifest_supervised_live_smoke.sh`, NOT a member of
   `check-offline`, exits 0 only if all 12 acceptance markers
-  observed); tier 3 (hardware-backed CI) is undecided. The
-  preserving / try-preserving fallback migration is gated on
-  further tier-2 exposure across operators / machines plus a
-  written tier-3 decision, both landing before that migration
-  slice opens), and the
+  observed); tier 3 (hardware-backed CI) is **deferred, not
+  rejected** by
+  [notes/2026-05-20-a-supervised-route-tier3-decision.md](notes/2026-05-20-a-supervised-route-tier3-decision.md).
+  The preserving / try-preserving fallback migration opens
+  against that note's bar: deterministic route tests plus a
+  minimum of two marker-clean tier-2 runs attached to the PR
+  (two different hosts / audio backends preferred when
+  available). The note also lists the reopen triggers that
+  would put tier 3 back on the slate), and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a

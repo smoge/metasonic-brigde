@@ -692,22 +692,22 @@ migrating preserving / try-preserving onto the supervisor:
    that touch the supervised path or before opening a
    preserving-migration slice.
 
-3. **Hardware-backed CI (still undecided).** A dedicated lane
-   that runs the live smoke on every relevant commit, on a
-   machine with known audio + MIDI state. Strongest
-   evidence; expensive to own. The repo's main CI is not
-   yet shaped to run device-backed jobs; opening that lane
-   is its own slice with its own design (hardware ownership,
-   hot-plug assumptions, cleanup, timeouts, failure
-   diagnosis). The current default-CI surface stays
-   deterministic / offline.
+3. **Hardware-backed CI (deferred, see decision below).** A
+   dedicated lane that runs the live smoke on every
+   relevant commit, on a machine with known audio + MIDI
+   state. Strongest evidence; expensive to own. The repo's
+   main CI is not yet shaped to run device-backed jobs;
+   opening that lane is its own slice with its own design
+   (hardware ownership, hot-plug assumptions, cleanup,
+   timeouts, failure diagnosis). The current default-CI
+   surface stays deterministic / offline.
 
-Migrating preserving / try-preserving onto the supervisor is
-gated on (a) further supervised-route hardware exposure
-through tier 2 (multiple successful runs across operators /
-machines, not just the 2026-05-20 single host), plus (b) the
-tier-3 CI-gating decision — i.e., a written answer to "do we
-require hardware-backed CI for the supervised path before
-moving more routes onto it, or is tier 2 enough?" That
-answer should land before the preserving migration slice
-opens, not during its review.
+The tier-3 CI-gating question is now answered in
+[2026-05-20-a-supervised-route-tier3-decision.md](2026-05-20-a-supervised-route-tier3-decision.md):
+tier 2 is sufficient to open the preserving / try-preserving
+supervisor-migration slices, tier 3 is deferred (not
+rejected), and the migration slice's evidence bar is
+deterministic route tests plus a minimum of two marker-clean
+tier-2 runs attached to the PR (two different hosts / audio
+backends preferred when available). The reopen triggers for
+tier 3 are listed in that note.
