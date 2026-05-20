@@ -54,7 +54,9 @@ import qualified Data.Map.Strict                as M
 import qualified Data.Set                       as S
 import qualified Data.Text                      as T
 import           System.Exit                    (die)
-import           System.IO                      (hFlush, stdout)
+import           System.IO                      (BufferMode (..),
+                                                 hFlush, hSetBuffering,
+                                                 stdout)
 import           System.Timeout                 (timeout)
 
 import           MetaSonic.App.Demos            (Demo (..), demoTable,
@@ -203,6 +205,16 @@ runManifestLiveReloadDemo
   -> ListenerConfig
   -> IO ()
 runManifestLiveReloadDemo strategy manifestPath oldDemo newDemo listenerCfg = do
+  -- Force line-buffered stdout so an operator wrapper script
+  -- (e.g. tools/manifest_supervised_live_smoke.sh) sees the
+  -- interactive prompts in real time. GHC's runtime defaults
+  -- stdout to BlockBuffering when redirected to a file, which
+  -- can hide the "press Enter" prompt inside a ~4 KB buffer
+  -- and deadlock a wrapper that polls the file for that
+  -- string. LineBuffering matches the interactive semantic of
+  -- this command and removes the buffer-fill timing
+  -- dependency.
+  hSetBuffering stdout LineBuffering
   doc <- readManifestDocOrDie manifestPath
   catalog <- either die pure (demoManifestReloadCatalog demoTable)
   oldPlan <- planOrDie doc catalog oldDemo

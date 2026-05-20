@@ -493,14 +493,30 @@ audible behavior below stays manual.
 
 ### Manual run command
 
+Either run the raw command directly:
+
 ```sh
 stack exec -- metasonic-bridge --manifest-live-reload-demo \
   stopped-audio-only examples/manifests/preserve-cutoff.json \
   preserve-cutoff-dark preserve-cutoff-bright
 ```
 
-(Substitute `preserve-cutoff-dark` / `preserve-cutoff-bright`
-with any pair of demo keys present in the manifest.)
+(Substitute the two demo keys with any pair present in the
+manifest), OR run the committed wrapper recipe which does
+the same thing plus pre/post-reload OSC injection, post-exit
+`ss` + active Python bind probes, and end-of-run marker
+checks:
+
+```sh
+just manifest-supervised-live-smoke               # default port 17001
+just manifest-supervised-live-smoke port=18001    # override port
+```
+
+The wrapper at `tools/manifest_supervised_live_smoke.sh`
+exits 0 only if every acceptance marker from the table below
+is observed. It is intentionally NOT a member of `just
+check-offline` or any default CI gate — see the "Evidence
+policy" subsection below for the tier classification.
 
 ### What the supervised live transcript must prove
 
@@ -649,3 +665,49 @@ transitioned from "needs hardware exercise" to
 [notes/2026-05-14-k-host-reload-supervisor.md](2026-05-14-k-host-reload-supervisor.md).
 Hardware-gated CI for this route is a separate slice and is
 intentionally not opened here.
+
+### Evidence policy
+
+The supervised stopped-audio route's evidence stack is now
+classified into three tiers. The same tiering is the gate for
+migrating preserving / try-preserving onto the supervisor:
+
+1. **Default deterministic checks.** Run everywhere, block
+   normal commits / CI. In this repo: `just check-offline`
+   (which runs `git diff --check` + `just stack-test` + `just
+   cpp-test-offline`). The supervised route's
+   routing/state-machine behavior is covered here through
+   deterministic fake-IO tests (1216-case suite as of the
+   §219 slice-4 close).
+
+2. **Opt-in local live smoke.** A repeatable operator command
+   that exercises real PortAudio / real UDP ingress / real
+   OSC accept end-to-end against the committed
+   preserve-cutoff fixture, with marker checks for each
+   acceptance item the runbook names. Implemented as `just
+   manifest-supervised-live-smoke` wrapping
+   `tools/manifest_supervised_live_smoke.sh`. NOT a member of
+   `check-offline`. Operators run this manually on a host
+   with a working audio backend before promoting changes
+   that touch the supervised path or before opening a
+   preserving-migration slice.
+
+3. **Hardware-backed CI (still undecided).** A dedicated lane
+   that runs the live smoke on every relevant commit, on a
+   machine with known audio + MIDI state. Strongest
+   evidence; expensive to own. The repo's main CI is not
+   yet shaped to run device-backed jobs; opening that lane
+   is its own slice with its own design (hardware ownership,
+   hot-plug assumptions, cleanup, timeouts, failure
+   diagnosis). The current default-CI surface stays
+   deterministic / offline.
+
+Migrating preserving / try-preserving onto the supervisor is
+gated on (a) further supervised-route hardware exposure
+through tier 2 (multiple successful runs across operators /
+machines, not just the 2026-05-20 single host), plus (b) the
+tier-3 CI-gating decision — i.e., a written answer to "do we
+require hardware-backed CI for the supervised path before
+moving more routes onto it, or is tier 2 enough?" That
+answer should land before the preserving migration slice
+opens, not during its review.

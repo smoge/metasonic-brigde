@@ -132,6 +132,32 @@ check-offline:
     just stack-test
     just cpp-test-offline
 
+# Opt-in live operator smoke for the supervised
+# --manifest-live-reload-demo stopped-audio-only route. Drives
+# the audible reload end-to-end against the committed
+# preserve-cutoff fixture, injects OSC pre- and post-reload,
+# runs post-exit `ss` + active Python bind probes, and verifies
+# the six acceptance markers from
+# notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md.
+#
+# This is a LIVE / DEVICE smoke. It opens real PortAudio and
+# binds a real UDP socket. It is INTENTIONALLY NOT a member of
+# `check-offline` or any default CI gate — default gates stay
+# deterministic and device-free. Run this manually on a host
+# with a working audio backend when verifying the supervised
+# route (e.g. before migrating preserving / try-preserving onto
+# the supervisor).
+#
+# Default port is 17001 to avoid colliding with the everyday
+# 7001 workspace if a smoke gets stuck. Override with
+# `just manifest-supervised-live-smoke port=N`.
+#
+# Other parameters (manifest fixture, old/new demo keys, work
+# dir for artifacts) are env-var configurable in the wrapper
+# script; see tools/manifest_supervised_live_smoke.sh.
+manifest-supervised-live-smoke port="17001": stack-build
+    PORT={{port}} ./tools/manifest_supervised_live_smoke.sh
+
 # §4.B kernel microbench. Configures and builds in a separate
 # RelWithDebInfo tree so the numbers aren't dominated by
 # libstdc++ assertion overhead from the Debug `cpp-build`.

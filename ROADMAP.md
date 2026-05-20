@@ -3824,10 +3824,20 @@ Still gated:
   `MetaSonic.App.ManifestReloadHostStack`; real-host
   `StoppedAudioHostStackOps` and the supervised
   `StoppedAudioOnly` CLI route are landed and
-  hardware-confirmed once on 2026-05-20, with the preserving /
-  try-preserving fallback migration gated on further
-  supervised-route hardware exposure plus the CI-gating
-  decision for that path), and the
+  hardware-confirmed once on 2026-05-20. Evidence is now
+  classified into three tiers (see the "Evidence policy"
+  subsection at the bottom of
+  [notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)):
+  tier 1 is the default deterministic offline suite covered
+  by `just check-offline`; tier 2 is the opt-in local live
+  smoke at `just manifest-supervised-live-smoke` (wrapper at
+  `tools/manifest_supervised_live_smoke.sh`, NOT a member of
+  `check-offline`, exits 0 only if all 12 acceptance markers
+  observed); tier 3 (hardware-backed CI) is undecided. The
+  preserving / try-preserving fallback migration is gated on
+  further tier-2 exposure across operators / machines plus a
+  written tier-3 decision, both landing before that migration
+  slice opens), and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a
