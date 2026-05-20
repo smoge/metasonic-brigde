@@ -3871,10 +3871,31 @@ Still gated:
   slate, and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
-  work. Remaining work in this arc is a
-  resource/allocation recovery event stream (gated on a concrete
-  consumer) and hardware confirmation / hardware-gated CI for the
-  device-backed paths. Host strategy smoke and live reload demo
+  work. The supervisor substrate also has its first
+  open-ended consumer: the Phase 8 v0 manifest-backed live
+  session shell at `--manifest-live-session MANIFEST.json DEMO
+  [--strategy STRATEGY]` (default `require-preserving`).
+  Unlike the two-shot `--manifest-live-reload-demo` operator
+  smoke, the session shell runs an open-ended owner loop with
+  a tiny stdin protocol — `demo:KEY` triggers a supervised
+  reload, `<Enter>` prints a status snapshot, `<Ctrl-D>`
+  exits — and is the first real consumer that all four
+  supervisor outcomes (committed / request-rejected /
+  rejected-recovered / escalated) have to be sound against on
+  a live timeline. Tier-2 wrapper at
+  `tools/manifest_live_session_require_preserving_smoke.sh`
+  (`just manifest-live-session-require-preserving-smoke`,
+  port 17004) was marker-clean across two runs on
+  2026-05-21 on host RME ADI-2 Pro / PipeWire; design
+  rationale + acceptance criteria + non-goals at
+  [notes/2026-05-21-a-manifest-live-session-v0.md](notes/2026-05-21-a-manifest-live-session-v0.md).
+  Remaining work in this arc is a resource/allocation
+  recovery event stream (gated on a concrete consumer; the
+  session shell is now that consumer's first candidate),
+  stale-command rejection rendering surfaced through the
+  session shell's OSC accept timeline, and hardware
+  confirmation / hardware-gated CI for the device-backed
+  paths. Host strategy smoke and live reload demo
   share a typed prose reload-event vocabulary
   (`f595542` / `aca37ed`). The preserving live-reload path has a
   blessed committed fixture at
