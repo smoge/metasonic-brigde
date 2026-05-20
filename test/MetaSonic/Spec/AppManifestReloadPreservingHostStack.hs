@@ -22,7 +22,7 @@
 --     open sequences. Includes the A→B→C→D! regression mirroring
 --     the stopped-audio factory-layer guard.
 --
--- The 'sahsConfig' field on the test fakes for the factory-
+-- The 'rhsConfig' field on the test fakes for the factory-
 -- composition group is left as a deferred @error@ placeholder;
 -- tests verify by inspection that @pahsoInWindowReload@ never
 -- forces it (the in-window slot is overridden in every test).
@@ -55,9 +55,9 @@ import           MetaSonic.App.ManifestReloadEvent
 import           MetaSonic.App.ManifestReloadHost.Types
                                    (ManifestReloadHostIssue (..))
 import           MetaSonic.App.ManifestReloadHostStack
-                                   (RealStoppedAudioHostStackInputs (..),
-                                    StoppedAudioHostStack (..),
-                                    StoppedAudioHostStackOpenIssue (..),
+                                   (RealReloadHostStackInputs (..),
+                                    ReloadHostStack (..),
+                                    ReloadHostStackOpenIssue (..),
                                     StoppedAudioHostStackOps (..),
                                     realStoppedAudioHostStackOps)
 import           MetaSonic.App.ManifestReloadOrchestration.Types
@@ -94,7 +94,7 @@ import           MetaSonic.Spec.AppManifestReloadHostStack
 
 -- | Type instantiation. 'ingressIssue' = 'String'; 'target' = '()'
 -- and 'handle' = '()' since none of the fakes inspect them.
-type TestStack = StoppedAudioHostStack () String ()
+type TestStack = ReloadHostStack () String ()
 
 -- | The matching factory issue type for the test stack.
 type TestFactoryIssue = PreservingHostStackIssue String
@@ -123,7 +123,7 @@ data StackCall
 data FakeStackPlan = FakeStackPlan
   { fspOpenBehavior
       :: !(MR.ManifestReloadPlan
-            -> IO (Either (StoppedAudioHostStackOpenIssue String) ()))
+            -> IO (Either (ReloadHostStackOpenIssue String) ()))
   , fspInWindowBehavior
       :: !(MR.ManifestReloadPlan -> IO TestInWindowOutcome)
   }
@@ -158,10 +158,10 @@ mkFakeOps traceRef plans = PreservingHostStackOps
 -- value around without inspecting it; the fake @pahsoInWindowReload@
 -- never forces the config field; so the placeholder never blows up.
 stubStack :: TestStack
-stubStack = StoppedAudioHostStack
-  { sahsConfig =
+stubStack = ReloadHostStack
+  { rhsConfig =
       error
-        "test placeholder: sahsConfig is intentionally undefined; \
+        "test placeholder: rhsConfig is intentionally undefined; \
         \fakes override pahsoInWindowReload so the config is never read"
   }
 
@@ -185,7 +185,7 @@ planB = mkPlan "requested"
 
 
 -- | Convenient open behaviors.
-openOk :: MR.ManifestReloadPlan -> IO (Either (StoppedAudioHostStackOpenIssue String) ())
+openOk :: MR.ManifestReloadPlan -> IO (Either (ReloadHostStackOpenIssue String) ())
 openOk _ = pure (Right ())
 
 
@@ -390,8 +390,8 @@ factoryCompositionTests =
       -- PahsiInWindow / PahsiOpen respectively.
       traceRef <- newIORef []
       let -- Pick a recognizable variant so the assertion is
-          -- specific. StoppedAudioHostStackOpenIssue is imported
-          -- directly because PreservingHostStackOpenIssue is an
+          -- specific. ReloadHostStackOpenIssue is imported
+          -- directly because ReloadHostStackOpenIssue is an
           -- alias and the constructors are the same.
           openFails _plan = pure (Left stoppedAudioOpenIssueFakeForTest)
           ops = mkFakeOps traceRef FakeStackPlan
@@ -468,13 +468,13 @@ factoryCompositionTests =
   ]
 
 
--- | A recognizable 'StoppedAudioHostStackOpenIssue' value for
+-- | A recognizable 'ReloadHostStackOpenIssue' value for
 -- pinning Escalated outcomes. The specific variant doesn't matter
 -- to the supervisor's branching; only that the test assertion can
 -- name the same one back.
-stoppedAudioOpenIssueFakeForTest :: StoppedAudioHostStackOpenIssue String
+stoppedAudioOpenIssueFakeForTest :: ReloadHostStackOpenIssue String
 stoppedAudioOpenIssueFakeForTest =
-  SahsoiIngressOpenFailed "rebuild-broke"
+  RhsoiIngressOpenFailed "rebuild-broke"
 
 
 -- | Diagnostic 'ProducerId' for the direct-integration test. The
@@ -536,7 +536,7 @@ realInWindowReloadTests =
               (fakeIngressOpsOpenOk ingressCloseCalls)
               fakeAudioFFIStartOk
           inputs = baseInputs
-            { rsahsiOnEvent = \e -> modifyIORef' eventsRef (++ [e])
+            { rrhsiOnEvent = \e -> modifyIORef' eventsRef (++ [e])
             }
           ops = realStoppedAudioHostStackOps inputs
       openResult <- sahsoOpen ops (mkPlan "initial")

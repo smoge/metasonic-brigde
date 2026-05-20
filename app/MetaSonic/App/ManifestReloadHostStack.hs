@@ -4,36 +4,39 @@
 
 -- |
 -- Module      : MetaSonic.App.ManifestReloadHostStack
--- Description : Production HostStackFactory for the stopped-audio host path.
+-- Description : Substrate stack + stopped-audio strategy for supervised manifest reloads.
 --
--- This module composes the production open / close / in-window
--- primitives into a 'HostStackFactory MR.ManifestReloadPlan ...'
--- the supervisor adapter can drive. It is the §219 slice 4
--- prerequisite the supervisor design note named: defining what a
--- "closeable / reopenable host stack" is for the stopped-audio
--- path. Routing landed in commits @93e755c@ (CLI smoke) and
+-- This module hosts two things:
+--
+--   1. The /substrate/ — 'ReloadHostStack' (one active host stack),
+--      'ReloadHostStackOpenIssue' (open-time failure ADT), and
+--      'RealReloadHostStackInputs' (producer-supplied inputs for the
+--      live open\/close path), plus 'realOpen' \/ 'realClose'. All
+--      route-agnostic, reused by every supervised route's production
+--      ops bundle.
+--   2. The /stopped-audio strategy/ — the route-specific
+--      'StoppedAudioHostStackOps' \/ 'StoppedAudioHostStackIssue',
+--      'realStoppedAudioInWindowReload', 'realStoppedAudioHostStackOps',
+--      'mkStoppedAudioHostStackFactory', and the
+--      'runSupervisedStoppedAudioReload' entry point.
+--
+-- The §219 slice-4 design note required defining what a
+-- \"closeable \/ reopenable host stack\" is; the substrate types here
+-- answer that. Routing landed in commits @93e755c@ (CLI smoke) and
 -- @905edd5@ (audible @--manifest-live-reload-demo@), and was
--- hardware-confirmed once on 2026-05-20 (full transcript in
--- the runbook at @notes/2026-05-19-b-manifest-host-reload-
--- smoke-runbook.md@). The @StoppedAudioOnly@ strategy now
--- dispatches through this factory + 'reloadSupervised' in
--- both operator-facing entrypoints.
--- @TryPreservingThenStoppedAudio@ uses the sibling
+-- hardware-confirmed once on 2026-05-20 (full transcript in the
+-- runbook at @notes/2026-05-19-b-manifest-host-reload-smoke-
+-- runbook.md@). The @StoppedAudioOnly@ strategy dispatches through
+-- 'mkStoppedAudioHostStackFactory' + 'reloadSupervised' in both
+-- operator-facing entrypoints. @TryPreservingThenStoppedAudio@ uses
+-- the sibling
 -- "MetaSonic.App.ManifestReloadTryPreservingHostStack" factory,
 -- which composes the preserving in-window helper with
--- 'realStoppedAudioInWindowReload' from this module under the
--- existing 'preservingAllowsStoppedAudioFallback' gate.
--- @RequirePreserving@ stays on the direct
--- 'reloadManifestHostWithStrategy' path; migrating it is its
--- own slice and opens against the evidence bar in
--- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
---
--- The 'StoppedAudioHostStack' newtype wraps the per-active
--- 'ManifestReloadHostConfig'; plan ownership stays at the
--- supervisor's caller (threaded as @fallback@ on each call).
--- The 'StoppedAudioHostStackOps' record carries the three IO
--- actions a 'HostStackFactory' needs: open / close /
--- in-window-reload.
+-- 'realStoppedAudioInWindowReload' under the existing
+-- 'preservingAllowsStoppedAudioFallback' gate. @RequirePreserving@
+-- stays on the direct 'reloadManifestHostWithStrategy' path;
+-- migrating it is its own slice and opens against the evidence bar
+-- in @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
 --
 -- 'realStoppedAudioHostStackOps' is the production wiring for
 -- open / close. It opens the imperative
@@ -42,7 +45,7 @@
 -- ingress target from the plan, opens ingress, then starts audio
 -- in that order; close runs in reverse. Partial-cleanup failures
 -- during rollback are surfaced through
--- 'SahsoiPartialCleanupFailed' so the supervisor can escalate
+-- 'RhsoiPartialCleanupFailed' so the supervisor can escalate
 -- rather than reuse a partially-cleaned stack.
 --
 -- 'realStoppedAudioInWindowReload' is the production wiring for
@@ -64,29 +67,32 @@
 --
 -- See notes/2026-05-14-k-host-reload-supervisor.md \xa7219 slice 4.
 module MetaSonic.App.ManifestReloadHostStack
-  ( StoppedAudioHostStack (..)
-  , StoppedAudioHostStackOps (..)
-  , StoppedAudioHostStackOpenIssue (..)
-  , StoppedAudioHostStackIssue (..)
-  , mkStoppedAudioHostStackFactory
-  , realStoppedAudioInWindowReload
-  , RealStoppedAudioHostStackInputs (..)
-  , realStoppedAudioHostStackOps
-    -- * Shared open\/close (used by the preserving host-stack lane)
+  ( -- * Substrate (shared across all supervised routes)
+    --
+    -- These three types describe \"one active host stack\" and the
+    -- inputs needed to spin one up. They are route-agnostic: every
+    -- supervised route (stopped-audio, preserving, try-preserving)
+    -- threads the same value through the supervisor adapter and uses
+    -- the same production-input record. The strategy-specific
+    -- machinery lives in companion modules and reuses these.
+    ReloadHostStack (..)
+  , ReloadHostStackOpenIssue (..)
+  , RealReloadHostStackInputs (..)
+    -- * Shared open\/close
     --
     -- The open and close paths are route-agnostic — they spin up a
     -- fresh @SessionFanInService@ + audio + ingress against a plan,
-    -- and tear them down in reverse. Both stopped-audio and
-    -- preserving need that lifecycle on initial open and on
-    -- terminal-failure rebuild; only the in-window slot differs.
-    -- The 'StoppedAudio' prefix is an artifact of the order in
-    -- which routes landed; a follow-up cleanup will lift it to a
-    -- neutral name. Exported here so
-    -- "MetaSonic.App.ManifestReloadPreservingHostStack" can reuse
-    -- the identical machinery without duplicating ~150 lines of
-    -- masking + exception-safety code.
+    -- and tear them down in reverse. Every supervised route needs
+    -- that lifecycle on initial open and on terminal-failure rebuild;
+    -- only the in-window slot differs.
   , realOpen
   , realClose
+    -- * Stopped-audio strategy
+  , StoppedAudioHostStackOps (..)
+  , StoppedAudioHostStackIssue (..)
+  , mkStoppedAudioHostStackFactory
+  , realStoppedAudioInWindowReload
+  , realStoppedAudioHostStackOps
     -- * Supervised stopped-audio entry
   , SupervisedStoppedAudioReloadResult (..)
   , runSupervisedStoppedAudioReload
@@ -146,12 +152,15 @@ import qualified MetaSonic.Session.ManifestReload            as MR
 import           MetaSonic.Session.Owner                     (SessionOwnerOptions)
 
 
--- | The runtime objects that constitute one active stopped-audio
--- host stack. Built fresh on each 'sahsoOpen'; torn down by
--- 'sahsoClose'. The supervisor adapter holds exactly one of these
--- in its IORef at any time.
+-- | The runtime objects that constitute one active supervised host
+-- stack. Built fresh on each open; torn down on close. The
+-- supervisor adapter holds exactly one of these in its IORef at any
+-- time. This type is route-agnostic — every supervised route
+-- (stopped-audio, preserving, try-preserving) threads the same
+-- 'ReloadHostStack' value through the adapter; only the in-window
+-- slot's behavior varies.
 --
--- @sahsConfig@ carries the live runtime references (the
+-- @rhsConfig@ carries the live runtime references (the
 -- 'SessionFanInService', the ingress manager, the audio FFI, the
 -- ingress targets, and the event hook).
 --
@@ -166,9 +175,9 @@ import           MetaSonic.Session.Owner                     (SessionOwnerOption
 -- read the stack for the next fallback. Keep plan ownership at
 -- the caller and rebuilds use whichever plan the supervisor was
 -- told to remember.
-newtype StoppedAudioHostStack target ingressIssue handle =
-  StoppedAudioHostStack
-    { sahsConfig :: ManifestReloadHostConfig target ingressIssue handle
+newtype ReloadHostStack target ingressIssue handle =
+  ReloadHostStack
+    { rhsConfig :: ManifestReloadHostConfig target ingressIssue handle
     }
 
 
@@ -194,22 +203,22 @@ data StoppedAudioHostStackOps target ingressIssue handle =
     { sahsoOpen
         :: !(MR.ManifestReloadPlan
               -> IO (Either
-                      (StoppedAudioHostStackOpenIssue ingressIssue)
-                      (StoppedAudioHostStack target ingressIssue handle)))
+                      (ReloadHostStackOpenIssue ingressIssue)
+                      (ReloadHostStack target ingressIssue handle)))
       -- ^ Build a fresh stack from the supplied plan. Per the
       -- 'HostStackFactory' contract the producer must clean up any
       -- partial state before returning 'Left'; the supervisor
       -- adapter calls this only on the rebuild path against the
       -- captured fallback plan.
     , sahsoClose
-        :: !(StoppedAudioHostStack target ingressIssue handle -> IO ())
+        :: !(ReloadHostStack target ingressIssue handle -> IO ())
       -- ^ Dispose a previously-opened stack: close ingress, stop
       -- audio, dispose the SessionFanInService and its host
       -- bracket. Best-effort; the supervisor adapter wraps the
       -- close path in 'mask_' so the atomic-take-then-close
       -- handoff is uninterruptible.
     , sahsoInWindowReload
-        :: !(StoppedAudioHostStack target ingressIssue handle
+        :: !(ReloadHostStack target ingressIssue handle
               -> MR.ManifestReloadPlan
               -> MR.ManifestReloadPlan
               -> IO (InWindowReloadOutcome
@@ -237,32 +246,35 @@ data StoppedAudioHostStackOps target ingressIssue handle =
     }
 
 
--- | Failures from 'sahsoOpen'. Mirrors the five resource-bearing
+-- | Failures from the substrate open path ('realOpen', driven by
+-- the route's open slot — e.g. 'sahsoOpen' for stopped-audio,
+-- 'pahsoOpen' for preserving). Mirrors the five resource-bearing
 -- side effects the production wiring performs (target projection,
 -- service setup, ingress open, audio start, and partial-cleanup
 -- rollback) so the supervisor's 'SupervisedReloadEscalated' payload
 -- carries actionable diagnostics when both the requested in-window
--- reload AND the rebuild fail.
-data StoppedAudioHostStackOpenIssue ingressIssue
-  = SahsoiServiceSetupFailed !SessionFanInServiceSetupIssue
+-- reload AND the rebuild fail. Route-agnostic — every supervised
+-- route's open issue threads through this ADT.
+data ReloadHostStackOpenIssue ingressIssue
+  = RhsoiServiceSetupFailed !SessionFanInServiceSetupIssue
     -- ^ 'openSessionFanInService' (or its bracketed counterpart)
     -- rejected the supplied template graph + service options. No
     -- resources were acquired; no rollback is needed.
-  | SahsoiAudioStartFailed !SessionFanInAudioIssue
+  | RhsoiAudioStartFailed !SessionFanInAudioIssue
     -- ^ Audio FFI start returned a non-zero error after the
     -- service and ingress were already constructed. The producer
     -- is responsible for disposing the service + ingress before
     -- returning this.
-  | SahsoiIngressOpenFailed !ingressIssue
+  | RhsoiIngressOpenFailed !ingressIssue
     -- ^ The listener/producer factory rejected the initial open.
     -- The producer is responsible for disposing the service
     -- before returning this.
-  | SahsoiIngressTargetProjectionFailed !ManifestMIDIProjectionIssue
+  | RhsoiIngressTargetProjectionFailed !ManifestMIDIProjectionIssue
     -- ^ 'manifestReloadIngressTargetFromPlan' rejected the
     -- supplied plan (duplicate MIDI CC mapping in the projection
     -- table). No resources were acquired; no rollback is needed.
-  | SahsoiPartialCleanupFailed
-      !(StoppedAudioHostStackOpenIssue ingressIssue)
+  | RhsoiPartialCleanupFailed
+      !(ReloadHostStackOpenIssue ingressIssue)
       !Text
     -- ^ A primary open failure triggered a rollback that itself
     -- failed (close-ingress returned 'Left', stop-audio threw,
@@ -271,7 +283,7 @@ data StoppedAudioHostStackOpenIssue ingressIssue
     -- must escalate to 'SupervisedReloadEscalated' on this — the
     -- stack is in an unknown partial state and a clean rebuild is
     -- the only safe recovery. The primary issue is never itself a
-    -- 'SahsoiPartialCleanupFailed' (rollback failures from a
+    -- 'RhsoiPartialCleanupFailed' (rollback failures from a
     -- rollback are folded into the outer cleanup-display text).
   deriving stock (Eq, Show)
 
@@ -287,7 +299,7 @@ data StoppedAudioHostStackIssue ingressIssue
     -- ^ In-window reload failed terminally; the supervisor will
     -- close the stack and attempt a rebuild from the captured
     -- fallback plan.
-  | SahsiOpen !(StoppedAudioHostStackOpenIssue ingressIssue)
+  | SahsiOpen !(ReloadHostStackOpenIssue ingressIssue)
     -- ^ The rebuild's 'sahsoOpen' against the fallback plan
     -- failed; the supervisor escalates with both causes preserved.
   deriving stock (Eq, Show)
@@ -340,7 +352,7 @@ data StoppedAudioHostStackIssue ingressIssue
 -- forces.
 realStoppedAudioInWindowReload
   :: ManifestReloadIngressTargetPolicy
-  -> StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle
+  -> ReloadHostStack ManifestReloadIngressTarget ingressIssue handle
   -> MR.ManifestReloadPlan
   -> MR.ManifestReloadPlan
   -> IO (InWindowReloadOutcome
@@ -363,7 +375,7 @@ realStoppedAudioInWindowReload policy stack fallback requested =
                 (MrhiPlanning
                   (MR.MriUnknownManifestDemo (MR.mrlpDemoKey fallback)))))
         Right oldTarget ->
-          let baseConfig = sahsConfig stack
+          let baseConfig = rhsConfig stack
               freshConfig = baseConfig
                 { mrhcOldIngressTarget = oldTarget
                 , mrhcNewIngressTarget = newTarget
@@ -404,7 +416,7 @@ mkStoppedAudioHostStackFactory
   :: StoppedAudioHostStackOps target ingressIssue handle
   -> HostStackFactory
        MR.ManifestReloadPlan
-       (StoppedAudioHostStack target ingressIssue handle)
+       (ReloadHostStack target ingressIssue handle)
        (StoppedAudioHostStackIssue ingressIssue)
 mkStoppedAudioHostStackFactory ops = HostStackFactory
   { hsfOpenStack      = fmap (first SahsiOpen) . sahsoOpen ops
@@ -415,8 +427,10 @@ mkStoppedAudioHostStackFactory ops = HostStackFactory
   }
 
 
--- | Producer-supplied inputs for the production
--- 'StoppedAudioHostStackOps'.
+-- | Producer-supplied inputs for the substrate 'realOpen' /
+-- 'realClose' path, reused by every supervised route's production
+-- ops bundle ('realStoppedAudioHostStackOps',
+-- 'realPreservingHostStackOps', 'realTryPreservingHostStackOps').
 --
 -- These are the dependencies the production helper cannot derive
 -- from the supervisor's plan alone: the ingress ops bundle (OSC or
@@ -426,36 +440,36 @@ mkStoppedAudioHostStackFactory ops = HostStackFactory
 --
 -- The supervisor adapter holds one of these for the lifetime of the
 -- supervised process; the helper closes over them when building the
--- 'StoppedAudioHostStackOps' record. The 'target' parameter is
--- locked to 'ManifestReloadIngressTarget' because the projection
--- helper only knows about that type; the @ingressIssue@ and @handle@
--- parameters stay polymorphic so OSC and MIDI ingress factories can
--- both reuse the helper.
-data RealStoppedAudioHostStackInputs ingressIssue handle =
-  RealStoppedAudioHostStackInputs
-    { rsahsiBuildIngressOps
+-- route-specific ops record. The 'target' parameter is locked to
+-- 'ManifestReloadIngressTarget' because the projection helper only
+-- knows about that type; the @ingressIssue@ and @handle@ parameters
+-- stay polymorphic so OSC and MIDI ingress factories can both reuse
+-- the helper.
+data RealReloadHostStackInputs ingressIssue handle =
+  RealReloadHostStackInputs
+    { rrhsiBuildIngressOps
         :: !(SessionFanInHost
               -> ManifestReloadIngressOps ManifestReloadIngressTarget ingressIssue handle)
       -- ^ Build the ingress ops bundle against the just-opened
       -- 'SessionFanInHost'. Production OSC / MIDI ingress ops
       -- close over the host (the listener thread forwards to it),
-      -- so they must be re-built fresh on every 'sahsoOpen' — the
+      -- so they must be re-built fresh on every 'realOpen' — the
       -- supervisor opens a new service on each rebuild, and the
       -- old host is gone by then. The factory makes that
       -- per-stack lifetime explicit.
-    , rsahsiIngressTargetPolicy
+    , rrhsiIngressTargetPolicy
         :: !ManifestReloadIngressTargetPolicy
-    , rsahsiAudioFFI
+    , rrhsiAudioFFI
         :: !SessionFanInAudioFFI
-    , rsahsiAudioOptions
+    , rrhsiAudioOptions
         :: !SessionFanInAudioOptions
-    , rsahsiOwnerOptions
+    , rrhsiOwnerOptions
         :: !SessionOwnerOptions
-    , rsahsiServiceOptions
+    , rrhsiServiceOptions
         :: !SessionFanInServiceOptions
-    , rsahsiServiceHooks
+    , rrhsiServiceHooks
         :: !SessionFanInServiceHooks
-    , rsahsiOnEvent
+    , rrhsiOnEvent
         :: !(ManifestReloadEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
     }
 
@@ -470,7 +484,7 @@ data RealStoppedAudioHostStackInputs ingressIssue handle =
 -- Partial-cleanup contract: if a primary open failure triggers
 -- rollback (close-ingress / stop-audio / close-service) and the
 -- rollback itself fails (returns 'Left', throws, or both), the
--- primary issue is wrapped in 'SahsoiPartialCleanupFailed' with a
+-- primary issue is wrapped in 'RhsoiPartialCleanupFailed' with a
 -- textual rollback diagnostic. The supervisor escalates on that
 -- variant; a clean rebuild is the only safe recovery.
 --
@@ -479,17 +493,18 @@ data RealStoppedAudioHostStackInputs ingressIssue handle =
 -- plan is the source of truth (no silent re-planning).
 realStoppedAudioHostStackOps
   :: Show ingressIssue
-  => RealStoppedAudioHostStackInputs ingressIssue handle
+  => RealReloadHostStackInputs ingressIssue handle
   -> StoppedAudioHostStackOps ManifestReloadIngressTarget ingressIssue handle
 realStoppedAudioHostStackOps inputs = StoppedAudioHostStackOps
   { sahsoOpen           = realOpen inputs
   , sahsoClose          = realClose
   , sahsoInWindowReload =
-      realStoppedAudioInWindowReload (rsahsiIngressTargetPolicy inputs)
+      realStoppedAudioInWindowReload (rrhsiIngressTargetPolicy inputs)
   }
 
 
--- | Forward open path for 'realStoppedAudioHostStackOps'.
+-- | Forward open path used by every supervised route's production
+-- ops bundle (wired through 'sahsoOpen' / 'pahsoOpen' / 'tpahsoOpen').
 --
 -- Exception-safety: every acquired resource is wrapped in an
 -- 'onException' handler before the next step runs, so an
@@ -512,25 +527,25 @@ realStoppedAudioHostStackOps inputs = StoppedAudioHostStackOps
 -- 'ManifestReloadIngressOps' with a raw-handle close.
 realOpen
   :: Show ingressIssue
-  => RealStoppedAudioHostStackInputs ingressIssue handle
+  => RealReloadHostStackInputs ingressIssue handle
   -> MR.ManifestReloadPlan
   -> IO (Either
-          (StoppedAudioHostStackOpenIssue ingressIssue)
-          (StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle))
+          (ReloadHostStackOpenIssue ingressIssue)
+          (ReloadHostStack ManifestReloadIngressTarget ingressIssue handle))
 realOpen inputs plan = mask $ \restore ->
   case manifestReloadIngressTargetFromPlan
-         (rsahsiIngressTargetPolicy inputs)
+         (rrhsiIngressTargetPolicy inputs)
          plan of
     Left projIssue ->
-      pure (Left (SahsoiIngressTargetProjectionFailed projIssue))
+      pure (Left (RhsoiIngressTargetProjectionFailed projIssue))
     Right target -> do
       serviceResult <- restore $ openSessionFanInServiceHooks
-        (rsahsiServiceHooks inputs)
+        (rrhsiServiceHooks inputs)
         (MR.mrlpTemplateGraph plan)
-        (rsahsiServiceOptions inputs)
+        (rrhsiServiceOptions inputs)
       case serviceResult of
         Left issue ->
-          pure (Left (SahsoiServiceSetupFailed issue))
+          pure (Left (RhsoiServiceSetupFailed issue))
         Right service ->
           openIngressAndStartAudio restore inputs target service
             `onException` closeSessionFanInService service
@@ -543,21 +558,21 @@ realOpen inputs plan = mask $ \restore ->
 openIngressAndStartAudio
   :: Show ingressIssue
   => (forall a. IO a -> IO a)
-  -> RealStoppedAudioHostStackInputs ingressIssue handle
+  -> RealReloadHostStackInputs ingressIssue handle
   -> ManifestReloadIngressTarget
   -> SessionFanInService
   -> IO (Either
-          (StoppedAudioHostStackOpenIssue ingressIssue)
-          (StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle))
+          (ReloadHostStackOpenIssue ingressIssue)
+          (ReloadHostStack ManifestReloadIngressTarget ingressIssue handle))
 openIngressAndStartAudio restore inputs target service = do
-  let ingressOps = rsahsiBuildIngressOps
+  let ingressOps = rrhsiBuildIngressOps
         inputs
         (sessionFanInServiceHost service)
   ingressResult <- restore $ mrioOpenIngress ingressOps target
   case ingressResult of
     Left issue ->
       rollbackIngressOpen
-        (SahsoiIngressOpenFailed issue)
+        (RhsoiIngressOpenFailed issue)
         service
     Right initialHandle -> do
       ingressManager <- newManifestReloadIngressManager
@@ -569,55 +584,55 @@ openIngressAndStartAudio restore inputs target service = do
               `onException` void (closeManifestReloadIngress ingressManager)
       withIngressCleanup $ do
         audioResult <- restore $ startSessionFanInHostAudioWith
-          (rsahsiAudioFFI inputs)
+          (rrhsiAudioFFI inputs)
           (sessionFanInServiceHost service)
-          (rsahsiAudioOptions inputs)
+          (rrhsiAudioOptions inputs)
         case audioResult of
           Left issue ->
             rollbackAudioStart
-              (SahsoiAudioStartFailed issue)
+              (RhsoiAudioStartFailed issue)
               service
               ingressManager
           Right () ->
             pure $ Right (mkStack inputs target service ingressManager)
 
 
--- | Build the 'StoppedAudioHostStack' value from a fully-acquired
+-- | Build the 'ReloadHostStack' value from a fully-acquired
 -- resource set. Both 'mrhcOldIngressTarget' and 'mrhcNewIngressTarget'
 -- carry the projection of the install-time plan; the supervisor
 -- routing slice (step 4) is responsible for re-projecting both on
 -- each subsequent in-window reload so a cached @newTarget@ cannot
 -- drift away from the supervisor's current plan.
 mkStack
-  :: RealStoppedAudioHostStackInputs ingressIssue handle
+  :: RealReloadHostStackInputs ingressIssue handle
   -> ManifestReloadIngressTarget
   -> SessionFanInService
   -> ManifestReloadIngressManager ManifestReloadIngressTarget ingressIssue handle
-  -> StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle
-mkStack inputs target service ingressManager = StoppedAudioHostStack
+  -> ReloadHostStack ManifestReloadIngressTarget ingressIssue handle
+mkStack inputs target service ingressManager = ReloadHostStack
   ManifestReloadHostConfig
     { mrhcService          = service
     , mrhcIngressManager   = ingressManager
     , mrhcOldIngressTarget = target
     , mrhcNewIngressTarget = target
-    , mrhcAudioFFI         = rsahsiAudioFFI inputs
-    , mrhcAudioOptions     = rsahsiAudioOptions inputs
-    , mrhcOwnerOptions     = rsahsiOwnerOptions inputs
-    , mrhcOnEvent          = rsahsiOnEvent inputs
+    , mrhcAudioFFI         = rrhsiAudioFFI inputs
+    , mrhcAudioOptions     = rrhsiAudioOptions inputs
+    , mrhcOwnerOptions     = rrhsiOwnerOptions inputs
+    , mrhcOnEvent          = rrhsiOnEvent inputs
     }
 
 
 -- | Rollback path when ingress open fails. Only the service has
 -- been opened, so cleanup closes just the service.
 rollbackIngressOpen
-  :: StoppedAudioHostStackOpenIssue ingressIssue
+  :: ReloadHostStackOpenIssue ingressIssue
   -> SessionFanInService
-  -> IO (Either (StoppedAudioHostStackOpenIssue ingressIssue) a)
+  -> IO (Either (ReloadHostStackOpenIssue ingressIssue) a)
 rollbackIngressOpen primary service = do
   closeResult <- try @SomeException (closeSessionFanInService service)
   pure $ Left $ case closeResult of
     Left ex ->
-      SahsoiPartialCleanupFailed
+      RhsoiPartialCleanupFailed
         primary
         (T.pack ("service close threw: " <> show ex))
     Right () ->
@@ -629,16 +644,16 @@ rollbackIngressOpen primary service = do
 -- whether an earlier step failed, so a throw from
 -- 'closeManifestReloadIngress' cannot leave the service open.
 -- The strongest / first diagnostic is surfaced through
--- 'SahsoiPartialCleanupFailed'. Priority order: ingress-close
+-- 'RhsoiPartialCleanupFailed'. Priority order: ingress-close
 -- threw, then ingress-close returned 'Left', then service-close
 -- threw. If both succeeded, the original 'primary' issue is
 -- returned untouched.
 rollbackAudioStart
   :: Show ingressIssue
-  => StoppedAudioHostStackOpenIssue ingressIssue
+  => ReloadHostStackOpenIssue ingressIssue
   -> SessionFanInService
   -> ManifestReloadIngressManager ManifestReloadIngressTarget ingressIssue handle
-  -> IO (Either (StoppedAudioHostStackOpenIssue ingressIssue) a)
+  -> IO (Either (ReloadHostStackOpenIssue ingressIssue) a)
 rollbackAudioStart primary service ingressManager = do
   ingressResult <- try @SomeException
     (closeManifestReloadIngress ingressManager)
@@ -648,20 +663,21 @@ rollbackAudioStart primary service ingressManager = do
     (Right (Right ()), Right ()) ->
       primary
     (Left ex, _) ->
-      SahsoiPartialCleanupFailed
+      RhsoiPartialCleanupFailed
         primary
         (T.pack ("ingress close threw: " <> show ex))
     (Right (Left ingressErr), _) ->
-      SahsoiPartialCleanupFailed
+      RhsoiPartialCleanupFailed
         primary
         (T.pack ("ingress close: " <> show ingressErr))
     (_, Left ex) ->
-      SahsoiPartialCleanupFailed
+      RhsoiPartialCleanupFailed
         primary
         (T.pack ("service close threw: " <> show ex))
 
 
--- | Forward close path for 'realStoppedAudioHostStackOps'.
+-- | Forward close path used by every supervised route's production
+-- ops bundle (wired through 'sahsoClose' / 'pahsoClose' / 'tpahsoClose').
 --
 -- Reverse order: stop audio → close ingress → close service.
 -- Every step is attempted regardless of whether an earlier step
@@ -674,10 +690,10 @@ rollbackAudioStart primary service ingressManager = do
 -- terminal cleanup failure, which matches the §238 #9 "close
 -- before propagation" invariant.
 realClose
-  :: StoppedAudioHostStack ManifestReloadIngressTarget ingressIssue handle
+  :: ReloadHostStack ManifestReloadIngressTarget ingressIssue handle
   -> IO ()
 realClose stack = do
-  let config = sahsConfig stack
+  let config = rhsConfig stack
       service = mrhcService config
   audioEx <- attemptUnit $ void $ stopSessionFanInHostAudioWith
     (mrhcAudioFFI config)
@@ -749,7 +765,7 @@ data SupervisedStoppedAudioReloadResult ingressIssue
 -- supervised path's rebuild issues.
 runSupervisedStoppedAudioReload
   :: Show ingressIssue
-  => RealStoppedAudioHostStackInputs ingressIssue handle
+  => RealReloadHostStackInputs ingressIssue handle
   -> MR.ManifestReloadPlan  -- ^ fallback (currently-running plan)
   -> MR.ManifestReloadPlan  -- ^ requested (new plan)
   -> IO (Either

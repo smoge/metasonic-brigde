@@ -461,7 +461,7 @@ appManifestReloadCliTests =
       $ do
       -- Regression test for the §219 slice-4 partial-cleanup
       -- diagnostic preservation. The previous CLI mapping
-      -- collapsed 'SahsoiPartialCleanupFailed' back to its
+      -- collapsed 'RhsoiPartialCleanupFailed' back to its
       -- primary cause, hiding the rollback-also-failed signal
       -- that warns the operator the host stack may be in an
       -- unknown state. After the fix in this slice, the

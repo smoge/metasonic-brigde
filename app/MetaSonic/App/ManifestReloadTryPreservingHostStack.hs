@@ -35,9 +35,10 @@
 -- The open and close paths are reused unchanged from
 -- "MetaSonic.App.ManifestReloadHostStack" — both preserving and
 -- stopped-audio routes need the same audio-bearing lifecycle
--- (open service + audio + ingress; close in reverse). The
--- 'StoppedAudio'-prefixed names exposed by that module are
--- aliased here under neutral 'TryPreserving'-prefixed names.
+-- (open service + audio + ingress; close in reverse). The substrate
+-- ('ReloadHostStack', 'ReloadHostStackOpenIssue', 'realOpen',
+-- 'realClose', 'RealReloadHostStackInputs') is imported from that
+-- module directly.
 --
 -- Strategy-level events ('MreStrategyStarted',
 -- 'MreStrategySucceeded', 'MreStrategyFailed') are NOT emitted
@@ -59,12 +60,15 @@
 -- it is not on the critical path for the audible-route work.
 module MetaSonic.App.ManifestReloadTryPreservingHostStack
   ( -- * Types
-    TryPreservingHostStack
-  , TryPreservingHostStackOpenIssue
-  , TryPreservingHostStackOps (..)
+    --
+    -- The substrate stack value 'ReloadHostStack', its open-issue ADT
+    -- 'ReloadHostStackOpenIssue', and the production-input record
+    -- 'RealReloadHostStackInputs' live in
+    -- "MetaSonic.App.ManifestReloadHostStack" because the open / close
+    -- lifecycle is route-agnostic. Import them from there.
+    TryPreservingHostStackOps (..)
   , TryPreservingHostStackIssue (..)
   , TryPreservingInWindowIssue (..)
-  , RealTryPreservingHostStackInputs
     -- * Pure cores (testable without IO)
   , TryPreservingNext (..)
   , decideTryPreservingNext
@@ -81,9 +85,9 @@ import           Data.Bifunctor                              (first)
 import           MetaSonic.App.ManifestReloadEvent           (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost            (preservingAllowsStoppedAudioFallback)
 import           MetaSonic.App.ManifestReloadHost.Types      (ManifestReloadHostIssue)
-import           MetaSonic.App.ManifestReloadHostStack       (RealStoppedAudioHostStackInputs (..),
-                                                              StoppedAudioHostStack (..),
-                                                              StoppedAudioHostStackOpenIssue,
+import           MetaSonic.App.ManifestReloadHostStack       (RealReloadHostStackInputs (..),
+                                                              ReloadHostStack (..),
+                                                              ReloadHostStackOpenIssue,
                                                               realClose, realOpen,
                                                               realStoppedAudioInWindowReload)
 import           MetaSonic.App.ManifestReloadIngressTarget   (ManifestReloadIngressTarget,
@@ -98,24 +102,6 @@ import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                                              (HostStackFactory (..))
 import qualified MetaSonic.Session.ManifestReload            as MR
 import           MetaSonic.Session.Queue                     (ProducerId)
-
-
--- | Stack value the supervisor adapter threads through try-preserving
--- reloads. Same shape as 'StoppedAudioHostStack' (and as
--- 'PreservingHostStack'); the underlying value is just a newtype
--- around 'ManifestReloadHostConfig'.
-type TryPreservingHostStack = StoppedAudioHostStack
-
-
--- | Open-time failure variants. Same shape as the stopped-audio
--- equivalent because the open path is shared.
-type TryPreservingHostStackOpenIssue = StoppedAudioHostStackOpenIssue
-
-
--- | Inputs to 'realTryPreservingHostStackOps'. Aliased to the
--- stopped-audio inputs record because the open / close machinery is
--- route-agnostic.
-type RealTryPreservingHostStackInputs = RealStoppedAudioHostStackInputs
 
 
 -- | Discriminated cause for the try-preserving in-window slot.
@@ -156,16 +142,16 @@ data TryPreservingHostStackOps target ingressIssue handle =
     { tpahsoOpen
         :: !(MR.ManifestReloadPlan
               -> IO (Either
-                      (TryPreservingHostStackOpenIssue ingressIssue)
-                      (TryPreservingHostStack target ingressIssue handle)))
+                      (ReloadHostStackOpenIssue ingressIssue)
+                      (ReloadHostStack target ingressIssue handle)))
       -- ^ Build a fresh stack from the supplied plan. Same
       -- contract as the other two routes' open slots.
     , tpahsoClose
-        :: !(TryPreservingHostStack target ingressIssue handle -> IO ())
+        :: !(ReloadHostStack target ingressIssue handle -> IO ())
       -- ^ Dispose a previously-opened stack. Best-effort under
       -- 'mask_' per the adapter contract.
     , tpahsoInWindowReload
-        :: !(TryPreservingHostStack target ingressIssue handle
+        :: !(ReloadHostStack target ingressIssue handle
               -> MR.ManifestReloadPlan
               -> MR.ManifestReloadPlan
               -> IO (InWindowReloadOutcome
@@ -186,7 +172,7 @@ data TryPreservingHostStackIssue ingressIssue
     -- ^ In-window reload returned a classified non-Committed
     -- outcome. Carries the discriminated 'TryPreservingInWindow
     -- Issue' (see its Haddock for the three sub-branches).
-  | TpahsiOpen !(TryPreservingHostStackOpenIssue ingressIssue)
+  | TpahsiOpen !(ReloadHostStackOpenIssue ingressIssue)
     -- ^ The rebuild's 'tpahsoOpen' against the fallback plan
     -- failed; the supervisor escalates with both causes
     -- preserved.
@@ -322,7 +308,7 @@ realTryPreservingInWindowReload
   => (ManifestReloadEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
   -> ProducerId
   -> ManifestReloadIngressTargetPolicy
-  -> TryPreservingHostStack ManifestReloadIngressTarget ingressIssue handle
+  -> ReloadHostStack ManifestReloadIngressTarget ingressIssue handle
   -> MR.ManifestReloadPlan
   -> MR.ManifestReloadPlan
   -> IO (InWindowReloadOutcome
@@ -356,23 +342,23 @@ realTryPreservingInWindowReload onEvent producer policy stack fallback requested
 -- the preserving + stopped-audio helpers under the
 -- 'decideTryPreservingNext' policy.
 --
--- The event sink is read off the inputs' 'rsahsiOnEvent' field so
+-- The event sink is read off the inputs' 'rrhsiOnEvent' field so
 -- 'MreFallbackAdmitted' / 'MreFallbackDeclined' reach the same
 -- destination as the phase events. Strategy-frame events are not
 -- emitted here.
 realTryPreservingHostStackOps
   :: Show ingressIssue
   => ProducerId
-  -> RealTryPreservingHostStackInputs ingressIssue handle
+  -> RealReloadHostStackInputs ingressIssue handle
   -> TryPreservingHostStackOps ManifestReloadIngressTarget ingressIssue handle
 realTryPreservingHostStackOps producer inputs = TryPreservingHostStackOps
   { tpahsoOpen           = realOpen inputs
   , tpahsoClose          = realClose
   , tpahsoInWindowReload =
       realTryPreservingInWindowReload
-        (rsahsiOnEvent inputs)
+        (rrhsiOnEvent inputs)
         producer
-        (rsahsiIngressTargetPolicy inputs)
+        (rrhsiIngressTargetPolicy inputs)
   }
 
 
@@ -384,7 +370,7 @@ mkTryPreservingHostStackFactory
   :: TryPreservingHostStackOps target ingressIssue handle
   -> HostStackFactory
        MR.ManifestReloadPlan
-       (TryPreservingHostStack target ingressIssue handle)
+       (ReloadHostStack target ingressIssue handle)
        (TryPreservingHostStackIssue ingressIssue)
 mkTryPreservingHostStackFactory ops = HostStackFactory
   { hsfOpenStack      = fmap (first TpahsiOpen) . tpahsoOpen ops

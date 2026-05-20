@@ -40,11 +40,14 @@
 -- its own migration slice opens.
 module MetaSonic.App.ManifestReloadPreservingHostStack
   ( -- * Types
-    PreservingHostStack
-  , PreservingHostStackOpenIssue
-  , PreservingHostStackOps (..)
+    --
+    -- The substrate stack value 'ReloadHostStack', its open-issue ADT
+    -- 'ReloadHostStackOpenIssue', and the production-input record
+    -- 'RealReloadHostStackInputs' live in
+    -- "MetaSonic.App.ManifestReloadHostStack" because the open / close
+    -- lifecycle is route-agnostic. Import them from there.
+    PreservingHostStackOps (..)
   , PreservingHostStackIssue (..)
-  , RealPreservingHostStackInputs
     -- * Classification policy
   , classifyPreservingOutcome
     -- * Production wiring
@@ -58,9 +61,9 @@ import           Data.Bifunctor                              (first)
 import           MetaSonic.App.ManifestReloadHost            (ManifestReloadHostConfig (..),
                                                               manifestPreservingReloadHostOps)
 import           MetaSonic.App.ManifestReloadHost.Types      (ManifestReloadHostIssue (..))
-import           MetaSonic.App.ManifestReloadHostStack       (RealStoppedAudioHostStackInputs (..),
-                                                              StoppedAudioHostStack (..),
-                                                              StoppedAudioHostStackOpenIssue,
+import           MetaSonic.App.ManifestReloadHostStack       (RealReloadHostStackInputs (..),
+                                                              ReloadHostStack (..),
+                                                              ReloadHostStackOpenIssue,
                                                               realClose, realOpen)
 import           MetaSonic.App.ManifestReloadIngressTarget   (ManifestReloadIngressTarget,
                                                               ManifestReloadIngressTargetPolicy,
@@ -78,35 +81,20 @@ import qualified MetaSonic.Session.ManifestReload            as MR
 import           MetaSonic.Session.Queue                     (ProducerId)
 
 
--- | Stack value the supervisor adapter threads through preserving
--- reloads. Reuses 'StoppedAudioHostStack' under the hood: the value
--- is just a newtype around 'ManifestReloadHostConfig' and carries no
--- route-specific state. The alias documents the role at this layer.
-type PreservingHostStack = StoppedAudioHostStack
-
-
--- | Failures from 'pahsoOpen'. Same shape as the stopped-audio
--- equivalent because the open path is shared.
-type PreservingHostStackOpenIssue = StoppedAudioHostStackOpenIssue
-
-
--- | Inputs to 'realPreservingHostStackOps'. Same record as the
--- stopped-audio production wiring uses, exposed under the
--- preserving-side name so callers do not have to import the
--- stopped-audio-named identifier just to spin up a preserving stack.
-type RealPreservingHostStackInputs = RealStoppedAudioHostStackInputs
-
-
 -- | Producer-defined slots for the preserving host stack. Mirrors
 -- 'MetaSonic.App.ManifestReloadHostStack.StoppedAudioHostStackOps'
 -- shape; only the in-window slot's classification machinery differs.
+-- The stack value, the open-issue ADT, and the production-input
+-- record are reused unchanged from
+-- "MetaSonic.App.ManifestReloadHostStack" because the open / close
+-- lifecycle is route-agnostic.
 data PreservingHostStackOps target ingressIssue handle =
   PreservingHostStackOps
     { pahsoOpen
         :: !(MR.ManifestReloadPlan
               -> IO (Either
-                      (PreservingHostStackOpenIssue ingressIssue)
-                      (PreservingHostStack target ingressIssue handle)))
+                      (ReloadHostStackOpenIssue ingressIssue)
+                      (ReloadHostStack target ingressIssue handle)))
       -- ^ Build a fresh stack from the supplied plan. Same contract
       -- as the stopped-audio open: 'Right' means the stack is ready
       -- to serve commands; 'Left' means construction failed
@@ -115,13 +103,13 @@ data PreservingHostStackOps target ingressIssue handle =
       -- open and on the supervisor's rebuild path against the
       -- captured fallback plan.
     , pahsoClose
-        :: !(PreservingHostStack target ingressIssue handle -> IO ())
+        :: !(ReloadHostStack target ingressIssue handle -> IO ())
       -- ^ Dispose a previously-opened stack. Same best-effort
       -- contract as the stopped-audio close: the adapter wraps
       -- this in @mask_@ so the atomic-take-then-close handoff is
       -- uninterruptible.
     , pahsoInWindowReload
-        :: !(PreservingHostStack target ingressIssue handle
+        :: !(ReloadHostStack target ingressIssue handle
               -> MR.ManifestReloadPlan
               -> MR.ManifestReloadPlan
               -> IO (InWindowReloadOutcome
@@ -176,7 +164,7 @@ data PreservingHostStackIssue ingressIssue
     -- 'InWindowReloadOutcome', so the cause-payload constructor
     -- tag is route-uniform and the supervisor's outcome variant
     -- communicates the branch.
-  | PahsiOpen !(PreservingHostStackOpenIssue ingressIssue)
+  | PahsiOpen !(ReloadHostStackOpenIssue ingressIssue)
     -- ^ The rebuild's 'pahsoOpen' against the fallback plan
     -- failed; the supervisor escalates with both causes preserved.
   deriving stock (Eq, Show)
@@ -280,7 +268,7 @@ classifyPreservingOutcome issue =
 realPreservingInWindowReload
   :: ProducerId
   -> ManifestReloadIngressTargetPolicy
-  -> PreservingHostStack ManifestReloadIngressTarget ingressIssue handle
+  -> ReloadHostStack ManifestReloadIngressTarget ingressIssue handle
   -> MR.ManifestReloadPlan
   -> MR.ManifestReloadPlan
   -> IO (InWindowReloadOutcome
@@ -299,7 +287,7 @@ realPreservingInWindowReload producer policy stack fallback requested =
             (MrhiPlanning
               (MR.MriUnknownManifestDemo (MR.mrlpDemoKey fallback)))
         Right oldTarget ->
-          let baseConfig = sahsConfig stack
+          let baseConfig = rhsConfig stack
               freshConfig = baseConfig
                 { mrhcOldIngressTarget = oldTarget
                 , mrhcNewIngressTarget = newTarget
@@ -345,13 +333,13 @@ realPreservingInWindowReload producer policy stack fallback requested =
 realPreservingHostStackOps
   :: Show ingressIssue
   => ProducerId
-  -> RealPreservingHostStackInputs ingressIssue handle
+  -> RealReloadHostStackInputs ingressIssue handle
   -> PreservingHostStackOps ManifestReloadIngressTarget ingressIssue handle
 realPreservingHostStackOps producer inputs = PreservingHostStackOps
   { pahsoOpen           = realOpen inputs
   , pahsoClose          = realClose
   , pahsoInWindowReload =
-      realPreservingInWindowReload producer (rsahsiIngressTargetPolicy inputs)
+      realPreservingInWindowReload producer (rrhsiIngressTargetPolicy inputs)
   }
 
 
@@ -364,7 +352,7 @@ mkPreservingHostStackFactory
   :: PreservingHostStackOps target ingressIssue handle
   -> HostStackFactory
        MR.ManifestReloadPlan
-       (PreservingHostStack target ingressIssue handle)
+       (ReloadHostStack target ingressIssue handle)
        (PreservingHostStackIssue ingressIssue)
 mkPreservingHostStackFactory ops = HostStackFactory
   { hsfOpenStack      = fmap (first PahsiOpen) . pahsoOpen ops

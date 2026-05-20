@@ -46,8 +46,8 @@ import           Test.Tasty.HUnit
 import           MetaSonic.App.ManifestReloadHost.Types
                                    (ManifestReloadHostIssue (..))
 import           MetaSonic.App.ManifestReloadHostStack
-                                   (StoppedAudioHostStack (..),
-                                    StoppedAudioHostStackOpenIssue (..))
+                                   (ReloadHostStack (..),
+                                    ReloadHostStackOpenIssue (..))
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                    (HostPreservingReloadIssue (..),
                                     HostStoppedAudioReloadIssue (..))
@@ -79,7 +79,7 @@ import           MetaSonic.Session.RTGraphAdapter
 
 -- | Type instantiation: 'ingressIssue' = 'String'; 'target' = '()',
 -- 'handle' = '()'.
-type TestStack = StoppedAudioHostStack () String ()
+type TestStack = ReloadHostStack () String ()
 
 
 -- | Outcome alias matching the try-preserving in-window slot's
@@ -100,7 +100,7 @@ data StackCall
 data FakeStackPlan = FakeStackPlan
   { fspOpenBehavior
       :: !(MR.ManifestReloadPlan
-            -> IO (Either (StoppedAudioHostStackOpenIssue String) ()))
+            -> IO (Either (ReloadHostStackOpenIssue String) ()))
   , fspInWindowBehavior
       :: !(MR.ManifestReloadPlan -> IO TestInWindowOutcome)
   }
@@ -130,10 +130,10 @@ mkFakeOps traceRef plans = TryPreservingHostStackOps
 -- override 'tpahsoInWindowReload' with a fake, so the config
 -- field is never forced.
 stubStack :: TestStack
-stubStack = StoppedAudioHostStack
-  { sahsConfig =
+stubStack = ReloadHostStack
+  { rhsConfig =
       error
-        "test placeholder: sahsConfig is intentionally undefined; \
+        "test placeholder: rhsConfig is intentionally undefined; \
         \fakes override tpahsoInWindowReload so the config is never read"
   }
 
@@ -154,7 +154,7 @@ planA = mkPlan "fallback"
 planB = mkPlan "requested"
 
 
-openOk :: MR.ManifestReloadPlan -> IO (Either (StoppedAudioHostStackOpenIssue String) ())
+openOk :: MR.ManifestReloadPlan -> IO (Either (ReloadHostStackOpenIssue String) ())
 openOk _ = pure (Right ())
 
 
@@ -457,7 +457,7 @@ factoryCompositionTests =
       -- tpahsoOpen against the fallback plan also returns Left.
       traceRef <- newIORef []
       let openFails _plan =
-            pure (Left (SahsoiIngressOpenFailed "rebuild-broke"))
+            pure (Left (RhsoiIngressOpenFailed "rebuild-broke"))
           ops = mkFakeOps traceRef FakeStackPlan
             { fspOpenBehavior     = openFails
             , fspInWindowBehavior = inWindowPreservingTerminal
@@ -473,7 +473,7 @@ factoryCompositionTests =
           (TpahsiInWindow
             (TpiwiPreservingTerminal
               (HpariReloadFailedTerminal (MrhiIngress "preserving-terminal"))))
-          (TpahsiOpen (SahsoiIngressOpenFailed "rebuild-broke"))
+          (TpahsiOpen (RhsoiIngressOpenFailed "rebuild-broke"))
       trace @?=
         [ InWindowCalled (MR.mrlpDemoKey planB)
         , CloseCalled

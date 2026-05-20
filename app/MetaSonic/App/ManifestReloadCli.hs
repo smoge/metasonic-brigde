@@ -74,10 +74,10 @@ import           MetaSonic.App.ManifestReloadOSCBinding
 import           MetaSonic.App.ManifestReloadEvent
                                                   (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHostStack
-                                                  (RealStoppedAudioHostStackInputs (..),
-                                                   StoppedAudioHostStack (..),
+                                                  (RealReloadHostStackInputs (..),
+                                                   ReloadHostStack (..),
                                                    StoppedAudioHostStackIssue (..),
-                                                   StoppedAudioHostStackOpenIssue (..),
+                                                   ReloadHostStackOpenIssue (..),
                                                    SupervisedStoppedAudioReloadResult (..),
                                                    mkStoppedAudioHostStackFactory,
                                                    realStoppedAudioHostStackOps)
@@ -177,13 +177,13 @@ data ManifestReloadCliIssue
     -- 'MrciSupervisedPartialCleanupFailed' — the recursion is
     -- bounded by construction in 'mapSupervisedOpenIssue'). The
     -- second field is the textual rollback diagnostic emitted
-    -- by 'SahsoiPartialCleanupFailed'. The operator should see
+    -- by 'RhsoiPartialCleanupFailed'. The operator should see
     -- both: the primary cause explains why open failed, and
     -- the cleanup diagnostic explains why the host stack is
     -- in an unknown state. Keeping this as its own variant
     -- (instead of collapsing back to the primary) preserves
     -- the manual-cleanup-may-be-required signal that the
-    -- 'SahsoiPartialCleanupFailed' constructor was designed to
+    -- 'RhsoiPartialCleanupFailed' constructor was designed to
     -- carry.
   deriving (Eq, Show)
 
@@ -273,7 +273,7 @@ data ManifestSupervisedStoppedAudioReloadSmokeResult =
                                     (ManifestReloadHostIssue
                                       ManifestOSCIngressOpsIssue)]
       -- ^ Orchestrator events captured via the inputs'
-      -- @rsahsiOnEvent@ sink. Note: this list does NOT include
+      -- @rrhsiOnEvent@ sink. Note: this list does NOT include
       -- the @strategy started@ / @strategy succeeded@ frame
       -- events that the direct 'reloadManifestHostWithStrategy'
       -- path emits, because the supervised path does not run
@@ -712,22 +712,22 @@ runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
                 defaultOSCProducerOptions
                 host
                 lcfg
-            inputs = RealStoppedAudioHostStackInputs
-              { rsahsiBuildIngressOps =
+            inputs = RealReloadHostStackInputs
+              { rrhsiBuildIngressOps =
                   buildIngressOps
-              , rsahsiIngressTargetPolicy =
+              , rrhsiIngressTargetPolicy =
                   manifestHostStrategySmokeIngressTargetPolicy
-              , rsahsiAudioFFI =
+              , rrhsiAudioFFI =
                   audioFFI
-              , rsahsiAudioOptions =
+              , rrhsiAudioOptions =
                   manifestHostStrategySmokeAudioOptions
-              , rsahsiOwnerOptions =
+              , rrhsiOwnerOptions =
                   defaultSessionOwnerOptions
-              , rsahsiServiceOptions =
+              , rrhsiServiceOptions =
                   defaultSessionFanInServiceOptions
-              , rsahsiServiceHooks =
+              , rrhsiServiceHooks =
                   defaultSessionFanInServiceHooks
-              , rsahsiOnEvent =
+              , rrhsiOnEvent =
                   appendSmokeReloadEvent reloadEventsRef
               }
             ops = realStoppedAudioHostStackOps inputs
@@ -748,7 +748,7 @@ runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
               withHostStackSupervisorAdapter factory initialStack $
                 \supOps -> restore $ do
                   pre <- readManifestReloadIngressManager
-                    (mrhcIngressManager (sahsConfig initialStack))
+                    (mrhcIngressManager (rhsConfig initialStack))
                   out <- reloadSupervised supOps fallbackPlan requestedPlan
                   pure (pre, out)
             audioEvents <- readIORef audioEventsRef
@@ -789,7 +789,7 @@ runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
 -- initial 'hsfOpenStack' call into a 'ManifestReloadCliIssue'
 -- the CLI surface already understands.
 --
--- 'SahsoiPartialCleanupFailed' is preserved as its own
+-- 'RhsoiPartialCleanupFailed' is preserved as its own
 -- 'MrciSupervisedPartialCleanupFailed' variant, NOT folded back
 -- into the primary cause. That constructor exists specifically
 -- to signal that the helper's rollback failed and the host
@@ -797,7 +797,7 @@ runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
 -- primary cause would hide the manual-cleanup-may-be-required
 -- condition from the operator. The recursion through
 -- 'mapOpenIssue' is bounded: by construction in
--- 'SahsoiPartialCleanupFailed' the primary is never itself
+-- 'RhsoiPartialCleanupFailed' the primary is never itself
 -- another partial-cleanup, so depth is at most one.
 --
 -- 'SahsiInWindow' is unreachable here (no in-window has run
@@ -815,22 +815,22 @@ mapSupervisedOpenIssue (SahsiInWindow _) =
 
 
 -- | Inner helper for 'mapSupervisedOpenIssue'. Kept as a
--- separate function so the 'SahsoiPartialCleanupFailed'
+-- separate function so the 'RhsoiPartialCleanupFailed'
 -- recursion is local and doesn't have to re-establish the
 -- 'SahsiOpen' wrapper at each step.
 mapOpenIssue
-  :: StoppedAudioHostStackOpenIssue ManifestOSCIngressOpsIssue
+  :: ReloadHostStackOpenIssue ManifestOSCIngressOpsIssue
   -> ManifestReloadCliIssue
 mapOpenIssue openIssue = case openIssue of
-  SahsoiServiceSetupFailed e ->
+  RhsoiServiceSetupFailed e ->
     MrciHostStrategySetupFailed e
-  SahsoiAudioStartFailed e ->
+  RhsoiAudioStartFailed e ->
     MrciHostStrategyAudioStartFailed e
-  SahsoiIngressOpenFailed e ->
+  RhsoiIngressOpenFailed e ->
     MrciOSCIngressOpenFailed e
-  SahsoiIngressTargetProjectionFailed e ->
+  RhsoiIngressTargetProjectionFailed e ->
     MrciIngressTargetFailed e
-  SahsoiPartialCleanupFailed primary diag ->
+  RhsoiPartialCleanupFailed primary diag ->
     MrciSupervisedPartialCleanupFailed (mapOpenIssue primary) diag
 
 
@@ -1224,15 +1224,15 @@ renderSupervisedHostStackIssue
 renderSupervisedHostStackIssue issue = case issue of
   SahsiInWindow _ ->
     "in-window orchestrator"
-  SahsiOpen (SahsoiServiceSetupFailed _) ->
+  SahsiOpen (RhsoiServiceSetupFailed _) ->
     "service setup"
-  SahsiOpen (SahsoiAudioStartFailed _) ->
+  SahsiOpen (RhsoiAudioStartFailed _) ->
     "audio start"
-  SahsiOpen (SahsoiIngressOpenFailed _) ->
+  SahsiOpen (RhsoiIngressOpenFailed _) ->
     "ingress open"
-  SahsiOpen (SahsoiIngressTargetProjectionFailed _) ->
+  SahsiOpen (RhsoiIngressTargetProjectionFailed _) ->
     "ingress target projection"
-  SahsiOpen (SahsoiPartialCleanupFailed _ _) ->
+  SahsiOpen (RhsoiPartialCleanupFailed _ _) ->
     "partial cleanup"
 
 

@@ -106,8 +106,8 @@ import           MetaSonic.App.ManifestReloadHost
                                                  ManifestReloadHostStrategy (..),
                                                  reloadManifestHostWithStrategyWithEvents)
 import           MetaSonic.App.ManifestReloadHostStack
-                                                (RealStoppedAudioHostStackInputs (..),
-                                                 StoppedAudioHostStack (..),
+                                                (RealReloadHostStackInputs (..),
+                                                 ReloadHostStack (..),
                                                  StoppedAudioHostStackIssue,
                                                  mkStoppedAudioHostStackFactory,
                                                  realStoppedAudioHostStackOps)
@@ -500,15 +500,15 @@ runSupervisedStoppedAudioLiveReload listenerCfg oldPlan newPlan oldTarget _newTa
           defaultOSCProducerOptions
           host
           listenerCfg
-      inputs = RealStoppedAudioHostStackInputs
-        { rsahsiBuildIngressOps     = buildIngressOps
-        , rsahsiIngressTargetPolicy = liveIngressTargetPolicy
-        , rsahsiAudioFFI            = defaultSessionFanInAudioFFI
-        , rsahsiAudioOptions        = liveAudioOptions
-        , rsahsiOwnerOptions        = defaultSessionOwnerOptions
-        , rsahsiServiceOptions      = defaultSessionFanInServiceOptions
-        , rsahsiServiceHooks        = defaultSessionFanInServiceHooks
-        , rsahsiOnEvent             =
+      inputs = RealReloadHostStackInputs
+        { rrhsiBuildIngressOps     = buildIngressOps
+        , rrhsiIngressTargetPolicy = liveIngressTargetPolicy
+        , rrhsiAudioFFI            = defaultSessionFanInAudioFFI
+        , rrhsiAudioOptions        = liveAudioOptions
+        , rrhsiOwnerOptions        = defaultSessionOwnerOptions
+        , rrhsiServiceOptions      = defaultSessionFanInServiceOptions
+        , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
+        , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
         }
       ops     = realStoppedAudioHostStackOps inputs
@@ -521,9 +521,9 @@ runSupervisedStoppedAudioLiveReload listenerCfg oldPlan newPlan oldTarget _newTa
           ("Supervised initial open failed: "
             <> renderSupervisedIssue issue)
       Right initialStack -> do
-        let initialService = mrhcService (sahsConfig initialStack)
+        let initialService = mrhcService (rhsConfig initialStack)
             initialIngressManager =
-              mrhcIngressManager (sahsConfig initialStack)
+              mrhcIngressManager (rhsConfig initialStack)
         _outcome <-
           withHostStackSupervisorAdapter factory initialStack $
             \supOps -> restore $ do
@@ -685,15 +685,15 @@ runSupervisedTryPreservingLiveReload listenerCfg oldPlan newPlan oldTarget _newT
           defaultOSCProducerOptions
           host
           listenerCfg
-      inputs = RealStoppedAudioHostStackInputs
-        { rsahsiBuildIngressOps     = buildIngressOps
-        , rsahsiIngressTargetPolicy = liveIngressTargetPolicy
-        , rsahsiAudioFFI            = defaultSessionFanInAudioFFI
-        , rsahsiAudioOptions        = liveAudioOptions
-        , rsahsiOwnerOptions        = defaultSessionOwnerOptions
-        , rsahsiServiceOptions      = defaultSessionFanInServiceOptions
-        , rsahsiServiceHooks        = defaultSessionFanInServiceHooks
-        , rsahsiOnEvent             =
+      inputs = RealReloadHostStackInputs
+        { rrhsiBuildIngressOps     = buildIngressOps
+        , rrhsiIngressTargetPolicy = liveIngressTargetPolicy
+        , rrhsiAudioFFI            = defaultSessionFanInAudioFFI
+        , rrhsiAudioOptions        = liveAudioOptions
+        , rrhsiOwnerOptions        = defaultSessionOwnerOptions
+        , rrhsiServiceOptions      = defaultSessionFanInServiceOptions
+        , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
+        , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
         }
       -- Reuse the same producer identity the direct path passes
@@ -714,9 +714,9 @@ runSupervisedTryPreservingLiveReload listenerCfg oldPlan newPlan oldTarget _newT
           ("Supervised initial open failed: "
             <> renderSupervisedIssue issue)
       Right initialStack -> do
-        let initialService = mrhcService (sahsConfig initialStack)
+        let initialService = mrhcService (rhsConfig initialStack)
             initialIngressManager =
-              mrhcIngressManager (sahsConfig initialStack)
+              mrhcIngressManager (rhsConfig initialStack)
         _outcome <-
           withHostStackSupervisorAdapter factory initialStack $
             \supOps -> restore $ do

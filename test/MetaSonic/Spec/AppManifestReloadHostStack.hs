@@ -13,7 +13,7 @@
 -- @HsariAudioRestartFailed@, @HsariListenerRestartFailed@)
 -- without staging real session-layer state.
 --
--- The 'sahsConfig' field on the test fakes is left as a deferred
+-- The 'rhsConfig' field on the test fakes is left as a deferred
 -- @error@ placeholder; tests verify by inspection that
 -- @sahsoInWindowReload@ never forces it (the in-window slot is
 -- overridden in every test) and the supervisor adapter never
@@ -81,10 +81,10 @@ import           MetaSonic.App.ManifestReloadHost
 import           MetaSonic.App.ManifestReloadHost.Types
                                          (ManifestReloadHostIssue (..))
 import           MetaSonic.App.ManifestReloadHostStack
-                                         (RealStoppedAudioHostStackInputs (..),
-                                          StoppedAudioHostStack (..),
+                                         (RealReloadHostStackInputs (..),
+                                          ReloadHostStack (..),
                                           StoppedAudioHostStackIssue (..),
-                                          StoppedAudioHostStackOpenIssue (..),
+                                          ReloadHostStackOpenIssue (..),
                                           StoppedAudioHostStackOps (..),
                                           SupervisedStoppedAudioReloadResult (..),
                                           mkStoppedAudioHostStackFactory,
@@ -126,7 +126,7 @@ import           MetaSonic.Session.RTGraphAdapter
 -- 'handle' parameters are '()' — none of them are inspected by
 -- the supervisor adapter or by the fake slots, so simple
 -- placeholders are enough.
-type TestStack = StoppedAudioHostStack () String ()
+type TestStack = ReloadHostStack () String ()
 
 
 -- | Trace of factory calls observed by the test fakes. The plan
@@ -144,7 +144,7 @@ data StackCall
 data FakeStackPlan = FakeStackPlan
   { fspOpenBehavior
       :: !(MR.ManifestReloadPlan
-            -> IO (Either (StoppedAudioHostStackOpenIssue String) ()))
+            -> IO (Either (ReloadHostStackOpenIssue String) ()))
   , fspInWindowBehavior
       :: !(MR.ManifestReloadPlan
             -> IO (InWindowReloadOutcome
@@ -155,7 +155,7 @@ data FakeStackPlan = FakeStackPlan
 
 -- | Build a fake 'StoppedAudioHostStackOps' that records every
 -- call to a shared trace. The open slot, on Right, mints a stack
--- whose 'sahsConfig' is a deferred 'error' (never forced by the
+-- whose 'rhsConfig' is a deferred 'error' (never forced by the
 -- supervisor adapter or the fake in-window slot). The plan that
 -- triggered each call is captured in the trace via its demo key
 -- so tests can assert which plan drove which slot — the stack
@@ -185,10 +185,10 @@ mkFakeOps traceRef plans = StoppedAudioHostStackOps
 -- value around without inspecting it; the fake @sahsoInWindowReload@
 -- never forces the config field; so the placeholder never blows up.
 stubStack :: TestStack
-stubStack = StoppedAudioHostStack
-  { sahsConfig =
+stubStack = ReloadHostStack
+  { rhsConfig =
       error
-        "test placeholder: sahsConfig is intentionally undefined; \
+        "test placeholder: rhsConfig is intentionally undefined; \
         \fakes override sahsoInWindowReload so the config is never read"
   }
 
@@ -212,12 +212,12 @@ planB = mkPlan "requested"
 
 
 -- | Convenient open behaviors.
-openOk :: MR.ManifestReloadPlan -> IO (Either (StoppedAudioHostStackOpenIssue String) ())
+openOk :: MR.ManifestReloadPlan -> IO (Either (ReloadHostStackOpenIssue String) ())
 openOk _ = pure (Right ())
 
-openFailsAudioStart :: MR.ManifestReloadPlan -> IO (Either (StoppedAudioHostStackOpenIssue String) ())
+openFailsAudioStart :: MR.ManifestReloadPlan -> IO (Either (ReloadHostStackOpenIssue String) ())
 openFailsAudioStart _ =
-  pure (Left (SahsoiAudioStartFailed (SfaiStartFailed (-1))))
+  pure (Left (RhsoiAudioStartFailed (SfaiStartFailed (-1))))
 
 
 -- | Convenient in-window behaviors keyed to specific named
@@ -386,7 +386,7 @@ factoryCompositionTests =
             (HsariReloadFailedNoOwner
               (MrhiIngress "owner-setup")))
           (SahsiOpen
-            (SahsoiAudioStartFailed (SfaiStartFailed (-1))))
+            (RhsoiAudioStartFailed (SfaiStartFailed (-1))))
       -- Trace: in-window, then close of the initial stack, then
       -- the open call that failed (no second close because there
       -- is no live stack at exit).
@@ -497,7 +497,7 @@ factoryCompositionTests =
       -- Re-pins the supervisor's §238 #2 "no remembered history"
       -- invariant at the production-shaped factory layer. The
       -- stack value carries no plan field (see the
-      -- 'StoppedAudioHostStack' Haddock); plan ownership is the
+      -- 'ReloadHostStack' Haddock); plan ownership is the
       -- caller's. The caller threads currentPlan -> fallback
       -- forward on each successful reload. After A->B->C both
       -- commit, a failed C->D must rebuild from C (the plan
@@ -557,7 +557,7 @@ factoryCompositionTests =
 -- partial-cleanup contract the production helper added in step 2:
 -- successful open, ingress-open failure, audio-start failure with
 -- clean rollback, and audio-start failure with ingress-close-also-
--- fails surfacing 'SahsoiPartialCleanupFailed'.
+-- fails surfacing 'RhsoiPartialCleanupFailed'.
 realProductionHelperTests :: TestTree
 realProductionHelperTests =
   testGroup "realStoppedAudioHostStackOps partial-cleanup paths"
@@ -583,7 +583,7 @@ realProductionHelperTests =
           closeCount @?= 1
 
   , testCase
-      "ingress-open failure returns Left SahsoiIngressOpenFailed (service rolled back)"
+      "ingress-open failure returns Left RhsoiIngressOpenFailed (service rolled back)"
       $ do
       ingressCloseCalls <- newIORef (0 :: Int)
       let inputs = mkProductionInputs
@@ -592,20 +592,20 @@ realProductionHelperTests =
           ops = realStoppedAudioHostStackOps inputs
       result <- sahsoOpen ops (mkPlan "demo-key")
       case result of
-        Left (SahsoiIngressOpenFailed "boom") -> do
+        Left (RhsoiIngressOpenFailed "boom") -> do
           -- Ingress never opened, so close-ingress was never called.
           closeCount <- readIORef ingressCloseCalls
           closeCount @?= 0
         Left other ->
           assertFailure
-            ("expected Left (SahsoiIngressOpenFailed \"boom\"), got Left: "
+            ("expected Left (RhsoiIngressOpenFailed \"boom\"), got Left: "
               <> show other)
         Right _stack ->
           assertFailure
-            "expected Left (SahsoiIngressOpenFailed \"boom\"), got Right"
+            "expected Left (RhsoiIngressOpenFailed \"boom\"), got Right"
 
   , testCase
-      "audio-start failure with clean ingress close returns Left SahsoiAudioStartFailed"
+      "audio-start failure with clean ingress close returns Left RhsoiAudioStartFailed"
       $ do
       ingressCloseCalls <- newIORef (0 :: Int)
       let inputs = mkProductionInputs
@@ -614,20 +614,20 @@ realProductionHelperTests =
           ops = realStoppedAudioHostStackOps inputs
       result <- sahsoOpen ops (mkPlan "demo-key")
       case result of
-        Left (SahsoiAudioStartFailed (SfaiStartFailed (-1))) -> do
+        Left (RhsoiAudioStartFailed (SfaiStartFailed (-1))) -> do
           -- Rollback closed the ingress manager exactly once.
           closeCount <- readIORef ingressCloseCalls
           closeCount @?= 1
         Left other ->
           assertFailure
-            ("expected Left (SahsoiAudioStartFailed (SfaiStartFailed -1)), got Left: "
+            ("expected Left (RhsoiAudioStartFailed (SfaiStartFailed -1)), got Left: "
               <> show other)
         Right _stack ->
           assertFailure
-            "expected Left (SahsoiAudioStartFailed (SfaiStartFailed -1)), got Right"
+            "expected Left (RhsoiAudioStartFailed (SfaiStartFailed -1)), got Right"
 
   , testCase
-      "audio-start failure with ingress-close-also-fails surfaces SahsoiPartialCleanupFailed"
+      "audio-start failure with ingress-close-also-fails surfaces RhsoiPartialCleanupFailed"
       $ do
       ingressCloseCalls <- newIORef (0 :: Int)
       let inputs = mkProductionInputs
@@ -637,8 +637,8 @@ realProductionHelperTests =
       result <- sahsoOpen ops (mkPlan "demo-key")
       case result of
         Left
-          (SahsoiPartialCleanupFailed
-            (SahsoiAudioStartFailed (SfaiStartFailed (-1)))
+          (RhsoiPartialCleanupFailed
+            (RhsoiAudioStartFailed (SfaiStartFailed (-1)))
             cleanupText) -> do
           -- The cleanup text mentions the ingress-close failure so
           -- the supervisor's escalation payload carries actionable
@@ -648,11 +648,11 @@ realProductionHelperTests =
           closeCount @?= 1
         Left other ->
           assertFailure
-            ("expected SahsoiPartialCleanupFailed (SahsoiAudioStartFailed ...), got Left: "
+            ("expected RhsoiPartialCleanupFailed (RhsoiAudioStartFailed ...), got Left: "
               <> show other)
         Right _stack ->
           assertFailure
-            "expected SahsoiPartialCleanupFailed (SahsoiAudioStartFailed ...), got Right"
+            "expected RhsoiPartialCleanupFailed (RhsoiAudioStartFailed ...), got Right"
 
   , testCase
       "rollback after audio-start failure runs service close even when ingress close throws"
@@ -660,14 +660,14 @@ realProductionHelperTests =
       -- Pins the §7d3da25 fix: a throw from closeManifestReloadIngress
       -- during rollback must not skip closeSessionFanInService. The
       -- proof shape is the diagnostic itself — if the function
-      -- returns SahsoiPartialCleanupFailed with the "ingress close
+      -- returns RhsoiPartialCleanupFailed with the "ingress close
       -- threw" tag, then 'rollbackAudioStart' caught the throw via
       -- 'try' and continued running. The 'try @SomeException
       -- (closeSessionFanInService service)' immediately after is the
       -- only code that can produce that return value, so service
       -- close ran. A regression that re-introduces the
       -- "throw-skips-later-cleanup" shape would propagate the
-      -- exception instead of returning SahsoiPartialCleanupFailed.
+      -- exception instead of returning RhsoiPartialCleanupFailed.
       ingressCloseCalls <- newIORef (0 :: Int)
       let inputs = mkProductionInputs
             (fakeIngressOpsCloseThrows ingressCloseCalls)
@@ -677,19 +677,19 @@ realProductionHelperTests =
       case attempt of
         Left ex ->
           assertFailure
-            ("expected SahsoiPartialCleanupFailed return, but the \
+            ("expected RhsoiPartialCleanupFailed return, but the \
              \ingress-close throw propagated: " <> show ex)
         Right result -> case result of
           Left
-            (SahsoiPartialCleanupFailed
-              (SahsoiAudioStartFailed (SfaiStartFailed (-1)))
+            (RhsoiPartialCleanupFailed
+              (RhsoiAudioStartFailed (SfaiStartFailed (-1)))
               cleanupText) -> do
             ("ingress close threw" `subStr` show cleanupText) @?= True
             closeCount <- readIORef ingressCloseCalls
             closeCount @?= 1
           Left other ->
             assertFailure
-              ("expected SahsoiPartialCleanupFailed wrapping audio-start \
+              ("expected RhsoiPartialCleanupFailed wrapping audio-start \
                \with 'ingress close threw' diagnostic, got Left: "
                 <> show other)
           Right _stack ->
@@ -739,7 +739,7 @@ realProductionHelperTests =
         [0 .. length haystack - length needle]
 
 
--- | Build a 'RealStoppedAudioHostStackInputs' that pairs a real
+-- | Build a 'RealReloadHostStackInputs' that pairs a real
 -- (empty-graph) SessionFanInService open with caller-supplied
 -- fake ingress ops + fake audio FFI. The non-essential dependencies
 -- (target policy, owner options, service options/hooks, event sink)
@@ -747,16 +747,16 @@ realProductionHelperTests =
 mkProductionInputs
   :: ManifestReloadIngressOps ManifestReloadIngressTarget String ()
   -> SessionFanInAudioFFI
-  -> RealStoppedAudioHostStackInputs String ()
-mkProductionInputs ingressOps audioFFI = RealStoppedAudioHostStackInputs
-  { rsahsiBuildIngressOps     = const ingressOps
-  , rsahsiIngressTargetPolicy = testIngressTargetPolicy
-  , rsahsiAudioFFI            = audioFFI
-  , rsahsiAudioOptions        = testAudioOptions
-  , rsahsiOwnerOptions        = defaultSessionOwnerOptions
-  , rsahsiServiceOptions      = defaultSessionFanInServiceOptions
-  , rsahsiServiceHooks        = defaultSessionFanInServiceHooks
-  , rsahsiOnEvent             = \_ -> pure ()
+  -> RealReloadHostStackInputs String ()
+mkProductionInputs ingressOps audioFFI = RealReloadHostStackInputs
+  { rrhsiBuildIngressOps     = const ingressOps
+  , rrhsiIngressTargetPolicy = testIngressTargetPolicy
+  , rrhsiAudioFFI            = audioFFI
+  , rrhsiAudioOptions        = testAudioOptions
+  , rrhsiOwnerOptions        = defaultSessionOwnerOptions
+  , rrhsiServiceOptions      = defaultSessionFanInServiceOptions
+  , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
+  , rrhsiOnEvent             = \_ -> pure ()
   }
 
 
@@ -810,7 +810,7 @@ fakeIngressOpsOpenFails closeCounter = ManifestReloadIngressOps
 
 -- | Fake ingress ops where 'mrioOpenIngress' succeeds but
 -- 'mrioCloseIngress' fails. Pairs with audio-start-fails to
--- exercise the 'SahsoiPartialCleanupFailed' path.
+-- exercise the 'RhsoiPartialCleanupFailed' path.
 fakeIngressOpsCloseFails
   :: IORef Int
   -> ManifestReloadIngressOps ManifestReloadIngressTarget String ()
@@ -895,11 +895,11 @@ runSupervisedStoppedAudioReloadTests =
       case result of
         Left
           (SahsiOpen
-            (SahsoiAudioStartFailed (SfaiStartFailed (-1)))) ->
+            (RhsoiAudioStartFailed (SfaiStartFailed (-1)))) ->
           pure ()
         other ->
           assertFailure
-            ("expected Left SahsiOpen (SahsoiAudioStartFailed -1), got: "
+            ("expected Left SahsiOpen (RhsoiAudioStartFailed -1), got: "
               <> show other)
 
   , testCase
@@ -937,7 +937,7 @@ runSupervisedStoppedAudioReloadTests =
 -- Pairs with 'fakeAudioFFIStartFails' to pin the
 -- 'rollbackAudioStart' regression test: when the ingress close
 -- step throws during rollback, the service close step must still
--- run, and the function must surface 'SahsoiPartialCleanupFailed'
+-- run, and the function must surface 'RhsoiPartialCleanupFailed'
 -- (proof that the throw was caught and processing continued).
 fakeIngressOpsCloseThrows
   :: IORef Int
