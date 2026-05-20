@@ -1,4 +1,5 @@
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE TupleSections      #-}
 
 -- |
 -- Module      : MetaSonic.App.ManifestReloadSupervisorAdapter
@@ -28,7 +29,8 @@ module MetaSonic.App.ManifestReloadSupervisorAdapter
   , withHostStackSupervisorAdapter
   ) where
 
-import           Control.Exception (finally)
+import           Control.Exception (finally, mask, mask_)
+import           Data.Foldable     (for_)
 import           Data.IORef        (IORef, atomicModifyIORef', newIORef,
                                     readIORef, writeIORef)
 
@@ -103,8 +105,18 @@ withHostStackSupervisorAdapter factory initialStack k = do
 
   let closeOps = closeActiveStack factory stackRef
 
-      openOps plan = do
-        result <- hsfOpenStack factory plan
+      -- Async-exception safety: the window between "hsfOpenStack
+      -- returns Right newStack" and "writeIORef stackRef (Just
+      -- newStack)" must be uninterruptible. Without the mask, an
+      -- async exception landing there would lose the only handle to
+      -- a freshly built stack (the ref still reads Nothing and the
+      -- finally below no-ops). 'mask' establishes
+      -- MaskedInterruptible; 'restore' lets the producer's
+      -- hsfOpenStack run interruptibly so its own internal
+      -- cleanup on async exception still works as a producer
+      -- contract.
+      openOps plan = mask $ \restore -> do
+        result <- restore (hsfOpenStack factory plan)
         case result of
           Left e ->
             pure (Left e)
@@ -122,7 +134,7 @@ withHostStackSupervisorAdapter factory initialStack k = do
             -- of contract (e.g. an open failure left the ref
             -- empty and the caller still requested an
             -- in-window). Surface it as an error rather than
-            -- silently silently succeed with no stack to mutate.
+            -- silently succeed with no stack to mutate.
             ioError $ userError $
               "withHostStackSupervisorAdapter: in-window reload " <>
               "requested with no active stack. This is a " <>
@@ -140,17 +152,25 @@ withHostStackSupervisorAdapter factory initialStack k = do
   k supOps `finally` closeOps
 
 
--- | Idempotent close: read the ref, dispose the stack if any, and
--- empty the ref. Calling this on an already-empty ref is a no-op,
--- so the 'finally' guard in 'withHostStackSupervisorAdapter' does
--- not double-close a stack the supervisor already disposed.
+-- | Idempotent close: take the stack out of the ref atomically,
+-- then dispose it via 'hsfCloseStack'. Both steps run under
+-- 'mask_' so an async exception cannot land between the take and
+-- the close — that window would otherwise drop the only handle
+-- to a half-disposed stack (ref now @Nothing@, hsfCloseStack
+-- never ran). Calling this on an already-empty ref is a no-op,
+-- so the 'finally' guard in 'withHostStackSupervisorAdapter'
+-- does not double-close a stack the supervisor already disposed.
+--
+-- 'hsfCloseStack' itself runs masked; if it uses interruptible
+-- primitives internally (e.g. @takeMVar@ to drain a worker), it
+-- remains its responsibility to handle interrupts cleanly. The
+-- adapter's contract is only that the take-from-ref and the
+-- start-of-close form one atomic step from the async-exception
+-- perspective.
 closeActiveStack
   :: HostStackFactory plan stack e
   -> IORef (Maybe stack)
   -> IO ()
-closeActiveStack factory stackRef = do
-  mStack <- atomicModifyIORef' stackRef $ \current ->
-              (Nothing, current)
-  case mStack of
-    Just stack -> hsfCloseStack factory stack
-    Nothing    -> pure ()
+closeActiveStack factory stackRef = mask_ $ do
+  mStack <- atomicModifyIORef' stackRef (Nothing,)
+  for_ mStack (hsfCloseStack factory)

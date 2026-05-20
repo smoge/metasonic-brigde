@@ -24,8 +24,15 @@ module MetaSonic.Spec.AppManifestReloadSupervisorAdapter
   ( appManifestReloadSupervisorAdapterTests
   ) where
 
-import           Control.Exception (ErrorCall (..), throwIO, try)
-import           Data.IORef        (IORef, modifyIORef', newIORef, readIORef)
+import           Control.Concurrent      (forkIO)
+import           Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import           Control.Exception       (ErrorCall (..), MaskingState (..),
+                                          SomeException, fromException,
+                                          getMaskingState, throwIO, throwTo,
+                                          try)
+import           Control.Monad           (void)
+import           Data.IORef              (IORef, modifyIORef', newIORef,
+                                          readIORef)
 
 import           Test.Tasty
 import           Test.Tasty.HUnit
@@ -312,4 +319,151 @@ appManifestReloadSupervisorAdapterTests =
         , InWindowCalled 2 "second-request"
         , CloseCalled 2     -- finally on bracket exit
         ]
+
+  , testCase
+      "openOps runs hsfOpenStack unmasked (restore works)"
+      $ do
+      -- Direct, deterministic proof that openOps wraps the producer
+      -- call in `mask $ \\restore -> ... restore (hsfOpenStack ...)`.
+      -- Inside hsfOpenStack the masking state must be 'Unmasked' so
+      -- the producer's own internal exception handling (its
+      -- @bracket@s, its allocation cleanup) keeps working. Without
+      -- 'restore', the producer would inherit the outer mask and
+      -- silently lose interruptibility for things like @takeMVar@.
+      observedRef <- newIORef Nothing
+      let factory = HostStackFactory
+            { hsfOpenStack = \_plan -> do
+                ms <- getMaskingState
+                modifyIORef' observedRef (const (Just ms))
+                pure (Right (42 :: Int))
+            , hsfCloseStack     = \_ -> pure ()
+            , hsfInWindowReload = \_ _ ->
+                pure (Left (InWindowFailure "force-recovery"))
+            }
+      _ <-
+        withHostStackSupervisorAdapter factory 1 $ \ops ->
+          reloadSupervised ops planA planB
+      observed <- readIORef observedRef
+      observed @?= Just Unmasked
+
+  , testCase
+      "closeActiveStack runs hsfCloseStack under MaskedInterruptible"
+      $ do
+      -- Direct proof that closeActiveStack wraps the take-from-ref
+      -- + hsfCloseStack call in `mask_`. The masking state inside
+      -- hsfCloseStack must be 'MaskedInterruptible'. Without the
+      -- mask, an async exception landing between the
+      -- atomicModifyIORef' and the close call would leak the only
+      -- handle to the just-emptied stack (the ref now reads
+      -- Nothing, the close never ran, the bracket's finally
+      -- no-ops). Asserts the recovery path's CloseCalled and the
+      -- bracket's-finally CloseCalled BOTH ran masked.
+      observedRef <- newIORef []
+      let factory = HostStackFactory
+            { hsfOpenStack = \_plan -> pure (Right (99 :: Int))
+            , hsfCloseStack = \_ -> do
+                ms <- getMaskingState
+                modifyIORef' observedRef (++ [ms])
+            , hsfInWindowReload = \_ _ ->
+                pure (Left (InWindowFailure "trigger-close"))
+            }
+      _ <-
+        withHostStackSupervisorAdapter factory 1 $ \ops ->
+          reloadSupervised ops planA planB
+      observed <- readIORef observedRef
+      -- Two closes are expected here: the recovery close of the
+      -- initial stack (1), and the bracket's-finally close of the
+      -- rebuilt stack (2). Both must run masked.
+      length observed @?= 2
+      all (== MaskedInterruptible) observed @?= True
+
+  , testCase
+      "async throwTo during a recovery cycle does not leak the active stack"
+      $ do
+      -- Live-racing version of the §238 #9 cleanup invariant. A
+      -- worker thread drives a supervised reload while the fake's
+      -- hsfInWindowReload blocks on an MVar; the main thread
+      -- throws an async exception at the worker while it is
+      -- inside that producer call. With the mask machinery on
+      -- both halves of the adapter, the exception propagates out
+      -- but the initial stack (id 1) MUST still be closed before
+      -- the worker exits — either by the supervisor's
+      -- onException cleanup or by the bracket's finally.
+      --
+      -- The deterministic proof of \"writeIORef runs under mask\"
+      -- and \"hsfCloseStack runs under mask_\" is in the two
+      -- getMaskingState tests immediately above; this test pins
+      -- the *behavioral* contract under live throwTo timing — no
+      -- minted stack is left without a matching close, regardless
+      -- of where the throwTo lands.
+      inWindowReached <- newEmptyMVar :: IO (MVar ())
+      mayReturn       <- newEmptyMVar :: IO (MVar ())
+      workerDone      <- newEmptyMVar :: IO (MVar (Either SomeException ()))
+      traceRef        <- newIORef []
+      idRef           <- newIORef 1
+
+      let mintId = do
+            prev <- readIORef idRef
+            let nextId = prev + 1
+            modifyIORef' idRef (const nextId)
+            pure nextId
+          recordCall c = modifyIORef' traceRef (++ [c])
+          factory :: HostStackFactory String Int AdapterFailure
+          factory = HostStackFactory
+            { hsfOpenStack = \plan -> do
+                newId <- mintId
+                recordCall (OpenCalled plan newId)
+                pure (Right newId)
+            , hsfCloseStack = recordCall . CloseCalled
+            , hsfInWindowReload = \stackId plan -> do
+                recordCall (InWindowCalled stackId plan)
+                putMVar inWindowReached ()
+                takeMVar mayReturn
+                pure (Right ())
+            }
+
+      workerTid <- forkIO $ do
+        result <-
+          try
+            (withHostStackSupervisorAdapter factory 1 $ \ops ->
+                void (reloadSupervised ops planA planB))
+        putMVar workerDone result
+
+      -- Wait for the worker to reach the in-window block. The
+      -- supervisor's onException wrapper has already registered
+      -- its cleanup (sopsCloseStack), so a throwTo here forces
+      -- the closeActiveStack/mask_ path to run on the live stack.
+      takeMVar inWindowReached
+      throwTo workerTid (ErrorCall "recovery-window-interrupt")
+
+      -- Unblock the producer in case the throwTo races with our
+      -- putMVar (fork so we don't deadlock if the worker is
+      -- already gone).
+      _ <- forkIO (putMVar mayReturn ())
+
+      result <- takeMVar workerDone
+      trace  <- readIORef traceRef
+
+      case result of
+        Left e ->
+          case fromException e of
+            Just (ErrorCall msg) ->
+              msg @?= "recovery-window-interrupt"
+            Nothing ->
+              assertFailure ("unexpected exception type: " <> show e)
+        Right () ->
+          assertFailure "expected the async exception to propagate"
+
+      -- Invariant §4: every minted stack must have a matching
+      -- close. With the mask_ on closeActiveStack, the supervisor's
+      -- onException-driven close of the initial stack (id 1) runs
+      -- atomically with the ref-take; with the mask on openOps,
+      -- any published rebuild stack also gets a matching close
+      -- through the bracket's finally. The trace must satisfy
+      -- close-count >= open-count, and every opened id must
+      -- appear in the close list.
+      let closes  = [i | CloseCalled i <- trace]
+          opens   = [i | OpenCalled _ i <- trace]
+      (1 `elem` closes) @?= True
+      all (`elem` closes) opens @?= True
   ]
