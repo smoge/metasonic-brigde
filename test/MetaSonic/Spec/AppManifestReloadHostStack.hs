@@ -57,11 +57,20 @@ import           MetaSonic.App.ManifestReloadHost
 import           MetaSonic.App.ManifestReloadHost.Types
                                          (ManifestReloadHostIssue (..))
 import           MetaSonic.App.ManifestReloadHostStack
-                                         (StoppedAudioHostStack (..),
+                                         (RealStoppedAudioHostStackInputs (..),
+                                          StoppedAudioHostStack (..),
                                           StoppedAudioHostStackIssue (..),
                                           StoppedAudioHostStackOpenIssue (..),
                                           StoppedAudioHostStackOps (..),
-                                          mkStoppedAudioHostStackFactory)
+                                          mkStoppedAudioHostStackFactory,
+                                          realStoppedAudioHostStackOps)
+import           MetaSonic.App.ManifestReloadIngress
+                                         (ManifestReloadIngressOps (..))
+import           MetaSonic.App.ManifestReloadIngressTarget
+                                         (ManifestReloadIngressTarget,
+                                          ManifestReloadIngressTargetPolicy (..))
+import           MetaSonic.App.ManifestReloadBinding
+                                         (ManifestUIVoiceSelection (..))
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                          (HostStoppedAudioReloadIssue (..))
 import           MetaSonic.App.ManifestReloadSupervisor
@@ -70,10 +79,16 @@ import           MetaSonic.App.ManifestReloadSupervisor
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                          (withHostStackSupervisorAdapter)
 import           MetaSonic.Bridge.Templates (TemplateGraph (..))
-import           MetaSonic.Pattern              (SwapLabel (..))
+import           MetaSonic.Pattern              (SwapLabel (..), VoiceKey (..))
 import           MetaSonic.Session.Arbitration  (ArbitrationPolicy (..))
-import           MetaSonic.Session.FanIn (SessionFanInAudioIssue (..))
+import           MetaSonic.Session.FanIn (SessionFanInAudioFFI (..),
+                                          SessionFanInAudioIssue (..),
+                                          SessionFanInAudioOptions (..))
+import           MetaSonic.Session.FanInService
+                                         (defaultSessionFanInServiceHooks,
+                                          defaultSessionFanInServiceOptions)
 import qualified MetaSonic.Session.ManifestReload as MR
+import           MetaSonic.Session.Owner (defaultSessionOwnerOptions)
 import           MetaSonic.Session.RTGraphAdapter
                                          (defaultRTGraphAdapterOptions)
 
@@ -198,7 +213,15 @@ inWindowListenerRestartFailed _ =
 
 appManifestReloadHostStackTests :: TestTree
 appManifestReloadHostStackTests =
-  testGroup "App manifest reload host stack (stopped-audio factory)"
+  testGroup "App manifest reload host stack"
+  [ factoryCompositionTests
+  , realProductionHelperTests
+  ]
+
+
+factoryCompositionTests :: TestTree
+factoryCompositionTests =
+  testGroup "Stopped-audio factory composition (fake-IO slots)"
   [ testCase
       "successful in-window reload commits without rebuild"
       $ do
@@ -488,3 +511,215 @@ appManifestReloadHostStackTests =
       MR.mrlpDemoKey planA `notElem` openedKeys @?= True
       MR.mrlpDemoKey planB `notElem` openedKeys @?= True
   ]
+
+
+-- | Tests that drive 'realStoppedAudioHostStackOps' through its
+-- forward open path against a real (empty-graph) SessionFanInService
+-- plus fake ingress ops + fake audio FFI. The four cases pin the
+-- partial-cleanup contract the production helper added in step 2:
+-- successful open, ingress-open failure, audio-start failure with
+-- clean rollback, and audio-start failure with ingress-close-also-
+-- fails surfacing 'SahsoiPartialCleanupFailed'.
+realProductionHelperTests :: TestTree
+realProductionHelperTests =
+  testGroup "realStoppedAudioHostStackOps partial-cleanup paths"
+  [ testCase
+      "successful open returns Right and close is a no-op on the stack"
+      $ do
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsOpenOk ingressCloseCalls)
+            fakeAudioFFIStartOk
+          ops = realStoppedAudioHostStackOps inputs
+      result <- sahsoOpen ops (mkPlan "demo-key")
+      case result of
+        Left issue ->
+          assertFailure ("expected Right, got Left: " <> show issue)
+        Right stack -> do
+          -- Close the live stack to release the SessionFanInService
+          -- owner; otherwise the test process leaks an RTGraph.
+          sahsoClose ops stack
+          -- Close path called close-ingress exactly once during
+          -- the forward shutdown.
+          closeCount <- readIORef ingressCloseCalls
+          closeCount @?= 1
+
+  , testCase
+      "ingress-open failure returns Left SahsoiIngressOpenFailed (service rolled back)"
+      $ do
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsOpenFails ingressCloseCalls)
+            fakeAudioFFIStartOk
+          ops = realStoppedAudioHostStackOps inputs
+      result <- sahsoOpen ops (mkPlan "demo-key")
+      case result of
+        Left (SahsoiIngressOpenFailed "boom") -> do
+          -- Ingress never opened, so close-ingress was never called.
+          closeCount <- readIORef ingressCloseCalls
+          closeCount @?= 0
+        Left other ->
+          assertFailure
+            ("expected Left (SahsoiIngressOpenFailed \"boom\"), got Left: "
+              <> show other)
+        Right _stack ->
+          assertFailure
+            "expected Left (SahsoiIngressOpenFailed \"boom\"), got Right"
+
+  , testCase
+      "audio-start failure with clean ingress close returns Left SahsoiAudioStartFailed"
+      $ do
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsOpenOk ingressCloseCalls)
+            fakeAudioFFIStartFails
+          ops = realStoppedAudioHostStackOps inputs
+      result <- sahsoOpen ops (mkPlan "demo-key")
+      case result of
+        Left (SahsoiAudioStartFailed (SfaiStartFailed (-1))) -> do
+          -- Rollback closed the ingress manager exactly once.
+          closeCount <- readIORef ingressCloseCalls
+          closeCount @?= 1
+        Left other ->
+          assertFailure
+            ("expected Left (SahsoiAudioStartFailed (SfaiStartFailed -1)), got Left: "
+              <> show other)
+        Right _stack ->
+          assertFailure
+            "expected Left (SahsoiAudioStartFailed (SfaiStartFailed -1)), got Right"
+
+  , testCase
+      "audio-start failure with ingress-close-also-fails surfaces SahsoiPartialCleanupFailed"
+      $ do
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsCloseFails ingressCloseCalls)
+            fakeAudioFFIStartFails
+          ops = realStoppedAudioHostStackOps inputs
+      result <- sahsoOpen ops (mkPlan "demo-key")
+      case result of
+        Left
+          (SahsoiPartialCleanupFailed
+            (SahsoiAudioStartFailed (SfaiStartFailed (-1)))
+            cleanupText) -> do
+          -- The cleanup text mentions the ingress-close failure so
+          -- the supervisor's escalation payload carries actionable
+          -- diagnostics for both layers.
+          ("ingress close" `subStr` show cleanupText) @?= True
+          closeCount <- readIORef ingressCloseCalls
+          closeCount @?= 1
+        Left other ->
+          assertFailure
+            ("expected SahsoiPartialCleanupFailed (SahsoiAudioStartFailed ...), got Left: "
+              <> show other)
+        Right _stack ->
+          assertFailure
+            "expected SahsoiPartialCleanupFailed (SahsoiAudioStartFailed ...), got Right"
+  ]
+  where
+    subStr needle haystack =
+      any (\i -> take (length needle) (drop i haystack) == needle)
+        [0 .. length haystack - length needle]
+
+
+-- | Build a 'RealStoppedAudioHostStackInputs' that pairs a real
+-- (empty-graph) SessionFanInService open with caller-supplied
+-- fake ingress ops + fake audio FFI. The non-essential dependencies
+-- (target policy, owner options, service options/hooks, event sink)
+-- are wired to library defaults.
+mkProductionInputs
+  :: ManifestReloadIngressOps ManifestReloadIngressTarget String ()
+  -> SessionFanInAudioFFI
+  -> RealStoppedAudioHostStackInputs String ()
+mkProductionInputs ingressOps audioFFI = RealStoppedAudioHostStackInputs
+  { rsahsiIngressOps          = ingressOps
+  , rsahsiIngressTargetPolicy = testIngressTargetPolicy
+  , rsahsiAudioFFI            = audioFFI
+  , rsahsiAudioOptions        = testAudioOptions
+  , rsahsiOwnerOptions        = defaultSessionOwnerOptions
+  , rsahsiServiceOptions      = defaultSessionFanInServiceOptions
+  , rsahsiServiceHooks        = defaultSessionFanInServiceHooks
+  , rsahsiOnEvent             = \_ -> pure ()
+  }
+
+
+testIngressTargetPolicy :: ManifestReloadIngressTargetPolicy
+testIngressTargetPolicy = ManifestReloadIngressTargetPolicy
+  { mritpUIVoiceSelection = ManifestUIVoiceSelection
+      { muvsFocusedVoice = Nothing
+      , muvsDefaultVoice = VoiceKey "v0"
+      }
+  , mritpUIRetainedValues = M.empty
+  , mritpMIDIDefaultVoice = VoiceKey "v0"
+  }
+
+
+-- | Audio options small enough to drive the start-FFI smoke
+-- without staging real PortAudio state. The exact numbers don't
+-- matter because the fake FFI ignores them.
+testAudioOptions :: SessionFanInAudioOptions
+testAudioOptions = SessionFanInAudioOptions
+  { sfiaoOutputChannels = 2
+  , sfiaoDeviceID       = 0
+  , sfiaoReadyTimeoutMs = 100
+  }
+
+
+-- | Fake ingress ops where every open / close succeeds. The
+-- close-call counter lets tests verify rollback ordering.
+fakeIngressOpsOpenOk
+  :: IORef Int
+  -> ManifestReloadIngressOps ManifestReloadIngressTarget String ()
+fakeIngressOpsOpenOk closeCounter = ManifestReloadIngressOps
+  { mrioOpenIngress  = \_target -> pure (Right ())
+  , mrioCloseIngress = \() -> do
+      modifyIORef' closeCounter (+ 1)
+      pure (Right ())
+  }
+
+
+-- | Fake ingress ops where 'mrioOpenIngress' returns Left "boom"
+-- so 'realOpen' enters the rollback-ingress-open path.
+fakeIngressOpsOpenFails
+  :: IORef Int
+  -> ManifestReloadIngressOps ManifestReloadIngressTarget String ()
+fakeIngressOpsOpenFails closeCounter = ManifestReloadIngressOps
+  { mrioOpenIngress  = \_target -> pure (Left "boom")
+  , mrioCloseIngress = \() -> do
+      modifyIORef' closeCounter (+ 1)
+      pure (Right ())
+  }
+
+
+-- | Fake ingress ops where 'mrioOpenIngress' succeeds but
+-- 'mrioCloseIngress' fails. Pairs with audio-start-fails to
+-- exercise the 'SahsoiPartialCleanupFailed' path.
+fakeIngressOpsCloseFails
+  :: IORef Int
+  -> ManifestReloadIngressOps ManifestReloadIngressTarget String ()
+fakeIngressOpsCloseFails closeCounter = ManifestReloadIngressOps
+  { mrioOpenIngress  = \_target -> pure (Right ())
+  , mrioCloseIngress = \() -> do
+      modifyIORef' closeCounter (+ 1)
+      pure (Left "close-failed")
+  }
+
+
+-- | Fake audio FFI where 'saffiStartAudio' returns 0 (success).
+fakeAudioFFIStartOk :: SessionFanInAudioFFI
+fakeAudioFFIStartOk = SessionFanInAudioFFI
+  { saffiStartAudio       = \_rt _sr _bs -> pure 0
+  , saffiWaitAudioStarted = \_rt _to     -> pure True
+  , saffiStopAudio        = \_rt         -> pure ()
+  }
+
+
+-- | Fake audio FFI where 'saffiStartAudio' returns -1, which
+-- 'startSessionFanInHostAudioWith' translates to
+-- 'SfaiStartFailed (-1)'.
+fakeAudioFFIStartFails :: SessionFanInAudioFFI
+fakeAudioFFIStartFails = SessionFanInAudioFFI
+  { saffiStartAudio       = \_rt _sr _bs -> pure (-1)
+  , saffiWaitAudioStarted = \_rt _to     -> pure True
+  , saffiStopAudio        = \_rt         -> pure ()
+  }
