@@ -40,14 +40,22 @@ baseline + A→B→C→D! regression + the exception/no-double-fire
 pair), 10 cases in
 `MetaSonic.Spec.AppManifestReloadSupervisorAdapter` (six
 structural + two `getMaskingState` + one throwTo injection +
-one outer-restore passthrough), and 8 cases in
-`MetaSonic.Spec.AppManifestReloadHostStack` (success + three
+one outer-restore passthrough), 8 cases of factory composition
+in `MetaSonic.Spec.AppManifestReloadHostStack` (success + three
 named in-window failure-recovery shapes + rebuild escalation +
 no-overlapping-stacks transition invariant + async cleanup +
-A→B→C→D! factory-layer regression). 30 lane cases in total.
-All three modules are wired into `test/Spec.hs` and the
-package.yaml test-component `other-modules`. Total suite at
-this lane's close: 1202 cases.
+A→B→C→D! factory-layer regression), 6 cases of
+`realStoppedAudioHostStackOps` partial-cleanup paths (forward
+success, ingress-open Left, audio-start Left with clean
+rollback, audio-start Left with ingress-close-Left surfacing
+`SahsoiPartialCleanupFailed`, ingress-close-throws-during-
+rollback still runs service close, audio-stop-throws-during-
+realClose still runs ingress + service close — the last two
+pin the §7d3da25 exception-safety fix), and 1 case for
+`realStoppedAudioInWindowReload`'s plan-native short-circuit.
+37 lane cases in total. All three modules are wired into
+`test/Spec.hs` and the package.yaml test-component
+`other-modules`. Total suite at this lane's close: 1209 cases.
 
 §238 test-checklist coverage: 11/11 — all 9 originally listed
 plus the two additions explicitly named by the design ("A→B→C
@@ -57,7 +65,7 @@ partial stack before surfacing").
 ### What remains
 
 §219 slice 4 ("Add the real stopped-audio host command, using
-the supervisor as its outer wrapper") is partially landed and
+the supervisor as its outer wrapper") is mostly landed and
 slice 5 (manual CLI smoke against a working device) has not
 been started. Slices 1 and 3 from the supervisor's dependency
 list (j-note slices 1 and 2) are independently landed in the
@@ -67,43 +75,68 @@ session layer: `startSessionFanInHostAudio` /
 `reloadManifestSessionStoppedAudio` lives in
 `MetaSonic.Session.ManifestReload.Runtime`.
 
-The slice-4 work is now narrower than the original framing.
-`MetaSonic.App.ManifestReloadHostStack` has shipped the
-production `HostStackFactory` shape:
+`MetaSonic.App.ManifestReloadHostStack` has shipped both the
+production `HostStackFactory` shape AND the open / close
+half against the live session-layer primitives:
 
 - `StoppedAudioHostStack target ingressIssue handle` newtype
   around `ManifestReloadHostConfig` (no stack-level plan
   field; the supervisor's caller owns currentPlan externally).
 - `StoppedAudioHostStackOps target ingressIssue handle` with
   injectable open / close / in-window-reload slots, plus a
-  `StoppedAudioHostStackOpenIssue` ADT covering the three
+  `StoppedAudioHostStackOpenIssue` ADT covering five
   real-failure causes (service setup, audio start, ingress
-  open) and a unified `StoppedAudioHostStackIssue` sum that
+  open, ingress-target-projection, partial-cleanup-failed)
+  and a unified `StoppedAudioHostStackIssue` sum that
   threads through `HostStackFactory`'s @e@.
-- `realStoppedAudioInWindowReload` — plan-native production
-  wiring that drives
+- `realStoppedAudioInWindowReload` — plan-native, target-fresh
+  production wiring. Drives
   `orchestrateHostStoppedAudioReloadWithEvents` with
-  `hsaroPreparePlan = const (pure (Right plan))`, so the
+  `hsaroPreparePlan = const (pure (Right requested))` so the
   supervisor's supplied plan is the source of truth at the
-  seam (no silent re-planning from doc/catalog drift).
+  seam, and re-projects both `mrhcOldIngressTarget` and
+  `mrhcNewIngressTarget` from the `(fallback, requested)`
+  plans so target selection cannot drift across a long
+  reload sequence (the contract was extended end-to-end:
+  `SupervisorOps.sopsInWindowReload :: plan -> plan -> ...`,
+  `HostStackFactory.hsfInWindowReload :: stack -> plan ->
+  plan -> ...`, `realStoppedAudioInWindowReload :: policy ->
+  stack -> plan -> plan -> ...`).
+- `realStoppedAudioHostStackOps` + `RealStoppedAudioHostStackInputs`
+  — production open / close against `openSessionFanInService`,
+  the ingress-ops factory (per-host so OSC/MIDI listener
+  closures bind to the freshly-opened host on each rebuild),
+  and `startSessionFanInHostAudioWith`. Exception-hardened:
+  `realOpen` brackets every acquired resource under
+  `mask` + `onException`, `realClose` and `rollbackAudioStart`
+  both attempt every owned cleanup step and surface the
+  strongest/first diagnostic so a throw mid-cleanup cannot
+  skip later finalizers.
 - `mkStoppedAudioHostStackFactory` — smart constructor
   producing the `HostStackFactory` the supervisor adapter
   drives directly.
-- Eight fake-IO scenarios in
-  `MetaSonic.Spec.AppManifestReloadHostStack` (the seven
-  named in §219 slice 4's scope plus an A→B→C→D! factory-layer
-  regression against the no-remembered-history invariant).
+- 15 cases in `MetaSonic.Spec.AppManifestReloadHostStack`:
+  eight factory-composition scenarios (the seven named in
+  §219 slice 4's scope plus an A→B→C→D! factory-layer
+  regression against the no-remembered-history invariant),
+  six production-helper partial-cleanup paths (including the
+  two cleanup-regression tests that pin the exception-safety
+  fix from §7d3da25), and one direct integration test for
+  `realStoppedAudioInWindowReload`'s plan-native
+  short-circuit (asserts no `MrhiPlanning` when running
+  against empty doc / catalog).
 
-What remains in slice 4 is therefore the open / close half:
-implement `StoppedAudioHostStackOps` against the live
-`SessionFanInService` + ingress manager + audio FFI bundle
-(via imperative open/close primitives mirrored from
-`withSessionFanInService`, or a worker-thread promotion of
-the bracket — whichever fits cleaner), then route the
-existing `reloadManifestHostWithStrategy` `StoppedAudioOnly`
-path through `reloadSupervised` + this factory + the
-real-host ops. Preserving hot-swap stays outside this
-supervisor by design.
+What remains in slice 4 is therefore the routing only: wire
+the `StoppedAudioOnly` strategy in the CLI (currently direct
+at [`ManifestReloadHost.hs`](../app/MetaSonic/App/ManifestReloadHost.hs#L524))
+through `reloadSupervised` + `mkStoppedAudioHostStackFactory`
++ `realStoppedAudioHostStackOps`. Preserving and
+`TryPreservingThenStoppedAudio` fallback stay direct until
+the supervised stopped-audio path is stable. The routing
+slice will likely need a narrow
+`SupervisedStoppedAudioReloadResult` / -Issue type rather
+than forcing `SupervisedReloadOutcome`'s rebuild causes into
+the existing `ManifestReloadHostStrategyIssue` shape.
 
 Resource/allocation recovery events stay parked behind a
 real consumer per the

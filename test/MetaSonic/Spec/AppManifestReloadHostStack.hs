@@ -1,4 +1,5 @@
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE TypeApplications   #-}
 
 -- | Fake-IO tests for the stopped-audio HostStackFactory.
 --
@@ -50,7 +51,8 @@ import           Control.Concurrent      (forkIO)
 import           Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar,
                                           takeMVar)
 import           Control.Exception       (ErrorCall (..), SomeException,
-                                          fromException, throwTo, try)
+                                          fromException, throwIO, throwTo,
+                                          try)
 import           Control.Monad           (void)
 import qualified Data.Map.Strict         as M
 import           Data.IORef              (IORef, modifyIORef', newIORef,
@@ -624,6 +626,85 @@ realProductionHelperTests =
         Right _stack ->
           assertFailure
             "expected SahsoiPartialCleanupFailed (SahsoiAudioStartFailed ...), got Right"
+
+  , testCase
+      "rollback after audio-start failure runs service close even when ingress close throws"
+      $ do
+      -- Pins the §7d3da25 fix: a throw from closeManifestReloadIngress
+      -- during rollback must not skip closeSessionFanInService. The
+      -- proof shape is the diagnostic itself — if the function
+      -- returns SahsoiPartialCleanupFailed with the "ingress close
+      -- threw" tag, then 'rollbackAudioStart' caught the throw via
+      -- 'try' and continued running. The 'try @SomeException
+      -- (closeSessionFanInService service)' immediately after is the
+      -- only code that can produce that return value, so service
+      -- close ran. A regression that re-introduces the
+      -- "throw-skips-later-cleanup" shape would propagate the
+      -- exception instead of returning SahsoiPartialCleanupFailed.
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsCloseThrows ingressCloseCalls)
+            fakeAudioFFIStartFails
+          ops = realStoppedAudioHostStackOps inputs
+      attempt <- try @SomeException (sahsoOpen ops (mkPlan "demo-key"))
+      case attempt of
+        Left ex ->
+          assertFailure
+            ("expected SahsoiPartialCleanupFailed return, but the \
+             \ingress-close throw propagated: " <> show ex)
+        Right result -> case result of
+          Left
+            (SahsoiPartialCleanupFailed
+              (SahsoiAudioStartFailed (SfaiStartFailed (-1)))
+              cleanupText) -> do
+            ("ingress close threw" `subStr` show cleanupText) @?= True
+            closeCount <- readIORef ingressCloseCalls
+            closeCount @?= 1
+          Left other ->
+            assertFailure
+              ("expected SahsoiPartialCleanupFailed wrapping audio-start \
+               \with 'ingress close threw' diagnostic, got Left: "
+                <> show other)
+          Right _stack ->
+            assertFailure
+              "expected rollback path, got Right (open succeeded)"
+
+  , testCase
+      "realClose runs ingress and service close even when audio stop throws"
+      $ do
+      -- Pins the §7d3da25 fix on the close side: a throw from
+      -- stopSessionFanInHostAudioWith must not skip the later
+      -- closeManifestReloadIngress / closeSessionFanInService
+      -- steps. After realClose runs, the first captured
+      -- exception (audio's, by ordering) is re-thrown — the test
+      -- catches it and asserts the ingress-close counter
+      -- incremented anyway. A regression that short-circuits on
+      -- the audio throw would leave the counter at 0.
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let inputs = mkProductionInputs
+            (fakeIngressOpsOpenOk ingressCloseCalls)
+            fakeAudioFFIStopThrows
+          ops = realStoppedAudioHostStackOps inputs
+      openResult <- sahsoOpen ops (mkPlan "demo-key")
+      case openResult of
+        Left issue ->
+          assertFailure ("expected Right open, got Left: " <> show issue)
+        Right stack -> do
+          closeAttempt <- try @SomeException (sahsoClose ops stack)
+          case closeAttempt of
+            Right () ->
+              assertFailure
+                "expected realClose to re-throw the audio-stop \
+                \exception once every cleanup step had run"
+            Left ex -> case fromException ex :: Maybe ErrorCall of
+              Just (ErrorCall msg) ->
+                msg @?= "synthetic audio stop crash"
+              Nothing ->
+                assertFailure
+                  ("realClose re-threw an unexpected exception type: "
+                    <> show ex)
+          closeCount <- readIORef ingressCloseCalls
+          closeCount @?= 1
   ]
   where
     subStr needle haystack =
@@ -731,6 +812,37 @@ fakeAudioFFIStartFails = SessionFanInAudioFFI
   { saffiStartAudio       = \_rt _sr _bs -> pure (-1)
   , saffiWaitAudioStarted = \_rt _to     -> pure True
   , saffiStopAudio        = \_rt         -> pure ()
+  }
+
+
+-- | Fake audio FFI where start succeeds but stop throws.
+-- Used to pin the 'realClose' regression test: when audio stop
+-- throws, the later ingress and service close steps must still
+-- run.
+fakeAudioFFIStopThrows :: SessionFanInAudioFFI
+fakeAudioFFIStopThrows = SessionFanInAudioFFI
+  { saffiStartAudio       = \_rt _sr _bs -> pure 0
+  , saffiWaitAudioStarted = \_rt _to     -> pure True
+  , saffiStopAudio        = \_rt         ->
+      throwIO (ErrorCall "synthetic audio stop crash")
+  }
+
+
+-- | Fake ingress ops where 'mrioOpenIngress' succeeds but
+-- 'mrioCloseIngress' /throws/ (rather than returning 'Left').
+-- Pairs with 'fakeAudioFFIStartFails' to pin the
+-- 'rollbackAudioStart' regression test: when the ingress close
+-- step throws during rollback, the service close step must still
+-- run, and the function must surface 'SahsoiPartialCleanupFailed'
+-- (proof that the throw was caught and processing continued).
+fakeIngressOpsCloseThrows
+  :: IORef Int
+  -> ManifestReloadIngressOps ManifestReloadIngressTarget String ()
+fakeIngressOpsCloseThrows closeCounter = ManifestReloadIngressOps
+  { mrioOpenIngress  = \_target -> pure (Right ())
+  , mrioCloseIngress = \() -> do
+      modifyIORef' closeCounter (+ 1)
+      throwIO (ErrorCall "synthetic ingress close crash")
   }
 
 

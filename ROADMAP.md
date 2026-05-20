@@ -3566,27 +3566,45 @@ deterministically tested through 22 fake-IO cases that cover the
 full §238 test-checklist including A→B→C→D! no-remembered-history
 and `forkIO`/`throwTo` cleanup-under-exception invariants. The
 production `HostStackFactory ManifestReloadPlan ...` shape has
-also landed in `MetaSonic.App.ManifestReloadHostStack` (opt-in,
-not yet routed): `StoppedAudioHostStack` newtype around
-`ManifestReloadHostConfig`, injectable
-`StoppedAudioHostStackOps` for open / close / in-window-reload,
-and a plan-native `realStoppedAudioInWindowReload` that drives
+landed in `MetaSonic.App.ManifestReloadHostStack` together with
+both the open/close half and the in-window half against the
+live session-layer primitives (opt-in, not yet routed):
+`StoppedAudioHostStack` newtype around `ManifestReloadHostConfig`,
+injectable `StoppedAudioHostStackOps` for open / close /
+in-window-reload, the plan-native + target-fresh
+`realStoppedAudioInWindowReload` (drives
 `orchestrateHostStoppedAudioReloadWithEvents` with
-`hsaroPreparePlan` overridden to `const (pure (Right plan))`
-so the supplied plan is the source of truth at the seam (no
-silent re-planning from doc/catalog drift). Eight fake-IO
-scenarios at this layer pin success, the three named
-in-window failure-recovery shapes, rebuild escalation, the
-no-overlapping-stacks transition invariant, async cleanup,
-and an A→B→C→D! regression against the factory composition.
-What remains is the open/close half: implement
-`StoppedAudioHostStackOps` against the live
-`SessionFanInService` + ingress manager + audio FFI bundle
-(via imperative open/close primitives or a worker-thread
-promotion of `withSessionFanInService`), then route the
-existing `reloadManifestHostWithStrategy` `StoppedAudioOnly`
-path through `reloadSupervised` + this factory + the
-real-host ops.
+`hsaroPreparePlan` overridden to `const (pure (Right requested))`
+so the supplied plan is the source of truth at the seam, and
+re-projects both `mrhcOldIngressTarget` and
+`mrhcNewIngressTarget` from the `(fallback, requested)` plans so
+target selection cannot drift across a long reload sequence),
+and the production-wiring `realStoppedAudioHostStackOps` +
+`RealStoppedAudioHostStackInputs` that compose
+`openSessionFanInService` + a per-host ingress-ops factory +
+`startSessionFanInHostAudioWith`. Exception-hardened: `realOpen`
+brackets every acquired resource under `mask` + `onException`,
+and both `realClose` and `rollbackAudioStart` attempt every
+owned cleanup step regardless of prior throws, surfacing the
+first/strongest diagnostic so a throw mid-cleanup cannot skip
+later finalizers. 15 fake-IO + real-service cases at this layer
+pin success, the three named in-window failure-recovery shapes,
+rebuild escalation, the no-overlapping-stacks transition
+invariant, async cleanup, an A→B→C→D! regression against the
+factory composition, six production-helper partial-cleanup paths
+(including ingress-close-throws-during-rollback and
+audio-stop-throws-during-realClose), and one direct integration
+test for `realStoppedAudioInWindowReload`'s plan-native
+short-circuit.
+What remains is the routing only: wire `StoppedAudioOnly`
+(currently direct at `reloadManifestHostWithStrategy`) through
+`reloadSupervised` + `mkStoppedAudioHostStackFactory` +
+`realStoppedAudioHostStackOps`, likely with a narrow
+`SupervisedStoppedAudioReloadResult` / -Issue type so the
+supervisor's rebuild causes don't have to fit into the existing
+`ManifestReloadHostStrategyIssue`. Preserving and
+`TryPreservingThenStoppedAudio` fallback stay direct until the
+supervised stopped-audio path is stable.
 The preserving-live sibling path has also landed behind explicit host
 APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
 runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`
