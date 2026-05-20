@@ -78,6 +78,8 @@ import           MetaSonic.Bridge.Templates (TemplateGraph (..))
 import           MetaSonic.Pattern        (SwapLabel (..))
 import           MetaSonic.Session.Arbitration (ArbitrationPolicy (..))
 import qualified MetaSonic.Session.ManifestReload as MR
+import           MetaSonic.Session.ManifestReload.Runtime
+                                            (ManifestPreservingHotSwapReport (..))
 import           MetaSonic.Session.Queue   (ProducerId (..),
                                             ProducerKind (..))
 import           MetaSonic.Session.RTGraphAdapter
@@ -560,19 +562,22 @@ realInWindowReloadTests =
 
           events <- readIORef eventsRef
 
-          -- The orchestrator must have started: if not, the
-          -- helper never reached the override and the test is
-          -- vacuous.
+          -- Assertion 1: the orchestrator must have started. If
+          -- not, the helper short-circuited (e.g., projection
+          -- failed) and we never reached the override — the test
+          -- is vacuous and the maintainer needs to know.
           let started = any isPreservingStarted events
           started @?=! "MrePreservingReloadStarted was never \
                        \emitted; the helper short-circuited \
                        \before reaching the orchestrator"
 
-          -- The regression: if any MrePreservingReloadRejected
-          -- carries HpariPlanRejected with MrhiPlanning, the
-          -- orchestrator's preparePlan slot ran (instead of the
-          -- override) and failed to find the demo in the empty
-          -- catalog. That is exactly the bug we want to catch.
+          -- Assertion 2 (override-removed regression): if any
+          -- MrePreservingReloadRejected carries HpariPlanRejected
+          -- with MrhiPlanning, the orchestrator's preparePlan
+          -- slot ran (instead of the override) and failed to find
+          -- the demo in the empty catalog. That is the bug we
+          -- want to catch when someone removes
+          -- @hproPreparePlan = const (pure (Right requested))@.
           case findOrchestratorPlanRejected events of
             Just demoKey ->
               assertFailure $
@@ -583,6 +588,37 @@ realInWindowReloadTests =
                 <> "))) — the hproPreparePlan override is broken \
                 \or bypassed"
             Nothing -> pure ()
+
+          -- Assertion 3 (fallback-swap regression): if the
+          -- override is bugged to @const (pure (Right fallback))@,
+          -- the orchestrator passes the FALLBACK plan to
+          -- hproReloadPreserving — observable in the downstream
+          -- ManifestPreservingHotSwapReport's @mphsrDemoKey@ /
+          -- @mphsrSwapLabel@, which carry the actual plan's
+          -- identity (see
+          -- 'MetaSonic.Session.ManifestReload.Runtime' /
+          -- 'reloadManifestSessionPreservingHotSwap'). The report
+          -- is bubbled through MrhiPreservingReload{Rejected,
+          -- Stopped,Unexpected} on any non-Committed orchestrator
+          -- result. With no real owner installed, the empty-
+          -- service preserving call fails and produces a report;
+          -- we assert the report carries the REQUESTED plan's
+          -- demo key and swap label, not the fallback's.
+          --
+          -- If a future orchestration change removes the report
+          -- from this path, this assertion will fail loudly — at
+          -- which point the test maintainer must redesign the
+          -- observation, not silently accept the gap.
+          case findPreservingReportIdentity events of
+            Just (demoKey, swapLabel) -> do
+              demoKey   @?= MR.mrlpDemoKey   newPlan
+              swapLabel @?= MR.mrlpSwapLabel newPlan
+            Nothing ->
+              assertFailure $
+                "no MrePreservingReloadRejected carrying a \
+                \ManifestPreservingHotSwapReport appeared in the \
+                \event trace; the fallback-swap regression cannot \
+                \be observed. Event trace was: " <> show events
   ]
   where
     isPreservingStarted :: ManifestReloadEvent issue -> Bool
@@ -591,7 +627,7 @@ realInWindowReloadTests =
 
     -- Returns Just demoKey if any rejection event in the trace
     -- carries an orchestrator planning failure with an
-    -- unknown-demo cause. Used as the regression signal.
+    -- unknown-demo cause. Used as the override-removed signal.
     findOrchestratorPlanRejected
       :: [ManifestReloadEvent (ManifestReloadHostIssue String)]
       -> Maybe String
@@ -603,6 +639,36 @@ realInWindowReloadTests =
             (HpariPlanRejected
               (MrhiPlanning (MR.MriUnknownManifestDemo demoKey))) ->
                 Just demoKey
+          _ -> go rest
+
+    -- Returns Just (demoKey, swapLabel) if any rejection event in
+    -- the trace carries a ManifestPreservingHotSwapReport. The
+    -- report's identity fields carry the actual plan passed to
+    -- 'reloadManifestSessionPreservingHotSwap', which is what
+    -- distinguishes "override returns requested" from "override
+    -- returns fallback".
+    findPreservingReportIdentity
+      :: [ManifestReloadEvent (ManifestReloadHostIssue String)]
+      -> Maybe (String, SwapLabel)
+    findPreservingReportIdentity = go
+      where
+        go [] = Nothing
+        go (e : rest) = case e of
+          MrePreservingReloadRejected (HpariReloadRejected issue) ->
+            extractReport issue rest
+          MrePreservingReloadRejected (HpariReloadRejectedResumeFailed issue _) ->
+            extractReport issue rest
+          MrePreservingReloadRejected (HpariReloadFailedTerminal issue) ->
+            extractReport issue rest
+          _ -> go rest
+
+        extractReport issue rest = case issue of
+          MrhiPreservingReloadRejected report ->
+            Just (mphsrDemoKey report, mphsrSwapLabel report)
+          MrhiPreservingReloadStopped report ->
+            Just (mphsrDemoKey report, mphsrSwapLabel report)
+          MrhiPreservingReloadUnexpected report ->
+            Just (mphsrDemoKey report, mphsrSwapLabel report)
           _ -> go rest
 
     -- Custom assertion helper: an HUnit-style @True@ check with a
