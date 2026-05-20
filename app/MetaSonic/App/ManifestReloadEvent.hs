@@ -184,11 +184,33 @@ data ManifestReloadEvent issue
   | MreFallbackAdmitted !(HostPreservingReloadIssue issue)
 
     -- | The 'TryPreservingThenStoppedAudio' strategy has
-    -- rejected a preserving failure as ineligible for fallback
-    -- (terminal preserving failure or
-    -- already-changed-live-owner). The strategy will surface
-    -- the original failure; no 'MreStoppedAudioReload*' events
-    -- will follow.
+    -- rejected a preserving failure as ineligible for fallback.
+    -- Two classes of preserving outcome trigger this event:
+    --
+    --   * /Live-stack-not-eligible/: the orchestrator reported
+    --     a preserving rejection that left the stack still
+    --     serving the fallback plan (the four resume-ok cases
+    --     classified by 'classifyPreservingOutcome' as
+    --     'InWindowReloadRejectedLiveFallback' —
+    --     'HpariPlanRejected', 'HpariQuiesceRejected',
+    --     'HpariDrainRejected', 'HpariReloadRejected') /and/
+    --     the conservative 'preservingAllowsStoppedAudioFallback'
+    --     gate said no. Only 'HpariReloadRejected' admits
+    --     fallback today; the other three are recognized as
+    --     live-stack survivors but the direct path declines
+    --     fallback because the run-with-stopped-audio code does
+    --     not have a stronger guarantee that the old owner is
+    --     intact for those failure modes.
+    --   * /Terminal/: preserving reached a terminal owner or
+    --     service state (terminal drain, terminal reload, ingress
+    --     restart failed, or a resume-failed variant). The
+    --     supervisor still surfaces the original failure.
+    --
+    -- In both cases, no 'MreStoppedAudioReload*' events follow
+    -- the event. The downstream supervised outcome
+    -- ('SupervisedReloadRequestRejected' for the first class,
+    -- 'SupervisedReloadRejectedRecovered'/'Escalated' for the
+    -- second) reflects which class fired.
   | MreFallbackDeclined !(HostPreservingReloadIssue issue)
   deriving stock (Eq, Show)
 
