@@ -33,6 +33,8 @@ import           MetaSonic.Spec.AppManifestReloadOrchestration
 import           MetaSonic.Spec.AppManifestReloadOSCBinding
 import           MetaSonic.Spec.AppManifestReloadOSCIngress
 import           MetaSonic.Spec.AppManifestReloadSupervisor
+import           MetaSonic.Spec.AppManifestReloadSupervisorAdapter
+                                                  (appManifestReloadSupervisorAdapterTests)
 import           MetaSonic.Spec.AppManifestReloadUIIngress
 import           MetaSonic.Spec.Core
 import           MetaSonic.Spec.Core.Properties (properties)
@@ -118,6 +120,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , appManifestReloadOSCBindingTests
   , appManifestReloadOSCIngressTests
   , appManifestReloadSupervisorTests
+  , appManifestReloadSupervisorAdapterTests
   , appManifestReloadUIIngressTests
   , unitTests
   , properties

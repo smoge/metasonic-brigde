@@ -163,6 +163,7 @@ executable metasonic-bridge
       MetaSonic.App.ManifestReloadOSCBinding
       MetaSonic.App.ManifestReloadOSCIngress
       MetaSonic.App.ManifestReloadSupervisor
+      MetaSonic.App.ManifestReloadSupervisorAdapter
       MetaSonic.App.ManifestReloadUIIngress
       MetaSonic.App.Osc
       MetaSonic.App.ProfitabilityGate
@@ -222,6 +223,7 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestReloadOSCBinding
       MetaSonic.App.ManifestReloadOSCIngress
       MetaSonic.App.ManifestReloadSupervisor
+      MetaSonic.App.ManifestReloadSupervisorAdapter
       MetaSonic.App.ManifestReloadUIIngress
       MetaSonic.Spec.AppManifestLiveReloadDemoRender
       MetaSonic.Spec.AppManifestMIDIIngressOps
@@ -244,6 +246,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestReloadOSCBinding
       MetaSonic.Spec.AppManifestReloadOSCIngress
       MetaSonic.Spec.AppManifestReloadSupervisor
+      MetaSonic.Spec.AppManifestReloadSupervisorAdapter
       MetaSonic.Spec.AppManifestReloadUIIngress
       MetaSonic.Spec.AppDemos
       MetaSonic.Spec.AppFusionCostLab
