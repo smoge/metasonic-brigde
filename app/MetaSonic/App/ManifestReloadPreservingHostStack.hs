@@ -33,11 +33,15 @@
 -- composes 'realPreservingInWindowReload' with
 -- 'realStoppedAudioInWindowReload' under the existing
 -- 'preservingAllowsStoppedAudioFallback' gate and is the factory
--- that @--manifest-live-reload-demo try-preserving@ now drives.
--- 'realPreservingInWindowReload' is not exposed as a standalone
--- CLI route today — preserving-without-fallback would correspond
--- to @RequirePreserving@, which stays on the direct path until
--- its own migration slice opens.
+-- that @--manifest-live-reload-demo try-preserving@ drives.
+-- This module's 'realPreservingHostStackOps' is the factory that
+-- @--manifest-live-reload-demo require-preserving@ drives
+-- directly (no fallback composition); since
+-- @RequirePreserving@'s contract is "no fallback under any
+-- preserving rejection", every
+-- 'InWindowReloadRejectedLiveFallback' surfaces as
+-- 'SupervisedReloadRequestRejected' and the stack stays serving
+-- the previous plan.
 module MetaSonic.App.ManifestReloadPreservingHostStack
   ( -- * Types
     --

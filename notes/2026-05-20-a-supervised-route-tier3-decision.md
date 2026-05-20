@@ -37,8 +37,46 @@ was met by:
   (12/12), covering the shared-helper rename and the route
   rendering change.
 
-`RequirePreserving` remains on the direct path. Its migration
-is its own slice and would land against the same bar.
+`RequirePreserving` remains on the direct path at the time of
+the try-preserving migration; its migration is its own slice
+and would land against the same bar. (Superseded — see the
+next subsection.)
+
+### Update 2026-05-20: require-preserving migration landed against this bar
+
+`RequirePreserving` migrated onto the supervised stack via
+`realPreservingHostStackOps` (preserving-only — no stopped-audio
+fallback composition). Because there is no fallback gate, every
+`InWindowReloadRejectedLiveFallback`-classified preserving
+outcome surfaces as `SupervisedReloadRequestRejected` and the
+stack stays serving the previous plan; terminal preserving
+variants still drive the supervisor's close+rebuild path. The
+evidence bar was met by:
+
+* `just check-offline` green at suite 1262 (deterministic
+  route + classifier coverage including the updated
+  `selectLiveReloadRoute RequirePreserving` test and the new
+  `renderLiveReloadRoute SfRequirePreserving` rendering test
+  in `MetaSonic.Spec.AppManifestLiveReloadDemoRender`);
+* two marker-clean runs of the new
+  `just manifest-supervised-require-preserving-live-smoke`
+  wrapper on host RME ADI-2 Pro / PipeWire (run 1: 13/13;
+  run 2: 13/13). The wrapper adds a load-bearing NEGATIVE
+  marker that no "stopped-audio phase" lines appear in the
+  transcript, proving the require-preserving supervised path
+  never composes with fallback;
+* one no-regression confirmation run each of
+  `just manifest-supervised-live-smoke` (12/12) and
+  `just manifest-supervised-try-preserving-live-smoke`
+  (12/12) on the same host, covering the new
+  `SfRequirePreserving` arm of the dispatcher.
+
+The supervisor migration arc is now complete: all three
+`--manifest-live-reload-demo` strategies (`StoppedAudioOnly`,
+`TryPreservingThenStoppedAudio`, `RequirePreserving`) dispatch
+through the supervised lifecycle. Nothing remains on the
+direct `reloadManifestHostWithStrategy` path for the audible
+demo command.
 
 ## What this means in practice
 
@@ -106,21 +144,26 @@ if any of the following land:
   Strongest trigger — proves the deterministic lane has a
   gap that only an automated device-backed lane can catch.
 - **Route count outgrows the operator.** The supervised
-  footprint grows past ~three routes (today:
-  stopped-audio; next: preserving, try-preserving). Beyond
-  that, "operators run N marker-clean smokes per PR"
-  becomes infeasible and CI must take it over.
+  footprint grows past ~three routes (today's three:
+  stopped-audio, try-preserving, require-preserving). A
+  fourth supervised route added to the
+  `--manifest-live-reload-demo` dispatcher would push the
+  per-PR operator burden to four marker-clean smokes in
+  sequence on shared-machinery changes, which is the
+  threshold where "operators run N smokes per PR" becomes
+  infeasible and CI must take it over.
 - **Timing-sensitive marker failures appear.** A supervised
   route's marker checks start failing intermittently in a
   way that traces to device timing rather than logic —
   e.g., a cold-vs-warm-start flake, a re-run that passes
   with no code change, or marker order varying across runs.
   This failure mode is most plausible on supervised paths
-  that install a plan with audio running (preserving /
+  that install a plan with audio running (require-preserving /
   try-preserving), but the trigger here is the **observed
-  flake**, not the path category — preserving and
-  try-preserving are explicitly unlocked by this decision
-  and do not by themselves fire this trigger. If a
+  flake**, not the path category — all three audible
+  supervised routes (stopped-audio, try-preserving,
+  require-preserving) are explicitly unlocked by this
+  decision and do not by themselves fire this trigger. If a
   timing-sensitive failure does appear on any supervised
   route, "one operator ran it once" loses statistical power
   and the regression class needs automated re-runs across

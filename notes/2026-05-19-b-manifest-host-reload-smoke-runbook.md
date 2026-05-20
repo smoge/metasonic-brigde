@@ -448,20 +448,13 @@ remaining open polish in this arc) is a separate question.
   consumer-gated; see
   [ManifestReloadEvent Partial Coverage](2026-05-19-a-manifest-reload-event-partial-coverage.md)
   for the open work.
-- The `--manifest-live-reload-demo` CLI's audio + interaction
-  surface for `require-preserving`. The demo's own pre- /
-  post-reload service snapshots, OSC accept log, and prompt
-  flow live in its source; for `require-preserving` this
-  runbook captures only the shared-vocabulary slice (strategy
-  outcome + reload events + ingress snapshot). The supervised
-  `StoppedAudioOnly` and `TryPreservingThenStoppedAudio` paths
-  ARE recorded end-to-end (operator wrapper marker checks +
-  snapshots + OSC accept log + prompt flow) in the
-  "Supervised `StoppedAudioOnly` live-reload demo (slice 2)"
-  and "Supervised `TryPreservingThenStoppedAudio` live-reload
-  demo (slice 5)" sections below — both routes are under
-  active validation. `require-preserving` will move under the
-  same coverage shape only once the migration slice opens.
+- (None for the `--manifest-live-reload-demo` audible paths.)
+  All three supervised live-reload routes — `StoppedAudioOnly`,
+  `TryPreservingThenStoppedAudio`, and `RequirePreserving` —
+  are recorded end-to-end (operator wrapper marker checks +
+  snapshots + OSC accept log + prompt flow) in the three
+  "Supervised … live-reload demo" sections below, each backed
+  by a tier-2 wrapper.
 - Fixtures for non-preserving smoke targets. The preserving live-
   reload path has a committed fixture at
   [examples/manifests/preserve-cutoff.json](../examples/manifests/preserve-cutoff.json),
@@ -478,11 +471,9 @@ through the supervised lifecycle (factory + adapter +
 `reloadSupervised` + `realStoppedAudioHostStackOps`), the same
 machinery the `--manifest-host-reload-smoke` CLI uses. The
 supervised route is hardware-confirmed once (transcript
-below). `try-preserving` is now also supervised via a sibling
-factory; see the next section. `require-preserving` remains
-on the direct `reloadManifestHostWithStrategy` path; its
-migration is its own slice and opens against the evidence bar
-in
+below). `try-preserving` and `require-preserving` are now also
+supervised via sibling factories; see the next two sections.
+All three audible-route migrations met the evidence bar in
 [2026-05-20-a-supervised-route-tier3-decision.md](2026-05-20-a-supervised-route-tier3-decision.md).
 
 The routing decision is exposed as a pure
@@ -801,3 +792,99 @@ Both routes share the same supervisor + adapter machinery, so
 a regression in either would propagate; running both wrappers
 in sequence is the operator gate before promoting any
 shared-machinery change.
+
+## Supervised `RequirePreserving` live-reload demo (slice 5 step 5)
+
+`--manifest-live-reload-demo require-preserving` now routes
+through the supervised lifecycle with a third sibling factory:
+`realPreservingHostStackOps` (preserving-only — no stopped-audio
+fallback composition). The supervisor sees one classified
+in-window slot covering all three `InWindowReloadOutcome`
+variants, but because there is no fallback gate, every
+`InWindowReloadRejectedLiveFallback`-classified preserving
+outcome (the four resume-ok variants: PlanRejected,
+QuiesceRejected, DrainRejected, ReloadRejected) surfaces as
+`SupervisedReloadRequestRejected` and the stack stays serving
+the previous plan. Terminal preserving variants still drive
+the supervisor's close+rebuild path. The route flip landed
+2026-05-20 alongside the two marker-clean tier-2 runs recorded
+below.
+
+Routing tests at
+`MetaSonic.Spec.AppManifestLiveReloadDemoRender` pin
+`selectLiveReloadRoute RequirePreserving` to
+`LiveReloadSupervised SfRequirePreserving` and pin
+`renderLiveReloadRoute` for that flavor to
+`supervised (require-preserving; reloadSupervised +
+HostStackFactory)` — the tier-2 wrapper's marker-1 grep
+depends on this exact string.
+
+### Wrapper
+
+`tools/manifest_supervised_require_preserving_live_smoke.sh`,
+exposed as `just manifest-supervised-require-preserving-live-smoke`.
+Parallel to the stopped-audio and try-preserving wrappers but
+distinct in four ways:
+
+* **Default port** is 17003 (vs 17001 for stopped-audio and
+  17002 for try-preserving), so the three smokes can run in
+  sequence without colliding and a stuck post-exit state on one
+  port does not affect the others.
+* **Artifact names** are
+  `manifest-supervised-require-preserving-live-{transcript,probe}.txt`
+  (vs the other two wrappers' names), avoiding stale transcript
+  confusion when all three smokes run on the same workstation.
+* **Marker checks 4b/4c** look for `preserving phase started`
+  and `preserving phase committed` (same as the try-preserving
+  wrapper, since preserving commits on the blessed
+  preserve-cutoff fixture).
+* **Negative marker 4d** — load-bearing for this route. Uses a
+  `check_absent_marker` helper to assert the transcript
+  contains NO "stopped-audio phase" lines. This is the
+  structural difference from try-preserving: the
+  require-preserving supervised path must never compose with
+  stopped-audio fallback, and a regression that accidentally
+  wired in the wrong factory would surface as the absent marker
+  flipping to present. A bare positive-only marker set could
+  silently pass even with a route mis-wire if preserving still
+  commits.
+
+Marker 1 looks for the specific require-preserving route string
+above; the rest (audio + ingress + OSC accept + post-reload +
+exit + ss + active bind probe) are identical to the other two
+wrappers.
+
+### Tier-2 evidence record (2026-05-20)
+
+Two marker-clean runs of
+`just manifest-supervised-require-preserving-live-smoke` on host
+RME ADI-2 Pro / PipeWire, plus one no-regression confirmation
+run each of `just manifest-supervised-live-smoke` and
+`just manifest-supervised-try-preserving-live-smoke` on the
+same host:
+
+* `require-preserving-run-1-transcript.txt` /
+  `require-preserving-run-1-probe.txt` — 13/13 markers passed
+  (12 positive + 1 negative). Confirms one observation of the
+  new route under marker-clean conditions, including the
+  load-bearing "no stopped-audio phase" negative marker.
+* `require-preserving-run-2-transcript.txt` /
+  `require-preserving-run-2-probe.txt` — 13/13 markers passed.
+  Second observation, per the tier-3 decision note's "minimum
+  two runs to count as evidence" rule.
+* `stopped-audio-confirmation-transcript.txt` /
+  `stopped-audio-confirmation-probe.txt` — 12/12 markers
+  passed on the stopped-audio wrapper, confirming the
+  dispatcher's new `SfRequirePreserving` arm did not regress
+  the stopped-audio path.
+* `try-preserving-confirmation-transcript.txt` /
+  `try-preserving-confirmation-probe.txt` — 12/12 markers
+  passed on the try-preserving wrapper, confirming the same
+  for the try-preserving path.
+
+All three routes share the supervisor + adapter machinery, so
+a regression in any would propagate; running all three wrappers
+in sequence is the operator gate before promoting any
+shared-machinery change. The supervisor migration arc is now
+complete — no `--manifest-live-reload-demo` strategy remains on
+the direct `reloadManifestHostWithStrategy` path.

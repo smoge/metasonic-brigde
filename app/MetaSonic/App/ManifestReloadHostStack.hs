@@ -33,10 +33,13 @@
 -- "MetaSonic.App.ManifestReloadTryPreservingHostStack" factory,
 -- which composes the preserving in-window helper with
 -- 'realStoppedAudioInWindowReload' under the existing
--- 'preservingAllowsStoppedAudioFallback' gate. @RequirePreserving@
--- stays on the direct 'reloadManifestHostWithStrategy' path;
--- migrating it is its own slice and opens against the evidence bar
--- in @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
+-- 'preservingAllowsStoppedAudioFallback' gate.
+-- @RequirePreserving@ uses
+-- "MetaSonic.App.ManifestReloadPreservingHostStack" directly
+-- (preserving-only — no fallback composition). All three
+-- @--manifest-live-reload-demo@ strategies now dispatch through
+-- the supervisor; the original migration evidence bar lives in
+-- @notes/2026-05-20-a-supervised-route-tier3-decision.md@.
 --
 -- 'realStoppedAudioHostStackOps' is the production wiring for
 -- open / close. It opens the imperative

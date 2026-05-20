@@ -3638,10 +3638,16 @@ since also migrated onto the supervised stack via
 stopped-audio fallback under the existing
 `preservingAllowsStoppedAudioFallback` gate; tier-2
 hardware-confirmed 2026-05-20 by two marker-clean runs of
-`just manifest-supervised-try-preserving-live-smoke`).
-`RequirePreserving` still stays on the direct
-`reloadManifestHostWithStrategy` path; its migration would
-open against the same evidence bar as the two landed slices.
+`just manifest-supervised-try-preserving-live-smoke`), and
+`RequirePreserving` followed via `realPreservingHostStackOps`
+(preserving-only — no fallback composition; tier-2
+hardware-confirmed 2026-05-20 by two marker-clean runs of
+`just manifest-supervised-require-preserving-live-smoke`,
+including a load-bearing negative marker that no
+"stopped-audio phase" lines appear in the transcript). All
+three `--manifest-live-reload-demo` strategies now dispatch
+through the supervisor; nothing remains on the direct path
+for the audible demo command.
 The preserving-live sibling path has also landed behind explicit host
 APIs: `CmdHotSwapPreservingOnly` and `HotSwapPreservingOnly` reject
 runtime clear/rebuild fallback, `reloadManifestSessionPreservingHotSwap`
@@ -3838,27 +3844,31 @@ Still gated:
   wrapper on host RME ADI-2 Pro / PipeWire 2026-05-20). The
   classified `InWindowReloadOutcome` and the four-variant
   `SupervisedReloadOutcome` (Committed / RequestRejected /
-  RejectedRecovered / Escalated) underpin both routes through
-  one supervisor primitive. Evidence is classified into three
-  tiers (see the "Evidence policy" subsection at the bottom of
+  RejectedRecovered / Escalated) underpin all three routes
+  through one supervisor primitive. Evidence is classified
+  into three tiers (see the "Evidence policy" subsection at
+  the bottom of
   [notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)):
   tier 1 is the default deterministic offline suite covered
   by `just check-offline`; tier 2 is the opt-in local live
   smokes at `just manifest-supervised-live-smoke` /
-  `just manifest-supervised-try-preserving-live-smoke`
-  (wrappers at `tools/manifest_supervised_live_smoke.sh` and
+  `just manifest-supervised-try-preserving-live-smoke` /
+  `just manifest-supervised-require-preserving-live-smoke`
+  (wrappers at `tools/manifest_supervised_live_smoke.sh`,
   `tools/manifest_supervised_try_preserving_live_smoke.sh`,
-  NOT members of `check-offline`, exit 0 only if all 12
-  acceptance markers observed); tier 3 (hardware-backed CI)
-  is **deferred, not rejected** by
+  and `tools/manifest_supervised_require_preserving_live_smoke.sh`,
+  NOT members of `check-offline`, exit 0 only if all
+  acceptance markers observed — the require-preserving wrapper
+  also pins a negative marker that no "stopped-audio phase"
+  lines appear in the transcript, proving the preserving-only
+  path never composes with fallback); tier 3 (hardware-backed
+  CI) is **deferred, not rejected** by
   [notes/2026-05-20-a-supervised-route-tier3-decision.md](notes/2026-05-20-a-supervised-route-tier3-decision.md).
-  `RequirePreserving` stays on the direct path; its migration
-  would open against the same bar as the two landed slices
-  did: deterministic route tests plus a minimum of two
-  marker-clean tier-2 runs (different hosts / audio backends
-  preferred when available). The decision note also lists
+  All three strategies (`StoppedAudioOnly`,
+  `TryPreservingThenStoppedAudio`, `RequirePreserving`) now
+  route through the supervisor. The decision note also lists
   the reopen triggers that would put tier 3 back on the
-  slate), and the
+  slate, and the
   [Manifest Reload Ingress v1 Closeout](notes/2026-05-15-d-manifest-reload-ingress-v1-closeout.md)
   checkpoint that pins the v1 scope, non-goals, and remaining
   work. Remaining work in this arc is a
