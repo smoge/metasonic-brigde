@@ -10,6 +10,7 @@
 module MetaSonic.App.ManifestReloadCli
   ( ManifestReloadCliIssue (..)
   , ManifestStoppedAudioReloadSmokeResult (..)
+  , ManifestSupervisedStoppedAudioReloadSmokeResult (..)
   , decodeManifestReloadDocBytes
   , readManifestReloadDocFile
   , planManifestReloadForDemo
@@ -24,6 +25,8 @@ module MetaSonic.App.ManifestReloadCli
   , runManifestHostStrategyReloadSmokeWithCatalog
   , runManifestHostStrategyReloadSmokeWithListenerConfig
   , runManifestHostStrategyReloadSmokeResultWithListenerConfig
+  , runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
+  , renderManifestSupervisedStoppedAudioReloadSmoke
   , renderManifestReloadCliIssue
   , renderManifestStoppedAudioReloadSmoke
     -- * Operator-facing typed renderers for strategy outcomes
@@ -69,6 +72,20 @@ import           MetaSonic.App.ManifestReloadOSCBinding
                                                   (motControls)
 import           MetaSonic.App.ManifestReloadEvent
                                                   (ManifestReloadEvent (..))
+import           MetaSonic.App.ManifestReloadHostStack
+                                                  (RealStoppedAudioHostStackInputs (..),
+                                                   StoppedAudioHostStack (..),
+                                                   StoppedAudioHostStackIssue (..),
+                                                   StoppedAudioHostStackOpenIssue (..),
+                                                   SupervisedStoppedAudioReloadResult (..),
+                                                   mkStoppedAudioHostStackFactory,
+                                                   realStoppedAudioHostStackOps)
+import           MetaSonic.App.ManifestReloadSupervisor
+                                                  (SupervisedReloadOutcome (..),
+                                                   reloadSupervised)
+import           MetaSonic.App.ManifestReloadSupervisorAdapter
+                                                  (HostStackFactory (..),
+                                                   withHostStackSupervisorAdapter)
 import           MetaSonic.App.ManifestReloadHost
                                                   (ManifestReloadHostConfig (..),
                                                    ManifestReloadHostIssue (..),
@@ -121,6 +138,7 @@ import           MetaSonic.Session.FanIn          (SessionFanInAudioFFI (..),
                                                    startSessionFanInHostAudioWith,
                                                    withSessionFanInHost)
 import           MetaSonic.Session.FanInService   (SessionFanInServiceSetupIssue,
+                                                   defaultSessionFanInServiceHooks,
                                                    defaultSessionFanInServiceOptions,
                                                    readSessionFanInService,
                                                    sessionFanInServiceHost,
@@ -186,6 +204,50 @@ data ManifestHostStrategyReloadSmokeResult =
       -- smoke's @mrhcOnEvent@ hook in arrival order; the renderer
       -- presents this as the @reload events:@ block.
     } deriving (Show)
+
+
+-- | Result of one supervised StoppedAudioOnly reload smoke. Used
+-- when the @StoppedAudioOnly@ strategy is dispatched through
+-- 'runSupervisedStoppedAudioReload' rather than the direct
+-- 'reloadManifestHostWithStrategy' path. The narrow
+-- 'SupervisedStoppedAudioReloadResult' preserves the supervisor's
+-- rebuild causes through the outcome rather than collapsing them
+-- into the 'ManifestReloadHostStrategyIssue' shape.
+data ManifestSupervisedStoppedAudioReloadSmokeResult =
+  ManifestSupervisedStoppedAudioReloadSmokeResult
+    { mssarsInitialEntry      :: !MR.ManifestReloadCatalogEntry
+      -- ^ Catalog entry the supervisor opened the initial stack
+      -- against (its plan is the @fallback@ at reload entry).
+    , mssarsFallbackPlan      :: !MR.ManifestReloadPlan
+    , mssarsPlan              :: !MR.ManifestReloadPlan
+      -- ^ The @requested@ plan the supervisor attempted to
+      -- install.
+    , mssarsOutcome
+        :: !(SupervisedStoppedAudioReloadResult
+              ManifestOSCIngressOpsIssue)
+    , mssarsPreIngressSnapshot
+        :: !(ManifestReloadIngressSnapshot
+              ManifestReloadIngressTarget
+              ManifestOSCIngressHandle)
+      -- ^ Pre-reload ingress snapshot read from the initial
+      -- stack before the supervisor adapter took ownership. Lets
+      -- the renderer report the bound OSC port without exposing
+      -- the active stack through the adapter contract.
+    , mssarsAudioEvents       :: ![ManifestHostStrategySmokeAudioEvent]
+    , mssarsReloadEvents      :: ![ManifestReloadEvent
+                                    (ManifestReloadHostIssue
+                                      ManifestOSCIngressOpsIssue)]
+      -- ^ Orchestrator events captured via the inputs'
+      -- @rsahsiOnEvent@ sink. Note: this list does NOT include
+      -- the @strategy started@ / @strategy succeeded@ frame
+      -- events that the direct 'reloadManifestHostWithStrategy'
+      -- path emits, because the supervised path does not run
+      -- that strategy wrapper. The renderer synthesizes
+      -- equivalent wrapper lines around this list so operator
+      -- output stays uniform across direct and supervised
+      -- paths.
+    } deriving (Show)
+
 
 data ManifestHostStrategySmokeAudioEvent
   = MhssaStart !Int !Int
@@ -365,14 +427,26 @@ runManifestHostStrategyReloadSmokeWithListenerConfig
   -> Demo
   -> IO (Either ManifestReloadCliIssue String)
 runManifestHostStrategyReloadSmokeWithListenerConfig
-    listenerCfg strategy doc catalog demo =
-  fmap renderManifestHostStrategyReloadSmoke
-    <$> runManifestHostStrategyReloadSmokeResultWithListenerConfig
-          listenerCfg
-          strategy
-          doc
-          catalog
-          demo
+    listenerCfg strategy doc catalog demo = case strategy of
+  StoppedAudioOnly ->
+    -- §219 slice 4 routing: StoppedAudioOnly goes through the
+    -- supervisor + factory now. Preserving and
+    -- TryPreservingThenStoppedAudio stay on the direct path
+    -- below until the supervised stopped-audio path is stable.
+    fmap renderManifestSupervisedStoppedAudioReloadSmoke
+      <$> runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
+            listenerCfg
+            doc
+            catalog
+            demo
+  _ ->
+    fmap renderManifestHostStrategyReloadSmoke
+      <$> runManifestHostStrategyReloadSmokeResultWithListenerConfig
+            listenerCfg
+            strategy
+            doc
+            catalog
+            demo
 
 runManifestHostStrategyReloadSmokeResultWithCatalog
   :: ManifestReloadHostStrategy
@@ -539,6 +613,137 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
             , mshsReloadEvents =
                 capturedReloadEvents
             })
+
+
+-- | Supervised counterpart of
+-- 'runManifestHostStrategyReloadSmokeResultWithListenerConfig'
+-- for the @StoppedAudioOnly@ strategy. Opens the initial stack
+-- via 'realStoppedAudioHostStackOps' against the initial entry's
+-- plan (the supervisor's @fallback@), reads the pre-reload
+-- ingress snapshot off the live stack before the adapter takes
+-- ownership (so the renderer can still report @oscPort=N@), runs
+-- 'reloadSupervised' against @(fallback, requested)@, and lets
+-- the adapter close whichever stack is active on exit.
+runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
+  :: ListenerConfig
+  -> AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> Demo
+  -> IO (Either
+          ManifestReloadCliIssue
+          ManifestSupervisedStoppedAudioReloadSmokeResult)
+runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
+    listenerCfg doc catalog demo =
+  case planManifestReloadForDemo doc catalog demo of
+    Left issue ->
+      pure (Left issue)
+    Right requestedPlan ->
+      case selectStoppedAudioReloadInitialEntry demo catalog of
+        Left issue ->
+          pure (Left issue)
+        Right initialEntry ->
+          case planManifestReloadForCatalogEntry initialEntry of
+            Left issue ->
+              pure (Left issue)
+            Right fallbackPlan ->
+              runSupervisedSmoke
+                listenerCfg
+                initialEntry
+                fallbackPlan
+                requestedPlan
+  where
+    runSupervisedSmoke lcfg initialEntry fallbackPlan requestedPlan = do
+      audioEventsRef  <- newIORef []
+      reloadEventsRef <- newIORef []
+      let audioFFI = manifestHostStrategySmokeAudioFFI audioEventsRef
+          buildIngressOps host =
+            manifestOSCIngressOps
+              defaultManifestOSCListenerHooks
+              defaultOSCProducerOptions
+              host
+              lcfg
+          inputs = RealStoppedAudioHostStackInputs
+            { rsahsiBuildIngressOps =
+                buildIngressOps
+            , rsahsiIngressTargetPolicy =
+                manifestHostStrategySmokeIngressTargetPolicy
+            , rsahsiAudioFFI =
+                audioFFI
+            , rsahsiAudioOptions =
+                manifestHostStrategySmokeAudioOptions
+            , rsahsiOwnerOptions =
+                defaultSessionOwnerOptions
+            , rsahsiServiceOptions =
+                defaultSessionFanInServiceOptions
+            , rsahsiServiceHooks =
+                defaultSessionFanInServiceHooks
+            , rsahsiOnEvent =
+                appendSmokeReloadEvent reloadEventsRef
+            }
+          ops = realStoppedAudioHostStackOps inputs
+          factory = mkStoppedAudioHostStackFactory ops
+      openResult <- hsfOpenStack factory fallbackPlan
+      case openResult of
+        Left issue ->
+          pure (Left (mapSupervisedOpenIssue issue))
+        Right initialStack -> do
+          preSnapshot <- readManifestReloadIngressManager
+            (mrhcIngressManager (sahsConfig initialStack))
+          outcome <-
+            withHostStackSupervisorAdapter factory initialStack $
+              \supOps ->
+                reloadSupervised supOps fallbackPlan requestedPlan
+          audioEvents <- readIORef audioEventsRef
+          reloadEvents <- readIORef reloadEventsRef
+          let supResult = case outcome of
+                SupervisedReloadCommitted ->
+                  SsasrrCommitted
+                SupervisedReloadRejectedRecovered e ->
+                  SsasrrRebuildRecovered e
+                SupervisedReloadEscalated e1 e2 ->
+                  SsasrrEscalated e1 e2
+          pure $ Right ManifestSupervisedStoppedAudioReloadSmokeResult
+            { mssarsInitialEntry       = initialEntry
+            , mssarsFallbackPlan       = fallbackPlan
+            , mssarsPlan               = requestedPlan
+            , mssarsOutcome            = supResult
+            , mssarsPreIngressSnapshot = preSnapshot
+            , mssarsAudioEvents        = audioEvents
+            , mssarsReloadEvents       = reloadEvents
+            }
+
+
+-- | Translate a 'StoppedAudioHostStackIssue' returned by the
+-- initial 'hsfOpenStack' call into a 'ManifestReloadCliIssue'
+-- the CLI surface already understands. 'SahsiInWindow' is
+-- unreachable here (no in-window has run yet); we surface it as
+-- a setup-failed catch-all if it ever shows up to avoid silent
+-- pattern-match failure.
+mapSupervisedOpenIssue
+  :: StoppedAudioHostStackIssue ManifestOSCIngressOpsIssue
+  -> ManifestReloadCliIssue
+mapSupervisedOpenIssue (SahsiOpen openIssue) =
+  case openIssue of
+    SahsoiServiceSetupFailed e ->
+      MrciHostStrategySetupFailed e
+    SahsoiAudioStartFailed e ->
+      MrciHostStrategyAudioStartFailed e
+    SahsoiIngressOpenFailed e ->
+      MrciOSCIngressOpenFailed e
+    SahsoiIngressTargetProjectionFailed e ->
+      MrciIngressTargetFailed e
+    SahsoiPartialCleanupFailed primary _diag ->
+      mapSupervisedOpenIssue (SahsiOpen primary)
+mapSupervisedOpenIssue (SahsiInWindow _) =
+  -- Unreachable in practice: in-window failure can only happen
+  -- after reloadSupervised runs, not from the initial
+  -- 'hsfOpenStack'. If a future refactor reaches this branch,
+  -- the catch-all setup-failed shape gives the operator a
+  -- clear diagnostic without crashing the CLI.
+  MrciCatalogFailed
+    "supervised stopped-audio reload: unexpected in-window issue \
+    \during initial open (supervisor contract violation)"
+
 
 renderManifestReloadCliIssue :: ManifestReloadCliIssue -> String
 renderManifestReloadCliIssue issue =
@@ -824,6 +1029,110 @@ renderManifestHostStrategyReloadSmoke smoke =
       mshsBefore smoke
     afterSnapshot =
       mshsAfter smoke
+
+
+-- | Renderer for the supervised StoppedAudioOnly smoke. The output
+-- shape stays close to 'renderManifestHostStrategyReloadSmoke' so
+-- the operator-facing header / strategy / ingress / audio /
+-- reload-events blocks read the same way across direct and
+-- supervised dispatches.
+--
+-- The supervised path does not run 'reloadManifestHostWithStrategy',
+-- so the @strategy started@ / @strategy succeeded@ wrapper events
+-- that the direct render emits are not in
+-- 'mssarsReloadEvents'. The renderer synthesizes them here so
+-- operator output stays uniform — the genuine orchestrator
+-- events (e.g. @stopped-audio phase started/committed@) still
+-- come from the captured list, sandwiched between the synthetic
+-- frame events.
+--
+-- Pre-reload graph / post-reload graph snapshot lines are
+-- intentionally omitted: the supervisor adapter does not expose
+-- the active stack to the supervised callback by design, so the
+-- post-reload SessionFanInService snapshot is not reachable
+-- without breaking the encapsulation. The pre-reload ingress
+-- snapshot IS read (off the initial stack before the adapter
+-- takes ownership) and rendered, so @oscPort=N@ stays visible
+-- for tests that pin the real-UDP-bind path.
+renderManifestSupervisedStoppedAudioReloadSmoke
+  :: ManifestSupervisedStoppedAudioReloadSmokeResult
+  -> String
+renderManifestSupervisedStoppedAudioReloadSmoke smoke =
+  unlines $
+    [ "Manifest host strategy reload smoke"
+    , "  strategy: stopped-audio-only"
+    , "  initial demo: " <> MR.mrcDemoKey initialEntry
+    , "  target demo: " <> MR.mrlpDemoKey plan
+    , "  swap label: " <> swapLabelText (MR.mrlpSwapLabel plan)
+    , "  fake audio lifecycle: yes (no PortAudio device opened)"
+    , "  strategy result: " <> supervisedOutcomeText outcome
+    , "  ingress: " <> renderSmokeIngressSnapshot preSnapshot
+    , "  reload events:"
+    ]
+    <> [ "    - strategy started: stopped-audio-only" ]
+    <> renderSmokeReloadEvents (mssarsReloadEvents smoke)
+    <> [ "    - " <> supervisedStrategyEventText outcome ]
+    <> [ "  fake audio events:" ]
+    <> renderSmokeAudioEvents (mssarsAudioEvents smoke)
+  where
+    initialEntry = mssarsInitialEntry smoke
+    plan         = mssarsPlan smoke
+    preSnapshot  = mssarsPreIngressSnapshot smoke
+    outcome      = mssarsOutcome smoke
+
+    -- Strategy-result line text. The 'committed' branch
+    -- intentionally matches the direct path's wording so
+    -- existing assertContains "success: stopped-audio installed"
+    -- assertions stay green; the supervised-specific
+    -- 'recovered' / 'escalated' branches are new prose.
+    supervisedOutcomeText o = case o of
+      SsasrrCommitted ->
+        "success: stopped-audio installed"
+      SsasrrRebuildRecovered cause ->
+        "recovered: in-window failed ("
+        <> renderSupervisedHostStackIssue cause
+        <> "); rebuild from fallback succeeded"
+      SsasrrEscalated inWindow rebuild ->
+        "escalated: in-window failed ("
+        <> renderSupervisedHostStackIssue inWindow
+        <> "); rebuild also failed ("
+        <> renderSupervisedHostStackIssue rebuild
+        <> ")"
+
+    -- Synthetic strategy-frame closer event. Mirrors the
+    -- direct path's @strategy succeeded:@ / @strategy failed:@
+    -- prose so operator timelines read uniformly.
+    supervisedStrategyEventText o = case o of
+      SsasrrCommitted ->
+        "strategy succeeded: stopped-audio installed"
+      SsasrrRebuildRecovered _ ->
+        "strategy recovered: stopped-audio rebuilt from fallback"
+      SsasrrEscalated _ _ ->
+        "strategy failed: stopped-audio escalated"
+
+
+-- | Compact textual tag for a supervised host-stack issue.
+-- Both halves of the supervisor's outcome (in-window cause /
+-- rebuild cause) flow through this so the renderer's
+-- @recovered:@ / @escalated:@ lines name which step broke
+-- without dumping the full structured payload.
+renderSupervisedHostStackIssue
+  :: StoppedAudioHostStackIssue ManifestOSCIngressOpsIssue
+  -> String
+renderSupervisedHostStackIssue issue = case issue of
+  SahsiInWindow _ ->
+    "in-window orchestrator"
+  SahsiOpen (SahsoiServiceSetupFailed _) ->
+    "service setup"
+  SahsiOpen (SahsoiAudioStartFailed _) ->
+    "audio start"
+  SahsiOpen (SahsoiIngressOpenFailed _) ->
+    "ingress open"
+  SahsiOpen (SahsoiIngressTargetProjectionFailed _) ->
+    "ingress target projection"
+  SahsiOpen (SahsoiPartialCleanupFailed _ _) ->
+    "partial cleanup"
+
 
 -- | Shared typed renderer for a successful strategy outcome. Used
 -- by both the @--manifest-host-reload-smoke@ @strategy result:@

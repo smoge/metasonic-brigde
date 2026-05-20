@@ -159,26 +159,36 @@ appManifestReloadCliTests =
             ("expected stopped-audio-only host strategy smoke success, got: "
              <> renderManifestReloadCliIssue issue)
         Right output -> do
+          -- §219 slice 4 routing: StoppedAudioOnly now goes
+          -- through 'runSupervisedStoppedAudioReload' instead of
+          -- the direct 'reloadManifestHostWithStrategy' dispatch.
+          -- The supervised renderer is shaped to keep the
+          -- operator-facing header / strategy / result /
+          -- audio-events / reload-events lines identical to the
+          -- direct path's render where possible. The graph-snapshot
+          -- and selector-command lines are dropped because the
+          -- supervisor adapter does not expose the active stack to
+          -- the supervised callback by design.
           assertContains "Manifest host strategy reload smoke" output
           assertContains "  strategy: stopped-audio-only" output
-          -- 'MrhsrStoppedAudio' has no payload; the typed renderer
-          -- prints "stopped-audio installed ...". Pin the prose
-          -- and the absence of the Mrhsr* show.
           assertContains
             "  strategy result: success: stopped-audio installed"
             output
-          assertNotContains "MrhsrStoppedAudio" output
-          assertContains "    graph installed: yes" output
-          assertContains "  ingress: open demo=send-return" output
+          assertNotContains "SsasrrCommitted" output
+          -- 'oscPort=' is rendered from the pre-reload ingress
+          -- snapshot read off the initial stack before the
+          -- supervisor adapter took ownership, so the actual
+          -- bound port stays visible even though post-reload
+          -- snapshots aren't reachable from the supervised
+          -- callback.
+          assertContains "oscPort=" output
           assertContains "  fake audio events:" output
           assertContains "    - start channels=2 device=-1" output
           assertContains "    - stop" output
-          assertContains
-            "  selector command projection: CmdHotSwapPreservingOnly manifest:send-return templates=2 (selector-controlled)"
-            output
-          -- Stopped-audio-only is the simplest event timeline: no
-          -- preserving phase, no fallback admission, just the
-          -- stopped-audio bracket plus the strategy frame.
+          -- The supervised path's reload-events block: synthetic
+          -- 'strategy started' / 'strategy succeeded' wrapper
+          -- events bracket the genuine orchestrator events so the
+          -- timeline reads the same as the direct path's render.
           assertContainsInOrder
             [ "  reload events:"
             , "    - strategy started: stopped-audio-only"
