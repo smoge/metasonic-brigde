@@ -466,4 +466,50 @@ appManifestReloadSupervisorAdapterTests =
           opens   = [i | OpenCalled _ i <- trace]
       (1 `elem` closes) @?= True
       all (`elem` closes) opens @?= True
+
+  , testCase
+      "continuation runs at the caller's masking state via outer restore"
+      $ do
+      -- Pins the outer-mask + restore shape of
+      -- withHostStackSupervisorAdapter. The adapter wraps its
+      -- setup (newIORef of the initial-stack slot + 'finally'
+      -- installation) in 'mask', then restores ONLY the
+      -- continuation @k supOps@ so the producer code inside @k@
+      -- runs at the caller's original masking state.
+      --
+      -- Test setup: caller is the default Unmasked state. With
+      -- the outer mask + restore correctly applied, the
+      -- continuation observes Unmasked (restore lifts the
+      -- adapter's MaskedInterruptible back to caller state).
+      -- Failure modes this catches:
+      --
+      --   * outer mask present, restore missing: continuation
+      --     would observe MaskedInterruptible and fail this
+      --     assertion. This is the most subtle regression — a
+      --     drive-by refactor could plausibly drop the restore.
+      --
+      -- Failure modes this does NOT catch (limit of direct
+      -- observation):
+      --
+      --   * outer mask entirely missing (the user-named §103
+      --     bug). With no outer mask, the continuation also
+      --     observes Unmasked and the test passes vacuously.
+      --     The behavioral guarantee for that case — that
+      --     async exceptions cannot land between newIORef and
+      --     the 'finally' installation — is enforced by the
+      --     code review of the @mask $ \\restore -> ...@
+      --     opening of the adapter and is not deterministically
+      --     observable from outside.
+      observedRef <- newIORef Nothing
+      let factory :: HostStackFactory String Int AdapterFailure
+          factory = HostStackFactory
+            { hsfOpenStack = \_ -> pure (Right 42)
+            , hsfCloseStack = \_ -> pure ()
+            , hsfInWindowReload = \_ _ -> pure (Right ())
+            }
+      withHostStackSupervisorAdapter factory 1 $ \_ops -> do
+        ms <- getMaskingState
+        modifyIORef' observedRef (const (Just ms))
+      observed <- readIORef observedRef
+      observed @?= Just Unmasked
   ]

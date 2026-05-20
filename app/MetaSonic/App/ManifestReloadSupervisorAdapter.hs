@@ -95,28 +95,42 @@ data HostStackFactory plan stack e = HostStackFactory
 -- in-window throw left the ref empty (no-op) and the case where
 -- the supervisor never failed and the original stack is still
 -- live (closed here).
+--
+-- The entire setup runs under an outer 'mask'; only the
+-- continuation @k supOps@ is 'restore'd to the caller's masking
+-- state. Without the outer mask, an async exception landing
+-- between @newIORef (Just initialStack)@ and the 'finally'
+-- installation would leak @initialStack@: the caller has already
+-- opened it and handed it to us, but no bracket is yet in place
+-- to dispose it. With the mask, queued async exceptions can only
+-- fire inside @restore (k supOps)@ — at which point 'finally'
+-- is fully installed and @closeOps@ runs as the cleanup.
 withHostStackSupervisorAdapter
   :: HostStackFactory plan stack e
   -> stack
   -> (SupervisorOps plan e -> IO a)
   -> IO a
-withHostStackSupervisorAdapter factory initialStack k = do
+withHostStackSupervisorAdapter factory initialStack k = mask $ \restore -> do
   stackRef <- newIORef (Just initialStack)
 
   let closeOps = closeActiveStack factory stackRef
 
       -- Async-exception safety: the window between "hsfOpenStack
       -- returns Right newStack" and "writeIORef stackRef (Just
-      -- newStack)" must be uninterruptible. Without the mask, an
-      -- async exception landing there would lose the only handle to
-      -- a freshly built stack (the ref still reads Nothing and the
-      -- finally below no-ops). 'mask' establishes
-      -- MaskedInterruptible; 'restore' lets the producer's
-      -- hsfOpenStack run interruptibly so its own internal
-      -- cleanup on async exception still works as a producer
-      -- contract.
-      openOps plan = mask $ \restore -> do
-        result <- restore (hsfOpenStack factory plan)
+      -- newStack)" must be uninterruptible. Without the inner
+      -- mask, an async exception landing there would lose the
+      -- only handle to a freshly built stack (the ref still
+      -- reads Nothing and the finally below no-ops). The inner
+      -- 'mask' nests safely inside the outer one — when openOps
+      -- is invoked from within the outer 'restore' (i.e. from
+      -- the continuation k), @restore'@ here returns to the
+      -- caller's original masking state, so the producer's
+      -- hsfOpenStack still runs at whatever state the caller
+      -- had (typically Unmasked) and its own internal
+      -- bracket/finally on partial allocation continues to
+      -- work.
+      openOps plan = mask $ \restore' -> do
+        result <- restore' (hsfOpenStack factory plan)
         case result of
           Left e ->
             pure (Left e)
@@ -149,7 +163,7 @@ withHostStackSupervisorAdapter factory initialStack k = do
         , sopsOpenStack      = openOps
         }
 
-  k supOps `finally` closeOps
+  restore (k supOps) `finally` closeOps
 
 
 -- | Idempotent close: take the stack out of the ref atomically,
