@@ -22,14 +22,22 @@
 --     open sequences. Includes the A→B→C→D! regression mirroring
 --     the stopped-audio factory-layer guard.
 --
--- The 'sahsConfig' field on the test fakes is left as a deferred
--- @error@ placeholder; tests verify by inspection that
--- @pahsoInWindowReload@ never forces it (the in-window slot is
--- overridden in every test). The 'realPreservingInWindowReload'
--- production wiring is not exercised here — its plan-native +
--- target-fresh contract is identical in shape to
--- 'realStoppedAudioInWindowReload's and is proven structurally by
--- the existing stopped-audio direct-integration test.
+-- The 'sahsConfig' field on the test fakes for the factory-
+-- composition group is left as a deferred @error@ placeholder;
+-- tests verify by inspection that @pahsoInWindowReload@ never
+-- forces it (the in-window slot is overridden in every test).
+--
+-- The 'realPreservingInWindowReload' production wiring is
+-- exercised separately by 'realInWindowReloadTests', which opens
+-- a real fan-in service via the shared stopped-audio fixtures and
+-- calls 'realPreservingInWindowReload' directly with non-matching
+-- @(fallback, requested)@ demo keys. The plan-native @hproPreparePlan@
+-- override is load-bearing at that seam: without it, the
+-- orchestrator would consult the empty doc / catalog and reject
+-- planning with @HpariPlanRejected (MrhiPlanning
+-- MriUnknownManifestDemo)@. The direct test asserts on the
+-- captured event stream so the regression mode is named loudly
+-- if the override is ever removed.
 module MetaSonic.Spec.AppManifestReloadPreservingHostStack
   ( appManifestReloadPreservingHostStackTests
   ) where
@@ -40,18 +48,26 @@ import           Data.IORef        (IORef, modifyIORef', newIORef, readIORef)
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
+import qualified Data.Text                 as T
+
+import           MetaSonic.App.ManifestReloadEvent
+                                   (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost.Types
                                    (ManifestReloadHostIssue (..))
 import           MetaSonic.App.ManifestReloadHostStack
-                                   (StoppedAudioHostStack (..),
-                                    StoppedAudioHostStackOpenIssue (..))
+                                   (RealStoppedAudioHostStackInputs (..),
+                                    StoppedAudioHostStack (..),
+                                    StoppedAudioHostStackOpenIssue (..),
+                                    StoppedAudioHostStackOps (..),
+                                    realStoppedAudioHostStackOps)
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                    (HostPreservingReloadIssue (..))
 import           MetaSonic.App.ManifestReloadPreservingHostStack
                                    (PreservingHostStackIssue (..),
                                     PreservingHostStackOps (..),
                                     classifyPreservingOutcome,
-                                    mkPreservingHostStackFactory)
+                                    mkPreservingHostStackFactory,
+                                    realPreservingInWindowReload)
 import           MetaSonic.App.ManifestReloadSupervisor
                                    (InWindowReloadOutcome (..),
                                     SupervisedReloadOutcome (..),
@@ -62,8 +78,16 @@ import           MetaSonic.Bridge.Templates (TemplateGraph (..))
 import           MetaSonic.Pattern        (SwapLabel (..))
 import           MetaSonic.Session.Arbitration (ArbitrationPolicy (..))
 import qualified MetaSonic.Session.ManifestReload as MR
+import           MetaSonic.Session.Queue   (ProducerId (..),
+                                            ProducerKind (..))
 import           MetaSonic.Session.RTGraphAdapter
                                    (defaultRTGraphAdapterOptions)
+
+import           MetaSonic.Spec.AppManifestReloadHostStack
+                                   (fakeAudioFFIStartOk,
+                                    fakeIngressOpsOpenOk,
+                                    mkProductionInputs,
+                                    testIngressTargetPolicy)
 
 
 -- | Type instantiation. 'ingressIssue' = 'String'; 'target' = '()'
@@ -190,6 +214,7 @@ appManifestReloadPreservingHostStackTests =
   testGroup "App manifest reload preserving host stack"
   [ classifyPreservingOutcomePolicyTests
   , factoryCompositionTests
+  , realInWindowReloadTests
   ]
 
 
@@ -362,14 +387,11 @@ factoryCompositionTests =
       -- in-window cause AND the rebuild cause preserved through
       -- PahsiInWindow / PahsiOpen respectively.
       traceRef <- newIORef []
-      let -- Use a separate import to construct the open issue
-          -- without leaking the symbol through the preserving
-          -- module; the test file already imports
-          -- StoppedAudioHostStackOpenIssue.
-          openFails _plan = pure $ Left $
-            -- Pick a recognizable variant so the assertion is
-            -- specific.
-            stoppedAudioOpenIssueFakeForTest
+      let -- Pick a recognizable variant so the assertion is
+          -- specific. StoppedAudioHostStackOpenIssue is imported
+          -- directly because PreservingHostStackOpenIssue is an
+          -- alias and the constructors are the same.
+          openFails _plan = pure (Left stoppedAudioOpenIssueFakeForTest)
           ops = mkFakeOps traceRef FakeStackPlan
             { fspOpenBehavior = openFails
             , fspInWindowBehavior = inWindowReloadFailedTerminal
@@ -451,3 +473,141 @@ factoryCompositionTests =
 stoppedAudioOpenIssueFakeForTest :: StoppedAudioHostStackOpenIssue String
 stoppedAudioOpenIssueFakeForTest =
   SahsoiIngressOpenFailed "rebuild-broke"
+
+
+-- | Diagnostic 'ProducerId' for the direct-integration test. The
+-- @hproPreparePlan@ override does not consult the producer, but
+-- the orchestrator's downstream slots do, so a real value is
+-- supplied.
+testProducerId :: ProducerId
+testProducerId = ProducerId
+  { producerKind = ProducerTest
+  , producerName = T.pack "preserving-direct-integration"
+  }
+
+
+-- | Direct integration test for 'realPreservingInWindowReload'.
+--
+-- The helper drives 'orchestrateHostPreservingReloadWithEvents'
+-- with @hproPreparePlan = const (pure (Right requested))@ and
+-- passes intentionally empty doc + empty catalog through
+-- 'manifestPreservingReloadHostOps'. If the override is ever
+-- removed (or accidentally bypassed in a refactor), the default
+-- 'preparePlan' would consult the empty doc / catalog and emit
+-- @MrePreservingReloadRejected (HpariPlanRejected (MrhiPlanning
+-- (MriUnknownManifestDemo ...)))@ as the first failure event —
+-- before any other lifecycle step.
+--
+-- The supervisor cannot observe this through its
+-- 'InWindowReloadOutcome' alone because the projection failure
+-- branch of 'realPreservingInWindowReload' itself synthesizes the
+-- same @HpariPlanRejected (MrhiPlanning ...)@ shape. The
+-- distinguishing signal lives in the event stream: the
+-- orchestrator emits @MrePreservingReloadStarted@ unconditionally
+-- before calling @hproPreparePlan@, so a captured trace that
+-- shows @MrePreservingReloadStarted@ followed by
+-- @MrePreservingReloadRejected (HpariPlanRejected
+-- (MrhiPlanning ...))@ is the orchestrator's planning step
+-- failing, which proves the override was bypassed. A trace that
+-- shows neither (because projection short-circuited before the
+-- orchestrator ran) or that shows @MrePreservingReloadStarted@
+-- followed by a non-MrhiPlanning rejection both confirm the
+-- override is in effect.
+--
+-- Setup: open the real-fan-in path with fakes (audio start
+-- succeeds, ingress open/close succeed). No real owner is
+-- installed, so the preserving hot-swap itself is expected to
+-- fail at a later step (likely @HpariReloadFailedTerminal@ from
+-- 'reloadManifestSessionPreservingHotSwap' on an empty service).
+-- That downstream failure is acceptable here — only the planning
+-- step's pass/fail matters for the regression this test catches.
+realInWindowReloadTests :: TestTree
+realInWindowReloadTests =
+  testGroup "realPreservingInWindowReload plan-native short-circuit"
+  [ testCase
+      "supplied plan is installed despite empty doc/catalog (no MrhiPlanning)"
+      $ do
+      eventsRef <- newIORef []
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let baseInputs =
+            mkProductionInputs
+              (fakeIngressOpsOpenOk ingressCloseCalls)
+              fakeAudioFFIStartOk
+          inputs = baseInputs
+            { rsahsiOnEvent = \e -> modifyIORef' eventsRef (++ [e])
+            }
+          ops = realStoppedAudioHostStackOps inputs
+      openResult <- sahsoOpen ops (mkPlan "initial")
+      case openResult of
+        Left issue ->
+          assertFailure ("open failed: " <> show issue)
+        Right stack -> do
+          -- The "after-reload" plan's demo key is distinct from
+          -- "initial" so any code path that re-derived a plan
+          -- from doc/catalog (which is empty) would emit
+          -- HpariPlanRejected (MrhiPlanning (MriUnknownManifestDemo
+          -- "after-reload")) as the first orchestrator failure.
+          let initialPlan = mkPlan "initial"
+              newPlan     = mkPlan "after-reload"
+          _reloadResult <-
+            realPreservingInWindowReload
+              testProducerId
+              testIngressTargetPolicy
+              stack
+              initialPlan
+              newPlan
+          sahsoClose ops stack
+
+          events <- readIORef eventsRef
+
+          -- The orchestrator must have started: if not, the
+          -- helper never reached the override and the test is
+          -- vacuous.
+          let started = any isPreservingStarted events
+          started @?=! "MrePreservingReloadStarted was never \
+                       \emitted; the helper short-circuited \
+                       \before reaching the orchestrator"
+
+          -- The regression: if any MrePreservingReloadRejected
+          -- carries HpariPlanRejected with MrhiPlanning, the
+          -- orchestrator's preparePlan slot ran (instead of the
+          -- override) and failed to find the demo in the empty
+          -- catalog. That is exactly the bug we want to catch.
+          case findOrchestratorPlanRejected events of
+            Just demoKey ->
+              assertFailure $
+                "realPreservingInWindowReload re-derived plan \
+                \from doc/catalog: observed MrePreservingReloadRejected \
+                \(HpariPlanRejected (MrhiPlanning (MriUnknownManifestDemo "
+                <> show demoKey
+                <> "))) — the hproPreparePlan override is broken \
+                \or bypassed"
+            Nothing -> pure ()
+  ]
+  where
+    isPreservingStarted :: ManifestReloadEvent issue -> Bool
+    isPreservingStarted MrePreservingReloadStarted = True
+    isPreservingStarted _                          = False
+
+    -- Returns Just demoKey if any rejection event in the trace
+    -- carries an orchestrator planning failure with an
+    -- unknown-demo cause. Used as the regression signal.
+    findOrchestratorPlanRejected
+      :: [ManifestReloadEvent (ManifestReloadHostIssue String)]
+      -> Maybe String
+    findOrchestratorPlanRejected = go
+      where
+        go [] = Nothing
+        go (e : rest) = case e of
+          MrePreservingReloadRejected
+            (HpariPlanRejected
+              (MrhiPlanning (MR.MriUnknownManifestDemo demoKey))) ->
+                Just demoKey
+          _ -> go rest
+
+    -- Custom assertion helper: an HUnit-style @True@ check with a
+    -- failure message. Keeps the test reading top-to-bottom
+    -- without nested case-of branches.
+    (@?=!) :: Bool -> String -> Assertion
+    True  @?=! _   = pure ()
+    False @?=! msg = assertFailure msg

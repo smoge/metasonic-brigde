@@ -45,6 +45,21 @@
 -- See notes/2026-05-14-k-host-reload-supervisor.md \xa7219 slice 4.
 module MetaSonic.Spec.AppManifestReloadHostStack
   ( appManifestReloadHostStackTests
+    -- * Fixtures shared with
+    --   "MetaSonic.Spec.AppManifestReloadPreservingHostStack"
+    --
+    -- These helpers build the real-fan-in-service open path with
+    -- fake ingress + fake audio FFI. The preserving direct-
+    -- integration test reuses them because the open lifecycle is
+    -- route-agnostic; the only difference between the two specs
+    -- is which in-window helper is exercised after the stack is
+    -- open. Keeping them in one place avoids drift between the
+    -- two test setups.
+  , mkPlan
+  , mkProductionInputs
+  , fakeIngressOpsOpenOk
+  , fakeAudioFFIStartOk
+  , testIngressTargetPolicy
   ) where
 
 import           Control.Concurrent      (forkIO)

@@ -153,9 +153,25 @@ data PreservingHostStackIssue ingressIssue
   = PahsiInWindow
       !(HostPreservingReloadIssue
           (ManifestReloadHostIssue ingressIssue))
-    -- ^ In-window reload failed terminally; the supervisor closes
-    -- the stack and attempts a rebuild from the captured fallback
-    -- plan.
+    -- ^ In-window reload returned a classified non-Committed
+    -- outcome. Carries the 'HostPreservingReloadIssue' cause for
+    -- either branch:
+    --
+    -- * Wrapped inside 'SupervisedReloadRequestRejected' when the
+    --   classifier produced 'InWindowReloadRejectedLiveFallback'
+    --   (stack still serving fallback plan; no rebuild ran).
+    -- * Wrapped inside 'SupervisedReloadRejectedRecovered' or
+    --   'SupervisedReloadEscalated' when the classifier produced
+    --   'InWindowReloadTerminal' (supervisor closed the stack and
+    --   rebuilt from the captured fallback plan).
+    --
+    -- 'mkPreservingHostStackFactory' uses the same 'PahsiInWindow'
+    -- constructor for both branches via @fmap PahsiInWindow <$>
+    -- pahsoInWindowReload@: the outer @<$>@ lifts through 'IO' and
+    -- the inner 'fmap' lifts through the 'Functor' instance on
+    -- 'InWindowReloadOutcome', so the cause-payload constructor
+    -- tag is route-uniform and the supervisor's outcome variant
+    -- communicates the branch.
   | PahsiOpen !(PreservingHostStackOpenIssue ingressIssue)
     -- ^ The rebuild's 'pahsoOpen' against the fallback plan
     -- failed; the supervisor escalates with both causes preserved.
