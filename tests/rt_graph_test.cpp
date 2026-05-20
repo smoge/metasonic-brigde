@@ -121,12 +121,29 @@ TEST_CASE("static plugin registry exposes identity") {
     CHECK(rt_graph_plugin_state_size_bytes(-1) == -1);
 }
 
+TEST_CASE("static plugin registry exposes one-tap-delay") {
+    const int id = rt_graph_plugin_find("one-tap-delay");
+    REQUIRE(id >= 0);
+
+    const char *name = rt_graph_plugin_name(id);
+    REQUIRE(name != nullptr);
+    CHECK(std::string(name) == "one-tap-delay");
+    CHECK(rt_graph_plugin_audio_in_count(id) == 2);
+    CHECK(rt_graph_plugin_audio_out_count(id) == 1);
+    CHECK(rt_graph_plugin_latency_samples(id) == 1);
+    CHECK(rt_graph_plugin_state_size_bytes(id) > 0);
+    CHECK(rt_graph_plugin_state_size_bytes(id) <= metasonic::kMaxPluginState);
+}
+
 // Phase 6.E v2 §5 test #13: register_plugin enforces
 // `state_size_bytes ∈ [0, kMaxPluginState]` at registration time so
-// the runtime registry never carries an out-of-spec row. Each
-// rejection case can share a name because the bounds check fires
-// before the duplicate-name check in register_plugin
-// (rt_graph_plugins.cpp). The accept case uses a unique name.
+// the runtime registry never carries an out-of-spec row. The
+// rejection cases share a stack-local spec because the bounds
+// check fires before `g_plugins[id] = spec` in register_plugin
+// (rt_graph_plugins.cpp), so the pointer is never stored — the
+// stack lifetime is irrelevant. The accept case is in its own
+// TEST_CASE below precisely because acceptance *does* store the
+// pointer, and storage duration matters there.
 TEST_CASE("register_plugin rejects out-of-range state_size_bytes") {
     auto noop_process = [](void *, int, const float * const *,
                            float * const *) noexcept { return 0; };
@@ -150,13 +167,36 @@ TEST_CASE("register_plugin rejects out-of-range state_size_bytes") {
         spec.state_size_bytes = INT_MIN;
         CHECK(metasonic::register_plugin(&spec) == -1);
     }
-    SUBCASE("at upper bound is accepted") {
-        spec.name = "phase-6e-v2-bounds-accept";
-        spec.state_size_bytes = metasonic::kMaxPluginState;
-        const int id = metasonic::register_plugin(&spec);
-        CHECK(id >= 0);
-        CHECK(rt_graph_plugin_state_size_bytes(id) == metasonic::kMaxPluginState);
-    }
+}
+
+// Accept case for §5 test #13. register_plugin stores the raw
+// PluginSpec pointer in its global registry (rt_graph_plugins.cpp
+// `g_plugins[id] = spec`), so the spec must outlive the test —
+// a function-local `static` gives it process-wide storage. A
+// stack-local spec would leave a dangling registry entry the
+// moment this test returns, which any later registry-touching
+// test (or a future run that doesn't reset state) could read
+// through.
+TEST_CASE("register_plugin accepts state_size_bytes at the upper bound") {
+    static int (*const noop_process)(void *, int, const float * const *,
+                                     float * const *) noexcept =
+        [](void *, int, const float * const *,
+           float * const *) noexcept { return 0; };
+
+    static const metasonic::PluginSpec kAcceptSpec{
+        /*name=*/"phase-6e-v2-bounds-accept",
+        /*state_size_bytes=*/metasonic::kMaxPluginState,
+        /*audio_in_count=*/1,
+        /*audio_out_count=*/1,
+        /*latency_samples=*/0,
+        /*init=*/nullptr,
+        /*reset=*/nullptr,
+        /*process=*/noop_process,
+    };
+
+    const int id = metasonic::register_plugin(&kAcceptSpec);
+    CHECK(id >= 0);
+    CHECK(rt_graph_plugin_state_size_bytes(id) == metasonic::kMaxPluginState);
 }
 
 // ----------------------------------------------------------------
