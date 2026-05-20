@@ -36,6 +36,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -878,7 +879,41 @@ struct SpectralLpfState {
 struct StaticPluginState {
   int plugin_id = -1;
   const metasonic::PluginSpec *spec = nullptr;
+
+  // §6.E v2 (notes/2026-05-19-d-phase-6e4-second-static-plugin-contract.md
+  // §4.1): host-owned inline per-instance plugin state. Zeroed at
+  // instance reset by value-initialization. `spec->init` is *not*
+  // called in v2 — the contract pins that plugin state must be
+  // zero-valid and implicit-lifetime / trivially copyable, so a
+  // zero-initialized blob is the correct initial value.
+  //
+  // This prep slice only declares the storage. The dispatcher
+  // change in `process_static_plugin` that actually passes
+  // `&storage[0]` to `spec->process` (instead of the current
+  // unconditional `nullptr`) lands in the follow-up slice that
+  // also adds the one-tap-delay plugin TU.
+  //
+  // `metasonic::` qualifier matches the existing
+  // `metasonic::PluginSpec` / `metasonic::plugin_at` references in
+  // this TU; rt_graph.cpp does not `using namespace metasonic`.
+  alignas(std::max_align_t)
+  std::array<std::byte, metasonic::kMaxPluginState> storage{};
 };
+
+// §6.E v2 invariant: StaticPluginState's inline blob free-rides on
+// the spectral states' variant footprint. NodeState is a
+// std::variant; sizeof(NodeState) is the max over its alternatives,
+// and the size-driver today is SpectralFreezeState (~21 KiB).
+// Adding `storage` to StaticPluginState therefore does not grow
+// per-node memory because the spectral arms already dominate.
+// If this assertion ever fires, plugin storage has become the
+// NodeState size-driver and the §4.1 contract requires either
+// shrinking kMaxPluginState or moving plugin state out-of-line.
+// See notes/2026-05-19-d-phase-6e4-second-static-plugin-contract.md §4.1.
+static_assert(
+    sizeof(StaticPluginState) <= sizeof(SpectralFreezeState),
+    "StaticPluginState must not grow the NodeState variant past the "
+    "spectral arms; see notes/2026-05-19-d-phase-6e4-second-static-plugin-contract.md §4.1");
 
 // Stateless nodes use monostate: this keeps each runtime node from dealing
 // directly with every possible state object.

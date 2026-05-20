@@ -2,6 +2,18 @@
 
 namespace metasonic {
 
+// Upper bound on `PluginSpec::state_size_bytes` that
+// `register_plugin` will eventually enforce. Pinned by Phase 6.E
+// v2 §4.1 / §4.2
+// (notes/2026-05-19-d-phase-6e4-second-static-plugin-contract.md):
+// matches the v1 §6.E §2.1 design constant. The host owns this
+// many bytes of per-instance plugin state inline on
+// `StaticPluginState::storage` (rt_graph.cpp). The bounds-check
+// site in `register_plugin` lands in the follow-up slice that
+// adds the one-tap-delay plugin TU — this prep slice only
+// declares the constant and the storage.
+constexpr int kMaxPluginState = 4096;
+
 struct PluginSpec {
   const char *name = nullptr;
   int state_size_bytes = 0;
