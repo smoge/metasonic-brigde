@@ -16,9 +16,12 @@ import           MetaSonic.App.ManifestOSCIngressOps
 import           MetaSonic.App.ManifestOSCListener
                                                   (ListenerInfo (..),
                                                    ManifestOSCListenerHooks (..),
+                                                   ManifestOSCListenerIssue (..),
                                                    ManifestOSCListenerOpenIssue (..),
                                                    defaultListenerConfig,
                                                    defaultManifestOSCListenerHooks)
+import           MetaSonic.App.ManifestReloadOSCIngress
+                                                  (ManifestOSCIngressIssue (..))
 import           MetaSonic.App.ManifestReloadIngress
                                                   (ManifestReloadIngressOps (..),
                                                    ManifestReloadIngressSnapshot (..),
@@ -152,7 +155,7 @@ appManifestOSCIngressOpsTests =
               assertFailure "expected cutoff rejection on B"
           case acceptedB of
             Just (OSCProducerEnqueueAttempted cmdB _) ->
-              cmdB @?= CmdControlWrite (VoiceKey "v0") volTag 1500.0
+              cmdB @?= CmdControlWrite (VoiceKey "v0") volTag 0.5
             other ->
               assertFailure
                 ("expected vol accepted on B, got: " <> show other)
@@ -223,6 +226,71 @@ appManifestOSCIngressOpsTests =
             MrisOpen _ _ ->
               assertFailure
                 "expected manager closed after openFresh failure"
+
+  -- See notes/2026-05-21-d-manifest-osc-range-rejection.md: an
+  -- out-of-range OSC value rejects at submitManifestOSCMessage, the
+  -- producer is not called, the fan-in queue stays empty, and the
+  -- listener's molhOnIssue receives the wrapped MoiiValueOutOfRange.
+  , testCase "out-of-range OSC value surfaces MoiiValueOutOfRange to molhOnIssue (producer not called)" $ do
+      result <-
+        withSessionFanInHost
+          (TemplateGraph [] M.empty)
+          defaultSessionFanInOptions
+          $ \host -> do
+              issueMV <- newEmptyMVar
+              let hooks = ManifestOSCListenerHooks
+                    { molhOnAccepted =
+                        \_ -> pure ()
+                    , molhOnIssue =
+                        putMVar issueMV
+                    }
+                  ops =
+                    manifestOSCIngressOps
+                      hooks
+                      defaultOSCProducerOptions
+                      host
+                      (defaultListenerConfig 0)
+                  -- Cutoff with a narrow [0, 100] range so the
+                  -- 1500.0 in cutoffPacket lands out-of-range.
+                  targetNarrow = projectedTarget planNarrow
+
+              openedNarrow <- mrioOpenIngress ops targetNarrow
+              handle <-
+                case openedNarrow of
+                  Left issue ->
+                    assertFailure
+                      ("expected open of narrow target, got: "
+                        <> show issue)
+                    >> error "unreachable"
+                  Right h ->
+                    pure h
+              manager <-
+                newManifestReloadIngressManager
+                  ops targetNarrow handle
+
+              sendUdpLoopback
+                (liBoundPort (moihInfo handle))
+                cutoffPacket
+              observed <- timeout 1000000 (takeMVar issueMV)
+
+              snapshot <- readSessionFanInHost host
+              _ <- closeManifestReloadIngress manager
+              pure (observed, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (observed, snapshot) -> do
+          case observed of
+            Just (MoliManifestIssue (MoiiValueOutOfRange tag value lo hi)) -> do
+              tag   @?= cutoffTag
+              value @?= 1500.0
+              lo    @?= 0.0
+              hi    @?= 100.0
+            other ->
+              assertFailure
+                ("expected MoliManifestIssue (MoiiValueOutOfRange ...), got: "
+                  <> show other)
+          sfisQueueDepth snapshot @?= 0
 
   , testCase "openFresh failure does not leave the fan-in queue dirty" $ do
       result <-
@@ -310,6 +378,12 @@ planA = manifestPlanWith [cutoffControl, volControl]
 planB :: MR.ManifestReloadPlan
 planB = manifestPlanWith [volControl]
 
+-- | Same cutoff tag as 'planA', but with a deliberately narrow
+-- @[0, 100]@ range so 'cutoffPacket' (which encodes 1500.0) lands
+-- out-of-range. Used by the range-rejection fan-out row.
+planNarrow :: MR.ManifestReloadPlan
+planNarrow = manifestPlanWith [narrowCutoffControl]
+
 manifestPlanWith :: [MR.ManifestControlSurface] -> MR.ManifestReloadPlan
 manifestPlanWith controls = MR.ManifestReloadPlan
   { MR.mrlpDemoKey =
@@ -362,6 +436,24 @@ volControl = MR.ManifestControlSurface
       Nothing
   }
 
+narrowCutoffControl :: MR.ManifestControlSurface
+narrowCutoffControl = MR.ManifestControlSurface
+  { MR.mcsDisplayName =
+      "cutoff"
+  , MR.mcsControlTag =
+      cutoffTag
+  , MR.mcsDefault =
+      50.0
+  , MR.mcsRangeMin =
+      0.0
+  , MR.mcsRangeMax =
+      100.0
+  , MR.mcsSmoothingHz =
+      30.0
+  , MR.mcsCC =
+      Nothing
+  }
+
 cutoffTag :: ControlTag
 cutoffTag =
   ControlTag (MigrationKey "cutoff") 0
@@ -371,16 +463,22 @@ volTag =
   ControlTag (MigrationKey "vol") 0
 
 cutoffPacket :: OBSC.ByteString
-cutoffPacket = oscMessageBytes "/v0/cutoff/0"
+cutoffPacket = oscMessageBytes "/v0/cutoff/0" floatBytes1500
 
+-- | Vol writes use 0.5 so they land inside vol's declared range
+-- @[0.0, 1.0]@ (see 'volControl'). Before
+-- @notes/2026-05-21-d-manifest-osc-range-rejection.md@ the range was
+-- not enforced and this packet carried 1500.0; the value is now
+-- whatever fits the declared range so the accept-path stays
+-- audible-equivalent in this test.
 volPacket :: OBSC.ByteString
-volPacket = oscMessageBytes "/v0/vol/0"
+volPacket = oscMessageBytes "/v0/vol/0" floatBytesHalf
 
-oscMessageBytes :: String -> OBSC.ByteString
-oscMessageBytes addr = OBSC.concat
+oscMessageBytes :: String -> OBSC.ByteString -> OBSC.ByteString
+oscMessageBytes addr valueBytes = OBSC.concat
   [ oscString (OBSC.pack addr)
   , oscString (OBSC.pack ",f")
-  , floatBytes1500
+  , valueBytes
   ]
 
 oscString :: OBSC.ByteString -> OBSC.ByteString
@@ -389,5 +487,14 @@ oscString s =
       pad = (4 - ((n + 1) `mod` 4)) `mod` 4
   in s `OBSC.append` OBSC.replicate (1 + pad) '\NUL'
 
+-- | IEEE 754 single-precision encoding of 1500.0 in OSC big-endian
+-- byte order. Used by 'cutoffPacket'; lands inside cutoff's
+-- @[200.0, 8000.0]@ range.
 floatBytes1500 :: OBSC.ByteString
 floatBytes1500 = OBSC.pack ['\x44', '\xBB', '\x80', '\NUL']
+
+-- | IEEE 754 single-precision encoding of 0.5 (sign 0, exp 126
+-- biased, mantissa 0) = 0x3F000000. Used by 'volPacket'; lands
+-- inside vol's @[0.0, 1.0]@ range.
+floatBytesHalf :: OBSC.ByteString
+floatBytesHalf = OBSC.pack ['\x3F', '\NUL', '\NUL', '\NUL']

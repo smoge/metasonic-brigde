@@ -918,21 +918,28 @@ volControl = ManifestControl
   }
 
 cutoffPacket :: OBSC.ByteString
-cutoffPacket = oscMessageBytes "/v0/cutoff/0"
+cutoffPacket = oscMessageBytes "/v0/cutoff/0" floatBytes1500
 
+-- | Vol writes use 0.5 so they land inside vol's declared
+-- @[0.0, 1.0]@ range. Before
+-- @notes/2026-05-21-d-manifest-osc-range-rejection.md@ the OSC
+-- ingress did not enforce the manifest range and this packet
+-- shared the 1500.0 encoding with 'cutoffPacket'; that value is
+-- now out-of-range for vol.
 volPacket :: OBSC.ByteString
-volPacket = oscMessageBytes "/v0/vol/0"
+volPacket = oscMessageBytes "/v0/vol/0" floatBytesHalf
 
 -- | OSC packet for the address both demoTable preserving entries
--- expose: /v0/lpf/0, direct write into KLPF cutoff slot.
+-- expose: /v0/lpf/0, direct write into KLPF cutoff slot. 1500.0 is
+-- a reasonable Hz value for the KLPF cutoff slot.
 lpfPacket :: OBSC.ByteString
-lpfPacket = oscMessageBytes "/v0/lpf/0"
+lpfPacket = oscMessageBytes "/v0/lpf/0" floatBytes1500
 
-oscMessageBytes :: String -> OBSC.ByteString
-oscMessageBytes addr = OBSC.concat
+oscMessageBytes :: String -> OBSC.ByteString -> OBSC.ByteString
+oscMessageBytes addr valueBytes = OBSC.concat
   [ oscString (OBSC.pack addr)
   , oscString (OBSC.pack ",f")
-  , floatBytes1500
+  , valueBytes
   ]
 
 oscString :: OBSC.ByteString -> OBSC.ByteString
@@ -943,6 +950,10 @@ oscString s =
 
 floatBytes1500 :: OBSC.ByteString
 floatBytes1500 = OBSC.pack ['\x44', '\xBB', '\x80', '\NUL']
+
+-- | IEEE 754 single-precision encoding of 0.5 (= 0x3F000000).
+floatBytesHalf :: OBSC.ByteString
+floatBytesHalf = OBSC.pack ['\x3F', '\NUL', '\NUL', '\NUL']
 
 fakeAudioFFI :: SessionFanInAudioFFI
 fakeAudioFFI = SessionFanInAudioFFI

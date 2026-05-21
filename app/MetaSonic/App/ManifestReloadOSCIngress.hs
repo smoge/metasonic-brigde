@@ -21,6 +21,7 @@ module MetaSonic.App.ManifestReloadOSCIngress
 
 import           MetaSonic.App.ManifestReloadOSCBinding
                                                   (ManifestOSCAddressIssue,
+                                                   ManifestOSCControlBinding (..),
                                                    ManifestOSCIngressTarget,
                                                    validateOSCControlTag)
 import           MetaSonic.OSC.Dispatch.Internal  (DispatchIssue,
@@ -64,12 +65,16 @@ newtype ManifestOSCIngressResult = ManifestOSCIngressResult
 -- | Submit one already-received OSC message through the producer
 -- fan-in path.
 --
--- Two layers of validation run before the producer is invoked: the
+-- Three layers of validation run before the producer is invoked: the
 -- shared symbolic OSC decoder parses the @\/<voice>\/<tag>\/<slot>@
--- grammar, and the projection rejects tags absent from the current
--- manifest. Accepted messages are forwarded unchanged through
+-- grammar, the projection rejects tags absent from the current
+-- manifest, and the manifest's declared @[rangeMin, rangeMax]@ for
+-- the matched tag rejects out-of-range values (NaN included; all NaN
+-- comparisons evaluate 'False', so an explicit 'isNaN' arm is part of
+-- the predicate). Accepted messages are forwarded unchanged through
 -- 'enqueueOSCControlWrite'; the decoder runs again inside the producer
--- — acceptable in v1 for code clarity.
+-- — acceptable in v1 for code clarity. See
+-- @notes/2026-05-21-d-manifest-osc-range-rejection.md@.
 submitManifestOSCMessage
   :: OSCProducerOptions
   -> ManifestOSCIngressTarget
@@ -80,10 +85,16 @@ submitManifestOSCMessage opts target msg host =
   case decodeSymbolicControlWrite msg of
     Left issue ->
       pure (ManifestOSCIngressResult (Left (MoiiDecodeFailed issue)))
-    Right (SymbolicControlWrite _voiceKey tag _value) ->
+    Right (SymbolicControlWrite _voiceKey tag value) ->
       case validateOSCControlTag tag target of
         Left addrIssue ->
           pure (ManifestOSCIngressResult (Left (MoiiAddressIssue addrIssue)))
-        Right _binding -> do
-          producerResult <- enqueueOSCControlWrite opts msg host
-          pure (ManifestOSCIngressResult (Right producerResult))
+        Right binding
+          | let lo = mocbRangeMin binding
+                hi = mocbRangeMax binding
+          , isNaN value || value < lo || value > hi ->
+              pure (ManifestOSCIngressResult
+                     (Left (MoiiValueOutOfRange tag value lo hi)))
+          | otherwise -> do
+              producerResult <- enqueueOSCControlWrite opts msg host
+              pure (ManifestOSCIngressResult (Right producerResult))

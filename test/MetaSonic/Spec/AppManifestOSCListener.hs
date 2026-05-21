@@ -83,7 +83,12 @@ appManifestOSCListenerTests =
   , testCase "int control packet enqueues a CmdControlWrite" $ do
       let target = manifestOSCIngressTargetFromPlan validPlan
           expected =
-            CmdControlWrite (VoiceKey "v0") cutoffTag 42.0
+            -- 400 lands inside cutoff's [200, 8000] range; the
+            -- previous fixture used 42 which was implicitly accepted
+            -- only because the OSC ingress did not yet enforce the
+            -- manifest range. See
+            -- notes/2026-05-21-d-manifest-osc-range-rejection.md.
+            CmdControlWrite (VoiceKey "v0") cutoffTag 400.0
       result <-
         withSessionFanInHost
           (TemplateGraph [] M.empty)
@@ -219,7 +224,12 @@ appManifestOSCListenerTests =
       let firstTarget = manifestOSCIngressTargetFromPlan validPlan
           secondTarget = manifestOSCIngressTargetFromPlan volOnlyPlan
           expectedVol =
-            CmdControlWrite (VoiceKey "v0") volTag 1500.0
+            -- 0.5 lands inside vol's [0, 1] range; the previous
+            -- fixture used 1500.0 which was implicitly accepted only
+            -- because the OSC ingress did not yet enforce the
+            -- manifest range. See
+            -- notes/2026-05-21-d-manifest-osc-range-rejection.md.
+            CmdControlWrite (VoiceKey "v0") volTag 0.5
       result <-
         withSessionFanInHost
           (TemplateGraph [] M.empty)
@@ -370,14 +380,23 @@ messageBytesV0CutoffFloat =
 
 messageBytesV0CutoffInt :: OBSC.ByteString
 messageBytesV0CutoffInt =
-  oscMessageBytes "/v0/cutoff/0" ",i" intBytes42
+  -- 400 (0x190) lands inside cutoff's [200, 8000] range. Previously
+  -- this fixture used 42, which was implicitly accepted only because
+  -- the OSC ingress did not yet enforce the manifest range.
+  oscMessageBytes "/v0/cutoff/0" ",i" intBytes400
 
 messageBytesV0VolFloat :: OBSC.ByteString
 messageBytesV0VolFloat =
-  oscMessageBytes "/v0/vol/0" ",f" floatBytes1500
+  -- 0.5 lands inside vol's [0, 1] range. Previously this fixture
+  -- used 1500.0; same reason as the int fixture above.
+  oscMessageBytes "/v0/vol/0" ",f" floatBytesHalf
 
 messageBytesSingleSegment :: OBSC.ByteString
 messageBytesSingleSegment =
+  -- This packet is supposed to be rejected at the parser layer for
+  -- having only one path segment, so its float payload is never
+  -- inspected against any manifest range. The value bytes here can
+  -- be any well-formed float; we keep the original 1500.0 encoding.
   oscMessageBytes "/just-one-segment" ",f" floatBytes1500
 
 oscMessageBytes :: String -> String -> OBSC.ByteString -> OBSC.ByteString
@@ -396,5 +415,10 @@ oscString s =
 floatBytes1500 :: OBSC.ByteString
 floatBytes1500 = OBSC.pack ['\x44', '\xBB', '\x80', '\NUL']
 
-intBytes42 :: OBSC.ByteString
-intBytes42 = OBSC.pack ['\NUL', '\NUL', '\NUL', '*']
+-- | IEEE 754 single-precision encoding of 0.5 (= 0x3F000000).
+floatBytesHalf :: OBSC.ByteString
+floatBytesHalf = OBSC.pack ['\x3F', '\NUL', '\NUL', '\NUL']
+
+-- | Big-endian 32-bit signed encoding of 400 (= 0x00000190).
+intBytes400 :: OBSC.ByteString
+intBytes400 = OBSC.pack ['\NUL', '\NUL', '\x01', '\x90']

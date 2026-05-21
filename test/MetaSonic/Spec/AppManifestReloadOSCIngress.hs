@@ -100,6 +100,133 @@ appManifestReloadOSCIngressTests =
               ("expected decoder rejection, got: " <> show other)
         snapshot <- readSessionFanInHost host
         sfisQueueDepth snapshot @?= 0
+
+  -- See notes/2026-05-21-d-manifest-osc-range-rejection.md for the
+  -- contract these rows pin: inclusive bounds, NaN rejected as
+  -- out-of-range, producer never called on reject.
+  , testCase "value at rangeMin is accepted (inclusive lower bound)" $ do
+      let target = manifestOSCIngressTargetFromPlan validPlan
+          msg = OscMessage
+            { oscAddr = BSC.pack "/v0/cutoff/1"
+            , oscArgs = [OscArgFloat 200.0]
+            }
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestOSCMessage
+            defaultOSCProducerOptions
+            target
+            msg
+            host
+        case moirOutcome result of
+          Right (OSCProducerEnqueueAttempted command enq) -> do
+            command @?= CmdControlWrite (VoiceKey "v0") cutoffTag 200.0
+            queued <- fanInQueuedOrFail enq
+            qscCommand queued @?= command
+          other ->
+            assertFailure
+              ("expected accept at rangeMin, got: " <> show other)
+
+  , testCase "value at rangeMax is accepted (inclusive upper bound)" $ do
+      let target = manifestOSCIngressTargetFromPlan validPlan
+          msg = OscMessage
+            { oscAddr = BSC.pack "/v0/cutoff/1"
+            , oscArgs = [OscArgFloat 8000.0]
+            }
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestOSCMessage
+            defaultOSCProducerOptions
+            target
+            msg
+            host
+        case moirOutcome result of
+          Right (OSCProducerEnqueueAttempted command enq) -> do
+            command @?= CmdControlWrite (VoiceKey "v0") cutoffTag 8000.0
+            queued <- fanInQueuedOrFail enq
+            qscCommand queued @?= command
+          other ->
+            assertFailure
+              ("expected accept at rangeMax, got: " <> show other)
+
+  -- The OSC wire format uses 32-bit floats; values not exactly
+  -- representable in single precision round-trip with small drift
+  -- when promoted back to Double. The chosen rejection values
+  -- (199.0 and 9000.0) are integers <= 2^24, so they round-trip
+  -- exactly and the equality assertions below remain precise.
+  , testCase "value below rangeMin rejects with MoiiValueOutOfRange (producer not called)" $ do
+      let target = manifestOSCIngressTargetFromPlan validPlan
+          msg = OscMessage
+            { oscAddr = BSC.pack "/v0/cutoff/1"
+            , oscArgs = [OscArgFloat 199.0]
+            }
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestOSCMessage
+            defaultOSCProducerOptions
+            target
+            msg
+            host
+        case moirOutcome result of
+          Left (MoiiValueOutOfRange tag value lo hi) -> do
+            tag   @?= cutoffTag
+            value @?= 199.0
+            lo    @?= 200.0
+            hi    @?= 8000.0
+          other ->
+            assertFailure
+              ("expected out-of-range below min, got: " <> show other)
+        snapshot <- readSessionFanInHost host
+        sfisQueueDepth snapshot @?= 0
+
+  , testCase "value above rangeMax rejects with MoiiValueOutOfRange (producer not called)" $ do
+      let target = manifestOSCIngressTargetFromPlan validPlan
+          msg = OscMessage
+            { oscAddr = BSC.pack "/v0/cutoff/1"
+            , oscArgs = [OscArgFloat 9000.0]
+            }
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestOSCMessage
+            defaultOSCProducerOptions
+            target
+            msg
+            host
+        case moirOutcome result of
+          Left (MoiiValueOutOfRange tag value lo hi) -> do
+            tag   @?= cutoffTag
+            value @?= 9000.0
+            lo    @?= 200.0
+            hi    @?= 8000.0
+          other ->
+            assertFailure
+              ("expected out-of-range above max, got: " <> show other)
+        snapshot <- readSessionFanInHost host
+        sfisQueueDepth snapshot @?= 0
+
+  , testCase "NaN rejects with MoiiValueOutOfRange (NaN comparisons are all False; explicit isNaN arm catches it)" $ do
+      let target = manifestOSCIngressTargetFromPlan validPlan
+          msg = OscMessage
+            { oscAddr = BSC.pack "/v0/cutoff/1"
+            , oscArgs = [OscArgFloat (0/0)]
+            }
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestOSCMessage
+            defaultOSCProducerOptions
+            target
+            msg
+            host
+        case moirOutcome result of
+          Left (MoiiValueOutOfRange tag value lo hi) -> do
+            tag   @?= cutoffTag
+            assertBool ("expected NaN value, got: " <> show value) (isNaN value)
+            lo    @?= 200.0
+            hi    @?= 8000.0
+          other ->
+            assertFailure
+              ("expected out-of-range for NaN, got: " <> show other)
+        snapshot <- readSessionFanInHost host
+        sfisQueueDepth snapshot @?= 0
   ]
   where
     withFanInOrFail action = do
