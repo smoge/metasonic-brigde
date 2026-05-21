@@ -27,6 +27,7 @@ import           MetaSonic.OSC.Dispatch.Internal  (DispatchIssue,
                                                    SymbolicControlWrite (..),
                                                    decodeSymbolicControlWrite)
 import           MetaSonic.OSC.Wire               (OscMessage)
+import           MetaSonic.Pattern                (ControlTag)
 import           MetaSonic.Session.FanIn          (SessionFanInHost)
 import           MetaSonic.Session.OSCProducer    (OSCProducerEnqueueResult,
                                                    OSCProducerOptions,
@@ -39,9 +40,16 @@ import           MetaSonic.Session.OSCProducer    (OSCProducerEnqueueResult,
 -- address, missing argument, etc.). 'MoiiAddressIssue' surfaces a
 -- projection-side rejection (the decoded 'ControlTag' is not in the
 -- current target — removed-by-reload or never-existed).
+-- 'MoiiValueOutOfRange' surfaces a value-domain rejection: the tag
+-- exists in the current target, but the supplied value lies outside
+-- the manifest's declared @[rangeMin, rangeMax]@ for that tag (NaN
+-- is rendered the same way). The fields are @tag@, @value@,
+-- @rangeMin@, @rangeMax@. See
+-- @notes/2026-05-21-d-manifest-osc-range-rejection.md@.
 data ManifestOSCIngressIssue
-  = MoiiDecodeFailed !DispatchIssue
-  | MoiiAddressIssue !ManifestOSCAddressIssue
+  = MoiiDecodeFailed     !DispatchIssue
+  | MoiiAddressIssue     !ManifestOSCAddressIssue
+  | MoiiValueOutOfRange  !ControlTag !Double !Double !Double
   deriving (Eq, Show)
 
 -- | Outcome of one 'submitManifestOSCMessage' call.

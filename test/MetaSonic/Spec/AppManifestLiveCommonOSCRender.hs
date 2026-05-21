@@ -111,6 +111,34 @@ renderOSCIssueLineTests =
             <> show sampleControlTag
             <> " value=0.75"
             <> " issue=SeiSessionUnavailable"
+
+  , testCase "MoiiValueOutOfRange renders the dedicated out-of-range line" $
+      -- See notes/2026-05-21-d-manifest-osc-range-rejection.md: tag
+      -- renders through renderManifestOSCAddressTail (e.g. 'lpf/0'),
+      -- value and bounds render through 'show :: Double -> String'
+      -- (e.g. '0.75', '200.0', '6000.0').
+      renderOSCIssueLine
+        (MoliManifestIssue (MoiiValueOutOfRange sampleControlTag 0.75 200.0 6000.0))
+        @?= "osc reject (out-of-range): tag=lpf/0 value=0.75 range=[200.0, 6000.0]"
+
+  , testCase "MoiiValueOutOfRange renders NaN through the same line shape" $
+      -- The accept predicate explicitly rejects NaN (all NaN
+      -- comparisons evaluate False, so 'value < lo || value > hi'
+      -- alone would accept it). The rendered string pins how 'show
+      -- (0/0 :: Double)' surfaces in the line — 'NaN' on GHC today.
+      renderOSCIssueLine
+        (MoliManifestIssue
+          (MoiiValueOutOfRange sampleControlTag (0/0) 200.0 6000.0))
+        @?= "osc reject (out-of-range): tag=lpf/0 value=NaN range=[200.0, 6000.0]"
+
+  , testCase "MoiiValueOutOfRange renders a zero-width range without special-casing" $
+      -- Degenerate-but-legal: a manifest may declare rangeMin == rangeMax
+      -- (single-valued control). The renderer treats it like any other
+      -- range; the accept-predicate side (commit 2) rejects every value
+      -- but the exact min, which lands here for everything else.
+      renderOSCIssueLine
+        (MoliManifestIssue (MoiiValueOutOfRange sampleControlTag 0.1 0.0 0.0))
+        @?= "osc reject (out-of-range): tag=lpf/0 value=0.1 range=[0.0, 0.0]"
   ]
 
 

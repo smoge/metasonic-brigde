@@ -131,7 +131,10 @@ import           MetaSonic.App.ManifestReloadOSCBinding
                                                 (ManifestOSCControlBinding (..),
                                                  ManifestOSCIngressTarget (..),
                                                  motControls,
-                                                 renderManifestOSCAddressPattern)
+                                                 renderManifestOSCAddressPattern,
+                                                 renderManifestOSCAddressTail)
+import           MetaSonic.App.ManifestReloadOSCIngress
+                                                (ManifestOSCIngressIssue (..))
 import           MetaSonic.Authoring.Manifest   (AuthoringManifestDoc)
 import           MetaSonic.Bridge.Templates     (Template (..),
                                                  TemplateGraph (..))
@@ -530,6 +533,10 @@ renderOSCIssueLine :: ManifestOSCListenerIssue -> String
 renderOSCIssueLine issue = case issue of
   MoliParseFailure msg ->
     "osc reject (parse): " <> msg
+  MoliManifestIssue (MoiiValueOutOfRange tag value lo hi) ->
+    "osc reject (out-of-range): tag=" <> renderManifestOSCAddressTail tag
+    <> " value=" <> show value
+    <> " range=[" <> show lo <> ", " <> show hi <> "]"
   MoliManifestIssue manifestIssue ->
     "osc reject (manifest): " <> show manifestIssue
   MoliEnqueueRejected cmd SeiReloadInProgress ->
