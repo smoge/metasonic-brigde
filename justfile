@@ -254,6 +254,34 @@ manifest-supervised-require-preserving-live-smoke port="17003": stack-build
 manifest-live-session-require-preserving-smoke port="17004": stack-build
     PORT={{port}} ./tools/manifest_live_session_require_preserving_smoke.sh
 
+# Live-audio operator smoke for the supervised
+# --manifest-live-session (require-preserving) /reject/ branch.
+# Sibling of the smoke above. Drives the reject-preserving-smooth
+# fixture (KSmooth voice template, preserve-unsupported) so the
+# supervised hot-swap rejects instead of committing; pins the
+# resulting request-rejected operator narrative end-to-end —
+# including the four reload-event lines (preserving started,
+# resume-old-ingress started/succeeded, preserving rejected), the
+# compact 'cause:' line that 13f3a8e introduced, and the
+# resource-timeline section that 5cc1eda introduced. The negative
+# markers also pin the F-1 leak guard at runtime: no
+# 'TemplateGraph' / 'RuntimeNode' substring in the transcript.
+#
+# Like the other live-audio wrappers, this is a LIVE / DEVICE
+# smoke and is INTENTIONALLY NOT a member of `check-offline` or
+# any default CI gate.
+#
+# Default port is 17005 so this smoke does not collide with the
+# four other live wrappers on 17001-17004. Override with
+# `just manifest-live-session-require-preserving-reject-smoke port=N`.
+#
+# Other parameters (manifest fixture, initial/target demo keys,
+# work dir for artifacts) are env-var configurable in the
+# wrapper script; see
+# tools/manifest_live_session_require_preserving_reject_smoke.sh.
+manifest-live-session-require-preserving-reject-smoke port="17005": stack-build
+    PORT={{port}} ./tools/manifest_live_session_require_preserving_reject_smoke.sh
+
 # §4.B kernel microbench. Configures and builds in a separate
 # RelWithDebInfo tree so the numbers aren't dominated by
 # libstdc++ assertion overhead from the Debug `cpp-build`.
