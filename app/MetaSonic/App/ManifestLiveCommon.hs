@@ -70,18 +70,17 @@ module MetaSonic.App.ManifestLiveCommon
     -- * OSC listener-event line renderers (pure, testable)
     --
     -- These two helpers are the operator-string contract the
-    -- live entrypoints will eventually drive their OSC listener
-    -- hooks against. They are exported so the test suite can
-    -- pin the rendered strings — including the dedup policy
-    -- encoded by 'renderOSCAcceptLine's 'Maybe' result — without
-    -- staging real listener IO or capturing stdout.
+    -- live OSC listener hooks drive against. They are exported
+    -- so the test suite can pin the rendered strings — including
+    -- the dedup policy encoded by 'renderOSCAcceptLine's 'Maybe'
+    -- result — without staging real listener IO or capturing
+    -- stdout. 'liveOSCListenerHooks' above already routes through
+    -- both: 'molhOnAccepted' uses 'mapM_ ... renderOSCAcceptLine'
+    -- so a 'Nothing' return is a no-op, and 'molhOnIssue' renders
+    -- the @(reload-window)@ \/ @enqueue-reject@ taxonomy.
     --
-    -- The current 'liveOSCListenerHooks' still drives the legacy
-    -- 'renderOSCAccept' \/ 'renderOSCIssue' pair (which double-
-    -- prints rejected packets — see
-    -- @notes/2026-05-20-d-stale-command-rejection-rendering.md@).
-    -- A follow-up commit rewires the hooks to these helpers and
-    -- removes the legacy pair.
+    -- See @notes/2026-05-20-d-stale-command-rejection-rendering.md@
+    -- for the design rationale and the operator-string taxonomy.
   , renderOSCAcceptLine
   , renderOSCIssueLine
   ) where
@@ -461,37 +460,23 @@ renderLiveReloadEvents events =
       map renderSmokeReloadEvent events
 
 
+-- | The live OSC listener's operator-facing print surface. Both
+-- hooks now drive the pure 'renderOSCAcceptLine' \/
+-- 'renderOSCIssueLine' helpers defined below: 'molhOnAccepted' only
+-- prints when 'renderOSCAcceptLine' returns 'Just' (so an enqueue
+-- rejection observed here is a no-op because 'molhOnIssue' owns the
+-- rejection line for the same packet), and 'molhOnIssue' renders the
+-- new taxonomy that distinguishes 'SeiReloadInProgress' from generic
+-- enqueue failures. The previous pair of private renderers that
+-- produced two identical "osc enqueue-reject" lines per rejected
+-- packet is gone.
 liveOSCListenerHooks :: ManifestOSCListenerHooks
 liveOSCListenerHooks = defaultManifestOSCListenerHooks
   { molhOnAccepted =
-      \accepted -> putStrLn ("  " <> renderOSCAccept accepted)
+      mapM_ (putStrLn . ("  " <>)) . renderOSCAcceptLine
   , molhOnIssue =
-      \issue -> putStrLn ("  " <> renderOSCIssue issue)
+      \issue -> putStrLn ("  " <> renderOSCIssueLine issue)
   }
-
-
-renderOSCAccept :: OSCProducerEnqueueResult -> String
-renderOSCAccept result = case result of
-  OSCProducerDecodeRejected issue ->
-    "osc reject (decode): " <> show issue
-  OSCProducerEnqueueAttempted cmd enqueue ->
-    case sfierResult enqueue of
-      SessionEnqueued _ ->
-        "osc accept: " <> renderCommand cmd
-      SessionEnqueueRejected _producer _cmd issue ->
-        "osc enqueue-reject: " <> renderCommand cmd
-        <> " issue=" <> show issue
-
-
-renderOSCIssue :: ManifestOSCListenerIssue -> String
-renderOSCIssue issue = case issue of
-  MoliParseFailure msg ->
-    "osc reject (parse): " <> msg
-  MoliManifestIssue manifestIssue ->
-    "osc reject (manifest): " <> show manifestIssue
-  MoliEnqueueRejected cmd queueIssue ->
-    "osc enqueue-reject: " <> renderCommand cmd
-    <> " issue=" <> show queueIssue
 
 
 -- | Render the accepted-side of one OSC listener event into an
