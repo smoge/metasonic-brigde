@@ -13,7 +13,7 @@ import qualified Data.Map.Strict            as M
 import           Data.Word                  (Word8)
 import           Foreign.Ptr                (Ptr)
 import           System.Environment         (getArgs, getProgName)
-import           System.Exit                (die)
+import           System.Exit                (die, exitSuccess)
 
 import           MetaSonic.App.CorpusSurvey (runCorpusSurvey)
 import qualified Data.ByteString.Lazy.Char8  as BL
@@ -948,10 +948,14 @@ main = do
 
   opts <-
     case parseArgs args of
-      Left msg ->
+      Left msg
+        | null msg -> do
+            putStr (usage prog)
+            exitSuccess
+        | otherwise ->
         die $
           usage prog <>
-          (if null msg then "" else "\nError: " <> msg <> "\n")
+          "\nError: " <> msg <> "\n"
       Right x ->
         pure x
 
