@@ -14,6 +14,7 @@
 module MetaSonic.Spec.AppManifestLiveReloadDemoRender where
 
 import           Data.List                              (isInfixOf)
+import qualified Data.Text                              as T
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
@@ -24,15 +25,27 @@ import           MetaSonic.App.ManifestLiveReloadDemo   (LiveReloadRoute (..),
 import           MetaSonic.App.ManifestOSCIngressOps    (ManifestOSCIngressOpsIssue)
 import           MetaSonic.App.ManifestReloadCli        (renderHostPreservingIssueTag,
                                                          renderHostStoppedAudioIssueTag,
+                                                         renderPreservingHostStackIssueTag,
+                                                         renderReloadHostStackOpenIssueTag,
                                                          renderSmokeReloadEvent,
-                                                         renderStrategyRan)
+                                                         renderStoppedAudioHostStackIssueTag,
+                                                         renderStrategyRan,
+                                                         renderTryPreservingHostStackIssueTag,
+                                                         renderTryPreservingInWindowIssueTag)
 import           MetaSonic.App.ManifestReloadEvent      (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost       (ManifestReloadHostIssue (..),
                                                          ManifestReloadHostStrategy (..),
                                                          ManifestReloadHostStrategyRan (..))
+import           MetaSonic.App.ManifestReloadHostStack  (ReloadHostStackOpenIssue (..),
+                                                         StoppedAudioHostStackIssue (..))
 import           MetaSonic.App.ManifestReloadOrchestration
                                                         (HostPreservingReloadIssue (..),
                                                          HostStoppedAudioReloadIssue (..))
+import           MetaSonic.App.ManifestReloadPreservingHostStack
+                                                        (PreservingHostStackIssue (..))
+import           MetaSonic.App.ManifestReloadTryPreservingHostStack
+                                                        (TryPreservingHostStackIssue (..),
+                                                         TryPreservingInWindowIssue (..))
 import qualified MetaSonic.Session.ManifestReload      as MR
 
 
@@ -136,6 +149,126 @@ appManifestLiveReloadDemoRenderTests =
           event = MrePreservingReloadEnqueueRejected issue
       renderSmokeReloadEvent event
         @?= "    - preserving reload enqueue rejected: planning"
+
+    -- F-1 leak guards for the live-session supervised-cause
+    -- renderers. The 2026-05-21-a reject-path operator pass found
+    -- 'runReloadWith' was printing 'show cause' on a host-stack
+    -- issue value that recursively unrolled a full
+    -- 'ManifestPreservingHotSwapReport' (~13 KB / single line, two
+    -- complete 'TemplateGraph' records). These tests pin the
+    -- structural shape of each route's renderer and assert the
+    -- carried payload cannot leak through any branch of the four
+    -- wrappers ('renderReloadHostStackOpenIssueTag',
+    -- 'renderPreservingHostStackIssueTag',
+    -- 'renderStoppedAudioHostStackIssueTag',
+    -- 'renderTryPreservingInWindowIssueTag', and
+    -- 'renderTryPreservingHostStackIssueTag').
+
+  , testCase "renderReloadHostStackOpenIssueTag pins the polymorphic IngressOpen branch" $ do
+      let rendered = renderReloadHostStackOpenIssueTag
+                       (RhsoiIngressOpenFailed leakProbe)
+      rendered @?= "ingress-open-failed"
+      assertNoLeak rendered
+
+  , testCase "renderReloadHostStackOpenIssueTag drops the diagnostic Text on PartialCleanupFailed" $ do
+      -- Both halves carry payload: the primary issue carries the
+      -- polymorphic leakProbe, the diagnostic Text carries a fake
+      -- banned-substring fragment. Neither must reach the rendered
+      -- line; only the kebab tags do.
+      let primary = RhsoiIngressOpenFailed leakProbe
+          rendered = renderReloadHostStackOpenIssueTag
+                       (RhsoiPartialCleanupFailed
+                         primary
+                         (T.pack "TemplateGraph diagnostic"))
+      rendered @?= "partial-cleanup-failed (ingress-open-failed)"
+      assertNoLeak rendered
+
+  , testCase "renderPreservingHostStackIssueTag never leaks across every HostPreservingReloadIssue constructor (PahsiInWindow)" $
+      mapM_
+        (\mkIssue ->
+           let rendered = renderPreservingHostStackIssueTag
+                            (PahsiInWindow (mkIssue leakProbeHostIssue))
+           in do
+             assertNoLeak rendered
+             assertShortLine 300 rendered)
+        allHpariOnHostIssue
+
+  , testCase "renderPreservingHostStackIssueTag pins the PahsiOpen branch" $ do
+      let rendered = renderPreservingHostStackIssueTag
+                       (PahsiOpen (RhsoiIngressOpenFailed leakProbe))
+      rendered @?= "open: ingress-open-failed"
+      assertNoLeak rendered
+
+  , testCase "renderStoppedAudioHostStackIssueTag never leaks across every HostStoppedAudioReloadIssue constructor (SahsiInWindow)" $
+      mapM_
+        (\mkIssue ->
+           let rendered = renderStoppedAudioHostStackIssueTag
+                            (SahsiInWindow (mkIssue leakProbeHostIssue))
+           in do
+             assertNoLeak rendered
+             assertShortLine 300 rendered)
+        allHsariOnHostIssue
+
+  , testCase "renderStoppedAudioHostStackIssueTag pins the SahsiOpen branch" $ do
+      let rendered = renderStoppedAudioHostStackIssueTag
+                       (SahsiOpen (RhsoiIngressOpenFailed leakProbe))
+      rendered @?= "open: ingress-open-failed"
+      assertNoLeak rendered
+
+  , testCase "renderTryPreservingInWindowIssueTag never leaks (PreservingFallbackDeclined)" $
+      mapM_
+        (\mkIssue ->
+           let rendered = renderTryPreservingInWindowIssueTag
+                            (TpiwiPreservingFallbackDeclined
+                              (mkIssue leakProbeHostIssue))
+           in do
+             assertNoLeak rendered
+             assertShortLine 300 rendered)
+        allHpariOnHostIssue
+
+  , testCase "renderTryPreservingInWindowIssueTag never leaks (PreservingTerminal)" $
+      mapM_
+        (\mkIssue ->
+           let rendered = renderTryPreservingInWindowIssueTag
+                            (TpiwiPreservingTerminal
+                              (mkIssue leakProbeHostIssue))
+           in do
+             assertNoLeak rendered
+             assertShortLine 300 rendered)
+        allHpariOnHostIssue
+
+  , testCase "renderTryPreservingInWindowIssueTag never leaks (FallbackStoppedAudioFailed, both halves)" $
+      mapM_
+        (\(mkPrev, mkCurr) ->
+           let rendered = renderTryPreservingInWindowIssueTag
+                            (TpiwiFallbackStoppedAudioFailed
+                              (mkPrev leakProbeHostIssue)
+                              (mkCurr leakProbeHostIssue))
+           in do
+             assertNoLeak rendered
+             assertShortLine 300 rendered)
+        [ (prev, curr)
+        | prev <- allHpariOnHostIssue
+        , curr <- allHsariOnHostIssue
+        ]
+
+  , testCase "renderTryPreservingHostStackIssueTag pins the TpahsiOpen branch" $ do
+      let rendered = renderTryPreservingHostStackIssueTag
+                       (TpahsiOpen (RhsoiIngressOpenFailed leakProbe))
+      rendered @?= "open: ingress-open-failed"
+      assertNoLeak rendered
+
+  , testCase "renderTryPreservingHostStackIssueTag never leaks (TpahsiInWindow with PreservingFallbackDeclined)" $
+      mapM_
+        (\mkIssue ->
+           let rendered = renderTryPreservingHostStackIssueTag
+                            (TpahsiInWindow
+                              (TpiwiPreservingFallbackDeclined
+                                (mkIssue leakProbeHostIssue)))
+           in do
+             assertNoLeak rendered
+             assertShortLine 300 rendered)
+        allHpariOnHostIssue
   ]
 
 -- | Carried-issue stand-in: a payload whose textual content includes
@@ -185,6 +318,59 @@ allHpariConstructors =
 -- taking function.
 allHsariConstructors :: [String -> HostStoppedAudioReloadIssue String]
 allHsariConstructors =
+  [ HsariPlanRejected
+  , HsariQuiesceRejected
+  , \x -> HsariQuiesceRejectedResumeFailed x x
+  , HsariDrainRejected
+  , \x -> HsariDrainRejectedResumeFailed x x
+  , HsariDrainFailedTerminal
+  , HsariStopOldAudioFailed
+  , HsariReloadRejectedOldOwnerRestarted
+  , \x -> HsariReloadRejectedOldOwnerRestartFailed x x
+  , \x -> HsariReloadRejectedOldOwnerResumeFailed x x
+  , HsariReloadFailedNoOwner
+  , HsariAudioRestartFailed
+  , HsariListenerRestartFailed
+  ]
+
+-- | Probe-laden 'ManifestReloadHostIssue' value at type
+-- 'ManifestReloadHostIssue String'. Used by the supervised-cause
+-- wrapper tests below: the in-window arms of those wrappers carry
+-- @HostPreservingReloadIssue (ManifestReloadHostIssue ingressIssue)@
+-- / @HostStoppedAudioReloadIssue ...@, so the inner payload type
+-- must be 'ManifestReloadHostIssue', not a raw 'String'. Wrapping
+-- 'leakProbe' through 'MrhiIngress' threads the banned-substring
+-- payload one level deeper so any leak through the wrapper's
+-- recursive 'show' or accidental payload embedding would surface.
+leakProbeHostIssue :: ManifestReloadHostIssue String
+leakProbeHostIssue = MrhiIngress leakProbe
+
+-- | 'allHpariConstructors' lifted to operate at the host-issue
+-- type. Same constructors, different element type. The duplicated
+-- table is intentional — kept verbatim so a future Hpari constructor
+-- gets surfaced as a kindTag-style drift between the two lists.
+allHpariOnHostIssue
+  :: [ManifestReloadHostIssue String
+      -> HostPreservingReloadIssue (ManifestReloadHostIssue String)]
+allHpariOnHostIssue =
+  [ HpariPlanRejected
+  , HpariQuiesceRejected
+  , \x -> HpariQuiesceRejectedResumeFailed x x
+  , HpariDrainRejected
+  , \x -> HpariDrainRejectedResumeFailed x x
+  , HpariDrainFailedTerminal
+  , HpariReloadRejected
+  , \x -> HpariReloadRejectedResumeFailed x x
+  , HpariReloadFailedTerminal
+  , HpariIngressRestartFailed
+  ]
+
+-- | 'allHsariConstructors' lifted to operate at the host-issue
+-- type. Same constructors, different element type.
+allHsariOnHostIssue
+  :: [ManifestReloadHostIssue String
+      -> HostStoppedAudioReloadIssue (ManifestReloadHostIssue String)]
+allHsariOnHostIssue =
   [ HsariPlanRejected
   , HsariQuiesceRejected
   , \x -> HsariQuiesceRejectedResumeFailed x x

@@ -39,6 +39,11 @@ module MetaSonic.App.ManifestReloadCli
   , renderHostPreservingIssueTag
   , renderHostStoppedAudioIssueTag
   , renderHostIssueTag
+  , renderReloadHostStackOpenIssueTag
+  , renderPreservingHostStackIssueTag
+  , renderStoppedAudioHostStackIssueTag
+  , renderTryPreservingInWindowIssueTag
+  , renderTryPreservingHostStackIssueTag
   , renderSmokeReloadEvent
   ) where
 
@@ -81,6 +86,11 @@ import           MetaSonic.App.ManifestReloadHostStack
                                                    SupervisedStoppedAudioReloadResult (..),
                                                    mkStoppedAudioHostStackFactory,
                                                    realStoppedAudioHostStackOps)
+import           MetaSonic.App.ManifestReloadPreservingHostStack
+                                                  (PreservingHostStackIssue (..))
+import           MetaSonic.App.ManifestReloadTryPreservingHostStack
+                                                  (TryPreservingHostStackIssue (..),
+                                                   TryPreservingInWindowIssue (..))
 import           MetaSonic.App.ManifestReloadSupervisor
                                                   (SupervisedReloadOutcome (..),
                                                    reloadSupervised)
@@ -1357,6 +1367,86 @@ renderHostIssueTag issue = case issue of
     "preserving-reload-stopped"
   MrhiPreservingReloadUnexpected{} ->
     "preserving-reload-unexpected"
+
+-- | Compact tag for an open-time host-stack failure. Payload-free so
+-- the carried 'SessionFanInServiceSetupIssue' /
+-- 'SessionFanInAudioIssue' / @ingressIssue@ values (which may
+-- recursively carry 'TemplateGraph' or 'RuntimeNode' state) never
+-- reach the operator transcript via this path.
+--
+-- 'RhsoiPartialCleanupFailed' nests an inner primary failure; the
+-- rendering recurses on that primary so the operator sees both the
+-- partial-cleanup signal and the underlying open failure that
+-- triggered it.
+renderReloadHostStackOpenIssueTag
+  :: ReloadHostStackOpenIssue ingressIssue
+  -> String
+renderReloadHostStackOpenIssueTag issue = case issue of
+  RhsoiServiceSetupFailed{}            -> "service-setup-failed"
+  RhsoiAudioStartFailed{}              -> "audio-start-failed"
+  RhsoiIngressOpenFailed{}             -> "ingress-open-failed"
+  RhsoiIngressTargetProjectionFailed{} -> "ingress-target-projection-failed"
+  RhsoiPartialCleanupFailed primary _diag ->
+    "partial-cleanup-failed ("
+      <> renderReloadHostStackOpenIssueTag primary <> ")"
+
+-- | Compact tag for the supervised-route /require-preserving/ cause
+-- carried by 'SupervisedReloadRequestRejected' /
+-- 'SupervisedReloadRejectedRecovered' / 'SupervisedReloadEscalated'.
+-- Composes 'renderHostPreservingIssueTag' (in-window) and
+-- 'renderReloadHostStackOpenIssueTag' (rebuild-open) so the operator
+-- transcript never carries the underlying
+-- 'ManifestPreservingHotSwapReport' payload.
+renderPreservingHostStackIssueTag
+  :: PreservingHostStackIssue ingressIssue
+  -> String
+renderPreservingHostStackIssueTag wrapper = case wrapper of
+  PahsiInWindow issue ->
+    "in-window: " <> renderHostPreservingIssueTag issue
+  PahsiOpen openIssue ->
+    "open: " <> renderReloadHostStackOpenIssueTag openIssue
+
+-- | Compact tag for the supervised-route /stopped-audio/ cause.
+-- Same shape as 'renderPreservingHostStackIssueTag', but the
+-- in-window branch tags through 'renderHostStoppedAudioIssueTag'.
+renderStoppedAudioHostStackIssueTag
+  :: StoppedAudioHostStackIssue ingressIssue
+  -> String
+renderStoppedAudioHostStackIssueTag wrapper = case wrapper of
+  SahsiInWindow issue ->
+    "in-window: " <> renderHostStoppedAudioIssueTag issue
+  SahsiOpen openIssue ->
+    "open: " <> renderReloadHostStackOpenIssueTag openIssue
+
+-- | Compact tag for the three-way 'TryPreservingInWindowIssue'
+-- branch the try-preserving in-window slot returns.
+renderTryPreservingInWindowIssueTag
+  :: TryPreservingInWindowIssue ingressIssue
+  -> String
+renderTryPreservingInWindowIssueTag issue = case issue of
+  TpiwiPreservingFallbackDeclined prev ->
+    "preserving-fallback-declined ("
+      <> renderHostPreservingIssueTag prev <> ")"
+  TpiwiPreservingTerminal prev ->
+    "preserving-terminal ("
+      <> renderHostPreservingIssueTag prev <> ")"
+  TpiwiFallbackStoppedAudioFailed prev curr ->
+    "fallback-stopped-audio-failed (preserving="
+      <> renderHostPreservingIssueTag prev
+      <> "; stopped-audio="
+      <> renderHostStoppedAudioIssueTag curr <> ")"
+
+-- | Compact tag for the supervised-route /try-preserving/ cause.
+-- Same outer shape as the other two routes' renderers; in-window
+-- delegates to 'renderTryPreservingInWindowIssueTag'.
+renderTryPreservingHostStackIssueTag
+  :: TryPreservingHostStackIssue ingressIssue
+  -> String
+renderTryPreservingHostStackIssueTag wrapper = case wrapper of
+  TpahsiInWindow issue ->
+    "in-window: " <> renderTryPreservingInWindowIssueTag issue
+  TpahsiOpen openIssue ->
+    "open: " <> renderReloadHostStackOpenIssueTag openIssue
 
 renderStrategyOutcome
   :: Either

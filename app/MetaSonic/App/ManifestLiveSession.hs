@@ -119,7 +119,10 @@ import           MetaSonic.App.ManifestOSCListener
 import           MetaSonic.App.ManifestReloadCli
                                                 (planManifestReloadForDemo,
                                                  renderManifestReloadCliIssue,
-                                                 renderManifestReloadHostStrategy)
+                                                 renderManifestReloadHostStrategy,
+                                                 renderPreservingHostStackIssueTag,
+                                                 renderStoppedAudioHostStackIssueTag,
+                                                 renderTryPreservingHostStackIssueTag)
 import           MetaSonic.App.ManifestReloadEvent
                                                 (ManifestReloadEvent)
 import           MetaSonic.App.ManifestReloadHost
@@ -497,6 +500,12 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
             \ev -> modifyIORef' reloadEventsRef (<> [ev])
         }
 
+  -- Per-route 'causeLabel' projections. Each renderer is
+  -- structurally payload-free at every depth (see the F-1 leak
+  -- guard in 'AppManifestLiveSessionRender'); replacing 'show' here
+  -- would re-introduce the 13 KB 'ManifestPreservingHotSwapReport'
+  -- transcript dump that the 2026-05-21-a operator pressure pass
+  -- surfaced.
   case strategy of
     StoppedAudioOnly -> do
       let factory = withTrackedFactory
@@ -504,6 +513,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
               (realStoppedAudioHostStackOps inputs))
             trackedStackRef
       runSupervised
+        renderStoppedAudioHostStackIssueTag
         factory
         doc catalog
         initialPlan initialTarget
@@ -518,6 +528,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
               (realTryPreservingHostStackOps liveReloadProducer inputs))
             trackedStackRef
       runSupervised
+        renderTryPreservingHostStackIssueTag
         factory
         doc catalog
         initialPlan initialTarget
@@ -532,6 +543,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
               (realPreservingHostStackOps liveReloadProducer inputs))
             trackedStackRef
       runSupervised
+        renderPreservingHostStackIssueTag
         factory
         doc catalog
         initialPlan initialTarget
@@ -549,8 +561,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
 -- adapter, run the session loop inside the adapter callback so the
 -- adapter's @finally closeOps@ covers exit / async exception paths.
 runSupervised
-  :: Show e
-  => HostStackFactory MR.ManifestReloadPlan LiveStack e
+  :: (e -> String)
+  -> HostStackFactory MR.ManifestReloadPlan LiveStack e
   -> AuthoringManifestDoc
   -> [MR.ManifestReloadCatalogEntry]
   -> MR.ManifestReloadPlan
@@ -561,13 +573,13 @@ runSupervised
   -> IORef [LiveEvent]
   -> IO ()
 runSupervised
-    factory doc catalog initialPlan initialTarget
+    causeLabel factory doc catalog initialPlan initialTarget
     trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef = do
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory initialPlan)
     case openResult of
       Left issue ->
-        die ("Live session initial open failed: " <> show issue)
+        die ("Live session initial open failed: " <> causeLabel issue)
       Right initialStack -> do
         let initialService = mrhcService (rhsConfig initialStack)
             initialIngress = mrhcIngressManager (rhsConfig initialStack)
@@ -583,6 +595,7 @@ runSupervised
               putStrLn ""
               hFlush stdout
               sessionLoop
+                causeLabel
                 supOps
                 doc catalog
                 trackedStackRef
@@ -595,8 +608,8 @@ runSupervised
 -- | Read-parse-dispatch loop. Returns when the user hits EOF or a
 -- reload outcome maps to 'SsTerminate'.
 sessionLoop
-  :: Show e
-  => SupervisorOps MR.ManifestReloadPlan e
+  :: (e -> String)
+  -> SupervisorOps MR.ManifestReloadPlan e
   -> AuthoringManifestDoc
   -> [MR.ManifestReloadCatalogEntry]
   -> IORef (Maybe LiveStack)
@@ -604,7 +617,7 @@ sessionLoop
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
   -> IO ()
-sessionLoop supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef = do
+sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef = do
   putStrLn "Type a command, or <Enter> for status, or <Ctrl-D> to exit:"
   hFlush stdout
   done <- isEOF
@@ -619,7 +632,7 @@ sessionLoop supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef rel
       case step of
         SsContinue -> do
           putStrLn ""
-          sessionLoop supOps doc catalog trackedStackRef
+          sessionLoop causeLabel supOps doc catalog trackedStackRef
                       currentPlanRef lastOutcomeRef reloadEventsRef
         SsTerminate code -> do
           putStrLn ""
@@ -640,6 +653,7 @@ sessionLoop supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef rel
         runReloadWith
           (catalogPlanResolver doc catalog)
           MR.mrlpDemoKey
+          causeLabel
           autoStartIfStackIsEmpty
           supOps
           currentPlanRef
@@ -738,9 +752,9 @@ catalogPlanResolver doc catalog = ReloadResolver $ \key ->
 -- not invoked). Production uses the hook to do the post-reload
 -- voice auto-start; tests pass @const (pure ())@.
 runReloadWith
-  :: Show e
-  => ReloadResolver plan
+  :: ReloadResolver plan
   -> (plan -> String)
+  -> (e -> String)
   -> (plan -> IO ())
   -> SupervisorOps plan e
   -> IORef plan
@@ -748,7 +762,7 @@ runReloadWith
   -> IORef [LiveEvent]
   -> String
   -> IO SessionStep
-runReloadWith resolver planLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
+runReloadWith resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
   case resolvePlan resolver key of
     Left reason -> do
       putStrLn ("  reload rejected: " <> reason)
@@ -769,17 +783,21 @@ runReloadWith resolver planLabel onLiveStackChanged supOps currentPlanRef lastOu
       when (lso == LsoCommitted) $
         writeIORef currentPlanRef requestedPlan
       -- Cause lines first so the operator sees the failure detail
-      -- adjacent to the supervised outcome name.
+      -- adjacent to the supervised outcome name. The 'causeLabel'
+      -- projection is route-specific (see 'runManifestLiveSession');
+      -- it must NOT call 'show' on a value that recursively carries
+      -- 'TemplateGraph' / 'RuntimeNode' state, or the operator
+      -- transcript reverts to the F-1 leak shape this slice fixed.
       case out of
         SupervisedReloadCommitted ->
           pure ()
         SupervisedReloadRequestRejected cause ->
-          putStrLn ("  cause: " <> show cause)
+          putStrLn ("  cause: " <> causeLabel cause)
         SupervisedReloadRejectedRecovered cause ->
-          putStrLn ("  in-window cause: " <> show cause)
+          putStrLn ("  in-window cause: " <> causeLabel cause)
         SupervisedReloadEscalated inWindow rebuild -> do
-          putStrLn ("  in-window cause: " <> show inWindow)
-          putStrLn ("  rebuild cause:   " <> show rebuild)
+          putStrLn ("  in-window cause: " <> causeLabel inWindow)
+          putStrLn ("  rebuild cause:   " <> causeLabel rebuild)
           hPutStrLn stderr
             "live session escalated: no live stack remains."
       -- Resource timeline before 'onLiveStackChanged' so the

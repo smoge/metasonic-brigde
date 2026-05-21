@@ -454,6 +454,7 @@ runReloadWithTests =
         step <- runReloadWith
                   resolver
                   show
+                  show
                   noHook
                   blockingSupOps
                   currentPlanRef
@@ -483,6 +484,7 @@ runReloadWithTests =
         step <- runReloadWith
                   resolver
                   show
+                  show
                   noHook
                   blockingSupOps
                   currentPlanRef
@@ -511,6 +513,7 @@ runReloadWithTests =
         step <- runReloadWith
                   resolver
                   show
+                  show
                   noHook
                   supOps
                   currentPlanRef
@@ -536,6 +539,7 @@ runReloadWithTests =
             supOps   = fakeSupOpsWithOutcome eventsRef outcome 8
         step <- runReloadWith
                   resolver
+                  show
                   show
                   noHook
                   supOps
@@ -573,6 +577,7 @@ runReloadWithTests =
         step <- runReloadWith
                   resolver
                   show
+                  show
                   noHook
                   supOps
                   currentPlanRef
@@ -600,6 +605,7 @@ runReloadWithTests =
         step <- runReloadWith
                   resolver
                   show
+                  show
                   noHook
                   supOps
                   currentPlanRef
@@ -622,11 +628,11 @@ runReloadWithTests =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 11
             supOpsSecond =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 12
-        _ <- runReloadWith resolver show noHook supOpsFirst
+        _ <- runReloadWith resolver show show noHook supOpsFirst
                currentPlanRef lastOutcomeRef eventsRef "next"
         eventsAfterFirst <- readIORef eventsRef
         eventsAfterFirst @?= [syntheticEvent 11]
-        _ <- runReloadWith resolver show noHook supOpsSecond
+        _ <- runReloadWith resolver show show noHook supOpsSecond
                currentPlanRef lastOutcomeRef eventsRef "next"
         eventsAfterSecond <- readIORef eventsRef
         eventsAfterSecond @?= [syntheticEvent 12]
@@ -658,7 +664,7 @@ runReloadWithTests =
               , sopsOpenStack  = \_ ->
                   assertFailure "open must not be called"
               }
-        _ <- runReloadWith resolver show recordingHook blockingSupOps
+        _ <- runReloadWith resolver show show recordingHook blockingSupOps
                currentPlanRef lastOutcomeRef eventsRef "bad-key"
         pure ()
       readIORef hookCallsRef >>= (@?= ([] :: [StubPlan]))
@@ -667,7 +673,7 @@ runReloadWithTests =
       withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
         let supOps =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 100
-        _ <- runReloadWith resolver show recordingHook supOps
+        _ <- runReloadWith resolver show show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2])  -- requestedPlan == 2
@@ -678,7 +684,7 @@ runReloadWithTests =
               fakeSupOpsWithOutcome eventsRef
                 (InWindowReloadRejectedLiveFallback "live-fallback")
                 101
-        _ <- runReloadWith resolver show recordingHook supOps
+        _ <- runReloadWith resolver show show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       -- Hook list still just [2] from the Committed test above.
@@ -694,7 +700,7 @@ runReloadWithTests =
               , sopsCloseStack = pure ()
               , sopsOpenStack  = const (pure (Right ()))
               }
-        _ <- runReloadWith resolver show recordingHook supOps
+        _ <- runReloadWith resolver show show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- recovered with fallback (1)
@@ -709,7 +715,7 @@ runReloadWithTests =
               , sopsCloseStack = pure ()
               , sopsOpenStack  = const (pure (Left "rebuild-cause"))
               }
-        _ <- runReloadWith resolver show recordingHook supOps
+        _ <- runReloadWith resolver show show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- unchanged from step 4
