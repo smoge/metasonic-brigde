@@ -143,7 +143,11 @@ directly on the `PreservingAdapterHostStackInWindowIssue` /
 `HostPreservingReloadIssue` shape, whose `Show` instance recursively
 unrolls the carried report.
 
-## Next lane
+## Next lane (closed by `13f3a8e` — see Follow-up below)
+
+*Historical record of what this pass recommended at the time. The
+compact-cause slice landed; see the Follow-up section for the
+post-fix transcript and the current set of deferred lanes.*
 
 Per the post-pass decision rubric, the lines being too noisy points
 at **compact `renderCommand` / compact cause renderer for supervised
@@ -174,6 +178,71 @@ Other lanes deliberately deferred until that lands:
 - GUI / control binding lane. Stdin felt fine in this pass;
   not the bottleneck today.
 
+## Follow-up (2026-05-21, post-fix)
+
+`13f3a8e` landed the compact supervised-cause renderer along the
+lines sketched above. Five new route-specific renderers in
+[`ManifestReloadCli.hs`](../app/MetaSonic/App/ManifestReloadCli.hs)
+(`renderReloadHostStackOpenIssueTag`,
+`renderPreservingHostStackIssueTag`,
+`renderStoppedAudioHostStackIssueTag`,
+`renderTryPreservingInWindowIssueTag`,
+`renderTryPreservingHostStackIssueTag`); a `(e -> String)`
+`causeLabel` threaded through `runReloadWith` / `sessionLoop` /
+`runSupervised` / `runManifestLiveSession`, replacing the
+`Show e =>` constraint; eleven F-1 leak tests in
+[`AppManifestLiveReloadDemoRender`](../test/MetaSonic/Spec/AppManifestLiveReloadDemoRender.hs)
+covering each constructor of each in-window arm plus the open arm,
+all capped at 300 characters and banning `TemplateGraph` /
+`RuntimeNode` substrings.
+
+Re-running the same driver (`/tmp/drive_reject_session.sh`) against
+the same fixture now produces:
+
+```text
+  supervised outcome: request-rejected (stack still on previous plan)
+  reload events:
+    - preserving phase started
+    - resume old ingress: started
+    - resume old ingress: succeeded
+    - preserving phase rejected: reload-rejected (old owner still installed)
+  cause: in-window: reload-rejected (old owner still installed)
+  resource timeline:
+    - request rejected; stack stayed live
+    - no supervisor rebuild
+    - serving plan: reject-preserving-smooth-dark
+```
+
+The `cause:` line dropped from **13,112 characters to 63** — a 99.5%
+reduction. The outcome / events / cause / resource timeline block
+now reads as a single contiguous operator narrative; the resource
+timeline is no longer below the fold. The F-1 leak shape that this
+pass surfaced is closed at the runReloadWith call site, and the
+supervised-cause path now has the same kind of leak guard that
+`renderHostPreservingIssueTag` has had since the strategy-outcome
+F-1 slice.
+
+The inner `SriHotSwapWouldPreserveVoices` reason is intentionally
+*not* extracted into the cause line yet — the structural form
+("in-window: reload-rejected (old owner still installed)") was the
+v1 target. Drilling into `mphsrDrainResult →
+SessionDrainItem → StepRuntimeFailed` to surface the runtime reason
+is a future slice if a real pass shows the structural line is
+insufficient.
+
+### Lanes still open
+
+- **Tier-2 reject wrapper** for the live session is now unblocked:
+  the transcript is compact enough to assert on. Next implementation
+  slice.
+- **Richer recovery timeline** for the `RejectedRecovered` /
+  `Escalated` branches. Still deferred — those branches did not
+  fire in this pass, and recurring evidence of confusion is the
+  trigger.
+- **GUI / control binding lane** — still not the bottleneck;
+  reach for it only after the CLI operator surface is exercised more
+  broadly.
+
 ## Artifacts
 
 - Driver: `/tmp/drive_reject_session.sh` (one-off, not committed)
@@ -182,3 +251,4 @@ Other lanes deliberately deferred until that lands:
 - Fixture drift guard: `b01cda6`
 - Resource timeline observability slice: `5cc1eda`
 - Preserving enqueue-rejected event slice: `5849efc`
+- Compact supervised-cause renderer: `13f3a8e`

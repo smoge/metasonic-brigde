@@ -3903,16 +3903,23 @@ Still gated:
   timeline, distinct from generic `osc enqueue-reject`, and a
   pre-existing double-print where `molhOnAccepted` and
   `molhOnIssue` both fired for the same packet is fixed
-  structurally via a `Maybe`-typed renderer return. Remaining
-  work in this arc is a resource/allocation recovery event
-  stream (gated on a concrete consumer; the session shell is
-  now that consumer's first candidate), the richer
-  `MrePreservingReloadEnqueueRejected` consumer surface for
-  internal preserving-queue rejection beyond the existing
-  `renderLiveReloadEvents` timeline (the second half of the
-  live-session v0 note's "Stale-command semantics" bullet), and
-  hardware confirmation / hardware-gated CI for the
-  device-backed paths. Host strategy smoke and live reload demo
+  structurally via a `Maybe`-typed renderer return. The
+  internal preserving-queue rejection got its own
+  `MrePreservingReloadEnqueueRejected` event + CLI rendering
+  in `5849efc`, closing the second half of the live-session v0
+  note's "Stale-command semantics" bullet. The supervised-cause
+  F-1 leak surfaced by the 2026-05-21-a reject-path operator
+  pressure pass was closed in `13f3a8e`: the `cause: /
+  in-window cause: / rebuild cause:` lines now flow through
+  route-specific kebab renderers
+  (`renderPreservingHostStackIssueTag` etc.) instead of `show`,
+  and F-1 leak coverage in
+  `AppManifestLiveReloadDemoRender` extends to the live-session
+  supervised-cause path. Remaining work in this arc is a
+  resource/allocation recovery event stream (gated on a
+  concrete consumer; the session shell is now that consumer's
+  first candidate) and hardware confirmation / hardware-gated
+  CI for the device-backed paths. Host strategy smoke and live reload demo
   share a typed prose reload-event vocabulary
   (`f595542` / `aca37ed`). The preserving live-reload path has a
   blessed committed fixture at
