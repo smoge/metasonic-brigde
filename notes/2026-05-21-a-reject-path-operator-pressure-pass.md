@@ -256,10 +256,32 @@ insufficient.
 
 ### Lanes still open
 
-- **Richer recovery timeline** for the `RejectedRecovered` /
-  `Escalated` branches. Still deferred — those branches did not
-  fire in this pass, and recurring evidence of confusion is the
-  trigger.
+- **`RejectedRecovered` / `Escalated` real-session pressure.**
+  The supervisor lifecycle event stream itself landed in
+  `d86a2df` + `ffaca33` + `6b8c08c`: `SupervisedReloadEvent`
+  observed end-to-end through the live session's new
+  `supervisor events:` block (see
+  [2026-05-20-b-manifest-live-session-v0.md](2026-05-20-b-manifest-live-session-v0.md)'s
+  "Follow-ups landed" section). What's still open is forcing
+  those two branches to actually fire under real PortAudio +
+  OSC; this reject pass only exercised the
+  `RequestRejected` shape because the
+  `reject-preserving-smooth` fixture deliberately leaves the
+  old stack live. A second fixture that produces an
+  `InWindowReloadTerminal` (e.g. by failing a post-classification
+  stage so the supervisor closes-then-rebuilds) would unlock
+  the `RejectedRecovered` transcript; a third where
+  `sopsOpenStack` also fails would unlock `Escalated`. Both
+  belong in the same fixture family as
+  `reject-preserving-smooth`, not in pressure passes against
+  the happy-path fixtures.
+- **Finer in-window allocation/resource detail.** Speculative
+  until a real transcript shows the current `supervisor events:`
+  block is too coarse. The existing block names the
+  in-window / close-previous / fallback-open boundaries; an
+  open-stage subdivision (service-setup vs. audio-start vs.
+  ingress-open) is the next reach if the recovery transcript
+  ever shows the current granularity hides the failing stage.
 - **GUI / control binding lane** — still not the bottleneck;
   reach for it only after the CLI operator surface is exercised more
   broadly.
@@ -276,3 +298,8 @@ insufficient.
 - Tier-2 reject wrapper: `9b39fd2`
   (`tools/manifest_live_session_require_preserving_reject_smoke.sh`;
   `just manifest-live-session-require-preserving-reject-smoke`)
+- Supervisor lifecycle event substrate + live-session rendering:
+  `d86a2df` (`SupervisedReloadEvent`,
+  `reloadSupervisedWithEvents`) + `ffaca33` (callback-safety
+  guard) + `6b8c08c` (`supervisor events:` block in
+  `--manifest-live-session`)

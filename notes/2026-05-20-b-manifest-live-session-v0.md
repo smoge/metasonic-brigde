@@ -168,7 +168,13 @@ pieces without any live IO:
 
 Total: 24 new test cases.
 
-## What this slice does NOT do
+## What this slice did NOT do (at the time)
+
+These bullets describe scope as the v0 slice landed on
+2026-05-20. Some have since been closed by follow-up slices —
+see "Follow-ups landed" below for the closed list and the
+commit hashes. The bullets here stay in their original wording
+so the v0 design rationale is recoverable.
 
 Deliberately out of scope so the entrypoint can be the consumer
 that informs each:
@@ -194,25 +200,50 @@ that informs each:
   pattern is mechanical to fan out (port 17005 + 17006); the
   marker shape is the same plus or minus the negative marker.
 
+## Follow-ups landed
+
+* **Stale-command rejection surface (2026-05-20):** producer-aware
+  OSC reload-window rendering (`144901f` + `737b124`), then the
+  internal preserving-queue rejection event
+  (`MrePreservingReloadEnqueueRejected`) + CLI rendering in
+  `5849efc`. Closes the second half of the original
+  "Stale-command semantics" bullet above. Design note:
+  [2026-05-20-d-stale-command-rejection-rendering.md](2026-05-20-d-stale-command-rejection-rendering.md).
+* **Supervisor lifecycle event stream (2026-05-21):**
+  `SupervisedReloadEvent` substrate (`d86a2df`), callback-safety
+  guard so observer exceptions cannot bypass terminal cleanup
+  (`ffaca33`), and the live-session `supervisor events:` block
+  reading the observed stream alongside the existing derived
+  `resource timeline:` summary (`6b8c08c`). Partially closes the
+  original "Resource/allocation event streaming" bullet: the
+  supervisor's own close/open lifecycle is now observed; finer
+  resource/allocation detail INSIDE the in-window slot
+  (open-stage subdivision, audio start/stop framing) is the
+  next reach if a real-session transcript shows the current
+  block is too abstract.
+* **Reject-path tier-2 fan-out (2026-05-21):** companion wrapper
+  `manifest_live_session_require_preserving_reject_smoke.sh`
+  (`9b39fd2`) against the new `reject-preserving-smooth`
+  fixture (`c19e0cc`). Pins the request-rejected operator
+  narrative end-to-end (23 markers). The other supervised
+  routes (try-preserving session, stopped-audio session) still
+  do not have wrappers.
+
 ## What comes next
 
-The session shell is now the consumer; the question of what to
-build next gets a real answer rather than an abstract one. The
-most likely candidates, in rough priority order:
+The current open lanes after the closeouts above:
 
-* **Stale-command rejection surface.** The session can already
-  enqueue OSC writes that arrive during a hot-swap window. The
-  current direct-OSC-accept print does not distinguish "accepted
-  pre-reload" from "accepted but rejected at enqueue time during
-  the swap window." Designing a small operator-facing line for
-  that case is the cleanest consumer-driven next slice; the
-  concrete design note is
-  [2026-05-20-d-stale-command-rejection-rendering.md](2026-05-20-d-stale-command-rejection-rendering.md).
-* **Resource/allocation event consumer.** With a real
-  `SupervisedReloadEscalated` path the operator can hit, having a
-  per-attempt allocation summary becomes useful.
-* **Tier-2 fan-out.** If session adoption proves the route, the
-  other two strategies get their own wrappers.
-
-None of these are committed today. The session shell is what
-their design has to be sound against.
+* **`RejectedRecovered` / `Escalated` real-session pressure.**
+  The supervisor's terminal close + fallback-open path is
+  deterministic-unit-tested but has not been exercised under
+  real PortAudio + OSC. A fixture that forces a terminal
+  in-window failure (vs. the current request-rejected fixture
+  which leaves the stack live) would unlock that pressure
+  pass.
+* **Finer in-window allocation/resource detail.** Pure
+  conjectural until a transcript shows the current
+  `supervisor events:` block is too coarse; document the gap
+  if one shows up.
+* **Try-preserving / stopped-audio session wrappers.** Same
+  mechanical fan-out as the existing two wrappers; trigger
+  is operator demand for those strategies.

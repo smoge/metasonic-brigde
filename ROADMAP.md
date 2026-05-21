@@ -3925,11 +3925,24 @@ Still gated:
   (`renderPreservingHostStackIssueTag` etc.) instead of `show`,
   and F-1 leak coverage in
   `AppManifestLiveReloadDemoRender` extends to the live-session
-  supervised-cause path. Remaining work in this arc is a
-  resource/allocation recovery event stream (gated on a
-  concrete consumer; the session shell is now that consumer's
-  first candidate) and hardware confirmation / hardware-gated
-  CI for the device-backed paths. Host strategy smoke and live reload demo
+  supervised-cause path. The supervisor's own lifecycle event
+  stream landed in `d86a2df` + `ffaca33` + `6b8c08c`:
+  `SupervisedReloadEvent` (nine constructors covering in-window
+  + close-previous + fallback-open boundaries),
+  `reloadSupervisedWithEvents` taking a typed callback (with
+  `safeEmit` distinguishing synchronous callback exceptions from
+  async shutdown signals so observer bugs cannot bypass the
+  recovery-path cleanup contract), and a new compact
+  `supervisor events:` block in `--manifest-live-session` that
+  reads the observed stream and sits beside the derived
+  `resource timeline:` summary. Remaining work in this arc is
+  finer-grained allocation/resource detail INSIDE the
+  in-window slot (open-stage subdivision, audio start/stop
+  framing) and hardware confirmation / hardware-gated CI for
+  the device-backed paths; the `RejectedRecovered` /
+  `Escalated` shapes of the new event stream are deterministic
+  unit-tested but still lack a real-session pressure
+  transcript. Host strategy smoke and live reload demo
   share a typed prose reload-event vocabulary
   (`f595542` / `aca37ed`). The preserving live-reload path has a
   blessed committed fixture at
