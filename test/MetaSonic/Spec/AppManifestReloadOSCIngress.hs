@@ -227,6 +227,34 @@ appManifestReloadOSCIngressTests =
               ("expected out-of-range for NaN, got: " <> show other)
         snapshot <- readSessionFanInHost host
         sfisQueueDepth snapshot @?= 0
+
+  -- Degenerate-but-legal range: a manifest may declare
+  -- rangeMin == rangeMax (single-valued control). The accept
+  -- predicate is inclusive on both sides, so the exact midpoint
+  -- accepts and the producer is called. See
+  -- notes/2026-05-21-d-manifest-osc-range-rejection.md.
+  , testCase "zero-width range accepts the exact boundary value (rangeMin == rangeMax)" $ do
+      let target = manifestOSCIngressTargetFromPlan zeroWidthPlan
+          msg = OscMessage
+            { oscAddr = BSC.pack "/v0/cutoff/1"
+            , oscArgs = [OscArgFloat 0.0]
+            }
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestOSCMessage
+            defaultOSCProducerOptions
+            target
+            msg
+            host
+        case moirOutcome result of
+          Right (OSCProducerEnqueueAttempted command enq) -> do
+            command @?= CmdControlWrite (VoiceKey "v0") cutoffTag 0.0
+            queued <- fanInQueuedOrFail enq
+            qscCommand queued @?= command
+          other ->
+            assertFailure
+              ("expected accept at zero-width range midpoint, got: "
+                <> show other)
   ]
   where
     withFanInOrFail action = do
@@ -284,3 +312,38 @@ validPlan = MR.ManifestReloadPlan
 cutoffTag :: ControlTag
 cutoffTag =
   ControlTag (MigrationKey "cutoff") 1
+
+-- | Same cutoff tag as 'validPlan' but with @rangeMin == rangeMax == 0.0@.
+-- Used to pin the inclusive-bound contract at the degenerate-but-legal
+-- end (single-valued control).
+zeroWidthPlan :: MR.ManifestReloadPlan
+zeroWidthPlan = MR.ManifestReloadPlan
+  { MR.mrlpDemoKey =
+      "demo"
+  , MR.mrlpSwapLabel =
+      SwapLabel "reload"
+  , MR.mrlpTemplateGraph =
+      TemplateGraph [] M.empty
+  , MR.mrlpAdapterOptions =
+      defaultRTGraphAdapterOptions
+  , MR.mrlpControlSurface =
+      [ MR.ManifestControlSurface
+          { MR.mcsDisplayName =
+              "cutoff"
+          , MR.mcsControlTag =
+              cutoffTag
+          , MR.mcsDefault =
+              0.0
+          , MR.mcsRangeMin =
+              0.0
+          , MR.mcsRangeMax =
+              0.0
+          , MR.mcsSmoothingHz =
+              30.0
+          , MR.mcsCC =
+              Nothing
+          }
+      ]
+  , MR.mrlpArbitrationPolicy =
+      FifoOnly
+  }
