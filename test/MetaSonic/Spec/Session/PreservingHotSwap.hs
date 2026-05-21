@@ -233,4 +233,32 @@ sessionPreservingHotSwapSpecTests =
         other ->
           assertFailure ("expected modeled preserving hot-swap commit, got: "
                          <> show other)
+
+  , testCase "spectral-lpf active voice rejects preserving swap instead of crashing" $ do
+      graph <- compileTemplateGraphOrFail spectralFreezePadTemplates
+      let startCmd =
+            fromPatternEvent
+              (PEVoiceOn (TemplateName "lpf-bed") (VoiceKey "v0") [])
+          swapCmd =
+            fromPatternEvent
+              (PEHotSwap (SwapLabel "same-spectral-lpf") graph)
+      result <- withSessionOwner graph defaultSessionOwnerOptions $
+        \owner -> do
+          started <- stepSessionOwner owner startCmd
+          swapped <- stepSessionOwner owner swapCmd
+          status <- sessionOwnerStatus owner
+          pure (started, swapped, status)
+
+      case result of
+        Left issue ->
+          assertFailure ("expected session owner, got: " <> show issue)
+        Right ( SessionOwnerStep (StepCommitted _ Nothing)
+              , SessionOwnerStep
+                  (StepRuntimeFailed SriHotSwapWouldPreserveVoices)
+              , SessionOwnerReady
+              ) ->
+          pure ()
+        Right other ->
+          assertFailure
+            ("expected spectral-lpf preserving rejection, got: " <> show other)
   ]

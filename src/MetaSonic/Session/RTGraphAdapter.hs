@@ -499,6 +499,7 @@ preservingHotSwapNodeClass = \case
   KRecordBufMono   -> PreserveUnsupported
   KSpectralFreeze  -> PreserveUnsupported
   KStaticPlugin    -> PreserveUnsupported
+  KSpectralLpf     -> PreserveUnsupported
   KSinOsc          -> PreserveStateful
   KOut             -> PreserveStateless
   KGain            -> PreserveStateless
