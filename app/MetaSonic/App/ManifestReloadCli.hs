@@ -1288,8 +1288,11 @@ renderHostPreservingIssueTag issue = case issue of
     -- This constructor is the retryable old-owner-still-installed
     -- shape, not specifically a graph-shape incompatibility.
     -- mapPreservingReloadReport (ManifestReloadHost.hs) collapses
-    -- SessionEnqueueRejected, StepRuntimeFailed, and StepRejected
-    -- all into HprfOldOwnerStillInstalled → HpariReloadRejected.
+    -- SessionEnqueueRejected through HprfReloadEnqueueRejected and
+    -- StepRuntimeFailed / StepRejected through
+    -- HprfOldOwnerStillInstalled — both funnel here. The
+    -- enqueue-rejected case is named separately on the event
+    -- timeline via MrePreservingReloadEnqueueRejected.
     "reload-rejected (old owner still installed)"
   HpariReloadRejectedResumeFailed{}  ->
     "reload-rejected; resume-failed"
