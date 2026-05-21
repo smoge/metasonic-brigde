@@ -23,10 +23,13 @@ import           Test.Tasty.HUnit
 import           MetaSonic.App.ManifestLiveSession
                                             (LiveSessionCommand (..),
                                              LiveSessionOutcome (..),
+                                             LiveSessionResourceEvent (..),
                                              ReloadResolver (..),
                                              SessionStep (..),
                                              parseLiveSessionCommand,
                                              renderLiveSessionOutcome,
+                                             renderLiveSessionResourceEvents,
+                                             resourceTimelineForOutcome,
                                              runReloadWith,
                                              stepFromOutcome,
                                              withTrackedFactory)
@@ -53,6 +56,10 @@ appManifestLiveSessionTests =
   [ testGroup "parseLiveSessionCommand"  parseLiveSessionCommandTests
   , testGroup "stepFromOutcome"          stepFromOutcomeTests
   , testGroup "renderLiveSessionOutcome" renderLiveSessionOutcomeTests
+  , testGroup "resourceTimelineForOutcome"
+                                         resourceTimelineForOutcomeTests
+  , testGroup "renderLiveSessionResourceEvents"
+                                         renderLiveSessionResourceEventsTests
   , testGroup "withTrackedFactory"       withTrackedFactoryTests
   , testGroup "runReloadWith"            runReloadWithTests
   ]
@@ -140,6 +147,104 @@ renderLiveSessionOutcomeTests =
   , testCase "PlanRejected embeds the reason verbatim" $
       renderLiveSessionOutcome (LsoPlanRejected "demo \"missing\" not in catalog")
         @?= "plan-rejected (demo \"missing\" not in catalog)"
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- resourceTimelineForOutcome
+-- ---------------------------------------------------------------------------
+
+-- | The four supervisor outcomes each project to a fixed-shape
+-- timeline. Tests pin the structural shape (which events fire, in
+-- which order, and which plan is named) per outcome. The plan type
+-- is the same 'StubPlan' alias used by 'runReloadWith' tests.
+resourceTimelineForOutcomeTests :: [TestTree]
+resourceTimelineForOutcomeTests =
+  [ testCase "Committed: [InWindowReloadCommitted, ServingPlan requested]" $
+      resourceTimelineForOutcome fallback requested
+          (SupervisedReloadCommitted :: SupervisedReloadOutcome String)
+        @?= [ LsreInWindowReloadCommitted
+            , LsreServingPlan requested
+            ]
+
+  , testCase "RequestRejected: [RequestRejectedStackStayedLive, NoSupervisorRebuild, ServingPlan fallback]" $
+      resourceTimelineForOutcome fallback requested
+          (SupervisedReloadRequestRejected "live-fallback-cause")
+        @?= [ LsreRequestRejectedStackStayedLive
+            , LsreNoSupervisorRebuild
+            , LsreServingPlan fallback
+            ]
+
+  , testCase "RejectedRecovered: [TerminalRecovering, ClosedPrevious, OpenedFallback, ServingPlan fallback]" $
+      resourceTimelineForOutcome fallback requested
+          (SupervisedReloadRejectedRecovered "in-window-cause")
+        @?= [ LsreTerminalRecoveringFromFallback
+            , LsreClosedPreviousStack
+            , LsreOpenedFallbackStack
+            , LsreServingPlan fallback
+            ]
+
+  , testCase "Escalated: [TerminalRecovering, ClosedPrevious, FallbackRebuildFailed, NoLiveStack]" $
+      resourceTimelineForOutcome fallback requested
+          (SupervisedReloadEscalated "in-window-cause" "rebuild-cause")
+        @?= [ LsreTerminalRecoveringFromFallback
+            , LsreClosedPreviousStack
+            , LsreFallbackRebuildFailed
+            , LsreNoLiveStack
+            ]
+  ]
+  where
+    fallback, requested :: StubPlan
+    fallback  = 1
+    requested = 2
+
+
+-- ---------------------------------------------------------------------------
+-- renderLiveSessionResourceEvents
+-- ---------------------------------------------------------------------------
+
+-- | The renderer is a flat per-event mapping; tests pin the
+-- operator-facing line text per outcome so any wording drift gets
+-- flagged. 'show' is the test-time plan-label projection;
+-- production passes 'MR.mrlpDemoKey'.
+renderLiveSessionResourceEventsTests :: [TestTree]
+renderLiveSessionResourceEventsTests =
+  [ testCase "Committed renders 2 lines naming the requested plan" $
+      renderLiveSessionResourceEvents show
+          (resourceTimelineForOutcome (1 :: StubPlan) 2
+             (SupervisedReloadCommitted :: SupervisedReloadOutcome String))
+        @?= [ "in-window reload committed"
+            , "serving plan: 2"
+            ]
+
+  , testCase "RequestRejected renders 3 lines naming the fallback plan" $
+      renderLiveSessionResourceEvents show
+          (resourceTimelineForOutcome (1 :: StubPlan) 2
+             (SupervisedReloadRequestRejected "cause"))
+        @?= [ "request rejected; stack stayed live"
+            , "no supervisor rebuild"
+            , "serving plan: 1"
+            ]
+
+  , testCase "RejectedRecovered renders 4 lines spelling close/open and fallback plan" $
+      renderLiveSessionResourceEvents show
+          (resourceTimelineForOutcome (1 :: StubPlan) 2
+             (SupervisedReloadRejectedRecovered "cause"))
+        @?= [ "terminal in-window failure; recovering from fallback"
+            , "closed previous stack"
+            , "opened fallback stack"
+            , "serving plan: 1"
+            ]
+
+  , testCase "Escalated renders 4 lines spelling close, rebuild failure, and no-live-stack" $
+      renderLiveSessionResourceEvents show
+          (resourceTimelineForOutcome (1 :: StubPlan) 2
+             (SupervisedReloadEscalated "in-window" "rebuild"))
+        @?= [ "terminal in-window failure; recovering from fallback"
+            , "closed previous stack"
+            , "fallback rebuild failed"
+            , "serving plan: (no live stack)"
+            ]
   ]
 
 
@@ -348,6 +453,7 @@ runReloadWithTests =
             resolver = stubResolver "good" 42
         step <- runReloadWith
                   resolver
+                  show
                   noHook
                   blockingSupOps
                   currentPlanRef
@@ -376,6 +482,7 @@ runReloadWithTests =
             resolver = stubAlwaysReject "manifest does not name this demo"
         step <- runReloadWith
                   resolver
+                  show
                   noHook
                   blockingSupOps
                   currentPlanRef
@@ -403,6 +510,7 @@ runReloadWithTests =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 7
         step <- runReloadWith
                   resolver
+                  show
                   noHook
                   supOps
                   currentPlanRef
@@ -428,6 +536,7 @@ runReloadWithTests =
             supOps   = fakeSupOpsWithOutcome eventsRef outcome 8
         step <- runReloadWith
                   resolver
+                  show
                   noHook
                   supOps
                   currentPlanRef
@@ -463,6 +572,7 @@ runReloadWithTests =
               }
         step <- runReloadWith
                   resolver
+                  show
                   noHook
                   supOps
                   currentPlanRef
@@ -489,6 +599,7 @@ runReloadWithTests =
               }
         step <- runReloadWith
                   resolver
+                  show
                   noHook
                   supOps
                   currentPlanRef
@@ -511,11 +622,11 @@ runReloadWithTests =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 11
             supOpsSecond =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 12
-        _ <- runReloadWith resolver noHook supOpsFirst
+        _ <- runReloadWith resolver show noHook supOpsFirst
                currentPlanRef lastOutcomeRef eventsRef "next"
         eventsAfterFirst <- readIORef eventsRef
         eventsAfterFirst @?= [syntheticEvent 11]
-        _ <- runReloadWith resolver noHook supOpsSecond
+        _ <- runReloadWith resolver show noHook supOpsSecond
                currentPlanRef lastOutcomeRef eventsRef "next"
         eventsAfterSecond <- readIORef eventsRef
         eventsAfterSecond @?= [syntheticEvent 12]
@@ -547,7 +658,7 @@ runReloadWithTests =
               , sopsOpenStack  = \_ ->
                   assertFailure "open must not be called"
               }
-        _ <- runReloadWith resolver recordingHook blockingSupOps
+        _ <- runReloadWith resolver show recordingHook blockingSupOps
                currentPlanRef lastOutcomeRef eventsRef "bad-key"
         pure ()
       readIORef hookCallsRef >>= (@?= ([] :: [StubPlan]))
@@ -556,7 +667,7 @@ runReloadWithTests =
       withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
         let supOps =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 100
-        _ <- runReloadWith resolver recordingHook supOps
+        _ <- runReloadWith resolver show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2])  -- requestedPlan == 2
@@ -567,7 +678,7 @@ runReloadWithTests =
               fakeSupOpsWithOutcome eventsRef
                 (InWindowReloadRejectedLiveFallback "live-fallback")
                 101
-        _ <- runReloadWith resolver recordingHook supOps
+        _ <- runReloadWith resolver show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       -- Hook list still just [2] from the Committed test above.
@@ -583,7 +694,7 @@ runReloadWithTests =
               , sopsCloseStack = pure ()
               , sopsOpenStack  = const (pure (Right ()))
               }
-        _ <- runReloadWith resolver recordingHook supOps
+        _ <- runReloadWith resolver show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- recovered with fallback (1)
@@ -598,7 +709,7 @@ runReloadWithTests =
               , sopsCloseStack = pure ()
               , sopsOpenStack  = const (pure (Left "rebuild-cause"))
               }
-        _ <- runReloadWith resolver recordingHook supOps
+        _ <- runReloadWith resolver show recordingHook supOps
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- unchanged from step 4

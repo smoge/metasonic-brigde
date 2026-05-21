@@ -49,6 +49,17 @@ module MetaSonic.App.ManifestLiveSession
   , SessionStep (..)
   , stepFromOutcome
 
+    -- * Resource timeline (pure, table-tested observability projection)
+    --
+    -- A flat, derived projection of a 'SupervisedReloadOutcome' onto
+    -- the resource consequences the operator should see (close /
+    -- open / which plan is serving). The events come from the
+    -- supervisor contract, not new instrumentation inside
+    -- 'realOpen' / 'realClose'.
+  , LiveSessionResourceEvent (..)
+  , resourceTimelineForOutcome
+  , renderLiveSessionResourceEvents
+
     -- * Tracked-stack factory wrapper (exported for tests)
   , withTrackedFactory
 
@@ -259,6 +270,108 @@ stepFromOutcome = \case
     (LsoRejectedRecovered, SsContinue)
   SupervisedReloadEscalated _ _ ->
     (LsoEscalated, SsTerminate (ExitFailure 1))
+
+
+-- ============================================================================
+-- Resource timeline
+-- ============================================================================
+
+-- | One step of the operator-facing /resource consequence/ of a
+-- supervised reload attempt. 'reloadSupervised's contract pins down
+-- what happens to the host stack and which plan is serving on each
+-- 'SupervisedReloadOutcome' constructor:
+--
+--   * 'SupervisedReloadCommitted' — no close, no reopen; the
+--     requested plan is serving.
+--   * 'SupervisedReloadRequestRejected' — no close, no reopen; the
+--     entry-time fallback plan is still serving.
+--   * 'SupervisedReloadRejectedRecovered' — previous stack was
+--     closed, a fresh stack opened on the fallback plan.
+--   * 'SupervisedReloadEscalated' — previous stack closed, fallback
+--     rebuild failed; no live stack remains.
+--
+-- The events here are a flat projection of that contract into lines
+-- the live session can print so the operator can see /what the
+-- supervisor did with the host stack/ in addition to the classified
+-- outcome name. They are pure consequences derivable from the
+-- outcome value; they are not new runtime telemetry from inside
+-- 'realOpen' / 'realClose'.
+data LiveSessionResourceEvent plan
+  = LsreInWindowReloadCommitted
+  | LsreRequestRejectedStackStayedLive
+  | LsreNoSupervisorRebuild
+  | LsreTerminalRecoveringFromFallback
+  | LsreClosedPreviousStack
+  | LsreOpenedFallbackStack
+  | LsreFallbackRebuildFailed
+  | LsreServingPlan !plan
+  | LsreNoLiveStack
+  deriving stock (Eq, Show)
+
+
+-- | Pure projection from the entry-time fallback plan, the
+-- requested plan, and the supervisor outcome to the resource
+-- timeline the operator should see. The fallback plan is the one
+-- already serving at reload entry (read from 'currentPlanRef' in
+-- 'runReloadWith'); the requested plan is the operator's reload
+-- target.
+resourceTimelineForOutcome
+  :: plan
+  -> plan
+  -> SupervisedReloadOutcome e
+  -> [LiveSessionResourceEvent plan]
+resourceTimelineForOutcome fallback requested = \case
+  SupervisedReloadCommitted ->
+    [ LsreInWindowReloadCommitted
+    , LsreServingPlan requested
+    ]
+  SupervisedReloadRequestRejected _ ->
+    [ LsreRequestRejectedStackStayedLive
+    , LsreNoSupervisorRebuild
+    , LsreServingPlan fallback
+    ]
+  SupervisedReloadRejectedRecovered _ ->
+    [ LsreTerminalRecoveringFromFallback
+    , LsreClosedPreviousStack
+    , LsreOpenedFallbackStack
+    , LsreServingPlan fallback
+    ]
+  SupervisedReloadEscalated _ _ ->
+    [ LsreTerminalRecoveringFromFallback
+    , LsreClosedPreviousStack
+    , LsreFallbackRebuildFailed
+    , LsreNoLiveStack
+    ]
+
+
+-- | Render a resource timeline as one line per event. The plan
+-- label projection is operator-facing: production passes
+-- 'MR.mrlpDemoKey'; tests can pass 'show' against a stub plan.
+renderLiveSessionResourceEvents
+  :: (plan -> String)
+  -> [LiveSessionResourceEvent plan]
+  -> [String]
+renderLiveSessionResourceEvents planLabel = map render
+  where
+    render = \case
+      LsreInWindowReloadCommitted ->
+        "in-window reload committed"
+      LsreRequestRejectedStackStayedLive ->
+        "request rejected; stack stayed live"
+      LsreNoSupervisorRebuild ->
+        "no supervisor rebuild"
+      LsreTerminalRecoveringFromFallback ->
+        "terminal in-window failure; recovering from fallback"
+      LsreClosedPreviousStack ->
+        "closed previous stack"
+      LsreOpenedFallbackStack ->
+        "opened fallback stack"
+      LsreFallbackRebuildFailed ->
+        "fallback rebuild failed"
+      LsreServingPlan plan ->
+        "serving plan: " <> planLabel plan
+      LsreNoLiveStack ->
+        "serving plan: (no live stack)"
 
 
 -- ============================================================================
@@ -526,6 +639,7 @@ sessionLoop supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef rel
       LscReloadTo key ->
         runReloadWith
           (catalogPlanResolver doc catalog)
+          MR.mrlpDemoKey
           autoStartIfStackIsEmpty
           supOps
           currentPlanRef
@@ -626,6 +740,7 @@ catalogPlanResolver doc catalog = ReloadResolver $ \key ->
 runReloadWith
   :: Show e
   => ReloadResolver plan
+  -> (plan -> String)
   -> (plan -> IO ())
   -> SupervisorOps plan e
   -> IORef plan
@@ -633,7 +748,7 @@ runReloadWith
   -> IORef [LiveEvent]
   -> String
   -> IO SessionStep
-runReloadWith resolver onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
+runReloadWith resolver planLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
   case resolvePlan resolver key of
     Left reason -> do
       putStrLn ("  reload rejected: " <> reason)
@@ -653,23 +768,40 @@ runReloadWith resolver onLiveStackChanged supOps currentPlanRef lastOutcomeRef r
       writeIORef lastOutcomeRef (Just lso)
       when (lso == LsoCommitted) $
         writeIORef currentPlanRef requestedPlan
+      -- Cause lines first so the operator sees the failure detail
+      -- adjacent to the supervised outcome name.
       case out of
-        SupervisedReloadCommitted -> do
-          onLiveStackChanged requestedPlan
-          pure step
-        SupervisedReloadRequestRejected cause -> do
+        SupervisedReloadCommitted ->
+          pure ()
+        SupervisedReloadRequestRejected cause ->
           putStrLn ("  cause: " <> show cause)
-          pure step
-        SupervisedReloadRejectedRecovered cause -> do
+        SupervisedReloadRejectedRecovered cause ->
           putStrLn ("  in-window cause: " <> show cause)
-          onLiveStackChanged fallbackPlan
-          pure step
         SupervisedReloadEscalated inWindow rebuild -> do
           putStrLn ("  in-window cause: " <> show inWindow)
           putStrLn ("  rebuild cause:   " <> show rebuild)
           hPutStrLn stderr
             "live session escalated: no live stack remains."
-          pure step
+      -- Resource timeline before 'onLiveStackChanged' so the
+      -- operator reads close/open/serving-plan consequences
+      -- contiguously with the outcome + cause section, ahead of
+      -- any noisy "post-reload: auto-starting ..." output the
+      -- hook may produce.
+      let timeline =
+            resourceTimelineForOutcome fallbackPlan requestedPlan out
+      putStrLn "  resource timeline:"
+      mapM_ (putStrLn . ("    - " <>))
+            (renderLiveSessionResourceEvents planLabel timeline)
+      case out of
+        SupervisedReloadCommitted ->
+          onLiveStackChanged requestedPlan
+        SupervisedReloadRejectedRecovered _ ->
+          onLiveStackChanged fallbackPlan
+        SupervisedReloadRequestRejected _ ->
+          pure ()
+        SupervisedReloadEscalated _ _ ->
+          pure ()
+      pure step
 
 
 -- | Read the active stack via the tracking IORef and print the
