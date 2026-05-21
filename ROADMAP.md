@@ -3895,6 +3895,14 @@ Still gated:
   2026-05-20 on host RME ADI-2 Pro / PipeWire; design
   rationale + acceptance criteria + non-goals at
   [notes/2026-05-20-b-manifest-live-session-v0.md](notes/2026-05-20-b-manifest-live-session-v0.md).
+  Companion reject-path wrapper at
+  `tools/manifest_live_session_require_preserving_reject_smoke.sh`
+  (`just manifest-live-session-require-preserving-reject-smoke`,
+  port 17005) landed in `9b39fd2` against the
+  `reject-preserving-smooth` fixture; 23 markers pin the
+  request-rejected operator narrative end-to-end including the
+  compact `cause:` line and resource timeline, plus the runtime
+  F-1 leak guard (no `TemplateGraph` / `RuntimeNode` substring).
   Producer-aware OSC reload-window rendering landed in
   `144901f` + `737b124` (design note:
   [notes/2026-05-20-d-stale-command-rejection-rendering.md](notes/2026-05-20-d-stale-command-rejection-rendering.md)):

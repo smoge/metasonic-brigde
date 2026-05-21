@@ -230,11 +230,22 @@ SessionDrainItem → StepRuntimeFailed` to surface the runtime reason
 is a future slice if a real pass shows the structural line is
 insufficient.
 
+### Lanes closed in this arc
+
+- **Tier-2 reject wrapper** landed in `9b39fd2`:
+  `tools/manifest_live_session_require_preserving_reject_smoke.sh`
+  + `just manifest-live-session-require-preserving-reject-smoke`,
+  default port 17005. Pins 23 markers covering the request-rejected
+  operator narrative end-to-end — outcome name, reload events,
+  compact `cause:` line, resource timeline (stack stayed live / no
+  rebuild / serving old plan), post-reject status snapshot, and
+  pre/post OSC survival — plus negative markers gating the
+  classification (no supervised committed outcome / no preserving
+  phase committed / no stopped-audio phase) and the F-1 leak guard
+  at runtime (no `TemplateGraph` / `RuntimeNode` substring).
+
 ### Lanes still open
 
-- **Tier-2 reject wrapper** for the live session is now unblocked:
-  the transcript is compact enough to assert on. Next implementation
-  slice.
 - **Richer recovery timeline** for the `RejectedRecovered` /
   `Escalated` branches. Still deferred — those branches did not
   fire in this pass, and recurring evidence of confusion is the
@@ -252,3 +263,6 @@ insufficient.
 - Resource timeline observability slice: `5cc1eda`
 - Preserving enqueue-rejected event slice: `5849efc`
 - Compact supervised-cause renderer: `13f3a8e`
+- Tier-2 reject wrapper: `9b39fd2`
+  (`tools/manifest_live_session_require_preserving_reject_smoke.sh`;
+  `just manifest-live-session-require-preserving-reject-smoke`)
