@@ -244,6 +244,16 @@ insufficient.
   phase committed / no stopped-audio phase) and the F-1 leak guard
   at runtime (no `TemplateGraph` / `RuntimeNode` substring).
 
+  **Evidence run (2026-05-21, Linux 6.17.10 Fedora 41 / PipeWire 1.2.8):**
+  23/23 markers green, `supervised outcome: request-rejected (stack
+  still on previous plan)`, compact `cause: in-window:
+  reload-rejected (old owner still installed)` held, no
+  `TemplateGraph` / `RuntimeNode` substring anywhere in the
+  transcript, session exit 0, port 17005 cleanly rebound after
+  exit. The reject branch of the live session is now backed by
+  the same kind of marker-clean evidence the happy-path wrapper
+  has carried since 2026-05-20.
+
 ### Lanes still open
 
 - **Richer recovery timeline** for the `RejectedRecovered` /

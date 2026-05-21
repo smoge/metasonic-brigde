@@ -3903,6 +3903,8 @@ Still gated:
   request-rejected operator narrative end-to-end including the
   compact `cause:` line and resource timeline, plus the runtime
   F-1 leak guard (no `TemplateGraph` / `RuntimeNode` substring).
+  Marker-clean evidence run on 2026-05-21 on host
+  Linux 6.17.10 Fedora 41 / PipeWire 1.2.8.
   Producer-aware OSC reload-window rendering landed in
   `144901f` + `737b124` (design note:
   [notes/2026-05-20-d-stale-command-rejection-rendering.md](notes/2026-05-20-d-stale-command-rejection-rendering.md)):
