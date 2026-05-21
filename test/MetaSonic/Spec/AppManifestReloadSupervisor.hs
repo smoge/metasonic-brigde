@@ -283,7 +283,161 @@ appManifestReloadSupervisorTests =
         , CloseStackCalled
         , OpenStackCalled planA
         ]
+
+  --------------------------------------------------------------------
+  -- Lifecycle event stream — pins the per-outcome event order.
+  --
+  -- The contract for each scenario is documented on the
+  -- 'SupervisedReloadEvent' constructors in
+  -- 'MetaSonic.App.ManifestReloadSupervisor'. These tests pin
+  -- the structural sequence the supervisor emits for each of the
+  -- four classified outcomes plus the close-throws exception
+  -- path, so future refactors of the recovery flow surface as
+  -- event-order failures before they become operator-transcript
+  -- failures.
+  --------------------------------------------------------------------
+
+  , testCase "withEvents: committed emits [Started, Committed] with no close/open events" $ do
+      (ops, log_)   <- mkRecordingOps inWindowOk openStackUnused
+      (evRef, onEv) <- mkEventLog
+      outcome <- reloadSupervisedWithEvents onEv ops planA planB
+      events <- readIORef evRef
+      calls  <- readIORef log_
+      outcome @?= SupervisedReloadCommitted
+      events @?=
+        [ SreInWindowStarted
+        , SreInWindowCommitted
+        ]
+      CloseStackCalled `elem` calls @?= False
+      any isOpenCall calls @?= False
+
+  , testCase "withEvents: request-rejected emits [Started, RejectedLiveFallback] with no close/open events" $ do
+      (ops, log_)   <-
+        mkRecordingOps
+          (inWindowRejectsLiveFallbackWith FakeOwnerSetupFailed)
+          openStackUnused
+      (evRef, onEv) <- mkEventLog
+      outcome <- reloadSupervisedWithEvents onEv ops planA planB
+      events <- readIORef evRef
+      calls  <- readIORef log_
+      outcome @?= SupervisedReloadRequestRejected FakeOwnerSetupFailed
+      events @?=
+        [ SreInWindowStarted
+        , SreInWindowRejectedLiveFallback FakeOwnerSetupFailed
+        ]
+      CloseStackCalled `elem` calls @?= False
+      any isOpenCall calls @?= False
+
+  , testCase "withEvents: rejected-recovered emits Terminal then close+open pairs (both Succeeded)" $ do
+      (ops, _log)   <-
+        mkRecordingOps
+          (inWindowTerminalWith FakeAudioRestartFailed)
+          openStackOk
+      (evRef, onEv) <- mkEventLog
+      outcome <- reloadSupervisedWithEvents onEv ops planA planB
+      events <- readIORef evRef
+      outcome @?= SupervisedReloadRejectedRecovered FakeAudioRestartFailed
+      events @?=
+        [ SreInWindowStarted
+        , SreInWindowTerminal FakeAudioRestartFailed
+        , SreClosePreviousStarted
+        , SreClosePreviousSucceeded
+        , SreFallbackOpenStarted
+        , SreFallbackOpenSucceeded
+        ]
+
+  , testCase "withEvents: escalated emits Terminal, ClosePreviousSucceeded, FallbackOpenFailed" $ do
+      (ops, _log)   <-
+        mkRecordingOps
+          (inWindowTerminalWith FakeAudioRestartFailed)
+          (openStackFailsWith FakeRebuildFailed)
+      (evRef, onEv) <- mkEventLog
+      outcome <- reloadSupervisedWithEvents onEv ops planA planB
+      events <- readIORef evRef
+      outcome @?=
+        SupervisedReloadEscalated FakeAudioRestartFailed FakeRebuildFailed
+      events @?=
+        [ SreInWindowStarted
+        , SreInWindowTerminal FakeAudioRestartFailed
+        , SreClosePreviousStarted
+        , SreClosePreviousSucceeded
+        , SreFallbackOpenStarted
+        , SreFallbackOpenFailed FakeRebuildFailed
+        ]
+
+  , testCase "withEvents: close throws on recovery path emits ClosePreviousStarted then propagates without SreClosePreviousSucceeded / SreFallbackOpen*" $ do
+      -- §238 close-throws contract: 'sopsCloseStack' is best-effort
+      -- on the recovery path. If it throws, the supervisor emits
+      -- 'SreClosePreviousStarted' but does not pretend the close
+      -- succeeded or that any fallback-open ran. The exception
+      -- propagates; the supervisor never returns a classified
+      -- outcome.
+      evRef <- newIORef ([] :: [SupervisedReloadEvent FakeFailure])
+      let onEv e = modifyIORef' evRef (++ [e])
+          opsCloseThrows :: SupervisorOps String FakeFailure
+          opsCloseThrows = SupervisorOps
+            { sopsInWindowReload = \_fallback _p ->
+                pure (InWindowReloadTerminal FakeOwnerSetupFailed)
+            , sopsCloseStack =
+                throwIO (ErrorCall "synthetic close-throws")
+            , sopsOpenStack = \_p ->
+                assertFailure
+                  "sopsOpenStack must not be called after sopsCloseStack throws"
+                  >> pure (Right ())
+            }
+      result <- try (reloadSupervisedWithEvents onEv opsCloseThrows planA planB)
+      events <- readIORef evRef
+      case result :: Either ErrorCall (SupervisedReloadOutcome FakeFailure) of
+        Left (ErrorCall msg) ->
+          msg @?= "synthetic close-throws"
+        Right outcome ->
+          assertFailure $
+            "expected the close-throws exception to propagate, got: "
+            <> show outcome
+      events @?=
+        [ SreInWindowStarted
+        , SreInWindowTerminal FakeOwnerSetupFailed
+        , SreClosePreviousStarted
+        ]
+
+  , testCase "withEvents: reloadSupervised (silent default) returns the same outcomes as reloadSupervisedWithEvents noSupervisedReloadEvents" $ do
+      -- Regression for the delegation refactor: the legacy
+      -- 'reloadSupervised' entrypoint must remain
+      -- behavior-equivalent to invoking 'reloadSupervisedWithEvents'
+      -- with 'noSupervisedReloadEvents'. Drives both entrypoints
+      -- against the recovery path and asserts identical outcomes.
+      (opsLegacy, _)        <-
+        mkRecordingOps
+          (inWindowTerminalWith FakeAudioRestartFailed)
+          openStackOk
+      (opsWithEvents, _)    <-
+        mkRecordingOps
+          (inWindowTerminalWith FakeAudioRestartFailed)
+          openStackOk
+      legacyOutcome    <- reloadSupervised opsLegacy planA planB
+      withEventsOutcome <-
+        reloadSupervisedWithEvents
+          noSupervisedReloadEvents
+          opsWithEvents
+          planA
+          planB
+      legacyOutcome @?= withEventsOutcome
+      legacyOutcome @?= SupervisedReloadRejectedRecovered FakeAudioRestartFailed
   ]
+
+
+-- | Build an event-log 'IORef' and an append-only callback the
+-- supervisor calls per emitted event. Returns the ref so tests can
+-- read back the sequence after the supervised call returns (or
+-- throws). Append order matches emit order — the supervisor calls
+-- the callback synchronously, in event order.
+mkEventLog
+  :: IO ( IORef [SupervisedReloadEvent FakeFailure]
+        , SupervisedReloadEvent FakeFailure -> IO ()
+        )
+mkEventLog = do
+  ref <- newIORef []
+  pure (ref, \e -> modifyIORef' ref (++ [e]))
 
 
 -- | Helper: distinguish the open-stack call without case-matching by hand.

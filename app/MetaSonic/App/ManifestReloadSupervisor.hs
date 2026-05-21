@@ -26,6 +26,17 @@ module MetaSonic.App.ManifestReloadSupervisor
   , InWindowReloadOutcome (..)
   , inWindowOutcomeFromEither
   , reloadSupervised
+
+    -- * Operator-visible supervisor lifecycle events
+    --
+    -- A small stream of events the supervisor emits as it crosses
+    -- the in-window / close-previous / fallback-open boundaries.
+    -- Mirrors the 'ManifestReloadEvent' pattern at the orchestration
+    -- layer: 'reloadSupervised' delegates to 'reloadSupervisedWithEvents'
+    -- with 'noSupervisedReloadEvents' so silent callers stay quiet.
+  , SupervisedReloadEvent (..)
+  , noSupervisedReloadEvents
+  , reloadSupervisedWithEvents
   ) where
 
 import           Control.Exception (onException)
@@ -116,6 +127,87 @@ data SupervisedReloadOutcome e
     -- is (in-window failure, rebuild failure) in that order.
   deriving stock (Eq, Show)
 
+-- | One operator-visible transition in a supervised reload run.
+--
+-- The events bracket each stage the supervisor actually enters; the
+-- existing 'SupervisedReloadOutcome' summarizes the final state,
+-- but consumers that want a live timeline of /what the supervisor
+-- did to the host stack/ — close-then-open vs. stack-stayed-live —
+-- read the event stream instead of inferring from the outcome.
+--
+-- Each constructor names a specific boundary:
+--
+--   * Lifecycle (4 constructors): the in-window attempt entry plus
+--     each of the three classified return shapes. Exactly one of
+--     'SreInWindowCommitted' / 'SreInWindowRejectedLiveFallback' /
+--     'SreInWindowTerminal' fires per call, immediately after
+--     'SreInWindowStarted'.
+--
+--   * Recovery (5 constructors): the close-previous + fallback-open
+--     pair the supervisor runs after 'SreInWindowTerminal'. Each
+--     started/succeeded pair is interleaved so a consumer can tell
+--     /which/ stage of the recovery failed if an exception
+--     propagates mid-recovery (see the close-throws and open-throws
+--     contract documented on the constructors below).
+--
+-- The 'onException' close that fires when 'sopsInWindowReload'
+-- itself throws (the §238 leak-prevention path) is intentionally
+-- silent: that close runs from inside an exception handler, the
+-- supervised call never returns a classified outcome, and emitting
+-- events from the handler risks masking the original exception.
+data SupervisedReloadEvent e
+  = SreInWindowStarted
+    -- ^ About to call 'sopsInWindowReload'. Fires exactly once per
+    -- supervised reload, before any classified outcome is known.
+  | SreInWindowCommitted
+    -- ^ 'sopsInWindowReload' returned 'InWindowReloadCommitted'.
+    -- The supervised call returns 'SupervisedReloadCommitted'
+    -- next; no close-previous / fallback-open events will fire.
+  | SreInWindowRejectedLiveFallback !e
+    -- ^ 'sopsInWindowReload' returned
+    -- 'InWindowReloadRejectedLiveFallback'. The supervised call
+    -- returns 'SupervisedReloadRequestRejected' next; no
+    -- close-previous / fallback-open events will fire (the stack
+    -- is still live and serving the fallback plan).
+  | SreInWindowTerminal !e
+    -- ^ 'sopsInWindowReload' returned 'InWindowReloadTerminal'.
+    -- The recovery path runs next: 'SreClosePreviousStarted' will
+    -- fire, then either 'SreClosePreviousSucceeded' followed by the
+    -- fallback-open pair, or the close exception propagates.
+  | SreClosePreviousStarted
+    -- ^ About to call 'sopsCloseStack' on the recovery path. If
+    -- the close throws, this is the LAST event emitted by this
+    -- call and the exception propagates without
+    -- 'SreClosePreviousSucceeded' / fallback-open events. Consumers
+    -- can rely on the structural rule: 'SreClosePreviousStarted'
+    -- without a matching 'SreClosePreviousSucceeded' means
+    -- "close threw; supervisor bailed without attempting rebuild".
+  | SreClosePreviousSucceeded
+    -- ^ 'sopsCloseStack' returned cleanly. The supervisor proceeds
+    -- to the fallback open.
+  | SreFallbackOpenStarted
+    -- ^ About to call 'sopsOpenStack' against the captured fallback
+    -- plan. If the open throws, this is the LAST event emitted by
+    -- this call (no 'SreFallbackOpenSucceeded' /
+    -- 'SreFallbackOpenFailed'). 'sopsOpenStack' is required by
+    -- contract to clean up any partial state internally before
+    -- propagating.
+  | SreFallbackOpenSucceeded
+    -- ^ 'sopsOpenStack' returned 'Right ()'. The supervised call
+    -- returns 'SupervisedReloadRejectedRecovered' next.
+  | SreFallbackOpenFailed !e
+    -- ^ 'sopsOpenStack' returned 'Left _'. The supervised call
+    -- returns 'SupervisedReloadEscalated' next; the host has no
+    -- live stack.
+  deriving stock (Eq, Show)
+
+-- | A 'SupervisedReloadEvent' callback that discards every event.
+-- The default for 'reloadSupervised', kept so callers that have not
+-- opted in to the event stream stay silent. Polymorphic in @e@ so
+-- the same constant works at every instantiation.
+noSupervisedReloadEvents :: SupervisedReloadEvent e -> IO ()
+noSupervisedReloadEvents _ = pure ()
+
 -- | Drive a single supervised reload attempt.
 --
 -- The @fallback@ argument is the plan running at reload entry — by
@@ -128,38 +220,73 @@ data SupervisedReloadOutcome e
 -- The supervisor performs at most one rebuild attempt. If both the
 -- requested reload and the rebuild fail, the call returns
 -- 'SupervisedReloadEscalated' without further retries.
+--
+-- Equivalent to @'reloadSupervisedWithEvents' 'noSupervisedReloadEvents'@.
+-- New callers that want operator-visible lifecycle events should
+-- call 'reloadSupervisedWithEvents' directly.
 reloadSupervised
   :: SupervisorOps plan e
   -> plan
   -> plan
   -> IO (SupervisedReloadOutcome e)
-reloadSupervised ops fallback requested = do
+reloadSupervised = reloadSupervisedWithEvents noSupervisedReloadEvents
+
+-- | 'reloadSupervised' with a typed event callback. The callback
+-- receives one 'SupervisedReloadEvent' per boundary the supervisor
+-- crosses (see the constructor Haddock on 'SupervisedReloadEvent'
+-- for the per-outcome shape).
+--
+-- The callback is invoked synchronously on the supervisor's IO
+-- thread; long-running work in the callback delays the supervisor.
+-- The expected use is to write the event into an 'IORef' / channel
+-- for downstream rendering.
+reloadSupervisedWithEvents
+  :: (SupervisedReloadEvent e -> IO ())
+  -> SupervisorOps plan e
+  -> plan
+  -> plan
+  -> IO (SupervisedReloadOutcome e)
+reloadSupervisedWithEvents onEvent ops fallback requested = do
   -- §238 test-checklist invariant: an exception during the in-window
   -- reload must not leak the still-live previous stack. 'onException'
   -- runs 'sopsCloseStack' when 'sopsInWindowReload' throws (sync or
   -- async) and then rethrows; on a normal classified return it does
   -- not fire, so the explicit close on the recovery path below is
-  -- not double-called.
+  -- not double-called. The onException close is intentionally
+  -- /silent/ on the event stream: it runs from inside an exception
+  -- handler, the call never returns a classified outcome, and
+  -- emitting events from the handler risks masking the original
+  -- exception.
+  onEvent SreInWindowStarted
   attempt <- sopsInWindowReload ops fallback requested
                 `onException` sopsCloseStack ops
   case attempt of
-    InWindowReloadCommitted ->
+    InWindowReloadCommitted -> do
+      onEvent SreInWindowCommitted
       pure SupervisedReloadCommitted
-    InWindowReloadRejectedLiveFallback rejectErr ->
+    InWindowReloadRejectedLiveFallback rejectErr -> do
       -- The producer guarantees the stack is still serving the
       -- fallback plan; no close/open runs. The CLI surfaces this
       -- without claiming a rebuild happened.
+      onEvent (SreInWindowRejectedLiveFallback rejectErr)
       pure (SupervisedReloadRequestRejected rejectErr)
     InWindowReloadTerminal originalErr -> do
+      onEvent (SreInWindowTerminal originalErr)
       -- Recovery path. 'sopsCloseStack' is best-effort: if it throws,
-      -- the in-window failure escapes without a rebuild attempt — the
+      -- 'SreClosePreviousStarted' is emitted but 'SreClosePreviousSucceeded'
+      -- is not; the exception escapes without a rebuild attempt and the
       -- caller is responsible for process-level escalation. The new
       -- stack constructed by 'sopsOpenStack' is required by contract
       -- to clean up any partial state internally before propagating.
+      onEvent SreClosePreviousStarted
       sopsCloseStack ops
+      onEvent SreClosePreviousSucceeded
+      onEvent SreFallbackOpenStarted
       rebuild <- sopsOpenStack ops fallback
-      pure $ case rebuild of
-        Right () ->
-          SupervisedReloadRejectedRecovered originalErr
-        Left rebuildErr ->
-          SupervisedReloadEscalated originalErr rebuildErr
+      case rebuild of
+        Right () -> do
+          onEvent SreFallbackOpenSucceeded
+          pure (SupervisedReloadRejectedRecovered originalErr)
+        Left rebuildErr -> do
+          onEvent (SreFallbackOpenFailed rebuildErr)
+          pure (SupervisedReloadEscalated originalErr rebuildErr)
