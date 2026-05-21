@@ -1,23 +1,33 @@
--- | Drift guard for the committed @preserve-cutoff@ manifest
--- fixture.
+-- | Drift guard for the committed preserving manifest fixtures.
 --
--- The fixture at @examples/manifests/preserve-cutoff.json@ is the
--- blessed operator input for the preserving manifest live-reload
--- path (see [smoke runbook](../notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)).
--- It must stay byte-identical to what
--- @stack exec -- metasonic-bridge --authoring-manifest
--- preserve-cutoff-dark preserve-cutoff-bright@ produces; otherwise
--- the runbook's command sequence silently desyncs from the
--- committed input and operators end up debugging a stale fixture.
+-- Two on-disk fixtures live under @examples/manifests/@ and are
+-- referenced from runbooks and operator smokes:
 --
--- The test reconstructs the same 'AuthoringManifestDoc' the CLI
--- builds from 'preserveCutoffDarkAuthoring' /
--- 'preserveCutoffBrightAuthoring' in 'MetaSonic.App.Demos', runs it
--- through the canonical 'encodeManifestDoc' encoder, and asserts
--- byte-equality against the on-disk file. Any drift (control
--- default change, smoothing change, migration key rename, schema
--- bump, formatter swap) fails this test before it can mislead an
--- operator.
+--   * @preserve-cutoff.json@ — the blessed happy-path input for
+--     the preserving manifest live-reload path
+--     (see [smoke runbook](../notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)).
+--   * @reject-preserving-smooth.json@ — a reject-eligible sibling
+--     used by the operator-pressure pass to exercise the
+--     'SupervisedReloadRequestRejected' branch deterministically
+--     (KSmooth on the gain path makes the active voice
+--     preserve-unsupported).
+--
+-- Each must stay byte-identical to what
+-- @stack exec -- metasonic-bridge --authoring-manifest DARK BRIGHT@
+-- produces for the corresponding demo pair; otherwise the runbook /
+-- smoke command sequence silently desyncs from the committed input
+-- and operators end up debugging a stale fixture.
+--
+-- For each fixture the test reconstructs the same
+-- 'AuthoringManifestDoc' the CLI builds from the in-Haskell
+-- authoring reports, runs it through the canonical
+-- 'encodeManifestDoc' encoder, and asserts byte-equality against
+-- the on-disk file. Any drift (control default change, smoothing
+-- change, migration key rename, schema bump, formatter swap) fails
+-- this test before it can mislead an operator. The MIDI CC / key /
+-- slot decode assertion sits alongside each byte-eq test so the
+-- two together pin: the source-of-truth has the binding, the file
+-- on disk encodes it, and the decoder round-trips it.
 module MetaSonic.Spec.AppManifestPreservingFixture
   ( appManifestPreservingFixtureTests
   ) where
@@ -45,6 +55,9 @@ import           MetaSonic.Pattern              (VoiceKey (..))
 
 fixturePath :: FilePath
 fixturePath = "examples/manifests/preserve-cutoff.json"
+
+rejectFixturePath :: FilePath
+rejectFixturePath = "examples/manifests/reject-preserving-smooth.json"
 
 appManifestPreservingFixtureTests :: TestTree
 appManifestPreservingFixtureTests =
@@ -120,6 +133,81 @@ appManifestPreservingFixtureTests =
       demoCC "preserve-cutoff-dark"
         @?= Just (Just 74, "lpf", 0)
       demoCC "preserve-cutoff-bright"
+        @?= Just (Just 74, "lpf", 0)
+
+  , testCase
+      "examples/manifests/reject-preserving-smooth.json matches --authoring-manifest output"
+      $ do
+      -- Parallel byte-equality drift guard for the
+      -- reject-eligible fixture. Same reasoning as the
+      -- preserve-cutoff test above: KSmooth makes the active
+      -- voice preserve-unsupported, but the on-disk JSON has no
+      -- way to express that — it just declares the control
+      -- contract. If 'rejectPreservingSmooth*Authoring' changes
+      -- (control rename, default shift, schema bump, formatter
+      -- swap) but the JSON does not, the operator-pressure
+      -- runbook silently desyncs from the committed input.
+      darkDemo <- case lookupDemo "reject-preserving-smooth-dark" of
+        Just d  -> pure d
+        Nothing -> assertFailure "reject-preserving-smooth-dark demo missing from demoTable"
+                   >> error "unreachable"
+      brightDemo <- case lookupDemo "reject-preserving-smooth-bright" of
+        Just d  -> pure d
+        Nothing -> assertFailure "reject-preserving-smooth-bright demo missing from demoTable"
+                   >> error "unreachable"
+      darkReport <- case demoAuthoring darkDemo of
+        Just r  -> pure r
+        Nothing -> assertFailure "reject-preserving-smooth-dark has no authoring metadata"
+                   >> error "unreachable"
+      brightReport <- case demoAuthoring brightDemo of
+        Just r  -> pure r
+        Nothing -> assertFailure "reject-preserving-smooth-bright has no authoring metadata"
+                   >> error "unreachable"
+
+      let doc = AuthoringManifestDoc
+            { docSchemaVersion = manifestSchemaVersion
+            , docDemos =
+                [ manifestFromReport "reject-preserving-smooth-dark"
+                    darkReport
+                , manifestFromReport "reject-preserving-smooth-bright"
+                    brightReport
+                ]
+            }
+          generated = encodeManifestDoc doc
+
+      onDisk <- BL.readFile rejectFixturePath
+      assertEqual
+        ("Fixture " <> rejectFixturePath <> " is out of date. Regenerate with:\n"
+         <> "  stack exec -- metasonic-bridge --authoring-manifest "
+         <> "reject-preserving-smooth-dark reject-preserving-smooth-bright "
+         <> "> " <> rejectFixturePath)
+        generated
+        onDisk
+
+  , testCase
+      "reject-preserving-smooth manifest projects MIDI CC 74 on both demos"
+      $ do
+      -- Same control contract as preserve-cutoff: one 'cutoff'
+      -- control per demo, CC 74, migration key "lpf"/slot 0. The
+      -- reject fixture exists to exercise the supervisor-rejection
+      -- path, NOT to alter the ingress contract — pinning the
+      -- decoded CC/key/slot guards against an accidental
+      -- "let's bind a different control while we're here" drift.
+      raw <- BL.readFile rejectFixturePath
+      doc <- case decodeManifestDoc raw of
+        Right d  -> pure d
+        Left err -> assertFailure
+                      ("failed to decode " <> rejectFixturePath <> ": " <> err)
+                    >> error "unreachable"
+      let demoCC name =
+            case [ mfControls m
+                 | m <- docDemos doc, mfDemoKey m == name
+                 ] of
+              [[c]] -> Just (mcCC c, mcKey c, mcSlot c)
+              _     -> Nothing
+      demoCC "reject-preserving-smooth-dark"
+        @?= Just (Just 74, "lpf", 0)
+      demoCC "reject-preserving-smooth-bright"
         @?= Just (Just 74, "lpf", 0)
 
   , testCase
