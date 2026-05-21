@@ -254,27 +254,91 @@ insufficient.
   the same kind of marker-clean evidence the happy-path wrapper
   has carried since 2026-05-20.
 
-### Lanes still open
+### Lane status after spike
 
-- **`RejectedRecovered` / `Escalated` real-session pressure.**
-  The supervisor lifecycle event stream itself landed in
-  `d86a2df` + `ffaca33` + `6b8c08c`: `SupervisedReloadEvent`
-  observed end-to-end through the live session's new
-  `supervisor events:` block (see
+- **`RejectedRecovered` / `Escalated` real-session pressure —
+  closed by 2026-05-21 spike; re-open conditions below.** The
+  supervisor lifecycle event stream itself landed in `d86a2df` +
+  `ffaca33` + `6b8c08c`: `SupervisedReloadEvent` is observed
+  end-to-end through the live session's new `supervisor events:`
+  block (see
   [2026-05-20-b-manifest-live-session-v0.md](2026-05-20-b-manifest-live-session-v0.md)'s
-  "Follow-ups landed" section). What's still open is forcing
-  those two branches to actually fire under real PortAudio +
-  OSC; this reject pass only exercised the
-  `RequestRejected` shape because the
-  `reject-preserving-smooth` fixture deliberately leaves the
-  old stack live. A second fixture that produces an
-  `InWindowReloadTerminal` (e.g. by failing a post-classification
-  stage so the supervisor closes-then-rebuilds) would unlock
-  the `RejectedRecovered` transcript; a third where
-  `sopsOpenStack` also fails would unlock `Escalated`. Both
-  belong in the same fixture family as
-  `reject-preserving-smooth`, not in pressure passes against
-  the happy-path fixtures.
+  "Follow-ups landed" section). This pass only exercised the
+  `RequestRejected` shape because the `reject-preserving-smooth`
+  fixture deliberately leaves the old stack live.
+
+  A short investigation spike walked
+  [classifyPreservingOutcome](../app/MetaSonic/App/ManifestReloadPreservingHostStack.hs)
+  (its 10-row policy table) and the upstream
+  [classifySessionStep](../app/MetaSonic/App/ManifestReloadHost.hs)
+  / `mapPreservingReloadReport` chain to find the least-artificial
+  real-session trigger for `InWindowReloadTerminal`. The six
+  terminal constructors are:
+
+  | Constructor | Real-session trigger | Clean fixture? |
+  |---|---|---|
+  | `HpariQuiesceRejectedResumeFailed` | quiesce rejects AND `resumeAfterFailure` independently fails | No — compound |
+  | `HpariDrainRejectedResumeFailed` | drain rejects AND resume independently fails | No — compound |
+  | `HpariReloadRejectedResumeFailed` | reload rejects AND resume independently fails | No — compound |
+  | `HpariDrainFailedTerminal` | pre-reload `drainPreservingLive` sees a stopped / diverged session-fan-in owner (`sdrStopped (Just _)` on the preflight drain); the reload command is never submitted | No — backend death or owner divergence during the preflight drain |
+  | `HpariReloadFailedTerminal` | preserving reload command was submitted; `mapPreservingReloadReport` maps the post-reload drain to terminal — either `stoppedDrain` (owner stopped / diverged after submit: `sdrStopped (Just _)`, `SessionOwnerDivergedNow`, `SessionOwnerBlocked`, where `SodBackendStopped` / `SodHotSwapInstallFailed` land) or `unexpectedDrain` (queue-depth mismatch, multi-item drain, or `classifySessionStep` arms `StepCommitted _ Nothing` / `StepCommitMismatch` / `StepAdapterProtocolBug` / `StepControlAccepted`) | No — backend death, owner divergence, or protocol-shape pathology during reload |
+  | `HpariIngressRestartFailed` | ingress port unavailable at restart | Only via a competing UDP listener racing the close-reopen window (millisecond timing, inherently flaky) |
+
+  The musical mechanism that `reject-preserving-smooth` already
+  uses (`KSmooth` on the gain path → `SriHotSwapWouldPreserveVoices`
+  → `StepRuntimeFailed` → `oldOwnerStillInstalled` →
+  `HpariReloadRejected`) routes to `RejectedLiveFallback` *by
+  design*: the old voice and ingress are still installed, so the
+  supervisor is correct to leave the stack live and surface
+  `RequestRejected` rather than close-and-rebuild. Every other
+  classifier path that could pivot the same fixture to Terminal
+  requires injecting one of the pathologies above, not changing
+  the graph.
+
+  The recovered / escalated shapes are pinned at unit level by:
+
+  - Supervisor lifecycle event order (6 cases including
+    `RejectedRecovered`, `Escalated`, close-throws) in
+    `AppManifestReloadSupervisor`'s `withEvents` tests (`d86a2df`).
+  - Classifier policy (10 constructors → 2 outcomes) in
+    `classifyPreservingOutcomePolicyTests`.
+  - Adapter close-then-open lifecycle in
+    `AppManifestReloadSupervisorAdapter`.
+  - Live-session renderer for all six supervisor events in
+    `renderLiveSessionSupervisorEventsTests` (`6b8c08c`).
+  - F-1 leak guard for the supervised-cause path in
+    `AppManifestLiveReloadDemoRender`.
+
+  Rejected alternatives, with reasons:
+
+  - **Port-collision tier-2 wrapper.** A background process
+    binding the OSC port during the supervisor's close-reopen
+    window would force `HpariIngressRestartFailed`. This tests
+    millisecond timing more than supervisor semantics and would
+    land as a flaky tier-2 lane; the close-reopen window is short
+    enough on the current host that the race is mostly invisible.
+  - **Test-only `--force-terminal-on-next-reload` CLI flag.**
+    A production-facing flag whose only purpose is fixture
+    injection scaffolds the transcript at the cost of permanent
+    surface area. Deterministic failure injection belongs in
+    in-language tests, not hidden live-session flags. The
+    existing unit coverage already discharges the deterministic
+    side of this.
+
+  Re-open conditions:
+
+  - (a) A real operator session produces a terminal recovery
+    transcript organically — e.g. a backend death during a real
+    rehearsal / studio run that triggers
+    `SodHotSwapInstallFailed` for non-fixture reasons.
+  - (b) A deterministic, non-racy resource trigger appears that
+    doesn't require a test-only hook in production code paths —
+    e.g. a refactor that exposes a previously-internal failure
+    mode through a normal user-driven action.
+
+  Until then this lane is closed. The unit suite carries the
+  semantic load; tier-2 carries the request-rejected operator
+  narrative.
 - **Finer in-window allocation/resource detail.** Speculative
   until a real transcript shows the current `supervisor events:`
   block is too coarse. The existing block names the

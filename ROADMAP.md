@@ -3941,8 +3941,24 @@ Still gated:
   framing) and hardware confirmation / hardware-gated CI for
   the device-backed paths; the `RejectedRecovered` /
   `Escalated` shapes of the new event stream are deterministic
-  unit-tested but still lack a real-session pressure
-  transcript. Host strategy smoke and live reload demo
+  unit-tested, and a 2026-05-21 investigation spike (recorded
+  in
+  [notes/2026-05-21-a-reject-path-operator-pressure-pass.md](notes/2026-05-21-a-reject-path-operator-pressure-pass.md)'s
+  "Lane status after spike" section) walked
+  `classifyPreservingOutcome`'s six terminal constructors and
+  found no clean fixture-shaped trigger — each requires one of
+  compound resume-failure, an unexpected drain/protocol shape
+  from the session owner, owner divergence
+  (`SessionOwnerDivergedNow` / `SessionOwnerBlocked`, where
+  `SodBackendStopped` / `SodHotSwapInstallFailed` land), or a
+  millisecond port-collision race against the close-reopen
+  window — so the real-session pressure lane is closed
+  pending either an organic terminal-recovery transcript from
+  a real operator session or a deterministic non-racy resource
+  trigger; in particular, both a port-collision tier-2 wrapper
+  and a test-only `--force-terminal-on-next-reload` CLI flag
+  were rejected (timing-flaky and production-flag-as-test-hook,
+  respectively). Host strategy smoke and live reload demo
   share a typed prose reload-event vocabulary
   (`f595542` / `aca37ed`). The preserving live-reload path has a
   blessed committed fixture at

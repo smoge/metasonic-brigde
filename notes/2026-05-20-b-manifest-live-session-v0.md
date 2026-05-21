@@ -229,17 +229,34 @@ that informs each:
   routes (try-preserving session, stopped-audio session) still
   do not have wrappers.
 
-## What comes next
+## Lane status after closeouts
 
-The current open lanes after the closeouts above:
+Lane state after the closeouts above:
 
-* **`RejectedRecovered` / `Escalated` real-session pressure.**
-  The supervisor's terminal close + fallback-open path is
-  deterministic-unit-tested but has not been exercised under
-  real PortAudio + OSC. A fixture that forces a terminal
-  in-window failure (vs. the current request-rejected fixture
-  which leaves the stack live) would unlock that pressure
-  pass.
+* **`RejectedRecovered` / `Escalated` real-session pressure —
+  closed by 2026-05-21 spike.** The supervisor's terminal
+  close + fallback-open path remains deterministic-unit-tested
+  only. A short investigation spike walked
+  `classifyPreservingOutcome`'s six terminal constructors and
+  found that each one requires one of: compound resume-failure
+  (primary AND resume both fail independently); an unexpected
+  drain / protocol shape from the session owner (`StepCommitted
+  _ Nothing`, `StepCommitMismatch`, `StepAdapterProtocolBug`,
+  `StepControlAccepted`); an owner-divergence shape
+  (`SessionOwnerDivergedNow` / `SessionOwnerBlocked`, which is
+  where `SodBackendStopped` / `SodHotSwapInstallFailed` land);
+  or a millisecond port-collision race against the close-reopen
+  window. No clean musical fixture in the same family as
+  `reject-preserving-smooth` puts the runtime in any of these
+  Terminal-routed states. Both a port-collision tier-2 wrapper
+  and a test-only `--force-terminal-on-next-reload` CLI flag
+  were rejected (timing-flaky and production-flag-as-test-hook,
+  respectively). Re-open only if a real operator session
+  produces a terminal recovery transcript organically or if a
+  deterministic non-racy resource trigger appears. Full
+  analysis at
+  [2026-05-21-a-reject-path-operator-pressure-pass.md](2026-05-21-a-reject-path-operator-pressure-pass.md)'s
+  "Lane status after spike" section.
 * **Finer in-window allocation/resource detail.** Pure
   conjectural until a transcript shows the current
   `supervisor events:` block is too coarse; document the gap
