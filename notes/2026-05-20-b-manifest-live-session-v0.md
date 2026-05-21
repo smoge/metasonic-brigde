@@ -179,7 +179,10 @@ that informs each:
 * **Stale-command semantics.** No producer-aware enqueue rejection;
   no `MrePreservingReloadEnqueueRejected` consumer surface beyond
   the `renderLiveReloadEvents` timeline that the live-reload-demo
-  already prints.
+  already prints. The first follow-up slice, limited to
+  reload-window OSC rejection rendering and listener double-print
+  cleanup, is scoped in
+  [2026-05-20-d-stale-command-rejection-rendering.md](2026-05-20-d-stale-command-rejection-rendering.md).
 * **GUI bindings.** Pure stdin; no MIDI control surface beyond
   what the manifest catalog already projects.
 * **Hardware-CI promotion.** Tier-2 wrapper + the existing
@@ -202,7 +205,9 @@ most likely candidates, in rough priority order:
   current direct-OSC-accept print does not distinguish "accepted
   pre-reload" from "accepted but rejected at enqueue time during
   the swap window." Designing a small operator-facing line for
-  that case is the cleanest consumer-driven next slice.
+  that case is the cleanest consumer-driven next slice; the
+  concrete design note is
+  [2026-05-20-d-stale-command-rejection-rendering.md](2026-05-20-d-stale-command-rejection-rendering.md).
 * **Resource/allocation event consumer.** With a real
   `SupervisedReloadEscalated` path the operator can hit, having a
   per-attempt allocation summary becomes useful.

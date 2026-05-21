@@ -235,6 +235,7 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestReloadSupervisor
       MetaSonic.App.ManifestReloadSupervisorAdapter
       MetaSonic.App.ManifestReloadUIIngress
+      MetaSonic.Spec.AppManifestLiveCommonOSCRender
       MetaSonic.Spec.AppManifestLiveReloadDemoRender
       MetaSonic.Spec.AppManifestLiveSession
       MetaSonic.Spec.AppManifestMIDIIngressOps

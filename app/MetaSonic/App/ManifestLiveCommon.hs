@@ -66,6 +66,24 @@ module MetaSonic.App.ManifestLiveCommon
 
     -- * OSC control-surface rendering
   , renderOSCControls
+
+    -- * OSC listener-event line renderers (pure, testable)
+    --
+    -- These two helpers are the operator-string contract the
+    -- live entrypoints will eventually drive their OSC listener
+    -- hooks against. They are exported so the test suite can
+    -- pin the rendered strings — including the dedup policy
+    -- encoded by 'renderOSCAcceptLine's 'Maybe' result — without
+    -- staging real listener IO or capturing stdout.
+    --
+    -- The current 'liveOSCListenerHooks' still drives the legacy
+    -- 'renderOSCAccept' \/ 'renderOSCIssue' pair (which double-
+    -- prints rejected packets — see
+    -- @notes/2026-05-20-d-stale-command-rejection-rendering.md@).
+    -- A follow-up commit rewires the hooks to these helpers and
+    -- removes the legacy pair.
+  , renderOSCAcceptLine
+  , renderOSCIssueLine
   ) where
 
 import           Control.Concurrent             (threadDelay)
@@ -136,6 +154,7 @@ import           MetaSonic.Session.OSCProducer  (OSCProducerEnqueueResult (..),
 import           MetaSonic.Session.Queue        (ProducerId (..),
                                                  ProducerKind (..),
                                                  QueuedSessionCommand (..),
+                                                 SessionEnqueueIssue (..),
                                                  SessionEnqueueResult (..))
 import           MetaSonic.Session.State        (SessionState (..))
 
@@ -470,6 +489,66 @@ renderOSCIssue issue = case issue of
     "osc reject (parse): " <> msg
   MoliManifestIssue manifestIssue ->
     "osc reject (manifest): " <> show manifestIssue
+  MoliEnqueueRejected cmd queueIssue ->
+    "osc enqueue-reject: " <> renderCommand cmd
+    <> " issue=" <> show queueIssue
+
+
+-- | Render the accepted-side of one OSC listener event into an
+-- operator-facing line, or 'Nothing' when the event has no line of
+-- its own at this layer.
+--
+-- The 'Maybe' encodes the dedup policy that the legacy
+-- 'renderOSCAccept' / 'renderOSCIssue' pair gets wrong: an enqueue
+-- rejection observed through 'molhOnAccepted' returns 'Nothing'
+-- here so that 'molhOnIssue' (which fires for the same packet,
+-- carrying 'MoliEnqueueRejected') is the single source of the
+-- operator-facing line.
+--
+-- A defensive 'Just' rendering is kept for 'OSCProducerDecodeRejected'
+-- because the manifest listener's normal path pre-decodes before the
+-- producer call (so the arm should be unreachable today), but a future
+-- reorganization of the call chain could expose it. Keeping the
+-- defensive line means the operator still sees something instead of
+-- silently dropping a packet.
+--
+-- See @notes/2026-05-20-d-stale-command-rejection-rendering.md@ for
+-- the contract this helper anchors.
+renderOSCAcceptLine :: OSCProducerEnqueueResult -> Maybe String
+renderOSCAcceptLine result = case result of
+  OSCProducerDecodeRejected issue ->
+    Just ("osc reject (decode): " <> show issue)
+  OSCProducerEnqueueAttempted cmd enqueue ->
+    case sfierResult enqueue of
+      SessionEnqueued _ ->
+        Just ("osc accept: " <> renderCommand cmd)
+      SessionEnqueueRejected{} ->
+        Nothing
+
+
+-- | Render one 'ManifestOSCListenerIssue' as an operator-facing
+-- rejection line, distinguishing the expected-transient reload-
+-- window case from generic enqueue failures.
+--
+-- The taxonomy:
+--
+-- * 'MoliParseFailure'  → @\"osc reject (parse): ...\"@
+-- * 'MoliManifestIssue' → @\"osc reject (manifest): ...\"@
+-- * 'MoliEnqueueRejected _ 'SeiReloadInProgress'@ →
+--   @\"osc reject (reload-window): <cmd>\"@. No @issue=@ suffix;
+--   the @(reload-window)@ label already names the cause.
+-- * 'MoliEnqueueRejected _ <other>'@ →
+--   @\"osc enqueue-reject: <cmd> issue=<...>\"@. The catch-all,
+--   covering 'SeiQueueFull', 'SeiSessionUnavailable', and any
+--   future variants.
+renderOSCIssueLine :: ManifestOSCListenerIssue -> String
+renderOSCIssueLine issue = case issue of
+  MoliParseFailure msg ->
+    "osc reject (parse): " <> msg
+  MoliManifestIssue manifestIssue ->
+    "osc reject (manifest): " <> show manifestIssue
+  MoliEnqueueRejected cmd SeiReloadInProgress ->
+    "osc reject (reload-window): " <> renderCommand cmd
   MoliEnqueueRejected cmd queueIssue ->
     "osc enqueue-reject: " <> renderCommand cmd
     <> " issue=" <> show queueIssue

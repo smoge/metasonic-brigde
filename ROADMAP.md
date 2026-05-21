@@ -3899,7 +3899,9 @@ Still gated:
   recovery event stream (gated on a concrete consumer; the
   session shell is now that consumer's first candidate),
   stale-command rejection rendering surfaced through the
-  session shell's OSC accept timeline, and hardware
+  session shell's OSC accept timeline (design note:
+  [notes/2026-05-20-d-stale-command-rejection-rendering.md](notes/2026-05-20-d-stale-command-rejection-rendering.md)),
+  and hardware
   confirmation / hardware-gated CI for the device-backed
   paths. Host strategy smoke and live reload demo
   share a typed prose reload-event vocabulary
