@@ -1,10 +1,41 @@
 # Stale-Command Rejection Rendering: Reload-Window OSC Visibility
 
-Date: 2026-05-20
+Date: 2026-05-20 (design); 2026-05-21 (landed)
 
-Status: design + planned. Slice not yet started. Next action after this
-note lands: write the focused renderer test module, then the one-commit
-production edit.
+Status: **landed at the deterministic level**. Implementation split into
+two commits per the design plan:
+
+* `144901f` adds the pure renderer helpers
+  (`renderOSCAcceptLine :: OSCProducerEnqueueResult -> Maybe String`,
+  `renderOSCIssueLine :: ManifestOSCListenerIssue -> String`) plus
+  the focused test module
+  `MetaSonic.Spec.AppManifestLiveCommonOSCRender` (13 cases: 6 issue-
+  line rows, 4 accept-line rows, 3 synthetic listener fan-out
+  composition tests). At this point the helpers exist as a parallel
+  testable surface; the legacy `renderOSCAccept` /
+  `renderOSCIssue` pair is still wired into `liveOSCListenerHooks`
+  and still double-prints rejected packets.
+* `737b124` wires `liveOSCListenerHooks` to the new helpers
+  (`molhOnAccepted` becomes
+  `mapM_ (putStrLn . ("  " <>)) . renderOSCAcceptLine` so a
+  `Nothing` return on a `SessionEnqueueRejected` inner result is a
+  natural no-op; `molhOnIssue` routes through `renderOSCIssueLine`)
+  and deletes the legacy private pair. Net diff: -37 / +22.
+
+The 13 deterministic cases now exercise the actually-wired hooks
+rather than a parallel surface. Full suite 1306/1306;
+`git diff --check` clean. The reload-window rejection line is
+`osc reject (reload-window): <cmd>`; the previous double-print is
+structurally impossible because the `Maybe` return on
+`renderOSCAcceptLine` encodes the dedup at the type level.
+
+What this slice still does **not** address: the
+`MrePreservingReloadEnqueueRejected` consumer surface (the second
+half of the v0 note's "Stale-command semantics" bullet), tier-2
+runbook capture (deferred until an operator actually catches the
+line during a real session — the wrapper grep contract for the four
+existing wrappers is unchanged), and the verbose `renderCommand`
+payload follow-up. See the Out-of-scope section below.
 
 This note scopes the first Phase 8 / live-session productization slice
 flagged by the recent narrative checkpoint at

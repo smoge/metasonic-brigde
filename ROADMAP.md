@@ -3895,15 +3895,24 @@ Still gated:
   2026-05-20 on host RME ADI-2 Pro / PipeWire; design
   rationale + acceptance criteria + non-goals at
   [notes/2026-05-20-b-manifest-live-session-v0.md](notes/2026-05-20-b-manifest-live-session-v0.md).
-  Remaining work in this arc is a resource/allocation
-  recovery event stream (gated on a concrete consumer; the
-  session shell is now that consumer's first candidate),
-  stale-command rejection rendering surfaced through the
-  session shell's OSC accept timeline (design note:
-  [notes/2026-05-20-d-stale-command-rejection-rendering.md](notes/2026-05-20-d-stale-command-rejection-rendering.md)),
-  and hardware
-  confirmation / hardware-gated CI for the device-backed
-  paths. Host strategy smoke and live reload demo
+  Producer-aware OSC reload-window rendering landed in
+  `144901f` + `737b124` (design note:
+  [notes/2026-05-20-d-stale-command-rejection-rendering.md](notes/2026-05-20-d-stale-command-rejection-rendering.md)):
+  packets rejected at enqueue during the reload window now
+  render as `osc reject (reload-window): <cmd>` in the session
+  timeline, distinct from generic `osc enqueue-reject`, and a
+  pre-existing double-print where `molhOnAccepted` and
+  `molhOnIssue` both fired for the same packet is fixed
+  structurally via a `Maybe`-typed renderer return. Remaining
+  work in this arc is a resource/allocation recovery event
+  stream (gated on a concrete consumer; the session shell is
+  now that consumer's first candidate), the richer
+  `MrePreservingReloadEnqueueRejected` consumer surface for
+  internal preserving-queue rejection beyond the existing
+  `renderLiveReloadEvents` timeline (the second half of the
+  live-session v0 note's "Stale-command semantics" bullet), and
+  hardware confirmation / hardware-gated CI for the
+  device-backed paths. Host strategy smoke and live reload demo
   share a typed prose reload-event vocabulary
   (`f595542` / `aca37ed`). The preserving live-reload path has a
   blessed committed fixture at
