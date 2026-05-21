@@ -51,6 +51,19 @@ module MetaSonic.App.ManifestLiveSession
 
     -- * Tracked-stack factory wrapper (exported for tests)
   , withTrackedFactory
+
+    -- * Testable reload command core
+    --
+    -- 'runReloadWith' is the IO body that 'sessionLoop' dispatches
+    -- to on an 'LscReloadTo'. It is parameterized over an
+    -- injectable plan resolver so tests can exercise the
+    -- catalog-lookup + planning failure paths and the supervisor-
+    -- outcome IORef-mutation paths without staging a real manifest
+    -- doc or catalog fixture. Production calls 'runReloadWith'
+    -- through 'catalogPlanResolver' against the live doc + catalog.
+  , ReloadResolver (..)
+  , catalogPlanResolver
+  , runReloadWith
   ) where
 
 import           Control.Exception              (finally, mask)
@@ -507,67 +520,97 @@ sessionLoop supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef rel
         putStrLn "  expected one of: demo:KEY  |  <Enter>  |  <Ctrl-D>"
         pure SsContinue
       LscReloadTo key ->
-        runReload key supOps doc catalog
-                  currentPlanRef lastOutcomeRef reloadEventsRef
+        runReloadWith
+          (catalogPlanResolver doc catalog)
+          supOps
+          currentPlanRef
+          lastOutcomeRef
+          reloadEventsRef
+          key
+
+
+-- | Injectable plan resolver: given an operator-typed @demo:KEY@
+-- payload, return either a rendered rejection reason
+-- (command-level reject, session keeps serving) or the requested
+-- plan. Parameterized so the testable IO core
+-- ('runReloadWith') does not need a real
+-- 'AuthoringManifestDoc' + catalog fixture; tests construct a
+-- stub resolver and a stub plan type.
+newtype ReloadResolver plan = ReloadResolver
+  { resolvePlan :: String -> Either String plan
+  }
+
+
+-- | Production plan resolver: catalog lookup against 'demoTable',
+-- then 'planManifestReloadForDemo' against the loaded doc +
+-- catalog. The rejection reason is the rendered CLI issue (for
+-- planning failures) or a short \"no demo named …\" string (for
+-- catalog misses).
+catalogPlanResolver
+  :: AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> ReloadResolver MR.ManifestReloadPlan
+catalogPlanResolver doc catalog = ReloadResolver $ \key ->
+  case find (\d -> demoKey d == key) demoTable of
+    Nothing ->
+      Left ("no demo named " <> show key <> " in catalog")
+    Just demo ->
+      case planManifestReloadForDemo doc catalog demo of
+        Left issue ->
+          Left (renderManifestReloadCliIssue issue)
+        Right plan ->
+          Right plan
 
 
 -- | One supervised reload attempt driven by an operator-typed key.
 -- Distinguishes planning failures (command-level reject; keep
 -- serving) from supervisor outcomes. Always overwrites
 -- 'lastOutcomeRef' so 'LscStatus' reads the most recent attempt.
-runReload
+-- Parameterized over a 'ReloadResolver' so tests can inject a stub.
+runReloadWith
   :: Show e
-  => String
-  -> SupervisorOps MR.ManifestReloadPlan e
-  -> AuthoringManifestDoc
-  -> [MR.ManifestReloadCatalogEntry]
-  -> IORef MR.ManifestReloadPlan
+  => ReloadResolver plan
+  -> SupervisorOps plan e
+  -> IORef plan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> String
   -> IO SessionStep
-runReload key supOps doc catalog currentPlanRef lastOutcomeRef reloadEventsRef =
-  case find (\d -> demoKey d == key) demoTable of
-    Nothing -> do
-      let reason = "no demo named " <> show key <> " in catalog"
+runReloadWith resolver supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
+  case resolvePlan resolver key of
+    Left reason -> do
       putStrLn ("  reload rejected: " <> reason)
       writeIORef lastOutcomeRef (Just (LsoPlanRejected reason))
       pure SsContinue
-    Just demo ->
-      case planManifestReloadForDemo doc catalog demo of
-        Left issue -> do
-          let reason = renderManifestReloadCliIssue issue
-          putStrLn ("  reload rejected: " <> reason)
-          writeIORef lastOutcomeRef (Just (LsoPlanRejected reason))
-          pure SsContinue
-        Right requestedPlan -> do
-          fallbackPlan <- readIORef currentPlanRef
-          writeIORef reloadEventsRef []
-          out <- reloadSupervised supOps fallbackPlan requestedPlan
-          events <- readIORef reloadEventsRef
-          putStrLn ""
-          let (lso, step) = stepFromOutcome out
-          putStrLn $
-            "  supervised outcome: " <> renderLiveSessionOutcome lso
-          putStrLn "  reload events:"
-          mapM_ putStrLn (renderLiveReloadEvents events)
-          writeIORef lastOutcomeRef (Just lso)
-          when (lso == LsoCommitted) $
-            writeIORef currentPlanRef requestedPlan
-          case out of
-            SupervisedReloadCommitted ->
-              pure step
-            SupervisedReloadRequestRejected cause -> do
-              putStrLn ("  cause: " <> show cause)
-              pure step
-            SupervisedReloadRejectedRecovered cause -> do
-              putStrLn ("  in-window cause: " <> show cause)
-              pure step
-            SupervisedReloadEscalated inWindow rebuild -> do
-              putStrLn ("  in-window cause: " <> show inWindow)
-              putStrLn ("  rebuild cause:   " <> show rebuild)
-              hPutStrLn stderr
-                "live session escalated: no live stack remains."
-              pure step
+    Right requestedPlan -> do
+      fallbackPlan <- readIORef currentPlanRef
+      writeIORef reloadEventsRef []
+      out <- reloadSupervised supOps fallbackPlan requestedPlan
+      events <- readIORef reloadEventsRef
+      putStrLn ""
+      let (lso, step) = stepFromOutcome out
+      putStrLn $
+        "  supervised outcome: " <> renderLiveSessionOutcome lso
+      putStrLn "  reload events:"
+      mapM_ putStrLn (renderLiveReloadEvents events)
+      writeIORef lastOutcomeRef (Just lso)
+      when (lso == LsoCommitted) $
+        writeIORef currentPlanRef requestedPlan
+      case out of
+        SupervisedReloadCommitted ->
+          pure step
+        SupervisedReloadRequestRejected cause -> do
+          putStrLn ("  cause: " <> show cause)
+          pure step
+        SupervisedReloadRejectedRecovered cause -> do
+          putStrLn ("  in-window cause: " <> show cause)
+          pure step
+        SupervisedReloadEscalated inWindow rebuild -> do
+          putStrLn ("  in-window cause: " <> show inWindow)
+          putStrLn ("  rebuild cause:   " <> show rebuild)
+          hPutStrLn stderr
+            "live session escalated: no live stack remains."
+          pure step
 
 
 -- | Read the active stack via the tracking IORef and print the

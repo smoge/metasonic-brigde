@@ -3886,9 +3886,9 @@ Still gated:
   `tools/manifest_live_session_require_preserving_smoke.sh`
   (`just manifest-live-session-require-preserving-smoke`,
   port 17004) was marker-clean across two runs on
-  2026-05-21 on host RME ADI-2 Pro / PipeWire; design
+  2026-05-20 on host RME ADI-2 Pro / PipeWire; design
   rationale + acceptance criteria + non-goals at
-  [notes/2026-05-21-a-manifest-live-session-v0.md](notes/2026-05-21-a-manifest-live-session-v0.md).
+  [notes/2026-05-20-b-manifest-live-session-v0.md](notes/2026-05-20-b-manifest-live-session-v0.md).
   Remaining work in this arc is a resource/allocation
   recovery event stream (gated on a concrete consumer; the
   session shell is now that consumer's first candidate),

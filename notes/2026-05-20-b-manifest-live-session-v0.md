@@ -1,6 +1,6 @@
 # Manifest Live Session v0 (Phase 8)
 
-Date: 2026-05-21
+Date: 2026-05-20
 
 Status: design + landed.
 

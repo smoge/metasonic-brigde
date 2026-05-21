@@ -248,8 +248,23 @@ data Options = Options
     -- ^ External authoring manifest JSON path for manifest reload
     -- diagnostic / construction-smoke modes.
   , optManifestReloadHostStrategy :: Maybe ManifestReloadHostStrategy
-    -- ^ Explicit selector mode for
-    -- --manifest-host-reload-smoke.
+    -- ^ Positional strategy for --manifest-host-reload-smoke and
+    -- --manifest-live-reload-demo. Set by their respective
+    -- positional-strategy parsers. NOT used by
+    -- --manifest-live-session (which reads
+    -- 'optLiveSessionStrategy' instead so the global --strategy
+    -- flag cannot silently override a positional strategy on the
+    -- older commands).
+  , optLiveSessionStrategy :: Maybe ManifestReloadHostStrategy
+    -- ^ Live-session-only strategy from the global --strategy
+    -- flag. Read only by the --manifest-live-session dispatch
+    -- (defaulting to 'RequirePreserving' when 'Nothing').
+    -- Kept separate from 'optManifestReloadHostStrategy' so a
+    -- command like
+    -- @--manifest-live-reload-demo try-preserving … --strategy require-preserving@
+    -- does not silently downgrade try-preserving — that command
+    -- ignores --strategy entirely. (The flag is documented as
+    -- live-session-only in --help.)
   , optFused   :: Bool
     -- ^ When True, demos load through 'loadRuntimeGraphFused' /
     -- 'loadTemplateGraphFused' on a 'compileRuntimeGraphFused'-
@@ -280,6 +295,7 @@ defaultOptions = Options
   , optTargets = []
   , optManifestReloadFile = Nothing
   , optManifestReloadHostStrategy = Nothing
+  , optLiveSessionStrategy = Nothing
   , optFused   = False
   , optOscPort = 7000
   , optMidiDevice = Nothing
@@ -425,6 +441,12 @@ parseArgs = go defaultOptions
                   } xs
     go _ ("--manifest-live-session" : []) =
       Left "Missing manifest JSON file for --manifest-live-session"
+    -- --strategy is intentionally live-session-only: it writes to
+    -- a dedicated field so it cannot silently override the
+    -- positional strategy on --manifest-host-reload-smoke or
+    -- --manifest-live-reload-demo (those parsers populate
+    -- 'optManifestReloadHostStrategy'). Documented as live-
+    -- session-only in --help.
     go opts ("--strategy" : strategyText : xs)
       | null strategyText || "--" `prefixOf` strategyText =
           Left $
@@ -434,7 +456,7 @@ parseArgs = go defaultOptions
       | otherwise =
           case parseManifestReloadHostStrategy strategyText of
             Just strategy ->
-              go opts { optManifestReloadHostStrategy = Just strategy } xs
+              go opts { optLiveSessionStrategy = Just strategy } xs
             Nothing ->
               Left $
                 "Invalid strategy for --strategy: " <> strategyText
@@ -1037,7 +1059,7 @@ main = do
       let strategy =
             maybe RequirePreserving
                   id
-                  (optManifestReloadHostStrategy opts)
+                  (optLiveSessionStrategy opts)
       demo <- either die pure $
         resolveManifestReloadDiagnosticTarget
           "--manifest-live-session"
