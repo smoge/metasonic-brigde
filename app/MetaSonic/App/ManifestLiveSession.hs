@@ -74,6 +74,7 @@ import           Data.IORef                     (IORef, modifyIORef',
                                                  writeIORef)
 import           Data.List                      (dropWhileEnd, find,
                                                  isPrefixOf)
+import qualified Data.Map.Strict                as M
 import           System.Exit                    (ExitCode (..), die,
                                                  exitWith)
 import           System.IO                      (BufferMode (..), hFlush,
@@ -138,11 +139,14 @@ import           MetaSonic.App.ManifestReloadIngressTarget
                                                 (ManifestReloadIngressTarget)
 import           MetaSonic.Authoring.Manifest   (AuthoringManifestDoc)
 import qualified MetaSonic.Session.ManifestReload as MR
-import           MetaSonic.Session.FanIn        (defaultSessionFanInAudioFFI)
+import           MetaSonic.Session.FanIn        (SessionFanInSnapshot (..),
+                                                 defaultSessionFanInAudioFFI)
 import           MetaSonic.Session.FanInService (defaultSessionFanInServiceHooks,
-                                                 defaultSessionFanInServiceOptions)
+                                                 defaultSessionFanInServiceOptions,
+                                                 readSessionFanInService)
 import           MetaSonic.Session.OSCProducer  (defaultOSCProducerOptions)
 import           MetaSonic.Session.Owner        (defaultSessionOwnerOptions)
+import           MetaSonic.Session.State        (SessionState (..))
 
 
 -- ============================================================================
@@ -522,11 +526,42 @@ sessionLoop supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef rel
       LscReloadTo key ->
         runReloadWith
           (catalogPlanResolver doc catalog)
+          autoStartIfStackIsEmpty
           supOps
           currentPlanRef
           lastOutcomeRef
           reloadEventsRef
           key
+
+    -- | Post-reload voice auto-start. Fires on
+    -- 'SupervisedReloadCommitted' and
+    -- 'SupervisedReloadRejectedRecovered' through 'runReloadWith's
+    -- 'onLiveStackChanged' hook. Checks whether the active stack's
+    -- owner has zero live voices; if so, enqueues one 'CmdVoiceOn'
+    -- per template on the supplied plan (matching the two-shot demo's
+    -- post-reload-auto-start pattern). For 'require-preserving' the
+    -- owner is preserved across the reload so 'ssVoices' is
+    -- non-empty and this is a no-op; for 'stopped-audio-only',
+    -- 'try-preserving' falling back to stopped-audio, and the
+    -- 'RejectedRecovered' close-then-reopen path, the substrate's
+    -- 'realOpen' produces a service + audio + ingress with no
+    -- voices, and the auto-start gives the operator back an
+    -- audible surface.
+    autoStartIfStackIsEmpty livePlan = do
+      mStack <- readIORef trackedStackRef
+      case mStack of
+        Nothing ->
+          -- Reads as @(no live stack)@ in status; the supervisor's
+          -- bracket has not yet rewritten the tracking IORef. Skip
+          -- auto-start rather than fight the close-then-open window.
+          pure ()
+        Just stack -> do
+          let service = mrhcService (rhsConfig stack)
+          snapshot <- readSessionFanInService service
+          when (M.null (ssVoices (sfisOwnerState snapshot))) $ do
+            voices <-
+              autoStartTemplates "post-reload" service livePlan
+            warnIfMissingVoices service voices
 
 
 -- | Injectable plan resolver: given an operator-typed @demo:KEY@
@@ -567,16 +602,38 @@ catalogPlanResolver doc catalog = ReloadResolver $ \key ->
 -- serving) from supervisor outcomes. Always overwrites
 -- 'lastOutcomeRef' so 'LscStatus' reads the most recent attempt.
 -- Parameterized over a 'ReloadResolver' so tests can inject a stub.
+--
+-- @onLiveStackChanged@ fires on outcomes that may have left the
+-- active stack with a freshly-opened owner and no voices:
+--
+--   * 'SupervisedReloadCommitted' — the owner may have been
+--     replaced (stopped-audio strategy, or try-preserving falling
+--     back to stopped-audio); preserving keeps voices, so the
+--     hook should be a no-op for require-preserving in practice.
+--     Called with the @requested@ plan, which is now the current
+--     plan.
+--   * 'SupervisedReloadRejectedRecovered' — the supervisor closed
+--     the broken stack and rebuilt via the substrate's @realOpen@,
+--     which opens service + audio + ingress but does not enqueue
+--     any 'CmdVoiceOn'. Called with the @fallback@ plan, which is
+--     now the current plan.
+--
+-- The hook is NOT called on 'SupervisedReloadRequestRejected'
+-- (stack unchanged), 'SupervisedReloadEscalated' (session
+-- terminates), or on a command-level 'LsoPlanRejected' (supervisor
+-- not invoked). Production uses the hook to do the post-reload
+-- voice auto-start; tests pass @const (pure ())@.
 runReloadWith
   :: Show e
   => ReloadResolver plan
+  -> (plan -> IO ())
   -> SupervisorOps plan e
   -> IORef plan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
   -> String
   -> IO SessionStep
-runReloadWith resolver supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
+runReloadWith resolver onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
   case resolvePlan resolver key of
     Left reason -> do
       putStrLn ("  reload rejected: " <> reason)
@@ -597,13 +654,15 @@ runReloadWith resolver supOps currentPlanRef lastOutcomeRef reloadEventsRef key 
       when (lso == LsoCommitted) $
         writeIORef currentPlanRef requestedPlan
       case out of
-        SupervisedReloadCommitted ->
+        SupervisedReloadCommitted -> do
+          onLiveStackChanged requestedPlan
           pure step
         SupervisedReloadRequestRejected cause -> do
           putStrLn ("  cause: " <> show cause)
           pure step
         SupervisedReloadRejectedRecovered cause -> do
           putStrLn ("  in-window cause: " <> show cause)
+          onLiveStackChanged fallbackPlan
           pure step
         SupervisedReloadEscalated inWindow rebuild -> do
           putStrLn ("  in-window cause: " <> show inWindow)

@@ -310,6 +310,14 @@ withSessionRefs initialPlan k = do
   k preExistingEvents currentPlanRef lastOutcomeRef eventsRef
 
 
+-- | Default no-op for 'runReloadWith's 'onLiveStackChanged' hook.
+-- Tests that do not care about the hook pass this; the
+-- "onLiveStackChanged hook fires on the right outcomes" test
+-- below builds a recording closure instead.
+noHook :: StubPlan -> IO ()
+noHook _ = pure ()
+
+
 -- | A stub resolver that maps a fixed key → @Right plan@ and
 -- everything else → @Left reason@.
 stubResolver :: String -> StubPlan -> ReloadResolver StubPlan
@@ -340,6 +348,7 @@ runReloadWithTests =
             resolver = stubResolver "good" 42
         step <- runReloadWith
                   resolver
+                  noHook
                   blockingSupOps
                   currentPlanRef
                   lastOutcomeRef
@@ -367,6 +376,7 @@ runReloadWithTests =
             resolver = stubAlwaysReject "manifest does not name this demo"
         step <- runReloadWith
                   resolver
+                  noHook
                   blockingSupOps
                   currentPlanRef
                   lastOutcomeRef
@@ -393,6 +403,7 @@ runReloadWithTests =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 7
         step <- runReloadWith
                   resolver
+                  noHook
                   supOps
                   currentPlanRef
                   lastOutcomeRef
@@ -417,6 +428,7 @@ runReloadWithTests =
             supOps   = fakeSupOpsWithOutcome eventsRef outcome 8
         step <- runReloadWith
                   resolver
+                  noHook
                   supOps
                   currentPlanRef
                   lastOutcomeRef
@@ -451,6 +463,7 @@ runReloadWithTests =
               }
         step <- runReloadWith
                   resolver
+                  noHook
                   supOps
                   currentPlanRef
                   lastOutcomeRef
@@ -476,6 +489,7 @@ runReloadWithTests =
               }
         step <- runReloadWith
                   resolver
+                  noHook
                   supOps
                   currentPlanRef
                   lastOutcomeRef
@@ -497,15 +511,95 @@ runReloadWithTests =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 11
             supOpsSecond =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 12
-        _ <- runReloadWith resolver supOpsFirst
+        _ <- runReloadWith resolver noHook supOpsFirst
                currentPlanRef lastOutcomeRef eventsRef "next"
         eventsAfterFirst <- readIORef eventsRef
         eventsAfterFirst @?= [syntheticEvent 11]
-        _ <- runReloadWith resolver supOpsSecond
+        _ <- runReloadWith resolver noHook supOpsSecond
                currentPlanRef lastOutcomeRef eventsRef "next"
         eventsAfterSecond <- readIORef eventsRef
         eventsAfterSecond @?= [syntheticEvent 12]
         assertBool
           "second reload's events ref must not contain the first reload's tag"
           (syntheticEvent 11 `notElem` eventsAfterSecond)
+
+  , testCase "onLiveStackChanged fires on Committed (with requested plan), Recovered (with fallback plan), and NOT on RequestRejected / PlanRejected / Escalated" $ do
+      -- Production uses this hook to enqueue CmdVoiceOn against
+      -- whichever plan the active stack is now running. For the
+      -- require-preserving happy path the owner is preserved so
+      -- the production hook short-circuits on the empty-voice
+      -- check, but the contract here is the firing pattern: the
+      -- two outcomes that may have produced a freshly-opened
+      -- owner (Committed and RejectedRecovered) call the hook;
+      -- the other three outcomes do not.
+      hookCallsRef <- newIORef ([] :: [StubPlan])
+      let recordingHook livePlan =
+            modifyIORef' hookCallsRef (<> [livePlan])
+          resolver = stubResolver "next" 2
+      -- 1. PlanRejected: bad key, no supervisor call. Hook NOT
+      --    called.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
+        let blockingSupOps :: SupervisorOps StubPlan String
+            blockingSupOps = SupervisorOps
+              { sopsInWindowReload = \_ _ ->
+                  assertFailure "supOps must not be called on PlanRejected"
+              , sopsCloseStack = assertFailure "close must not be called"
+              , sopsOpenStack  = \_ ->
+                  assertFailure "open must not be called"
+              }
+        _ <- runReloadWith resolver recordingHook blockingSupOps
+               currentPlanRef lastOutcomeRef eventsRef "bad-key"
+        pure ()
+      readIORef hookCallsRef >>= (@?= ([] :: [StubPlan]))
+
+      -- 2. Committed: hook called with the requested plan.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
+        let supOps =
+              fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 100
+        _ <- runReloadWith resolver recordingHook supOps
+               currentPlanRef lastOutcomeRef eventsRef "next"
+        pure ()
+      readIORef hookCallsRef >>= (@?= [2])  -- requestedPlan == 2
+
+      -- 3. RequestRejected: stack unchanged, hook NOT called.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
+        let supOps =
+              fakeSupOpsWithOutcome eventsRef
+                (InWindowReloadRejectedLiveFallback "live-fallback")
+                101
+        _ <- runReloadWith resolver recordingHook supOps
+               currentPlanRef lastOutcomeRef eventsRef "next"
+        pure ()
+      -- Hook list still just [2] from the Committed test above.
+      readIORef hookCallsRef >>= (@?= [2])
+
+      -- 4. RejectedRecovered: stack was rebuilt on the fallback
+      --    plan; hook called with the fallback plan (== 1 here).
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
+        let supOps = SupervisorOps
+              { sopsInWindowReload = \_ _ -> do
+                  modifyIORef' eventsRef (<> [syntheticEvent 102])
+                  pure (InWindowReloadTerminal "terminal-cause")
+              , sopsCloseStack = pure ()
+              , sopsOpenStack  = const (pure (Right ()))
+              }
+        _ <- runReloadWith resolver recordingHook supOps
+               currentPlanRef lastOutcomeRef eventsRef "next"
+        pure ()
+      readIORef hookCallsRef >>= (@?= [2, 1])  -- recovered with fallback (1)
+
+      -- 5. Escalated: session terminating, no live stack, hook
+      --    NOT called.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
+        let supOps = SupervisorOps
+              { sopsInWindowReload = \_ _ -> do
+                  modifyIORef' eventsRef (<> [syntheticEvent 103])
+                  pure (InWindowReloadTerminal "in-window-cause")
+              , sopsCloseStack = pure ()
+              , sopsOpenStack  = const (pure (Left "rebuild-cause"))
+              }
+        _ <- runReloadWith resolver recordingHook supOps
+               currentPlanRef lastOutcomeRef eventsRef "next"
+        pure ()
+      readIORef hookCallsRef >>= (@?= [2, 1])  -- unchanged from step 4
   ]
