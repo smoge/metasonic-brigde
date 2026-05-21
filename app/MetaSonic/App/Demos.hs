@@ -30,6 +30,10 @@ module MetaSonic.App.Demos
   , preserveCutoffBrightAuthoring
   , dronePreserveSawDark
   , dronePreserveSawBright
+  , rejectPreservingSmoothDarkAuthoring
+  , rejectPreservingSmoothBrightAuthoring
+  , dronePreserveSmoothDark
+  , dronePreserveSmoothBright
   ) where
 
 import           Data.Maybe                (catMaybes)
@@ -517,6 +521,89 @@ preserveCutoffBrightAuthoring = emptyAuthoringReport
   }
 
 ------------------------------------------------------------
+-- Reject-eligible preserving hot-swap pair
+------------------------------------------------------------
+--
+-- Sibling of the 'preserve-cutoff' pair above, deliberately
+-- shaped to make the preserving hot-swap REJECT instead of
+-- commit. Used to exercise the
+-- 'SupervisedReloadRequestRejected' branch of the live session
+-- shell deterministically (without racing an OSC reload-window
+-- or relying on a bad demo key).
+--
+-- Mechanism: the voice template carries a 'smooth' (KSmooth)
+-- node on the gain-amount path. KSmooth is classified as
+-- 'PreserveUnsupported' by 'preservingHotSwapNodeClass'
+-- (RTGraphAdapter.hs), so any active voice using a template
+-- with KSmooth fails the runtime preserving-migration check
+-- with 'SriHotSwapWouldPreserveVoices'. The downstream
+-- classification chain is
+--   StepRuntimeFailed
+--     -> mapPreservingReloadReport: HprfOldOwnerStillInstalled
+--     -> orchestrator: HpariReloadRejected (resume-old-ingress
+--                      succeeds; old stack stays live)
+--     -> classifyPreservingOutcome: InWindowReloadRejectedLiveFallback
+--     -> reloadSupervised: SupervisedReloadRequestRejected.
+--
+-- The user-facing control contract is intentionally identical
+-- to 'preserve-cutoff': one OSC/MIDI-addressable cutoff control
+-- on KLPF slot 0 via migration key "lpf". The KSmooth node is
+-- a topology decoration that affects voice migrability only;
+-- it is NOT in the control path. (Contrast the 'preserve-cutoff'
+-- header above, which explains why that pair *avoids* KSmooth.)
+
+dronePreserveSmoothDark :: SynthGraph
+dronePreserveSmoothDark = runSynth $ do
+  carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
+  filtered <- tagged "lpf"     (lpf carrier (Param 600.0) (Param 0.7))
+  amount   <- smooth 20.0 (Param 0.2)
+  shaped   <- gain filtered amount
+  out 0 shaped
+
+dronePreserveSmoothBright :: SynthGraph
+dronePreserveSmoothBright = runSynth $ do
+  carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
+  filtered <- tagged "lpf"     (lpf carrier (Param 2400.0) (Param 0.7))
+  amount   <- smooth 20.0 (Param 0.2)
+  shaped   <- gain filtered amount
+  out 0 shaped
+
+-- | Cutoff control for the dark reject-eligible entry. Binding
+-- shape (migration key "lpf", slot 0, OSC @/v<voice>/lpf/0@,
+-- MIDI CC 74, default 600 Hz) is identical to
+-- 'preserveCutoffControlDark'; only the demo containing it
+-- differs.
+rejectPreservingSmoothControlDark :: Report.ReportedControl
+rejectPreservingSmoothControlDark = preserveCutoffControlDark
+
+-- | Cutoff control for the bright reject-eligible entry; default
+-- 2400 Hz, otherwise identical to the dark variant.
+rejectPreservingSmoothControlBright :: Report.ReportedControl
+rejectPreservingSmoothControlBright = preserveCutoffControlBright
+
+rejectPreservingSmoothDarkAuthoring :: AuthoringReport
+rejectPreservingSmoothDarkAuthoring = emptyAuthoringReport
+  { Report.arTemplates =
+      [ Report.ReportedTemplate
+          { Report.rtName = "drone"
+          , Report.rtRole = Auth.VoiceTemplate
+          }
+      ]
+  , Report.arControls = [rejectPreservingSmoothControlDark]
+  }
+
+rejectPreservingSmoothBrightAuthoring :: AuthoringReport
+rejectPreservingSmoothBrightAuthoring = emptyAuthoringReport
+  { Report.arTemplates =
+      [ Report.ReportedTemplate
+          { Report.rtName = "drone"
+          , Report.rtRole = Auth.VoiceTemplate
+          }
+      ]
+  , Report.arControls = [rejectPreservingSmoothControlBright]
+  }
+
+------------------------------------------------------------
 
 data Demo = Demo
   { demoKey       :: String
@@ -597,6 +684,14 @@ demoTable =
          "Preserving hot-swap target (saw drone @ LPF 2400 Hz; OSC cutoff /v0/lpf/0)"
          (MultiTemplate [("drone", dronePreserveSawBright)])
          preserveCutoffBrightAuthoring
+  , demoWithAuth "reject-preserving-smooth-dark"
+         "Reject-eligible preserving source (saw drone @ LPF 600 Hz, +KSmooth on gain)"
+         (MultiTemplate [("drone", dronePreserveSmoothDark)])
+         rejectPreservingSmoothDarkAuthoring
+  , demoWithAuth "reject-preserving-smooth-bright"
+         "Reject-eligible preserving target (saw drone @ LPF 2400 Hz, +KSmooth on gain)"
+         (MultiTemplate [("drone", dronePreserveSmoothBright)])
+         rejectPreservingSmoothBrightAuthoring
   , demoNoAuth "midi-poly"
          "Live MIDI poly synth (8 voices; CC7 → master, pitch-bend ±2)"
          (MidiPoly 8 midiPolySynth)

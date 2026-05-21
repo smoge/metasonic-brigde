@@ -37,6 +37,8 @@ appDemoCatalogTests =
         , "send-return"
         , "preserve-cutoff-dark"
         , "preserve-cutoff-bright"
+        , "reject-preserving-smooth-dark"
+        , "reject-preserving-smooth-bright"
         ]
 
   , testCase "catalog filters unauthored demo rows directly" $ do
