@@ -9,8 +9,10 @@
 
 module MetaSonic.Spec.AppManifestReloadSupervisor where
 
-import           Control.Exception                (ErrorCall (..), evaluate,
+import           Control.Exception                (AsyncException (..),
+                                                   ErrorCall (..), evaluate,
                                                    throwIO, try)
+import           Control.Monad                    (when)
 import           Data.IORef                       (IORef, modifyIORef',
                                                    newIORef, readIORef)
 
@@ -400,6 +402,106 @@ appManifestReloadSupervisorTests =
         , SreClosePreviousStarted
         ]
 
+  --------------------------------------------------------------------
+  -- Callback-exception cleanup guarantees.
+  --
+  -- A buggy observer must not be able to bypass the supervisor's
+  -- terminal close + fallback-open contract. The supervisor uses
+  -- 'safeEmit' to suppress synchronous callback exceptions while
+  -- re-throwing asynchronous ones so process-level shutdown signals
+  -- ('UserInterrupt' etc.) still propagate.
+  --------------------------------------------------------------------
+
+  , testCase "withEvents: synchronous callback exception at SreInWindowTerminal does NOT bypass close + fallback-open" $ do
+      -- Reproduces the bug the safeEmit guard fixes: before the fix,
+      -- a callback that threw on the terminal event exited the
+      -- supervisor without closing the previous stack or attempting
+      -- rebuild. Now: cleanup runs to completion and the supervisor
+      -- returns the classified recovery outcome.
+      (ops, log_) <-
+        mkRecordingOps
+          (inWindowTerminalWith FakeAudioRestartFailed)
+          openStackOk
+      evRef <- newIORef ([] :: [SupervisedReloadEvent FakeFailure])
+      let onEv ev = do
+            modifyIORef' evRef (++ [ev])
+            when (matchesTerminal ev) $
+              throwIO (ErrorCall "synthetic callback throw at terminal")
+      outcome <- reloadSupervisedWithEvents onEv ops planA planB
+      events <- readIORef evRef
+      calls  <- readIORef log_
+      outcome @?= SupervisedReloadRejectedRecovered FakeAudioRestartFailed
+      -- The supervisor closed the previous stack and rebuilt the
+      -- fallback DESPITE the callback exception:
+      CloseStackCalled `elem` calls @?= True
+      any isOpenCall calls @?= True
+      calls @?=
+        [ InWindowReloadCalled planB
+        , CloseStackCalled
+        , OpenStackCalled planA
+        ]
+      -- The recovery events continued to be delivered to the
+      -- callback after the suppressed throw (only events past the
+      -- throw site are interesting here — those prove the supervisor
+      -- did not abort emission either):
+      SreClosePreviousStarted `elem` events @?= True
+      SreClosePreviousSucceeded `elem` events @?= True
+      SreFallbackOpenStarted `elem` events @?= True
+      SreFallbackOpenSucceeded `elem` events @?= True
+
+  , testCase "withEvents: synchronous callback exception at SreClosePreviousStarted does NOT bypass close + fallback-open" $ do
+      -- The other half of the user-reported bug: callback throwing
+      -- between the terminal event and sopsCloseStack must not skip
+      -- the close. The fix routes every emit through safeEmit, so
+      -- the close runs regardless.
+      (ops, log_) <-
+        mkRecordingOps
+          (inWindowTerminalWith FakeAudioRestartFailed)
+          openStackOk
+      evRef <- newIORef ([] :: [SupervisedReloadEvent FakeFailure])
+      let onEv ev = do
+            modifyIORef' evRef (++ [ev])
+            when (ev == SreClosePreviousStarted) $
+              throwIO (ErrorCall "synthetic callback throw at close-started")
+      outcome <- reloadSupervisedWithEvents onEv ops planA planB
+      events <- readIORef evRef
+      calls  <- readIORef log_
+      outcome @?= SupervisedReloadRejectedRecovered FakeAudioRestartFailed
+      calls @?=
+        [ InWindowReloadCalled planB
+        , CloseStackCalled
+        , OpenStackCalled planA
+        ]
+      SreClosePreviousStarted `elem` events @?= True
+      SreClosePreviousSucceeded `elem` events @?= True
+      SreFallbackOpenSucceeded `elem` events @?= True
+
+  , testCase "withEvents: asynchronous callback exception propagates (UserInterrupt does NOT get swallowed)" $ do
+      -- The other half of the safeEmit contract: process-level
+      -- shutdown signals MUST reach the runtime. Throwing
+      -- UserInterrupt from the callback (which carries the
+      -- 'SomeAsyncException' tag) must surface through the
+      -- supervisor as a thrown exception, not get caught by the
+      -- sync-only catch. The previous-stack close on the recovery
+      -- path may not complete in that case (the host process is
+      -- the appropriate disposer at that point), and this test
+      -- intentionally does NOT assert that it does.
+      (ops, _log) <-
+        mkRecordingOps
+          (inWindowTerminalWith FakeAudioRestartFailed)
+          openStackOk
+      let onEv ev = when (matchesTerminal ev) $ throwIO UserInterrupt
+      result <- try (reloadSupervisedWithEvents onEv ops planA planB)
+      case result :: Either AsyncException (SupervisedReloadOutcome FakeFailure) of
+        Left UserInterrupt ->
+          pure ()
+        Left other ->
+          assertFailure $
+            "expected UserInterrupt to propagate, got: " <> show other
+        Right outcome ->
+          assertFailure $
+            "expected UserInterrupt to propagate, got outcome: " <> show outcome
+
   , testCase "withEvents: reloadSupervised (silent default) returns the same outcomes as reloadSupervisedWithEvents noSupervisedReloadEvents" $ do
       -- Regression for the delegation refactor: the legacy
       -- 'reloadSupervised' entrypoint must remain
@@ -438,6 +540,15 @@ mkEventLog
 mkEventLog = do
   ref <- newIORef []
   pure (ref, \e -> modifyIORef' ref (++ [e]))
+
+-- | Constructor-only predicate for 'SreInWindowTerminal', used by
+-- the callback-exception tests to throw selectively without
+-- caring about the carried payload value. Pattern-matching with a
+-- wildcard payload would inline cleanly, but a named helper makes
+-- the test's intent (\"throw at the terminal event\") obvious.
+matchesTerminal :: SupervisedReloadEvent e -> Bool
+matchesTerminal (SreInWindowTerminal _) = True
+matchesTerminal _                       = False
 
 
 -- | Helper: distinguish the open-stack call without case-matching by hand.

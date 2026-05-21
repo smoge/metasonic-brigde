@@ -39,7 +39,9 @@ module MetaSonic.App.ManifestReloadSupervisor
   , reloadSupervisedWithEvents
   ) where
 
-import           Control.Exception (onException)
+import           Control.Exception (SomeAsyncException, SomeException,
+                                    catch, fromException, onException,
+                                    throwIO)
 
 
 -- | Classified outcome of one in-window reload attempt.
@@ -240,6 +242,24 @@ reloadSupervised = reloadSupervisedWithEvents noSupervisedReloadEvents
 -- thread; long-running work in the callback delays the supervisor.
 -- The expected use is to write the event into an 'IORef' / channel
 -- for downstream rendering.
+--
+-- Exception safety contract for the callback:
+--
+-- * Synchronous exceptions thrown by 'onEvent' are /caught and
+--   suppressed/ by 'safeEmit'. The supervisor's terminal close +
+--   fallback-open contract on the recovery path must not depend on
+--   an observer's exception behavior; a rendering callback that
+--   throws cannot bypass cleanup of the previous stack or short-
+--   circuit the rebuild attempt.
+-- * Asynchronous exceptions (e.g. 'UserInterrupt', 'ThreadKilled',
+--   the various 'AsyncException' constructors) are /re-thrown/ so
+--   process-level shutdown signals reach the runtime.
+-- * The trade-off: callback bugs that produce synchronous
+--   exceptions silently drop events. Consumers should be
+--   'IORef'-style sinks ('modifyIORef'' / channel writes) that do
+--   not throw in normal operation; debug a missing event by
+--   instrumenting the callback, not by adding exception handling
+--   here.
 reloadSupervisedWithEvents
   :: (SupervisedReloadEvent e -> IO ())
   -> SupervisorOps plan e
@@ -257,36 +277,71 @@ reloadSupervisedWithEvents onEvent ops fallback requested = do
   -- handler, the call never returns a classified outcome, and
   -- emitting events from the handler risks masking the original
   -- exception.
-  onEvent SreInWindowStarted
+  emit SreInWindowStarted
   attempt <- sopsInWindowReload ops fallback requested
                 `onException` sopsCloseStack ops
   case attempt of
     InWindowReloadCommitted -> do
-      onEvent SreInWindowCommitted
+      emit SreInWindowCommitted
       pure SupervisedReloadCommitted
     InWindowReloadRejectedLiveFallback rejectErr -> do
       -- The producer guarantees the stack is still serving the
       -- fallback plan; no close/open runs. The CLI surfaces this
       -- without claiming a rebuild happened.
-      onEvent (SreInWindowRejectedLiveFallback rejectErr)
+      emit (SreInWindowRejectedLiveFallback rejectErr)
       pure (SupervisedReloadRequestRejected rejectErr)
     InWindowReloadTerminal originalErr -> do
-      onEvent (SreInWindowTerminal originalErr)
-      -- Recovery path. 'sopsCloseStack' is best-effort: if it throws,
-      -- 'SreClosePreviousStarted' is emitted but 'SreClosePreviousSucceeded'
-      -- is not; the exception escapes without a rebuild attempt and the
-      -- caller is responsible for process-level escalation. The new
-      -- stack constructed by 'sopsOpenStack' is required by contract
-      -- to clean up any partial state internally before propagating.
-      onEvent SreClosePreviousStarted
+      -- Recovery path. Event emissions here flow through 'emit'
+      -- (via 'safeEmit') so a callback that throws at
+      -- 'SreInWindowTerminal' or 'SreClosePreviousStarted' cannot
+      -- bypass the close + fallback-open below; the §238 invariant
+      -- holds independently of the observer.
+      --
+      -- 'sopsCloseStack' itself is best-effort: if it throws,
+      -- 'SreClosePreviousStarted' has been emitted but
+      -- 'SreClosePreviousSucceeded' is not; the exception escapes
+      -- without a rebuild attempt and the caller is responsible
+      -- for process-level escalation. The new stack constructed by
+      -- 'sopsOpenStack' is required by contract to clean up any
+      -- partial state internally before propagating.
+      emit (SreInWindowTerminal originalErr)
+      emit SreClosePreviousStarted
       sopsCloseStack ops
-      onEvent SreClosePreviousSucceeded
-      onEvent SreFallbackOpenStarted
+      emit SreClosePreviousSucceeded
+      emit SreFallbackOpenStarted
       rebuild <- sopsOpenStack ops fallback
       case rebuild of
         Right () -> do
-          onEvent SreFallbackOpenSucceeded
+          emit SreFallbackOpenSucceeded
           pure (SupervisedReloadRejectedRecovered originalErr)
         Left rebuildErr -> do
-          onEvent (SreFallbackOpenFailed rebuildErr)
+          emit (SreFallbackOpenFailed rebuildErr)
           pure (SupervisedReloadEscalated originalErr rebuildErr)
+  where
+    emit = safeEmit onEvent
+
+-- | Run an event callback with cleanup-safety: synchronous
+-- exceptions are suppressed so they cannot bypass the supervisor's
+-- recovery-path contract, but asynchronous exceptions
+-- ('UserInterrupt', 'ThreadKilled', etc.) are re-thrown so
+-- process-level shutdown signals are not silently swallowed.
+--
+-- The discriminator is structural: 'SomeAsyncException' is the
+-- runtime tag the RTS uses for thread-targeted exceptions, so
+-- matching on it via 'fromException' covers every async shape
+-- without needing to enumerate constructors.
+--
+-- Internal to 'reloadSupervisedWithEvents'; the only call site is
+-- the local 'emit' binding. Kept top-level (and unexported) so the
+-- 'where'-bound lambda does not need a let-bound type signature to
+-- restrict the rank of the 'onEvent' argument.
+safeEmit
+  :: (SupervisedReloadEvent e -> IO ())
+  -> SupervisedReloadEvent e
+  -> IO ()
+safeEmit onEvent ev = onEvent ev `catch` handler
+  where
+    handler :: SomeException -> IO ()
+    handler e = case fromException e :: Maybe SomeAsyncException of
+      Just _  -> throwIO e  -- async (UserInterrupt etc.) — propagate
+      Nothing -> pure ()    -- sync callback bug — suppress
