@@ -304,6 +304,16 @@ orchestrateHostPreservingReloadWithEvents onEvent ops request = do
     reloadPreserving plan = do
       result <- hproReloadPreserving ops plan
       case result of
+        Left (HprfReloadEnqueueRejected issue) -> do
+          -- Surface the specific failure mode (the fan-in service
+          -- refused to enqueue the preserving command) before the
+          -- timeline collapses to the generic 'HpariReloadRejected'
+          -- outcome via 'resumeAfterFailure'.
+          onEvent (MrePreservingReloadEnqueueRejected issue)
+          resumeAfterFailure
+            issue
+            HpariReloadRejected
+            HpariReloadRejectedResumeFailed
         Left (HprfOldOwnerStillInstalled issue) ->
           resumeAfterFailure
             issue

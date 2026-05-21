@@ -187,6 +187,62 @@ appManifestReloadEventTests =
                 "resume-failed")
           ]
 
+    , testCase "preserving reload-command enqueue rejected, resume success" $ do
+        -- The preserving hot-swap command is rejected at the fan-in
+        -- service before it runs (e.g. mid-reload-window). The
+        -- timeline emits the new EnqueueRejected event between
+        -- Started and the resume attempt; the final phase rejection
+        -- still collapses to HpariReloadRejected so downstream
+        -- fallback / supervisor policy is unchanged.
+        let ops = preservingOpsAllSuccess
+              { hproReloadPreserving = \_plan ->
+                  pure (Left (HprfReloadEnqueueRejected "enqueue-rejected"))
+              }
+        (ref, onEvent) <- newEventLog
+        result <-
+          orchestrateHostPreservingReloadWithEvents onEvent ops ()
+        result @?= Left (HpariReloadRejected "enqueue-rejected")
+        events <- readEvents ref
+        events @?=
+          [ MrePreservingReloadStarted
+          , MrePreservingReloadEnqueueRejected "enqueue-rejected"
+          , MreResumeOldIngressStarted
+          , MreResumeOldIngressSucceeded
+          , MrePreservingReloadRejected
+              (HpariReloadRejected "enqueue-rejected")
+          ]
+
+    , testCase "preserving reload-command enqueue rejected, resume failure" $ do
+        -- Same as above but resume-old-ingress also fails. The final
+        -- rejection collapses to HpariReloadRejectedResumeFailed and
+        -- the timeline names the resume failure between the new
+        -- EnqueueRejected event and the phase rejection.
+        let ops = preservingOpsAllSuccess
+              { hproReloadPreserving = \_plan ->
+                  pure (Left (HprfReloadEnqueueRejected "enqueue-rejected"))
+              , hproResumeOldIngress =
+                  pure (Left "resume-failed")
+              }
+        (ref, onEvent) <- newEventLog
+        result <-
+          orchestrateHostPreservingReloadWithEvents onEvent ops ()
+        result @?=
+          Left
+            (HpariReloadRejectedResumeFailed
+              "enqueue-rejected"
+              "resume-failed")
+        events <- readEvents ref
+        events @?=
+          [ MrePreservingReloadStarted
+          , MrePreservingReloadEnqueueRejected "enqueue-rejected"
+          , MreResumeOldIngressStarted
+          , MreResumeOldIngressFailed "resume-failed"
+          , MrePreservingReloadRejected
+              (HpariReloadRejectedResumeFailed
+                "enqueue-rejected"
+                "resume-failed")
+          ]
+
     , testCase "stopped-audio success: Started, Committed" $ do
         (ref, onEvent) <- newEventLog
         result <-

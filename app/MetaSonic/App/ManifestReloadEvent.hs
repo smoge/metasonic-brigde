@@ -115,6 +115,20 @@ data ManifestReloadEvent issue
     -- reopened against the new owner.
   | MrePreservingReloadCommitted
 
+    -- | The preserving hot-swap command could not be enqueued at
+    -- the fan-in service — the command never ran, the old owner
+    -- is intact, and orchestration is about to resume old ingress.
+    -- The downstream timeline still collapses to
+    -- 'MrePreservingReloadRejected' with 'HpariReloadRejected'
+    -- (or 'HpariReloadRejectedResumeFailed' if resume fails) so
+    -- supervisor / fallback policy is unchanged; this event names
+    -- the specific failure mode that the bare rejection tag would
+    -- otherwise hide. The payload is the host-level issue from
+    -- 'HprfReloadEnqueueRejected' — for production hosts this is
+    -- @MrhiPreservingReloadRejected report@ carrying the rejected
+    -- command and the fan-in enqueue issue.
+  | MrePreservingReloadEnqueueRejected !issue
+
     -- | The preserving hot-swap was rejected. The payload is the
     -- structured outcome from
     -- @orchestrateHostPreservingReload@; operators pattern-match

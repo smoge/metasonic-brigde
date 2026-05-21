@@ -1456,6 +1456,9 @@ renderSmokeReloadEvent event =
       "    - preserving phase started"
     MrePreservingReloadCommitted ->
       "    - preserving phase committed"
+    MrePreservingReloadEnqueueRejected issue ->
+      "    - preserving reload enqueue rejected: "
+      <> renderHostIssueTag issue
     MrePreservingReloadRejected issue ->
       "    - preserving phase rejected: " <> renderHostPreservingIssueTag issue
     MreStoppedAudioReloadStarted ->

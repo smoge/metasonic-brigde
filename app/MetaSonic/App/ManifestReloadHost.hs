@@ -609,11 +609,14 @@ mapPreservingReloadReport
 mapPreservingReloadReport report =
   case sfierResult (mphsrEnqueueResult report) of
     SessionEnqueueRejected {} ->
-      -- Defensive under the strict v1 host contract: preflight drains
-      -- before this enqueue and the producer is configured by the
-      -- caller. Treat rejection as retryable because the old owner is
-      -- still installed.
-      oldOwnerStillInstalled
+      -- The fan-in service refused the preserving command outright
+      -- (e.g. mid-reload-window rejection). The command never ran,
+      -- so the old owner is intact and old ingress can be resumed.
+      -- Surface this as its own failure variant so orchestration can
+      -- emit 'MrePreservingReloadEnqueueRejected' on the operator
+      -- timeline; both this and 'HprfOldOwnerStillInstalled' funnel
+      -- to 'HpariReloadRejected' downstream.
+      reloadEnqueueRejected
     SessionEnqueued {} ->
       case mphsrDrainResult report of
         Nothing ->
@@ -630,6 +633,11 @@ mapPreservingReloadReport report =
               | otherwise ->
                   classifyDrainItems (sdrItems (sfidrDrain drained))
   where
+    reloadEnqueueRejected =
+      Left
+        (HprfReloadEnqueueRejected
+          (MrhiPreservingReloadRejected report))
+
     oldOwnerStillInstalled =
       Left
         (HprfOldOwnerStillInstalled

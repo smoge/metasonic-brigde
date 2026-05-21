@@ -21,14 +21,19 @@ import           MetaSonic.App.ManifestLiveReloadDemo   (LiveReloadRoute (..),
                                                          SupervisedFactoryFlavor (..),
                                                          renderLiveReloadRoute,
                                                          selectLiveReloadRoute)
+import           MetaSonic.App.ManifestOSCIngressOps    (ManifestOSCIngressOpsIssue)
 import           MetaSonic.App.ManifestReloadCli        (renderHostPreservingIssueTag,
                                                          renderHostStoppedAudioIssueTag,
+                                                         renderSmokeReloadEvent,
                                                          renderStrategyRan)
-import           MetaSonic.App.ManifestReloadHost       (ManifestReloadHostStrategy (..),
+import           MetaSonic.App.ManifestReloadEvent      (ManifestReloadEvent (..))
+import           MetaSonic.App.ManifestReloadHost       (ManifestReloadHostIssue (..),
+                                                         ManifestReloadHostStrategy (..),
                                                          ManifestReloadHostStrategyRan (..))
 import           MetaSonic.App.ManifestReloadOrchestration
                                                         (HostPreservingReloadIssue (..),
                                                          HostStoppedAudioReloadIssue (..))
+import qualified MetaSonic.Session.ManifestReload      as MR
 
 
 appManifestLiveReloadDemoRenderTests :: TestTree
@@ -113,6 +118,24 @@ appManifestLiveReloadDemoRenderTests =
   , testCase "renderLiveReloadRoute LiveReloadSupervised SfRequirePreserving"
       $ renderLiveReloadRoute (LiveReloadSupervised SfRequirePreserving)
           @?= "supervised (require-preserving; reloadSupervised + HostStackFactory)"
+
+    -- The new 'MrePreservingReloadEnqueueRejected' constructor must
+    -- be reachable through 'renderSmokeReloadEvent' (and therefore
+    -- 'renderLiveReloadEvents'), or its appearance in the timeline
+    -- would silently fall back to the @Show@-derived default. The
+    -- assertion pins the exact operator line for an inner
+    -- 'MrhiPlanning' issue ("planning" tag); production wraps the
+    -- issue in 'MrhiPreservingReloadRejected' through
+    -- 'mapPreservingReloadReport' so the realistic tag will be
+    -- "preserving-reload-rejected", but the inner choice does not
+    -- change the wiring this test pins.
+
+  , testCase "renderSmokeReloadEvent wires up MrePreservingReloadEnqueueRejected" $ do
+      let issue :: ManifestReloadHostIssue ManifestOSCIngressOpsIssue
+          issue = MrhiPlanning (MR.MriUnknownManifestDemo "probe-demo")
+          event = MrePreservingReloadEnqueueRejected issue
+      renderSmokeReloadEvent event
+        @?= "    - preserving reload enqueue rejected: planning"
   ]
 
 -- | Carried-issue stand-in: a payload whose textual content includes

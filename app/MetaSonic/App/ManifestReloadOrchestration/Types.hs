@@ -159,10 +159,26 @@ data HostPreservingDrainFailure issue
   deriving stock (Eq, Show)
 
 -- | Owner/service state after the preserving hot-swap command fails.
+--
+-- Both 'HprfReloadEnqueueRejected' and 'HprfOldOwnerStillInstalled'
+-- describe a retryable state (the old owner is still installed and
+-- old ingress can be resumed) and orchestration collapses them onto
+-- the same public outcome ('HpariReloadRejected') so downstream
+-- supervisor / fallback policy is unchanged. They differ in /which/
+-- failure mode produced the live-stack survivor: the command itself
+-- was rejected before it could affect ownership (e.g. fan-in queue
+-- still locked), versus the command ran but the owner did not flip
+-- (e.g. drained-but-not-replaced). The orchestrator emits a distinct
+-- 'MrePreservingReloadEnqueueRejected' event for the enqueue-rejected
+-- variant so the operator timeline names the specific failure mode.
 data HostPreservingReloadFailure issue
-  = HprfOldOwnerStillInstalled !issue
-    -- ^ The preserving command rejected without replacing or stopping
-    -- the old owner.
+  = HprfReloadEnqueueRejected !issue
+    -- ^ The preserving command could not be enqueued at the fan-in
+    -- service (e.g. fan-in service still in reload window). The
+    -- command never ran and the old owner is unaffected.
+  | HprfOldOwnerStillInstalled !issue
+    -- ^ The preserving command was enqueued and processed but the
+    -- swap did not take effect; the old owner is still installed.
   | HprfTerminal !issue
     -- ^ The preserving command reached a terminal owner/service state.
   deriving stock (Eq, Show)
