@@ -3835,14 +3835,20 @@ Still gated:
   `MetaSonic.App.ManifestReloadSupervisorAdapter` +
   `MetaSonic.App.ManifestReloadHostStack` +
   `MetaSonic.App.ManifestReloadPreservingHostStack` +
-  `MetaSonic.App.ManifestReloadTryPreservingHostStack`; two
-  supervised audible routes are landed and tier-2 confirmed:
-  `StoppedAudioOnly` (hardware-confirmed 2026-05-20 plus
-  follow-up no-regression run after the route-rendering flip)
-  and `TryPreservingThenStoppedAudio` (two marker-clean tier-2
-  runs of the new `just manifest-supervised-try-preserving-live-smoke`
-  wrapper on host RME ADI-2 Pro / PipeWire 2026-05-20). The
-  classified `InWindowReloadOutcome` and the four-variant
+  `MetaSonic.App.ManifestReloadTryPreservingHostStack`; all
+  three supervised audible routes are landed and tier-2
+  confirmed: `StoppedAudioOnly` (hardware-confirmed 2026-05-20
+  plus follow-up no-regression run after the route-rendering
+  flip), `TryPreservingThenStoppedAudio` (two marker-clean
+  tier-2 runs of the
+  `just manifest-supervised-try-preserving-live-smoke` wrapper
+  on host RME ADI-2 Pro / PipeWire 2026-05-20), and
+  `RequirePreserving` (two marker-clean tier-2 runs of the
+  `just manifest-supervised-require-preserving-live-smoke`
+  wrapper on the same host 2026-05-20, with the
+  load-bearing negative marker pinning the no-fallback-
+  composition invariant). The classified
+  `InWindowReloadOutcome` and the four-variant
   `SupervisedReloadOutcome` (Committed / RequestRejected /
   RejectedRecovered / Escalated) underpin all three routes
   through one supervisor primitive. Evidence is classified
