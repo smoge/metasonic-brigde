@@ -43,7 +43,12 @@ flagged by the recent narrative checkpoint at
 and the "What this slice does NOT do" list in the live-session v0 note at
 [2026-05-20-b-manifest-live-session-v0.md (line 179)](2026-05-20-b-manifest-live-session-v0.md).
 
-## Problem
+## Problem (pre-implementation)
+
+State of the system at design time, before `144901f` + `737b124`
+landed. Preserved as the historical motivation for the slice; for
+the post-implementation behavior, see the Status header above and
+the corresponding helpers in `ManifestLiveCommon`.
 
 The `--manifest-live-session` operator surface accepts OSC writes
 continuously, including during a supervised reload. When a packet
@@ -52,30 +57,37 @@ arrives during the reload window, after the supervisor has flipped
 new owner has been installed, the host-level enqueue gate rejects it
 with `SessionEnqueueRejected _ cmd SeiReloadInProgress`.
 
-Today the live session renders that rejection identically to any other
-queue-side enqueue failure:
+At design time the live session rendered that rejection identically
+to any other queue-side enqueue failure:
 `osc enqueue-reject: CmdControlWrite ... issue=...`. Manifest-side
-rejections already have their own `osc reject (manifest): ...` line,
-but the queue-side line does not distinguish a normal enqueue failure
+rejections already had their own `osc reject (manifest): ...` line,
+but the queue-side line did not distinguish a normal enqueue failure
 (`SeiQueueFull`, `SeiSessionUnavailable`) from the expected transient
 reload-window rejection (`SeiReloadInProgress`). Worse, see the
-investigation finding below, the same rejected packet currently prints
+investigation finding below, the same rejected packet was printed
 **twice**.
 
-## Current Surfaces
+## Surfaces at design time
 
-Three files cooperate to produce the rendered line:
+Three files cooperated to produce the rendered line at the moment
+this note was written. The `liveOSCListenerHooks` wiring described
+in the third bullet has since changed in `737b124`; the
+`FanIn.hs` and `ManifestOSCListener.hs` paths are unchanged.
 
 - [src/MetaSonic/Session/FanIn.hs:354-380](../src/MetaSonic/Session/FanIn.hs#L354-L380):
   `enqueueSessionFanInCommand` checks `sfihsReloadStatus` and produces
   `SessionEnqueueRejected _ _ SeiReloadInProgress` when reload is in
-  progress.
+  progress. (Unchanged by the slice.)
 - [app/MetaSonic/App/ManifestOSCListener.hs:136-162](../app/MetaSonic/App/ManifestOSCListener.hs#L136-L162):
   `processManifestOSCPacket` parses, projects, submits, and dispatches
-  to hooks. The double-fire issue lives here.
-- [app/MetaSonic/App/ManifestLiveCommon.hs:445-475](../app/MetaSonic/App/ManifestLiveCommon.hs#L445-L475):
-  `liveOSCListenerHooks`, `renderOSCAccept`, and `renderOSCIssue`
-  collapse the listener events into the operator-facing text.
+  to hooks. The double-fire was here. (Unchanged by the slice; the
+  dedup is resolved at the renderer site, not the listener API.)
+- `app/MetaSonic/App/ManifestLiveCommon.hs`:
+  `liveOSCListenerHooks`, plus the private `renderOSCAccept` /
+  `renderOSCIssue` pair, collapsed the listener events into the
+  operator-facing text. **The private pair was deleted in `737b124`.**
+  The hooks now route through the exported `renderOSCAcceptLine` /
+  `renderOSCIssueLine` helpers added in `144901f`.
 
 ## Investigation findings
 
@@ -113,10 +125,13 @@ Looking at the two renderers in `ManifestLiveCommon.hs`:
 - `renderOSCIssue`'s `MoliEnqueueRejected cmd queueIssue` arm renders
   the same `"osc enqueue-reject: <cmd> issue=<queueIssue>"`.
 
-Both fire for the same packet, both print, with identical content.
-**The live session prints two identical `osc enqueue-reject` lines
-per rejected packet today.** Pre-existing bug, independent of the
-reload-window classification work, but the slice has to fix it.
+Both fired for the same packet, both printed, with identical content.
+**At design time the live session printed two identical
+`osc enqueue-reject` lines per rejected packet.** Pre-existing bug,
+independent of the reload-window classification work, but the slice
+had to fix it — and did, in `737b124`, by deleting the legacy
+private pair and routing the hooks through helpers whose `Maybe`
+return makes the dedup structural rather than discipline-based.
 
 ## Contract
 
@@ -158,10 +173,20 @@ this slice: the packet event is concurrent ingress activity, while
 strategy/orchestrator path. A future UI event stream can unify those
 views if a real consumer needs it.
 
-## Implementation plan
+## Implementation plan (executed in `144901f` + `737b124`)
 
-Single render-layer commit. No listener-API change, no ingress
-rewiring, no `ManifestReloadEvent` change.
+The slice landed as a render-layer change with no listener-API
+change, no ingress rewiring, and no `ManifestReloadEvent`
+constructor. The original plan called for a single commit; on
+execution it landed as two for testability: `144901f` added the
+exported pure helpers + the 13-case test module against a parallel
+testable surface (the legacy renderer was still wired); `737b124`
+rewired `liveOSCListenerHooks` to the new helpers and deleted the
+legacy private pair (-37 / +22 net). The two-commit shape made the
+behavioral cut (`737b124`) trivially small to review against the
+pure contract (`144901f`).
+
+Plan as written, retained for the design record:
 
 In `ManifestLiveCommon.hs`:
 
@@ -300,23 +325,39 @@ small.
   its timeline too. No additional work; the commit message should
   mention the spillover.
 
-## Commit shape
+## Commit shape (as landed)
 
-One commit: `Render reload-window OSC rejection distinctly; fix
-listener double-print`.
+Two commits, split for review clarity (the pre-implementation plan
+had a one-commit shape; the executed shape separates the contract
+from the behavior change):
 
-Touches:
+1. **`144901f`** — `Add pure OSC listener-event line renderers
+   (renderOSCAcceptLine + renderOSCIssueLine)`. Exports the two
+   helpers in `ManifestLiveCommon`, adds the focused test module
+   `MetaSonic.Spec.AppManifestLiveCommonOSCRender` with 13 cases
+   (6 issue-line rows, 4 accept-line rows, 3 synthetic listener
+   fan-out composition tests). Touches:
+   - `app/MetaSonic/App/ManifestLiveCommon.hs`
+   - `test/MetaSonic/Spec/AppManifestLiveCommonOSCRender.hs` (new)
+   - `test/Spec.hs`
+   - `package.yaml` (hpack regenerates `.cabal`)
 
-- `app/MetaSonic/App/ManifestLiveCommon.hs` (renderer + hook
-  adjustment + test-facing renderer exports);
-- `test/MetaSonic/Spec/AppManifestLiveCommonOSCRender.hs` (new focused
-  test module);
-- `test/Spec.hs` (register the new test group);
-- `package.yaml` (add the new test module; let hpack regenerate the
-  `.cabal` file).
+   At this commit, the helpers exist as a parallel testable surface;
+   the legacy `renderOSCAccept` / `renderOSCIssue` pair is still
+   wired and still double-prints.
 
-If the implementation instead extends the existing
-`AppManifestLiveSession` tests, the test-module wiring disappears, but
-the focused module is the cleaner shape because `ManifestLiveCommon`
-is shared by both live entrypoints. Suite grows by roughly 5-6
-deterministic cases.
+2. **`737b124`** — `Wire live OSC listener hooks to
+   renderOSCAcceptLine / renderOSCIssueLine`. Rewires
+   `liveOSCListenerHooks.molhOnAccepted` to
+   `mapM_ (putStrLn . ("  " <>)) . renderOSCAcceptLine` and
+   `molhOnIssue` to `renderOSCIssueLine`, then deletes the legacy
+   private pair. Net diff: -37 / +22. Touches only
+   `app/MetaSonic/App/ManifestLiveCommon.hs`.
+
+   This is the behavioral commit. The 13 deterministic cases from
+   `144901f` now exercise the actually-wired hooks. Suite stays at
+   1306/1306.
+
+Suite grew by 13 deterministic cases (1293 → 1306) at the
+`144901f` close; `737b124` is suite-neutral by construction (the
+cases pin the helpers' contract, not the hook wiring path).
