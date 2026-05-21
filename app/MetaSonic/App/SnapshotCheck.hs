@@ -306,13 +306,14 @@ costLabChecks rows =
       | fam <- familyNames
       ]
 
-    -- Variant fan-out is now 6 (node-loop, region-kernel, rfused,
-    -- generated, generated-block, generated-super). Bumping
-    -- per-family row counts 5x -> 6x; the underlying member
-    -- counts per family are unchanged.
+    -- Variant fan-out is 6 (node-loop, region-kernel, rfused,
+    -- generated, generated-block, generated-super). Row counts are
+    -- member count × variant count. The corpus family has eight
+    -- members after the spectral-freeze-pad row grew the second
+    -- @lpf-bed@ template alongside @texture@.
     expectedFamilyCounts =
       [ ("add-chain",             24)
-      , ("corpus",                42)
+      , ("corpus",                48)
       , ("dynamic-gain",          18)
       , ("fanout",                 6)
       , ("generated-tail-sweep",  36)
@@ -370,10 +371,12 @@ costLabChecks rows =
     -- unsupported to emitted accordingly.
     --
     -- Phase 7.G step 4: the synthetic 'generated-tail-sweep'
-    -- family contributes six more generator-supported members,
-    -- pushing emitted 20 -> 26 and considered 22 -> 28.
-    -- unsupported stays at 2.
-    expectedGeneratedRows = 26
+    -- family contributes six generator-supported members, pushing
+    -- emitted 20 -> 26 and considered 22 -> 28. The later
+    -- spectral-freeze-pad @lpf-bed@ corpus template adds one more
+    -- generator-supported member, so emitted is now 27 and
+    -- considered is 29. Unsupported stays at 2.
+    expectedGeneratedRows = 27
 
     -- §7.E step 5: pin the considered / unsupported split too.
     -- considered = one generated row per cost-lab member; it moves
@@ -381,7 +384,7 @@ costLabChecks rows =
     -- whose maximal selected candidate the generator declines;
     -- it moves only when the generator's shape coverage changes.
     -- Neither flaps with bench noise.
-    expectedGeneratedConsidered  = 28
+    expectedGeneratedConsidered  = 29
     expectedGeneratedUnsupported = 2
 
     generatedUnsupportedCount =
@@ -477,16 +480,16 @@ costLabChecks rows =
                  , lrEquivalence r /= EqExact ]
 
     -- Pinned super-mode classification counts. Derived from the
-    -- diagnostic output the first run reported: 17 GainOut + 1
-    -- AddGainOut recognized, 8 fallback (= 26 emitted - 18
-    -- recognized). All structural; will shift only when the
-    -- generator widens or the recognizer set grows.
-    expectedSuperRecognized = 18
+    -- diagnostic output: 18 GainOut + 1 AddGainOut recognized,
+    -- 8 fallback (= 27 emitted - 19 recognized). All structural;
+    -- will shift only when the corpus, generator, or recognizer set
+    -- grows.
+    expectedSuperRecognized = 19
     expectedSuperFallback   = 8
     expectedSuperKindCounts :: [(String, Int)]
     expectedSuperKindCounts =
       [ ("AddGainOut",  1)
-      , ("GainOut",    17)
+      , ("GainOut",    18)
       , ("fallback",    8)
       ]
 
