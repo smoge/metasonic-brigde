@@ -29,6 +29,7 @@ import           MetaSonic.App.ManifestLiveSession
                                              parseLiveSessionCommand,
                                              renderLiveSessionOutcome,
                                              renderLiveSessionResourceEvents,
+                                             renderLiveSessionSupervisorEvents,
                                              resourceTimelineForOutcome,
                                              runReloadWith,
                                              stepFromOutcome,
@@ -43,6 +44,7 @@ import           MetaSonic.App.ManifestReloadOrchestration.Types
                                             (HostPreservingReloadIssue (..))
 import           MetaSonic.App.ManifestReloadSupervisor
                                             (InWindowReloadOutcome (..),
+                                             SupervisedReloadEvent (..),
                                              SupervisedReloadOutcome (..),
                                              SupervisorOps (..))
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
@@ -60,6 +62,8 @@ appManifestLiveSessionTests =
                                          resourceTimelineForOutcomeTests
   , testGroup "renderLiveSessionResourceEvents"
                                          renderLiveSessionResourceEventsTests
+  , testGroup "renderLiveSessionSupervisorEvents"
+                                         renderLiveSessionSupervisorEventsTests
   , testGroup "withTrackedFactory"       withTrackedFactoryTests
   , testGroup "runReloadWith"            runReloadWithTests
   ]
@@ -244,6 +248,80 @@ renderLiveSessionResourceEventsTests =
             , "closed previous stack"
             , "fallback rebuild failed"
             , "serving plan: (no live stack)"
+            ]
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- renderLiveSessionSupervisorEvents
+-- ---------------------------------------------------------------------------
+
+-- | One pinned-output test per 'SupervisedReloadOutcome' covering
+-- the observed event stream the supervisor emits. The expected
+-- event sequences mirror what 'AppManifestReloadSupervisor's
+-- "withEvents" tests pin on the supervisor side; this group pins
+-- the operator wording the live session renders from that
+-- sequence.
+--
+-- Cause payloads in 'SreInWindowRejectedLiveFallback' /
+-- 'SreInWindowTerminal' / 'SreFallbackOpenFailed' are
+-- intentionally absent from the rendered lines — they are still
+-- shown by the @cause:@ line in 'runReloadWith', so embedding
+-- them on the event lines too would duplicate noise (the F-1
+-- leak guard structurally holds because the renderer matches on
+-- the constructor and discards the payload regardless of @e@).
+renderLiveSessionSupervisorEventsTests :: [TestTree]
+renderLiveSessionSupervisorEventsTests =
+  [ testCase "Committed renders [in-window: started, in-window: committed]" $
+      renderLiveSessionSupervisorEvents
+          ([ SreInWindowStarted
+           , SreInWindowCommitted
+           ] :: [SupervisedReloadEvent String])
+        @?= [ "in-window: started"
+            , "in-window: committed"
+            ]
+
+  , testCase "RequestRejected renders [in-window: started, in-window: rejected-live-fallback]" $
+      renderLiveSessionSupervisorEvents
+          ([ SreInWindowStarted
+           , SreInWindowRejectedLiveFallback "live-fallback-cause"
+           ] :: [SupervisedReloadEvent String])
+        @?= [ "in-window: started"
+            , "in-window: rejected-live-fallback"
+            ]
+
+  , testCase "RejectedRecovered renders the six-step terminal+close+open sequence" $
+      renderLiveSessionSupervisorEvents
+          ([ SreInWindowStarted
+           , SreInWindowTerminal "in-window-cause"
+           , SreClosePreviousStarted
+           , SreClosePreviousSucceeded
+           , SreFallbackOpenStarted
+           , SreFallbackOpenSucceeded
+           ] :: [SupervisedReloadEvent String])
+        @?= [ "in-window: started"
+            , "in-window: terminal"
+            , "close previous stack: started"
+            , "close previous stack: succeeded"
+            , "fallback open: started"
+            , "fallback open: succeeded"
+            ]
+
+  , testCase "Escalated renders the six-step sequence ending in fallback open: failed" $
+      renderLiveSessionSupervisorEvents
+          ([ SreInWindowStarted
+           , SreInWindowTerminal "in-window-cause"
+           , SreClosePreviousStarted
+           , SreClosePreviousSucceeded
+           , SreFallbackOpenStarted
+           , SreFallbackOpenFailed "rebuild-cause"
+           ] :: [SupervisedReloadEvent String])
+        @?= [ "in-window: started"
+            , "in-window: terminal"
+            , "close previous stack: started"
+            , "close previous stack: succeeded"
+            , "fallback open: started"
+            , "fallback open: failed"
             ]
   ]
 

@@ -60,6 +60,16 @@ module MetaSonic.App.ManifestLiveSession
   , resourceTimelineForOutcome
   , renderLiveSessionResourceEvents
 
+    -- * Supervisor event stream rendering (pure, table-tested)
+    --
+    -- Operator-facing wording for the observed
+    -- 'SupervisedReloadEvent' stream emitted by
+    -- 'reloadSupervisedWithEvents'. Co-exists with the derived
+    -- 'renderLiveSessionResourceEvents' summary: the resource
+    -- timeline says "what is now true", the supervisor events say
+    -- "what happened, in order".
+  , renderLiveSessionSupervisorEvents
+
     -- * Tracked-stack factory wrapper (exported for tests)
   , withTrackedFactory
 
@@ -141,9 +151,10 @@ import           MetaSonic.App.ManifestReloadTryPreservingHostStack
                                                 (mkTryPreservingHostStackFactory,
                                                  realTryPreservingHostStackOps)
 import           MetaSonic.App.ManifestReloadSupervisor
-                                                (SupervisedReloadOutcome (..),
+                                                (SupervisedReloadEvent (..),
+                                                 SupervisedReloadOutcome (..),
                                                  SupervisorOps,
-                                                 reloadSupervised)
+                                                 reloadSupervisedWithEvents)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                                 (HostStackFactory (..),
                                                  withHostStackSupervisorAdapter)
@@ -375,6 +386,37 @@ renderLiveSessionResourceEvents planLabel = map render
         "serving plan: " <> planLabel plan
       LsreNoLiveStack ->
         "serving plan: (no live stack)"
+
+
+-- | Render the observed 'SupervisedReloadEvent' stream as one line
+-- per event. Operator-facing wording: each line names the
+-- supervisor stage and outcome ("started" / "committed" /
+-- "rejected-live-fallback" / "terminal" / "succeeded" / "failed")
+-- without embedding the carried error payload — the per-outcome
+-- cause is still shown by the dedicated @cause:@ line above the
+-- resource timeline, so duplicating it on every event line would
+-- only add noise.
+--
+-- Payload-free by construction: the renderer matches on the
+-- constructor and ignores carried payloads (the F-1 leak guard
+-- structurally; no @show@ on @e@ values reaches the operator
+-- transcript).
+renderLiveSessionSupervisorEvents
+  :: [SupervisedReloadEvent e]
+  -> [String]
+renderLiveSessionSupervisorEvents = map render
+  where
+    render = \case
+      SreInWindowStarted              -> "in-window: started"
+      SreInWindowCommitted            -> "in-window: committed"
+      SreInWindowRejectedLiveFallback _ ->
+                                         "in-window: rejected-live-fallback"
+      SreInWindowTerminal _           -> "in-window: terminal"
+      SreClosePreviousStarted         -> "close previous stack: started"
+      SreClosePreviousSucceeded       -> "close previous stack: succeeded"
+      SreFallbackOpenStarted          -> "fallback open: started"
+      SreFallbackOpenSucceeded        -> "fallback open: succeeded"
+      SreFallbackOpenFailed _         -> "fallback open: failed"
 
 
 -- ============================================================================
@@ -771,14 +813,35 @@ runReloadWith resolver planLabel causeLabel onLiveStackChanged supOps currentPla
     Right requestedPlan -> do
       fallbackPlan <- readIORef currentPlanRef
       writeIORef reloadEventsRef []
-      out <- reloadSupervised supOps fallbackPlan requestedPlan
+      -- Supervisor event stream is local to this reload — it
+      -- describes the supervisor's close/open lifecycle for this
+      -- one call. We allocate the ref inside the case so a stale
+      -- list from a previous reload cannot leak into the next
+      -- render. 'safeEmit' inside 'reloadSupervisedWithEvents'
+      -- guards the supervisor's cleanup invariants against any
+      -- exception this callback might throw (ffaca33).
+      supervisorEventsRef <- newIORef []
+      out <- reloadSupervisedWithEvents
+               (\ev -> modifyIORef' supervisorEventsRef (++ [ev]))
+               supOps fallbackPlan requestedPlan
       events <- readIORef reloadEventsRef
+      supervisorEvents <- readIORef supervisorEventsRef
       putStrLn ""
       let (lso, step) = stepFromOutcome out
       putStrLn $
         "  supervised outcome: " <> renderLiveSessionOutcome lso
       putStrLn "  reload events:"
       mapM_ putStrLn (renderLiveReloadEvents events)
+      -- Observed supervisor-layer timeline: what the supervisor
+      -- actually did to the host stack around the in-window slot
+      -- (in-window start/outcome + close-previous + fallback-open).
+      -- The derived 'resource timeline:' block below stays as the
+      -- compact "what is now true" summary; this block is the
+      -- "what happened, in order" narrative read from
+      -- 'reloadSupervisedWithEvents'.
+      putStrLn "  supervisor events:"
+      mapM_ (putStrLn . ("    - " <>))
+            (renderLiveSessionSupervisorEvents supervisorEvents)
       writeIORef lastOutcomeRef (Just lso)
       when (lso == LsoCommitted) $
         writeIORef currentPlanRef requestedPlan
