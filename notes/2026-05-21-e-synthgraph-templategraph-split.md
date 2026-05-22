@@ -418,10 +418,10 @@ This rule keeps authoring convenient, compilation explicit, and the
 runtime simple.
 
 
-## Related artifacts
+## Related Artifacts
 
-Source anchors (file-level links, symbol-named anchors — line numbers
-deliberately omitted so the table stays stable across small edits):
+Source anchors (file-level links with symbol-named anchors; no line
+numbers):
 
 | Topic | Source file | Symbol / anchor |
 |-------|-------------|-----------------|
