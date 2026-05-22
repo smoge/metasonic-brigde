@@ -778,3 +778,60 @@ Follow-up chosen from this pass: none. This is durable validation of
 the Phase 8b saw-family operator path, not evidence for a new code
 slice. The standing candidates remain watch items until a future
 operator pass repeats or sharpens one of them.
+
+### 2026-05-22 — reproducible noise-family OSC pass
+
+Transcript: `/tmp/metasonic-live-session-musical-long-noise.log`,
+captured against `examples/manifests/saw-noise-filter.json` starting
+from `noise-filter-soft` with `--strategy require-preserving`.
+
+Objective result:
+
+- Session opened on `noise-filter-soft` with one active voice, OSC
+  port `17004`, and the expected three-control addressable surface.
+- `demos` listed all four Phase 8b Tier 1 demos and marked
+  `noise-filter-soft` as current.
+- `controls` printed the noise-family pattern and addressable surfaces
+  for cutoff (`/v0/lpf/0`), q (`/v0/lpf/1`), and level
+  (`/v0/gain/0`).
+- Pre-reload OSC writes were accepted with the polished operator
+  rendering: level `0.15`, cutoff `900`, cutoff `3200`, q `1`, and
+  q `3`.
+- The timed multi-write sweeps sent through `tools/send_osc.py` with
+  `--interval 0.2` landed cleanly: cutoff `900` to `3200`, and q `1`
+  to `3`.
+- `demo noise-filter-sharp` committed through the preserving route and
+  reported `serving plan: noise-filter-sharp`.
+- Post-reload `controls` showed the sharp defaults, cutoff `3200.0`
+  and q `3.0`, while preserving the same addressable surface shape.
+- Post-reload OSC writes were accepted for cutoff `900`, q `1`, and
+  level `0.1`.
+- The deliberate out-of-range cutoff write `10000.0` was rejected at
+  ingress with the declared `[200.0, 6000.0]` range.
+- The cross-family `demo saw-filter-dark` request was rejected under
+  `require-preserving`; the status check confirmed the stack stayed
+  live on `noise-filter-sharp` with `audio running: yes`, one active
+  voice, open ingress, and `last outcome: request-rejected`.
+- `quit` terminated cleanly with command exit code `0`.
+
+Observed friction:
+
+- This pass completed the saw/noise symmetry check: both source
+  families now have an extended pass covering `demos`, `controls`,
+  multi-write OSC control, preserving reload, post-reload `controls`,
+  post-reload OSC writes, range rejection, cross-family rejection,
+  `status`, and `quit`.
+- The OSC accept-line polish held up across the noise-family reload,
+  including binding metadata lookup after `noise-filter-sharp` became
+  current.
+- The same-family reload and cross-family reject behaviors matched the
+  Phase 8b repertoire contract from the noise side as well.
+- ALSA stderr noise remained present at startup, but it did not
+  obscure the post-start commands or OSC accept/reject evidence in
+  this run.
+- No repeated or blocking interaction friction surfaced.
+
+Follow-up chosen from this pass: none. Under the Evidence To Code
+rubric above, this is a third no-new-lane pass after the Phase 8b
+closure tag and completes the mirrored saw/noise validation. The
+standing candidates remain watch items, not implementation pressure.
