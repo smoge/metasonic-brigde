@@ -886,3 +886,26 @@ Until then, no implementation opens. The 8e scripted-runner slice
 itself is closed: text-scaffolding works as designed, the operator's
 ears remain the perceptual authority, no harness changes warranted
 by this run.
+
+### 2026-05-22 — shutdown-only isolation pass confirms snap is teardown pressure
+
+Transcript: `/tmp/metasonic-live-session-shutdown-only.log`.
+
+Pass A of the bisection plan from the prior entry: `status` then
+`quit` on `examples/manifests/preserve-smooth-cutoff.json` with no
+reload and no OSC sweep. The audible snap at final `quit`
+reproduced. This isolates the snap to session shutdown / teardown,
+not preserving reload and not KSmooth state migration.
+
+Candidate lane: **graceful session shutdown fade/mute**. Pass B
+(OSC sweep, no reload) was not run — the bisection's first step
+already identified the cause, and running Pass B would only confirm
+the same shutdown-teardown attribution by a longer route.
+
+Follow-up chosen from this pass: none. The snap is now a
+confirmed-cause watch item, not just a hypothesized one. Under the
+Evidence To Code rubric this remains one repeated observation
+(scripted pass + isolation pass on the same session shape, same
+shutdown moment); promoting it to a code lane needs a second
+independent operator pass surfacing the same friction, or a
+deliberately named roadmap-completeness exception. Neither today.
