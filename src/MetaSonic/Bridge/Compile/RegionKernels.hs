@@ -49,7 +49,7 @@ Match arity is /not/ implicit: 'findKernelMatch' returns a
 'kernelArity' and the dispatch in 'findKernelMatch' — the splitter
 consumes whatever length the descriptor reports.
 
-Currently five kernel shapes are recognized. The sink-terminal kernels
+Currently seven kernel shapes are recognized. The sink-terminal kernels
 accept either 'KOut' or 'KBusOut' at the terminal slot; both dispatch
 to the same per-node kernel ('process_out' on the C++ side) and read
 their bus index from @rnControls[0]@, so the fused kernel body absorbs
@@ -99,6 +99,14 @@ them identically. See 'isSinkTerminal'.
     iterator. Filter / gain / sink absorption are identical to
     'RSawLpfGainOut'.
 
+  * 'RNoiseLpfGainOut' — 4-node sink-terminal:
+    @[KNoiseGen, KLPF, KGain, /sink/]@. The noise counterpart of
+    'RSawLpfGainOut'; the source is a 'q::white_noise_gen' xorshift
+    PRNG (same per-sample read pattern as 'RNoiseGainOut'), and the
+    LPF / gain / sink absorption matches 'RSawLpfGainOut'. As with
+    the 3-node noise kernel, bit-equivalence depends on advancing
+    the PRNG once per sample exactly as 'process_noisegen' does.
+
 /Longest-match priority/. At each candidate offset 'findKernelMatch'
 tries shapes longest-first: for example, on @[SawOsc, LPF, Gain, Out]@
 the 4-node 'RSawLpfGainOut' wins over the 3-node 'RSawLpfGain' prefix
@@ -139,8 +147,8 @@ Match preconditions, common to every fused kernel (3-node and
      Audio-modulated gain stays on 'RNodeLoop' just like §4.C's
      scalar Gain fusion stays off audio-rate Gains.
   5. Where the kernel /absorbs/ the Gain's output (any sink-
-     terminal shape, currently 'RSinGainOut' and
-     'RSawLpfGainOut'), the Gain itself must additionally have
+     terminal shape — see the kernel descriptions above for the
+     current set), the Gain itself must additionally have
      'rnConsumerCount == 1' — otherwise an external consumer
      also reads the gain's buffer and the sink-terminal kernel
      must not absorb it. Longest-match falls through to the
