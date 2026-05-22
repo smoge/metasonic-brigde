@@ -564,3 +564,53 @@ single-cutoff fixture, and the first operator pass over it validated
 that premise. The next useful pass should use this manifest musically
 with OSC writes; only open a new code slice if that pass makes a
 specific pain point sharp.
+
+### 2026-05-22 — Phase 8b saw/noise OSC pass
+
+Transcript: `/tmp/metasonic-live-session-repertoire-osc.log`,
+captured against `examples/manifests/saw-noise-filter.json` starting
+from `saw-filter-dark` with `--strategy require-preserving`.
+
+Objective result:
+
+- `saw-filter-dark` opened with four addressable OSC controls:
+  pitch (`/v0/carrier/0`), cutoff (`/v0/lpf/0`), q (`/v0/lpf/1`),
+  and level (`/v0/gain/0`).
+- Pre-reload OSC writes were accepted for all four controls:
+  level `0.18`, cutoff `700.0`, cutoff `2400.0`, q `2.5`, and
+  pitch `110.0`, `330.0`, `220.0`.
+- `demo saw-filter-bright` committed with the preserving route and
+  reported `serving plan: saw-filter-bright`.
+- A repeated `demo saw-filter-bright` while already on the bright
+  plan also committed. This is behaviorally harmless in the pass, but
+  it confirms the shell does not currently special-case same-demo
+  reloads.
+- Post-reload OSC writes still reached the preserved voice: cutoff
+  `600.0`, q `0.7`, and level `0.12` were accepted on the bright
+  plan.
+- The deliberate out-of-range write to cutoff with value `10000.0`
+  was rejected at ingress with the declared `[200.0, 6000.0]` range.
+- `exit` terminated cleanly with command exit code `0`.
+
+Observed friction:
+
+- The richer saw surface is playable through `tools/send_osc.py`: the
+  operator could move level, cutoff, q, and pitch before reload, then
+  keep controlling cutoff/q/level after a preserving reload.
+- The OSC accept diagnostics are now visibly internal: they expose
+  `CmdControlWrite`, `ControlTag`, `MigrationKey`, and floating-point
+  representation noise such as `0.18000000715255737`. That did not
+  block this pass, but repeated OSC work makes the renderer polish
+  more noticeable than the earlier one-control fixtures did.
+- Current-value introspection still did not become a hard blocker.
+  The transcript proves accepted writes and rejects, but not a live
+  "what value is the voice currently using?" query.
+- Same-demo reloads are allowed and produce a full committed reload
+  block. The transcript does not show this causing confusion, so it
+  stays below implementation threshold.
+
+Follow-up chosen from this pass: no new code slice yet. The next
+sharpest candidate is cosmetic/operator rendering for OSC accept
+lines, but only if another pass confirms those internal constructors
+make live use harder. Current-value introspection remains
+design-note-first if it becomes the actual pain point.
