@@ -835,3 +835,20 @@ Follow-up chosen from this pass: none. Under the Evidence To Code
 rubric above, this is a third no-new-lane pass after the Phase 8b
 closure tag and completes the mirrored saw/noise validation. The
 standing candidates remain watch items, not implementation pressure.
+
+### 2026-05-22 — 8d-b smooth-cutoff preserving reload, no new lane
+
+Transcript: `/tmp/metasonic-live-session-smooth-cutoff.log`.
+
+The KSmooth-backed `preserve-smooth-cutoff` manifest opened under
+`--strategy require-preserving`, exposed the expected `/v0/cutoff/1`
+surface, and committed the preserving reload from
+`preserve-smooth-cutoff-dark` to `preserve-smooth-cutoff-bright`.
+Post-reload status stayed live (`audio running: yes`, `active
+voices: 1`), post-reload OSC writes to `/v0/cutoff/1` were accepted,
+and the out-of-range reject remained the existing polished
+diagnostic.
+
+No new operator friction surfaced. This confirms the 8d-b
+state-copy slice in the live operator path, but does not open a
+Delay or Env lane.
