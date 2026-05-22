@@ -111,11 +111,19 @@ with audio actually playing.
 
    A dark drone should start playing. The terminal prints an
    `initial fan-in:` block, then `ingress: open ... oscPort=17004`,
-   then the stdin prompt:
+   the addressable OSC surface (with `range=...` / `default=...` /
+   optional `cc=...` per binding), the five-line command
+   vocabulary under `commands:`, and then the per-line prompt:
 
    ```
-   Type a command, or <Enter> for status, or <Ctrl-D> to exit:
+   Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:
    ```
+
+   The five commands recognized at this prompt are `demo:KEY` /
+   `demo KEY` (supervised reload), `status` (same as `<Enter>`),
+   `help` (or `?`, prints the vocabulary), and `quit` (or `exit`,
+   same as `<Ctrl-D>`). Anything else echoes the typed line and
+   reprints the same vocabulary.
 
 2. **Press `<Enter>` once.** Read the status snapshot. Note whether
    the layout reads well at a glance or has to be studied.

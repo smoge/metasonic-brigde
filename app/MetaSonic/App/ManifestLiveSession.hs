@@ -22,10 +22,14 @@
 --     @tools/manifest_live_session_require_preserving_smoke.sh@.
 --   * Default strategy is 'RequirePreserving' — safest-by-default.
 --     Other strategies are opt-in via @--strategy STRATEGY@.
---   * The stdin protocol is not a real REPL. Only three command
---     shapes ('LscReloadTo', 'LscStatus', 'LscUnknown') plus 'LscQuit'
---     on EOF. Everything else prints a one-line help string and
---     continues serving.
+--   * The stdin protocol is not a real REPL. Five command shapes
+--     parsed by 'parseLiveSessionCommand': 'LscReloadTo' (@demo:KEY@
+--     colon form or @demo KEY@ single-token form), 'LscStatus' (empty
+--     line or @status@), 'LscHelp' (@help@ \/ @?@), 'LscQuit' (@quit@
+--     \/ @exit@ \/ EOF), and 'LscUnknown' for everything else. An
+--     'LscUnknown' echoes the original input and prints the same
+--     command vocabulary 'LscHelp' does, so a typo immediately tells
+--     the operator what's accepted.
 --
 -- The session shell is the first real consumer of the supervisor
 -- migration arc (slices 5.1–5.5). Until something concrete consumes
@@ -716,7 +720,7 @@ sessionLoop
   -> IORef [LiveEvent]
   -> IO ()
 sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef = do
-  putStrLn "Type a command, or <Enter> for status, or <Ctrl-D> to exit:"
+  putStrLn "Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:"
   hFlush stdout
   done <- isEOF
   if done

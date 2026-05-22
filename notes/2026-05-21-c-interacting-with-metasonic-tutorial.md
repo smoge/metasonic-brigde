@@ -260,9 +260,14 @@ stack exec -- metasonic-bridge --manifest-live-session \
 ```
 
 Default strategy is `require-preserving` (safest: never composes
-with stopped-audio fallback). Stdin protocol: `demo:KEY` triggers
-reload, `<Enter>` prints a status snapshot, `<Ctrl-D>` exits.
-Operator-pass playbook in
+with stopped-audio fallback). Stdin protocol: `demo:KEY` (colon
+form, preserves any internal whitespace in the key) or `demo KEY`
+(single-token form, rejects multi-token payloads rather than
+silently absorbing them) trigger a supervised reload; `<Enter>` or
+`status` prints the current status snapshot; `help` (or `?`)
+prints the command vocabulary; `quit` (or `exit`, or `<Ctrl-D>`)
+all exit cleanly through the same code path. Operator-pass
+playbook in
 [2026-05-21-b-live-session-operator-pass-playbook.md](2026-05-21-b-live-session-operator-pass-playbook.md).
 
 **MIDI-driven reload smoke** (manual device probe):
