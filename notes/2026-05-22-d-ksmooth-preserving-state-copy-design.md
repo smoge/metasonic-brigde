@@ -2,15 +2,22 @@
 
 Date: 2026-05-22
 
-Status: small implementation note. Cross-references the 8d-a design
-note for the substrate framing, predicate split, and harness contract;
-does not restate them.
+Status: closed. Implementation landed as `6f4128c`
+(`Implement KSmooth preserving state copy`). First-run calibration
+measured peak delta = 0 and RMS delta = 0 on the
+`preserve-smooth-cutoff` fixture; pinned bounds carry a small
+stability margin above zero. Both test suites green.
+
+Cross-references the 8d-a design note for the substrate framing,
+predicate split, and harness contract; does not restate them.
 
 Companion to:
 
 - [2026-05-22-c-ksmooth-swap-artifact-harness-design.md](2026-05-22-c-ksmooth-swap-artifact-harness-design.md) — 8d-a design note.
 - 8d-a implementation: `bec7d2f` (`Add KSmooth default-init swap artifact baseline`).
 - 8d-a design-note commit: `31a6d43`.
+- 8d-b implementation: `6f4128c` (`Implement KSmooth preserving state copy`).
+- 8d-b design-note commit: `72977cc`.
 
 Primary source material touched by this slice:
 
@@ -201,13 +208,16 @@ together in the unsupported-state test at line 9186. The split:
 
 ## Verification
 
-1. `just cpp-test` — the new C++ test must pass and the old
-   unsupported-lazy-state test must still pass with `kKindDelay`
-   only.
-2. `just stack-test` — all Haskell tests pass; the harness's
-   `stateCopies @?= 3` and `<= kSmallPeakBound` assertions must
-   both hold.
-3. `git diff --check` — whitespace / trailing-whitespace clean.
+1. `just cpp-test` — 323/323 passed. The new
+   `hot-swap migration: smooth state survives payload install` test
+   asserts `state_copy_count == 2` (sine source + smoother) and a
+   sample-for-sample match against the never-swapped reference. The
+   unsupported-lazy-state test still passes with `kKindDelay` only.
+2. `just stack-test` — 1394/1394 passed. The harness's
+   `stateCopies @?= 3` and `<= kSmallPeakBound` /
+   `<= kSmallRmsBound` assertions all hold; calibration observed
+   peak delta = 0, RMS delta = 0.
+3. `git diff --check` — clean.
 
 One commit, same shape as 8d-a's `bec7d2f`.
 
@@ -217,7 +227,7 @@ One commit, same shape as 8d-a's `bec7d2f`.
 | Slice | Status | Notes |
 |-------|--------|-------|
 | 8d-a | Closed (`bec7d2f`) | Default-init baseline measured |
-| **8d-b** (this note) | Open | KSmooth real state copy; harness flips to bounded |
+| **8d-b** (this note) | Closed (`6f4128c`) | KSmooth state copy; harness flipped to bounded; calibration observed 0/0 |
 | Later: `KDelay` slice | Not open | Would re-introduce `PreserveStatefulDefaultInit` if same shape applies |
 | Later: `KEnv` slice | Not open | Hardest state shape (multi-segment state machine) |
 
