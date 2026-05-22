@@ -202,10 +202,22 @@ import           MetaSonic.Session.State        (SessionState (..))
 -- @status@ each parse to their respective constructor; an input
 -- like @help me@ falls through to 'LscUnknown' because it does not
 -- equal any of the recognized tokens.
+--
+-- Two reload syntaxes are supported, and they have intentionally
+-- different whitespace semantics:
+--
+-- * @demo:KEY@ — the colon form. Trims outer whitespace; preserves
+--   internal whitespace inside the key (so @demo:foo bar@ resolves
+--   to the catalog key @\"foo bar\"@). This is the historical form.
+-- * @demo KEY@ — the space form. Single-token only: @demo foo@
+--   accepts; @demo foo bar@ rejects as 'LscUnknown' rather than
+--   silently absorbing the trailing token. Use the colon form for
+--   any key that genuinely contains internal whitespace.
 data LiveSessionCommand
   = LscReloadTo !String
-    -- ^ @demo:KEY@. The key string is the trimmed payload after
-    -- the @demo:@ prefix.
+    -- ^ @demo:KEY@ or @demo KEY@. The key string is the trimmed
+    -- payload (with the colon form's internal whitespace preserved,
+    -- and the space form's single-token rule already enforced).
   | LscStatus
     -- ^ Empty line, whitespace-only line, or the literal @status@.
   | LscHelp
@@ -237,6 +249,15 @@ parseLiveSessionCommand line =
         in if null key
              then LscUnknown line
              else LscReloadTo key
+      | "demo " `isPrefixOf` s ->
+        -- Single-token rule: split the payload on whitespace and
+        -- accept only the exactly-one-token shape. Empty payload
+        -- ('demo ' with nothing after) and multi-token payload
+        -- ('demo foo bar') both reject as malformed so trailing
+        -- tokens cannot be silently absorbed into the key.
+        case words (drop 5 s) of
+          [k] -> LscReloadTo k
+          _   -> LscUnknown line
       | otherwise ->
         LscUnknown line
   where
@@ -258,6 +279,7 @@ renderLiveSessionCommandHelp :: [String]
 renderLiveSessionCommandHelp =
   [ "  commands:"
   , "    demo:KEY    supervised reload to catalog demo KEY"
+  , "    demo KEY    same, single-token form (no internal whitespace)"
   , "    status      print current status (same as <Enter>)"
   , "    help        print commands (same as ?)"
   , "    quit        close session cleanly (same as exit, <Ctrl-D>)"

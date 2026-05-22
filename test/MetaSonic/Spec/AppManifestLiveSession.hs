@@ -92,10 +92,26 @@ parseLiveSessionCommandTests =
       "demo:" (LscUnknown "demo:")
   , row "demo: with whitespace-only payload is unknown"
       "demo:   " (LscUnknown "demo:   ")
-  , row "internal whitespace in the demo key is preserved"
+  , row "internal whitespace in the demo key is preserved (colon form)"
       "demo:foo bar" (LscReloadTo "foo bar")
   , row "uppercase DEMO: prefix is unknown (case-sensitive)"
       "DEMO:foo" (LscUnknown "DEMO:foo")
+
+  -- demo<space>KEY alias (single-token rule)
+  , row "demo<space>KEY single-token form reloads to KEY"
+      "demo foo" (LscReloadTo "foo")
+  , row "demo<space>KEY with leading + trailing whitespace trims (outer)"
+      "  demo foo  " (LscReloadTo "foo")
+  , row "demo<space>KEY with multiple internal spaces still single-token"
+      "demo   foo" (LscReloadTo "foo")
+  , row "demo<space>KEY with extra trailing token is unknown (no silent absorption)"
+      "demo foo bar" (LscUnknown "demo foo bar")
+  , row "demo<space>KEY with empty payload (trailing space only) is unknown"
+      "demo " (LscUnknown "demo ")
+  , row "demo bare word (no space, no colon) is unknown"
+      "demo" (LscUnknown "demo")
+  , row "uppercase DEMO<space> prefix is unknown (case-sensitive)"
+      "DEMO foo" (LscUnknown "DEMO foo")
   , row "literal 'help' is LscHelp"
       "help" LscHelp
   , row "literal '?' is LscHelp"
@@ -133,8 +149,8 @@ parseLiveSessionCommandTests =
 -- with the command vocabulary the operator sees.
 renderLiveSessionCommandHelpTests :: [TestTree]
 renderLiveSessionCommandHelpTests =
-  [ testCase "renders five lines: header + four command rows" $
-      length renderLiveSessionCommandHelp @?= 5
+  [ testCase "renders six lines: header + five command rows" $
+      length renderLiveSessionCommandHelp @?= 6
 
   , testCase "first line is the 'commands:' header (two-space indent)" $
       head renderLiveSessionCommandHelp @?= "  commands:"
@@ -143,6 +159,7 @@ renderLiveSessionCommandHelpTests =
       renderLiveSessionCommandHelp
         @?= [ "  commands:"
             , "    demo:KEY    supervised reload to catalog demo KEY"
+            , "    demo KEY    same, single-token form (no internal whitespace)"
             , "    status      print current status (same as <Enter>)"
             , "    help        print commands (same as ?)"
             , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
