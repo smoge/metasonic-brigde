@@ -501,3 +501,66 @@ Against the questions raised when the slice was chosen:
 
 No new friction surfaced. Per the playbook rubric, no follow-up work
 is opened on the strength of this pass alone.
+
+### 2026-05-22 — Phase 8b saw/noise repertoire pass
+
+Transcripts:
+
+- `/tmp/metasonic-live-session-repertoire-saw.log`
+- `/tmp/metasonic-live-session-repertoire-noise.log`
+
+Both were captured against
+`examples/manifests/saw-noise-filter.json` with
+`--strategy require-preserving`.
+
+Objective result:
+
+- `saw-filter-dark` opened with four controls: pitch, cutoff, q, and
+  level. `demos` listed all four repertoire entries and marked
+  `saw-filter-dark` as current.
+- `controls` printed both the pattern surface and the addressable
+  `/v0/...` surface for the saw graph. After
+  `demo saw-filter-bright`, the committed plan showed the expected
+  bright cutoff default (`2400.0`) while the other controls stayed
+  stable.
+- `demo:saw-filter-dark` committed back to the dark saw plan.
+- Attempting `demo noise-filter-soft` from the active saw plan was
+  rejected as expected for the cross-family preserving boundary. The
+  session reported `request-rejected (stack still on previous plan)`,
+  resumed the old ingress, skipped supervisor rebuild, and continued
+  serving `saw-filter-dark`.
+- `noise-filter-soft` opened with three controls: cutoff, q, and
+  level. The absence of pitch in the noise family was reflected in
+  both startup output and `controls`.
+- `demo noise-filter-sharp` committed and showed the expected sharp
+  defaults (`cutoff=3200.0`, `q=3.0`). `demo:noise-filter-soft`
+  committed back and restored the soft defaults (`cutoff=900.0`,
+  `q=1.0`).
+- A typo at the prompt (`quis`) stayed non-fatal and reprinted the
+  complete command vocabulary. `quit` then terminated cleanly with
+  command exit code `0`.
+
+Observed friction:
+
+- The richer manifest did what it was meant to do: it generated a
+  broader operator pass without exposing new supervisor plumbing
+  friction. Same-family preserving reloads committed cleanly in both
+  source families, and cross-family reload rejected without taking
+  down the old plan.
+- `controls` is now tall enough to notice, especially with a
+  10-line terminal, but still readable for a three- or four-control
+  voice. This is a watch item, not yet a control-grouping slice.
+- The typo recovery path was useful in the moment. Reprinting the
+  full vocabulary after `quis` was not too heavy for this pass.
+- ALSA stderr noise remains present at startup. It still reads as
+  transcript noise rather than operator-session failure.
+- Current-value introspection was not exercised here. The pass
+  validated declared control surfaces and preserving/reject behavior,
+  not live readback of mutated values.
+
+Follow-up chosen from this pass: no immediate implementation. The
+Phase 8b Tier 1 repertoire is a better friction generator than the
+single-cutoff fixture, and the first operator pass over it validated
+that premise. The next useful pass should use this manifest musically
+with OSC writes; only open a new code slice if that pass makes a
+specific pain point sharp.
