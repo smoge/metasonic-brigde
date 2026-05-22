@@ -27,6 +27,7 @@ import           MetaSonic.App.ManifestLiveSession
                                              ReloadResolver (..),
                                              SessionStep (..),
                                              parseLiveSessionCommand,
+                                             renderLiveSessionCommandHelp,
                                              renderLiveSessionOutcome,
                                              renderLiveSessionResourceEvents,
                                              renderLiveSessionSupervisorEvents,
@@ -56,6 +57,8 @@ appManifestLiveSessionTests :: TestTree
 appManifestLiveSessionTests =
   testGroup "App manifest live session"
   [ testGroup "parseLiveSessionCommand"  parseLiveSessionCommandTests
+  , testGroup "renderLiveSessionCommandHelp"
+                                         renderLiveSessionCommandHelpTests
   , testGroup "stepFromOutcome"          stepFromOutcomeTests
   , testGroup "renderLiveSessionOutcome" renderLiveSessionOutcomeTests
   , testGroup "resourceTimelineForOutcome"
@@ -79,6 +82,8 @@ parseLiveSessionCommandTests =
       "" LscStatus
   , row "whitespace-only line is status"
       "   \t  " LscStatus
+  , row "literal 'status' is LscStatus (same as <Enter>)"
+      "status" LscStatus
   , row "demo:foo reloads to foo"
       "demo:foo" (LscReloadTo "foo")
   , row "demo:foo with leading + trailing whitespace trims"
@@ -91,8 +96,22 @@ parseLiveSessionCommandTests =
       "demo:foo bar" (LscReloadTo "foo bar")
   , row "uppercase DEMO: prefix is unknown (case-sensitive)"
       "DEMO:foo" (LscUnknown "DEMO:foo")
+  , row "literal 'help' is LscHelp"
+      "help" LscHelp
+  , row "literal '?' is LscHelp"
+      "?" LscHelp
+  , row "literal 'quit' is LscQuit"
+      "quit" LscQuit
+  , row "literal 'exit' is LscQuit"
+      "exit" LscQuit
+  , row "named commands tolerate leading + trailing whitespace"
+      "  help  " LscHelp
+  , row "named commands are case-sensitive (HELP is unknown)"
+      "HELP" (LscUnknown "HELP")
+  , row "named command with trailing token is unknown (help me does not parse)"
+      "help me" (LscUnknown "help me")
   , row "arbitrary text is unknown"
-      "quit" (LscUnknown "quit")
+      "hello world" (LscUnknown "hello world")
   , row "unknown command preserves the original (untrimmed) line"
       "  hello world  " (LscUnknown "  hello world  ")
   ]
@@ -100,6 +119,35 @@ parseLiveSessionCommandTests =
     row name input expected =
       testCase name $
         parseLiveSessionCommand input @?= expected
+
+
+-- ---------------------------------------------------------------------------
+-- renderLiveSessionCommandHelp
+-- ---------------------------------------------------------------------------
+
+-- | The command vocabulary is shared between three call sites — the
+-- startup prompt, the @help@ dispatch arm, and the @LscUnknown@
+-- rejection arm — so pinning its lines here guarantees that all
+-- three surfaces stay in sync. If a future contributor adds, removes,
+-- or renames a named command, these rows must change in lockstep
+-- with the command vocabulary the operator sees.
+renderLiveSessionCommandHelpTests :: [TestTree]
+renderLiveSessionCommandHelpTests =
+  [ testCase "renders five lines: header + four command rows" $
+      length renderLiveSessionCommandHelp @?= 5
+
+  , testCase "first line is the 'commands:' header (two-space indent)" $
+      head renderLiveSessionCommandHelp @?= "  commands:"
+
+  , testCase "exact body matches the documented vocabulary" $
+      renderLiveSessionCommandHelp
+        @?= [ "  commands:"
+            , "    demo:KEY    supervised reload to catalog demo KEY"
+            , "    status      print current status (same as <Enter>)"
+            , "    help        print commands (same as ?)"
+            , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
+            ]
+  ]
 
 
 -- ---------------------------------------------------------------------------

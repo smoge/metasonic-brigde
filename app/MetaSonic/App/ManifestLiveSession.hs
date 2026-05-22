@@ -42,6 +42,7 @@ module MetaSonic.App.ManifestLiveSession
     -- * Stdin command surface (pure, table-tested)
   , LiveSessionCommand (..)
   , parseLiveSessionCommand
+  , renderLiveSessionCommandHelp
 
     -- * Outcome state machine (pure, table-tested)
   , LiveSessionOutcome (..)
@@ -180,9 +181,11 @@ import           MetaSonic.Session.State        (SessionState (..))
 
 -- | One line of operator input parsed into a session command.
 --
--- The parser is intentionally tiny: it recognizes three shapes and
--- treats everything else as 'LscUnknown'. 'LscQuit' is not parsed —
--- it is emitted by the read loop when 'isEOF' returns 'True'.
+-- The parser is intentionally tiny: it recognizes a handful of
+-- named commands plus the @demo:KEY@ reload shape, and treats
+-- everything else as 'LscUnknown'. 'LscQuit' is parsed (as @quit@
+-- or @exit@) AND synthesized by the read loop on 'isEOF', so a
+-- @<Ctrl-D>@ press and a typed @quit@ produce the same outcome.
 --
 -- Whitespace policy: leading and trailing whitespace is trimmed
 -- before pattern-matching. An empty or whitespace-only line is
@@ -193,15 +196,25 @@ import           MetaSonic.Session.State        (SessionState (..))
 -- the key is preserved (catalog lookup will either find it or
 -- return not-found; both are valid command-level rejects, not
 -- parser failures).
+--
+-- Named commands are matched on the exact trimmed token (no
+-- prefix-of-a-prefix surprises): @help@, @?@, @quit@, @exit@, and
+-- @status@ each parse to their respective constructor; an input
+-- like @help me@ falls through to 'LscUnknown' because it does not
+-- equal any of the recognized tokens.
 data LiveSessionCommand
   = LscReloadTo !String
     -- ^ @demo:KEY@. The key string is the trimmed payload after
     -- the @demo:@ prefix.
   | LscStatus
-    -- ^ Empty line or whitespace-only.
+    -- ^ Empty line, whitespace-only line, or the literal @status@.
+  | LscHelp
+    -- ^ The literal @help@ or @?@. Prints the command vocabulary
+    -- and stays in the session.
   | LscQuit
-    -- ^ EOF on stdin. Not emitted by 'parseLiveSessionCommand';
-    -- the read loop synthesizes it on 'isEOF'.
+    -- ^ The literal @quit@ or @exit@. Also synthesized by the read
+    -- loop on EOF (@<Ctrl-D>@) so all three terminate the session
+    -- through the same code path.
   | LscUnknown !String
     -- ^ Anything else; original (untrimmed) line preserved for
     -- the help echo.
@@ -213,8 +226,12 @@ data LiveSessionCommand
 parseLiveSessionCommand :: String -> LiveSessionCommand
 parseLiveSessionCommand line =
   case trimmed of
-    "" ->
-      LscStatus
+    ""       -> LscStatus
+    "status" -> LscStatus
+    "help"   -> LscHelp
+    "?"      -> LscHelp
+    "quit"   -> LscQuit
+    "exit"   -> LscQuit
     s | "demo:" `isPrefixOf` s ->
         let key = trim (drop 5 s)
         in if null key
@@ -225,6 +242,26 @@ parseLiveSessionCommand line =
   where
     trimmed = trim line
     trim    = dropWhile isSpace . dropWhileEnd isSpace
+
+
+-- | The session-shell command vocabulary as a list of ready-to-print
+-- lines (each carrying its own indent). Used both by the startup
+-- prompt and the @help@ command so the two surfaces are guaranteed
+-- to stay in sync; also reused by the unknown-command rejection so
+-- a typo prints the same vocabulary the operator would have read
+-- from @help@.
+--
+-- The first line is the @commands:@ header (two-space indent);
+-- subsequent lines are the per-command rows (four-space indent),
+-- aligned by the longest left-hand token.
+renderLiveSessionCommandHelp :: [String]
+renderLiveSessionCommandHelp =
+  [ "  commands:"
+  , "    demo:KEY    supervised reload to catalog demo KEY"
+  , "    status      print current status (same as <Enter>)"
+  , "    help        print commands (same as ?)"
+  , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
+  ]
 
 
 -- ============================================================================
@@ -513,10 +550,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
   putStrLn ""
   renderOSCControls "initial OSC surface" initialTarget
   putStrLn ""
-  putStrLn "  Stdin commands:"
-  putStrLn "    demo:KEY    supervised reload to catalog demo KEY"
-  putStrLn "    <Enter>     print current status"
-  putStrLn "    <Ctrl-D>    exit cleanly"
+  mapM_ putStrLn renderLiveSessionCommandHelp
   putStrLn ""
   hFlush stdout
 
@@ -687,9 +721,12 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOut
       LscStatus -> do
         printStatus trackedStackRef currentPlanRef lastOutcomeRef
         pure SsContinue
+      LscHelp -> do
+        mapM_ putStrLn renderLiveSessionCommandHelp
+        pure SsContinue
       LscUnknown raw -> do
         putStrLn ("  unknown command: " <> show raw)
-        putStrLn "  expected one of: demo:KEY  |  <Enter>  |  <Ctrl-D>"
+        mapM_ putStrLn renderLiveSessionCommandHelp
         pure SsContinue
       LscReloadTo key ->
         runReloadWith
