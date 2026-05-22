@@ -9183,6 +9183,70 @@ TEST_CASE("hot-swap migration: biquad filter state survives payload install") {
     }
 }
 
+TEST_CASE("hot-swap migration: smooth state survives payload install") {
+    // Phase 8d-b. KSmooth's IIR state (low1, low2 inside
+    // q::dynamic_smoother, plus the configured base-frequency
+    // coefficients) is copy-safe; the migration path copies it just
+    // like the biquad family. Sine source feeds the smoother so the
+    // IIR memory diverges from any first-sample seed before the
+    // swap boundary, then the post-swap render must match the
+    // never-swapped reference graph sample-for-sample.
+    auto build = [](RTGraph *g) {
+        rt_graph_add_node(g, 0, kKindSinOsc);
+        rt_graph_set_control(g, 0, 0, 440.0f);
+        rt_graph_set_control(g, 0, 1, 0.0f);
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 0, "osc", 3) == 1);
+        rt_graph_add_node(g, 1, kKindSmooth);
+        rt_graph_set_control(g, 1, 0, 50.0f);
+        rt_graph_set_control(g, 1, 1, 0.0f);
+        REQUIRE(rt_graph_template_set_node_migration_key(
+                    g, 0, 1, "smt", 3) == 1);
+        rt_graph_add_node(g, 2, kKindOut);
+        rt_graph_set_control(g, 2, 0, 0.0f);
+        rt_graph_connect(g, 0, 0, 1, 0);
+        rt_graph_connect(g, 1, 0, 2, 0);
+    };
+
+    auto *swapped = rt_graph_create(4, kFrames);
+    auto *builder = rt_graph_create(4, kFrames);
+    auto *expected = rt_graph_create(4, kFrames);
+    REQUIRE(swapped != nullptr);
+    REQUIRE(builder != nullptr);
+    REQUIRE(expected != nullptr);
+
+    build(swapped);
+    build(builder);
+    build(expected);
+
+    rt_graph_process(swapped, kFrames);
+    rt_graph_process(expected, kFrames);
+
+    auto *swap = rt_graph_prepare_swap_from_graph(swapped, builder);
+    REQUIRE(swap != nullptr);
+    rt_graph_destroy(builder);
+    // SinOsc + Smooth both migrate state; Out is stateless and is
+    // skipped by the migration plan.
+    CHECK(rt_graph_swap_migration_committed_count(swap) == 2);
+    CHECK(rt_graph_swap_migration_skipped_count(swap) == 1);
+
+    REQUIRE(rt_graph_publish_swap(swapped, swap) == 1);
+    rt_graph_process(swapped, kFrames);
+    rt_graph_process(expected, kFrames);
+
+    check_exact_same(read_bus_vec(swapped, 0, kFrames),
+                     read_bus_vec(expected, 0, kFrames));
+
+    auto *retired = rt_graph_collect_retired_swap(swapped);
+    REQUIRE(retired == swap);
+    CHECK(rt_graph_swap_migration_instance_copy_count(retired) == 2);
+    CHECK(rt_graph_swap_migration_state_copy_count(retired) == 2);
+
+    rt_graph_cancel_swap(swapped, retired);
+    rt_graph_destroy(swapped);
+    rt_graph_destroy(expected);
+}
+
 TEST_CASE("hot-swap migration: unsupported lazy state skips without control copy") {
     auto build_unsupported_plan_only = [](RTGraph *g, int node_kind) {
         rt_graph_add_node(g, 0, node_kind);
@@ -9190,7 +9254,7 @@ TEST_CASE("hot-swap migration: unsupported lazy state skips without control copy
                     g, 0, 0, "lazy", 4) == 1);
     };
 
-    for (int unsupported_kind : {kKindDelay, kKindSmooth}) {
+    for (int unsupported_kind : {kKindDelay}) {
         auto *old_world = rt_graph_create(4, kFrames);
         auto *builder_world = rt_graph_create(4, kFrames);
         REQUIRE(old_world != nullptr);

@@ -2945,7 +2945,6 @@ static void record_migration_skip(
   switch (kind) {
   case NodeKind::Env:
   case NodeKind::Delay:
-  case NodeKind::Smooth:
   case NodeKind::PlayBufMono:
     // PlayBufMono state ties a per-instance playhead to a
     // specific buffer ID + start_frame; carrying it across a
@@ -2998,6 +2997,12 @@ static void record_migration_skip(
   case NodeKind::HPF:
   case NodeKind::BPF:
   case NodeKind::Notch:
+  case NodeKind::Smooth:
+    // Phase 8d-b: Smooth carries a copy-safe SmoothState (an
+    // std::optional<q::dynamic_smoother> plus two scalar memos).
+    // q::dynamic_smoother is five POD floats with compiler-default
+    // copy assignment, so the migration path can copy the smoother's
+    // IIR memory across a preserving swap.
     return true;
   }
   return false;
@@ -3143,6 +3148,24 @@ template <class State>
     return copy_biquad_filter_state<NotchState>(old_node, new_node);
   }
 
+  case NodeKind::Smooth: {
+    // Phase 8d-b: copy SmoothState directly. The
+    // std::optional<q::dynamic_smoother> assignment carries the
+    // smoother's full IIR state (low1, low2 plus the configured
+    // sense/wc/g0 coefficients); the two scalar memos drive the
+    // existing reconfigure-on-change discipline at the next block
+    // boundary, so a sample-rate or base-frequency change after
+    // the swap still does the right thing.
+    const auto *src = std::get_if<SmoothState>(&old_node.state);
+    auto *dst = std::get_if<SmoothState>(&new_node.state);
+    if (!src || !dst)
+      return StateMigrationResult::Unsupported;
+    dst->smoother = src->smoother;
+    dst->last_base_freq = src->last_base_freq;
+    dst->last_sps = src->last_sps;
+    return StateMigrationResult::Copied;
+  }
+
   case NodeKind::Out:
   case NodeKind::Gain:
   case NodeKind::Add:
@@ -3153,7 +3176,6 @@ template <class State>
 
   case NodeKind::Env:
   case NodeKind::Delay:
-  case NodeKind::Smooth:
   case NodeKind::PlayBufMono:
   case NodeKind::RecordBufMono:
   case NodeKind::SpectralFreeze:

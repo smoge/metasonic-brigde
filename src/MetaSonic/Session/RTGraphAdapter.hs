@@ -474,7 +474,6 @@ nodeKindSupportsPreservingHotSwap kind =
   case preservingHotSwapNodeClass kind of
     PreserveUnsupported -> False
     PreserveStateless   -> True
-    PreserveStatefulDefaultInit -> True
     PreserveStateful    -> True
 
 nodeKindNeedsPreservingValidation :: NodeKind -> Bool
@@ -482,7 +481,6 @@ nodeKindNeedsPreservingValidation kind =
   case preservingHotSwapNodeClass kind of
     PreserveUnsupported -> True
     PreserveStateless   -> False
-    PreserveStatefulDefaultInit -> True
     PreserveStateful    -> True
 
 nodeKindNeedsStateCopy :: NodeKind -> Bool
@@ -494,13 +492,11 @@ nodeKindNeedsStateCopy kind =
     -- predicate's narrower meaning literal.
     PreserveUnsupported -> False
     PreserveStateless   -> False
-    PreserveStatefulDefaultInit -> False
     PreserveStateful    -> True
 
 data PreservingHotSwapNodeClass
   = PreserveUnsupported
   | PreserveStateless
-  | PreserveStatefulDefaultInit
   | PreserveStateful
   deriving stock (Eq, Show)
 
@@ -508,16 +504,12 @@ data PreservingHotSwapNodeClass
 --
 -- Keeping support, validation, and state-copy expectation derived
 -- from this one table avoids the drift where a kind is admitted but
--- omitted from the relevant preserving-swap checks. The
--- DefaultInit class is deliberately admitted without contributing
--- to the post-swap migration-counter expectation: C++ leaves that
--- node state freshly initialized until a later per-kind prewarm/copy
--- slice teaches it how to migrate safely.
+-- omitted from the relevant preserving-swap checks.
 preservingHotSwapNodeClass :: NodeKind -> PreservingHotSwapNodeClass
 preservingHotSwapNodeClass = \case
   KEnv             -> PreserveUnsupported
   KDelay           -> PreserveUnsupported
-  KSmooth          -> PreserveStatefulDefaultInit
+  KSmooth          -> PreserveStateful
   KPlayBufMono     -> PreserveUnsupported
   KRecordBufMono   -> PreserveUnsupported
   KSpectralFreeze  -> PreserveUnsupported

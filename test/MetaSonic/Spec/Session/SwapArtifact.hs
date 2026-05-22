@@ -46,16 +46,22 @@ kWarmupBlocks :: Int
 -- failed smoothing contract with looser thresholds.
 kWarmupBlocks = 16
 
-kMinimumPeakGap :: Float
--- Empirical Phase 8d-a baseline bounds. See
--- notes/2026-05-22-c-ksmooth-swap-artifact-harness-design.md:
--- baseline tests prove a gap exists and guard against runaway; they
--- are not exact-value pins and should not be relaxed before checking
--- whether KSmooth default-init semantics changed.
-kMinimumPeakGap = 0.005
+kSmallPeakBound :: Float
+-- Phase 8d-b bounded-artifact bounds. See
+-- notes/2026-05-22-d-ksmooth-preserving-state-copy-design.md (and
+-- 8d-a's design note for the baseline framing). With KSmooth's IIR
+-- state copied across the swap, the post-install block matches the
+-- never-swapped reference render bit-for-bit on this fixture: the
+-- first 8d-b run observed peak delta = 0 and RMS delta = 0. The
+-- pinned bounds carry a small stability margin above zero so
+-- platform-float variance doesn't flake the test on otherwise-clean
+-- runs. If a future run drifts above the bound, inspect the copy
+-- path first; do not relax the bound before checking whether the
+-- smoother's migration semantics changed.
+kSmallPeakBound = 1.0e-5
 
-kMinimumRmsGap :: Float
-kMinimumRmsGap = 0.001
+kSmallRmsBound :: Float
+kSmallRmsBound = 1.0e-6
 
 kRunawayPeakBound :: Float
 kRunawayPeakBound = 1.0
@@ -72,8 +78,8 @@ data ArtifactMetrics = ArtifactMetrics
 
 sessionSwapArtifactTests :: TestTree
 sessionSwapArtifactTests =
-  testGroup "Phase 8d-a: KSmooth swap artifact baseline"
-  [ testCase "KSmooth default-init preserving swap has measurable post-install artifact" $ do
+  testGroup "Phase 8d-b: KSmooth swap artifact bounded"
+  [ testCase "KSmooth preserving swap post-install artifact stays within state-copy bound" $ do
       oldGraph <- compileTemplateGraphOrFail
         [("drone", dronePreserveSmoothCutoffDark)]
       newGraph <- compileTemplateGraphOrFail
@@ -87,17 +93,19 @@ sessionSwapArtifactTests =
         (artifactMetrics swappedPre oldPre)
 
       -- The copied-state count is the current fixture invariant:
-      -- KSawOsc carrier + KLPF. KSmooth participates in validation
-      -- but remains default-init in 8d-a, so it must not contribute
-      -- a copied-state count yet.
-      stateCopies @?= 2
+      -- KSawOsc carrier + KLPF + KSmooth. After 8d-b, KSmooth
+      -- migrates its IIR state copy-safely (per
+      -- node_kind_supports_state_migration in rt_graph.cpp), so it
+      -- contributes one state copy alongside the carrier and the
+      -- filter.
+      stateCopies @?= 3
 
       let metrics = artifactMetrics swappedPost oldPost
           msg = "metrics=" <> show metrics
-      assertBool ("expected measurable peak gap, " <> msg)
-        (amPeakDelta metrics >= kMinimumPeakGap)
-      assertBool ("expected measurable RMS gap, " <> msg)
-        (amRmsDelta metrics >= kMinimumRmsGap)
+      assertBool ("peak artifact exceeded small bound, " <> msg)
+        (amPeakDelta metrics <= kSmallPeakBound)
+      assertBool ("RMS artifact exceeded small bound, " <> msg)
+        (amRmsDelta metrics <= kSmallRmsBound)
       assertBool ("peak gap runaway, " <> msg)
         (amPeakDelta metrics <= kRunawayPeakBound)
       assertBool ("RMS gap runaway, " <> msg)

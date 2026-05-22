@@ -311,7 +311,7 @@ sessionRTGraphAdapterHotSwapTests =
           other ->
             assertFailure ("expected start commit, got: " <> show other)
 
-  , testCase "preserving-only hot-swap admits KSmooth default-init active voice" $ do
+  , testCase "preserving-only hot-swap migrates KSmooth active voice" $ do
       oldGraph <- compileTemplateGraphOrFail
         [("drone", dronePreserveSmoothCutoffDark)]
       newGraph <- compileTemplateGraphOrFail
@@ -348,7 +348,7 @@ sessionRTGraphAdapterHotSwapTests =
                     M.lookup voice (ssVoices st2) @?= Just binding
                     afterGeneration <- readSwapGeneration rt
                     assertBool
-                      "expected KSmooth default-init swap generation to advance"
+                      "expected KSmooth migration swap generation to advance"
                       (afterGeneration > beforeGeneration)
                     afterStatus <- c_rt_graph_instance_status
                                      rt
@@ -358,7 +358,7 @@ sessionRTGraphAdapterHotSwapTests =
                     written @?= StepControlAccepted
                   other ->
                     assertFailure
-                      ("expected KSmooth default-init preserving hot-swap commit, got: "
+                      ("expected KSmooth preserving hot-swap commit, got: "
                        <> show other)
           other ->
             assertFailure ("expected start commit, got: " <> show other)
