@@ -4,9 +4,10 @@ Date: 2026-05-21
 
 Status: documentation snapshot and future-reference note. This note
 does **not** propose an immediate implementation slice. It records the
-current fusion state so a future session can reopen the work from
-evidence instead of from the vague feeling that "generated fusion
-exists, so we should turn it on."
+current fusion state and sketches one candidate shape for a future
+reopening, so a future session can reopen the work from evidence
+instead of from the vague feeling that "generated fusion exists, so we
+should turn it on."
 
 The short version:
 
@@ -532,6 +533,80 @@ Future Phase 9 — Production Fusion Selection
 
 Do not start that phase with a generic executor rewrite. Start with a
 single gate-approved shape.
+
+
+## Possible Future Shape: Generated-Selected Specialized Kernels
+
+If generated fusion becomes production-relevant later, one plausible
+path is not a broader version of the current generic `FusionProgram`
+interpreter. It is generated-selected specialized kernels.
+
+In that model, the planner and generator still decide which region
+candidate is legal and profitable, but the runtime does not interpret a
+long generic op stream in the audio loop. Instead, the generated
+artifact is a compact binding:
+
+```text
+planner selects candidate
+-> generator classifies it as a known specialized shape
+-> loader records shape id plus bound node/control/bus references
+-> C++ runtime dispatches one tight precompiled loop
+```
+
+That is different from the current generic executor:
+
+```text
+program = OpLoadInput / OpAdd / OpMul / OpSinkWrite / ...
+-> C++ interprets ops per sample, per block, or through super-mode
+```
+
+The specialized path would look like a small catalog of precompiled
+C++ bodies selected by generated metadata. Early candidates, if the
+evidence ever justifies them, would be narrow arithmetic / sink tails:
+
+- `GainOut`;
+- `AddGainOut`;
+- `GainAddOut`;
+- `AddGainAddOut`;
+- other short sink tails that recur in real authored graphs and have
+  no existing §4.B / `RFused` winner.
+
+The "generated" part would be the planner-side binding of:
+
+- shape identity;
+- source node indices;
+- control slots;
+- sink bus indices;
+- scratch requirements, if any;
+- executor choice.
+
+The arithmetic loop itself would still be ordinary precompiled C++.
+This could plausibly approach hand-written kernel performance because
+it removes generic op dispatch and avoids intermediate buffer
+materialization. Mechanically, though, it is close to a hand-written
+kernel selected by generated metadata. It should therefore obey the
+same discipline:
+
+1. add only shapes with corpus recurrence;
+2. compare against stripped `RNodeLoop`;
+3. prove bit-exact output;
+4. preserve sink accumulation and `block_sink_peak` behavior;
+5. preserve invalid-input and state-advance parity;
+6. gate turn-on per shape;
+7. keep the existing hand-written kernel as the peer until generated
+   has repeatedly beaten it.
+
+This route is more appropriate than native code generation or JIT as
+the next generated-fusion reopening path. It is smaller, deterministic,
+auditable, and fits the existing `--fusion-cost-lab` /
+`evaluateGate` workflow. Native codegen should stay out of scope until
+this smaller shape-specialization path has produced a real
+`PreferGenerated` production candidate or clearly failed.
+
+The reason this is not simply "write more hand kernels" is that the
+planner / cost-lab / gate machinery can make the corpus-recurrence and
+profitability decision per shape, while the C++ side stays a small
+catalog of audited loops.
 
 
 ## What Should Come First
