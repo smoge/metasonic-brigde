@@ -125,9 +125,20 @@ This is the "groups exist, but as a derivation, not a primitive" model
 SC's runtime ordering primitives.
 -}
 
--- | A dense template identifier, parallel to 'NodeIndex'. Storage
--- order in 'tgTemplates' equals execution order; 'TemplateID i' is
--- the element at position @i@.
+-- | A dense template identifier, parallel to 'NodeIndex'.
+--
+-- A 'TemplateID' is assigned from the input-list position at stage 1
+-- of 'compileTemplateGraph' and is /not/ renumbered by the topological
+-- sort in stage 4. Storage order in 'tgTemplates' equals execution
+-- order (post-sort), so the two indexes — input position and storage
+-- position — typically differ once a non-trivial precedence DAG has
+-- been resolved.
+--
+-- The motivation is that callers can keep referring to a template by
+-- the ID they constructed it with even if the sort permuted the order.
+-- Callers that want a stable, content-addressed identity should hash
+-- the template themselves. See Note [TemplateGraph as the compile-
+-- decreed plan].
 newtype TemplateID = TemplateID Int
   deriving stock   (Eq, Ord, Show, Generic)
   deriving newtype (NFData)
