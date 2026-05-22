@@ -18,6 +18,7 @@ module MetaSonic.App.ManifestOSCIngressOps
   ( ManifestOSCIngressHandle (..)
   , ManifestOSCIngressOpsIssue (..)
   , manifestOSCIngressOps
+  , manifestOSCIngressOpsWithTargetHooks
   ) where
 
 import           MetaSonic.App.ManifestOSCListener
@@ -85,9 +86,27 @@ manifestOSCIngressOps
        ManifestReloadIngressTarget
        ManifestOSCIngressOpsIssue
        ManifestOSCIngressHandle
-manifestOSCIngressOps hooks opts host cfg = ManifestReloadIngressOps
+manifestOSCIngressOps hooks =
+  manifestOSCIngressOpsWithTargetHooks (const hooks)
+
+-- | Variant of 'manifestOSCIngressOps' for callers whose diagnostic
+-- hooks need the manifest target opened by this ingress generation.
+-- The live-session shell uses this to render accepted OSC writes with
+-- the current control binding metadata after preserving reloads.
+manifestOSCIngressOpsWithTargetHooks
+  :: (ManifestReloadIngressTarget -> ManifestOSCListenerHooks)
+  -> OSCProducerOptions
+  -> SessionFanInHost
+  -> ListenerConfig
+  -> ManifestReloadIngressOps
+       ManifestReloadIngressTarget
+       ManifestOSCIngressOpsIssue
+       ManifestOSCIngressHandle
+manifestOSCIngressOpsWithTargetHooks hooksForTarget opts host cfg =
+  ManifestReloadIngressOps
   { mrioOpenIngress =
       \target -> do
+        let hooks = hooksForTarget target
         result <-
           openManifestOSCListener
             hooks

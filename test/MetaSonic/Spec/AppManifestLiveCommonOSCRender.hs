@@ -29,8 +29,10 @@ import           Test.Tasty
 import           Test.Tasty.HUnit
 
 import           MetaSonic.App.ManifestLiveCommon       (renderOSCAcceptLine,
+                                                         renderOSCAcceptLineWithControls,
                                                          renderOSCIssueLine)
 import           MetaSonic.App.ManifestOSCListener      (ManifestOSCListenerIssue (..))
+import           MetaSonic.App.ManifestReloadOSCBinding (ManifestOSCControlBinding (..))
 import           MetaSonic.App.ManifestReloadOSCIngress (ManifestOSCIngressIssue (..))
 import           MetaSonic.Bridge.Source                (MigrationKey (..))
 import           MetaSonic.OSC.Dispatch                 (DispatchIssue (..))
@@ -156,10 +158,29 @@ renderOSCAcceptLineTests =
             { sfierResult     = SessionEnqueued sampleQueued
             , sfierQueueDepth = 1
             }))
-        @?= Just ("osc accept: "
-                  <> "CmdControlWrite voice=v0 tag="
-                  <> show sampleControlTag
-                  <> " value=0.75")
+        @?= Just "osc accept: /v0/lpf/0 value=0.75"
+
+  , testCase "SessionEnqueued uses manifest binding display name when available" $
+      renderOSCAcceptLineWithControls
+        [sampleControlBinding]
+        (OSCProducerEnqueueAttempted
+          sampleControlWrite
+          (SessionFanInEnqueueResult
+            { sfierResult     = SessionEnqueued sampleQueued
+            , sfierQueueDepth = 1
+            }))
+        @?= Just "osc accept: /v0/lpf/0 name=\"cutoff\" value=0.75"
+
+  , testCase "SessionEnqueued rounds common float representation noise" $
+      renderOSCAcceptLineWithControls
+        [sampleControlBinding]
+        (OSCProducerEnqueueAttempted
+          (CmdControlWrite sampleVoiceKey sampleControlTag 0.18000000715255737)
+          (SessionFanInEnqueueResult
+            { sfierResult     = SessionEnqueued sampleQueued
+            , sfierQueueDepth = 1
+            }))
+        @?= Just "osc accept: /v0/lpf/0 name=\"cutoff\" value=0.18"
 
   , testCase "SessionEnqueueRejected SeiReloadInProgress returns Nothing (dedup)" $
       -- The dedup policy: rejected packets are reported through the
@@ -257,10 +278,7 @@ syntheticFanOutTests =
                 , sfierQueueDepth = 1
                 }))
       length lines_ @?= 1
-      head lines_ @?= "osc accept: "
-                       <> "CmdControlWrite voice=v0 tag="
-                       <> show sampleControlTag
-                       <> " value=0.75"
+      head lines_ @?= "osc accept: /v0/lpf/0 value=0.75"
 
   , testCase "reload-window rejection → exactly one 'osc reject (reload-window): ...' line (no double-print)" $ do
       -- This is the load-bearing assertion: today the legacy
@@ -312,6 +330,22 @@ sampleVoiceKey = VoiceKey "v0"
 
 sampleControlTag :: ControlTag
 sampleControlTag = ControlTag (MigrationKey "lpf") 0
+
+sampleControlBinding :: ManifestOSCControlBinding
+sampleControlBinding = ManifestOSCControlBinding
+  { mocbControlTag =
+      sampleControlTag
+  , mocbDisplayName =
+      "cutoff"
+  , mocbDefault =
+      600.0
+  , mocbRangeMin =
+      200.0
+  , mocbRangeMax =
+      6000.0
+  , mocbCC =
+      Just 74
+  }
 
 sampleControlWrite :: SessionCommand
 sampleControlWrite =

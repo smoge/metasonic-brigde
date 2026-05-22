@@ -38,6 +38,7 @@
 module MetaSonic.App.ManifestLiveCommon
   ( -- * Live audio + ingress config
     liveOSCListenerHooks
+  , liveOSCListenerHooksFor
   , liveIngressTargetPolicy
   , liveReloadProducer
   , liveAudioOptions
@@ -83,6 +84,7 @@ module MetaSonic.App.ManifestLiveCommon
     -- See @notes/2026-05-20-d-stale-command-rejection-rendering.md@
     -- for the design rationale and the operator-string taxonomy.
   , renderOSCAcceptLine
+  , renderOSCAcceptLineWithControls
   , renderOSCIssueLine
 
     -- * OSC addressable-surface line renderer (pure, testable)
@@ -100,11 +102,13 @@ module MetaSonic.App.ManifestLiveCommon
 import           Control.Concurrent             (threadDelay)
 import           Control.Monad                  (forM, forM_, unless)
 import           Data.IORef                     ()
+import           Data.List                      (dropWhileEnd, find)
 import qualified Data.Map.Strict                as M
 import qualified Data.Set                       as S
 import qualified Data.Text                      as T
 import           System.Exit                    (die)
 import           System.Timeout                 (timeout)
+import           Text.Printf                    (printf)
 
 import           MetaSonic.App.Demos            (Demo (..))
 import           MetaSonic.App.ManifestOSCIngressOps
@@ -163,8 +167,7 @@ import           MetaSonic.Session.FanInService (SessionFanInService,
                                                  enqueueSessionFanInServiceCommand,
                                                  readSessionFanInService)
 import qualified MetaSonic.Session.ManifestReload as MR
-import           MetaSonic.Session.OSCProducer  (OSCProducerEnqueueResult (..),
-                                                 defaultOSCProducerOptions)
+import           MetaSonic.Session.OSCProducer  (OSCProducerEnqueueResult (..))
 import           MetaSonic.Session.Queue        (ProducerId (..),
                                                  ProducerKind (..),
                                                  QueuedSessionCommand (..),
@@ -554,9 +557,25 @@ renderLiveReloadEvents events =
 -- produced two identical "osc enqueue-reject" lines per rejected
 -- packet is gone.
 liveOSCListenerHooks :: ManifestOSCListenerHooks
-liveOSCListenerHooks = defaultManifestOSCListenerHooks
+liveOSCListenerHooks =
+  liveOSCListenerHooksWithControls []
+
+
+-- | Construct live OSC listener hooks for one opened manifest target.
+-- Accepted control-write diagnostics use the target's binding metadata
+-- when a matching control exists, falling back to the raw address shape
+-- if no binding can be found.
+liveOSCListenerHooksFor :: ManifestReloadIngressTarget -> ManifestOSCListenerHooks
+liveOSCListenerHooksFor target =
+  liveOSCListenerHooksWithControls (motControls (mitOSC target))
+
+
+liveOSCListenerHooksWithControls
+  :: [ManifestOSCControlBinding]
+  -> ManifestOSCListenerHooks
+liveOSCListenerHooksWithControls controls = defaultManifestOSCListenerHooks
   { molhOnAccepted =
-      mapM_ (putStrLn . ("  " <>)) . renderOSCAcceptLine
+      mapM_ (putStrLn . ("  " <>)) . renderOSCAcceptLineWithControls controls
   , molhOnIssue =
       \issue -> putStrLn ("  " <> renderOSCIssueLine issue)
   }
@@ -583,13 +602,25 @@ liveOSCListenerHooks = defaultManifestOSCListenerHooks
 -- See @notes/2026-05-20-d-stale-command-rejection-rendering.md@ for
 -- the contract this helper anchors.
 renderOSCAcceptLine :: OSCProducerEnqueueResult -> Maybe String
-renderOSCAcceptLine result = case result of
+renderOSCAcceptLine =
+  renderOSCAcceptLineWithControls []
+
+
+-- | Metadata-aware variant of 'renderOSCAcceptLine'. The binding list
+-- is target-local and may be empty; unmatched 'ControlTag's still
+-- render through their OSC address so accepted packets never disappear
+-- just because metadata was unavailable.
+renderOSCAcceptLineWithControls
+  :: [ManifestOSCControlBinding]
+  -> OSCProducerEnqueueResult
+  -> Maybe String
+renderOSCAcceptLineWithControls controls result = case result of
   OSCProducerDecodeRejected issue ->
     Just ("osc reject (decode): " <> show issue)
   OSCProducerEnqueueAttempted cmd enqueue ->
     case sfierResult enqueue of
       SessionEnqueued _ ->
-        Just ("osc accept: " <> renderCommand cmd)
+        Just ("osc accept: " <> renderAcceptedCommand controls cmd)
       SessionEnqueueRejected{} ->
         Nothing
 
@@ -636,6 +667,39 @@ renderCommand cmd = case cmd of
     "CmdVoiceOn template=" <> name <> " voice=" <> unVoiceKey voice
   _ ->
     show cmd
+
+
+renderAcceptedCommand :: [ManifestOSCControlBinding] -> SessionCommand -> String
+renderAcceptedCommand controls cmd = case cmd of
+  CmdControlWrite voice tag value ->
+    renderConcreteOSCAddress voice tag
+    <> nameSuffix
+    <> " value=" <> renderOperatorValue value
+    where
+      nameSuffix =
+        case find ((tag ==) . mocbControlTag) controls of
+          Nothing ->
+            ""
+          Just binding ->
+            " name=\"" <> mocbDisplayName binding <> "\""
+  _ ->
+    renderCommand cmd
+
+
+renderOperatorValue :: Double -> String
+renderOperatorValue value =
+  trimMantissa (printf "%.6g" value)
+  where
+    trimMantissa raw =
+      let (mantissa, suffix) = span (\c -> c /= 'e' && c /= 'E') raw
+      in stripTrailingDecimal (dropWhileEnd (== '0') mantissa) <> suffix
+
+    stripTrailingDecimal valueText =
+      case reverse valueText of
+        '.' : rest ->
+          reverse rest
+        _ ->
+          valueText
 
 
 liveIngressTargetPolicy :: ManifestReloadIngressTargetPolicy

@@ -117,7 +117,7 @@ import           MetaSonic.App.ManifestLiveCommon
                                                 (autoStartTemplates,
                                                  liveAudioOptions,
                                                  liveIngressTargetPolicy,
-                                                 liveOSCListenerHooks,
+                                                 liveOSCListenerHooksFor,
                                                  liveReloadProducer,
                                                  planOrDie,
                                                  printAddressableSurface,
@@ -132,7 +132,7 @@ import           MetaSonic.App.ManifestLiveCommon
 import           MetaSonic.App.ManifestOSCIngressOps
                                                 (ManifestOSCIngressHandle,
                                                  ManifestOSCIngressOpsIssue,
-                                                 manifestOSCIngressOps)
+                                                 manifestOSCIngressOpsWithTargetHooks)
 import           MetaSonic.App.ManifestOSCListener
                                                 (ListenerConfig)
 import           MetaSonic.App.ManifestReloadCli
@@ -620,8 +620,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
 
   let inputs = RealReloadHostStackInputs
         { rrhsiBuildIngressOps     = \host ->
-            manifestOSCIngressOps
-              liveOSCListenerHooks
+            manifestOSCIngressOpsWithTargetHooks
+              liveOSCListenerHooksFor
               defaultOSCProducerOptions
               host
               listenerCfg
