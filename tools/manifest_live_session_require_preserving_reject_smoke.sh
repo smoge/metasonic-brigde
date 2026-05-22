@@ -195,8 +195,8 @@ done
 
 # Pre-reload OSC: proves the auto-started voice is live and OSC
 # ingress is wired.
-if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 0.75 >/dev/null; then
-  echo "[smoke] pre-reload OSC sent (/v0/lpf/0 = 0.75)"
+if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 1800.0 >/dev/null; then
+  echo "[smoke] pre-reload OSC sent (/v0/lpf/0 = 1800.0)"
 else
   echo "[smoke] FAIL: pre-reload OSC send failed"
   exit 1
@@ -230,8 +230,8 @@ done
 
 # Post-reject OSC: proves ingress survives the rejection — the
 # old voice and OSC binding are still alive on the OLD demo.
-if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 0.25 >/dev/null; then
-  echo "[smoke] post-reject OSC sent (/v0/lpf/0 = 0.25)"
+if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 900.0 >/dev/null; then
+  echo "[smoke] post-reject OSC sent (/v0/lpf/0 = 900.0)"
 else
   echo "[smoke] FAIL: post-reject OSC send failed"
   exit 1
@@ -337,8 +337,8 @@ check_marker "2a. audio running" \
   "$TRANSCRIPT" "audio running: yes"
 check_marker "2b. OSC ingress bound on configured port" \
   "$TRANSCRIPT" "oscPort=$PORT"
-check_marker "3.  pre-reload OSC accept (value=0.75)" \
-  "$TRANSCRIPT" "value=0.75"
+check_marker "3.  pre-reload OSC accept (value=1800.0)" \
+  "$TRANSCRIPT" "value=1800.0"
 check_marker "4a. supervised outcome request-rejected" \
   "$TRANSCRIPT" "supervised outcome: request-rejected (stack still on previous plan)"
 check_marker "4b. preserving phase started" \
@@ -369,8 +369,8 @@ check_absent_marker "4n. no RuntimeNode leak in transcript (F-1 runtime guard)" 
   "$TRANSCRIPT" "RuntimeNode"
 check_marker "5a. post-reject status shows current plan STILL OLD demo" \
   "$TRANSCRIPT" "current plan demo: $OLD_DEMO"
-check_marker "5b. post-reject OSC accept (value=0.25)" \
-  "$TRANSCRIPT" "value=0.25"
+check_marker "5b. post-reject OSC accept (value=900.0)" \
+  "$TRANSCRIPT" "value=900.0"
 check_marker "6a. session exit 0" \
   "$PROBE_LOG" "session exit=0"
 check_marker "6b. ss snapshot clean (no listener)" \

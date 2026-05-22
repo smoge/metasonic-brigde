@@ -149,16 +149,21 @@ package needed):
 
 ```sh
 just osc-send 0.75                            # default port 7000, /v0/outgain/0
-just osc-send 0.5 7001 127.0.0.1 /v0/lpf/0    # explicit value/port/host/address
+just osc-send 1800.0 7001 127.0.0.1 /v0/lpf/0 # explicit value/port/host/address
 python3 tools/send_osc.py --port 7000 --address /v0/outgain/0 --value 0.75
 ```
+
+The value is always in the target control's own units. `/v0/outgain/0`
+is a gain amount, so `0.75` is useful. `/v0/lpf/0` is an LPF cutoff
+for the manifest fixtures, so use Hz values such as `900.0`, `1800.0`,
+or `2400.0` rather than normalized `0..1` values.
 
 OSC arbitration smoke (multi-producer + ingress arbitration):
 
 ```sh
 just session-osc-arbitration-smoke 10 7001
-just session-osc-arbitration-send-claimed 0.5 7001
-just session-osc-arbitration-send-allowed 0.5 7001
+just session-osc-arbitration-send-claimed 1800.0 7001
+just session-osc-arbitration-send-allowed 900.0 7001
 ```
 
 `osc-tool-test` is a unit smoke for the Python helper itself.

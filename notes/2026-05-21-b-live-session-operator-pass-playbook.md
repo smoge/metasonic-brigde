@@ -44,8 +44,14 @@ notepad output of this pass is the data.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17004 --address /v0/lpf/0 --value 0.75
+     --port 17004 --address /v0/lpf/0 --value 1800.0
    ```
+
+   OSC values are raw control values in the target parameter's
+   units, not normalized 0..1 values. For the preserve-cutoff
+   fixtures, `/v0/lpf/0` is an LPF cutoff in Hz with the manifest
+   range `[200, 6000]`. Sending `0.75` is therefore a 0.75 Hz
+   cutoff, which can sound like the audio stopped.
 
    The `just osc-send` recipe is the same helper wrapped in a
    recipe. `oscsend` from `liblo-tools` is also fine if it is
@@ -100,12 +106,13 @@ with audio actually playing.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17004 --address /v0/lpf/0 --value 0.75
+     --port 17004 --address /v0/lpf/0 --value 1800.0
    ```
 
    The session terminal should print an `osc accept:` line. Listen
-   — the cutoff should have moved. Try `0.15` and `0.95` if you want
-   to sweep it.
+   — the cutoff should have moved. Try `600.0`, `2400.0`, and
+   `5000.0` if you want to sweep it without leaving the manifest's
+   Hz range.
 
 4. **Trigger the reload.** In the session terminal, type:
 
@@ -113,8 +120,16 @@ with audio actually playing.
    demo:preserve-cutoff-bright
    ```
 
-   followed by `<Enter>`. You should hear the timbre change with no
-   audible glitch. Watch the printed block:
+   followed by `<Enter>`. The reload should commit without stopping
+   the drone, but it may *not* create an audible timbre jump by
+   itself. That is expected for the preserving route: the active
+   voice is preserved, and the runtime migrates the old voice's
+   per-instance control values onto the new graph. In this fixture,
+   the new demo's `2400 Hz` LPF default is therefore not forced onto
+   the already-running `v0`; the reload proves lifecycle/ingress
+   continuity, not "apply every new default to existing voices."
+
+   Watch the printed block:
 
    - `supervised outcome: committed`
    - `reload events: ...`
@@ -127,17 +142,20 @@ with audio actually playing.
      `supervisor events:` explained the supervisor stack story, or
      did they feel like duplicate noise?
    - Did the block read in 2–3 seconds, or did it require study?
-   - Was the audible transition aligned with the printed events, or
-     did they feel out of sync?
+   - Did the lack of an audible default jump make the wording or
+     operator narrative confusing?
+   - Did the commit still read as meaningful once you understood it
+     as "audio kept, voice/control state preserved, ingress moved"?
 
 5. **Press `<Enter>` for a status snapshot.** Confirm
    `current plan demo:` flipped to `preserve-cutoff-bright`.
 
-6. **OSC write on the new plan.**
+6. **OSC write on the new plan.** This is the audible confirmation
+   for the preserving path.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17004 --address /v0/lpf/0 --value 0.25
+     --port 17004 --address /v0/lpf/0 --value 900.0
    ```
 
    Should accept and you should hear the cutoff close. This is the
@@ -169,7 +187,7 @@ the rejection.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17005 --address /v0/lpf/0 --value 0.75
+     --port 17005 --address /v0/lpf/0 --value 1800.0
    ```
 
 3. **Attempt the reload that gets rejected.**
@@ -203,7 +221,7 @@ the rejection.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17005 --address /v0/lpf/0 --value 0.25
+     --port 17005 --address /v0/lpf/0 --value 900.0
    ```
 
    Should accept; you should hear the cutoff move on the *old*

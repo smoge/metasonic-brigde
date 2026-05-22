@@ -186,8 +186,8 @@ done
 
 # Inject pre-reload OSC. Numeric values picked to be
 # distinguishable in the post-run grep.
-if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 0.75 >/dev/null; then
-  echo "[smoke] pre-reload OSC sent (/v0/lpf/0 = 0.75)"
+if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 1800.0 >/dev/null; then
+  echo "[smoke] pre-reload OSC sent (/v0/lpf/0 = 1800.0)"
 else
   echo "[smoke] FAIL: pre-reload OSC send failed"
   exit 1
@@ -216,8 +216,8 @@ for i in $(seq 1 120); do
 done
 
 # Inject post-reload OSC against the new manifest target.
-if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 0.25 >/dev/null; then
-  echo "[smoke] post-reload OSC sent (/v0/lpf/0 = 0.25)"
+if python3 "$SEND_OSC" --port "$PORT" --address /v0/lpf/0 --value 900.0 >/dev/null; then
+  echo "[smoke] post-reload OSC sent (/v0/lpf/0 = 900.0)"
 else
   echo "[smoke] FAIL: post-reload OSC send failed"
   exit 1
@@ -303,8 +303,8 @@ check_marker "2a. audio running" \
   "$TRANSCRIPT" "audio running: yes"
 check_marker "2b. OSC ingress bound on configured port" \
   "$TRANSCRIPT" "oscPort=$PORT"
-check_marker "3.  pre-reload OSC accept (value=0.75)" \
-  "$TRANSCRIPT" "value=0.75"
+check_marker "3.  pre-reload OSC accept (value=1800.0)" \
+  "$TRANSCRIPT" "value=1800.0"
 check_marker "4a. supervised outcome committed" \
   "$TRANSCRIPT" "supervised outcome: committed (new plan installed)"
 check_marker "4b. preserving phase started" \
@@ -313,8 +313,8 @@ check_marker "4c. preserving phase committed" \
   "$TRANSCRIPT" "preserving phase committed"
 check_marker "5a. post-reload ingress on new demo" \
   "$TRANSCRIPT" "OSC ingress: open demo=$NEW_DEMO"
-check_marker "5b. post-reload OSC accept (value=0.25)" \
-  "$TRANSCRIPT" "value=0.25"
+check_marker "5b. post-reload OSC accept (value=900.0)" \
+  "$TRANSCRIPT" "value=900.0"
 check_marker "6a. demo exit 0" \
   "$PROBE_LOG" "demo exit=0"
 check_marker "6b. ss snapshot clean (no listener)" \
