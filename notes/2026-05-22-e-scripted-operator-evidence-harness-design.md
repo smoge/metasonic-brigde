@@ -2,8 +2,24 @@
 
 Date: 2026-05-22
 
-Status: design note. Implementation slice opens against this note.
-No code lands on the strength of this note alone.
+Status: closed. Runner landed as `f11d701`
+(`Add scripted operator pass runner for smooth-cutoff fixture`),
+audio-paired verification recorded as `7582ae6`
+(`Record 8e scripted smooth-cutoff pass in playbook Findings`).
+Transcript: `/tmp/metasonic-live-session-scripted-smooth-cutoff.log`.
+The runner met the text-scaffolding contract (exit 0, all expected
+markers seen, transcript structurally identical to the manual
+smooth-cutoff pass) and the operator-paired audio judgment confirmed
+the load-bearing 8d-b claim (reload boundary sounded clean).
+
+An end-of-session snap on `quit` was observed during the verification
+run and isolated by a follow-up shutdown-only pass (`f4034f7`) to
+session shutdown / teardown — not preserving reload, not KSmooth
+state migration. The snap is deferred as a watch item under the
+"graceful session shutdown fade/mute" candidate lane and is **not
+part of 8e's success criteria**. The runner is doing what 8e set out
+to do; the snap is a separate observation surfaced by 8e's
+scaffolding but belongs to a different (not-yet-opened) lane.
 
 Companion to
 [2026-05-21-b-live-session-operator-pass-playbook.md](2026-05-21-b-live-session-operator-pass-playbook.md)
@@ -199,10 +215,11 @@ have replaced operator judgment.
 
 | Slice | Status | Notes |
 |-------|--------|-------|
-| **8e** (this note) | Open | Scripted scaffolding for smooth-cutoff pass |
+| **8e** (this note) | Closed (`f11d701`, verified `7582ae6`) | Scripted scaffolding for smooth-cutoff pass |
 | Later: marker hard-gate | Not open | Only if soft summary repeatedly catches real drift |
 | Later: second fixture | Not open | Only if a second pass wants the same scaffolding |
 | Later: pass framework | Not open | Strong YAGNI; do not pre-generalize |
+| Later: graceful session shutdown fade/mute | Not open (watch item, `f4034f7`) | Surfaced by 8e but belongs to a different lane |
 
 No KDelay or KEnv arc opens from 8e. The substrate gap remains
 deferred; this slice is about tooling, not runtime.
