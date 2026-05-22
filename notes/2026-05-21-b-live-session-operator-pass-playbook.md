@@ -28,6 +28,34 @@ The four lanes any finding could redirect into are listed in the
 "Consolidating findings" section. None of them is pre-committed; the
 notepad output of this pass is the data.
 
+## Evidence To Code
+
+This playbook produces evidence, not implementation candidates. The
+rubric for promoting evidence into a code lane:
+
+1. **Smoke proves wiring; musical use produces pressure.** The
+   `just manifest-live-session-*-smoke` wrappers confirm reload and
+   reject paths fire end-to-end. They do not surface the operator
+   friction that names the next slice. Musical use — sweeping
+   controls, reloading between variants, hitting reject paths,
+   exiting cleanly — is what the Findings sections record.
+
+2. **One friction instance is a watch item, not pressure.** A single
+   transcript surfacing something operator-hostile gets recorded as a
+   watch item in the Findings entry. It does not open a code lane on
+   its own.
+
+3. **A code lane opens only after one of:**
+   - *Repeated friction* — the same observation surfaces across two
+     or more independent passes.
+   - *Blocking friction* — a single observation that makes ordinary
+     use impossible (audio drop, lost stack, unrecoverable shell).
+   - *Calibrated exception* — a single observation, with no competing
+     candidate lane, may justify opening one slice. The 2026-05-22 OSC
+     accept-line rendering polish (`131e487`) is the working example.
+     Exceptions must be named as such in the opening design note so
+     future-you doesn't read them as the general rule.
+
 ## Prep
 
 1. **Confirm build is current.** `just stack-build`. A no-op after
