@@ -909,3 +909,21 @@ Evidence To Code rubric this remains one repeated observation
 shutdown moment); promoting it to a code lane needs a second
 independent operator pass surfacing the same friction, or a
 deliberately named roadmap-completeness exception. Neither today.
+
+### 2026-05-22 — independent saw shutdown-only pass promotes shutdown fade lane
+
+Transcript: `/tmp/metasonic-live-session-shutdown-saw.log`.
+
+Independent confirmation pass after the smooth-cutoff shutdown-only
+isolation: `status` then `quit` on
+`examples/manifests/saw-noise-filter.json` / `saw-filter-dark` with no
+reload and no OSC sweep. The transcript exited cleanly with command
+exit code 0, and the audible snap at final `quit` reproduced.
+
+This is the same operator-visible shutdown artifact on a different
+fixture family and graph shape. It is no longer specific to
+`preserve-smooth-cutoff`, KSmooth, or the scripted pass. Under the
+Evidence To Code rubric, this promotes **graceful session shutdown
+fade/mute** from watch item to a narrow implementation lane: clean
+final session shutdown should avoid the snap before tearing down the
+audio stream.
