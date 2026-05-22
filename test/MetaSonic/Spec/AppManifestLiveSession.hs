@@ -28,6 +28,7 @@ import           MetaSonic.App.ManifestLiveSession
                                              SessionStep (..),
                                              parseLiveSessionCommand,
                                              renderLiveSessionCommandHelp,
+                                             renderLiveSessionDemoList,
                                              renderLiveSessionOutcome,
                                              renderLiveSessionResourceEvents,
                                              renderLiveSessionSupervisorEvents,
@@ -59,6 +60,8 @@ appManifestLiveSessionTests =
   [ testGroup "parseLiveSessionCommand"  parseLiveSessionCommandTests
   , testGroup "renderLiveSessionCommandHelp"
                                          renderLiveSessionCommandHelpTests
+  , testGroup "renderLiveSessionDemoList"
+                                         renderLiveSessionDemoListTests
   , testGroup "stepFromOutcome"          stepFromOutcomeTests
   , testGroup "renderLiveSessionOutcome" renderLiveSessionOutcomeTests
   , testGroup "resourceTimelineForOutcome"
@@ -112,6 +115,10 @@ parseLiveSessionCommandTests =
       "demo" (LscUnknown "demo")
   , row "uppercase DEMO<space> prefix is unknown (case-sensitive)"
       "DEMO foo" (LscUnknown "DEMO foo")
+  , row "literal 'demos' is LscDemos"
+      "demos" LscDemos
+  , row "literal 'controls' is LscControls"
+      "controls" LscControls
   , row "literal 'help' is LscHelp"
       "help" LscHelp
   , row "literal '?' is LscHelp"
@@ -126,6 +133,10 @@ parseLiveSessionCommandTests =
       "HELP" (LscUnknown "HELP")
   , row "named command with trailing token is unknown (help me does not parse)"
       "help me" (LscUnknown "help me")
+  , row "demos with trailing token is unknown"
+      "demos now" (LscUnknown "demos now")
+  , row "controls with trailing token is unknown"
+      "controls now" (LscUnknown "controls now")
   , row "arbitrary text is unknown"
       "hello world" (LscUnknown "hello world")
   , row "unknown command preserves the original (untrimmed) line"
@@ -149,20 +160,49 @@ parseLiveSessionCommandTests =
 -- with the command vocabulary the operator sees.
 renderLiveSessionCommandHelpTests :: [TestTree]
 renderLiveSessionCommandHelpTests =
-  [ testCase "renders six lines: header + five command rows" $
-      length renderLiveSessionCommandHelp @?= 6
+  [ testCase "renders eight lines: header + seven command rows" $
+      length renderLiveSessionCommandHelp @?= 8
 
   , testCase "first line is the 'commands:' header (two-space indent)" $
-      head renderLiveSessionCommandHelp @?= "  commands:"
+      take 1 renderLiveSessionCommandHelp @?= ["  commands:"]
 
   , testCase "exact body matches the documented vocabulary" $
       renderLiveSessionCommandHelp
         @?= [ "  commands:"
             , "    demo:KEY    supervised reload to catalog demo KEY"
             , "    demo KEY    same, single-token form (no internal whitespace)"
+            , "    demos       list manifest demo keys (marks current)"
+            , "    controls    print current OSC control surface"
             , "    status      print current status (same as <Enter>)"
             , "    help        print commands (same as ?)"
             , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
+            ]
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- renderLiveSessionDemoList
+-- ---------------------------------------------------------------------------
+
+renderLiveSessionDemoListTests :: [TestTree]
+renderLiveSessionDemoListTests =
+  [ testCase "marks the current demo and preserves manifest order" $
+      renderLiveSessionDemoList
+        "preserve-cutoff-dark"
+        [ "preserve-cutoff-dark"
+        , "preserve-cutoff-bright"
+        , "reject-preserving-smooth-dark"
+        ]
+        @?= [ "  demos:"
+            , "    * preserve-cutoff-dark (current)"
+            , "      preserve-cutoff-bright"
+            , "      reject-preserving-smooth-dark"
+            ]
+
+  , testCase "empty manifest demo list renders an explicit placeholder" $
+      renderLiveSessionDemoList "missing" []
+        @?= [ "  demos:"
+            , "    (none)"
             ]
   ]
 

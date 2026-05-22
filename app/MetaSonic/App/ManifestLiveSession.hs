@@ -23,11 +23,13 @@
 --     @tools/manifest_live_session_require_preserving_smoke.sh@.
 --   * Default strategy is 'RequirePreserving' — safest-by-default.
 --     Other strategies are opt-in via @--strategy STRATEGY@.
---   * The stdin protocol is not a real REPL. Five command shapes
+--   * The stdin protocol is not a real REPL. A small set of command
+--     shapes is
 --     parsed by 'parseLiveSessionCommand': 'LscReloadTo' (@demo:KEY@
---     colon form or @demo KEY@ single-token form), 'LscStatus' (empty
---     line or @status@), 'LscHelp' (@help@ \/ @?@), 'LscQuit' (@quit@
---     \/ @exit@ \/ EOF), and 'LscUnknown' for everything else. An
+--     colon form or @demo KEY@ single-token form), 'LscDemos'
+--     (@demos@), 'LscControls' (@controls@), 'LscStatus' (empty line
+--     or @status@), 'LscHelp' (@help@ \/ @?@), 'LscQuit' (@quit@ \/
+--     @exit@ \/ EOF), and 'LscUnknown' for everything else. An
 --     'LscUnknown' echoes the original input and prints the same
 --     command vocabulary 'LscHelp' does, so a typo immediately tells
 --     the operator what's accepted.
@@ -48,6 +50,7 @@ module MetaSonic.App.ManifestLiveSession
   , LiveSessionCommand (..)
   , parseLiveSessionCommand
   , renderLiveSessionCommandHelp
+  , renderLiveSessionDemoList
 
     -- * Outcome state machine (pure, table-tested)
   , LiveSessionOutcome (..)
@@ -167,8 +170,10 @@ import           MetaSonic.App.ManifestReloadSupervisorAdapter
 import           MetaSonic.App.ManifestReloadIngress
                                                 (readManifestReloadIngressManager)
 import           MetaSonic.App.ManifestReloadIngressTarget
-                                                (ManifestReloadIngressTarget)
-import           MetaSonic.Authoring.Manifest   (AuthoringManifestDoc)
+                                                (ManifestReloadIngressTarget,
+                                                 manifestReloadIngressTargetFromPlan)
+import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
+                                                 AuthoringManifestDoc (..))
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.FanIn        (SessionFanInSnapshot (..),
                                                  defaultSessionFanInAudioFFI)
@@ -204,8 +209,9 @@ import           MetaSonic.Session.State        (SessionState (..))
 -- parser failures).
 --
 -- Named commands are matched on the exact trimmed token (no
--- prefix-of-a-prefix surprises): @help@, @?@, @quit@, @exit@, and
--- @status@ each parse to their respective constructor; an input
+-- prefix-of-a-prefix surprises): @demos@, @controls@, @status@,
+-- @help@, @?@, @quit@, and @exit@ each parse to their respective
+-- constructor; an input
 -- like @help me@ falls through to 'LscUnknown' because it does not
 -- equal any of the recognized tokens.
 --
@@ -224,6 +230,13 @@ data LiveSessionCommand
     -- ^ @demo:KEY@ or @demo KEY@. The key string is the trimmed
     -- payload (with the colon form's internal whitespace preserved,
     -- and the space form's single-token rule already enforced).
+  | LscDemos
+    -- ^ The literal @demos@. Lists manifest demo keys and marks the
+    -- current serving plan.
+  | LscControls
+    -- ^ The literal @controls@. Reprints the current OSC control
+    -- surface so the operator does not have to scroll back to the
+    -- startup preamble.
   | LscStatus
     -- ^ Empty line, whitespace-only line, or the literal @status@.
   | LscHelp
@@ -246,6 +259,8 @@ parseLiveSessionCommand line =
   case trimmed of
     ""       -> LscStatus
     "status" -> LscStatus
+    "demos"  -> LscDemos
+    "controls" -> LscControls
     "help"   -> LscHelp
     "?"      -> LscHelp
     "quit"   -> LscQuit
@@ -286,10 +301,26 @@ renderLiveSessionCommandHelp =
   [ "  commands:"
   , "    demo:KEY    supervised reload to catalog demo KEY"
   , "    demo KEY    same, single-token form (no internal whitespace)"
+  , "    demos       list manifest demo keys (marks current)"
+  , "    controls    print current OSC control surface"
   , "    status      print current status (same as <Enter>)"
   , "    help        print commands (same as ?)"
   , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
   ]
+
+
+-- | Render the loaded manifest's demo keys, marking the currently
+-- serving plan. Kept pure so the command's operator surface can be
+-- pinned without running a live session.
+renderLiveSessionDemoList :: String -> [String] -> [String]
+renderLiveSessionDemoList current keys =
+  "  demos:" : case keys of
+    [] -> ["    (none)"]
+    _  -> map renderKey keys
+  where
+    renderKey key
+      | key == current = "    * " <> key <> " (current)"
+      | otherwise      = "      " <> key
 
 
 -- ============================================================================
@@ -749,6 +780,12 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOut
       LscStatus -> do
         printStatus trackedStackRef currentPlanRef lastOutcomeRef
         pure SsContinue
+      LscDemos -> do
+        printDemos doc catalog currentPlanRef
+        pure SsContinue
+      LscControls -> do
+        printControls trackedStackRef currentPlanRef
+        pure SsContinue
       LscHelp -> do
         mapM_ putStrLn renderLiveSessionCommandHelp
         pure SsContinue
@@ -982,3 +1019,55 @@ printStatus trackedStackRef currentPlanRef lastOutcomeRef = do
       putStrLn "    last outcome:      (none yet)"
     Just lso ->
       putStrLn $ "    last outcome:      " <> renderLiveSessionOutcome lso
+
+
+-- | Print the manifest demo keys known to this live session, marking
+-- the plan currently serving. This is intentionally the intersection
+-- of the loaded manifest document and the app reload catalog, not a
+-- full built-in demo-table dump: the operator wants to know what
+-- @demo KEY@ can reasonably target in this session.
+printDemos
+  :: AuthoringManifestDoc
+  -> [MR.ManifestReloadCatalogEntry]
+  -> IORef MR.ManifestReloadPlan
+  -> IO ()
+printDemos doc catalog currentPlanRef = do
+  currentPlan <- readIORef currentPlanRef
+  mapM_ putStrLn $
+    renderLiveSessionDemoList
+      (MR.mrlpDemoKey currentPlan)
+      [ key
+      | manifest <- docDemos doc
+      , let key = mfDemoKey manifest
+      , any ((== key) . MR.mrcDemoKey) catalog
+      ]
+
+
+-- | Reprint the current OSC control surface. The command projects
+-- from the current plan each time so it follows successful reloads;
+-- addressable lines resolve against the live voice set when a stack
+-- is available.
+printControls
+  :: IORef (Maybe LiveStack)
+  -> IORef MR.ManifestReloadPlan
+  -> IO ()
+printControls trackedStackRef currentPlanRef = do
+  currentPlan <- readIORef currentPlanRef
+  let currentDemoKey = MR.mrlpDemoKey currentPlan
+  putStrLn ""
+  case manifestReloadIngressTargetFromPlan
+         liveIngressTargetPolicy currentPlan of
+    Left issue ->
+      putStrLn $
+        "  controls for " <> currentDemoKey
+        <> ": unavailable: ingress projection failed: " <> show issue
+    Right target -> do
+      renderOSCControls
+        ("controls for " <> currentDemoKey <> " (pattern)") target
+      mStack <- readIORef trackedStackRef
+      case mStack of
+        Nothing ->
+          putStrLn
+            "  addressable OSC surface: (no live stack)"
+        Just stack ->
+          printAddressableSurface (mrhcService (rhsConfig stack)) target

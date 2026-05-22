@@ -236,9 +236,10 @@ data RunMode
     -- Open-ended counterpart to ManifestLiveReloadDemo: starts
     -- audio on DEMO through the manifest pipeline + supervised
     -- lifecycle, then accepts stdin commands (demo:KEY or demo KEY
-    -- to trigger a supervised reload, status or <Enter> for the
-    -- status snapshot, help or ? for the command vocabulary, quit
-    -- or exit or <Ctrl-D> to exit cleanly).
+    -- to trigger a supervised reload, demos to list reload targets,
+    -- controls to reprint the current OSC surface, status or
+    -- <Enter> for the status snapshot, help or ? for the command
+    -- vocabulary, quit or exit or <Ctrl-D> to exit cleanly).
     -- Default strategy is require-preserving. The first real
     -- consumer of the supervisor migration arc.
   deriving (Eq, Show)
@@ -814,6 +815,8 @@ usage prog = unlines
   , "                   MetaSonic.App.ManifestLiveSession for the canonical"
   , "                   source):"
   , "                     demo:KEY or demo KEY     supervised reload to KEY"
+  , "                     demos                    list manifest demo keys"
+  , "                     controls                 print current OSC surface"
   , "                     <Enter> or status        print status snapshot"
   , "                     help or ?                print command vocabulary"
   , "                     quit, exit, or <Ctrl-D>  exit cleanly"

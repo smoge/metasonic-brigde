@@ -5,6 +5,12 @@ anything. The point is to take the supervised live session as it
 exists today, drive it from the operator side, and let real friction
 pick the next code lane instead of speculation.
 
+Updated 2026-05-22 after the stdin ergonomics arc: `help`,
+`status`, `quit` / `exit`, `demo KEY`, `demos`, and `controls` are
+now part of the session shell. The next pass should test whether the
+remaining friction is deeper than basic command / control-surface
+discoverability.
+
 ## Why this pass
 
 The supervisor arc has had four consecutive non-speculative closeouts
@@ -112,23 +118,38 @@ with audio actually playing.
    A dark drone should start playing. The terminal prints an
    `initial fan-in:` block, then `ingress: open ... oscPort=17004`,
    the addressable OSC surface (with `range=...` / `default=...` /
-   optional `cc=...` per binding), the five-line command
+   optional `cc=...` per binding), the command
    vocabulary under `commands:`, and then the per-line prompt:
 
    ```
    Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:
    ```
 
-   The five commands recognized at this prompt are `demo:KEY` /
-   `demo KEY` (supervised reload), `status` (same as `<Enter>`),
-   `help` (or `?`, prints the vocabulary), and `quit` (or `exit`,
-   same as `<Ctrl-D>`). Anything else echoes the typed line and
-   reprints the same vocabulary.
+   The recognized commands at this prompt are `demo:KEY` /
+   `demo KEY` (supervised reload), `demos` (list manifest demo keys),
+   `controls` (reprint the current OSC surface), `status` (same as
+   `<Enter>`), `help` (or `?`, prints the vocabulary), and `quit`
+   (or `exit`, same as `<Ctrl-D>`). Anything else echoes the typed
+   line and reprints the same vocabulary.
 
-2. **Press `<Enter>` once.** Read the status snapshot. Note whether
+2. **Exercise the command vocabulary.** In the session terminal, type:
+
+   ```
+   help
+   demos
+   controls
+   status
+   ```
+
+   Confirm `help` prints the same command vocabulary shown at
+   startup, `demos` marks the current demo, `controls` reprints the
+   addressable OSC surface, and `status` prints the same kind of
+   snapshot as `<Enter>`.
+
+3. **Press `<Enter>` once.** Read the status snapshot. Note whether
    the layout reads well at a glance or has to be studied.
 
-3. **Pre-reload OSC write from the second terminal.**
+4. **Pre-reload OSC write from the second terminal.**
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
@@ -142,22 +163,32 @@ with audio actually playing.
    that range). If you want to confirm the rejection path, send
    `0.75` once and look for an `osc reject (out-of-range)` line.
 
-4. **Trigger the reload.** In the session terminal, type:
+5. **Trigger the reload with the space alias.** In the session terminal,
+   type:
 
    ```
-   demo:preserve-cutoff-bright
+   demo preserve-cutoff-bright
    ```
 
-   followed by `<Enter>`. The reload should commit without stopping
-   the drone, but it may *not* create an audible timbre jump by
-   itself. That is expected for the preserving route: the active
-   voice is preserved, and the runtime migrates the old voice's
-   per-instance control values onto the new graph. In this fixture,
-   the new demo's `2400 Hz` LPF default is therefore not forced onto
-   the already-running `v0`; the reload proves lifecycle/ingress
-   continuity, not "apply every new default to existing voices."
+   The space form is intentionally single-token; `demo foo bar`
+   should be rejected rather than silently using only `foo`.
 
-   Watch the printed block:
+6. **Reload back with the colon form.** In the session terminal, type:
+
+   ```
+   demo:preserve-cutoff-dark
+   ```
+
+   Both reloads should commit without stopping the drone, but neither
+   may create an audible timbre jump by itself. That is expected for
+   the preserving route: the active voice is preserved, and the
+   runtime migrates the old voice's per-instance control values onto
+   the new graph. In this fixture, the target demo's LPF default is
+   therefore not forced onto the already-running `v0`; the reload
+   proves lifecycle / ingress continuity, not "apply every new default
+   to existing voices."
+
+   Watch each printed block:
 
    - `supervised outcome: committed`
    - `reload events: ...`
@@ -175,24 +206,26 @@ with audio actually playing.
    - Did the commit still read as meaningful once you understood it
      as "audio kept, voice/control state preserved, ingress moved"?
 
-5. **Press `<Enter>` for a status snapshot.** Confirm
-   `current plan demo:` flipped to `preserve-cutoff-bright`.
+7. **Press `<Enter>` for a status snapshot.**
 
-6. **OSC write on the new plan.** This is the audible confirmation
+   Confirm `current plan demo:` reads `preserve-cutoff-dark`. This
+   keeps the happy-path pass to two reloads: one space-form reload,
+   one colon-form reload.
+
+8. **OSC write on the new plan.** This is the audible confirmation
    for the preserving path.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17004 --address /v0/lpf/0 --value 2400
+     --port 17004 --address /v0/lpf/0 --value 600
    ```
 
-   Should accept and you should hear the cutoff open. `2400` matches
-   the bright demo's own default, which is a nice mnemonic — the
-   audible result is what you would have heard if the voice were
-   rebuilt rather than preserved. This is the "OSC survives the
-   reload" invariant — interesting only if it does not work.
+   Should accept and you should hear the cutoff move on the dark plan.
+   `600` matches the dark demo's own default, which is a useful
+   mnemonic after reloading back from bright. This is the "OSC survives
+   the reload" invariant — interesting only if it does not work.
 
-7. **Exit with `<Ctrl-D>`.** Should be clean — no hang, no zombie
+9. **Exit with `quit`.** Should be clean — no hang, no zombie
    audio device.
 
 ## Session 2 — reject-preserving-smooth path
@@ -261,7 +294,11 @@ the rejection.
 
 ## Session 3 — bad-key / rejected command probes
 
-Do not start a third session; fold these into one of the two above.
+These are stdin-protocol probes, not a third audio scenario. If one
+of the earlier sessions is still open, fold in the first few checks
+that match your immediate question. If you want a complete parser pass,
+run all seven in a short follow-up session; only `exit` needs to come
+last because it closes the shell.
 
 1. **Typo'd demo key.**
 
@@ -281,24 +318,61 @@ Do not start a third session; fold these into one of the two above.
 
    Expected: also non-fatal, hits `LscUnknown`.
 
-3. **Empty whitespace.** A few spaces and `<Enter>` should fall
+3. **Malformed space-form reload.**
+
+   ```
+   demo foo bar
+   ```
+
+   Expected: non-fatal, hits `LscUnknown`. The space form is
+   intentionally single-token; it must not silently use `foo` and
+   ignore `bar`.
+
+4. **Bare reload word.**
+
+   ```
+   demo
+   ```
+
+   Expected: non-fatal, hits `LscUnknown`; a reload key is required.
+
+5. **Help alias.**
+
+   ```
+   ?
+   ```
+
+   Expected: prints the same vocabulary as `help`.
+
+6. **Empty whitespace.** A few spaces and `<Enter>` should fall
    through to the status snapshot path.
+
+7. **Exit alias.** `exit` should close the session cleanly. Run this
+   last if you are folding these probes into an active session.
 
 What to record:
 
-- Does the typo response tell you what *would* have been valid?
 - Is the distinction between "unknown command" and "unknown demo
   key" clear?
+- For `hello world`, `demo foo bar`, and `demo`, is the full command
+  vocabulary helpful, or would a one-line hint be better?
 - Does the session make it obvious that a command-level reject did
   not invoke the supervisor at all?
+- Do the `?` and `exit` aliases feel discoverable, or are they just
+  extra vocabulary to remember?
 
 ## Consolidating findings
 
 In the scratch notepad, sort each finding into one of four buckets:
 
-- **Interaction friction.** Stdin awkward; status snapshot hard to
-  read; no command history; can't see what demos exist; can't
-  introspect controls live. → points at GUI / control binding.
+- **Interaction friction.** Basic stdin vocabulary and current
+  demo/control-surface discovery are now available through `help`,
+  `demos`, and `controls`; remaining friction is more specific:
+  status snapshot hard to read, no command history, can't introspect
+  current control values live, or can't make repeated changes quickly.
+  → points at command-history/readline, current-value reporting, or
+  GUI / control binding if the text shell itself becomes the
+  bottleneck.
 - **Strategy gaps.** "I wanted to try try-preserving and there's no
   wrapper"; "the strategy flag default isn't obvious"; "I want to
   switch strategy without restarting the session." → points at
@@ -344,6 +418,54 @@ operator evidence, not the whole terminal dump.
 
 ## Findings
 
-(Empty until the pass runs. Append a dated subsection per pass,
-ordered chronologically. Keep the playbook part of the note stable
-so future passes can re-use it.)
+### 2026-05-22 — happy require-preserving session
+
+Transcript: `/tmp/metasonic-live-session-happy.log`, captured from:
+
+```sh
+script -q -f -c 'stack exec -- metasonic-bridge \
+  --session-osc-port 17004 \
+  --manifest-live-session examples/manifests/preserve-cutoff.json \
+  preserve-cutoff-dark \
+  --strategy require-preserving' \
+  /tmp/metasonic-live-session-happy.log
+```
+
+Objective result:
+
+- Session opened on `preserve-cutoff-dark` with `audio running: yes`,
+  `active voices: 1`, OSC port `17004`, and addressable control
+  `/v0/lpf/0  (name="cutoff", default=600.0, range=[200.0, 6000.0], cc=74)`.
+- `status` and `help` rendered the expected operator surfaces.
+- `demo preserve-cutoff-bright` committed and reported
+  `serving plan: preserve-cutoff-bright`.
+- `demo:preserve-cutoff-dark` committed and reported
+  `serving plan: preserve-cutoff-dark`.
+- Post-reload OSC writes to `/v0/lpf/0` with values `600.0`,
+  `1600.0`, and `300.0` were accepted, and the audible cutoff changed
+  without a glitch.
+- Final status reported `current plan demo: preserve-cutoff-dark`,
+  `last outcome: committed (new plan installed)`, and one active
+  voice.
+- `quit` terminated cleanly with command exit code `0`.
+
+Observed friction:
+
+- ALSA / PortAudio device-enumeration stderr is noisy enough to bury
+  the useful startup lines in transcripts, even though the run itself
+  succeeds. This is an operator-readability issue, not a correctness
+  failure in this pass.
+- Arrow-up history is not available in the raw stdin shell; escape
+  bytes are treated as an unknown command. This confirms "no command
+  history" as real shell friction, but it is not yet stronger than the
+  demo / control discoverability gap this pass produced.
+- The sharpest self-discovery gap was that the operator could read
+  the startup vocabulary but could not ask the shell which demos are
+  reload targets or reprint the current control surface after
+  scrollback had moved.
+
+Immediate follow-up chosen from this pass and landed into the shell:
+add App-level `demos` and `controls` commands. Keep later slices
+narrow: do not mix current-value introspection, GUI bindings,
+readline-style history, or ALSA stderr suppression into the same
+change without a fresh operator pass.
