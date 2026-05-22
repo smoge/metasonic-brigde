@@ -416,3 +416,39 @@ metadata together.
 
 This rule keeps authoring convenient, compilation explicit, and the
 runtime simple.
+
+
+## Related artifacts
+
+Source anchors (file-level links, symbol-named anchors — line numbers
+deliberately omitted so the table stays stable across small edits):
+
+| Topic | Source file | Symbol / anchor |
+|-------|-------------|-----------------|
+| Source graph type | [Source.hs](../src/MetaSonic/Bridge/Source.hs) | `SynthGraph` |
+| Source node spec | [Source.hs](../src/MetaSonic/Bridge/Source.hs) | `NodeSpec` |
+| Builder monad / entry point | [Source.hs](../src/MetaSonic/Bridge/Source.hs) | `SynthM`, `runSynth` |
+| Migration key for hot-swap | [Source.hs](../src/MetaSonic/Bridge/Source.hs) | `MigrationKey` |
+| Symbolic vs dense identity | [Types.hs](../src/MetaSonic/Types.hs) | `NodeID`, `NodeIndex` |
+| Validation + topo sort | [Validate.hs](../src/MetaSonic/Bridge/Validate.hs) | `validateAndSort` |
+| Lowering to IR | [IR.hs](../src/MetaSonic/Bridge/IR.hs) | `lowerGraph` |
+| IR graph + node types | [IR.hs](../src/MetaSonic/Bridge/IR.hs) | `GraphIR`, `NodeIR` |
+| IR execution-order invariant | [IR.hs](../src/MetaSonic/Bridge/IR.hs) | `Note [Execution order invariant]` |
+| Single-template compile | [Compile.hs](../src/MetaSonic/Bridge/Compile.hs) | `compileRuntimeGraph` |
+| Dense runtime graph | [Compile/Types.hs](../src/MetaSonic/Bridge/Compile/Types.hs) | `RuntimeGraph` |
+| Resource footprint | [Compile/Types.hs](../src/MetaSonic/Bridge/Compile/Types.hs) | `ResourceFootprint` |
+| Multi-template compile | [Templates.hs](../src/MetaSonic/Bridge/Templates.hs) | `compileTemplateGraph` |
+| Template + identifier | [Templates.hs](../src/MetaSonic/Bridge/Templates.hs) | `Template`, `TemplateID` |
+| Compiled template plan | [Templates.hs](../src/MetaSonic/Bridge/Templates.hs) | `TemplateGraph` |
+| Template plan contract | [Templates.hs](../src/MetaSonic/Bridge/Templates.hs) | `Note [TemplateGraph as the compile-decreed plan]` |
+| FFI loader | [FFI.hs](../src/MetaSonic/Bridge/FFI.hs) | `loadRuntimeGraph` |
+| Manifest reload plan | [ManifestReload.hs](../src/MetaSonic/Session/ManifestReload.hs) | `ManifestReloadPlan`, `planManifestReload` |
+
+Related notes:
+
+- [2026-05-20-b-manifest-live-session-v0.md](2026-05-20-b-manifest-live-session-v0.md)
+  — how this split feeds the live session.
+- [2026-05-20-c-compiler-runtime-to-live-system.md](2026-05-20-c-compiler-runtime-to-live-system.md)
+  — narrative checkpoint connecting the compiler to the live runtime.
+- [2026-05-21-f-fusion-kernel-state-and-reopen-criteria.md](2026-05-21-f-fusion-kernel-state-and-reopen-criteria.md)
+  — fusion sits inside the `RuntimeGraph` boundary the split protects.
