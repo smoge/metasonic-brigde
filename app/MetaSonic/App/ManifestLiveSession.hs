@@ -799,11 +799,13 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOut
             warnIfMissingVoices service voices
 
 
--- | Injectable plan resolver: given an operator-typed @demo:KEY@
--- payload, return either a rendered rejection reason
--- (command-level reject, session keeps serving) or the requested
--- plan. Parameterized so the testable IO core
--- ('runReloadWith') does not need a real
+-- | Injectable plan resolver: given a parsed reload key, return
+-- either a rendered rejection reason (command-level reject,
+-- session keeps serving) or the requested plan. Layer-boundary
+-- note: the parser owns surface syntax (the two reload forms),
+-- the resolver owns key lookup — it sees only the normalized key
+-- string, never the colon-vs-space spelling. Parameterized so the
+-- testable IO core ('runReloadWith') does not need a real
 -- 'AuthoringManifestDoc' + catalog fixture; tests construct a
 -- stub resolver and a stub plan type.
 newtype ReloadResolver plan = ReloadResolver
@@ -832,7 +834,7 @@ catalogPlanResolver doc catalog = ReloadResolver $ \key ->
           Right plan
 
 
--- | One supervised reload attempt driven by an operator-typed key.
+-- | One supervised reload attempt driven by a parsed reload key.
 -- Distinguishes planning failures (command-level reject; keep
 -- serving) from supervisor outcomes. Always overwrites
 -- 'lastOutcomeRef' so 'LscStatus' reads the most recent attempt.
