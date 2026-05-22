@@ -469,3 +469,35 @@ add App-level `demos` and `controls` commands. Keep later slices
 narrow: do not mix current-value introspection, GUI bindings,
 readline-style history, or ALSA stderr suppression into the same
 change without a fresh operator pass.
+
+### 2026-05-22 — `demos` / `controls` validation pass
+
+Transcript: `/tmp/metasonic-live-session-discovery.log`, captured
+against `bdad6e6` on the same require-preserving route as above. The
+operator exercised `status`, `demos`, `controls`, `demo preserve-cutoff-bright`
+(space form), `controls`, `demo:preserve-cutoff-dark` (colon form),
+`controls`, `help`, `quit`.
+
+Against the questions raised when the slice was chosen:
+
+- `demos` made the reload targets obvious enough. Two-line output with
+  `*` on the current key, no typo round-trip needed.
+- `controls` was useful after scrollback moved. Reprinting both the
+  pattern and addressable surface — and showing the new
+  `default=2400.0` after committing `preserve-cutoff-bright` — was the
+  clearest confirmation that the live plan, not the manifest's first
+  entry, drives the display.
+- Output volume felt about right. Two-line `demos`, three-line
+  `controls`, no need to trim further on this pass.
+- ALSA stderr noise is still present at startup but did not interfere
+  with the operator commands once the prompt appeared. Arrow-key
+  history was not exercised in this pass; the discoverability gap it
+  was deferred against has now been closed by `demos` / `controls`, so
+  the next lane on it should be a fresh operator pass, not this one.
+- Wanting current control values (live `cutoff` reading, not just the
+  declared surface) did not come up in this pass. It remains a real
+  candidate for the next slice, but only if it surfaces again under
+  operator pressure.
+
+No new friction surfaced. Per the playbook rubric, no follow-up work
+is opened on the strength of this pass alone.
