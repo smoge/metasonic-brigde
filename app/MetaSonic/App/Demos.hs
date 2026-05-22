@@ -604,6 +604,164 @@ rejectPreservingSmoothBrightAuthoring = emptyAuthoringReport
   }
 
 ------------------------------------------------------------
+-- Phase 8b — Tier 1 repertoire (saw + noise families)
+------------------------------------------------------------
+--
+-- Four single-template drone demos in two preserving-compatible
+-- pairs. The saw family ('saw-filter-dark' / 'saw-filter-bright')
+-- lands on the 'RSawLpfGainOut' kernel; the noise family
+-- ('noise-filter-soft' / 'noise-filter-sharp') lands on
+-- 'RNoiseLpfGainOut'.
+--
+-- Every voice exposes its controls as direct 'ReportedControl'
+-- bindings on tagged primitive nodes — never through
+-- 'Auth.control' / 'ccControl', which would emit a 'KSmooth' and
+-- break preserving compatibility. See
+-- notes/2026-05-22-a-live-session-repertoire-design.md for the
+-- design rationale and slot-mapping verification:
+--   * KLPF      slot 0 = cutoff  slot 1 = q
+--   * KGain     slot 0 = amount
+--   * KSawOsc   slot 0 = freq    (phase is initial-only — avoid)
+--
+-- All four voices tag their stateful source as "carrier" so a
+-- cross-family preserving reload (saw <-> noise) hits the
+-- kind-mismatch arm of 'validateStatefulNode' on the same
+-- migration key — a reject path the existing fixture set does
+-- not exercise.
+
+droneSawFilterDark :: SynthGraph
+droneSawFilterDark = runSynth $ do
+  carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
+  filtered <- tagged "lpf"     (lpf carrier (Param 600.0) (Param 0.7))
+  shaped   <- tagged "gain"    (gain filtered (Param 0.2))
+  out 0 shaped
+
+droneSawFilterBright :: SynthGraph
+droneSawFilterBright = runSynth $ do
+  carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
+  filtered <- tagged "lpf"     (lpf carrier (Param 2400.0) (Param 0.7))
+  shaped   <- tagged "gain"    (gain filtered (Param 0.2))
+  out 0 shaped
+
+droneNoiseFilterSoft :: SynthGraph
+droneNoiseFilterSoft = runSynth $ do
+  source   <- tagged "carrier" noiseGen
+  filtered <- tagged "lpf"     (lpf source (Param 900.0) (Param 1.0))
+  shaped   <- tagged "gain"    (gain filtered (Param 0.15))
+  out 0 shaped
+
+droneNoiseFilterSharp :: SynthGraph
+droneNoiseFilterSharp = runSynth $ do
+  source   <- tagged "carrier" noiseGen
+  filtered <- tagged "lpf"     (lpf source (Param 3200.0) (Param 3.0))
+  shaped   <- tagged "gain"    (gain filtered (Param 0.15))
+  out 0 shaped
+
+-- | Pitch control on the saw family's KSawOsc carrier. No
+-- canonical CC: oscillator frequency is normally driven by note
+-- number, not a controller.
+pitchControl :: Double -> Report.ReportedControl
+pitchControl def = Report.ReportedControl
+  { Report.rcName        = "pitch"
+  , Report.rcDefault     = def
+  , Report.rcRange       = (55.0, 880.0)
+  , Report.rcSmoothingHz = 0.0
+  , Report.rcCC          = Nothing
+  , Report.rcKey         = MigrationKey "carrier"
+  , Report.rcSlot        = 0
+  }
+
+-- | Cutoff control on the tagged KLPF. CC 74 = GM2 "Sound
+-- Controller 5 / Brightness", the conventional filter-cutoff CC
+-- (matches preserve-cutoff).
+cutoffControl :: Double -> Report.ReportedControl
+cutoffControl def = Report.ReportedControl
+  { Report.rcName        = "cutoff"
+  , Report.rcDefault     = def
+  , Report.rcRange       = (200.0, 6000.0)
+  , Report.rcSmoothingHz = 0.0
+  , Report.rcCC          = Just 74
+  , Report.rcKey         = MigrationKey "lpf"
+  , Report.rcSlot        = 0
+  }
+
+-- | Resonance control on the tagged KLPF. CC 71 = GM2 "Sound
+-- Controller 2 / Timbre / Harmonic Content", the conventional
+-- filter-resonance CC.
+qControl :: Double -> Report.ReportedControl
+qControl def = Report.ReportedControl
+  { Report.rcName        = "q"
+  , Report.rcDefault     = def
+  , Report.rcRange       = (0.3, 4.0)
+  , Report.rcSmoothingHz = 0.0
+  , Report.rcCC          = Just 71
+  , Report.rcKey         = MigrationKey "lpf"
+  , Report.rcSlot        = 1
+  }
+
+-- | Output level on the tagged KGain. CC 7 = channel volume.
+-- Range tops out below unity so the dark/bright contrast stays
+-- comfortable; widen if a session wants louder output.
+levelControl :: Double -> Report.ReportedControl
+levelControl def = Report.ReportedControl
+  { Report.rcName        = "level"
+  , Report.rcDefault     = def
+  , Report.rcRange       = (0.0, 0.5)
+  , Report.rcSmoothingHz = 0.0
+  , Report.rcCC          = Just 7
+  , Report.rcKey         = MigrationKey "gain"
+  , Report.rcSlot        = 0
+  }
+
+droneVoiceTemplate :: Report.ReportedTemplate
+droneVoiceTemplate = Report.ReportedTemplate
+  { Report.rtName = "drone"
+  , Report.rtRole = Auth.VoiceTemplate
+  }
+
+sawFilterDarkAuthoring :: AuthoringReport
+sawFilterDarkAuthoring = emptyAuthoringReport
+  { Report.arTemplates = [droneVoiceTemplate]
+  , Report.arControls  =
+      [ pitchControl  220.0
+      , cutoffControl 600.0
+      , qControl      0.7
+      , levelControl  0.2
+      ]
+  }
+
+sawFilterBrightAuthoring :: AuthoringReport
+sawFilterBrightAuthoring = emptyAuthoringReport
+  { Report.arTemplates = [droneVoiceTemplate]
+  , Report.arControls  =
+      [ pitchControl  220.0
+      , cutoffControl 2400.0
+      , qControl      0.7
+      , levelControl  0.2
+      ]
+  }
+
+noiseFilterSoftAuthoring :: AuthoringReport
+noiseFilterSoftAuthoring = emptyAuthoringReport
+  { Report.arTemplates = [droneVoiceTemplate]
+  , Report.arControls  =
+      [ cutoffControl 900.0
+      , qControl      1.0
+      , levelControl  0.15
+      ]
+  }
+
+noiseFilterSharpAuthoring :: AuthoringReport
+noiseFilterSharpAuthoring = emptyAuthoringReport
+  { Report.arTemplates = [droneVoiceTemplate]
+  , Report.arControls  =
+      [ cutoffControl 3200.0
+      , qControl      3.0
+      , levelControl  0.15
+      ]
+  }
+
+------------------------------------------------------------
 
 data Demo = Demo
   { demoKey       :: String
@@ -692,6 +850,22 @@ demoTable =
          "Reject-eligible preserving target (saw drone @ LPF 2400 Hz, +KSmooth on gain)"
          (MultiTemplate [("drone", dronePreserveSmoothBright)])
          rejectPreservingSmoothBrightAuthoring
+  , demoWithAuth "saw-filter-dark"
+         "Phase 8b saw drone (LPF 600 Hz, q 0.7, level 0.2; pitch/cutoff/q/level controls)"
+         (MultiTemplate [("drone", droneSawFilterDark)])
+         sawFilterDarkAuthoring
+  , demoWithAuth "saw-filter-bright"
+         "Phase 8b saw drone (LPF 2400 Hz, q 0.7, level 0.2; pitch/cutoff/q/level controls)"
+         (MultiTemplate [("drone", droneSawFilterBright)])
+         sawFilterBrightAuthoring
+  , demoWithAuth "noise-filter-soft"
+         "Phase 8b noise drone (LPF 900 Hz, q 1.0, level 0.15; cutoff/q/level controls)"
+         (MultiTemplate [("drone", droneNoiseFilterSoft)])
+         noiseFilterSoftAuthoring
+  , demoWithAuth "noise-filter-sharp"
+         "Phase 8b noise drone (LPF 3200 Hz, q 3.0, level 0.15; cutoff/q/level controls)"
+         (MultiTemplate [("drone", droneNoiseFilterSharp)])
+         noiseFilterSharpAuthoring
   , demoNoAuth "midi-poly"
          "Live MIDI poly synth (8 voices; CC7 → master, pitch-bend ±2)"
          (MidiPoly 8 midiPolySynth)

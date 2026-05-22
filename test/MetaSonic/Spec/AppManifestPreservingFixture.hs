@@ -1,7 +1,8 @@
 -- | Drift guard for the committed preserving manifest fixtures.
 --
--- Two on-disk fixtures live under @examples/manifests/@ and are
--- referenced from runbooks and operator smokes:
+-- Three on-disk fixtures live under @examples/manifests/@ and are
+-- referenced from runbooks, operator smokes, and the Phase 8b
+-- live-session repertoire:
 --
 --   * @preserve-cutoff.json@ — the blessed happy-path input for
 --     the preserving manifest live-reload path
@@ -11,6 +12,11 @@
 --     'SupervisedReloadRequestRejected' branch deterministically
 --     (KSmooth on the gain path makes the active voice
 --     preserve-unsupported).
+--   * @saw-noise-filter.json@ — the Phase 8b Tier 1 repertoire,
+--     four single-template drone demos in two preserving-compatible
+--     pairs (saw / noise) with multi-control surfaces (pitch /
+--     cutoff / q / level). See
+--     [notes/2026-05-22-a-live-session-repertoire-design.md](../notes/2026-05-22-a-live-session-repertoire-design.md).
 --
 -- Each must stay byte-identical to what
 -- @stack exec -- metasonic-bridge --authoring-manifest DARK BRIGHT@
@@ -58,6 +64,9 @@ fixturePath = "examples/manifests/preserve-cutoff.json"
 
 rejectFixturePath :: FilePath
 rejectFixturePath = "examples/manifests/reject-preserving-smooth.json"
+
+tier1FixturePath :: FilePath
+tier1FixturePath = "examples/manifests/saw-noise-filter.json"
 
 appManifestPreservingFixtureTests :: TestTree
 appManifestPreservingFixtureTests =
@@ -211,6 +220,41 @@ appManifestPreservingFixtureTests =
         @?= Just (Just 74, "lpf", 0)
 
   , testCase
+      "examples/manifests/saw-noise-filter.json matches --authoring-manifest output"
+      $ do
+      -- Byte-equality drift guard for the Phase 8b Tier 1
+      -- repertoire fixture. Same shape as the two guards above
+      -- but covers four demos in one file: saw-filter-dark,
+      -- saw-filter-bright, noise-filter-soft, noise-filter-sharp.
+      -- If any of the four authoring records drifts (control
+      -- rename, default shift, CC reassignment, range edit,
+      -- migration-key/slot change) without the JSON being
+      -- regenerated, the live-session repertoire silently
+      -- desyncs from the committed fixture and operators see a
+      -- stale control surface in the manifest live session.
+      let demoKeys =
+            [ "saw-filter-dark"
+            , "saw-filter-bright"
+            , "noise-filter-soft"
+            , "noise-filter-sharp"
+            ]
+      manifests <- mapM lookupReportManifest demoKeys
+      let doc = AuthoringManifestDoc
+            { docSchemaVersion = manifestSchemaVersion
+            , docDemos         = manifests
+            }
+          generated = encodeManifestDoc doc
+
+      onDisk <- BL.readFile tier1FixturePath
+      assertEqual
+        ("Fixture " <> tier1FixturePath <> " is out of date. Regenerate with:\n"
+         <> "  stack exec -- metasonic-bridge --authoring-manifest "
+         <> unwords demoKeys
+         <> " > " <> tier1FixturePath)
+        generated
+        onDisk
+
+  , testCase
       "--manifest-midi-reload-smoke policy targets the same voice as the UI/OSC default"
       $ do
       -- Pins the smoke's printed "default MIDI voice:" line and
@@ -232,3 +276,18 @@ appManifestPreservingFixtureTests =
     lookupDemo k = case filter ((== k) . demoKey) demoTable of
       [d] -> Just d
       _   -> Nothing
+
+    -- Look up a demo by key, require it carries authoring metadata,
+    -- and project its manifest entry the same way runAuthoringManifest
+    -- does. Asserts on the IO side so individual fixture tests stay
+    -- linear rather than nesting one Maybe-case per demo.
+    lookupReportManifest k = do
+      demo <- case lookupDemo k of
+        Just d  -> pure d
+        Nothing -> assertFailure (k <> " demo missing from demoTable")
+                   >> error "unreachable"
+      report <- case demoAuthoring demo of
+        Just r  -> pure r
+        Nothing -> assertFailure (k <> " has no authoring metadata")
+                   >> error "unreachable"
+      pure (manifestFromReport k report)
