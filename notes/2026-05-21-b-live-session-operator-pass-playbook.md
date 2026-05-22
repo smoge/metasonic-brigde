@@ -852,3 +852,37 @@ diagnostic.
 No new operator friction surfaced. This confirms the 8d-b
 state-copy slice in the live operator path, but does not open a
 Delay or Env lane.
+
+### 2026-05-22 — 8e scripted smooth-cutoff pass, end-of-session snap as watch item
+
+Transcript: `/tmp/metasonic-live-session-scripted-smooth-cutoff.log`.
+Runner: `tools/run_live_session_pass.py` (commit `f11d701`).
+
+The scripted runner drove the smooth-cutoff complete pass without
+two-terminal choreography. Session exit 0; soft summary reported
+"all expected markers seen." Transcript shape (commands, ordering,
+supervisor events, OSC accept/reject formatting) is structurally
+identical to the prior manual smooth-cutoff transcript at
+`/tmp/metasonic-live-session-smooth-cutoff.log`. The text-scaffolding
+contract from the 8e design note is met.
+
+Audio judgment from the operator-paired run:
+
+- **Reload boundary: clean swap.** No audible glitch at the
+  reload; the smoother's IIR state survived the swap as the C++
+  harness pinned (0/0 sample-level delta). The load-bearing 8d-b
+  audio claim is confirmed under the scripted pass.
+- **End-of-session snap.** A click was audible at the moment the
+  session shut down on `quit`. First explicit observation of this
+  across the operator-pass series — almost certainly a standing
+  condition (held drone + abrupt PortAudio close at quit produces a
+  DC discontinuity heard as a snap), recorded as a watch item.
+
+Follow-up chosen from this pass: none. Under the Evidence To Code
+rubric, the end-of-session snap is one observation = watch item, not
+pressure. A future pass surfacing the same friction would promote
+it to a lane (likely "graceful shutdown / fade-out at session quit").
+Until then, no implementation opens. The 8e scripted-runner slice
+itself is closed: text-scaffolding works as designed, the operator's
+ears remain the perceptual authority, no harness changes warranted
+by this run.
