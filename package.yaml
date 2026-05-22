@@ -247,6 +247,7 @@ tests:
       - MetaSonic.App.ManifestReloadSupervisorAdapter
       - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.Spec.AppManifestLiveCommonAddressableSurface
+      - MetaSonic.Spec.AppManifestLiveCommonOSCControls
       - MetaSonic.Spec.AppManifestLiveCommonOSCRender
       - MetaSonic.Spec.AppManifestLiveReloadDemoRender
       - MetaSonic.Spec.AppManifestLiveSession

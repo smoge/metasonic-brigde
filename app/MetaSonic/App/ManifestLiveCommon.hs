@@ -66,6 +66,7 @@ module MetaSonic.App.ManifestLiveCommon
 
     -- * OSC control-surface rendering
   , renderOSCControls
+  , renderOSCControlsLine
 
     -- * OSC listener-event line renderers (pure, testable)
     --
@@ -393,8 +394,11 @@ renderIngressSnapshot snapshot =
 
 
 -- | Print the bound OSC control surface (one line per binding)
--- against a given target. Used in the demo preamble and in the
--- session shell's status display.
+-- against a given target. Used in the demo preamble (as both
+-- @initial OSC surface@ and @target OSC surface@) and in the session
+-- shell's status display. Routes per-binding rendering through the
+-- pure helper 'renderOSCControlsLine' so the format can be pinned
+-- without staging IO.
 renderOSCControls :: String -> ManifestReloadIngressTarget -> IO ()
 renderOSCControls label target = do
   putStrLn $ "  " <> label <> ":"
@@ -402,12 +406,28 @@ renderOSCControls label target = do
     [] ->
       putStrLn "    (no OSC controls)"
     controls ->
-      forM_ controls renderOne
-  where
-    renderOne binding =
-      putStrLn $
-        "    " <> renderManifestOSCAddressPattern (mocbControlTag binding)
-        <> "  name=\"" <> mocbDisplayName binding <> "\""
+      forM_ controls (putStrLn . ("    " <>) . renderOSCControlsLine)
+
+
+-- | Render one pattern-level OSC control-surface line. Uses the
+-- literal @\<voice\>@ placeholder for the voice segment; the
+-- per-voice resolution is the job of 'renderAddressableOSCLine'.
+--
+-- Example renderings:
+--
+-- @
+-- \/\<voice\>\/lpf\/0  (name="cutoff", default=600.0, range=[200.0, 6000.0], cc=74)
+-- \/\<voice\>\/cutoff\/1  (name="cutoff", default=1200.0, range=[200.0, 8000.0])
+-- @
+--
+-- The metadata tail is the same 'renderControlBindingMetadata' format
+-- the addressable surface uses, so an operator scanning the demo
+-- preamble's pattern table and the session's concrete addressable
+-- table reads matching unit / range / CC fields on both surfaces.
+renderOSCControlsLine :: ManifestOSCControlBinding -> String
+renderOSCControlsLine binding =
+  renderManifestOSCAddressPattern (mocbControlTag binding)
+  <> "  " <> renderControlBindingMetadata binding
 
 
 -- | Print the concrete OSC addresses the operator can send packets to
@@ -460,15 +480,30 @@ renderConcreteOSCAddress voice (ControlTag (MigrationKey key) slot) =
 -- \/v0\/cutoff\/1  (name="cutoff", default=1200.0, range=[200.0, 8000.0])
 -- @
 --
--- The trailing @cc=...@ field is omitted when 'mocbCC' is 'Nothing'.
--- Range bounds and the default are rendered with the same 'show'
--- format as the @(out-of-range)@ rejection line in 'renderOSCIssueLine'
--- so an operator can copy a value between the two diagnostics
--- without unit drift.
+-- The metadata tail is produced by 'renderControlBindingMetadata' so
+-- the addressable surface and the pattern-level
+-- 'renderOSCControlsLine' share one source of truth.
 renderAddressableOSCLine :: VoiceKey -> ManifestOSCControlBinding -> String
 renderAddressableOSCLine voice binding =
   renderConcreteOSCAddress voice (mocbControlTag binding)
-  <> "  (name=\"" <> mocbDisplayName binding <> "\""
+  <> "  " <> renderControlBindingMetadata binding
+
+
+-- | The shared @(name=..., default=..., range=[..., ...], cc=...)@
+-- metadata tail used by both the pattern-level OSC control-surface
+-- table ('renderOSCControlsLine') and the concrete addressable-surface
+-- line ('renderAddressableOSCLine'). The trailing @, cc=...@ field is
+-- omitted when 'mocbCC' is 'Nothing' — not rendered as @cc=null@ or
+-- @cc=@.
+--
+-- Range bounds and the default render with the same
+-- @show :: Double -> String@ format as the @(out-of-range)@ rejection
+-- line in 'renderOSCIssueLine', so an operator can copy a value
+-- between the addressable surface, the pattern surface, and any
+-- rejection diagnostic without unit drift.
+renderControlBindingMetadata :: ManifestOSCControlBinding -> String
+renderControlBindingMetadata binding =
+  "(name=\"" <> mocbDisplayName binding <> "\""
   <> ", default=" <> show (mocbDefault binding)
   <> ", range=[" <> show (mocbRangeMin binding)
   <> ", " <> show (mocbRangeMax binding) <> "]"
