@@ -11,7 +11,8 @@
 -- of the manifest reload pipeline: it starts audio from a single
 -- authored demo + manifest pair, opens OSC ingress, and runs a tiny
 -- stdin command loop where the operator can trigger supervised
--- reloads to other catalog demos by typing @demo:KEY@.
+-- reloads to other catalog demos by typing @demo:KEY@ or
+-- @demo KEY@ (single-token form).
 --
 -- It is intentionally narrow:
 --
@@ -186,8 +187,9 @@ import           MetaSonic.Session.State        (SessionState (..))
 -- | One line of operator input parsed into a session command.
 --
 -- The parser is intentionally tiny: it recognizes a handful of
--- named commands plus the @demo:KEY@ reload shape, and treats
--- everything else as 'LscUnknown'. 'LscQuit' is parsed (as @quit@
+-- named commands plus two reload shapes (@demo:KEY@ and
+-- @demo KEY@), and treats everything else as 'LscUnknown'.
+-- 'LscQuit' is parsed (as @quit@
 -- or @exit@) AND synthesized by the read loop on 'isEOF', so a
 -- @<Ctrl-D>@ press and a typed @quit@ produce the same outcome.
 --
