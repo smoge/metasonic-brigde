@@ -706,6 +706,9 @@ Objective result:
 - Pre-reload OSC writes were accepted with the polished operator
   rendering: level `0.18`, cutoff `700`, cutoff `2400`, q `2.5`,
   and pitch `110`, `330`, `220`.
+- The timed multi-write sweeps sent through `tools/send_osc.py` with
+  `--interval 0.2` landed cleanly: cutoff `700` to `2400`, and pitch
+  `110` to `330` to `220`.
 - `demo saw-filter-bright` committed through the preserving route and
   reported `serving plan: saw-filter-bright`.
 - Post-reload `controls` showed the bright cutoff default `2400.0`
@@ -722,14 +725,25 @@ Objective result:
 
 Observed friction:
 
+- Unlike the short musical OSC check above, this pass exercised the
+  full operator vocabulary for the current shell: `demos`, `controls`,
+  multi-write OSC control, preserving reload, post-reload `controls`,
+  post-reload OSC writes, range rejection, cross-family rejection,
+  `status`, and `quit`.
 - The OSC accept-line polish held up across a longer, reproducible
   saw-family pass. Accepted writes stayed readable before and after a
-  preserving reload, including repeated writes to the same address.
+  preserving reload, including repeated writes to the same address and
+  binding metadata lookup after `saw-filter-bright` became current.
 - The same-family reload and cross-family reject behaviors matched the
   Phase 8b repertoire contract.
+- The cross-family reject diagnostic is now well rehearsed in saw/noise
+  operator passes; this run did not add any operator-side complaint
+  about that output.
 - ALSA stderr noise remained present at startup, but it did not
   obscure the post-start commands or OSC accept/reject evidence in
   this run.
+- The run covered the short-pass gaps: reload, cross-family rejection,
+  command repetition, and clean termination after the reject path.
 - No repeated or blocking interaction friction surfaced.
 
 Follow-up chosen from this pass: none. This is durable validation of
