@@ -423,7 +423,9 @@ renderOSCControls label target = do
 -- The metadata tail is the same 'renderControlBindingMetadata' format
 -- the addressable surface uses, so an operator scanning the demo
 -- preamble's pattern table and the session's concrete addressable
--- table reads matching unit / range / CC fields on both surfaces.
+-- table reads matching default / range / CC metadata on both surfaces,
+-- with units inferable from the control name and numeric range (the
+-- manifest schema has no @unit@ field).
 renderOSCControlsLine :: ManifestOSCControlBinding -> String
 renderOSCControlsLine binding =
   renderManifestOSCAddressPattern (mocbControlTag binding)
@@ -470,8 +472,10 @@ renderConcreteOSCAddress voice (ControlTag (MigrationKey key) slot) =
 
 -- | Render one addressable-OSC-surface line for a (voice, binding)
 -- pair. The line names the resolved address and surfaces the
--- manifest-declared metadata an operator needs to know the
--- control's units, default, range, and optional MIDI-CC binding.
+-- manifest-declared default, range, and optional MIDI-CC binding so
+-- the operator has the metadata to choose an in-range value; units
+-- are inferable from the control name and the numeric range (the
+-- manifest schema has no @unit@ field).
 --
 -- Example renderings:
 --
