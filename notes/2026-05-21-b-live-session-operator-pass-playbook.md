@@ -656,3 +656,34 @@ Follow-up chosen from this pass: none. The OSC accept-line rendering
 polish is closed; current-value introspection, ALSA stderr noise,
 command history, and same-demo reload special-casing remain separate
 lanes that need fresh operator pressure before implementation.
+
+### 2026-05-22 — short musical OSC check
+
+Transcript: `/tmp/metasonic-live-session-musical-pass.log`, captured
+against `examples/manifests/saw-noise-filter.json` starting from
+`saw-filter-dark` with `--strategy require-preserving`.
+
+Objective result:
+
+- Session opened on `saw-filter-dark` with `audio running: yes`, one
+  active voice, OSC port `17004`, and the expected four-control
+  addressable surface.
+- Four ordinary OSC writes were accepted with the polished operator
+  rendering: cutoff `700`, q `2.5`, level `0.15`, and pitch `330`.
+- `exit` terminated cleanly with command exit code `0`.
+
+Observed friction:
+
+- No new interaction or diagnosis friction surfaced in this short
+  check.
+- The polished accept lines remained readable in ordinary use.
+- ALSA stderr noise is still present at startup, but it did not
+  affect the post-start OSC interaction in this run.
+- This was a short straight-through OSC check, not an extended musical
+  pass: it did not exercise reloads, cross-family rejection, command
+  repetition, or a longer performance flow.
+
+Follow-up chosen from this pass: none. Treat this as another
+no-new-lane observation, not as evidence for a new implementation
+slice. A future pass would need longer use or repeated friction to
+promote any of the standing candidates.
