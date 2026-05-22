@@ -665,6 +665,29 @@ Decision checklist for a future reopening:
 
 ## Related Artifacts
 
+Source anchors (file-level links with symbol-named anchors; no line
+numbers):
+
+| Topic | Source file | Symbol / anchor |
+|-------|-------------|-----------------|
+| Region kernel contract | [RegionKernels.hs](../src/MetaSonic/Bridge/Compile/RegionKernels.hs) | `Note [Region kernel selection]` |
+| Region kernel selector | [RegionKernels.hs](../src/MetaSonic/Bridge/Compile/RegionKernels.hs) | `selectRegionKernels` |
+| Normal runtime compile | [Compile.hs](../src/MetaSonic/Bridge/Compile.hs) | `compileRuntimeGraph` |
+| Fused runtime compile | [Compile.hs](../src/MetaSonic/Bridge/Compile.hs) | `compileRuntimeGraphFused` |
+| RFused scalar rewrite | [Fusion.hs](../src/MetaSonic/Bridge/Compile/Fusion.hs) | `fuseRuntimeGraph` |
+| Generated program type | [FusionProgram.hs](../src/MetaSonic/Bridge/Compile/FusionProgram.hs) | `FusionProgram` |
+| Generated op type | [FusionProgram.hs](../src/MetaSonic/Bridge/Compile/FusionProgram.hs) | `FusionOp` |
+| Planner verdicts | [Planner.hs](../src/MetaSonic/Bridge/Planner.hs) | `planRuntimeGraph` |
+| Cost-lab variants | [FusionCostModel.hs](../app/MetaSonic/App/FusionCostModel.hs) | `Variant` |
+| Win threshold | [FusionCostModel.hs](../app/MetaSonic/App/FusionCostModel.hs) | `measuredWinThreshold` |
+| Profitability verdicts | [ProfitabilityGate.hs](../app/MetaSonic/App/ProfitabilityGate.hs) | `GateVerdict` |
+| Gate policy | [ProfitabilityGate.hs](../app/MetaSonic/App/ProfitabilityGate.hs) | `evaluateGate` |
+| Generated graph patching | [FusionCostLab.hs](../app/MetaSonic/App/FusionCostLab.hs) | `patchForGenerated` |
+| Gate index by executor | [FusionCostLab.hs](../app/MetaSonic/App/FusionCostLab.hs) | `costLabGateIndexFor` |
+| Super-mode classifier | [FusionCostLab.hs](../app/MetaSonic/App/FusionCostLab.hs) | `classifyFusionSuper` |
+| C++ super executor | [rt_graph.cpp](../tinysynth/rt_graph.cpp) | `process_fusion_program_super` |
+| C++ kernel bench | [rt_graph_bench.cpp](../tools/rt_graph_bench.cpp) | `rt_graph_bench` |
+
 Core implementation:
 
 - `src/MetaSonic/Bridge/Compile/RegionKernels.hs`
