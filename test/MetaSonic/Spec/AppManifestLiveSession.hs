@@ -191,12 +191,12 @@ renderLiveSessionDemoListTests =
         "preserve-cutoff-dark"
         [ "preserve-cutoff-dark"
         , "preserve-cutoff-bright"
-        , "reject-preserving-smooth-dark"
+        , "reject-preserving-delay-dark"
         ]
         @?= [ "  demos:"
             , "    * preserve-cutoff-dark (current)"
             , "      preserve-cutoff-bright"
-            , "      reject-preserving-smooth-dark"
+            , "      reject-preserving-delay-dark"
             ]
 
   , testCase "empty manifest demo list renders an explicit placeholder" $

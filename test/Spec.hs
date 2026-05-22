@@ -107,6 +107,8 @@ import           MetaSonic.Spec.Session.RTGraphAdapterInstall
                    (sessionRTGraphAdapterInstallTests)
 import           MetaSonic.Spec.Session.State (sessionStateTests)
 import           MetaSonic.Spec.Session.Step (sessionStepTests)
+import           MetaSonic.Spec.Session.SwapArtifact
+                   (sessionSwapArtifactTests)
 import           MetaSonic.Spec.SessionManifestReload
 import           MetaSonic.Spec.SessionMIDI
 
@@ -164,6 +166,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , controlTargetTests
   , sessionRTGraphAdapterInstallTests
   , sessionRTGraphAdapterHotSwapTests
+  , sessionSwapArtifactTests
   , sessionOwnerTests
   , sessionQueueTests
   , sessionArbitrationTests

@@ -53,6 +53,7 @@ import           Control.Exception          (SomeException, displayException,
                                              try)
 import           Control.Monad              (foldM, forM_, when)
 import qualified Data.ByteString.Char8      as BSC
+import           Data.Foldable              (traverse_)
 import           Data.List                  (find)
 import           Data.IORef                 (IORef, newIORef, readIORef,
                                              writeIORef)
@@ -434,8 +435,9 @@ validatePreservingTemplate
   -> Template
   -> Template
   -> Either SessionRuntimeIssue Int
-validatePreservingTemplate _name oldTpl newTpl =
-  length <$> traverse validateStatefulNode statefulNodes
+validatePreservingTemplate _name oldTpl newTpl = do
+  traverse_ validateStatefulNode validationNodes
+  pure (length stateCopyNodes)
   where
     oldNodesByKey = Map.fromList
       [ (key, node)
@@ -444,7 +446,9 @@ validatePreservingTemplate _name oldTpl newTpl =
       ]
 
     newNodes = rgNodes (tplGraph newTpl)
-    statefulNodes = filter (nodeKindNeedsStateCopy . rnKind) newNodes
+    validationNodes =
+      filter (nodeKindNeedsPreservingValidation . rnKind) newNodes
+    stateCopyNodes = filter (nodeKindNeedsStateCopy . rnKind) newNodes
 
     validateStatefulNode node
       | not (nodeKindSupportsPreservingHotSwap (rnKind node)) =
@@ -470,31 +474,50 @@ nodeKindSupportsPreservingHotSwap kind =
   case preservingHotSwapNodeClass kind of
     PreserveUnsupported -> False
     PreserveStateless   -> True
+    PreserveStatefulDefaultInit -> True
+    PreserveStateful    -> True
+
+nodeKindNeedsPreservingValidation :: NodeKind -> Bool
+nodeKindNeedsPreservingValidation kind =
+  case preservingHotSwapNodeClass kind of
+    PreserveUnsupported -> True
+    PreserveStateless   -> False
+    PreserveStatefulDefaultInit -> True
     PreserveStateful    -> True
 
 nodeKindNeedsStateCopy :: NodeKind -> Bool
 nodeKindNeedsStateCopy kind =
   case preservingHotSwapNodeClass kind of
-    PreserveUnsupported -> True
+    -- Unsupported kinds are still selected by
+    -- nodeKindNeedsPreservingValidation and rejected before the
+    -- count is used. Keeping them out of the copy count makes this
+    -- predicate's narrower meaning literal.
+    PreserveUnsupported -> False
     PreserveStateless   -> False
+    PreserveStatefulDefaultInit -> False
     PreserveStateful    -> True
 
 data PreservingHotSwapNodeClass
   = PreserveUnsupported
   | PreserveStateless
+  | PreserveStatefulDefaultInit
   | PreserveStateful
   deriving stock (Eq, Show)
 
 -- | Single preserving-swap classification table.
 --
--- Keeping support and state-copy expectation derived from this one
--- table avoids the drift where a kind is admitted but omitted from
--- the post-swap migration-counter check.
+-- Keeping support, validation, and state-copy expectation derived
+-- from this one table avoids the drift where a kind is admitted but
+-- omitted from the relevant preserving-swap checks. The
+-- DefaultInit class is deliberately admitted without contributing
+-- to the post-swap migration-counter expectation: C++ leaves that
+-- node state freshly initialized until a later per-kind prewarm/copy
+-- slice teaches it how to migrate safely.
 preservingHotSwapNodeClass :: NodeKind -> PreservingHotSwapNodeClass
 preservingHotSwapNodeClass = \case
   KEnv             -> PreserveUnsupported
   KDelay           -> PreserveUnsupported
-  KSmooth          -> PreserveUnsupported
+  KSmooth          -> PreserveStatefulDefaultInit
   KPlayBufMono     -> PreserveUnsupported
   KRecordBufMono   -> PreserveUnsupported
   KSpectralFreeze  -> PreserveUnsupported

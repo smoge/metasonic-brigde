@@ -30,10 +30,14 @@ module MetaSonic.App.Demos
   , preserveCutoffBrightAuthoring
   , dronePreserveSawDark
   , dronePreserveSawBright
-  , rejectPreservingSmoothDarkAuthoring
-  , rejectPreservingSmoothBrightAuthoring
-  , dronePreserveSmoothDark
-  , dronePreserveSmoothBright
+  , rejectPreservingDelayDarkAuthoring
+  , rejectPreservingDelayBrightAuthoring
+  , dronePreserveDelayDark
+  , dronePreserveDelayBright
+  , preserveSmoothCutoffDarkAuthoring
+  , preserveSmoothCutoffBrightAuthoring
+  , dronePreserveSmoothCutoffDark
+  , dronePreserveSmoothCutoffBright
   ) where
 
 import           Data.Maybe                (catMaybes)
@@ -521,6 +525,66 @@ preserveCutoffBrightAuthoring = emptyAuthoringReport
   }
 
 ------------------------------------------------------------
+-- Smooth preserving hot-swap baseline pair
+------------------------------------------------------------
+--
+-- Phase 8d-a fixture pair. Unlike 'preserve-cutoff', this pair
+-- routes the cutoff through 'Auth.ccControl', which emits a tagged
+-- 'KSmooth' named "cutoff". Under the 8d-a preserving contract,
+-- KSmooth participates in preserving validation but default-inits
+-- its runtime state after the swap; the artifact harness measures
+-- the resulting post-install block deviation before the later
+-- KSmooth prewarm/copy slice tightens it.
+
+smoothCutoffBuild :: Double -> SynthM Auth.NamedControl
+smoothCutoffBuild cutoffDefault = do
+  cutoffName <- case Auth.controlName "cutoff" of
+    Right n  -> pure n
+    Left err -> error $ "preserve-smooth-cutoff demo: " <> err
+  cutoffRng <- case Auth.controlRange 200 6000 of
+    Right r  -> pure r
+    Left err -> error $ "preserve-smooth-cutoff demo: " <> err
+  cutoff <- Auth.ccControl 74 cutoffName cutoffDefault cutoffRng
+
+  carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
+  filtered <- tagged "lpf"
+                (lpf carrier (Auth.controlConnection cutoff) (Param 0.7))
+  shaped   <- tagged "gain" (gain filtered (Param 0.2))
+  _        <- out 0 shaped
+  pure cutoff
+
+dronePreserveSmoothCutoffDark :: SynthGraph
+dronePreserveSmoothCutoffDark =
+  let (_, g) = runSynthWith (smoothCutoffBuild 600.0)
+  in g
+
+dronePreserveSmoothCutoffBright :: SynthGraph
+dronePreserveSmoothCutoffBright =
+  let (_, g) = runSynthWith (smoothCutoffBuild 2400.0)
+  in g
+
+preserveSmoothCutoffAuthoring :: Double -> AuthoringReport
+preserveSmoothCutoffAuthoring cutoffDefault =
+  let (cutoff, _) = runSynthWith (smoothCutoffBuild cutoffDefault)
+      base = emptyAuthoringReport
+        { Report.arTemplates =
+            [ Report.ReportedTemplate
+                { Report.rtName = "drone"
+                , Report.rtRole = Auth.VoiceTemplate
+                }
+            ]
+        }
+  in addReportedControl cutoff base
+
+preserveSmoothCutoffDarkAuthoring :: AuthoringReport
+preserveSmoothCutoffDarkAuthoring =
+  preserveSmoothCutoffAuthoring 600.0
+
+preserveSmoothCutoffBrightAuthoring :: AuthoringReport
+preserveSmoothCutoffBrightAuthoring =
+  preserveSmoothCutoffAuthoring 2400.0
+
+------------------------------------------------------------
 -- Reject-eligible preserving hot-swap pair
 ------------------------------------------------------------
 --
@@ -531,11 +595,11 @@ preserveCutoffBrightAuthoring = emptyAuthoringReport
 -- shell deterministically (without racing an OSC reload-window
 -- or relying on a bad demo key).
 --
--- Mechanism: the voice template carries a 'smooth' (KSmooth)
--- node on the gain-amount path. KSmooth is classified as
+-- Mechanism: the voice template carries a 'delayL' (KDelay)
+-- node on the wet path. KDelay is classified as
 -- 'PreserveUnsupported' by 'preservingHotSwapNodeClass'
 -- (RTGraphAdapter.hs), so any active voice using a template
--- with KSmooth fails the runtime preserving-migration check
+-- with KDelay fails the runtime preserving-migration check
 -- with 'SriHotSwapWouldPreserveVoices'. The downstream
 -- classification chain is
 --   StepRuntimeFailed
@@ -547,25 +611,24 @@ preserveCutoffBrightAuthoring = emptyAuthoringReport
 --
 -- The user-facing control contract is intentionally identical
 -- to 'preserve-cutoff': one OSC/MIDI-addressable cutoff control
--- on KLPF slot 0 via migration key "lpf". The KSmooth node is
+-- on KLPF slot 0 via migration key "lpf". The KDelay node is
 -- a topology decoration that affects voice migrability only;
--- it is NOT in the control path. (Contrast the 'preserve-cutoff'
--- header above, which explains why that pair *avoids* KSmooth.)
+-- it is NOT in the control path.
 
-dronePreserveSmoothDark :: SynthGraph
-dronePreserveSmoothDark = runSynth $ do
+dronePreserveDelayDark :: SynthGraph
+dronePreserveDelayDark = runSynth $ do
   carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
   filtered <- tagged "lpf"     (lpf carrier (Param 600.0) (Param 0.7))
-  amount   <- smooth 20.0 (Param 0.2)
-  shaped   <- gain filtered amount
+  wet      <- tagged "delay"   (delayL 1.0 filtered (Param 0.3))
+  shaped   <- gain wet (Param 0.2)
   out 0 shaped
 
-dronePreserveSmoothBright :: SynthGraph
-dronePreserveSmoothBright = runSynth $ do
+dronePreserveDelayBright :: SynthGraph
+dronePreserveDelayBright = runSynth $ do
   carrier  <- tagged "carrier" (sawOsc (Param 220.0) (Param 0.0))
   filtered <- tagged "lpf"     (lpf carrier (Param 2400.0) (Param 0.7))
-  amount   <- smooth 20.0 (Param 0.2)
-  shaped   <- gain filtered amount
+  wet      <- tagged "delay"   (delayL 1.0 filtered (Param 0.3))
+  shaped   <- gain wet (Param 0.2)
   out 0 shaped
 
 -- | Cutoff control for the dark reject-eligible entry. Binding
@@ -573,34 +636,34 @@ dronePreserveSmoothBright = runSynth $ do
 -- MIDI CC 74, default 600 Hz) is identical to
 -- 'preserveCutoffControlDark'; only the demo containing it
 -- differs.
-rejectPreservingSmoothControlDark :: Report.ReportedControl
-rejectPreservingSmoothControlDark = preserveCutoffControlDark
+rejectPreservingDelayControlDark :: Report.ReportedControl
+rejectPreservingDelayControlDark = preserveCutoffControlDark
 
 -- | Cutoff control for the bright reject-eligible entry; default
 -- 2400 Hz, otherwise identical to the dark variant.
-rejectPreservingSmoothControlBright :: Report.ReportedControl
-rejectPreservingSmoothControlBright = preserveCutoffControlBright
+rejectPreservingDelayControlBright :: Report.ReportedControl
+rejectPreservingDelayControlBright = preserveCutoffControlBright
 
-rejectPreservingSmoothDarkAuthoring :: AuthoringReport
-rejectPreservingSmoothDarkAuthoring = emptyAuthoringReport
+rejectPreservingDelayDarkAuthoring :: AuthoringReport
+rejectPreservingDelayDarkAuthoring = emptyAuthoringReport
   { Report.arTemplates =
       [ Report.ReportedTemplate
           { Report.rtName = "drone"
           , Report.rtRole = Auth.VoiceTemplate
           }
       ]
-  , Report.arControls = [rejectPreservingSmoothControlDark]
+  , Report.arControls = [rejectPreservingDelayControlDark]
   }
 
-rejectPreservingSmoothBrightAuthoring :: AuthoringReport
-rejectPreservingSmoothBrightAuthoring = emptyAuthoringReport
+rejectPreservingDelayBrightAuthoring :: AuthoringReport
+rejectPreservingDelayBrightAuthoring = emptyAuthoringReport
   { Report.arTemplates =
       [ Report.ReportedTemplate
           { Report.rtName = "drone"
           , Report.rtRole = Auth.VoiceTemplate
           }
       ]
-  , Report.arControls = [rejectPreservingSmoothControlBright]
+  , Report.arControls = [rejectPreservingDelayControlBright]
   }
 
 ------------------------------------------------------------
@@ -842,14 +905,22 @@ demoTable =
          "Preserving hot-swap target (saw drone @ LPF 2400 Hz; OSC cutoff /v0/lpf/0)"
          (MultiTemplate [("drone", dronePreserveSawBright)])
          preserveCutoffBrightAuthoring
-  , demoWithAuth "reject-preserving-smooth-dark"
-         "Reject-eligible preserving source (saw drone @ LPF 600 Hz, +KSmooth on gain)"
-         (MultiTemplate [("drone", dronePreserveSmoothDark)])
-         rejectPreservingSmoothDarkAuthoring
-  , demoWithAuth "reject-preserving-smooth-bright"
-         "Reject-eligible preserving target (saw drone @ LPF 2400 Hz, +KSmooth on gain)"
-         (MultiTemplate [("drone", dronePreserveSmoothBright)])
-         rejectPreservingSmoothBrightAuthoring
+  , demoWithAuth "preserve-smooth-cutoff-dark"
+         "Preserving KSmooth baseline source (saw drone @ smoothed LPF 600 Hz)"
+         (MultiTemplate [("drone", dronePreserveSmoothCutoffDark)])
+         preserveSmoothCutoffDarkAuthoring
+  , demoWithAuth "preserve-smooth-cutoff-bright"
+         "Preserving KSmooth baseline target (saw drone @ smoothed LPF 2400 Hz)"
+         (MultiTemplate [("drone", dronePreserveSmoothCutoffBright)])
+         preserveSmoothCutoffBrightAuthoring
+  , demoWithAuth "reject-preserving-delay-dark"
+         "Reject-eligible preserving source (saw drone @ LPF 600 Hz, +KDelay wet path)"
+         (MultiTemplate [("drone", dronePreserveDelayDark)])
+         rejectPreservingDelayDarkAuthoring
+  , demoWithAuth "reject-preserving-delay-bright"
+         "Reject-eligible preserving target (saw drone @ LPF 2400 Hz, +KDelay wet path)"
+         (MultiTemplate [("drone", dronePreserveDelayBright)])
+         rejectPreservingDelayBrightAuthoring
   , demoWithAuth "saw-filter-dark"
          "Phase 8b saw drone (LPF 600 Hz, q 0.7, level 0.2; pitch/cutoff/q/level controls)"
          (MultiTemplate [("drone", droneSawFilterDark)])

@@ -53,6 +53,8 @@ import qualified Data.Map.Strict                 as M
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
+import           MetaSonic.App.Demos              (dronePreserveSmoothCutoffBright,
+                                                   dronePreserveSmoothCutoffDark)
 import           MetaSonic.Bridge.FFI
 import           MetaSonic.Bridge.Source         (MigrationKey (..))
 import           MetaSonic.Pattern               (ControlTag (..),
@@ -305,6 +307,58 @@ sessionRTGraphAdapterHotSwapTests =
                   other ->
                     assertFailure
                       ("expected preserving-only hot-swap commit, got: "
+                       <> show other)
+          other ->
+            assertFailure ("expected start commit, got: " <> show other)
+
+  , testCase "preserving-only hot-swap admits KSmooth default-init active voice" $ do
+      oldGraph <- compileTemplateGraphOrFail
+        [("drone", dronePreserveSmoothCutoffDark)]
+      newGraph <- compileTemplateGraphOrFail
+        [("drone", dronePreserveSmoothCutoffBright)]
+      let st0      = initialSessionState oldGraph
+          voice    = VoiceKey "v0"
+          startCmd = CmdVoiceOn (TemplateName "drone") voice []
+          swapCmd  = CmdHotSwapPreservingOnly
+                       (SwapLabel "smooth-cutoff")
+                       newGraph
+          writeCmd = CmdControlWrite
+                       voice
+                       (ControlTag (MigrationKey "cutoff") 1)
+                       1800.0
+      withInstalledAdapter oldGraph defaultRTGraphAdapterOptions $ \rt adapter -> do
+        started <- stepSessionCommand adapter startCmd st0
+        case started of
+          StepCommitted st1 Nothing ->
+            case M.lookup voice (ssVoices st1) of
+              Nothing ->
+                assertFailure "expected committed voice binding"
+              Just binding -> do
+                c_rt_graph_process rt 1
+                beforeStatus <- c_rt_graph_instance_status
+                                  rt
+                                  (fromIntegral (vbSlotId binding))
+                beforeStatus @?= instanceStatusLive
+                beforeGeneration <- readSwapGeneration rt
+                swapped <- stepSessionCommand adapter swapCmd st1
+                case swapped of
+                  StepCommitted st2 (Just rebuild) -> do
+                    rrrDropped rebuild @?= []
+                    ssGraph st2 @?= newGraph
+                    M.lookup voice (ssVoices st2) @?= Just binding
+                    afterGeneration <- readSwapGeneration rt
+                    assertBool
+                      "expected KSmooth default-init swap generation to advance"
+                      (afterGeneration > beforeGeneration)
+                    afterStatus <- c_rt_graph_instance_status
+                                     rt
+                                     (fromIntegral (vbSlotId binding))
+                    afterStatus @?= instanceStatusLive
+                    written <- stepSessionCommand adapter writeCmd st2
+                    written @?= StepControlAccepted
+                  other ->
+                    assertFailure
+                      ("expected KSmooth default-init preserving hot-swap commit, got: "
                        <> show other)
           other ->
             assertFailure ("expected start commit, got: " <> show other)

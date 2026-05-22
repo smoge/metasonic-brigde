@@ -1,16 +1,20 @@
 -- | Drift guard for the committed preserving manifest fixtures.
 --
--- Three on-disk fixtures live under @examples/manifests/@ and are
+-- Four on-disk fixtures live under @examples/manifests/@ and are
 -- referenced from runbooks, operator smokes, and the Phase 8b
 -- live-session repertoire:
 --
 --   * @preserve-cutoff.json@ — the blessed happy-path input for
 --     the preserving manifest live-reload path
 --     (see [smoke runbook](../notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md)).
---   * @reject-preserving-smooth.json@ — a reject-eligible sibling
+--   * @preserve-smooth-cutoff.json@ — the Phase 8d-a KSmooth
+--     default-init baseline fixture. It admits the preserving swap
+--     and gives the artifact harness a smoothed cutoff path to
+--     measure.
+--   * @reject-preserving-delay.json@ — a reject-eligible sibling
 --     used by the operator-pressure pass to exercise the
 --     'SupervisedReloadRequestRejected' branch deterministically
---     (KSmooth on the gain path makes the active voice
+--     (KDelay on the wet path makes the active voice
 --     preserve-unsupported).
 --   * @saw-noise-filter.json@ — the Phase 8b Tier 1 repertoire,
 --     four single-template drone demos in two preserving-compatible
@@ -63,7 +67,10 @@ fixturePath :: FilePath
 fixturePath = "examples/manifests/preserve-cutoff.json"
 
 rejectFixturePath :: FilePath
-rejectFixturePath = "examples/manifests/reject-preserving-smooth.json"
+rejectFixturePath = "examples/manifests/reject-preserving-delay.json"
+
+smoothFixturePath :: FilePath
+smoothFixturePath = "examples/manifests/preserve-smooth-cutoff.json"
 
 tier1FixturePath :: FilePath
 tier1FixturePath = "examples/manifests/saw-noise-filter.json"
@@ -145,40 +152,90 @@ appManifestPreservingFixtureTests =
         @?= Just (Just 74, "lpf", 0)
 
   , testCase
-      "examples/manifests/reject-preserving-smooth.json matches --authoring-manifest output"
+      "examples/manifests/preserve-smooth-cutoff.json matches --authoring-manifest output"
+      $ do
+      -- Byte-equality drift guard for the Phase 8d-a KSmooth
+      -- default-init baseline fixture. It intentionally uses the
+      -- authored named-control path, so the control binds to the
+      -- smoother's target slot rather than directly to KLPF.
+      let demoKeys =
+            [ "preserve-smooth-cutoff-dark"
+            , "preserve-smooth-cutoff-bright"
+            ]
+      manifests <- mapM lookupReportManifest demoKeys
+      let doc = AuthoringManifestDoc
+            { docSchemaVersion = manifestSchemaVersion
+            , docDemos         = manifests
+            }
+          generated = encodeManifestDoc doc
+
+      onDisk <- BL.readFile smoothFixturePath
+      assertEqual
+        ("Fixture " <> smoothFixturePath <> " is out of date. Regenerate with:\n"
+         <> "  stack exec -- metasonic-bridge --authoring-manifest "
+         <> unwords demoKeys
+         <> " > " <> smoothFixturePath)
+        generated
+        onDisk
+
+  , testCase
+      "preserve-smooth-cutoff manifest projects MIDI CC 74 to KSmooth target slot"
+      $ do
+      -- The smoothed fixture deliberately keeps the same operator CC
+      -- as preserve-cutoff, but the binding target is the named
+      -- KSmooth node ("cutoff", slot 1), not KLPF ("lpf", slot 0).
+      raw <- BL.readFile smoothFixturePath
+      doc <- case decodeManifestDoc raw of
+        Right d  -> pure d
+        Left err -> assertFailure
+                      ("failed to decode " <> smoothFixturePath <> ": " <> err)
+                    >> error "unreachable"
+      let demoCC name =
+            case [ mfControls m
+                 | m <- docDemos doc, mfDemoKey m == name
+                 ] of
+              [[c]] -> Just (mcCC c, mcKey c, mcSlot c)
+              _     -> Nothing
+      demoCC "preserve-smooth-cutoff-dark"
+        @?= Just (Just 74, "cutoff", 1)
+      demoCC "preserve-smooth-cutoff-bright"
+        @?= Just (Just 74, "cutoff", 1)
+
+  , testCase
+      "examples/manifests/reject-preserving-delay.json matches --authoring-manifest output"
       $ do
       -- Parallel byte-equality drift guard for the
       -- reject-eligible fixture. Same reasoning as the
-      -- preserve-cutoff test above: KSmooth makes the active
+      -- preserve-cutoff test above: KDelay makes the active
       -- voice preserve-unsupported, but the on-disk JSON has no
       -- way to express that — it just declares the control
-      -- contract. If 'rejectPreservingSmooth*Authoring' changes
+      -- contract. If 'rejectPreservingDelay*Authoring' changes
       -- (control rename, default shift, schema bump, formatter
       -- swap) but the JSON does not, the operator-pressure
       -- runbook silently desyncs from the committed input.
-      darkDemo <- case lookupDemo "reject-preserving-smooth-dark" of
+      darkDemo <- case lookupDemo "reject-preserving-delay-dark" of
         Just d  -> pure d
-        Nothing -> assertFailure "reject-preserving-smooth-dark demo missing from demoTable"
+        Nothing -> assertFailure "reject-preserving-delay-dark demo missing from demoTable"
                    >> error "unreachable"
-      brightDemo <- case lookupDemo "reject-preserving-smooth-bright" of
+      brightDemo <- case lookupDemo "reject-preserving-delay-bright" of
         Just d  -> pure d
-        Nothing -> assertFailure "reject-preserving-smooth-bright demo missing from demoTable"
+        Nothing -> assertFailure "reject-preserving-delay-bright demo missing from demoTable"
                    >> error "unreachable"
       darkReport <- case demoAuthoring darkDemo of
         Just r  -> pure r
-        Nothing -> assertFailure "reject-preserving-smooth-dark has no authoring metadata"
+        Nothing -> assertFailure "reject-preserving-delay-dark has no authoring metadata"
                    >> error "unreachable"
       brightReport <- case demoAuthoring brightDemo of
         Just r  -> pure r
-        Nothing -> assertFailure "reject-preserving-smooth-bright has no authoring metadata"
+        Nothing -> assertFailure "reject-preserving-delay-bright has no authoring metadata"
                    >> error "unreachable"
 
       let doc = AuthoringManifestDoc
             { docSchemaVersion = manifestSchemaVersion
             , docDemos =
-                [ manifestFromReport "reject-preserving-smooth-dark"
+                [ manifestFromReport "reject-preserving-delay-dark"
                     darkReport
-                , manifestFromReport "reject-preserving-smooth-bright"
+                , manifestFromReport "reject-preserving-delay-bright"
                     brightReport
                 ]
             }
@@ -188,13 +245,13 @@ appManifestPreservingFixtureTests =
       assertEqual
         ("Fixture " <> rejectFixturePath <> " is out of date. Regenerate with:\n"
          <> "  stack exec -- metasonic-bridge --authoring-manifest "
-         <> "reject-preserving-smooth-dark reject-preserving-smooth-bright "
+         <> "reject-preserving-delay-dark reject-preserving-delay-bright "
          <> "> " <> rejectFixturePath)
         generated
         onDisk
 
   , testCase
-      "reject-preserving-smooth manifest projects MIDI CC 74 on both demos"
+      "reject-preserving-delay manifest projects MIDI CC 74 on both demos"
       $ do
       -- Same control contract as preserve-cutoff: one 'cutoff'
       -- control per demo, CC 74, migration key "lpf"/slot 0. The
@@ -214,9 +271,9 @@ appManifestPreservingFixtureTests =
                  ] of
               [[c]] -> Just (mcCC c, mcKey c, mcSlot c)
               _     -> Nothing
-      demoCC "reject-preserving-smooth-dark"
+      demoCC "reject-preserving-delay-dark"
         @?= Just (Just 74, "lpf", 0)
-      demoCC "reject-preserving-smooth-bright"
+      demoCC "reject-preserving-delay-bright"
         @?= Just (Just 74, "lpf", 0)
 
   , testCase

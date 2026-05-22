@@ -337,6 +337,7 @@ tests:
       - MetaSonic.Spec.Session.RTGraphAdapterInstall
       - MetaSonic.Spec.Session.State
       - MetaSonic.Spec.Session.Step
+      - MetaSonic.Spec.Session.SwapArtifact
       - MetaSonic.Spec.SessionManifestReload
       - MetaSonic.Spec.SessionMIDI
       - MetaSonic.Spec.SessionShared
