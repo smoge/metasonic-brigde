@@ -83,6 +83,17 @@ module MetaSonic.App.ManifestLiveCommon
     -- for the design rationale and the operator-string taxonomy.
   , renderOSCAcceptLine
   , renderOSCIssueLine
+
+    -- * OSC addressable-surface line renderer (pure, testable)
+    --
+    -- The startup-time print at 'printAddressableSurface' routes
+    -- through this helper so the per-binding rendering can be pinned
+    -- as a deterministic operator-string contract without staging
+    -- session IO. The same units-confusion that surfaced in the first
+    -- operator pass (writing @0.75@ to a cutoff bound in Hz) is what
+    -- this surface is meant to preempt: the rendered line now names
+    -- the declared default, range, and optional CC binding inline.
+  , renderAddressableOSCLine
   ) where
 
 import           Control.Concurrent             (threadDelay)
@@ -429,14 +440,44 @@ printAddressableSurface service target = do
       putStrLn "  addressable OSC surface:"
       forM_ voices $ \voice ->
         forM_ bindings $ \binding ->
-          putStrLn $
-            "    " <> renderConcreteOSCAddress voice (mocbControlTag binding)
-            <> "  (name=\"" <> mocbDisplayName binding <> "\")"
+          putStrLn ("    " <> renderAddressableOSCLine voice binding)
 
 
 renderConcreteOSCAddress :: VoiceKey -> ControlTag -> String
 renderConcreteOSCAddress voice (ControlTag (MigrationKey key) slot) =
   "/" <> unVoiceKey voice <> "/" <> key <> "/" <> show slot
+
+
+-- | Render one addressable-OSC-surface line for a (voice, binding)
+-- pair. The line names the resolved address and surfaces the
+-- manifest-declared metadata an operator needs to know the
+-- control's units, default, range, and optional MIDI-CC binding.
+--
+-- Example renderings:
+--
+-- @
+-- \/v0\/lpf\/0  (name="cutoff", default=600.0, range=[200.0, 6000.0], cc=74)
+-- \/v0\/cutoff\/1  (name="cutoff", default=1200.0, range=[200.0, 8000.0])
+-- @
+--
+-- The trailing @cc=...@ field is omitted when 'mocbCC' is 'Nothing'.
+-- Range bounds and the default are rendered with the same 'show'
+-- format as the @(out-of-range)@ rejection line in 'renderOSCIssueLine'
+-- so an operator can copy a value between the two diagnostics
+-- without unit drift.
+renderAddressableOSCLine :: VoiceKey -> ManifestOSCControlBinding -> String
+renderAddressableOSCLine voice binding =
+  renderConcreteOSCAddress voice (mocbControlTag binding)
+  <> "  (name=\"" <> mocbDisplayName binding <> "\""
+  <> ", default=" <> show (mocbDefault binding)
+  <> ", range=[" <> show (mocbRangeMin binding)
+  <> ", " <> show (mocbRangeMax binding) <> "]"
+  <> ccSuffix
+  <> ")"
+  where
+    ccSuffix = case mocbCC binding of
+      Nothing -> ""
+      Just cc -> ", cc=" <> show cc
 
 
 renderEnqueue :: SessionFanInEnqueueResult -> String
