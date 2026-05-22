@@ -235,8 +235,10 @@ data RunMode
     -- (--manifest-live-session MANIFEST.json DEMO [--strategy S]).
     -- Open-ended counterpart to ManifestLiveReloadDemo: starts
     -- audio on DEMO through the manifest pipeline + supervised
-    -- lifecycle, then accepts stdin commands (demo:KEY to trigger
-    -- a supervised reload, <Enter> for status, <Ctrl-D> to exit).
+    -- lifecycle, then accepts stdin commands (demo:KEY or demo KEY
+    -- to trigger a supervised reload, status or <Enter> for the
+    -- status snapshot, help or ? for the command vocabulary, quit
+    -- or exit or <Ctrl-D> to exit cleanly).
     -- Default strategy is require-preserving. The first real
     -- consumer of the supervisor migration arc.
   deriving (Eq, Show)
@@ -806,11 +808,15 @@ usage prog = unlines
   , "                   ended counterpart to --manifest-live-reload-demo:"
   , "                   starts audio on DEMO through the manifest pipeline"
   , "                   + supervised lifecycle, then reads stdin commands."
-  , "                   Stdin protocol:"
-  , "                     demo:KEY   trigger a supervised reload to KEY;"
-  , "                     <Enter>    print a status snapshot (current plan,"
-  , "                                audio running, ingress, last outcome);"
-  , "                     <Ctrl-D>   exit cleanly."
+  , "                   Stdin protocol (full list also printed at session"
+  , "                   start and by the in-session 'help' command — see"
+  , "                   'renderLiveSessionCommandHelp' in"
+  , "                   MetaSonic.App.ManifestLiveSession for the canonical"
+  , "                   source):"
+  , "                     demo:KEY or demo KEY     supervised reload to KEY"
+  , "                     <Enter> or status        print status snapshot"
+  , "                     help or ?                print command vocabulary"
+  , "                     quit, exit, or <Ctrl-D>  exit cleanly"
   , "                   STRATEGY (optional, default require-preserving):"
   , "                       "
       <> intercalate ", " manifestReloadHostStrategyNames

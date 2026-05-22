@@ -3883,10 +3883,11 @@ Still gated:
   [--strategy STRATEGY]` (default `require-preserving`).
   Unlike the two-shot `--manifest-live-reload-demo` operator
   smoke, the session shell runs an open-ended owner loop with
-  a tiny stdin protocol — `demo:KEY` triggers a supervised
-  reload, `<Enter>` prints a status snapshot, `<Ctrl-D>`
-  exits — and is the first real consumer that all four
-  supervisor outcomes (committed / request-rejected /
+  a stdin command vocabulary (`demo:KEY` / `demo KEY` reload,
+  `status` / `<Enter>` snapshot, `help` / `?` vocabulary,
+  `quit` / `exit` / `<Ctrl-D>` exit) — and is the first real
+  consumer that all four supervisor outcomes (committed /
+  request-rejected /
   rejected-recovered / escalated) have to be sound against on
   a live timeline. Tier-2 wrapper at
   `tools/manifest_live_session_require_preserving_smoke.sh`
