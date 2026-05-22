@@ -614,3 +614,45 @@ sharpest candidate is cosmetic/operator rendering for OSC accept
 lines, but only if another pass confirms those internal constructors
 make live use harder. Current-value introspection remains
 design-note-first if it becomes the actual pain point.
+
+### 2026-05-22 — OSC accept-line rendering validation
+
+Transcript: `/tmp/metasonic-live-session-osc-render.log`, captured
+after `131e487` against `examples/manifests/saw-noise-filter.json`
+starting from `saw-filter-dark` with `--strategy require-preserving`.
+
+Objective result:
+
+- `saw-filter-dark` opened with the expected four-control addressable
+  OSC surface.
+- Pre-reload accepted OSC writes rendered without internal
+  constructors and with manifest display names:
+  `/v0/gain/0 name="level" value=0.18`,
+  `/v0/lpf/0 name="cutoff" value=700`,
+  `/v0/lpf/1 name="q" value=0.7`, and
+  `/v0/carrier/0 name="pitch" value=330`.
+- `demo saw-filter-bright` committed through the preserving route and
+  reported `serving plan: saw-filter-bright`.
+- A post-reload OSC write to `/v0/lpf/0` still rendered with the
+  friendly binding metadata: `name="cutoff" value=600`.
+- The out-of-range rejection path stayed on the existing rejection
+  shape: `osc reject (out-of-range): tag=lpf/0 value=10000.0
+  range=[200.0, 6000.0]`.
+
+Observed friction:
+
+- The accept-line polish achieved the intended operator effect. The
+  transcript no longer leaks `CmdControlWrite`, `ControlTag`,
+  `MigrationKey`, or float tails like `0.18000000715255737`.
+- Binding lookup after preserving reload worked: the accepted
+  post-reload write still used the current target metadata.
+- Rejection rendering stayed stable. This pass did not ask for or
+  need a wider rejection-rendering redesign.
+- The pasted transcript stops after the out-of-range rejection and
+  does not include `quit` / `Script done`, so this entry does not
+  claim clean termination for this specific run.
+
+Follow-up chosen from this pass: none. The OSC accept-line rendering
+polish is closed; current-value introspection, ALSA stderr noise,
+command history, and same-demo reload special-casing remain separate
+lanes that need fresh operator pressure before implementation.
