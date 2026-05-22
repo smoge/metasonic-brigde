@@ -166,10 +166,13 @@ control's range: the startup print now includes a line of the form
 /v0/lpf/0  (name="cutoff", default=600.0, range=[200.0, 6000.0], cc=74)
 ```
 
-per voice × binding, so the unit / default / range / CC fields the
-manifest declared are visible before the first packet leaves your
-sender. Out-of-range values are rejected at ingress with an
-`osc reject (out-of-range): ...` line and never reach the runtime.
+per voice × binding, so the target units are inferable from the
+control name plus the declared default / range / CC metadata, all
+visible before the first packet leaves your sender. (The manifest
+schema has no separate `unit` field; units are conventional, read
+off the name and the numeric ranges.) Out-of-range values are
+rejected at ingress with an `osc reject (out-of-range): ...` line
+and never reach the runtime.
 
 OSC arbitration smoke (multi-producer + ingress arbitration):
 
