@@ -148,22 +148,35 @@ Send a single packet (uses the in-tree Python helper, no system
 package needed):
 
 ```sh
-just osc-send 0.75                            # default port 7000, /v0/outgain/0
-just osc-send 1800.0 7001 127.0.0.1 /v0/lpf/0 # explicit value/port/host/address
+just osc-send 0.75                          # default port 7000, /v0/outgain/0
+just osc-send 1200 7001 127.0.0.1 /v0/lpf/0 # explicit value/port/host/address
 python3 tools/send_osc.py --port 7000 --address /v0/outgain/0 --value 0.75
 ```
 
 The value is always in the target control's own units. `/v0/outgain/0`
 is a gain amount, so `0.75` is useful. `/v0/lpf/0` is an LPF cutoff
-for the manifest fixtures, so use Hz values such as `900.0`, `1800.0`,
-or `2400.0` rather than normalized `0..1` values.
+for the manifest fixtures, so use Hz values such as `1200` or `2400`
+(both inside the preserve-cutoff fixture's declared `[200, 6000]`
+range), not normalized `0..1` values.
+
+In a `--manifest-live-session` you no longer have to memorize each
+control's range: the startup print now includes a line of the form
+
+```
+/v0/lpf/0  (name="cutoff", default=600.0, range=[200.0, 6000.0], cc=74)
+```
+
+per voice × binding, so the unit / default / range / CC fields the
+manifest declared are visible before the first packet leaves your
+sender. Out-of-range values are rejected at ingress with an
+`osc reject (out-of-range): ...` line and never reach the runtime.
 
 OSC arbitration smoke (multi-producer + ingress arbitration):
 
 ```sh
 just session-osc-arbitration-smoke 10 7001
-just session-osc-arbitration-send-claimed 1800.0 7001
-just session-osc-arbitration-send-allowed 900.0 7001
+just session-osc-arbitration-send-claimed 1200 7001
+just session-osc-arbitration-send-allowed 2400 7001
 ```
 
 `osc-tool-test` is a unit smoke for the Python helper itself.

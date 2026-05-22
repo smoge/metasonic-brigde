@@ -44,14 +44,32 @@ notepad output of this pass is the data.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17004 --address /v0/lpf/0 --value 1800.0
+     --port 17004 --address /v0/lpf/0 --value 1200
    ```
 
    OSC values are raw control values in the target parameter's
    units, not normalized 0..1 values. For the preserve-cutoff
    fixtures, `/v0/lpf/0` is an LPF cutoff in Hz with the manifest
-   range `[200, 6000]`. Sending `0.75` is therefore a 0.75 Hz
-   cutoff, which can sound like the audio stopped.
+   range `[200, 6000]`; useful values are anywhere in that range
+   (`1200` and `2400` work well as mnemonics — `1200` sits between
+   the dark default `600` and the bright default `2400`).
+
+   You no longer have to memorize that range: the session prints it
+   on the addressable-OSC-surface line at startup, e.g.
+
+   ```
+   /v0/lpf/0  (name="cutoff", default=600.0, range=[200.0, 6000.0], cc=74)
+   ```
+
+   Sending an out-of-range value (e.g. `0.75`) rejects at ingress
+   with a single diagnostic and does not reach the runtime:
+
+   ```
+   osc reject (out-of-range): tag=lpf/0 value=0.75 range=[200.0, 6000.0]
+   ```
+
+   That is intentional — if you want to confirm the rejection is
+   wired, send `0.75` deliberately.
 
    The `just osc-send` recipe is the same helper wrapped in a
    recipe. `oscsend` from `liblo-tools` is also fine if it is
@@ -106,13 +124,15 @@ with audio actually playing.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17004 --address /v0/lpf/0 --value 1800.0
+     --port 17004 --address /v0/lpf/0 --value 1200
    ```
 
    The session terminal should print an `osc accept:` line. Listen
-   — the cutoff should have moved. Try `600.0`, `2400.0`, and
-   `5000.0` if you want to sweep it without leaving the manifest's
-   Hz range.
+   — the cutoff should have moved. Try `600`, `2400`, and `5000`
+   if you want to sweep it without leaving the manifest's Hz range
+   (the addressable-surface line from the startup print tells you
+   that range). If you want to confirm the rejection path, send
+   `0.75` once and look for an `osc reject (out-of-range)` line.
 
 4. **Trigger the reload.** In the session terminal, type:
 
@@ -155,12 +175,14 @@ with audio actually playing.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17004 --address /v0/lpf/0 --value 900.0
+     --port 17004 --address /v0/lpf/0 --value 2400
    ```
 
-   Should accept and you should hear the cutoff close. This is the
-   "OSC survives the reload" invariant — interesting only if it does
-   not work.
+   Should accept and you should hear the cutoff open. `2400` matches
+   the bright demo's own default, which is a nice mnemonic — the
+   audible result is what you would have heard if the voice were
+   rebuilt rather than preserved. This is the "OSC survives the
+   reload" invariant — interesting only if it does not work.
 
 7. **Exit with `<Ctrl-D>`.** Should be clean — no hang, no zombie
    audio device.
@@ -187,7 +209,7 @@ the rejection.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17005 --address /v0/lpf/0 --value 1800.0
+     --port 17005 --address /v0/lpf/0 --value 1200
    ```
 
 3. **Attempt the reload that gets rejected.**
@@ -221,7 +243,7 @@ the rejection.
 
    ```sh
    python3 tools/send_osc.py --host 127.0.0.1 \
-     --port 17005 --address /v0/lpf/0 --value 900.0
+     --port 17005 --address /v0/lpf/0 --value 2400
    ```
 
    Should accept; you should hear the cutoff move on the *old*
