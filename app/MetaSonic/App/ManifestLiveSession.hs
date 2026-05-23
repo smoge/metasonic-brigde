@@ -82,6 +82,19 @@ module MetaSonic.App.ManifestLiveSession
     -- * Tracked-stack factory wrapper (exported for tests)
   , withTrackedFactory
 
+    -- * Per-route initial-open ingress projectors (exported for tests)
+    --
+    -- The three projectors peel each route's outer wrapper
+    -- ('SahsiOpen' \/ 'PahsiOpen' \/ 'TpahsiOpen') plus the inner
+    -- 'RhsoiIngressOpenFailed' to recover the bundled
+    -- 'LiveProdIngressIssue' from an initial 'hsfOpenStack' failure.
+    -- 'runSupervised' uses them to route a startup MIDI failure
+    -- through 'renderLiveProdIngressIssue' instead of the
+    -- shared @causeLabel@ tag collapse.
+  , projectStoppedAudioInitialIngressFailure
+  , projectPreservingInitialIngressFailure
+  , projectTryPreservingInitialIngressFailure
+
     -- * Testable reload command core
     --
     -- 'runReloadWith' is the IO body that 'sessionLoop' dispatches
@@ -121,19 +134,30 @@ import           MetaSonic.App.ManifestLiveCommon
                                                 (autoStartTemplatesWith,
                                                  liveAudioOptions,
                                                  liveIngressTargetPolicy,
+                                                 liveMIDIListenerHooksForObservedWith,
                                                  liveOSCListenerHooksForObservedWith,
                                                  liveReloadProducer,
                                                  planOrDie,
                                                  printAddressableSurfaceWith,
-                                                 printIngressSnapshotWith,
                                                  printServiceSnapshotWith,
                                                  readManifestDocOrDie,
-                                                 renderIngressSnapshot,
                                                  renderLiveReloadEvents,
                                                  renderOSCControls,
                                                  renderOSCControlsWith,
                                                  targetOrDie,
                                                  warnIfMissingVoicesWith)
+import           MetaSonic.App.ManifestLiveIngressOps
+                                                (LiveProdIngressHandle,
+                                                 LiveProdIngressIssue,
+                                                 manifestLiveIngressOps,
+                                                 printLiveIngressSnapshotWith,
+                                                 renderLiveIngressSnapshot,
+                                                 renderLiveProdIngressIssue)
+import           MetaSonic.App.ManifestMIDIIngressOps
+                                                (defaultManifestMIDIIngressOpsHooks,
+                                                 manifestMIDIIngressOpsWithTargetHooks)
+import           MetaSonic.App.ManifestMIDIPortMIDI
+                                                (manifestPortMIDISourceFactory)
 import           MetaSonic.App.ManifestLiveValueCache
                                                 (LiveValueCache,
                                                  emptyLiveValueCache,
@@ -144,9 +168,7 @@ import           MetaSonic.App.ManifestReloadOSCBinding
                                                 (ManifestOSCControlBinding (..),
                                                  motControls)
 import           MetaSonic.App.ManifestOSCIngressOps
-                                                (ManifestOSCIngressHandle,
-                                                 ManifestOSCIngressOpsIssue,
-                                                 manifestOSCIngressOpsWithTargetHooks)
+                                                (manifestOSCIngressOpsWithTargetHooks)
 import           MetaSonic.App.ManifestOSCListener
                                                 (ListenerConfig)
 import           MetaSonic.App.ManifestReloadCli
@@ -165,13 +187,17 @@ import           MetaSonic.App.ManifestReloadHost
 import           MetaSonic.App.ManifestReloadHostStack
                                                 (RealReloadHostStackInputs (..),
                                                  ReloadHostStack (..),
+                                                 ReloadHostStackOpenIssue (..),
+                                                 StoppedAudioHostStackIssue (..),
                                                  mkStoppedAudioHostStackFactory,
                                                  realStoppedAudioHostStackOps)
 import           MetaSonic.App.ManifestReloadPreservingHostStack
-                                                (mkPreservingHostStackFactory,
+                                                (PreservingHostStackIssue (..),
+                                                 mkPreservingHostStackFactory,
                                                  realPreservingHostStackOps)
 import           MetaSonic.App.ManifestReloadTryPreservingHostStack
-                                                (mkTryPreservingHostStackFactory,
+                                                (TryPreservingHostStackIssue (..),
+                                                 mkTryPreservingHostStackFactory,
                                                  realTryPreservingHostStackOps)
 import           MetaSonic.App.ManifestReloadSupervisor
                                                 (SupervisedReloadEvent (..),
@@ -194,6 +220,9 @@ import           MetaSonic.Session.FanIn        (SessionFanInSnapshot (..),
 import           MetaSonic.Session.FanInService (defaultSessionFanInServiceHooks,
                                                  defaultSessionFanInServiceOptions,
                                                  readSessionFanInService)
+import           MetaSonic.Session.MIDIPortMIDI (PortMIDISourceOptions (..),
+                                                 defaultPortMIDISourceOptions)
+import           MetaSonic.Session.MIDIProducer (defaultMIDIProducerOptions)
 import           MetaSonic.Session.OSCProducer  (defaultOSCProducerOptions)
 import           MetaSonic.Session.Owner        (defaultSessionOwnerOptions)
 import           MetaSonic.Session.State        (SessionState (..))
@@ -602,30 +631,39 @@ withTrackedFactory f ref = f
 -- supervised route's stack value is structurally the same newtype,
 -- so the loop reads service\/ingress off it polymorphically only
 -- in the @e@ (issue) parameter.
+--
+-- Phase 8h step 3c re-parameterized this from the OSC-only
+-- @ManifestOSCIngressOpsIssue@ \/ @ManifestOSCIngressHandle@ pair
+-- to the bundled 'LiveProdIngressIssue' \/ 'LiveProdIngressHandle'
+-- aliases so the same supervisor lifecycle drives both OSC and
+-- (optional) MIDI ingress through 'manifestLiveIngressOps'.
 type LiveStack =
   ReloadHostStack
     ManifestReloadIngressTarget
-    ManifestOSCIngressOpsIssue
-    ManifestOSCIngressHandle
+    LiveProdIngressIssue
+    LiveProdIngressHandle
 
 
 type LiveEvent =
-  ManifestReloadEvent (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
+  ManifestReloadEvent (ManifestReloadHostIssue LiveProdIngressIssue)
 
 
 -- | Run a manifest-backed live session shell.
 --
--- Opens audio + OSC ingress against @manifest@ + @initialDemo@
+-- Opens audio + OSC ingress (and, when a device id is supplied,
+-- manifest MIDI ingress) against @manifest@ + @initialDemo@
 -- through the supervised lifecycle picked by @strategy@, then
 -- reads operator commands on stdin until EOF / supervisor
 -- escalation.
 --
--- The @Maybe Int@ device id (currently named @_mMidiDevice@) is the
--- 3c CLI seam for @--midi-device N@. Step 5 lands it as inert
--- plumbing; step 6 consumes it to build the optional MIDI half of
--- the combined ingress ops and wires the bundle through
--- 'rrhsiBuildIngressOps'. Passing 'Nothing' here is what every
--- pre-3c invocation does and preserves today's OSC-only behavior.
+-- The @Maybe Int@ device id is the @--midi-device N@ value
+-- threaded from @Main@. @Nothing@ keeps the session OSC-only
+-- (every invocation prior to Phase 8h step 3c); @Just n@ opens
+-- a PortMIDI source against device @n@ alongside the OSC
+-- listener through 'manifestLiveIngressOps'. An initial MIDI
+-- open failure dies with the operator-facing
+-- 'renderLiveProdIngressIssue' string instead of the
+-- supervisor's generic @ingress-open-failed@ collapse.
 runManifestLiveSession
   :: ManifestReloadHostStrategy
   -> FilePath
@@ -633,7 +671,7 @@ runManifestLiveSession
   -> ListenerConfig
   -> Maybe Int
   -> IO ()
-runManifestLiveSession strategy manifestPath initialDemo listenerCfg _mMidiDevice = do
+runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice = do
   hSetBuffering stdout LineBuffering
   doc <- readManifestDocOrDie manifestPath
   catalog <- either die pure (demoManifestReloadCatalog demoTable)
@@ -688,15 +726,35 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg _mMidiDevic
   let recordAccepted voice tag value =
         modifyIORef' valueCacheRef (recordAcceptedWrite voice tag value)
 
+  -- Phase 8h step 3c: build OSC ops as before, plus an optional
+  -- MIDI half when --midi-device is set. The bundle goes through
+  -- 'manifestLiveIngressOps' so the supervisor lifecycle drives
+  -- both halves under the same open / close ordering.
+  let oscOpsFor host =
+        manifestOSCIngressOpsWithTargetHooks
+          (\target ->
+             liveOSCListenerHooksForObservedWith
+               target recordAccepted extPrintDyn)
+          defaultOSCProducerOptions
+          host
+          listenerCfg
+
+      midiOpsFor host n =
+        manifestMIDIIngressOpsWithTargetHooks
+          (\target ->
+             liveMIDIListenerHooksForObservedWith
+               (mitMIDI target) recordAccepted extPrintDyn)
+          defaultManifestMIDIIngressOpsHooks
+          defaultMIDIProducerOptions
+          host
+          (manifestPortMIDISourceFactory
+             defaultPortMIDISourceOptions { pmsoDeviceId = Just n })
+
   let inputs = RealReloadHostStackInputs
         { rrhsiBuildIngressOps     = \host ->
-            manifestOSCIngressOpsWithTargetHooks
-              (\target ->
-                 liveOSCListenerHooksForObservedWith
-                   target recordAccepted extPrintDyn)
-              defaultOSCProducerOptions
-              host
-              listenerCfg
+            manifestLiveIngressOps
+              (oscOpsFor host)
+              (fmap (midiOpsFor host) mMidiDevice)
         , rrhsiIngressTargetPolicy = liveIngressTargetPolicy
         , rrhsiAudioFFI            = defaultSessionFanInAudioFFI
         , rrhsiAudioOptions        = liveAudioOptions
@@ -721,6 +779,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg _mMidiDevic
             trackedStackRef
       runSupervised
         renderStoppedAudioHostStackIssueTag
+        projectStoppedAudioInitialIngressFailure
+        mMidiDevice
         factory
         doc catalog
         initialPlan initialTarget
@@ -739,6 +799,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg _mMidiDevic
             trackedStackRef
       runSupervised
         renderTryPreservingHostStackIssueTag
+        projectTryPreservingInitialIngressFailure
+        mMidiDevice
         factory
         doc catalog
         initialPlan initialTarget
@@ -757,6 +819,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg _mMidiDevic
             trackedStackRef
       runSupervised
         renderPreservingHostStackIssueTag
+        projectPreservingInitialIngressFailure
+        mMidiDevice
         factory
         doc catalog
         initialPlan initialTarget
@@ -773,11 +837,60 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg _mMidiDevic
         <> "; reloadSupervised + HostStackFactory)"
 
 
+-- | Per-route projectors for 'runSupervised'. Each peels the
+-- outer route wrapper plus the inner 'RhsoiIngressOpenFailed' to
+-- expose the live ingress issue on initial open; every other
+-- route-issue variant (audio start, service open, fallback) maps
+-- to 'Nothing' so the supervisor's @causeLabel@ path renders it
+-- as today.
+projectStoppedAudioInitialIngressFailure
+  :: StoppedAudioHostStackIssue LiveProdIngressIssue
+  -> Maybe LiveProdIngressIssue
+projectStoppedAudioInitialIngressFailure = \case
+  SahsiOpen (RhsoiIngressOpenFailed e) -> Just e
+  _                                    -> Nothing
+
+projectPreservingInitialIngressFailure
+  :: PreservingHostStackIssue LiveProdIngressIssue
+  -> Maybe LiveProdIngressIssue
+projectPreservingInitialIngressFailure = \case
+  PahsiOpen (RhsoiIngressOpenFailed e) -> Just e
+  _                                    -> Nothing
+
+projectTryPreservingInitialIngressFailure
+  :: TryPreservingHostStackIssue LiveProdIngressIssue
+  -> Maybe LiveProdIngressIssue
+projectTryPreservingInitialIngressFailure = \case
+  TpahsiOpen (RhsoiIngressOpenFailed e) -> Just e
+  _                                     -> Nothing
+
+
 -- | Inner driver: open the initial stack, install the supervisor
 -- adapter, run the session loop inside the adapter callback so the
 -- adapter's @finally closeOps@ covers exit / async exception paths.
+--
+-- Phase 8h step 3c added two arguments threaded through from the
+-- live-session entrypoint:
+--
+-- * @projectInitialIngressFailure@ peels the route-specific outer
+--   wrapper (one of @SahsiOpen@, @PahsiOpen@, @TpahsiOpen@) plus the
+--   inner @RhsoiIngressOpenFailed@ on initial open failure. A
+--   @Just live@ result dies through 'renderLiveProdIngressIssue'
+--   with the operator-facing string; @Nothing@ falls through to
+--   the existing @causeLabel@-driven path so unrelated open
+--   failures (audio start, service open, fallback) retain their
+--   current operator strings.
+-- * @mMidiDevice@ is the @--midi-device@ value, threaded through
+--   so the issue renderer can pin the device id in MIDI failure
+--   strings.
+--
+-- Reload-time failures continue to flow through the supervisor's
+-- existing reload-window machinery; only the initial open is
+-- intercepted here.
 runSupervised
   :: (e -> String)
+  -> (e -> Maybe LiveProdIngressIssue)
+  -> Maybe Int
   -> HostStackFactory MR.ManifestReloadPlan LiveStack e
   -> AuthoringManifestDoc
   -> [MR.ManifestReloadCatalogEntry]
@@ -792,14 +905,19 @@ runSupervised
   -> (String -> IO ())
   -> IO ()
 runSupervised
-    causeLabel factory doc catalog initialPlan initialTarget
+    causeLabel projectInitialIngressFailure mMidiDevice
+    factory doc catalog initialPlan initialTarget
     trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef
     valueCacheRef extPrintRef extPrintDyn = do
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory initialPlan)
     case openResult of
       Left issue ->
-        die ("Live session initial open failed: " <> causeLabel issue)
+        case projectInitialIngressFailure issue of
+          Just live ->
+            die (renderLiveProdIngressIssue mMidiDevice live)
+          Nothing ->
+            die ("Live session initial open failed: " <> causeLabel issue)
       Right initialStack -> do
         let initialService = mrhcService (rhsConfig initialStack)
             initialIngress = mrhcIngressManager (rhsConfig initialStack)
@@ -810,7 +928,7 @@ runSupervised
                 autoStartTemplatesWith extPrintDyn "initial" initialService initialPlan
               warnIfMissingVoicesWith extPrintDyn initialService initialVoices
               printServiceSnapshotWith extPrintDyn "initial fan-in" initialService
-              printIngressSnapshotWith extPrintDyn initialIngress
+              printLiveIngressSnapshotWith extPrintDyn initialIngress
               printAddressableSurfaceWith extPrintDyn initialService initialTarget
               extPrintDyn ""
               hFlush stdout
@@ -1184,7 +1302,7 @@ printStatusWith output trackedStackRef currentPlanRef lastOutcomeRef = do
       printServiceSnapshotWith output "    fan-in" service
       ingressSnapshot <- readManifestReloadIngressManager ingress
       output $
-        "    ingress:           " <> renderIngressSnapshot ingressSnapshot
+        "    ingress:           " <> renderLiveIngressSnapshot ingressSnapshot
   mLast <- readIORef lastOutcomeRef
   case mLast of
     Nothing ->

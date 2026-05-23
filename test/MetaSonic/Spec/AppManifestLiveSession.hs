@@ -36,8 +36,8 @@ import           MetaSonic.App.ManifestLiveSession
                                              runReloadWith,
                                              stepFromOutcome,
                                              withTrackedFactory)
-import           MetaSonic.App.ManifestOSCIngressOps
-                                            (ManifestOSCIngressOpsIssue)
+import           MetaSonic.App.ManifestLiveIngressOps
+                                            (LiveProdIngressIssue)
 import           MetaSonic.App.ManifestReloadEvent
                                             (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
@@ -545,7 +545,7 @@ type StubPlan = Int
 syntheticEvent
   :: Int
   -> ManifestReloadEvent
-       (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
+       (ManifestReloadHostIssue LiveProdIngressIssue)
 syntheticEvent tag =
   -- 'MreFallbackDeclined' is the most ergonomic constructor: it
   -- carries one issue payload that we can identify via show. The
@@ -589,7 +589,7 @@ fakeSupOpsWithOutcome eventsRef outcome tag = SupervisorOps
 -- 'LiveEvent' type — kept local to the test so we do not export
 -- it from the production module.
 type LiveEvent =
-  ManifestReloadEvent (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
+  ManifestReloadEvent (ManifestReloadHostIssue LiveProdIngressIssue)
 
 
 -- | Helper: spin up the four IORefs 'runReloadWith' needs and pin

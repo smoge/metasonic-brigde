@@ -675,8 +675,9 @@ renderEnqueue result =
 -- list, mirroring the @--manifest-host-reload-smoke@ surface so
 -- operators read the same vocabulary in both CLIs.
 renderLiveReloadEvents
-  :: [ManifestReloadEvent
-        (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)]
+  :: Show ingressIssue
+  => [ManifestReloadEvent
+        (ManifestReloadHostIssue ingressIssue)]
   -> [String]
 renderLiveReloadEvents events =
   case events of

@@ -250,6 +250,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestLiveReloadDemoRender
       MetaSonic.Spec.AppManifestLiveSession
       MetaSonic.Spec.AppManifestLiveSessionOutputSink
+      MetaSonic.Spec.AppManifestLiveSessionProjectors
       MetaSonic.Spec.AppManifestLiveValueCache
       MetaSonic.Spec.AppManifestMIDIIngressOps
       MetaSonic.Spec.AppManifestMIDIListener

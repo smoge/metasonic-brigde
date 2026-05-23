@@ -1522,8 +1522,9 @@ renderSmokeAudioEvents events =
 -- @--manifest-live-reload-demo@'s timeline so operators read one
 -- surface across both CLIs.
 renderSmokeReloadEvents
-  :: [ManifestReloadEvent
-        (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)]
+  :: Show ingressIssue
+  => [ManifestReloadEvent
+        (ManifestReloadHostIssue ingressIssue)]
   -> [String]
 renderSmokeReloadEvents events =
   case events of
@@ -1533,8 +1534,9 @@ renderSmokeReloadEvents events =
       map renderSmokeReloadEvent events
 
 renderSmokeReloadEvent
-  :: ManifestReloadEvent
-       (ManifestReloadHostIssue ManifestOSCIngressOpsIssue)
+  :: Show ingressIssue
+  => ManifestReloadEvent
+       (ManifestReloadHostIssue ingressIssue)
   -> String
 renderSmokeReloadEvent event =
   case event of
