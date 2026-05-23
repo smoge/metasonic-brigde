@@ -1104,3 +1104,45 @@ same-demo `demo saw-filter-dark`, `values`, `status`, `quit`.
 Follow-up chosen from this pass: no new code lane. 8h closes; the
 text-shell observability gap promoted by the prior 8h evidence pass
 is now answered by the `values` command on this fixture.
+
+### 2026-05-22 — 8i noise-values pass, values stable; TTY friction sharpened
+
+Transcript: `/tmp/metasonic-live-session-8i-noise-values-pass.log`.
+
+Manual require-preserving pass against
+`examples/manifests/saw-noise-filter.json`, starting from
+`noise-filter-soft`. Driving order: fresh-session `values`, OSC batch
+on cutoff / q / level, `values`, `demo noise-filter-sharp`, `values`,
+second OSC batch, `values`, `demo noise-filter-soft`, `values`, third
+OSC batch, attempted `values`, same-demo `demo noise-filter-soft`,
+`values`, `status`, `quit`.
+
+- Initial `values` rendered the `noise-filter-soft` manifest defaults
+  in manifest order (`lpf/0`, `lpf/1`, `gain/0`) with
+  `source=default`.
+- All OSC writes accepted on the manifest-correct paths
+  (`/v0/lpf/0`, `/v0/lpf/1`, `/v0/gain/0`); no OSC reject,
+  reload-window reject, or Haskell constructor leakage appeared.
+- `values` tracked the last accepted target values after each batch,
+  retained them across `noise-filter-soft` -> `noise-filter-sharp`
+  and `noise-filter-sharp` -> `noise-filter-soft` preserving reloads,
+  and kept the `default=` column tied to the current plan. The
+  `5e-2` compact formatting appeared in both the OSC accept line and
+  the final `values` row.
+- Final `status` was healthy: current demo `noise-filter-soft`, audio
+  running, queue depth 0, owner ready, reload normal, one active
+  voice; the session exited cleanly with code 0.
+- One operator-visible shell issue did occur: async OSC accept output
+  interleaved while a partially typed command line was being edited,
+  leaving a stray prefix and producing `unknown command: "svalues"`.
+  The session recovered cleanly and the following `values` call showed
+  the correct state, but this is stronger evidence than the earlier
+  abstract "no history/readline" watch item.
+
+Follow-up chosen from this pass: no new code lane yet. The 8h
+`values` behavior is now stable on both the saw and noise fixture
+paths. Promote **live-session TTY line discipline / history** to a
+sharper watch item; open it as a design lane only if another operator
+pass reproduces command-line editing friction or if it becomes the
+dominant source of pass mistakes. Same-demo reload wording appeared
+again but still did not block the pass.
