@@ -863,9 +863,13 @@ usage prog = unlines
   , "  --midi-list      Print Q / PortMIDI devices and exit. Device ids"
   , "                   with inputs can be passed to --midi-device."
   , "  --midi-device N  Select PortMIDI device id N for midi-poly,"
-  , "                   --session-midi-smoke, or"
-  , "                   --manifest-midi-reload-smoke. Use --midi-list to"
-  , "                   discover ids. Ignored by non-MIDI modes."
+  , "                   --session-midi-smoke,"
+  , "                   --manifest-midi-reload-smoke, or"
+  , "                   --manifest-live-session (the live session"
+  , "                   opens MIDI only when this flag is set;"
+  , "                   absent leaves the session OSC-only)."
+  , "                   Use --midi-list to discover ids. Ignored"
+  , "                   by modes that do not open MIDI ingress."
   , "  --session-midi-smoke [SECONDS]"
   , "                   Manual non-audio probe for the session MIDI ingress"
   , "                   path. Opens the Q / PortMIDI source, feeds decoded"
@@ -1110,6 +1114,7 @@ main = do
         manifestPath
         demo
         (defaultListenerConfig (optSessionOscPort opts))
+        (optMidiDevice opts)
     ManifestMIDIReloadSmoke -> do
       manifestPath <- maybe
         (die "Missing manifest JSON file for --manifest-midi-reload-smoke")

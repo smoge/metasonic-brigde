@@ -619,13 +619,21 @@ type LiveEvent =
 -- through the supervised lifecycle picked by @strategy@, then
 -- reads operator commands on stdin until EOF / supervisor
 -- escalation.
+--
+-- The @Maybe Int@ device id (currently named @_mMidiDevice@) is the
+-- 3c CLI seam for @--midi-device N@. Step 5 lands it as inert
+-- plumbing; step 6 consumes it to build the optional MIDI half of
+-- the combined ingress ops and wires the bundle through
+-- 'rrhsiBuildIngressOps'. Passing 'Nothing' here is what every
+-- pre-3c invocation does and preserves today's OSC-only behavior.
 runManifestLiveSession
   :: ManifestReloadHostStrategy
   -> FilePath
   -> Demo
   -> ListenerConfig
+  -> Maybe Int
   -> IO ()
-runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
+runManifestLiveSession strategy manifestPath initialDemo listenerCfg _mMidiDevice = do
   hSetBuffering stdout LineBuffering
   doc <- readManifestDocOrDie manifestPath
   catalog <- either die pure (demoManifestReloadCatalog demoTable)
