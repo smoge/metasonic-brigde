@@ -1022,3 +1022,45 @@ audio path beyond what the transcript markers prove.
 Follow-up chosen from this pass: no new code lane. The fixture
 migration is now operator-confirmed at the same marker shape it
 held on the original `reject-preserving-smooth` fixture.
+
+### 2026-05-22 — 8h rich-control pass promotes current-value introspection
+
+Transcript: `/tmp/metasonic-live-session-8h-rich-control-pass.log`.
+
+Manual require-preserving pass against
+`examples/manifests/saw-noise-filter.json` starting from
+`saw-filter-dark`. The pass deliberately used the richer four-control
+surface as an instrument rather than a smoke: `status`, `controls`,
+an OSC batch across cutoff / q / level, dark -> bright preserving
+reload, a second OSC batch, bright -> dark preserving reload, a third
+OSC batch, a same-demo `demo saw-filter-dark`, final `status`, and
+`quit`.
+
+- The session stayed healthy throughout: every `status` snapshot
+  showed audio running, queue depth 0, owner ready, reload normal, and
+  one active voice.
+- All 20 OSC writes were accepted through the manifest-correct paths:
+  `/v0/lpf/0` (`cutoff`), `/v0/lpf/1` (`q`), and `/v0/gain/0`
+  (`level`). The accept lines kept the clean
+  `osc accept: /v0/lpf/0 name="cutoff" value=900` renderer shape; no
+  OSC reject, reload-window reject, or constructor leakage appeared in
+  the transcript.
+- Dark -> bright and bright -> dark preserving reloads both committed.
+  Same-demo `demo saw-filter-dark` also committed and left the session
+  healthy.
+- `controls` remained useful for declared surfaces and reload defaults,
+  but after repeated OSC writes both `status` and `controls` still
+  exposed only plan/session metadata and manifest defaults. They did
+  not answer the operator's immediate question: "what value is this
+  live voice using now?"
+
+This promotes **live control value introspection** to a narrow
+design-note lane. The pressure is not "build a GUI" and not "read DSP
+state from C++"; it is a text-shell observability gap for the last
+accepted control target values already visible in the transcript as
+`osc accept` lines. Same-demo reload wording remains a watch item only:
+`committed (new plan installed)` still reads slightly odd when the
+requested demo is already current, but it did not block the pass.
+
+Audio result not asserted in this entry; it records the transcript
+evidence and the operator-facing observability gap only.
