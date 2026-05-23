@@ -969,7 +969,7 @@ liveIngressTargetPolicy = ManifestReloadIngressTargetPolicy
   , mritpUIRetainedValues =
       M.empty
   , mritpMIDIDefaultVoice =
-      VoiceKey "fx"
+      VoiceKey "v0"
   }
 
 

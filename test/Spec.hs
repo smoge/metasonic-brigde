@@ -14,6 +14,8 @@ import           MetaSonic.Spec.AppManifestMIDIIngressOps
 import           MetaSonic.Spec.AppManifestMIDIListener
 import           MetaSonic.Spec.AppManifestLiveCommonAddressableSurface
                                                   (appManifestLiveCommonAddressableSurfaceTests)
+import           MetaSonic.Spec.AppManifestLiveCommonIngressPolicy
+                                                  (appManifestLiveCommonIngressPolicyTests)
 import           MetaSonic.Spec.AppManifestLiveCommonOSCControls
                                                   (appManifestLiveCommonOSCControlsTests)
 import           MetaSonic.Spec.AppManifestLiveCommonOSCRender
@@ -120,6 +122,7 @@ main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
   [ appDemoCatalogTests
   , appManifestLiveCommonAddressableSurfaceTests
+  , appManifestLiveCommonIngressPolicyTests
   , appManifestLiveCommonOSCControlsTests
   , appManifestLiveCommonOSCRenderTests
   , appManifestLiveReloadDemoRenderTests
