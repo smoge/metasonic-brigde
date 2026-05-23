@@ -14,17 +14,17 @@ the question this note opens is what to *play* through it next.
 
 Primary source material:
 
-| Topic                                                 | File                                                                 | Symbol                                            |
-|-------------------------------------------------------|----------------------------------------------------------------------|---------------------------------------------------|
-| Region kernel contract                                | [RegionKernels.hs](../src/MetaSonic/Bridge/Compile/RegionKernels.hs) | `Note [Region kernel selection]`                  |
-| Preserving-reload classification                      | [RTGraphAdapter.hs](../src/MetaSonic/Session/RTGraphAdapter.hs)      | `preservingHotSwapNodeClass`                      |
-| Per-node migration validation                         | [RTGraphAdapter.hs](../src/MetaSonic/Session/RTGraphAdapter.hs)      | `validateStatefulNode`                            |
-| Per-kind ABI table                                    | [Types.hs](../src/MetaSonic/Types.hs)                                | `kindSpec`                                        |
-| Manifest control schema                               | [Manifest.hs](../src/MetaSonic/Authoring/Manifest.hs)                | `ManifestControl`                                 |
-| Preserving drone pair (current)                       | [Demos.hs](../app/MetaSonic/App/Demos.hs)                            | `dronePreserveSawDark` / `dronePreserveSawBright` |
-| Direct ReportedControl binding                        | [Demos.hs](../app/MetaSonic/App/Demos.hs)                            | `preserveCutoffControlDark`                       |
-| Smoothed authoring control (avoid on preserving path) | [Authoring.hs](../src/MetaSonic/Authoring.hs)                        | `control`                                         |
-| Validated live manifest                               | [preserve-cutoff.json](../examples/manifests/preserve-cutoff.json)   | (whole file)                                      |
+|             Topic              |File                                                                |                    Symbol                     |
+|:------------------------------:|--------------------------------------------------------------------|:---------------------------------------------:|
+|     Region kernel contract     |[RegionKernels.hs](../src/MetaSonic/Bridge/Compile/RegionKernels.hs)|       `Note [Region kernel selection]`        |
+|Preserving-reload classification|[RTGraphAdapter.hs](../src/MetaSonic/Session/RTGraphAdapter.hs)     |         `preservingHotSwapNodeClass`          |
+| Per-node migration validation  |[RTGraphAdapter.hs](../src/MetaSonic/Session/RTGraphAdapter.hs)     |            `validateStatefulNode`             |
+|       Per-kind ABI table       |[Types.hs](../src/MetaSonic/Types.hs)                               |                  `kindSpec`                   |
+|    Manifest control schema     |[Manifest.hs](../src/MetaSonic/Authoring/Manifest.hs)               |               `ManifestControl`               |
+|Preserving drone pair (current) |[Demos.hs](../app/MetaSonic/App/Demos.hs)                           |`dronePreserveSawDark`/`dronePreserveSawBright`|
+| Direct ReportedControl binding |[Demos.hs](../app/MetaSonic/App/Demos.hs)                           |          `preserveCutoffControlDark`          |
+|   Smoothed authoring control   |[Authoring.hs](../src/MetaSonic/Authoring.hs)                       |                   `control`                   |
+|    Validated live manifest     |[preserve-cutoff.json](../examples/manifests/preserve-cutoff.json)  |                 (whole file)                  |
 
 
 ## Why This Arc
@@ -60,15 +60,15 @@ Confirmed against
 sink-terminal variants accept either `KOut` or `KBusOut` at the
 terminal slot.
 
-| Tag                | Shape                                   | Arity | Terminal |
-|--------------------|-----------------------------------------|-------|----------|
-| `RSawLpfGain`      | `KSawOsc → KLPF → KGain`                | 3     | buffer   |
-| `RSinGainOut`      | `KSinOsc → KGain → sink`                | 3     | sink     |
-| `RSawGainOut`      | `KSawOsc → KGain → sink`                | 3     | sink     |
-| `RNoiseGainOut`    | `KNoiseGen → KGain → sink`              | 3     | sink     |
-| `RSawLpfGainOut`   | `KSawOsc → KLPF → KGain → sink`         | 4     | sink     |
-| `RBusInLpfGainOut` | `KBusIn → KLPF → KGain → sink`          | 4     | sink     |
-| `RNoiseLpfGainOut` | `KNoiseGen → KLPF → KGain → sink`       | 4     | sink     |
+| Tag                |               Shape               | Arity | Terminal |
+| ------------------ | :-------------------------------: | ----- | -------- |
+| `RSawLpfGain`      |     `KSawOsc → KLPF → KGain`      | 3     | buffer   |
+| `RSinGainOut`      |     `KSinOsc → KGain → sink`      | 3     | sink     |
+| `RSawGainOut`      |     `KSawOsc → KGain → sink`      | 3     | sink     |
+| `RNoiseGainOut`    |    `KNoiseGen → KGain → sink`     | 3     | sink     |
+| `RSawLpfGainOut`   |  `KSawOsc → KLPF → KGain → sink`  | 4     | sink     |
+| `RBusInLpfGainOut` |  `KBusIn → KLPF → KGain → sink`   | 4     | sink     |
+| `RNoiseLpfGainOut` | `KNoiseGen → KLPF → KGain → sink` | 4     | sink     |
 
 The existing `dronePreserveSawDark` / `dronePreserveSawBright` pair
 in [Demos.hs](../app/MetaSonic/App/Demos.hs) lands on
