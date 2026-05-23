@@ -4006,9 +4006,12 @@ Still gated:
   reload's `committed (new plan installed)` wording, ALSA stderr
   noise on startup, in-session command history / readline — none
   blocking on current evidence.
-  What remains here is real
-  hardware confirmation and the same hardware-gated CI question
-  the device-backed paths share.
+  For the device-backed live-session paths above (the MIDI/device
+  smoke lane and the hardware-paired live-reload demo), what
+  remains is real hardware confirmation and the same hardware-gated
+  CI question those paths share. The Phase 8h `values` slice has
+  no hardware-specific contract; its live verification is the
+  2026-05-22 operator transcript recorded in the playbook.
 - [ ] Failure/event semantics across compile, allocation, and stale
   producer commands. The install/reload-strategy timeline is now
   covered by the `ManifestReloadEvent` ADT in
