@@ -984,3 +984,41 @@ Follow-up chosen from this pass: no new code lane. The post-8f
 system stayed operational under a normal richer-control pass, OSC
 accept lines were readable once the manifest-correct addresses were
 used, and shutdown remained clean.
+
+### 2026-05-22 — retargeted reject-path smoke marker-clean on `reject-preserving-delay`
+
+Transcript: `/tmp/manifest-live-session-require-preserving-reject-transcript.txt`.
+Probe log: `/tmp/manifest-live-session-require-preserving-reject-probe.txt`.
+
+First live operator run of the retargeted reject-path wrapper
+(`tools/manifest_live_session_require_preserving_reject_smoke.sh`,
+recipe `just manifest-live-session-require-preserving-reject-smoke`)
+after the fixture migration from the removed
+`reject-preserving-smooth` to the current
+`reject-preserving-delay` (commit `7b10af7`). The fixture's voice
+template carries a `KDelay` node (`PreserveUnsupported`), so the
+preserving hot-swap is expected to reject before install.
+
+- All 23 markers passed; wrapper exited 0.
+- Preserving rejection fired the four reload-event lines
+  (preserving started, resume-old-ingress started, resume-old-ingress
+  succeeded, preserving rejected) plus the compact `cause:` line and
+  the resource-timeline section.
+- Old plan stayed serving after the rejection: the session continued
+  to render the dark fixture without re-opening or losing the
+  voice; resource timeline pinned `serving plan:
+  reject-preserving-delay-dark` after the rebuild.
+- OSC ingress survived the rejection: the post-reject OSC accept
+  probe came back through the same producer with no port reopen.
+- Negative markers held: no `TemplateGraph` or `RuntimeNode`
+  substring in the transcript (F-1 leak guard).
+- Probe log confirmed `session exit=0` and that port 17005
+  rebound successfully after the wrapper exited.
+
+Audible result not asserted — the smoke runs the live session under
+device audio, but this entry does not claim anything about the
+audio path beyond what the transcript markers prove.
+
+Follow-up chosen from this pass: no new code lane. The fixture
+migration is now operator-confirmed at the same marker shape it
+held on the original `reject-preserving-smooth` fixture.

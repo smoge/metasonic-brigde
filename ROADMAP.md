@@ -3911,8 +3911,11 @@ Still gated:
   F-1 leak guard (no `TemplateGraph` / `RuntimeNode` substring).
   Original marker-clean evidence ran on 2026-05-21 on host
   Linux 6.17.10 Fedora 41 / PipeWire 1.2.8; the retargeted
-  wrapper remains a live/device smoke and needs a fresh operator
-  run when that branch is next exercised.
+  wrapper against `reject-preserving-delay` ran marker-clean on
+  2026-05-22 on the same host (all 23 markers passed; old plan
+  stayed serving after the KDelay preserving rejection; OSC
+  ingress survived the rejection; no `TemplateGraph` /
+  `RuntimeNode` leakage).
   Producer-aware OSC reload-window rendering landed in
   `144901f` + `737b124` (design note:
   [notes/2026-05-20-d-stale-command-rejection-rendering.md](notes/2026-05-20-d-stale-command-rejection-rendering.md)):
