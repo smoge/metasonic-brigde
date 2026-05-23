@@ -143,7 +143,7 @@ import           MetaSonic.Session.FanIn                     (SessionFanInAudioF
                                                               SessionFanInAudioOptions,
                                                               SessionFanInHost,
                                                               startSessionFanInHostAudioWith,
-                                                              stopSessionFanInHostAudioWith)
+                                                              stopSessionFanInHostAudioFadeWith)
 import           MetaSonic.Session.FanInService              (SessionFanInService,
                                                               SessionFanInServiceHooks,
                                                               SessionFanInServiceOptions,
@@ -698,8 +698,9 @@ realClose
 realClose stack = do
   let config = rhsConfig stack
       service = mrhcService config
-  audioEx <- attemptUnit $ void $ stopSessionFanInHostAudioWith
+  audioEx <- attemptUnit $ void $ stopSessionFanInHostAudioFadeWith
     (mrhcAudioFFI config)
+    kRealCloseFadeMs
     (sessionFanInServiceHost service)
   ingressEx <- attemptUnit $ void $
     closeManifestReloadIngress (mrhcIngressManager config)
@@ -712,6 +713,21 @@ realClose stack = do
       pure $ case r of
         Left ex  -> Just ex
         Right () -> Nothing
+
+-- | Phase 8f: linear output fade applied on the host-stack close
+-- path to avoid the audible snap that an abrupt callback teardown
+-- produces. 'realClose' is the close slot every supervised
+-- production route wires through (stopped-audio, preserving, try-
+-- preserving) and is also invoked for terminal reload recovery via
+-- 'hsfCloseStack'; the fade therefore covers each of those teardowns.
+-- In-window reload stop ('hsaroStopOldAudio' / 'hsaroStopNewAudio')
+-- remains on the ordinary stop path so reload sequencing is
+-- unaffected.
+--
+-- Sized in the short de-click range — long enough to round the
+-- discontinuity, short enough that close still feels immediate.
+kRealCloseFadeMs :: Int
+kRealCloseFadeMs = 10
 
 
 -- | Outcome of one supervised stopped-audio manifest reload

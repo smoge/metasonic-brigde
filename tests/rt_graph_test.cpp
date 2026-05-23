@@ -9526,6 +9526,119 @@ TEST_CASE("§6.C.5: set_polyphony=N then add_node(writer) still clamps to 1") {
     rt_graph_destroy(g);
 }
 
+// ----------------------------------------------------------------
+// Phase 8f: shutdown-fade ramp helper
+// ----------------------------------------------------------------
+//
+// These pin the pure ramp math used by GraphAudioStream::process to
+// avoid the end-of-session snap. The audio callback is not exercised
+// here — only the deterministic per-block ramp function. See
+// notes/2026-05-22-f-graceful-session-shutdown-fade-design.md.
+
+TEST_CASE("phase 8f fade: first sample preserves input, ramp reaches zero by end of window") {
+    constexpr int total = 480; // 10 ms at 48 kHz
+    // Use total + 1 frames in a single block so the (remaining - i)
+    // numerator hits zero on the trailing sample: gain(total) = 0 / total.
+    std::vector<float> data(total + 1, 1.0f);
+    const int new_remaining =
+        rt_graph_test_apply_shutdown_fade_block(
+            data.data(), total + 1, total, total);
+    CHECK(new_remaining == 0);
+    CHECK(data.front() == doctest::Approx(1.0f));
+    CHECK(data[total] == doctest::Approx(0.0f));
+    // One sample before the trailing zero sits at gain 1/total — pins
+    // the slope at the end of the ramp.
+    CHECK(data[total - 1] == doctest::Approx(1.0f / static_cast<float>(total)));
+    // Mid-point sits at gain 0.5.
+    CHECK(data[total / 2] == doctest::Approx(0.5f));
+}
+
+TEST_CASE("phase 8f fade: multi-channel buffers receive the same gain curve") {
+    constexpr int total = 256;
+    std::vector<float> ch0(total, 1.0f);
+    std::vector<float> ch1(total, 1.0f);
+    const int r0 = rt_graph_test_apply_shutdown_fade_block(
+        ch0.data(), total, total, total);
+    const int r1 = rt_graph_test_apply_shutdown_fade_block(
+        ch1.data(), total, total, total);
+    CHECK(r0 == r1);
+    for (int i = 0; i < total; ++i) {
+        CHECK(ch0[i] == doctest::Approx(ch1[i]));
+    }
+}
+
+TEST_CASE("phase 8f fade: continuing past completion produces zero output") {
+    constexpr int total = 128;
+    std::vector<float> data(total, 1.0f);
+    int remaining = total;
+    remaining = rt_graph_test_apply_shutdown_fade_block(
+        data.data(), total, remaining, total);
+    CHECK(remaining == 0);
+
+    // Re-fill with non-zero samples and run another block at
+    // remaining = 0; the helper must overwrite with silence.
+    std::fill(data.begin(), data.end(), 0.7f);
+    remaining = rt_graph_test_apply_shutdown_fade_block(
+        data.data(), total, remaining, total);
+    CHECK(remaining == 0);
+    for (float x : data) {
+        CHECK(x == doctest::Approx(0.0f));
+    }
+}
+
+TEST_CASE("phase 8f fade: zero / negative duration yields silence and zero remaining") {
+    constexpr int frames = 64;
+    std::vector<float> data(frames, 0.5f);
+
+    int r = rt_graph_test_apply_shutdown_fade_block(
+        data.data(), frames, frames, 0);
+    CHECK(r == 0);
+    for (float x : data) {
+        CHECK(x == doctest::Approx(0.0f));
+    }
+
+    std::fill(data.begin(), data.end(), 0.5f);
+    r = rt_graph_test_apply_shutdown_fade_block(
+        data.data(), frames, frames, -5);
+    CHECK(r == 0);
+    for (float x : data) {
+        CHECK(x == doctest::Approx(0.0f));
+    }
+
+    std::fill(data.begin(), data.end(), 0.5f);
+    r = rt_graph_test_apply_shutdown_fade_block(
+        data.data(), frames, 0, frames);
+    CHECK(r == 0);
+    for (float x : data) {
+        CHECK(x == doctest::Approx(0.0f));
+    }
+}
+
+TEST_CASE("phase 8f fade: block-by-block accumulation matches single-shot ramp") {
+    // Drain a 1024-frame fade in 4-frame blocks and compare to a
+    // single 1024-frame block. Pins that `remaining` plumbing through
+    // the callback's per-block advance produces the same curve as one
+    // big block.
+    constexpr int total = 1024;
+    constexpr int block = 4;
+
+    std::vector<float> single(total, 1.0f);
+    rt_graph_test_apply_shutdown_fade_block(
+        single.data(), total, total, total);
+
+    std::vector<float> chunked(total, 1.0f);
+    int remaining = total;
+    for (int offset = 0; offset < total; offset += block) {
+        remaining = rt_graph_test_apply_shutdown_fade_block(
+            chunked.data() + offset, block, remaining, total);
+    }
+    CHECK(remaining == 0);
+
+    for (int i = 0; i < total; ++i) {
+        CHECK(chunked[i] == doctest::Approx(single[i]));
+    }
+}
+
 TEST_CASE("§6.C.5: non-writer templates keep set_polyphony's higher cap") {
     auto *g = rt_graph_create(4, kFrames);
     REQUIRE(g != nullptr);

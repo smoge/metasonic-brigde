@@ -963,6 +963,8 @@ fakeAudioFFI = SessionFanInAudioFFI
       \_rt _timeoutMs -> pure True
   , saffiStopAudio =
       \_rt -> pure ()
+  , saffiStopAudioFade =
+      \_rt _fadeMs -> pure ()
   }
 
 -- | Tagged audio FFI events captured during the preserving test so
@@ -985,6 +987,9 @@ capturingAudioFFI ref = SessionFanInAudioFFI
         pure True
   , saffiStopAudio =
       \_rt ->
+        modifyIORef' ref (<> [AudioStop])
+  , saffiStopAudioFade =
+      \_rt _fadeMs ->
         modifyIORef' ref (<> [AudioStop])
   }
 

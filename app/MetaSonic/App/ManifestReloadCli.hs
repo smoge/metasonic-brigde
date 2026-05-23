@@ -1672,6 +1672,9 @@ manifestHostStrategySmokeAudioFFI events = SessionFanInAudioFFI
   , saffiStopAudio =
       \_rt ->
         appendSmokeAudioEvent events MhssaStop
+  , saffiStopAudioFade =
+      \_rt _fadeMs ->
+        appendSmokeAudioEvent events MhssaStop
   }
 
 appendSmokeAudioEvent

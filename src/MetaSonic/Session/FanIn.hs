@@ -49,6 +49,7 @@ module MetaSonic.Session.FanIn
   , startSessionFanInHostAudioWith
   , stopSessionFanInHostAudio
   , stopSessionFanInHostAudioWith
+  , stopSessionFanInHostAudioFadeWith
 
     -- * Scoped host
   , withSessionFanInHost
@@ -189,10 +190,18 @@ data SessionFanInAudioOptions = SessionFanInAudioOptions
 --
 -- Production code uses 'defaultSessionFanInAudioFFI'. Tests inject mocks
 -- so the audio state machine is observable without PortAudio.
+--
+-- 'saffiStopAudioFade' is the Phase 8f graceful-stop entry: it applies
+-- a brief linear output fade before stopping. It is used by the host-
+-- stack close path ('stopSessionFanInHostAudioFadeWith') — the close
+-- slot every supervised production route wires through. In-window
+-- reload stop continues to use 'saffiStopAudio' so reload sequencing
+-- is unaffected by the fade.
 data SessionFanInAudioFFI = SessionFanInAudioFFI
   { saffiStartAudio       :: !(Ptr RTGraph -> Int -> Int -> IO Int)
   , saffiWaitAudioStarted :: !(Ptr RTGraph -> Int -> IO Bool)
   , saffiStopAudio        :: !(Ptr RTGraph -> IO ())
+  , saffiStopAudioFade    :: !(Ptr RTGraph -> Int -> IO ())
   }
 
 -- | Real-FFI audio entry points.
@@ -201,6 +210,7 @@ defaultSessionFanInAudioFFI = SessionFanInAudioFFI
   { saffiStartAudio       = FFI.startAudio
   , saffiWaitAudioStarted = FFI.waitAudioStarted
   , saffiStopAudio        = FFI.stopAudio
+  , saffiStopAudioFade    = FFI.stopAudioFade
   }
 
 -- | Current-owner audio lifecycle failures.
@@ -594,6 +604,40 @@ stopSessionFanInHostAudioWith ffi host = mask $ \restore -> do
     Right ownerHandle -> do
       let rt = sessionOwnerHandleRTGraph ownerHandle
       restore (saffiStopAudio ffi rt)
+      setSessionFanInAudioRunning host False
+      pure (Right ())
+
+-- | Phase 8f: graceful-stop counterpart to
+-- 'stopSessionFanInHostAudioWith'. Identical admission and fail-closed
+-- semantics — only the FFI entry differs: this helper calls
+-- 'saffiStopAudioFade' with @fadeMs@ so the runtime applies a brief
+-- linear output ramp before closing the stream. Intended for the host-
+-- stack close path; in-window reload stop continues to use
+-- 'stopSessionFanInHostAudioWith'.
+stopSessionFanInHostAudioFadeWith
+  :: SessionFanInAudioFFI
+  -> Int
+  -> SessionFanInHost
+  -> IO (Either SessionFanInAudioIssue ())
+stopSessionFanInHostAudioFadeWith ffi fadeMs host = mask $ \restore -> do
+  admitted <- modifyMVar (sfihState host) $ \hostState ->
+    case (sfihsReloadStatus hostState, sfihsOwner hostState, sfihsAudioRunning hostState) of
+      (SessionFanInReloadInProgress, _, _) ->
+        pure (hostState, Left SfaiReloadInProgress)
+      (SessionFanInReloadFailed, _, _) ->
+        pure (hostState, Left SfaiNoOwner)
+      (SessionFanInNormalOperation, Nothing, _) ->
+        pure (hostState, Left SfaiNoOwner)
+      (SessionFanInNormalOperation, Just _, False) ->
+        pure (hostState, Left SfaiAudioAlreadyStopped)
+      (SessionFanInNormalOperation, Just owner, True) ->
+        pure (hostState, Right owner)
+  case admitted of
+    Left issue ->
+      pure (Left issue)
+    Right ownerHandle -> do
+      let rt = sessionOwnerHandleRTGraph ownerHandle
+      restore (saffiStopAudioFade ffi rt fadeMs)
       setSessionFanInAudioRunning host False
       pure (Right ())
 

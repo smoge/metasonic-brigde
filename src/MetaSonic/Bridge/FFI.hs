@@ -52,6 +52,7 @@ module MetaSonic.Bridge.FFI
     startAudio
   , waitAudioStarted
   , stopAudio
+  , stopAudioFade
   , -- * Introspection
     PluginRegistryEntry (..)
   , pluginRegistryEntries
@@ -102,6 +103,7 @@ module MetaSonic.Bridge.FFI
   , c_rt_graph_start_audio
   , c_rt_graph_wait_started
   , c_rt_graph_stop_audio
+  , c_rt_graph_stop_audio_fade
   , -- * Phase 5.1/5.2 low-level hot-swap ABI
     c_rt_graph_prepare_swap
   , c_rt_graph_prepare_swap_from_graph
@@ -728,6 +730,17 @@ foreign import ccall safe "rt_graph_stop_audio"
 -- | Locked wrapper. See Note [FFI lock: PortAudio lifecycle].
 c_rt_graph_stop_audio :: Ptr RTGraph -> IO ()
 c_rt_graph_stop_audio g = withFfiLock (c_rt_graph_stop_audio_raw g)
+
+foreign import ccall safe "rt_graph_stop_audio_fade"
+  c_rt_graph_stop_audio_fade_raw :: Ptr RTGraph -> CInt -> IO ()
+
+-- | Locked wrapper for the graceful stop entry point. The C side
+-- bounds its own wait on the fade window, so this can hold the FFI
+-- lock for roughly @fadeMs@ plus a small scheduling margin — the same
+-- bracket every other audio-lifecycle entry takes.
+c_rt_graph_stop_audio_fade :: Ptr RTGraph -> CInt -> IO ()
+c_rt_graph_stop_audio_fade g fadeMs =
+  withFfiLock (c_rt_graph_stop_audio_fade_raw g fadeMs)
 
 -- | Allocate an empty next-world swap for the target. Low-level ABI:
 -- callers own the returned pointer until cancel or successful publish.
@@ -2589,3 +2602,16 @@ waitAudioStarted g timeoutMs =
 -- calling it on an already stopped graph is harmless.
 stopAudio :: Ptr RTGraph -> IO ()
 stopAudio = c_rt_graph_stop_audio
+
+-- | Stop realtime audio with a brief linear fade-to-zero on the
+-- output stream. Removes the snap that an abrupt callback teardown
+-- produces. The fade is applied at the output-stream boundary;
+-- graph state (voices, smoothers, envelopes, controls) is not
+-- mutated.
+--
+-- @fadeMs@ is clamped on the C side to [0, 5000]. Values <= 0 fall
+-- back to the ordinary 'stopAudio' behavior with no fade. Used by
+-- the host-stack close path; in-window reload stop continues to use
+-- 'stopAudio'.
+stopAudioFade :: Ptr RTGraph -> Int -> IO ()
+stopAudioFade g fadeMs = c_rt_graph_stop_audio_fade g (fromIntegral fadeMs)

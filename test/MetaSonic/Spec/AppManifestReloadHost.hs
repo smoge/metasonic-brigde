@@ -864,6 +864,9 @@ audioFFI events = SessionFanInAudioFFI
   , saffiStopAudio =
       \_rt ->
         appendEvent events AudioStop
+  , saffiStopAudioFade =
+      \_rt _fadeMs ->
+        appendEvent events AudioStop
   }
 
 initialHandle :: TestHandle

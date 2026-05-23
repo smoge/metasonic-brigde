@@ -632,6 +632,7 @@ sessionManifestReloadTests =
             { saffiStartAudio       = \_ _ _ -> pure 0
             , saffiWaitAudioStarted = \_ _ -> pure True
             , saffiStopAudio        = \_ -> pure ()
+            , saffiStopAudioFade    = \_ _ -> pure ()
             }
       result <-
         withSessionFanInHost
@@ -681,6 +682,8 @@ sessionManifestReloadTests =
                   >> pure False
             , saffiStopAudio        = \_ ->
                 assertFailure "stop should not run on start failure"
+            , saffiStopAudioFade    = \_ _ ->
+                assertFailure "fade stop should not run on start failure"
             }
       result <-
         withSessionFanInHost
@@ -705,6 +708,8 @@ sessionManifestReloadTests =
             { saffiStartAudio       = \_ _ _ -> pure 0
             , saffiWaitAudioStarted = \_ _ -> pure False
             , saffiStopAudio        = \_ -> modifyIORef' stopCounter (+ 1)
+            , saffiStopAudioFade    = \_ _ ->
+                assertFailure "fade stop should not run on ready timeout"
             }
       result <-
         withSessionFanInHost
@@ -801,6 +806,8 @@ sessionManifestReloadTests =
             , saffiWaitAudioStarted = \_ _ ->
                 throwIO (ErrorCall "wait boom")
             , saffiStopAudio        = \_ -> modifyIORef' stopCounter (+ 1)
+            , saffiStopAudioFade    = \_ _ ->
+                assertFailure "fade stop should not run on wait failure"
             }
       result <-
         withSessionFanInHost
@@ -834,6 +841,8 @@ sessionManifestReloadTests =
                 assertFailure "wait should not run after start failure"
                   >> pure False
             , saffiStopAudio        = \_ -> modifyIORef' stopCounter (+ 1)
+            , saffiStopAudioFade    = \_ _ ->
+                assertFailure "fade stop should not run after start failure"
             }
       result <-
         withSessionFanInHost
@@ -869,6 +878,8 @@ sessionManifestReloadTests =
                   >> pure False
             , saffiStopAudio        = \_ ->
                 throwIO (ErrorCall "stop boom")
+            , saffiStopAudioFade    = \_ _ ->
+                assertFailure "fade stop should not run via stop FFI"
             }
       result <-
         withSessionFanInHost
@@ -893,6 +904,50 @@ sessionManifestReloadTests =
             ("expected start=Right, stop exception, got: "
              <> show s <> " / " <> show o)
 
+  , testCase "fade stopAudio failure leaves audio-running flag set (fail-closed)" $ do
+      -- Phase 8f symmetry test: the graceful stop helper
+      -- ('stopSessionFanInHostAudioFadeWith') must inherit the same
+      -- fail-closed posture as 'stopSessionFanInHostAudioWith' — if
+      -- 'saffiStopAudioFade' throws, the audio-running flag stays
+      -- True so a later reload rejects with SfriAudioStillRunning
+      -- instead of disposing the owner while the C++ stream might
+      -- still be live.
+      let startOkFFI = mockOkAudioFFI
+          stopFadeBoomFFI = SessionFanInAudioFFI
+            { saffiStartAudio       = \_ _ _ ->
+                assertFailure "start should not run via stop FFI"
+                  >> pure 0
+            , saffiWaitAudioStarted = \_ _ ->
+                assertFailure "wait should not run via stop FFI"
+                  >> pure False
+            , saffiStopAudio        = \_ ->
+                assertFailure "ordinary stop should not run on fade path"
+            , saffiStopAudioFade    = \_ _ ->
+                throwIO (ErrorCall "fade stop boom")
+            }
+      result <-
+        withSessionFanInHost
+          voiceOnlyTemplateGraph
+          defaultSessionFanInOptions
+          $ \host -> do
+              start <- startSessionFanInHostAudioWith startOkFFI host audioOpts
+              outcome <-
+                try
+                  (stopSessionFanInHostAudioFadeWith stopFadeBoomFFI 10 host)
+                  :: IO (Either ErrorCall
+                                (Either SessionFanInAudioIssue ()))
+              snapshot <- readSessionFanInHost host
+              pure (start, outcome, snapshot)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (Right (), Left _, snapshot) ->
+          sfisAudioRunning snapshot @?= True
+        Right (s, o, _) ->
+          assertFailure
+            ("expected start=Right, fade stop exception, got: "
+             <> show s <> " / " <> show o)
+
   , testCase "cleanup stopAudio failure leaves audio-running flag set and reload rejects" $ do
       plan <- planOrFail validDoc validCatalog validRequest
       let ffi = SessionFanInAudioFFI
@@ -901,6 +956,8 @@ sessionManifestReloadTests =
                 throwIO (ErrorCall "wait boom")
             , saffiStopAudio        = \_ ->
                 throwIO (ErrorCall "cleanup stop boom")
+            , saffiStopAudioFade    = \_ _ ->
+                assertFailure "fade stop should not run on reload path"
             }
       result <-
         withSessionFanInHost
@@ -946,6 +1003,7 @@ mockOkAudioFFI = SessionFanInAudioFFI
   { saffiStartAudio       = \_ _ _ -> pure 0
   , saffiWaitAudioStarted = \_ _ -> pure True
   , saffiStopAudio        = \_ -> pure ()
+  , saffiStopAudioFade    = \_ _ -> pure ()
   }
 
 validRequest :: ManifestReloadRequest

@@ -622,6 +622,9 @@ capturingAudioFFI ref = SessionFanInAudioFFI
   , saffiStopAudio =
       \_rt ->
         modifyIORef' ref (<> [AudioStop])
+  , saffiStopAudioFade =
+      \_rt _fadeMs ->
+        modifyIORef' ref (<> [AudioStop])
   }
 
 ------------------------------------------------------------

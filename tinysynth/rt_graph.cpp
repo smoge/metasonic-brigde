@@ -2097,8 +2097,37 @@ struct GraphAudioStream : q::audio_stream {
   void process(out_channels const &out) override;
   bool wait_started(std::chrono::milliseconds timeout) noexcept;
 
+  // Phase 8f: request a linear fade-to-zero over the next
+  // total_frames callback frames. Safe to call from the control
+  // thread; the audio callback observes the request via the
+  // shutdown_fade_active acquire-load and then drains
+  // shutdown_fade_remaining one block at a time. Idempotent on the
+  // already-fading state — repeated calls keep the first total.
+  void request_shutdown_fade(int total_frames) noexcept;
+
   RTGraph &graph;
   std::atomic<bool> started{false};
+
+  // Phase 8f: shutdown-fade state.
+  //
+  //   shutdown_fade_total:     window size in frames, fixed when the
+  //                            request is published; read only after
+  //                            an acquire-load of shutdown_fade_active
+  //                            saw `true`, so a plain int is safe.
+  //   shutdown_fade_active:    set true on request and stays true
+  //                            until the stream is destroyed by
+  //                            stop_audio_stream (g.audio.reset()).
+  //                            There is no live-clear path — the
+  //                            request is one-shot per stream object.
+  //   shutdown_fade_remaining: frames left to fade; decremented by
+  //                            the callback once per block.
+  //   shutdown_fade_done:      flips true when remaining reaches 0,
+  //                            polled by the control-thread stop
+  //                            path with a bounded wait.
+  int shutdown_fade_total = 0;
+  std::atomic<bool> shutdown_fade_active{false};
+  std::atomic<int>  shutdown_fade_remaining{0};
+  std::atomic<bool> shutdown_fade_done{false};
 };
 
 } // namespace
@@ -8581,6 +8610,29 @@ The runtime maps output buses to channels as follows:
     channels, bus 0 is duplicated to every channel
 */
 
+/* Note [Phase 8f shutdown fade]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Pure scalar ramp applied per channel after process_graph and per-bus
+copy. The same `remaining` is used for every channel of a single
+block (computed once), and `remaining` advances exactly once at the
+end of the block. Graph state — voices, smoothers, envelopes,
+controls — is untouched: this is output mute, not graph mutation.
+*/
+static int apply_shutdown_fade_block_impl(
+    float *data, int frames, int remaining, int total) noexcept {
+  if (total <= 0 || remaining <= 0) {
+    std::fill(data, data + frames, 0.0f);
+    return 0;
+  }
+  const float inv_total = 1.0f / static_cast<float>(total);
+  for (int i = 0; i < frames; ++i) {
+    const int r = remaining - i;
+    const float gain = (r > 0) ? static_cast<float>(r) * inv_total : 0.0f;
+    data[i] *= gain;
+  }
+  return std::max(0, remaining - frames);
+}
+
 void GraphAudioStream::process(out_channels const &out) {
   started.store(true, std::memory_order_release);
 
@@ -8608,6 +8660,44 @@ void GraphAudioStream::process(out_channels const &out) {
       );
     }
   }
+
+  if (shutdown_fade_active.load(std::memory_order_acquire)) {
+    const int remaining = shutdown_fade_remaining.load(std::memory_order_relaxed);
+    const int total = shutdown_fade_total;
+    int new_remaining = remaining;
+    // Guard the per-channel deref: an empty channel span or a zero
+    // nframes would make &(*dst.begin()) UB. The helper itself
+    // already handles frames == 0 deterministically, but we must
+    // not form the pointer before we know the range is non-empty.
+    if (nframes > 0) {
+      for (std::size_t ch = 0; ch < out.size(); ++ch) {
+        auto dst = out[ch];
+        if (dst.begin() == dst.end()) {
+          continue;
+        }
+        new_remaining = apply_shutdown_fade_block_impl(
+            &(*dst.begin()), nframes, remaining, total);
+      }
+    }
+    shutdown_fade_remaining.store(new_remaining, std::memory_order_relaxed);
+    if (new_remaining == 0) {
+      shutdown_fade_done.store(true, std::memory_order_release);
+    }
+  }
+}
+
+void GraphAudioStream::request_shutdown_fade(int total_frames) noexcept {
+  if (total_frames <= 0) {
+    shutdown_fade_done.store(true, std::memory_order_release);
+    return;
+  }
+  if (shutdown_fade_active.load(std::memory_order_acquire)) {
+    return;
+  }
+  shutdown_fade_total = total_frames;
+  shutdown_fade_remaining.store(total_frames, std::memory_order_relaxed);
+  shutdown_fade_done.store(false, std::memory_order_relaxed);
+  shutdown_fade_active.store(true, std::memory_order_release);
 }
 
 /* Note [Callback readiness signaling]
@@ -11338,6 +11428,78 @@ void rt_graph_stop_audio(RTGraph *g) {
   }
 
   stop_audio_stream(*g);
+}
+
+// Phase 8f: stop realtime audio with a brief linear output fade.
+// See Note [Phase 8f shutdown fade]. The control thread requests the
+// fade, polls for the audio callback to consume the requested window
+// (bounded by fade_ms + a couple of block-callback durations + a small
+// scheduling margin), and then falls through to the same join-the-
+// audio-thread stop path rt_graph_stop_audio uses.
+void rt_graph_stop_audio_fade(RTGraph *g, int fade_ms) {
+  if (!g) {
+    return;
+  }
+  if (!g->audio) {
+    return;
+  }
+  if (fade_ms <= 0) {
+    stop_audio_stream(*g);
+    return;
+  }
+  if (fade_ms > 5000) {
+    fade_ms = 5000;
+  }
+
+  const double sps = g->audio->sampling_rate();
+  if (!(sps > 0.0)) {
+    // No usable sample rate — fall back to ordinary stop rather than
+    // computing a bogus fade window.
+    stop_audio_stream(*g);
+    return;
+  }
+
+  const int total_frames =
+      static_cast<int>((static_cast<long long>(fade_ms) *
+                        static_cast<long long>(sps)) / 1000);
+  if (total_frames <= 0) {
+    stop_audio_stream(*g);
+    return;
+  }
+
+  g->audio->request_shutdown_fade(total_frames);
+
+  // Bound the wait so a stalled callback cannot hang shutdown:
+  //   fade_ms + two output-block periods + a small scheduling margin.
+  // Round the block-period estimate UP so a fractional period still
+  // gives the callback room to consume one full block.
+  const long long sps_ll = static_cast<long long>(sps);
+  const long long block_ms_ll =
+      sps_ll > 0
+        ? (static_cast<long long>(g->max_frames) * 1000 + sps_ll - 1) / sps_ll
+        : 0;
+  const int block_ms = std::max(1, static_cast<int>(block_ms_ll));
+  const int wait_ms = fade_ms + 2 * block_ms + 20;
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+  while (!g->audio->shutdown_fade_done.load(std::memory_order_acquire)) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  stop_audio_stream(*g);
+}
+
+// Phase 8f test surface: pure ramp helper. See header.
+int rt_graph_test_apply_shutdown_fade_block(
+    float *data, int frames, int remaining, int total) {
+  if (!data || frames < 0) {
+    return 0;
+  }
+  return apply_shutdown_fade_block_impl(data, frames, remaining, total);
 }
 
 // ----------------------------------------------------------------

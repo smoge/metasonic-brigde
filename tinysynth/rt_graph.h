@@ -788,6 +788,37 @@ int rt_graph_wait_started(RTGraph *g, int timeout_ms);
 // audio thread before returning.
 void rt_graph_stop_audio(RTGraph *g);
 
+// [T:audio-life] Phase 8f: stop realtime audio with a brief linear
+// fade-to-zero applied at the output-stream boundary, then stop.
+// Removes the click that an abrupt callback teardown produces at the
+// end of a live session. fade_ms is clamped to [0, 5000]; values
+// <= 0 fall back to rt_graph_stop_audio behavior with no fade.
+//
+// The fade is applied to the per-channel output AFTER process_graph
+// has produced the block, so graph state — voices, smoothers,
+// envelopes, controls — is never mutated by the fade. Once the
+// requested fade window has been consumed (or the bounded wait
+// expires), the same stop_audio_stream path that rt_graph_stop_audio
+// uses runs to join the audio thread.
+//
+// Used by the host-stack close path (every supervised production
+// route's close slot). In-window reload stop continues to use
+// rt_graph_stop_audio so reload sequencing is unaffected by the fade.
+void rt_graph_stop_audio_fade(RTGraph *g, int fade_ms);
+
+// [T:test-only] Phase 8f: apply one block of the linear shutdown-fade
+// ramp to an in-place float buffer. Returns the new remaining frame
+// count for the next block (>= 0). Pure scalar math; no graph state
+// is read or written. Pinned by C++ tests to lock the ramp curve and
+// end-of-fade behavior without exercising the audio callback.
+//
+//   gain(i) = max(0, (remaining - i) / total) for i in [0, frames)
+//
+// total <= 0 or remaining <= 0 fills `data` with zeros and returns 0.
+// `frames` may exceed remaining; samples past remaining become zero.
+int rt_graph_test_apply_shutdown_fade_block(
+    float *data, int frames, int remaining, int total);
+
 // [T:construction] Phase §6.C.3a: allocate a mono float32 buffer of
 // `frames` samples. Returns the assigned 0-based buffer ID on
 // success, or -1 if the pool is full (>= 64 allocated). The

@@ -732,6 +732,39 @@ realProductionHelperTests =
                     <> show ex)
           closeCount <- readIORef ingressCloseCalls
           closeCount @?= 1
+
+  , testCase
+      "realClose routes audio stop through the graceful fade entry"
+      $ do
+      -- Phase 8f routing: realClose must call saffiStopAudioFade
+      -- exactly once and never call the ordinary saffiStopAudio.
+      -- realClose is the host-stack close path (every supervised
+      -- production route's close slot, plus terminal reload-recovery
+      -- via hsfCloseStack); the in-window reload stop entries
+      -- (hsaroStopOldAudio / hsaroStopNewAudio) stay on the ordinary
+      -- stop path.
+      stopEvents <- newIORef ([] :: [AudioStopEvent])
+      ingressCloseCalls <- newIORef (0 :: Int)
+      let recordingFFI = recordingAudioFFI stopEvents
+          inputs = mkProductionInputs
+            (fakeIngressOpsOpenOk ingressCloseCalls)
+            recordingFFI
+          ops = realStoppedAudioHostStackOps inputs
+      openResult <- sahsoOpen ops (mkPlan "demo-key")
+      case openResult of
+        Left issue ->
+          assertFailure ("expected Right open, got Left: " <> show issue)
+        Right stack -> do
+          sahsoClose ops stack
+          events <- readIORef stopEvents
+          case events of
+            [AudioStopFade fadeMs] ->
+              assertBool
+                ("expected positive fade duration, got: " <> show fadeMs)
+                (fadeMs > 0)
+            _ ->
+              assertFailure
+                ("expected exactly one StopFade event, got: " <> show events)
   ]
   where
     subStr needle haystack =
@@ -828,6 +861,7 @@ fakeAudioFFIStartOk = SessionFanInAudioFFI
   { saffiStartAudio       = \_rt _sr _bs -> pure 0
   , saffiWaitAudioStarted = \_rt _to     -> pure True
   , saffiStopAudio        = \_rt         -> pure ()
+  , saffiStopAudioFade    = \_rt _ms     -> pure ()
   }
 
 
@@ -839,6 +873,30 @@ fakeAudioFFIStartFails = SessionFanInAudioFFI
   { saffiStartAudio       = \_rt _sr _bs -> pure (-1)
   , saffiWaitAudioStarted = \_rt _to     -> pure True
   , saffiStopAudio        = \_rt         -> pure ()
+  , saffiStopAudioFade    = \_rt _ms     -> pure ()
+  }
+
+
+-- | Captured audio-stop event used by the Phase 8f routing test
+-- to distinguish ordinary stop vs graceful fade stop.
+data AudioStopEvent
+  = AudioStopOrdinary
+  | AudioStopFade !Int
+  deriving (Eq, Show)
+
+
+-- | Fake audio FFI that records every stop call into the supplied
+-- IORef. Used by the Phase 8f realClose routing test to assert that
+-- realClose hits 'saffiStopAudioFade' (with a positive duration) and
+-- never the ordinary 'saffiStopAudio'.
+recordingAudioFFI :: IORef [AudioStopEvent] -> SessionFanInAudioFFI
+recordingAudioFFI events = SessionFanInAudioFFI
+  { saffiStartAudio       = \_rt _sr _bs -> pure 0
+  , saffiWaitAudioStarted = \_rt _to     -> pure True
+  , saffiStopAudio        = \_rt         ->
+      modifyIORef' events (<> [AudioStopOrdinary])
+  , saffiStopAudioFade    = \_rt ms      ->
+      modifyIORef' events (<> [AudioStopFade ms])
   }
 
 
@@ -851,6 +909,8 @@ fakeAudioFFIStopThrows = SessionFanInAudioFFI
   { saffiStartAudio       = \_rt _sr _bs -> pure 0
   , saffiWaitAudioStarted = \_rt _to     -> pure True
   , saffiStopAudio        = \_rt         ->
+      throwIO (ErrorCall "synthetic audio stop crash")
+  , saffiStopAudioFade    = \_rt _ms     ->
       throwIO (ErrorCall "synthetic audio stop crash")
   }
 
