@@ -250,6 +250,10 @@ renderLiveSessionOutcomeTests =
       renderLiveSessionOutcome LsoCommitted
         @?= "committed (new plan installed)"
 
+  , testCase "CommittedSameDemo distinguishes a same-demo reload from a new-plan install" $
+      renderLiveSessionOutcome LsoCommittedSameDemo
+        @?= "committed (same demo reloaded)"
+
   , testCase "RequestRejected names the live-fallback semantics" $
       renderLiveSessionOutcome LsoRequestRejected
         @?= "request-rejected (stack still on previous plan)"
@@ -722,6 +726,53 @@ runReloadWithTests =
         -- the pre-existing events list must NOT remain in the ref
         assertBool
           "event reset: pre-existing events should be cleared before sopsInWindowReload runs"
+          (events /= prior)
+
+  , testCase "Committed same-demo (planLabel fallback == requested) → LsoCommittedSameDemo, supervisor still runs, currentPlan written, hook still fires with requested plan" $ do
+      -- Phase 8k operator-polish: a same-demo reload still goes
+      -- through the full supervised path (in-window reload event,
+      -- value-cache retention, post-reload hook); only the
+      -- operator-facing outcome wording is refined so the status
+      -- line stops saying "new plan installed" when nothing about
+      -- the demo identity changed.
+      withSessionRefs 1 $ \prior currentPlanRef lastOutcomeRef eventsRef -> do
+        hookCallsRef <- newIORef ([] :: [StubPlan])
+        let recordingHook livePlan =
+              modifyIORef' hookCallsRef (<> [livePlan])
+            -- Initial plan is 1; resolver maps "same" → 1 too, so
+            -- 'planLabel' (show, here) is identical for fallback
+            -- and requested → triggers the same-demo refinement.
+            resolver = stubResolver "same" 1
+            supOps   =
+              fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 13
+        step <- runReloadWith
+                  resolver
+                  show
+                  show
+                  recordingHook
+                  supOps
+                  currentPlanRef
+                  lastOutcomeRef
+                  eventsRef
+                  "same"
+        step @?= SsContinue
+        -- currentPlanRef is still written through (idempotent for
+        -- same-demo, but load-bearing if the doc was edited
+        -- between reloads — the new plan structure must replace
+        -- the old one even when the demo key is unchanged).
+        plan <- readIORef currentPlanRef
+        plan @?= 1
+        readIORef lastOutcomeRef >>= (@?= Just LsoCommittedSameDemo)
+        -- Post-reload hook fires with the requested plan, exactly
+        -- as it does for cross-demo Committed.
+        readIORef hookCallsRef >>= (@?= [1])
+        -- supOps' in-window reload was actually invoked: the
+        -- synthetic event tagged 13 is present and the pre-existing
+        -- events list was cleared.
+        events <- readIORef eventsRef
+        events @?= [syntheticEvent 13]
+        assertBool
+          "event reset: pre-existing events should be cleared before sopsInWindowReload runs (same-demo)"
           (events /= prior)
 
   , testCase "RequestRejected → LsoRequestRejected, SsContinue, currentPlan unchanged" $ do

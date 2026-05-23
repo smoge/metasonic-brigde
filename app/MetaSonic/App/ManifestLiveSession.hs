@@ -357,8 +357,16 @@ renderLiveSessionDemoList current keys =
 -- four 'SupervisedReloadOutcome' variants). This matters because
 -- the session must terminate on supervisor escalation but only
 -- reject the command (continue serving) on a planning failure.
+--
+-- 'LsoCommitted' and 'LsoCommittedSameDemo' both correspond to
+-- 'SupervisedReloadCommitted'; 'runReloadWithSink' refines the
+-- former to the latter when the fallback and requested plan
+-- labels are equal (operator re-typed the demo key currently
+-- serving). The supervised reload still ran in full — only the
+-- operator-facing wording differs.
 data LiveSessionOutcome
   = LsoCommitted
+  | LsoCommittedSameDemo
   | LsoRequestRejected
   | LsoRejectedRecovered
   | LsoEscalated
@@ -370,6 +378,8 @@ renderLiveSessionOutcome :: LiveSessionOutcome -> String
 renderLiveSessionOutcome = \case
   LsoCommitted ->
     "committed (new plan installed)"
+  LsoCommittedSameDemo ->
+    "committed (same demo reloaded)"
   LsoRequestRejected ->
     "request-rejected (stack still on previous plan)"
   LsoRejectedRecovered ->
@@ -1090,7 +1100,17 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
       events <- readIORef reloadEventsRef
       supervisorEvents <- readIORef supervisorEventsRef
       output ""
-      let (lso, step) = stepFromOutcome out
+      let (lsoBase, step) = stepFromOutcome out
+          -- Same-demo refinement: the supervisor still ran the full
+          -- in-window reload (preserving the route, reload events,
+          -- and value-cache retention behavior); only the operator-
+          -- facing wording changes when the reload target equals the
+          -- plan already serving.
+          lso = case lsoBase of
+            LsoCommitted
+              | planLabel fallbackPlan == planLabel requestedPlan ->
+                  LsoCommittedSameDemo
+            _ -> lsoBase
       output $
         "  supervised outcome: " <> renderLiveSessionOutcome lso
       output "  reload events:"
@@ -1099,7 +1119,7 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
       mapM_ (output . ("    - " <>))
             (renderLiveSessionSupervisorEvents supervisorEvents)
       writeIORef lastOutcomeRef (Just lso)
-      when (lso == LsoCommitted) $
+      when (lso == LsoCommitted || lso == LsoCommittedSameDemo) $
         writeIORef currentPlanRef requestedPlan
       case out of
         SupervisedReloadCommitted ->
