@@ -1,0 +1,10 @@
+cradle:
+  stack:
+    - path: "./src"
+      component: "metasonic-bridge:lib"
+
+    - path: "./app"
+      component: "metasonic-bridge:exe:metasonic-bridge"
+
+    - path: "./test"
+      component: "metasonic-bridge:test:metasonic-bridge-test"

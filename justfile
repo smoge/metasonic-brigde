@@ -298,6 +298,10 @@ cpp-bench-build: cpp-bench-configure
 cpp-bench: cpp-bench-build
     ./{{cpp_bench_dir}}/rt_graph_bench
 
+
+lsp: cpp-lsp
+    stack ide targets >/dev/null
+
 build: stack-build cpp-build
 
 push:
