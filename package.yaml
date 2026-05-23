@@ -44,6 +44,8 @@ dependencies:
   - microlens
   - microlens-th
   - microlens-mtl
+  # Phase 8j live-session line editor (GHC boot library):
+  - haskeline
 
 ghc-options:
   - -Wall
@@ -253,6 +255,7 @@ tests:
       - MetaSonic.Spec.AppManifestLiveCommonOSCRender
       - MetaSonic.Spec.AppManifestLiveReloadDemoRender
       - MetaSonic.Spec.AppManifestLiveSession
+      - MetaSonic.Spec.AppManifestLiveSessionOutputSink
       - MetaSonic.Spec.AppManifestLiveValueCache
       - MetaSonic.Spec.AppManifestMIDIIngressOps
       - MetaSonic.Spec.AppManifestMIDIListener

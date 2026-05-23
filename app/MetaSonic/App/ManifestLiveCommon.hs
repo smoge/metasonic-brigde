@@ -40,6 +40,8 @@ module MetaSonic.App.ManifestLiveCommon
     liveOSCListenerHooks
   , liveOSCListenerHooksFor
   , liveOSCListenerHooksForObserved
+  , liveOSCListenerHooksForObservedWith
+  , liveOSCListenerHooksWithControlsAndObserverAndOutput
   , liveIngressTargetPolicy
   , liveReloadProducer
   , liveAudioOptions
@@ -68,16 +70,29 @@ module MetaSonic.App.ManifestLiveCommon
   , warnIfMissingVoices
 
     -- * Status printing
+    --
+    -- The plain entries route every operator-facing line through
+    -- 'putStrLn'. The Phase 8j @With@ variants let callers (the
+    -- live session under Haskeline) pass an output sink so the
+    -- same prints can be routed through Haskeline's
+    -- 'getExternalPrint' action without corrupting the operator's
+    -- current edit buffer.
   , printServiceSnapshot
+  , printServiceSnapshotWith
   , printIngressSnapshot
+  , printIngressSnapshotWith
   , printAddressableSurface
+  , printAddressableSurfaceWith
   , renderIngressSnapshot
+  , autoStartTemplatesWith
+  , warnIfMissingVoicesWith
 
     -- * Reload-event timeline
   , renderLiveReloadEvents
 
     -- * OSC control-surface rendering
   , renderOSCControls
+  , renderOSCControlsWith
   , renderOSCControlsLine
 
     -- * OSC listener-event line renderers (pure, testable)
@@ -299,14 +314,27 @@ autoStartTemplates
   -> SessionFanInService
   -> MR.ManifestReloadPlan
   -> IO [VoiceKey]
-autoStartTemplates label service plan = do
+autoStartTemplates =
+  autoStartTemplatesWith putStrLn
+
+
+-- | Phase 8j: sink-taking variant. The live session passes Haskeline's
+-- 'getExternalPrint'-returned action so operator output does not
+-- corrupt an in-progress edit buffer.
+autoStartTemplatesWith
+  :: (String -> IO ())
+  -> String
+  -> SessionFanInService
+  -> MR.ManifestReloadPlan
+  -> IO [VoiceKey]
+autoStartTemplatesWith output label service plan = do
   let templates = tgTemplates (MR.mrlpTemplateGraph plan)
   case templates of
     [] -> do
-      putStrLn $ "  " <> label <> ": no templates to auto-start."
+      output $ "  " <> label <> ": no templates to auto-start."
       pure []
     _ -> do
-      putStrLn $
+      output $
         "  " <> label <> ": auto-starting one instance per template..."
       forM (assignAutoVoiceKeys templates) $ \(tpl, voice) -> do
         let name = tplName tpl
@@ -315,7 +343,7 @@ autoStartTemplates label service plan = do
                  liveReloadProducer
                  cmd
                  service
-        putStrLn $
+        output $
           "    " <> name <> " -> " <> renderEnqueue enq
         pure voice
 
@@ -345,14 +373,23 @@ waitForVoices want service =
 -- caller-tracked truth (from 'autoStartTemplates'), not 'ssVoices' —
 -- so the warning names exactly which keys didn't show up.
 warnIfMissingVoices :: SessionFanInService -> [VoiceKey] -> IO ()
-warnIfMissingVoices _       []   = pure ()
-warnIfMissingVoices service want = do
+warnIfMissingVoices = warnIfMissingVoicesWith putStrLn
+
+
+-- | Phase 8j sink-taking variant. See 'autoStartTemplatesWith'.
+warnIfMissingVoicesWith
+  :: (String -> IO ())
+  -> SessionFanInService
+  -> [VoiceKey]
+  -> IO ()
+warnIfMissingVoicesWith _      _       []   = pure ()
+warnIfMissingVoicesWith output service want = do
   ready <- waitForVoices want service
   unless ready $ do
     snapshot <- readSessionFanInService service
     let have    = M.keysSet (ssVoices (sfisOwnerState snapshot))
         missing = [ k | k <- want, not (S.member k have) ]
-    putStrLn $
+    output $
       "    warning: auto-started voices did not all arrive in time; missing="
       <> show (map unVoiceKey missing)
 
@@ -361,16 +398,22 @@ warnIfMissingVoices service want = do
 -- (audio running, queue depth, owner / reload status, active voice
 -- count). Operators read this to confirm the host is alive.
 printServiceSnapshot :: String -> SessionFanInService -> IO ()
-printServiceSnapshot label service = do
+printServiceSnapshot = printServiceSnapshotWith putStrLn
+
+
+-- | Phase 8j sink-taking variant. See 'autoStartTemplatesWith'.
+printServiceSnapshotWith
+  :: (String -> IO ()) -> String -> SessionFanInService -> IO ()
+printServiceSnapshotWith output label service = do
   snapshot <- readSessionFanInService service
-  putStrLn $ "  " <> label <> ":"
-  putStrLn $ "    audio running: "
-          <> if sfisAudioRunning snapshot then "yes" else "no"
-  putStrLn $ "    queue depth: " <> show (sfisQueueDepth snapshot)
-  putStrLn $ "    owner status: " <> show (sfisOwnerStatus snapshot)
-  putStrLn $ "    reload status: " <> show (sfisReloadStatus snapshot)
-  putStrLn $ "    active voices: "
-          <> show (M.size (ssVoices (sfisOwnerState snapshot)))
+  output $ "  " <> label <> ":"
+  output $ "    audio running: "
+        <> if sfisAudioRunning snapshot then "yes" else "no"
+  output $ "    queue depth: " <> show (sfisQueueDepth snapshot)
+  output $ "    owner status: " <> show (sfisOwnerStatus snapshot)
+  output $ "    reload status: " <> show (sfisReloadStatus snapshot)
+  output $ "    active voices: "
+        <> show (M.size (ssVoices (sfisOwnerState snapshot)))
 
 
 -- | Print a one-line 'ingress: ...' summary of the
@@ -381,9 +424,20 @@ printIngressSnapshot
        ManifestOSCIngressOpsIssue
        ManifestOSCIngressHandle
   -> IO ()
-printIngressSnapshot manager = do
+printIngressSnapshot = printIngressSnapshotWith putStrLn
+
+
+-- | Phase 8j sink-taking variant. See 'autoStartTemplatesWith'.
+printIngressSnapshotWith
+  :: (String -> IO ())
+  -> ManifestReloadIngressManager
+       ManifestReloadIngressTarget
+       ManifestOSCIngressOpsIssue
+       ManifestOSCIngressHandle
+  -> IO ()
+printIngressSnapshotWith output manager = do
   snapshot <- readManifestReloadIngressManager manager
-  putStrLn $ "  ingress: " <> renderIngressSnapshot snapshot
+  output $ "  ingress: " <> renderIngressSnapshot snapshot
 
 
 -- | Mirrors @renderSmokeIngressSnapshot@ in
@@ -423,13 +477,19 @@ renderIngressSnapshot snapshot =
 -- pure helper 'renderOSCControlsLine' so the format can be pinned
 -- without staging IO.
 renderOSCControls :: String -> ManifestReloadIngressTarget -> IO ()
-renderOSCControls label target = do
-  putStrLn $ "  " <> label <> ":"
+renderOSCControls = renderOSCControlsWith putStrLn
+
+
+-- | Phase 8j sink-taking variant. See 'autoStartTemplatesWith'.
+renderOSCControlsWith
+  :: (String -> IO ()) -> String -> ManifestReloadIngressTarget -> IO ()
+renderOSCControlsWith output label target = do
+  output $ "  " <> label <> ":"
   case motControls (mitOSC target) of
     [] ->
-      putStrLn "    (no OSC controls)"
+      output "    (no OSC controls)"
     controls ->
-      forM_ controls (putStrLn . ("    " <>) . renderOSCControlsLine)
+      forM_ controls (output . ("    " <>) . renderOSCControlsLine)
 
 
 -- | Render one pattern-level OSC control-surface line. Uses the
@@ -470,22 +530,31 @@ printAddressableSurface
   :: SessionFanInService
   -> ManifestReloadIngressTarget
   -> IO ()
-printAddressableSurface service target = do
+printAddressableSurface = printAddressableSurfaceWith putStrLn
+
+
+-- | Phase 8j sink-taking variant. See 'autoStartTemplatesWith'.
+printAddressableSurfaceWith
+  :: (String -> IO ())
+  -> SessionFanInService
+  -> ManifestReloadIngressTarget
+  -> IO ()
+printAddressableSurfaceWith output service target = do
   snapshot <- readSessionFanInService service
   let voices = M.keys (ssVoices (sfisOwnerState snapshot))
       bindings = motControls (mitOSC target)
   case (voices, bindings) of
     ([], _) ->
-      putStrLn
+      output
         "  addressable OSC surface: (no live voices; manifest writes are accepted but have no audible target)"
     (_, []) ->
-      putStrLn
+      output
         "  addressable OSC surface: (manifest binds no OSC controls)"
     _ -> do
-      putStrLn "  addressable OSC surface:"
+      output "  addressable OSC surface:"
       forM_ voices $ \voice ->
         forM_ bindings $ \binding ->
-          putStrLn ("    " <> renderAddressableOSCLine voice binding)
+          output ("    " <> renderAddressableOSCLine voice binding)
 
 
 renderConcreteOSCAddress :: VoiceKey -> ControlTag -> String
@@ -605,31 +674,57 @@ liveOSCListenerHooksForObserved
   -> (VoiceKey -> ControlTag -> Value -> IO ())
   -> ManifestOSCListenerHooks
 liveOSCListenerHooksForObserved target observe =
-  liveOSCListenerHooksWithControlsAndObserver
+  liveOSCListenerHooksForObservedWith target observe putStrLn
+
+
+-- | Phase 8j variant of 'liveOSCListenerHooksForObserved' that routes
+-- every operator-facing output line through the supplied sink instead
+-- of @putStrLn@. The live session uses this to feed Haskeline's
+-- 'getExternalPrint'-returned action so async OSC output prints
+-- without corrupting the operator's current edit buffer. The accept
+-- and issue line shape is unchanged; only the sink differs.
+--
+-- The default 'liveOSCListenerHooksForObserved' above is preserved
+-- (using 'putStrLn') so other callers that do not own a Haskeline
+-- session keep working.
+liveOSCListenerHooksForObservedWith
+  :: ManifestReloadIngressTarget
+  -> (VoiceKey -> ControlTag -> Value -> IO ())
+  -> (String -> IO ())
+  -> ManifestOSCListenerHooks
+liveOSCListenerHooksForObservedWith target observe output =
+  liveOSCListenerHooksWithControlsAndObserverAndOutput
     (motControls (mitOSC target))
     observe
+    output
 
 
 liveOSCListenerHooksWithControls
   :: [ManifestOSCControlBinding]
   -> ManifestOSCListenerHooks
 liveOSCListenerHooksWithControls controls =
-  liveOSCListenerHooksWithControlsAndObserver controls (\_ _ _ -> pure ())
+  liveOSCListenerHooksWithControlsAndObserverAndOutput
+    controls (\_ _ _ -> pure ()) putStrLn
 
 
-liveOSCListenerHooksWithControlsAndObserver
+-- | Core variant: every operator-facing line goes through @output@.
+-- The accept-line printer routes accepted-write events into the
+-- observer in addition to printing; rejected events take the
+-- @molhOnIssue@ arm with the same @output@ sink.
+liveOSCListenerHooksWithControlsAndObserverAndOutput
   :: [ManifestOSCControlBinding]
   -> (VoiceKey -> ControlTag -> Value -> IO ())
+  -> (String -> IO ())
   -> ManifestOSCListenerHooks
-liveOSCListenerHooksWithControlsAndObserver controls observe =
+liveOSCListenerHooksWithControlsAndObserverAndOutput controls observe output =
   defaultManifestOSCListenerHooks
     { molhOnAccepted = \result -> do
-        mapM_ (putStrLn . ("  " <>)) (renderOSCAcceptLineWithControls controls result)
+        mapM_ (output . ("  " <>)) (renderOSCAcceptLineWithControls controls result)
         case acceptedControlWrite result of
           Just (voice, tag, value) -> observe voice tag value
           Nothing                  -> pure ()
     , molhOnIssue =
-        \issue -> putStrLn ("  " <> renderOSCIssueLine issue)
+        \issue -> output ("  " <> renderOSCIssueLine issue)
     }
 
 

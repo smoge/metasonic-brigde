@@ -94,10 +94,13 @@ module MetaSonic.App.ManifestLiveSession
   , ReloadResolver (..)
   , catalogPlanResolver
   , runReloadWith
+  , runReloadWithSink
   ) where
 
 import           Control.Exception              (finally, mask)
 import           Control.Monad                  (when)
+import           Control.Monad.IO.Class         (liftIO)
+import qualified System.Console.Haskeline       as Haskeline
 import           Data.Char                      (isSpace)
 import           Data.IORef                     (IORef, modifyIORef',
                                                  newIORef, readIORef,
@@ -110,26 +113,27 @@ import           System.Exit                    (ExitCode (..), die,
                                                  exitWith)
 import           System.IO                      (BufferMode (..), hFlush,
                                                  hPutStrLn, hSetBuffering,
-                                                 isEOF, stderr, stdout)
+                                                 stderr, stdout)
 
 import           MetaSonic.App.Demos            (Demo (..), demoTable,
                                                  demoManifestReloadCatalog)
 import           MetaSonic.App.ManifestLiveCommon
-                                                (autoStartTemplates,
+                                                (autoStartTemplatesWith,
                                                  liveAudioOptions,
                                                  liveIngressTargetPolicy,
-                                                 liveOSCListenerHooksForObserved,
+                                                 liveOSCListenerHooksForObservedWith,
                                                  liveReloadProducer,
                                                  planOrDie,
-                                                 printAddressableSurface,
-                                                 printIngressSnapshot,
-                                                 printServiceSnapshot,
+                                                 printAddressableSurfaceWith,
+                                                 printIngressSnapshotWith,
+                                                 printServiceSnapshotWith,
                                                  readManifestDocOrDie,
                                                  renderIngressSnapshot,
                                                  renderLiveReloadEvents,
                                                  renderOSCControls,
+                                                 renderOSCControlsWith,
                                                  targetOrDie,
-                                                 warnIfMissingVoices)
+                                                 warnIfMissingVoicesWith)
 import           MetaSonic.App.ManifestLiveValueCache
                                                 (LiveValueCache,
                                                  emptyLiveValueCache,
@@ -204,9 +208,10 @@ import           MetaSonic.Session.State        (SessionState (..))
 -- The parser is intentionally tiny: it recognizes a handful of
 -- named commands plus two reload shapes (@demo:KEY@ and
 -- @demo KEY@), and treats everything else as 'LscUnknown'.
--- 'LscQuit' is parsed (as @quit@
--- or @exit@) AND synthesized by the read loop on 'isEOF', so a
--- @<Ctrl-D>@ press and a typed @quit@ produce the same outcome.
+-- 'LscQuit' is parsed (as @quit@ or @exit@), and the read loop
+-- treats Haskeline's @getInputLine@ returning @Nothing@ (EOF /
+-- @<Ctrl-D>@) the same way it treats @LscQuit@, so a @<Ctrl-D>@
+-- press and a typed @quit@ produce the same outcome.
 --
 -- Whitespace policy: leading and trailing whitespace is trimmed
 -- before pattern-matching. An empty or whitespace-only line is
@@ -636,6 +641,28 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
   lastOutcomeRef  <- newIORef Nothing
   valueCacheRef   <- newIORef emptyLiveValueCache
 
+  -- Phase 8j: indirect operator-output sink.
+  --
+  -- The listener hook closure (in 'rrhsiBuildIngressOps' below)
+  -- captures whichever output function is in scope at construction
+  -- time, but the Haskeline 'getExternalPrint' action only exists
+  -- inside 'runInputT' — and 'runInputT' has to wrap 'sessionLoop'
+  -- itself (where 'getInputLine' lives). To bridge those two scopes
+  -- without lifting 'withHostStackSupervisorAdapter' over 'InputT',
+  -- the listener hook reads the sink from an IORef and 'runSupervised'
+  -- swaps it from 'putStrLn' to Haskeline's 'extPrint' for the
+  -- duration of the line-editor session.
+  --
+  -- Before / after the InputT bracket the sink is plain 'putStrLn',
+  -- which is correct: no operator edit buffer exists at those moments.
+  -- Inside the bracket the sink is Haskeline-aware and async output
+  -- redraws the prompt instead of corrupting the typed-but-unsubmitted
+  -- text. See @notes/2026-05-22-h-live-session-tty-line-discipline-design.md@.
+  extPrintRef <- newIORef putStrLn
+  let extPrintDyn s = do
+        f <- readIORef extPrintRef
+        f s
+
   -- Phase 8h: producer-neutral accepted-write observer for the
   -- live-session value cache. Wired through the OSC accepted hook
   -- here; identical updater shape would receive MIDI/UI accepted
@@ -646,7 +673,9 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
   let inputs = RealReloadHostStackInputs
         { rrhsiBuildIngressOps     = \host ->
             manifestOSCIngressOpsWithTargetHooks
-              (\target -> liveOSCListenerHooksForObserved target recordAccepted)
+              (\target ->
+                 liveOSCListenerHooksForObservedWith
+                   target recordAccepted extPrintDyn)
               defaultOSCProducerOptions
               host
               listenerCfg
@@ -682,6 +711,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
         lastOutcomeRef
         reloadEventsRef
         valueCacheRef
+        extPrintRef
+        extPrintDyn
 
     TryPreservingThenStoppedAudio -> do
       let factory = withTrackedFactory
@@ -698,6 +729,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
         lastOutcomeRef
         reloadEventsRef
         valueCacheRef
+        extPrintRef
+        extPrintDyn
 
     RequirePreserving -> do
       let factory = withTrackedFactory
@@ -714,6 +747,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
         lastOutcomeRef
         reloadEventsRef
         valueCacheRef
+        extPrintRef
+        extPrintDyn
   where
     renderRoute s =
       "supervised (" <> renderManifestReloadHostStrategy s
@@ -735,11 +770,13 @@ runSupervised
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
   -> IORef LiveValueCache
+  -> IORef (String -> IO ())
+  -> (String -> IO ())
   -> IO ()
 runSupervised
     causeLabel factory doc catalog initialPlan initialTarget
     trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef
-    valueCacheRef = do
+    valueCacheRef extPrintRef extPrintDyn = do
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory initialPlan)
     case openResult of
@@ -752,27 +789,66 @@ runSupervised
           withHostStackSupervisorAdapter factory initialStack $
             \supOps -> restore $ do
               initialVoices <-
-                autoStartTemplates "initial" initialService initialPlan
-              warnIfMissingVoices initialService initialVoices
-              printServiceSnapshot "initial fan-in" initialService
-              printIngressSnapshot initialIngress
-              printAddressableSurface initialService initialTarget
-              putStrLn ""
+                autoStartTemplatesWith extPrintDyn "initial" initialService initialPlan
+              warnIfMissingVoicesWith extPrintDyn initialService initialVoices
+              printServiceSnapshotWith extPrintDyn "initial fan-in" initialService
+              printIngressSnapshotWith extPrintDyn initialIngress
+              printAddressableSurfaceWith extPrintDyn initialService initialTarget
+              extPrintDyn ""
               hFlush stdout
-              sessionLoop
-                causeLabel
-                supOps
-                doc catalog
-                trackedStackRef
-                currentPlanRef
-                lastOutcomeRef
-                reloadEventsRef
-                valueCacheRef
+              -- Phase 8j: open Haskeline for the operator command
+              -- loop. The IORef swap means every operator-facing
+              -- sink (including the OSC listener's accept-line
+              -- printer) routes through Haskeline's 'extPrint'
+              -- while this bracket is open, so async output cannot
+              -- corrupt the operator's in-progress edit buffer.
+              --
+              -- The 'finally' restore is load-bearing: 'sessionLoop'
+              -- calls 'exitWith' on quit, which throws past
+              -- 'runInputT'\'s return point. Without 'finally', the
+              -- IORef would still point at Haskeline's 'extPrint'
+              -- during teardown / finalizers — any OSC packet that
+              -- lands in that tail window would print through a
+              -- torn-down terminal. The 'finally' guarantees the
+              -- sink is back to 'putStrLn' before the supervisor's
+              -- 'closeOps' (and any post-loop listener output) runs.
+              let settings =
+                    Haskeline.defaultSettings
+                      { Haskeline.historyFile = Nothing }
+              Haskeline.runInputT settings (do
+                rawExtPrint <- Haskeline.getExternalPrint
+                -- Haskeline's 'getExternalPrint'-returned action does
+                -- NOT append a newline (verified empirically: it
+                -- renders as "hello" then redraws the prompt on the
+                -- same line). Every '*With' sink in this slice passes
+                -- logical lines without '\n', matching 'putStrLn'\'s
+                -- contract — so we wrap once here and propagate the
+                -- newline-appending shape to both the IORef-backed
+                -- listener path and the in-loop dispatch path.
+                let extPrint s = rawExtPrint (s <> "\n")
+                liftIO (writeIORef extPrintRef extPrint)
+                sessionLoop
+                  causeLabel
+                  supOps
+                  doc catalog
+                  trackedStackRef
+                  currentPlanRef
+                  lastOutcomeRef
+                  reloadEventsRef
+                  valueCacheRef
+                  extPrint)
+                `finally` writeIORef extPrintRef putStrLn
         pure ()
 
 
 -- | Read-parse-dispatch loop. Returns when the user hits EOF or a
 -- reload outcome maps to 'SsTerminate'.
+--
+-- Phase 8j: input is read via Haskeline's 'getInputLine' inside an
+-- already-open 'runInputT' bracket (opened by 'runManifestLiveSession').
+-- The @extPrint@ action passed in is the 'getExternalPrint'-returned
+-- IO function — every operator-facing line goes through it so async
+-- OSC output cannot interleave with an in-progress edit buffer.
 sessionLoop
   :: (e -> String)
   -> SupervisorOps MR.ManifestReloadPlan e
@@ -783,55 +859,56 @@ sessionLoop
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
   -> IORef LiveValueCache
-  -> IO ()
+  -> (String -> IO ())
+  -> Haskeline.InputT IO ()
 sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
-            lastOutcomeRef reloadEventsRef valueCacheRef = do
-  putStrLn "Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:"
-  hFlush stdout
-  done <- isEOF
-  if done
-    then do
-      putStrLn ""
-      putStrLn "  (EOF; closing session.)"
-    else do
-      line <- getLine
-      let cmd = parseLiveSessionCommand line
-      step <- dispatch cmd
-      case step of
-        SsContinue -> do
-          putStrLn ""
-          sessionLoop causeLabel supOps doc catalog trackedStackRef
-                      currentPlanRef lastOutcomeRef reloadEventsRef
-                      valueCacheRef
-        SsTerminate code -> do
-          putStrLn ""
-          putStrLn "  Terminating session."
-          exitWith code
+            lastOutcomeRef reloadEventsRef valueCacheRef extPrint = loop
   where
+    prompt =
+      "Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:\n> "
+
+    loop = do
+      mLine <- Haskeline.getInputLine prompt
+      case mLine of
+        Nothing -> liftIO $ do
+          extPrint ""
+          extPrint "  (EOF; closing session.)"
+        Just line -> do
+          let cmd = parseLiveSessionCommand line
+          step <- liftIO (dispatch cmd)
+          case step of
+            SsContinue -> do
+              liftIO (extPrint "")
+              loop
+            SsTerminate code -> liftIO $ do
+              extPrint ""
+              extPrint "  Terminating session."
+              exitWith code
+
     dispatch = \case
       LscQuit ->
         pure (SsTerminate ExitSuccess)
       LscStatus -> do
-        printStatus trackedStackRef currentPlanRef lastOutcomeRef
+        printStatusWith extPrint trackedStackRef currentPlanRef lastOutcomeRef
         pure SsContinue
       LscDemos -> do
-        printDemos doc catalog currentPlanRef
+        printDemosWith extPrint doc catalog currentPlanRef
         pure SsContinue
       LscControls -> do
-        printControls trackedStackRef currentPlanRef
+        printControlsWith extPrint trackedStackRef currentPlanRef
         pure SsContinue
       LscValues -> do
-        printValues trackedStackRef currentPlanRef valueCacheRef
+        printValuesWith extPrint trackedStackRef currentPlanRef valueCacheRef
         pure SsContinue
       LscHelp -> do
-        mapM_ putStrLn renderLiveSessionCommandHelp
+        mapM_ extPrint renderLiveSessionCommandHelp
         pure SsContinue
       LscUnknown raw -> do
-        putStrLn ("  unknown command: " <> show raw)
-        mapM_ putStrLn renderLiveSessionCommandHelp
+        extPrint ("  unknown command: " <> show raw)
+        mapM_ extPrint renderLiveSessionCommandHelp
         pure SsContinue
       LscReloadTo key ->
-        runReloadWith
+        runReloadWithSink extPrint
           (catalogPlanResolver doc catalog)
           MR.mrlpDemoKey
           causeLabel
@@ -874,8 +951,8 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
               -- @source=default@ in the next 'values' call.
               writeIORef valueCacheRef emptyLiveValueCache
               voices <-
-                autoStartTemplates "post-reload" service livePlan
-              warnIfMissingVoices service voices
+                autoStartTemplatesWith extPrint "post-reload" service livePlan
+              warnIfMissingVoicesWith extPrint service voices
             else
               -- Owner survived (preserving path). Retain accepted
               -- values whose tag still exists on the new target;
@@ -975,74 +1052,71 @@ runReloadWith
   -> IORef [LiveEvent]
   -> String
   -> IO SessionStep
-runReloadWith resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
+runReloadWith =
+  runReloadWithSink putStrLn
+
+
+-- | Phase 8j: sink-taking variant. Every operator-facing line
+-- (reload rejection, supervised outcome, reload events, supervisor
+-- events, cause lines, resource timeline) routes through @output@.
+-- The stderr escalation line keeps using 'hPutStrLn stderr'
+-- unchanged: it is a non-operator surface and is not subject to the
+-- Haskeline edit-buffer corruption mechanism the 8j lane addresses.
+runReloadWithSink
+  :: (String -> IO ())
+  -> ReloadResolver plan
+  -> (plan -> String)
+  -> (e -> String)
+  -> (plan -> IO ())
+  -> SupervisorOps plan e
+  -> IORef plan
+  -> IORef (Maybe LiveSessionOutcome)
+  -> IORef [LiveEvent]
+  -> String
+  -> IO SessionStep
+runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
   case resolvePlan resolver key of
     Left reason -> do
-      putStrLn ("  reload rejected: " <> reason)
+      output ("  reload rejected: " <> reason)
       writeIORef lastOutcomeRef (Just (LsoPlanRejected reason))
       pure SsContinue
     Right requestedPlan -> do
       fallbackPlan <- readIORef currentPlanRef
       writeIORef reloadEventsRef []
-      -- Supervisor event stream is local to this reload — it
-      -- describes the supervisor's close/open lifecycle for this
-      -- one call. We allocate the ref inside the case so a stale
-      -- list from a previous reload cannot leak into the next
-      -- render. 'safeEmit' inside 'reloadSupervisedWithEvents'
-      -- guards the supervisor's cleanup invariants against any
-      -- exception this callback might throw (ffaca33).
       supervisorEventsRef <- newIORef []
       out <- reloadSupervisedWithEvents
                (\ev -> modifyIORef' supervisorEventsRef (++ [ev]))
                supOps fallbackPlan requestedPlan
       events <- readIORef reloadEventsRef
       supervisorEvents <- readIORef supervisorEventsRef
-      putStrLn ""
+      output ""
       let (lso, step) = stepFromOutcome out
-      putStrLn $
+      output $
         "  supervised outcome: " <> renderLiveSessionOutcome lso
-      putStrLn "  reload events:"
-      mapM_ putStrLn (renderLiveReloadEvents events)
-      -- Observed supervisor-layer timeline: what the supervisor
-      -- actually did to the host stack around the in-window slot
-      -- (in-window start/outcome + close-previous + fallback-open).
-      -- The derived 'resource timeline:' block below stays as the
-      -- compact "what is now true" summary; this block is the
-      -- "what happened, in order" narrative read from
-      -- 'reloadSupervisedWithEvents'.
-      putStrLn "  supervisor events:"
-      mapM_ (putStrLn . ("    - " <>))
+      output "  reload events:"
+      mapM_ output (renderLiveReloadEvents events)
+      output "  supervisor events:"
+      mapM_ (output . ("    - " <>))
             (renderLiveSessionSupervisorEvents supervisorEvents)
       writeIORef lastOutcomeRef (Just lso)
       when (lso == LsoCommitted) $
         writeIORef currentPlanRef requestedPlan
-      -- Cause lines first so the operator sees the failure detail
-      -- adjacent to the supervised outcome name. The 'causeLabel'
-      -- projection is route-specific (see 'runManifestLiveSession');
-      -- it must NOT call 'show' on a value that recursively carries
-      -- 'TemplateGraph' / 'RuntimeNode' state, or the operator
-      -- transcript reverts to the F-1 leak shape this slice fixed.
       case out of
         SupervisedReloadCommitted ->
           pure ()
         SupervisedReloadRequestRejected cause ->
-          putStrLn ("  cause: " <> causeLabel cause)
+          output ("  cause: " <> causeLabel cause)
         SupervisedReloadRejectedRecovered cause ->
-          putStrLn ("  in-window cause: " <> causeLabel cause)
+          output ("  in-window cause: " <> causeLabel cause)
         SupervisedReloadEscalated inWindow rebuild -> do
-          putStrLn ("  in-window cause: " <> causeLabel inWindow)
-          putStrLn ("  rebuild cause:   " <> causeLabel rebuild)
+          output ("  in-window cause: " <> causeLabel inWindow)
+          output ("  rebuild cause:   " <> causeLabel rebuild)
           hPutStrLn stderr
             "live session escalated: no live stack remains."
-      -- Resource timeline before 'onLiveStackChanged' so the
-      -- operator reads close/open/serving-plan consequences
-      -- contiguously with the outcome + cause section, ahead of
-      -- any noisy "post-reload: auto-starting ..." output the
-      -- hook may produce.
       let timeline =
             resourceTimelineForOutcome fallbackPlan requestedPlan out
-      putStrLn "  resource timeline:"
-      mapM_ (putStrLn . ("    - " <>))
+      output "  resource timeline:"
+      mapM_ (output . ("    - " <>))
             (renderLiveSessionResourceEvents planLabel timeline)
       case out of
         SupervisedReloadCommitted ->
@@ -1058,49 +1132,49 @@ runReloadWith resolver planLabel causeLabel onLiveStackChanged supOps currentPla
 
 -- | Read the active stack via the tracking IORef and print the
 -- snapshot the operator typed Enter for.
-printStatus
-  :: IORef (Maybe LiveStack)
+-- | Phase 8j sink-taking variant. Every operator-facing line routes
+-- through @output@ (typically Haskeline's 'getExternalPrint' action).
+printStatusWith
+  :: (String -> IO ())
+  -> IORef (Maybe LiveStack)
   -> IORef MR.ManifestReloadPlan
   -> IORef (Maybe LiveSessionOutcome)
   -> IO ()
-printStatus trackedStackRef currentPlanRef lastOutcomeRef = do
-  putStrLn ""
-  putStrLn "  status:"
+printStatusWith output trackedStackRef currentPlanRef lastOutcomeRef = do
+  output ""
+  output "  status:"
   currentPlan <- readIORef currentPlanRef
-  putStrLn $
+  output $
     "    current plan demo: " <> MR.mrlpDemoKey currentPlan
   mStack <- readIORef trackedStackRef
   case mStack of
     Nothing ->
-      putStrLn "    audio running:     (no live stack)"
+      output "    audio running:     (no live stack)"
     Just stack -> do
       let service = mrhcService (rhsConfig stack)
           ingress = mrhcIngressManager (rhsConfig stack)
-      printServiceSnapshot "    fan-in" service
+      printServiceSnapshotWith output "    fan-in" service
       ingressSnapshot <- readManifestReloadIngressManager ingress
-      putStrLn $
+      output $
         "    ingress:           " <> renderIngressSnapshot ingressSnapshot
   mLast <- readIORef lastOutcomeRef
   case mLast of
     Nothing ->
-      putStrLn "    last outcome:      (none yet)"
+      output "    last outcome:      (none yet)"
     Just lso ->
-      putStrLn $ "    last outcome:      " <> renderLiveSessionOutcome lso
+      output $ "    last outcome:      " <> renderLiveSessionOutcome lso
 
 
--- | Print the manifest demo keys known to this live session, marking
--- the plan currently serving. This is intentionally the intersection
--- of the loaded manifest document and the app reload catalog, not a
--- full built-in demo-table dump: the operator wants to know what
--- @demo KEY@ can reasonably target in this session.
-printDemos
-  :: AuthoringManifestDoc
+-- | Phase 8j sink-taking variant of the demos-list printer.
+printDemosWith
+  :: (String -> IO ())
+  -> AuthoringManifestDoc
   -> [MR.ManifestReloadCatalogEntry]
   -> IORef MR.ManifestReloadPlan
   -> IO ()
-printDemos doc catalog currentPlanRef = do
+printDemosWith output doc catalog currentPlanRef = do
   currentPlan <- readIORef currentPlanRef
-  mapM_ putStrLn $
+  mapM_ output $
     renderLiveSessionDemoList
       (MR.mrlpDemoKey currentPlan)
       [ key
@@ -1110,64 +1184,60 @@ printDemos doc catalog currentPlanRef = do
       ]
 
 
--- | Reprint the current OSC control surface. The command projects
--- from the current plan each time so it follows successful reloads;
--- addressable lines resolve against the live voice set when a stack
--- is available.
-printControls
-  :: IORef (Maybe LiveStack)
+-- | Phase 8j sink-taking variant of the controls reprint.
+printControlsWith
+  :: (String -> IO ())
+  -> IORef (Maybe LiveStack)
   -> IORef MR.ManifestReloadPlan
   -> IO ()
-printControls trackedStackRef currentPlanRef = do
+printControlsWith output trackedStackRef currentPlanRef = do
   currentPlan <- readIORef currentPlanRef
   let currentDemoKey = MR.mrlpDemoKey currentPlan
-  putStrLn ""
+  output ""
   case manifestReloadIngressTargetFromPlan
          liveIngressTargetPolicy currentPlan of
     Left issue ->
-      putStrLn $
+      output $
         "  controls for " <> currentDemoKey
         <> ": unavailable: ingress projection failed: " <> show issue
     Right target -> do
-      renderOSCControls
-        ("controls for " <> currentDemoKey <> " (pattern)") target
+      renderOSCControlsWith
+        output ("controls for " <> currentDemoKey <> " (pattern)") target
       mStack <- readIORef trackedStackRef
       case mStack of
         Nothing ->
-          putStrLn
+          output
             "  addressable OSC surface: (no live stack)"
         Just stack ->
-          printAddressableSurface (mrhcService (rhsConfig stack)) target
+          printAddressableSurfaceWith
+            output (mrhcService (rhsConfig stack)) target
 
 
--- | Phase 8h: print the last accepted control target values for active
--- voices on the current plan. Defaults render with @source=default@
--- for any control the live session has not yet observed an accepted
--- write for. Read-only; never reads back DSP state.
---
--- See 'renderValuesTable' for the row format. Output is whatever the
--- pure renderer produces, prefixed by one blank line so the table
--- visually separates from the prompt.
-printValues
-  :: IORef (Maybe LiveStack)
+-- | Phase 8j sink-taking variant of the 'values' command. Defaults
+-- render with @source=default@ for any control the live session has
+-- not yet observed an accepted write for. Read-only; never reads
+-- back DSP state.
+printValuesWith
+  :: (String -> IO ())
+  -> IORef (Maybe LiveStack)
   -> IORef MR.ManifestReloadPlan
   -> IORef LiveValueCache
   -> IO ()
-printValues trackedStackRef currentPlanRef valueCacheRef = do
+printValuesWith output trackedStackRef currentPlanRef valueCacheRef = do
   currentPlan <- readIORef currentPlanRef
   let currentDemoKey = MR.mrlpDemoKey currentPlan
-  putStrLn ""
+  output ""
   case manifestReloadIngressTargetFromPlan
          liveIngressTargetPolicy currentPlan of
     Left issue ->
-      putStrLn $
+      output $
         "  values for " <> currentDemoKey
         <> ": unavailable: ingress projection failed: " <> show issue
     Right target -> do
       mStack <- readIORef trackedStackRef
       case mStack of
         Nothing ->
-          putStrLn $
+          output $
             "  values for " <> currentDemoKey <> ": (no live stack)"
         Just stack -> do
           snapshot <-
@@ -1175,5 +1245,5 @@ printValues trackedStackRef currentPlanRef valueCacheRef = do
           cache <- readIORef valueCacheRef
           let voices   = M.keys (ssVoices (sfisOwnerState snapshot))
               bindings = motControls (mitOSC target)
-          mapM_ putStrLn
+          mapM_ output
             (renderValuesTable currentDemoKey voices bindings cache)

@@ -122,6 +122,7 @@ library
     , bytestring
     , containers
     , deepseq
+    , haskeline
     , microlens
     , microlens-mtl
     , microlens-th
@@ -190,6 +191,7 @@ executable metasonic-bridge
     , bytestring
     , containers
     , deepseq
+    , haskeline
     , metasonic-bridge
     , microlens
     , microlens-mtl
@@ -242,6 +244,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestLiveCommonOSCRender
       MetaSonic.Spec.AppManifestLiveReloadDemoRender
       MetaSonic.Spec.AppManifestLiveSession
+      MetaSonic.Spec.AppManifestLiveSessionOutputSink
       MetaSonic.Spec.AppManifestLiveValueCache
       MetaSonic.Spec.AppManifestMIDIIngressOps
       MetaSonic.Spec.AppManifestMIDIListener
@@ -346,6 +349,7 @@ test-suite metasonic-bridge-test
     , bytestring
     , containers
     , deepseq
+    , haskeline
     , metasonic-bridge
     , microlens
     , microlens-mtl
