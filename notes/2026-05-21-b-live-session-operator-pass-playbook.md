@@ -947,3 +947,40 @@ the script footer.
 Perceptual result: **no `quit` snap heard** on either fixture. The
 10 ms host-stack close fade resolves the observed shutdown artifact
 on this host. Lane closes.
+
+### 2026-05-22 — post-8f saw/noise operator pass stays clean
+
+Transcript: `/tmp/metasonic-live-session-8g-saw-noise-post-8f.log`.
+
+Post-closeout operator pass against
+`examples/manifests/saw-noise-filter.json` starting from
+`saw-filter-dark` with `--strategy require-preserving`. The pass
+exercised the richer saw/noise control surface after the Phase 8f
+shutdown fade landed:
+
+- `status` and `controls` rendered the four-control surface
+  (`pitch`, `cutoff`, `q`, `level`) and the addressable `/v0/...`
+  OSC paths.
+- Corrected saw/noise OSC writes accepted on `/v0/lpf/0` (`cutoff`),
+  `/v0/lpf/1` (`q`), and `/v0/gain/0` (`level`) before and after a
+  preserving same-demo reload.
+- OSC accept-line rendering stayed operator-readable
+  (`osc accept: /v0/lpf/0 name="cutoff" value=900` shape), with no
+  Haskell constructor leakage in the accepted-command path.
+- `demo saw-filter-dark` while already on `saw-filter-dark`
+  committed through the preserving route and left the session healthy:
+  `audio running: yes`, `queue depth: 0`, owner ready, reload normal.
+- `quit` terminated cleanly; no shutdown snap was heard.
+
+The earlier `/v0/cutoff/1` rejects from the first attempt were a
+stale-fixture operator error from the smooth-cutoff manifest, not
+system friction. Same-demo reload still performs a preserving commit,
+but it did not block the pass. The only possible watch item is wording:
+`committed (new plan installed)` reads slightly oddly when the
+requested demo is already current. It should open no lane unless it
+becomes annoying in future operator use.
+
+Follow-up chosen from this pass: no new code lane. The post-8f
+system stayed operational under a normal richer-control pass, OSC
+accept lines were readable once the manifest-correct addresses were
+used, and shutdown remained clean.
