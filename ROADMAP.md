@@ -224,7 +224,7 @@ behavior on a held gate and silence on an idle gate.
 
 ### [x] 1.5 Delay line
 
-`KDelay` (tag 8) wraps `q::fractional_ring_buffer` for sub-sample
+`KDelay` (tag 13) wraps `q::fractional_ring_buffer` for sub-sample
 interpolation. One audio input (signal) and three controls
 `[delay_seconds, feedback, mix]`; per-node state lives in
 `DelayState`. The buffer is sized at template compile time from a
@@ -766,11 +766,12 @@ Replace a running MetaDef with a recompiled version **without audible glitches**
 copy-safe state migration via caller-tagged keys + slot-index
 identity (§5.2), Haskell producer ergonomics (§5.3), swap-bench
 instrumentation (§5.3.C), and template identity precondition
-(§5.4.B) all shipped. State preservation is partial today — Env,
-Delay, and Smooth state default-init across a swap (§5.2); an
-allocation-free prewarm / custom-copy slice for those kinds is the
-remaining work toward the "without audible glitches" goal for graphs
-that depend on those state types. The two open API items — §5.3.D
+(§5.4.B) all shipped. State preservation is partial today — Smooth
+now copies its runtime state across preserving swaps, while Env and
+Delay remain unsupported on a preserving live path and reject before
+install. Dedicated Env / Delay migration slices are the remaining
+work toward the "without audible glitches" goal for graphs that
+depend on those state types. The two open API items — §5.3.D
 blocking wait and §5.4.C producer-side mapping helpers — stay
 deferred. Both are explicitly gated on real-producer evidence;
 pulling them ahead of that signal would be the same circular-evidence
@@ -807,11 +808,12 @@ slot-index instance identity:
 - `rt_graph_prepare_swap_from_graph` builds the migration plan off-audio.
 
 - The audio-thread install loop copies matched controls, copy-safe DSP
-  state (oscillators, noise, biquads), and live-slot lifecycle
-  metadata without allocation.
+  state (oscillators, noise, biquads, Smooth), and live-slot
+  lifecycle metadata without allocation.
 
-- Env, Delay, and Smooth DSP state remain default init until a later
-  prewarm/custom-state slice makes them allocation-free to migrate.
+- Env and Delay DSP state remain unsupported for preserving live-path
+  swaps until a later custom-state slice makes them allocation-free
+  to migrate.
 
 ### [x] 5.3 Producer ergonomics
 
@@ -3899,13 +3901,18 @@ Still gated:
   Companion reject-path wrapper at
   `tools/manifest_live_session_require_preserving_reject_smoke.sh`
   (`just manifest-live-session-require-preserving-reject-smoke`,
-  port 17005) landed in `9b39fd2` against the
-  `reject-preserving-smooth` fixture; 23 markers pin the
+  port 17005) landed in `9b39fd2` against the original
+  `reject-preserving-smooth` fixture. Phase 8d-a moved that
+  reject-path anchor to the current `reject-preserving-delay`
+  fixture when KSmooth started participating in preserving swaps;
+  the marker shape is unchanged. The 23 markers pin the
   request-rejected operator narrative end-to-end including the
   compact `cause:` line and resource timeline, plus the runtime
   F-1 leak guard (no `TemplateGraph` / `RuntimeNode` substring).
-  Marker-clean evidence run on 2026-05-21 on host
-  Linux 6.17.10 Fedora 41 / PipeWire 1.2.8.
+  Original marker-clean evidence ran on 2026-05-21 on host
+  Linux 6.17.10 Fedora 41 / PipeWire 1.2.8; the retargeted
+  wrapper remains a live/device smoke and needs a fresh operator
+  run when that branch is next exercised.
   Producer-aware OSC reload-window rendering landed in
   `144901f` + `737b124` (design note:
   [notes/2026-05-20-d-stale-command-rejection-rendering.md](notes/2026-05-20-d-stale-command-rejection-rendering.md)):

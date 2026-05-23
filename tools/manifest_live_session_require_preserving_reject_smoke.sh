@@ -5,7 +5,7 @@
 #
 # Sibling of tools/manifest_live_session_require_preserving_smoke.sh.
 # The happy-path wrapper drives a fixture where preserving COMMITS;
-# this one drives the reject-preserving-smooth fixture where
+# this one drives the reject-preserving-delay fixture where
 # preserving REJECTS, exercising the
 # 'SupervisedReloadRequestRejected' branch of the live-session
 # shell end-to-end on real PortAudio + real OSC.
@@ -33,9 +33,9 @@
 #   1. Confirms the configured UDP port is currently free.
 #   2. Launches `metasonic-bridge --manifest-live-session
 #      MANIFEST OLD_DEMO --strategy require-preserving` against
-#      the reject-preserving-smooth fixture, with stdin from a
+#      the reject-preserving-delay fixture, with stdin from a
 #      fifo so the wrapper can drive the interactive command
-#      loop. The fixture's voice template carries a KSmooth
+#      loop. The fixture's voice template carries a KDelay
 #      ('PreserveUnsupported') node, so any preserving hot-swap
 #      with the voice live is rejected.
 #   3. Waits for the first "Type a command" prompt, injects an
@@ -79,11 +79,11 @@
 #              does not collide with the other live-session /
 #              live-reload-demo smokes on those ports.
 #   MANIFEST   Manifest fixture path (default
-#              examples/manifests/reject-preserving-smooth.json).
+#              examples/manifests/reject-preserving-delay.json).
 #   OLD_DEMO   Initial demo key
-#              (default reject-preserving-smooth-dark).
+#              (default reject-preserving-delay-dark).
 #   NEW_DEMO   Target demo key fed via `demo:NEW_DEMO`
-#              (default reject-preserving-smooth-bright).
+#              (default reject-preserving-delay-bright).
 #   WORK_DIR   Where to put transcript + probe-log artifacts
 #              (default $TMPDIR or /tmp).
 #
@@ -98,9 +98,9 @@
 set -u
 
 PORT="${PORT:-17005}"
-MANIFEST="${MANIFEST:-examples/manifests/reject-preserving-smooth.json}"
-OLD_DEMO="${OLD_DEMO:-reject-preserving-smooth-dark}"
-NEW_DEMO="${NEW_DEMO:-reject-preserving-smooth-bright}"
+MANIFEST="${MANIFEST:-examples/manifests/reject-preserving-delay.json}"
+OLD_DEMO="${OLD_DEMO:-reject-preserving-delay-dark}"
+NEW_DEMO="${NEW_DEMO:-reject-preserving-delay-bright}"
 
 WORK_DIR="${WORK_DIR:-${TMPDIR:-/tmp}}"
 TRANSCRIPT="$WORK_DIR/manifest-live-session-require-preserving-reject-transcript.txt"
@@ -204,7 +204,7 @@ fi
 sleep 1
 
 # Trigger the supervised reload — this is the one we expect to
-# reject (the fixture's KSmooth voice is preserve-unsupported).
+# reject (the fixture's KDelay voice is preserve-unsupported).
 printf 'demo:%s\n' "$NEW_DEMO" >&3
 echo "[smoke] sent 'demo:$NEW_DEMO' (expected: request-rejected)"
 

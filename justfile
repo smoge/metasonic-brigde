@@ -256,8 +256,8 @@ manifest-live-session-require-preserving-smoke port="17004": stack-build
 
 # Live-audio operator smoke for the supervised
 # --manifest-live-session (require-preserving) /reject/ branch.
-# Sibling of the smoke above. Drives the reject-preserving-smooth
-# fixture (KSmooth voice template, preserve-unsupported) so the
+# Sibling of the smoke above. Drives the reject-preserving-delay
+# fixture (KDelay voice template, preserve-unsupported) so the
 # supervised hot-swap rejects instead of committing; pins the
 # resulting request-rejected operator narrative end-to-end —
 # including the four reload-event lines (preserving started,
