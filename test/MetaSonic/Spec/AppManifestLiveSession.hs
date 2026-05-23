@@ -119,6 +119,14 @@ parseLiveSessionCommandTests =
       "demos" LscDemos
   , row "literal 'controls' is LscControls"
       "controls" LscControls
+  , row "literal 'values' is LscValues (Phase 8h)"
+      "values" LscValues
+  , row "uppercase 'VALUES' is unknown (case-sensitive)"
+      "VALUES" (LscUnknown "VALUES")
+  , row "'values' with trailing token is unknown"
+      "values now" (LscUnknown "values now")
+  , row "'values' tolerates leading + trailing whitespace"
+      "  values  " LscValues
   , row "literal 'help' is LscHelp"
       "help" LscHelp
   , row "literal '?' is LscHelp"
@@ -160,8 +168,8 @@ parseLiveSessionCommandTests =
 -- with the command vocabulary the operator sees.
 renderLiveSessionCommandHelpTests :: [TestTree]
 renderLiveSessionCommandHelpTests =
-  [ testCase "renders eight lines: header + seven command rows" $
-      length renderLiveSessionCommandHelp @?= 8
+  [ testCase "renders nine lines: header + eight command rows" $
+      length renderLiveSessionCommandHelp @?= 9
 
   , testCase "first line is the 'commands:' header (two-space indent)" $
       take 1 renderLiveSessionCommandHelp @?= ["  commands:"]
@@ -173,6 +181,7 @@ renderLiveSessionCommandHelpTests =
             , "    demo KEY    same, single-token form (no internal whitespace)"
             , "    demos       list manifest demo keys (marks current)"
             , "    controls    print current OSC control surface"
+            , "    values      print last accepted control values per active voice"
             , "    status      print current status (same as <Enter>)"
             , "    help        print commands (same as ?)"
             , "    quit        close session cleanly (same as exit, <Ctrl-D>)"

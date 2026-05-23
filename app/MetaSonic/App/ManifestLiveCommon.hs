@@ -39,9 +39,20 @@ module MetaSonic.App.ManifestLiveCommon
   ( -- * Live audio + ingress config
     liveOSCListenerHooks
   , liveOSCListenerHooksFor
+  , liveOSCListenerHooksForObserved
   , liveIngressTargetPolicy
   , liveReloadProducer
   , liveAudioOptions
+
+    -- * Producer-neutral accepted-write extractor
+    --
+    -- Phase 8h: the live-session value cache observer reads this to
+    -- decide whether an OSC listener event represents an accepted
+    -- 'CmdControlWrite' worth recording. Producer-neutral by signature:
+    -- any future MIDI / UI accepted-write hook can call the same
+    -- updater shape (@VoiceKey -> ControlTag -> Value -> IO ()@) on
+    -- the result of an equivalent extractor.
+  , acceptedControlWrite
 
     -- * Startup helpers (die on failure)
   , readManifestDocOrDie
@@ -97,6 +108,14 @@ module MetaSonic.App.ManifestLiveCommon
     -- this surface is meant to preempt: the rendered line now names
     -- the declared default, range, and optional CC binding inline.
   , renderAddressableOSCLine
+
+    -- * Address + value formatting (pure, testable)
+    --
+    -- Phase 8h reuses these for the @values@ command so the address
+    -- column and value rendering match the existing addressable-OSC
+    -- surface and OSC accept lines without forking a second format.
+  , renderConcreteOSCAddress
+  , renderOperatorValue
   ) where
 
 import           Control.Concurrent             (threadDelay)
@@ -158,6 +177,7 @@ import           MetaSonic.Bridge.Source        (MigrationKey (..))
 import           MetaSonic.Pattern              (ControlTag (..),
                                                  SwapLabel (..),
                                                  TemplateName (..),
+                                                 Value,
                                                  VoiceKey (..))
 import           MetaSonic.Session.Command      (SessionCommand (..))
 import           MetaSonic.Session.FanIn        (SessionFanInAudioOptions (..),
@@ -570,15 +590,68 @@ liveOSCListenerHooksFor target =
   liveOSCListenerHooksWithControls (motControls (mitOSC target))
 
 
+-- | Phase 8h variant of 'liveOSCListenerHooksFor' that additionally
+-- feeds every accepted 'CmdControlWrite' into a producer-neutral
+-- observer callback. The callback signature
+-- (@VoiceKey -> ControlTag -> Value -> IO ()@) is deliberately
+-- ingress-agnostic so the same updater can also be wired from a future
+-- MIDI/UI accepted-write hook without changing the cache contract.
+--
+-- The accept-line printer remains the existing 'renderOSCAcceptLine'
+-- shape; the observer runs alongside it (after the printer) so the
+-- transcript is unchanged.
+liveOSCListenerHooksForObserved
+  :: ManifestReloadIngressTarget
+  -> (VoiceKey -> ControlTag -> Value -> IO ())
+  -> ManifestOSCListenerHooks
+liveOSCListenerHooksForObserved target observe =
+  liveOSCListenerHooksWithControlsAndObserver
+    (motControls (mitOSC target))
+    observe
+
+
 liveOSCListenerHooksWithControls
   :: [ManifestOSCControlBinding]
   -> ManifestOSCListenerHooks
-liveOSCListenerHooksWithControls controls = defaultManifestOSCListenerHooks
-  { molhOnAccepted =
-      mapM_ (putStrLn . ("  " <>)) . renderOSCAcceptLineWithControls controls
-  , molhOnIssue =
-      \issue -> putStrLn ("  " <> renderOSCIssueLine issue)
-  }
+liveOSCListenerHooksWithControls controls =
+  liveOSCListenerHooksWithControlsAndObserver controls (\_ _ _ -> pure ())
+
+
+liveOSCListenerHooksWithControlsAndObserver
+  :: [ManifestOSCControlBinding]
+  -> (VoiceKey -> ControlTag -> Value -> IO ())
+  -> ManifestOSCListenerHooks
+liveOSCListenerHooksWithControlsAndObserver controls observe =
+  defaultManifestOSCListenerHooks
+    { molhOnAccepted = \result -> do
+        mapM_ (putStrLn . ("  " <>)) (renderOSCAcceptLineWithControls controls result)
+        case acceptedControlWrite result of
+          Just (voice, tag, value) -> observe voice tag value
+          Nothing                  -> pure ()
+    , molhOnIssue =
+        \issue -> putStrLn ("  " <> renderOSCIssueLine issue)
+    }
+
+
+-- | Phase 8h: pure projection of an 'OSCProducerEnqueueResult' down to
+-- the @(VoiceKey, ControlTag, Value)@ shape the live-session value
+-- cache records. Returns 'Nothing' for any result that is not an
+-- accepted 'CmdControlWrite' (parse rejection, manifest rejection,
+-- reload-window rejection, queue rejection, voice-on / voice-off, or
+-- any other command kind).
+--
+-- Producer-neutral by signature: the same shape could project a
+-- MIDI/UI accepted-write event into the cache updater if a future
+-- slice adds an equivalent producer-side hook.
+acceptedControlWrite
+  :: OSCProducerEnqueueResult
+  -> Maybe (VoiceKey, ControlTag, Value)
+acceptedControlWrite = \case
+  OSCProducerEnqueueAttempted (CmdControlWrite voice tag value) enqueue
+    | SessionEnqueued _ <- sfierResult enqueue ->
+        Just (voice, tag, value)
+  _ ->
+    Nothing
 
 
 -- | Render the accepted-side of one OSC listener event into an

@@ -105,6 +105,7 @@ import           Data.IORef                     (IORef, modifyIORef',
 import           Data.List                      (dropWhileEnd, find,
                                                  isPrefixOf)
 import qualified Data.Map.Strict                as M
+import qualified Data.Set                       as Set
 import           System.Exit                    (ExitCode (..), die,
                                                  exitWith)
 import           System.IO                      (BufferMode (..), hFlush,
@@ -117,7 +118,7 @@ import           MetaSonic.App.ManifestLiveCommon
                                                 (autoStartTemplates,
                                                  liveAudioOptions,
                                                  liveIngressTargetPolicy,
-                                                 liveOSCListenerHooksFor,
+                                                 liveOSCListenerHooksForObserved,
                                                  liveReloadProducer,
                                                  planOrDie,
                                                  printAddressableSurface,
@@ -129,6 +130,15 @@ import           MetaSonic.App.ManifestLiveCommon
                                                  renderOSCControls,
                                                  targetOrDie,
                                                  warnIfMissingVoices)
+import           MetaSonic.App.ManifestLiveValueCache
+                                                (LiveValueCache,
+                                                 emptyLiveValueCache,
+                                                 recordAcceptedWrite,
+                                                 renderValuesTable,
+                                                 retainSurvivingControls)
+import           MetaSonic.App.ManifestReloadOSCBinding
+                                                (ManifestOSCControlBinding (..),
+                                                 motControls)
 import           MetaSonic.App.ManifestOSCIngressOps
                                                 (ManifestOSCIngressHandle,
                                                  ManifestOSCIngressOpsIssue,
@@ -170,7 +180,7 @@ import           MetaSonic.App.ManifestReloadSupervisorAdapter
 import           MetaSonic.App.ManifestReloadIngress
                                                 (readManifestReloadIngressManager)
 import           MetaSonic.App.ManifestReloadIngressTarget
-                                                (ManifestReloadIngressTarget,
+                                                (ManifestReloadIngressTarget (..),
                                                  manifestReloadIngressTargetFromPlan)
 import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
                                                  AuthoringManifestDoc (..))
@@ -237,6 +247,11 @@ data LiveSessionCommand
     -- ^ The literal @controls@. Reprints the current OSC control
     -- surface so the operator does not have to scroll back to the
     -- startup preamble.
+  | LscValues
+    -- ^ The literal @values@. Phase 8h: prints the last accepted
+    -- control target values for active voices on the current plan
+    -- (defaults shown for controls the session has not yet observed
+    -- an accepted write for). Read-only; never reads back DSP state.
   | LscStatus
     -- ^ Empty line, whitespace-only line, or the literal @status@.
   | LscHelp
@@ -261,6 +276,7 @@ parseLiveSessionCommand line =
     "status" -> LscStatus
     "demos"  -> LscDemos
     "controls" -> LscControls
+    "values" -> LscValues
     "help"   -> LscHelp
     "?"      -> LscHelp
     "quit"   -> LscQuit
@@ -303,6 +319,7 @@ renderLiveSessionCommandHelp =
   , "    demo KEY    same, single-token form (no internal whitespace)"
   , "    demos       list manifest demo keys (marks current)"
   , "    controls    print current OSC control surface"
+  , "    values      print last accepted control values per active voice"
   , "    status      print current status (same as <Enter>)"
   , "    help        print commands (same as ?)"
   , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
@@ -617,11 +634,19 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
   trackedStackRef <- newIORef Nothing
   currentPlanRef  <- newIORef initialPlan
   lastOutcomeRef  <- newIORef Nothing
+  valueCacheRef   <- newIORef emptyLiveValueCache
+
+  -- Phase 8h: producer-neutral accepted-write observer for the
+  -- live-session value cache. Wired through the OSC accepted hook
+  -- here; identical updater shape would receive MIDI/UI accepted
+  -- writes if a producer-neutral seam is added later.
+  let recordAccepted voice tag value =
+        modifyIORef' valueCacheRef (recordAcceptedWrite voice tag value)
 
   let inputs = RealReloadHostStackInputs
         { rrhsiBuildIngressOps     = \host ->
             manifestOSCIngressOpsWithTargetHooks
-              liveOSCListenerHooksFor
+              (\target -> liveOSCListenerHooksForObserved target recordAccepted)
               defaultOSCProducerOptions
               host
               listenerCfg
@@ -656,6 +681,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
         currentPlanRef
         lastOutcomeRef
         reloadEventsRef
+        valueCacheRef
 
     TryPreservingThenStoppedAudio -> do
       let factory = withTrackedFactory
@@ -671,6 +697,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
         currentPlanRef
         lastOutcomeRef
         reloadEventsRef
+        valueCacheRef
 
     RequirePreserving -> do
       let factory = withTrackedFactory
@@ -686,6 +713,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg = do
         currentPlanRef
         lastOutcomeRef
         reloadEventsRef
+        valueCacheRef
   where
     renderRoute s =
       "supervised (" <> renderManifestReloadHostStrategy s
@@ -706,10 +734,12 @@ runSupervised
   -> IORef MR.ManifestReloadPlan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef LiveValueCache
   -> IO ()
 runSupervised
     causeLabel factory doc catalog initialPlan initialTarget
-    trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef = do
+    trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef
+    valueCacheRef = do
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory initialPlan)
     case openResult of
@@ -737,6 +767,7 @@ runSupervised
                 currentPlanRef
                 lastOutcomeRef
                 reloadEventsRef
+                valueCacheRef
         pure ()
 
 
@@ -751,8 +782,10 @@ sessionLoop
   -> IORef MR.ManifestReloadPlan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef LiveValueCache
   -> IO ()
-sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef = do
+sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
+            lastOutcomeRef reloadEventsRef valueCacheRef = do
   putStrLn "Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:"
   hFlush stdout
   done <- isEOF
@@ -769,6 +802,7 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOut
           putStrLn ""
           sessionLoop causeLabel supOps doc catalog trackedStackRef
                       currentPlanRef lastOutcomeRef reloadEventsRef
+                      valueCacheRef
         SsTerminate code -> do
           putStrLn ""
           putStrLn "  Terminating session."
@@ -786,6 +820,9 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOut
       LscControls -> do
         printControls trackedStackRef currentPlanRef
         pure SsContinue
+      LscValues -> do
+        printValues trackedStackRef currentPlanRef valueCacheRef
+        pure SsContinue
       LscHelp -> do
         mapM_ putStrLn renderLiveSessionCommandHelp
         pure SsContinue
@@ -798,42 +835,72 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef lastOut
           (catalogPlanResolver doc catalog)
           MR.mrlpDemoKey
           causeLabel
-          autoStartIfStackIsEmpty
+          onPlanChange
           supOps
           currentPlanRef
           lastOutcomeRef
           reloadEventsRef
           key
 
-    -- | Post-reload voice auto-start. Fires on
-    -- 'SupervisedReloadCommitted' and
-    -- 'SupervisedReloadRejectedRecovered' through 'runReloadWith's
-    -- 'onLiveStackChanged' hook. Checks whether the active stack's
-    -- owner has zero live voices; if so, enqueues one 'CmdVoiceOn'
-    -- per template on the supplied plan (matching the two-shot demo's
-    -- post-reload-auto-start pattern). For 'require-preserving' the
-    -- owner is preserved across the reload so 'ssVoices' is
-    -- non-empty and this is a no-op; for 'stopped-audio-only',
-    -- 'try-preserving' falling back to stopped-audio, and the
-    -- 'RejectedRecovered' close-then-reopen path, the substrate's
-    -- 'realOpen' produces a service + audio + ingress with no
-    -- voices, and the auto-start gives the operator back an
-    -- audible surface.
-    autoStartIfStackIsEmpty livePlan = do
+    -- | Post-reload hook called on 'SupervisedReloadCommitted' and
+    -- 'SupervisedReloadRejectedRecovered'. Does two jobs:
+    --
+    --   * Auto-start a voice if the new stack's owner has no live
+    --     voices (the existing 'autoStartIfStackIsEmpty' behavior).
+    --
+    --   * Reconcile the Phase 8h value cache against the new plan.
+    --     For preserving reloads the cache survives; entries whose
+    --     'ControlTag' no longer exists on the new target are
+    --     dropped. For stopped-audio / rebuild outcomes the owner
+    --     was disposed and re-opened — the previous cache entries
+    --     refer to a dead graph, so reset to empty.
+    onPlanChange livePlan = do
       mStack <- readIORef trackedStackRef
       case mStack of
         Nothing ->
-          -- Reads as @(no live stack)@ in status; the supervisor's
-          -- bracket has not yet rewritten the tracking IORef. Skip
-          -- auto-start rather than fight the close-then-open window.
+          -- Supervisor bracket has not rewritten the tracking IORef
+          -- yet; same posture as the legacy
+          -- 'autoStartIfStackIsEmpty' early return.
           pure ()
         Just stack -> do
           let service = mrhcService (rhsConfig stack)
           snapshot <- readSessionFanInService service
-          when (M.null (ssVoices (sfisOwnerState snapshot))) $ do
-            voices <-
-              autoStartTemplates "post-reload" service livePlan
-            warnIfMissingVoices service voices
+          let voicesAlive = ssVoices (sfisOwnerState snapshot)
+          if M.null voicesAlive
+            then do
+              -- Owner was rebuilt or auto-started fresh; cached
+              -- values reference the disposed graph. Reset before
+              -- auto-starting so the new voices render as
+              -- @source=default@ in the next 'values' call.
+              writeIORef valueCacheRef emptyLiveValueCache
+              voices <-
+                autoStartTemplates "post-reload" service livePlan
+              warnIfMissingVoices service voices
+            else
+              -- Owner survived (preserving path). Retain accepted
+              -- values whose tag still exists on the new target;
+              -- drop entries for retired tags.
+              case manifestReloadIngressTargetFromPlan
+                     liveIngressTargetPolicy livePlan of
+                Right newTarget -> do
+                  let survivingTags =
+                        Set.fromList
+                          (map mocbControlTag (motControls (mitOSC newTarget)))
+                      survivingVoices =
+                        M.keysSet voicesAlive
+                  modifyIORef' valueCacheRef
+                    (retainSurvivingControls survivingVoices survivingTags)
+                Left _ ->
+                  -- Target projection failed; leave the cache
+                  -- alone. The operator will see the projection
+                  -- failure on the next 'controls' call.
+                  pure ()
+
+-- (The former 'autoStartIfStackIsEmpty' helper is replaced by
+-- 'onPlanChange' above, which keeps the auto-start behavior and adds
+-- the Phase 8h value-cache reconciliation. The two responsibilities
+-- share the same stack/voice snapshot so they have to read it once
+-- and branch on whether the owner survived.)
 
 
 -- | Injectable plan resolver: given a parsed reload key, return
@@ -1071,3 +1138,42 @@ printControls trackedStackRef currentPlanRef = do
             "  addressable OSC surface: (no live stack)"
         Just stack ->
           printAddressableSurface (mrhcService (rhsConfig stack)) target
+
+
+-- | Phase 8h: print the last accepted control target values for active
+-- voices on the current plan. Defaults render with @source=default@
+-- for any control the live session has not yet observed an accepted
+-- write for. Read-only; never reads back DSP state.
+--
+-- See 'renderValuesTable' for the row format. Output is whatever the
+-- pure renderer produces, prefixed by one blank line so the table
+-- visually separates from the prompt.
+printValues
+  :: IORef (Maybe LiveStack)
+  -> IORef MR.ManifestReloadPlan
+  -> IORef LiveValueCache
+  -> IO ()
+printValues trackedStackRef currentPlanRef valueCacheRef = do
+  currentPlan <- readIORef currentPlanRef
+  let currentDemoKey = MR.mrlpDemoKey currentPlan
+  putStrLn ""
+  case manifestReloadIngressTargetFromPlan
+         liveIngressTargetPolicy currentPlan of
+    Left issue ->
+      putStrLn $
+        "  values for " <> currentDemoKey
+        <> ": unavailable: ingress projection failed: " <> show issue
+    Right target -> do
+      mStack <- readIORef trackedStackRef
+      case mStack of
+        Nothing ->
+          putStrLn $
+            "  values for " <> currentDemoKey <> ": (no live stack)"
+        Just stack -> do
+          snapshot <-
+            readSessionFanInService (mrhcService (rhsConfig stack))
+          cache <- readIORef valueCacheRef
+          let voices   = M.keys (ssVoices (sfisOwnerState snapshot))
+              bindings = motControls (mitOSC target)
+          mapM_ putStrLn
+            (renderValuesTable currentDemoKey voices bindings cache)

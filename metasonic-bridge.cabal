@@ -153,6 +153,7 @@ executable metasonic-bridge
       MetaSonic.App.ManifestLiveCommon
       MetaSonic.App.ManifestLiveReloadDemo
       MetaSonic.App.ManifestLiveSession
+      MetaSonic.App.ManifestLiveValueCache
       MetaSonic.App.ManifestMIDIIngressOps
       MetaSonic.App.ManifestMIDIListener
       MetaSonic.App.ManifestMIDIPortMIDI
@@ -218,6 +219,7 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestLiveCommon
       MetaSonic.App.ManifestLiveReloadDemo
       MetaSonic.App.ManifestLiveSession
+      MetaSonic.App.ManifestLiveValueCache
       MetaSonic.App.ManifestMIDIIngressOps
       MetaSonic.App.ManifestMIDIListener
       MetaSonic.App.ManifestMIDIPortMIDI
@@ -240,6 +242,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestLiveCommonOSCRender
       MetaSonic.Spec.AppManifestLiveReloadDemoRender
       MetaSonic.Spec.AppManifestLiveSession
+      MetaSonic.Spec.AppManifestLiveValueCache
       MetaSonic.Spec.AppManifestMIDIIngressOps
       MetaSonic.Spec.AppManifestMIDIListener
       MetaSonic.Spec.AppManifestMIDIPortMIDI

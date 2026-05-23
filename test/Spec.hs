@@ -21,6 +21,8 @@ import           MetaSonic.Spec.AppManifestLiveCommonOSCRender
 import           MetaSonic.Spec.AppManifestLiveReloadDemoRender
 import           MetaSonic.Spec.AppManifestLiveSession
                                                   (appManifestLiveSessionTests)
+import           MetaSonic.Spec.AppManifestLiveValueCache
+                                                  (appManifestLiveValueCacheTests)
 import           MetaSonic.Spec.AppManifestMIDIPortMIDI
 import           MetaSonic.Spec.AppManifestMIDIReloadE2E
 import           MetaSonic.Spec.AppManifestOSCIngressOps
@@ -120,6 +122,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , appManifestLiveCommonOSCRenderTests
   , appManifestLiveReloadDemoRenderTests
   , appManifestLiveSessionTests
+  , appManifestLiveValueCacheTests
   , appManifestMIDIIngressOpsTests
   , appManifestMIDIListenerTests
   , appManifestMIDIPortMIDITests
