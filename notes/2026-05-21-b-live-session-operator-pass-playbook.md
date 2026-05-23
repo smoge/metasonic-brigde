@@ -1232,3 +1232,37 @@ lane is sealed. Persistent cross-session command history is not
 claimed by the closeout because the implementation uses
 `historyFile = Nothing`; keep that as a separate polish candidate only
 if it becomes useful.
+
+### 2026-05-23 — 8k same-demo reload wording verified live
+
+Transcript: `/tmp/metasonic-live-session-8k-same-demo-wording.log`.
+
+Post-implementation live check against
+`examples/manifests/saw-noise-filter.json`, starting from
+`saw-filter-dark` on the `require-preserving` route. Implementation
+under test: `5888883` (`LsoCommittedSameDemo` refinement in the live
+session shell).
+
+Driving sequence: same-demo `demo saw-filter-dark`, `status`, then
+`quit`.
+
+- Same-demo reload still ran the preserving supervised route: reload
+  events printed `preserving phase started` and `preserving phase
+  committed`; supervisor events printed `in-window: started` and
+  `in-window: committed`; resource timeline kept `in-window reload
+  committed` and `serving plan: saw-filter-dark`.
+- The immediate reload outcome now reported
+  `supervised outcome: committed (same demo reloaded)`.
+- The following status snapshot stayed healthy: current plan
+  `saw-filter-dark`, audio running, queue depth 0, owner ready, reload
+  normal, one active voice, ingress open on port 17004.
+- The status snapshot's last outcome also reported
+  `committed (same demo reloaded)`, so the old
+  `committed (new plan installed)` wording no longer appears for the
+  same-demo reload case.
+- The session exited cleanly at `quit` with `COMMAND_EXIT_CODE=0`.
+
+Follow-up chosen from this pass: close the same-demo reload wording
+watch item. This was an operator-text refinement only: it did not turn
+same-demo reload into a no-op and did not claim new DSP, routing,
+reload, or audio behavior.

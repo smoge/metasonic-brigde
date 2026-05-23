@@ -4002,8 +4002,7 @@ Still gated:
   the new target) and reset on stopped-audio / fallback rebuild;
   no DSP readback or runtime FFI surface. Residual watch items
   only — MIDI/UI accepted-write seam (the cache shape already
-  takes it; needs a producer-neutral upstream hook), same-demo
-  reload's `committed (new plan installed)` wording, ALSA stderr
+  takes it; needs a producer-neutral upstream hook), ALSA stderr
   noise on startup, and persistent command-history-file behavior
   — none blocking on current evidence. Phase 8j closed the
   readline / TTY-line-discipline watch item with a `haskeline`
@@ -4014,6 +4013,12 @@ Still gated:
   operator input redraws instead of merging into submitted
   commands. Persistent history remains deliberately off
   (`historyFile = Nothing`) and is only a future polish candidate.
+  Phase 8k closed the same-demo reload wording watch item
+  (`5888883`, verification transcript
+  `/tmp/metasonic-live-session-8k-same-demo-wording.log`): a
+  same-demo preserving commit still runs the full supervised route
+  but now reports `committed (same demo reloaded)` in both the reload
+  outcome and the following `status` snapshot.
   For the device-backed live-session paths above (the MIDI/device
   smoke lane and the hardware-paired live-reload demo), what
   remains is real hardware confirmation and the same hardware-gated
