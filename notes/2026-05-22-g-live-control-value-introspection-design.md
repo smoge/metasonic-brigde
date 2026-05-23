@@ -1,6 +1,29 @@
 # Phase 8h - Live Control Value Introspection
 
-Status: design note. No code lands on the strength of this note alone.
+Status: closed. Implementation landed as `2bb70cc`
+(`Implement Phase 8h live control value introspection`). Live
+verification ran the design note's validation recipe against
+`examples/manifests/saw-noise-filter.json` /
+`require-preserving`; transcript at
+`/tmp/metasonic-live-session-8h-values.log`. The `values` command
+rendered manifest order, defaults for unwritten controls, accepted
+values for written ones, and retained accepted values across all
+three preserving reloads (dark → bright, bright → dark, self-reload).
+The `0.05` write rendered as `value=5e-2` on both the OSC accept line
+and the matching `values` row, confirming the shared
+`renderOperatorValue` contract. Findings entry: see the
+[playbook](2026-05-21-b-live-session-operator-pass-playbook.md)
+"Phase 8h `values` command verified live" pass.
+
+Residual scope: the design note's pragmatic-fallback path stands —
+the cache is ingress-agnostic by signature, but only the OSC
+accepted-write hook feeds it in this slice. Adding a MIDI/UI seam is
+a few lines (call the same `recordAcceptedWrite` updater from a
+producer-neutral accepted-write seam upstream of the per-ingress
+hooks); not opened on its own evidence today. The
+"`committed (new plan installed)` reads oddly on same-demo reload"
+wording quirk remains a watch item only; it did not block this pass.
+Audible shutdown result not asserted (operator-paired).
 
 ## Evidence
 

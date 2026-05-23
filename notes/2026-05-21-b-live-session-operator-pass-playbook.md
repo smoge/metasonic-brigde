@@ -1064,3 +1064,43 @@ requested demo is already current, but it did not block the pass.
 
 Audio result not asserted in this entry; it records the transcript
 evidence and the operator-facing observability gap only.
+
+### 2026-05-22 — Phase 8h `values` command verified live
+
+Transcript: `/tmp/metasonic-live-session-8h-values.log`.
+
+First live operator pass against the implementation of the Phase 8h
+`values` command (commit `2bb70cc`). Used the same
+`examples/manifests/saw-noise-filter.json` /
+`require-preserving` setup as the 8h evidence pass. Driving order:
+`values` on a fresh session, OSC batch on cutoff / q / level,
+`values`, `demo saw-filter-bright`, `values`, OSC batch on
+cutoff / q, `values`, `demo saw-filter-dark`, `values`, single
+`level=0.05` OSC, `values`, OSC batch on level / cutoff, `values`,
+same-demo `demo saw-filter-dark`, `values`, `status`, `quit`.
+
+- Rows preserved manifest order (`carrier/0`, `lpf/0`, `lpf/1`,
+  `gain/0`) on every `values` print — matching the addressable
+  surface above it. The sort regression flagged before merge stays
+  gone.
+- Fresh-session `values` rendered all four rows as `source=default`
+  with manifest defaults.
+- Accepted writes landed as `source=accepted` with the operator-
+  supplied value; repeated writes to the same control resolved to
+  the last value (cutoff 900 / 1800 / 2400 → `value=2400`).
+- Accepted values were retained across three preserving reloads
+  (dark → bright, bright → dark, same-demo dark → dark). The
+  `default=` column tracked the new plan's defaults independently of
+  the retained `value=` column, so e.g. on bright the cutoff row
+  read `value=2400 source=accepted default=2400.0` — the `source=`
+  tag disambiguates "operator-set" from "default-derived" when the
+  two coincide. Worth noting for future readers; not a defect.
+- `0.05` rendered as `value=5e-2` in both the OSC accept line and
+  the matching `values` row, confirming the shared
+  `renderOperatorValue` contract.
+- `Terminating session.` printed cleanly at `quit`. Audible
+  shutdown result not asserted here.
+
+Follow-up chosen from this pass: no new code lane. 8h closes; the
+text-shell observability gap promoted by the prior 8h evidence pass
+is now answered by the `values` command on this fixture.
