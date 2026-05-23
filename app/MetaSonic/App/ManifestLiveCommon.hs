@@ -43,6 +43,7 @@ module MetaSonic.App.ManifestLiveCommon
   , liveOSCListenerHooksForObservedWith
   , liveOSCListenerHooksWithControlsAndObserverAndOutput
   , liveMIDIListenerHooksForObserved
+  , liveMIDIListenerHooksForObservedWith
   , liveIngressTargetPolicy
   , liveReloadProducer
   , liveAudioOptions
@@ -120,6 +121,25 @@ module MetaSonic.App.ManifestLiveCommon
   , renderOSCAcceptLineWithControls
   , renderOSCIssueLine
 
+    -- * MIDI listener-event line renderers (pure, testable)
+    --
+    -- The MIDI analogue of the OSC renderer pair. The accept line
+    -- carries only what the hook payload exposes — the queued
+    -- 'CmdControlWrite' plus the target's binding metadata. The
+    -- listener does not thread the raw CC \/ channel byte through
+    -- to the hook (see 'app/MetaSonic/App/ManifestMIDIListener.hs'),
+    -- so the accept line does not render @cc=N ch=M@; the design
+    -- note for Phase 8h step 3c records this constraint.
+    --
+    -- The issue renderer returns 'Maybe' because 'MmliIgnoredEvent'
+    -- is silent by default — non-CC events on a manifest MIDI path
+    -- would otherwise drown an operator transcript whenever VMPK
+    -- emits note-on \/ note-off.
+  , renderMIDIAcceptLine
+  , renderMIDIAcceptLineWithControls
+  , renderMIDIIssueLine
+  , renderMIDIIssueLineWithControls
+
     -- * OSC addressable-surface line renderer (pure, testable)
     --
     -- The startup-time print at 'printAddressableSurface' routes
@@ -143,7 +163,7 @@ module MetaSonic.App.ManifestLiveCommon
 import           Control.Concurrent             (threadDelay)
 import           Control.Monad                  (forM, forM_, unless)
 import           Data.IORef                     ()
-import           Data.List                      (dropWhileEnd, find)
+import           Data.List                      (dropWhileEnd, find, sort)
 import qualified Data.Map.Strict                as M
 import           Data.Maybe                     (mapMaybe)
 import qualified Data.Set                       as S
@@ -158,6 +178,7 @@ import           MetaSonic.App.ManifestOSCIngressOps
                                                  ManifestOSCIngressOpsIssue)
 import           MetaSonic.App.ManifestMIDIListener
                                                 (ManifestMIDIListenerHooks (..),
+                                                 ManifestMIDIListenerIssue (..),
                                                  defaultManifestMIDIListenerHooks)
 import           MetaSonic.App.ManifestOSCListener
                                                 (ManifestOSCListenerHooks (..),
@@ -170,7 +191,12 @@ import           MetaSonic.App.ManifestReloadBinding
                                                  muitDemoKey,
                                                  muitVoiceSelection)
 import           MetaSonic.App.ManifestReloadMIDIBinding
-                                                (mmitControls)
+                                                (ManifestMIDIAddressIssue (..),
+                                                 ManifestMIDIControlBinding (..),
+                                                 ManifestMIDIIngressTarget,
+                                                 mmitControls)
+import           MetaSonic.App.ManifestReloadMIDIIngress
+                                                (ManifestMIDIIngressIssue (..))
 import           MetaSonic.App.ManifestReloadCli
                                                 (planManifestReloadForDemo,
                                                  readManifestReloadDocFile,
@@ -745,6 +771,41 @@ liveMIDIListenerHooksForObserved observe =
     }
 
 
+-- | Phase 8h step 3c: target-aware, sink-aware MIDI hooks for the
+-- live shell. The supplied target's @'mmitControls'@ table is the
+-- metadata source for accept-line display names and the bound-CC
+-- context on a @cc-unbound@ reject; the sink is the live shell's
+-- Haskeline-aware @extPrintDyn@ so accept and issue lines redraw
+-- under an in-progress edit buffer instead of corrupting it. The
+-- observer keeps the producer-neutral
+-- @VoiceKey -> ControlTag -> Value -> IO ()@ shape so the value
+-- cache updater stays shared with OSC.
+--
+-- @mmlhOnAccepted@ prints the accept line (when 'renderMIDIAcceptLineWithControls'
+-- returns @Just@; 'Nothing' on a rejected enqueue defers to
+-- @mmlhOnIssue@) and then invokes the observer.
+-- @mmlhOnIssue@ prints the rejection line, except for
+-- 'MmliIgnoredEvent' which is silent by default.
+liveMIDIListenerHooksForObservedWith
+  :: ManifestMIDIIngressTarget
+  -> (VoiceKey -> ControlTag -> Value -> IO ())
+  -> (String -> IO ())
+  -> ManifestMIDIListenerHooks
+liveMIDIListenerHooksForObservedWith target observe output =
+  let controls = mmitControls target
+  in ManifestMIDIListenerHooks
+       { mmlhOnAccepted = \result -> do
+           mapM_ (output . ("  " <>))
+                 (renderMIDIAcceptLineWithControls controls result)
+           case acceptedFanInControlWrite result of
+             Just (voice, tag, value) -> observe voice tag value
+             Nothing                  -> pure ()
+       , mmlhOnIssue =
+           mapM_ (output . ("  " <>))
+             . renderMIDIIssueLineWithControls controls
+       }
+
+
 -- | Core variant: every operator-facing line goes through @output@.
 -- The accept-line printer routes accepted-write events into the
 -- observer in addition to printing; rejected events take the
@@ -910,6 +971,121 @@ renderOSCIssueLine issue = case issue of
   MoliEnqueueRejected cmd queueIssue ->
     "osc enqueue-reject: " <> renderCommand cmd
     <> " issue=" <> show queueIssue
+
+
+-- | MIDI analogue of 'renderOSCAcceptLine'. Renders the accepted
+-- enqueue side of one MIDI listener event as
+-- @\"midi accept: \/v0\/lpf\/0 value=900\"@; returns 'Nothing' for an
+-- enqueue rejection so 'renderMIDIIssueLine' is the single source
+-- of the operator-facing line (the same dedup policy the OSC
+-- renderer encodes).
+--
+-- The hook payload constraint: 'mmlhOnAccepted' takes only a
+-- 'SessionFanInEnqueueResult', not the raw CC \/ channel byte, so
+-- the line cannot render @cc=N ch=M@. The Phase 8h step 3c design
+-- note records the constraint.
+renderMIDIAcceptLine :: SessionFanInEnqueueResult -> Maybe String
+renderMIDIAcceptLine =
+  renderMIDIAcceptLineWithControls []
+
+
+-- | Metadata-aware variant of 'renderMIDIAcceptLine'. The binding
+-- list is target-local and may be empty; unmatched 'ControlTag's
+-- still render through their concrete address so accepted writes
+-- never disappear just because metadata was unavailable.
+renderMIDIAcceptLineWithControls
+  :: [ManifestMIDIControlBinding]
+  -> SessionFanInEnqueueResult
+  -> Maybe String
+renderMIDIAcceptLineWithControls controls result =
+  case sfierResult result of
+    SessionEnqueued queued ->
+      Just
+        ("midi accept: "
+         <> renderAcceptedMIDICommand controls (qscCommand queued))
+    SessionEnqueueRejected{} ->
+      Nothing
+
+
+-- | MIDI analogue of 'renderOSCIssueLine'. Mirrors the OSC reject
+-- taxonomy but lifts the result into 'Maybe' so 'MmliIgnoredEvent'
+-- can return 'Nothing' — non-CC events on a manifest MIDI path are
+-- silent by default to keep the operator transcript readable when
+-- VMPK or another virtual controller emits note-on \/ note-off.
+--
+-- The taxonomy:
+--
+-- * @'MmliIngressIssue' ('MmiiChannelFiltered' ch)@ →
+--   @\"midi reject (channel-filtered): ch=N\"@.
+-- * @'MmliIngressIssue' ('MmiiAddressIssue' ('MmaiUnknownCC' cc))@ →
+--   @\"midi reject (cc-unbound): cc=N (bound: ...)\"@ when bindings
+--   are supplied, or without the bound-CC context when they are not.
+-- * @'MmliIngressIssue' ('MmiiInvalidChannel' ch)@ /
+--   @'MmiiInvalidDataByte' b@ → @\"midi reject (bad-data): ...\"@.
+-- * @'MmliEnqueueRejected' cmd 'SeiReloadInProgress'@ →
+--   @\"midi reject (reload-window): <cmd>\"@ (same shape as the OSC
+--   reload-window line).
+-- * @'MmliEnqueueRejected' cmd \<other\>@ →
+--   @\"midi enqueue-reject: <cmd> issue=...\"@.
+-- * @'MmliIgnoredEvent' _@ → 'Nothing'.
+renderMIDIIssueLine :: ManifestMIDIListenerIssue -> Maybe String
+renderMIDIIssueLine =
+  renderMIDIIssueLineWithControls []
+
+
+-- | Metadata-aware variant of 'renderMIDIIssueLine'. The binding
+-- list seeds the @(bound: N, M, ...)@ context on the cc-unbound
+-- line. With an empty list the bound-CC context is omitted; with
+-- a non-empty list the bound CCs are listed in ascending order.
+renderMIDIIssueLineWithControls
+  :: [ManifestMIDIControlBinding]
+  -> ManifestMIDIListenerIssue
+  -> Maybe String
+renderMIDIIssueLineWithControls controls issue = case issue of
+  MmliIngressIssue (MmiiChannelFiltered ch) ->
+    Just ("midi reject (channel-filtered): ch=" <> show ch)
+  MmliIngressIssue (MmiiAddressIssue (MmaiUnknownCC cc)) ->
+    Just ("midi reject (cc-unbound): cc=" <> show cc <> boundContext)
+    where
+      boundContext = case sort (map mmcbCC controls) of
+        []  -> ""
+        ccs -> " (bound: " <> renderCCList ccs <> ")"
+  MmliIngressIssue (MmiiInvalidChannel ch) ->
+    Just ("midi reject (bad-data): channel=" <> show ch)
+  MmliIngressIssue (MmiiInvalidDataByte b) ->
+    Just ("midi reject (bad-data): byte=" <> show b)
+  MmliEnqueueRejected cmd SeiReloadInProgress ->
+    Just ("midi reject (reload-window): " <> renderCommand cmd)
+  MmliEnqueueRejected cmd queueIssue ->
+    Just
+      ("midi enqueue-reject: " <> renderCommand cmd
+       <> " issue=" <> show queueIssue)
+  MmliIgnoredEvent _ ->
+    Nothing
+  where
+    renderCCList []     = ""
+    renderCCList [c]    = show c
+    renderCCList (c:cs) = show c <> ", " <> renderCCList cs
+
+
+renderAcceptedMIDICommand
+  :: [ManifestMIDIControlBinding]
+  -> SessionCommand
+  -> String
+renderAcceptedMIDICommand controls cmd = case cmd of
+  CmdControlWrite voice tag value ->
+    renderConcreteOSCAddress voice tag
+    <> nameSuffix
+    <> " value=" <> renderOperatorValue value
+    where
+      nameSuffix =
+        case find ((tag ==) . mmcbControlTag) controls of
+          Nothing ->
+            ""
+          Just binding ->
+            " name=\"" <> mmcbDisplayName binding <> "\""
+  _ ->
+    renderCommand cmd
 
 
 renderCommand :: SessionCommand -> String

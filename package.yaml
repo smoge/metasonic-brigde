@@ -254,6 +254,7 @@ tests:
       - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.Spec.AppManifestLiveCommonAddressableSurface
       - MetaSonic.Spec.AppManifestLiveCommonIngressPolicy
+      - MetaSonic.Spec.AppManifestLiveCommonMIDIRender
       - MetaSonic.Spec.AppManifestLiveCommonOSCControls
       - MetaSonic.Spec.AppManifestLiveCommonOSCRender
       - MetaSonic.Spec.AppManifestLiveIngressOps

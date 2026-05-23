@@ -18,6 +18,8 @@ import           MetaSonic.Spec.AppManifestLiveCommonIngressPolicy
                                                   (appManifestLiveCommonIngressPolicyTests)
 import           MetaSonic.Spec.AppManifestLiveCommonOSCControls
                                                   (appManifestLiveCommonOSCControlsTests)
+import           MetaSonic.Spec.AppManifestLiveCommonMIDIRender
+                                                  (appManifestLiveCommonMIDIRenderTests)
 import           MetaSonic.Spec.AppManifestLiveCommonOSCRender
                                                   (appManifestLiveCommonOSCRenderTests)
 import           MetaSonic.Spec.AppManifestLiveIngressOps
@@ -125,6 +127,7 @@ main = defaultMain $ testGroup "MetaSonic"
   [ appDemoCatalogTests
   , appManifestLiveCommonAddressableSurfaceTests
   , appManifestLiveCommonIngressPolicyTests
+  , appManifestLiveCommonMIDIRenderTests
   , appManifestLiveCommonOSCControlsTests
   , appManifestLiveCommonOSCRenderTests
   , appManifestLiveIngressOpsTests
