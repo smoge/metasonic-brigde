@@ -195,5 +195,3 @@ rejectedResult cmd =
         SessionEnqueueRejected testProducer cmd SeiReloadInProgress
     , sfierQueueDepth = 0
     }
-
-

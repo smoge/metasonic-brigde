@@ -4004,14 +4004,25 @@ Still gated:
   only — MIDI/UI accepted-write seam (the cache shape already
   takes it; needs a producer-neutral upstream hook), same-demo
   reload's `committed (new plan installed)` wording, ALSA stderr
-  noise on startup, in-session command history / readline — none
-  blocking on current evidence.
+  noise on startup, and persistent command-history-file behavior
+  — none blocking on current evidence. Phase 8j closed the
+  readline / TTY-line-discipline watch item with a `haskeline`
+  boundary (`7df0586`, verification `6d11b3a`; design note:
+  [notes/2026-05-22-h-live-session-tty-line-discipline-design.md](notes/2026-05-22-h-live-session-tty-line-discipline-design.md)):
+  async OSC accept lines now route through `getExternalPrint`
+  while the command loop runs under `getInputLine`, so partial
+  operator input redraws instead of merging into submitted
+  commands. Persistent history remains deliberately off
+  (`historyFile = Nothing`) and is only a future polish candidate.
   For the device-backed live-session paths above (the MIDI/device
   smoke lane and the hardware-paired live-reload demo), what
   remains is real hardware confirmation and the same hardware-gated
   CI question those paths share. The Phase 8h `values` slice has
   no hardware-specific contract; its live verification is the
-  2026-05-22 operator transcript recorded in the playbook.
+  2026-05-22 operator transcript recorded in the playbook. The
+  Phase 8j line-editor closeout is likewise text-shell-only; its
+  live verification is the 2026-05-23 replay transcript recorded
+  in the playbook.
 - [ ] Failure/event semantics across compile, allocation, and stale
   producer commands. The install/reload-strategy timeline is now
   covered by the `ManifestReloadEvent` ADT in
