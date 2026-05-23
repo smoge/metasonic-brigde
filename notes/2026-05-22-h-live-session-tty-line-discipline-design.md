@@ -2,8 +2,15 @@
 
 Date: 2026-05-22
 
-Status: open. This note opens the lane from the 8i/8j live-session
-operator evidence. No implementation choice is selected yet.
+Status: closed. Implementation landed as `7df0586` using the
+line-editor boundary: the live-session command loop now runs under
+`haskeline`, operator-facing output routes through an injectable sink
+backed by `getExternalPrint`, and the OSC listener accept-line path
+uses that sink while the editor session is active. Verification
+transcript: `/tmp/metasonic-live-session-8j-tty-after-fix.log`
+(2026-05-23). The post-fix replay kept OSC accept lines visible and
+eliminated the merged-command failures (`statuvalues`, `statstatus`);
+final `status` was healthy and `quit` exited with code 0.
 
 Companion to:
 
@@ -114,8 +121,9 @@ The constraint above narrows the choice to two real options. A naïve
 "redraw the prompt after async output" is not an independent third
 option on the current input model — see the Line-Editor section.
 
-This note deliberately does not pick between the two below; the
-implementation design note will, with the tradeoff stated.
+The implementation picked the line-editor boundary. The deferred-output
+serialization option below remains as historical context for the
+decision that was available before code landed.
 
 ### Small Safety Fix: Output Serialization With Deferred Async
 
@@ -184,9 +192,9 @@ Questions:
   `useFileHandle` mode provides an in-process, no-TTY input path
   that is the standard test seam.
 - Should command history land in the same slice, or be split out
-  to keep the first slice focused on corruption? (History is free
-  once `haskeline` is wired; splitting it would mean explicitly
-  disabling history, which is more work than just keeping it.)
+  to keep the first slice focused on corruption? (Line editing is
+  cheap once `haskeline` is wired; persistent history-file behavior is
+  a separate operator-contract choice.)
 
 ### Lean
 
@@ -196,10 +204,15 @@ just an internal smoke. Dependency / risk inspection found the
 already present). The leaning recommendation, pending the
 implementation note's confirmation, is the **line-editor boundary**:
 it solves command corruption without the deferred-output operator
-regression, and incidentally closes the command-history watch item
-that would otherwise need its own slice later.
+regression and gives the shell real line-editor behavior. Persistent
+cross-session command history remains outside the closed slice unless a
+later operator pass makes it worth opening separately.
 
-The implementation design note remains the binding decision.
+Implementation `7df0586` made this recommendation binding for the
+closed slice. It deliberately used an in-memory `haskeline` session
+(`historyFile = Nothing`); persistent cross-session history is not
+claimed by this closeout and can be treated as a separate polish
+follow-up if it becomes useful.
 
 ## Source Seams To Inspect
 
@@ -233,7 +246,38 @@ Run partial `statu` + OSC burst + intended `values`, and partial
 `statuvalues`, `statstatus`, or equivalent merged-command submission,
 while OSC accept lines remain visible and final `status` is healthy.
 
+Closed verification (2026-05-23):
+
+- Transcript: `/tmp/metasonic-live-session-8j-tty-after-fix.log`.
+- Implementation: `7df0586`.
+- Deterministic focused test before live replay:
+  `stack test --fast --test-arguments "-p output --hide-successes"`
+  passed (`22/22`).
+- Probe B replay: async OSC accept lines landed while `statu` was in
+  the edit buffer; the operator then submitted `values`. The transcript
+  contains no `statuvalues`, and `values` executed normally with
+  accepted values `cutoff=2200`, `q=0.8`, `level=5e-2`.
+- Probe C replay: async OSC accept lines landed while `stat` was in
+  the edit buffer; the operator then submitted `status`. The transcript
+  contains no `statstatus`, and `status` reported audio running,
+  queue depth 0, owner ready, reload normal, and one active voice.
+- `quit` exited cleanly with `COMMAND_EXIT_CODE="0"`.
+- One non-load-bearing setup artifact remained:
+  `unknown command: "statu"` appeared before the timed Probe B replay,
+  because `statu` was submitted on its own once. This mirrors the
+  earlier Probe A setup-error framing and does not affect the
+  load-bearing OSC-interleaved probes.
+
 ## Open Questions Before Code
+
+Closeout answer: the slice chose the line-editor option. `haskeline`
+integrated cleanly with the existing IORef-threaded loop by placing
+one `runInputT` bracket around the whole `sessionLoop`, using an
+IORef-backed dynamic sink for listener hooks created before the
+`InputT` scope, and restoring the sink with `finally` before host-stack
+teardown. Async operator output is not deferred; it remains visible via
+`getExternalPrint`. Persistent history was intentionally not enabled in
+this slice.
 
 The questions below are scoped to whichever candidate the
 implementation note picks; "Can prompt redraw be correct with

@@ -1181,3 +1181,54 @@ deliberately reproduced the same phenomenon and pinned the mechanism.
 The implementation scope is not chosen here. The design note should
 decide deliberately between output serialization, prompt redraw, and a
 real line-editor boundary.
+
+### 2026-05-23 — 8j post-fix replay passed; line-editor boundary closes lane
+
+Transcript: `/tmp/metasonic-live-session-8j-tty-after-fix.log`.
+
+Post-implementation replay against
+`examples/manifests/saw-noise-filter.json`, starting from
+`noise-filter-soft` on the `require-preserving` route. Implementation
+under test: `7df0586` (`haskeline` line-editor boundary plus
+operator-output sink plumbing).
+
+Driving sequence: initial `values`, partial `statu` held in the edit
+buffer while an OSC burst landed, submitted `values`, partial `stat`
+held in the edit buffer while a second OSC burst landed, submitted
+`status`, then `quit`.
+
+- Baseline `values` rendered the `noise-filter-soft` defaults for
+  cutoff, q, and level.
+- Probe B replayed the former failure shape: partial `statu`, async
+  OSC accept output on `/v0/lpf/0`, `/v0/lpf/1`, and `/v0/gain/0`,
+  then intended `values`. OSC accept lines remained visible and
+  Haskeline redrew the edit buffer around those lines; the submitted
+  command did not merge into `statuvalues`, and `values`
+  executed normally with accepted values `cutoff=2200`, `q=0.8`,
+  `level=5e-2`.
+- Probe C replayed the second failure shape: partial `stat`, async OSC
+  accept output on the same three controls, then intended `status`.
+  OSC accept lines remained visible and Haskeline redrew the edit
+  buffer around those lines; the submitted command did not merge into
+  `statstatus`, and `status` reported a healthy live session: audio
+  running, queue depth 0, owner ready, reload normal, one active voice,
+  and ingress open on port 17004.
+- Pass condition: the transcript contains no `statuvalues` or
+  `statstatus` token, OSC accept lines remain visible during both
+  timed probes, and the final `values` / `status` commands execute as
+  intended.
+- The session exited cleanly at `quit` with `COMMAND_EXIT_CODE=0`.
+- One non-load-bearing setup artifact appeared before the timed Probe B
+  replay: `unknown command: "statu"`. Like the earlier Probe A setup
+  error, that line came from submitting a partial command on its own;
+  it is not the TTY corruption mechanism. The load-bearing
+  OSC-interleaved probes did not reproduce merged-command failures.
+
+Follow-up chosen from this pass: close **live-session TTY line
+discipline**. The design note
+`notes/2026-05-22-h-live-session-tty-line-discipline-design.md` is
+closed against `7df0586` and this transcript; the calibrated-exception
+lane is sealed. Persistent cross-session command history is not
+claimed by the closeout because the implementation uses
+`historyFile = Nothing`; keep that as a separate polish candidate only
+if it becomes useful.
