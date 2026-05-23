@@ -2,9 +2,27 @@
 
 Date: 2026-05-22
 
-Status: design note opening a narrow Evidence To Code lane. No code
-lands on the strength of this note alone; the implementation slice
-should still be reviewed against the source seams below before patching.
+Status: closed. Implementation landed as `ad26139`
+(`Implement Phase 8f host-stack close fade`). Live verification ran
+the design note's two shutdown-only recipes against the same fixture
+families that promoted the lane:
+
+- `/tmp/metasonic-live-session-shutdown-only-after-fade.log`
+  (`preserve-smooth-cutoff` / `preserve-smooth-cutoff-dark`).
+- `/tmp/metasonic-live-session-shutdown-saw-after-fade.log`
+  (`saw-noise-filter` / `saw-filter-dark`).
+
+Both exited cleanly (`COMMAND_EXIT_CODE=0`, `Terminating session.`
+present) and the operator heard no `quit` snap on either fixture.
+The 10 ms host-stack close fade resolves the observed shutdown
+artifact on this host. Findings entry: see the
+[playbook](2026-05-21-b-live-session-operator-pass-playbook.md)
+"Phase 8f host-stack close fade clears the shutdown snap" pass.
+
+Residual risk: host-/device-specific teardown could still vary, since
+the verification covers exactly one PortAudio host + output device
+configuration. The slice does not claim cross-device click-free
+shutdown — only that on this operator's pairing the snap is gone.
 
 Companion to:
 
@@ -248,8 +266,8 @@ Success criteria:
 
 | Slice | Status | Notes |
 |-------|--------|-------|
-| Phase 8f design | This note | Evidence now clears repeated-friction threshold |
-| Phase 8f implementation | Open next | Explicit graceful final stop; ordinary stop remains unchanged |
+| Phase 8f design | Closed | Evidence cleared repeated-friction threshold |
+| Phase 8f implementation | Closed (`ad26139`) | Host-stack close fade; ordinary stop unchanged; live verification clean on both shutdown-only fixtures |
 | Later: reload stop fade | Not open | Only if reload-specific stopped-audio passes produce snap pressure |
 | Later: configurable fade length | Not open | Only if fixed fade causes practical friction |
 

@@ -927,3 +927,23 @@ Evidence To Code rubric, this promotes **graceful session shutdown
 fade/mute** from watch item to a narrow implementation lane: clean
 final session shutdown should avoid the snap before tearing down the
 audio stream.
+
+### 2026-05-22 — Phase 8f host-stack close fade clears the shutdown snap
+
+Transcripts:
+
+- `/tmp/metasonic-live-session-shutdown-only-after-fade.log`
+  (`preserve-smooth-cutoff` / `preserve-smooth-cutoff-dark`).
+- `/tmp/metasonic-live-session-shutdown-saw-after-fade.log`
+  (`saw-noise-filter` / `saw-filter-dark`).
+
+Verification of the Phase 8f host-stack close fade
+(implementation `ad26139`). Both transcripts re-ran the shutdown-only
+recipe from the design note (`status`, listen, `quit`) against the
+same two fixture families that promoted the lane. Both exited cleanly
+with command exit code 0 and printed `Terminating session.` ahead of
+the script footer.
+
+Perceptual result: **no `quit` snap heard** on either fixture. The
+10 ms host-stack close fade resolves the observed shutdown artifact
+on this host. Lane closes.
