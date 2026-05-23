@@ -44,6 +44,7 @@ import qualified Data.ByteString            as BS
 import qualified Data.ByteString.Char8      as BSC
 import           Data.Int                   (Int32)
 import qualified Data.Map.Strict            as M
+import           GHC.Float                  (float2Double)
 import           GHC.Generics               (Generic)
 
 import           MetaSonic.Bridge.Source    (MigrationKey (..))
@@ -334,7 +335,7 @@ decodeControlAddress addr = do
 
 decodeControlValue :: [OscArg] -> Either DispatchIssue Value
 decodeControlValue args = case args of
-  [OscArgFloat f] -> Right (realToFrac f)
+  [OscArgFloat f] -> Right (float2Double f)
   [OscArgInt   i] -> Right (fromIntegral (i :: Int32))
   other           -> Left (DiUnsupportedArgShape (length other))
 
