@@ -5,9 +5,10 @@
 -- Description : Tests for the Phase 8h live-session value cache.
 --
 -- Pins the pure cache operations and the operator-facing renderer
--- behind the @values@ command, plus the producer-neutral
--- 'acceptedControlWrite' extractor that wires the OSC listener into
--- the cache. Avoids real UDP / audio so the test stays in-language.
+-- behind the @values@ command, plus the producer-neutral accepted-
+-- write extractors that wire OSC \/ UI \/ MIDI listeners into the
+-- cache. Avoids real UDP \/ audio \/ MIDI device IO so the test stays
+-- in-language.
 module MetaSonic.Spec.AppManifestLiveValueCache
   ( appManifestLiveValueCacheTests
   ) where
@@ -21,7 +22,10 @@ import           Test.Tasty       (TestTree, testGroup)
 import           Test.Tasty.HUnit (testCase, (@?=), assertBool)
 
 import           MetaSonic.App.ManifestLiveCommon
-                                                (acceptedControlWrite)
+                                                (acceptedFanInControlWrite,
+                                                 acceptedMIDIProducerControlWrites,
+                                                 acceptedOSCControlWrite,
+                                                 acceptedUIControlWrite)
 import           MetaSonic.App.ManifestLiveValueCache
                                                 (LiveControlValue (..),
                                                  LiveControlValueSource (..),
@@ -40,6 +44,10 @@ import           MetaSonic.Session.FanIn        (SessionFanInEnqueueResult (..))
 import qualified Data.ByteString.Char8       as BS
 
 import           MetaSonic.OSC.Dispatch.Internal (DispatchIssue (..))
+import           MetaSonic.Session.MIDIProducer (MIDIProducerCommandBatch (..),
+                                                 MIDIProducerEnqueueResult (..),
+                                                 MIDIProducerIssue (..),
+                                                 initialMIDIProducerState)
 import           MetaSonic.Session.OSCProducer  (OSCProducerEnqueueResult (..))
 import           MetaSonic.Session.Queue        (CommandSequence (..),
                                                  ProducerId (..),
@@ -47,15 +55,20 @@ import           MetaSonic.Session.Queue        (CommandSequence (..),
                                                  QueuedSessionCommand (..),
                                                  SessionEnqueueIssue (..),
                                                  SessionEnqueueResult (..))
+import           MetaSonic.Session.UIProducer   (UIProducerEnqueueResult (..),
+                                                 UIProducerIssue (..))
 
 
 appManifestLiveValueCacheTests :: TestTree
 appManifestLiveValueCacheTests =
   testGroup "App manifest live value cache (Phase 8h)"
-  [ testGroup "recordAcceptedWrite"     recordAcceptedWriteTests
-  , testGroup "retainSurvivingControls" retainSurvivingControlsTests
-  , testGroup "renderValuesTable"       renderValuesTableTests
-  , testGroup "acceptedControlWrite"    acceptedControlWriteTests
+  [ testGroup "recordAcceptedWrite"               recordAcceptedWriteTests
+  , testGroup "retainSurvivingControls"           retainSurvivingControlsTests
+  , testGroup "renderValuesTable"                 renderValuesTableTests
+  , testGroup "acceptedFanInControlWrite"         acceptedFanInControlWriteTests
+  , testGroup "acceptedOSCControlWrite"           acceptedOSCControlWriteTests
+  , testGroup "acceptedUIControlWrite"            acceptedUIControlWriteTests
+  , testGroup "acceptedMIDIProducerControlWrites" acceptedMIDIProducerControlWritesTests
   ]
 
 
@@ -287,30 +300,135 @@ renderValuesTableTests =
 
 
 -- ---------------------------------------------------------------------------
--- acceptedControlWrite (producer-neutral extractor)
+-- acceptedFanInControlWrite (producer-neutral core projection)
 -- ---------------------------------------------------------------------------
 
-acceptedControlWriteTests :: [TestTree]
-acceptedControlWriteTests =
-  [ testCase "extracts (voice, tag, value) from an accepted CmdControlWrite" $
-      acceptedControlWrite
-        (acceptedResult (CmdControlWrite (vk "v0") cutoffTag 900.0))
+acceptedFanInControlWriteTests :: [TestTree]
+acceptedFanInControlWriteTests =
+  [ testCase "projects an accepted CmdControlWrite to Just (voice, tag, value)" $
+      acceptedFanInControlWrite
+        (acceptedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0))
         @?= Just (vk "v0", cutoffTag, 900.0)
 
-  , testCase "returns Nothing for a rejected CmdControlWrite" $
-      acceptedControlWrite
-        (rejectedResult (CmdControlWrite (vk "v0") cutoffTag 900.0))
+  , testCase "returns Nothing for an accepted non-control command (CmdVoiceOff)" $
+      acceptedFanInControlWrite
+        (acceptedFanIn (CmdVoiceOff (vk "v0")))
+        @?= Nothing
+
+  , testCase "returns Nothing for an enqueue-rejected command" $
+      acceptedFanInControlWrite
+        (rejectedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0))
+        @?= Nothing
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- acceptedOSCControlWrite (OSC wrapper peel)
+-- ---------------------------------------------------------------------------
+
+acceptedOSCControlWriteTests :: [TestTree]
+acceptedOSCControlWriteTests =
+  [ testCase "peels OSCProducerEnqueueAttempted and projects the inner result" $
+      acceptedOSCControlWrite
+        (OSCProducerEnqueueAttempted
+           (CmdControlWrite (vk "v0") cutoffTag 900.0)
+           (acceptedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0)))
+        @?= Just (vk "v0", cutoffTag, 900.0)
+
+  , testCase "returns Nothing when the inner enqueue was rejected" $
+      acceptedOSCControlWrite
+        (OSCProducerEnqueueAttempted
+           (CmdControlWrite (vk "v0") cutoffTag 900.0)
+           (rejectedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0)))
         @?= Nothing
 
   , testCase "returns Nothing for OSCProducerDecodeRejected" $
-      acceptedControlWrite
+      acceptedOSCControlWrite
         (OSCProducerDecodeRejected (DiInvalidAddressFormat (BS.pack "/bogus")))
         @?= Nothing
   ]
 
 
 -- ---------------------------------------------------------------------------
--- Helpers — synthetic OSCProducerEnqueueResult builders for tests
+-- acceptedUIControlWrite (UI wrapper peel)
+-- ---------------------------------------------------------------------------
+
+acceptedUIControlWriteTests :: [TestTree]
+acceptedUIControlWriteTests =
+  [ testCase "peels UIProducerEnqueueAttempted and projects the inner result" $
+      acceptedUIControlWrite
+        (UIProducerEnqueueAttempted
+           (CmdControlWrite (vk "v0") cutoffTag 900.0)
+           (acceptedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0)))
+        @?= Just (vk "v0", cutoffTag, 900.0)
+
+  , testCase "returns Nothing when the inner enqueue was rejected" $
+      acceptedUIControlWrite
+        (UIProducerEnqueueAttempted
+           (CmdControlWrite (vk "v0") cutoffTag 900.0)
+           (rejectedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0)))
+        @?= Nothing
+
+  , testCase "returns Nothing for a producer-local UIProducerRejected" $
+      acceptedUIControlWrite
+        (UIProducerRejected (UpiNonFiniteControlValue cutoffTag (1/0)))
+        @?= Nothing
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- acceptedMIDIProducerControlWrites (MIDI wrapper, list-valued)
+-- ---------------------------------------------------------------------------
+
+acceptedMIDIProducerControlWritesTests :: [TestTree]
+acceptedMIDIProducerControlWritesTests =
+  [ testCase "projects one accepted CmdControlWrite to a singleton list" $
+      acceptedMIDIProducerControlWrites
+        (midiAttempted
+           [CmdControlWrite (vk "v0") cutoffTag 900.0]
+           [acceptedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0)])
+        @?= [(vk "v0", cutoffTag, 900.0)]
+
+  , testCase "projects two accepted CmdControlWrites in order" $
+      acceptedMIDIProducerControlWrites
+        (midiAttempted
+           [ CmdControlWrite (vk "v0") cutoffTag 900.0
+           , CmdControlWrite (vk "v0") qTag      0.4
+           ]
+           [ acceptedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0)
+           , acceptedFanIn (CmdControlWrite (vk "v0") qTag      0.4)
+           ])
+        @?= [ (vk "v0", cutoffTag, 900.0)
+            , (vk "v0", qTag,      0.4)
+            ]
+
+  , testCase "drops accepted non-control commands from a mixed batch" $
+      acceptedMIDIProducerControlWrites
+        (midiAttempted
+           [ CmdVoiceOff (vk "v0")
+           , CmdControlWrite (vk "v0") qTag 0.4
+           ]
+           [ acceptedFanIn (CmdVoiceOff (vk "v0"))
+           , acceptedFanIn (CmdControlWrite (vk "v0") qTag 0.4)
+           ])
+        @?= [(vk "v0", qTag, 0.4)]
+
+  , testCase "returns [] for a deferred wrapper (non-empty batch, empty results)" $
+      acceptedMIDIProducerControlWrites
+        (midiAttempted
+           [CmdControlWrite (vk "v0") cutoffTag 900.0]
+           [])
+        @?= []
+
+  , testCase "returns [] for MIDIProducerRejected" $
+      acceptedMIDIProducerControlWrites
+        (MIDIProducerRejected (MpiChannelFiltered 0) initialMIDIProducerState)
+        @?= []
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- Helpers — synthetic producer-enqueue result builders for tests
 -- ---------------------------------------------------------------------------
 
 testProducer :: ProducerId
@@ -319,21 +437,31 @@ testProducer = ProducerId
   , producerName = T.pack "values-cache-test"
   }
 
-acceptedResult :: SessionCommand -> OSCProducerEnqueueResult
-acceptedResult cmd =
-  OSCProducerEnqueueAttempted cmd SessionFanInEnqueueResult
-    { sfierResult = SessionEnqueued QueuedSessionCommand
-        { qscSequence = CommandSequence 1
-        , qscProducer = testProducer
-        , qscCommand  = cmd
-        }
-    , sfierQueueDepth = 1
-    }
+acceptedFanIn :: SessionCommand -> SessionFanInEnqueueResult
+acceptedFanIn cmd = SessionFanInEnqueueResult
+  { sfierResult = SessionEnqueued QueuedSessionCommand
+      { qscSequence = CommandSequence 1
+      , qscProducer = testProducer
+      , qscCommand  = cmd
+      }
+  , sfierQueueDepth = 1
+  }
 
-rejectedResult :: SessionCommand -> OSCProducerEnqueueResult
-rejectedResult cmd =
-  OSCProducerEnqueueAttempted cmd SessionFanInEnqueueResult
-    { sfierResult =
-        SessionEnqueueRejected testProducer cmd SeiReloadInProgress
-    , sfierQueueDepth = 0
-    }
+rejectedFanIn :: SessionCommand -> SessionFanInEnqueueResult
+rejectedFanIn cmd = SessionFanInEnqueueResult
+  { sfierResult =
+      SessionEnqueueRejected testProducer cmd SeiReloadInProgress
+  , sfierQueueDepth = 0
+  }
+
+midiAttempted
+  :: [SessionCommand]
+  -> [SessionFanInEnqueueResult]
+  -> MIDIProducerEnqueueResult
+midiAttempted commands results =
+  MIDIProducerEnqueueAttempted
+    MIDIProducerCommandBatch
+      { mpcbCommands = commands
+      , mpcbState    = initialMIDIProducerState
+      }
+    results

@@ -46,15 +46,21 @@ module MetaSonic.App.ManifestLiveCommon
   , liveReloadProducer
   , liveAudioOptions
 
-    -- * Producer-neutral accepted-write extractor
+    -- * Producer-neutral accepted-write extractors
     --
-    -- Phase 8h: the live-session value cache observer reads this to
-    -- decide whether an OSC listener event represents an accepted
-    -- 'CmdControlWrite' worth recording. Producer-neutral by signature:
-    -- any future MIDI / UI accepted-write hook can call the same
-    -- updater shape (@VoiceKey -> ControlTag -> Value -> IO ()@) on
-    -- the result of an equivalent extractor.
-  , acceptedControlWrite
+    -- Phase 8h step 3a: the live-session value cache observer reads
+    -- these to decide whether a producer enqueue event represents an
+    -- accepted 'CmdControlWrite' worth recording. The core projection
+    -- lives in 'acceptedFanInControlWrite' over
+    -- 'SessionFanInEnqueueResult'; the per-producer extractors below
+    -- peel their producer-specific wrapper and defer to it. All future
+    -- MIDI / UI accepted-write observer hooks can call the same updater
+    -- shape (@VoiceKey -> ControlTag -> Value -> IO ()@) without
+    -- re-implementing the projection.
+  , acceptedFanInControlWrite
+  , acceptedOSCControlWrite
+  , acceptedUIControlWrite
+  , acceptedMIDIProducerControlWrites
 
     -- * Startup helpers (die on failure)
   , readManifestDocOrDie
@@ -138,6 +144,7 @@ import           Control.Monad                  (forM, forM_, unless)
 import           Data.IORef                     ()
 import           Data.List                      (dropWhileEnd, find)
 import qualified Data.Map.Strict                as M
+import           Data.Maybe                     (mapMaybe)
 import qualified Data.Set                       as S
 import qualified Data.Text                      as T
 import           System.Exit                    (die)
@@ -202,7 +209,9 @@ import           MetaSonic.Session.FanInService (SessionFanInService,
                                                  enqueueSessionFanInServiceCommand,
                                                  readSessionFanInService)
 import qualified MetaSonic.Session.ManifestReload as MR
+import           MetaSonic.Session.MIDIProducer (MIDIProducerEnqueueResult (..))
 import           MetaSonic.Session.OSCProducer  (OSCProducerEnqueueResult (..))
+import           MetaSonic.Session.UIProducer   (UIProducerEnqueueResult (..))
 import           MetaSonic.Session.Queue        (ProducerId (..),
                                                  ProducerKind (..),
                                                  QueuedSessionCommand (..),
@@ -720,7 +729,7 @@ liveOSCListenerHooksWithControlsAndObserverAndOutput controls observe output =
   defaultManifestOSCListenerHooks
     { molhOnAccepted = \result -> do
         mapM_ (output . ("  " <>)) (renderOSCAcceptLineWithControls controls result)
-        case acceptedControlWrite result of
+        case acceptedOSCControlWrite result of
           Just (voice, tag, value) -> observe voice tag value
           Nothing                  -> pure ()
     , molhOnIssue =
@@ -728,25 +737,74 @@ liveOSCListenerHooksWithControlsAndObserverAndOutput controls observe output =
     }
 
 
--- | Phase 8h: pure projection of an 'OSCProducerEnqueueResult' down to
--- the @(VoiceKey, ControlTag, Value)@ shape the live-session value
--- cache records. Returns 'Nothing' for any result that is not an
--- accepted 'CmdControlWrite' (parse rejection, manifest rejection,
--- reload-window rejection, queue rejection, voice-on / voice-off, or
--- any other command kind).
+-- | Phase 8h step 3a: pure projection of a 'SessionFanInEnqueueResult'
+-- down to the @(VoiceKey, ControlTag, Value)@ shape the live-session
+-- value cache records. Returns 'Nothing' for any result that is not an
+-- accepted 'CmdControlWrite' (queue rejection, voice-on \/ voice-off,
+-- or any other command kind).
 --
--- Producer-neutral by signature: the same shape could project a
--- MIDI/UI accepted-write event into the cache updater if a future
--- slice adds an equivalent producer-side hook.
-acceptedControlWrite
+-- This is the producer-neutral seam. The OSC \/ UI \/ MIDI extractors
+-- below all peel their producer-specific wrapper and defer here, so
+-- the "accepted ⇒ projection" contract is expressed once instead of
+-- per producer. The projection reads from @qscCommand@ on the queued
+-- side, which is the command that actually entered the fan-in queue
+-- (relevant for MIDI, where one event can fan into multiple commands).
+acceptedFanInControlWrite
+  :: SessionFanInEnqueueResult
+  -> Maybe (VoiceKey, ControlTag, Value)
+acceptedFanInControlWrite enqueue =
+  case sfierResult enqueue of
+    SessionEnqueued queued ->
+      case qscCommand queued of
+        CmdControlWrite voice tag value -> Just (voice, tag, value)
+        _                               -> Nothing
+    SessionEnqueueRejected{} ->
+      Nothing
+
+
+-- | OSC peel: forward the inner enqueue result to
+-- 'acceptedFanInControlWrite'. Decode-rejected packets never reached
+-- the fan-in queue, so they project to 'Nothing'.
+acceptedOSCControlWrite
   :: OSCProducerEnqueueResult
   -> Maybe (VoiceKey, ControlTag, Value)
-acceptedControlWrite = \case
-  OSCProducerEnqueueAttempted (CmdControlWrite voice tag value) enqueue
-    | SessionEnqueued _ <- sfierResult enqueue ->
-        Just (voice, tag, value)
-  _ ->
+acceptedOSCControlWrite = \case
+  OSCProducerEnqueueAttempted _ enqueue ->
+    acceptedFanInControlWrite enqueue
+  OSCProducerDecodeRejected{} ->
     Nothing
+
+
+-- | UI peel: forward the inner enqueue result to
+-- 'acceptedFanInControlWrite'. UI-local shape rejections never reached
+-- the fan-in queue, so they project to 'Nothing'.
+acceptedUIControlWrite
+  :: UIProducerEnqueueResult
+  -> Maybe (VoiceKey, ControlTag, Value)
+acceptedUIControlWrite = \case
+  UIProducerEnqueueAttempted _ enqueue ->
+    acceptedFanInControlWrite enqueue
+  UIProducerRejected{} ->
+    Nothing
+
+
+-- | MIDI peel: one decoded MIDI event can enqueue multiple commands,
+-- so the result carries a list. Drop rejections, project each accepted
+-- entry, and concatenate.
+--
+-- Wrappers that translate a non-empty command batch but defer the
+-- enqueue (e.g. the session MIDI listener's control-write coalescer)
+-- report an empty result list; this extractor returns @[]@ for those
+-- because nothing has been accepted yet. The deferred writes surface
+-- here when the wrapper's flush path eventually submits them.
+acceptedMIDIProducerControlWrites
+  :: MIDIProducerEnqueueResult
+  -> [(VoiceKey, ControlTag, Value)]
+acceptedMIDIProducerControlWrites = \case
+  MIDIProducerEnqueueAttempted _ results ->
+    mapMaybe acceptedFanInControlWrite results
+  MIDIProducerRejected{} ->
+    []
 
 
 -- | Render the accepted-side of one OSC listener event into an

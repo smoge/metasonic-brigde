@@ -3995,16 +3995,26 @@ Still gated:
   app-local live-session target-value cache; OSC accepted-write
   hook wired now via a producer-neutral
   `(VoiceKey -> ControlTag -> Value -> IO ())` updater
-  (`acceptedControlWrite` + `liveOSCListenerHooksForObserved` in
-  `ManifestLiveCommon`); rows preserve manifest order so `values`
-  visually lines up with `controls` / addressable surface; cached
-  entries retain across preserving reloads (drop tags absent on
-  the new target) and reset on stopped-audio / fallback rebuild;
-  no DSP readback or runtime FFI surface. Residual watch items
-  only — MIDI/UI accepted-write seam (the cache shape already
-  takes it; needs a producer-neutral upstream hook), ALSA stderr
-  noise on startup, and persistent command-history-file behavior
-  — none blocking on current evidence. Phase 8j closed the
+  (`acceptedOSCControlWrite` + `liveOSCListenerHooksForObserved`
+  in `ManifestLiveCommon`, peeling the producer-neutral
+  `acceptedFanInControlWrite` core); rows preserve manifest order
+  so `values` visually lines up with `controls` / addressable
+  surface; cached entries retain across preserving reloads (drop
+  tags absent on the new target) and reset on stopped-audio /
+  fallback rebuild; no DSP readback or runtime FFI surface.
+  Phase 8h step 3a structurally closed the producer-neutral
+  accepted-write seam: the `SessionFanInEnqueueResult`-shaped
+  `acceptedFanInControlWrite` core plus `acceptedOSCControlWrite`
+  / `acceptedUIControlWrite` /
+  `acceptedMIDIProducerControlWrites` peels are exported from
+  `ManifestLiveCommon` and test-pinned. The OSC listener now
+  delegates to the OSC peel; UI / MIDI peels exist but are
+  unwired until the live shell opens those ingress paths
+  (step 3b). Residual watch items only — MIDI/UI accepted-write
+  wiring (extractors landed step 3a; remaining work is the
+  app-level ingress wiring once UI/MIDI ingress is opened), ALSA
+  stderr noise on startup, and persistent command-history-file
+  behavior — none blocking on current evidence. Phase 8j closed the
   readline / TTY-line-discipline watch item with a `haskeline`
   boundary (`7df0586`, verification `6d11b3a`; design note:
   [notes/2026-05-22-h-live-session-tty-line-discipline-design.md](notes/2026-05-22-h-live-session-tty-line-discipline-design.md)):
