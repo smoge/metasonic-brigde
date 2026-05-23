@@ -92,6 +92,7 @@ module MetaSonic.App.ManifestLiveCommon
   , printAddressableSurface
   , printAddressableSurfaceWith
   , renderIngressSnapshot
+  , renderIngressTargetSummary
   , autoStartTemplatesWith
   , warnIfMissingVoicesWith
 
@@ -494,19 +495,30 @@ renderIngressSnapshot snapshot =
     MrisClosed ->
       "closed"
     MrisOpen target handle ->
-      "open demo="
-      <> muitDemoKey (mitUI target)
-      <> " ui-controls="
-      <> show (length (muitControls (mitUI target)))
-      <> " osc-controls="
-      <> show (length (motControls (mitOSC target)))
-      <> " midi-cc="
-      <> show (length (mmitControls (mitMIDI target)))
-      <> " defaultVoice="
-      <> unVoiceKey
-           (muvsDefaultVoice (muitVoiceSelection (mitUI target)))
+      "open " <> renderIngressTargetSummary target
       <> " oscPort="
       <> show (liBoundPort (moihInfo handle))
+
+
+-- | Render the target-side summary of an ingress snapshot
+-- (@demo=... ui-controls=N osc-controls=N midi-cc=N
+-- defaultVoice=V@). Exported so live-session snapshot renderers can
+-- reuse the same byte-for-byte summary when rendering bundled
+-- handles (the OSC-only path appends @oscPort=N@; the live path
+-- appends both @oscPort=N@ and a @midi=on@\/@midi=off@ marker).
+renderIngressTargetSummary :: ManifestReloadIngressTarget -> String
+renderIngressTargetSummary target =
+  "demo="
+  <> muitDemoKey (mitUI target)
+  <> " ui-controls="
+  <> show (length (muitControls (mitUI target)))
+  <> " osc-controls="
+  <> show (length (motControls (mitOSC target)))
+  <> " midi-cc="
+  <> show (length (mmitControls (mitMIDI target)))
+  <> " defaultVoice="
+  <> unVoiceKey
+       (muvsDefaultVoice (muitVoiceSelection (mitUI target)))
 
 
 -- | Print the bound OSC control surface (one line per binding)

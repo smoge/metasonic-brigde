@@ -13,6 +13,7 @@ module MetaSonic.Spec.AppManifestLiveIngressOps
 import           Data.IORef                       (IORef, modifyIORef',
                                                    newIORef, readIORef,
                                                    writeIORef)
+import qualified Data.Map.Strict                  as M
 
 import           Test.Tasty       (TestTree, testGroup)
 import           Test.Tasty.HUnit (assertFailure, testCase, (@?=))
@@ -20,14 +21,52 @@ import           Test.Tasty.HUnit (assertFailure, testCase, (@?=))
 import           MetaSonic.App.ManifestLiveIngressOps
                                                   (LiveIngressHandle (..),
                                                    LiveIngressIssue (..),
-                                                   manifestLiveIngressOps)
+                                                   manifestLiveIngressOps,
+                                                   renderLiveIngressSnapshot,
+                                                   renderLiveIngressSnapshotWith,
+                                                   renderLiveProdIngressIssue)
+import           MetaSonic.App.ManifestMIDIIngressOps
+                                                  (ManifestMIDIIngressOpsIssue (..))
+import           MetaSonic.App.ManifestMIDIPortMIDI
+                                                  (ManifestMIDIPortMIDIError (..))
+import           MetaSonic.App.ManifestOSCIngressOps
+                                                  (ManifestOSCIngressOpsIssue (..))
+import           MetaSonic.App.ManifestOSCListener
+                                                  (ListenerInfo (..),
+                                                   ManifestOSCListenerOpenIssue (..))
+import           MetaSonic.App.ManifestReloadBinding
+                                                  (ManifestUIIngressTarget (..),
+                                                   ManifestUIVoiceSelection (..))
 import           MetaSonic.App.ManifestReloadIngress
-                                                  (ManifestReloadIngressOps (..))
+                                                  (ManifestReloadIngressOps (..),
+                                                   ManifestReloadIngressSnapshot (..))
+import           MetaSonic.App.ManifestReloadIngressTarget
+                                                  (ManifestReloadIngressTarget (..))
+import           MetaSonic.App.ManifestReloadMIDIBinding
+                                                  (ManifestMIDIIngressTarget (..))
+import           MetaSonic.App.ManifestReloadOSCBinding
+                                                  (ManifestOSCIngressTarget (..))
+import           MetaSonic.Pattern                (VoiceKey (..))
+import           MetaSonic.Session.Arbitration    (ArbitrationPolicy (..))
 
 
 appManifestLiveIngressOpsTests :: TestTree
 appManifestLiveIngressOpsTests =
   testGroup "App manifest live ingress ops (Phase 8h step 3c)"
+  [ testGroup "manifestLiveIngressOps (step 3)"  combinatorTests
+  , testGroup "renderLiveIngressSnapshot (step 6a)"
+              renderLiveIngressSnapshotTests
+  , testGroup "renderLiveProdIngressIssue (step 6a)"
+              renderLiveProdIngressIssueTests
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- Combinator behavior (step 3)
+-- ---------------------------------------------------------------------------
+
+combinatorTests :: [TestTree]
+combinatorTests =
   [ testCase "MIDI absent: open opens OSC only; lihMIDI = Nothing" $ do
       logRef <- newIORef []
       osc <- newStub "osc" logRef
@@ -150,6 +189,118 @@ appManifestLiveIngressOpsTests =
       log_ @?= ["open-osc", "open-midi", "close-midi-fail", "close-osc"]
       closeResult @?= Left (LiiMIDI "midi-bad")
   ]
+
+
+-- ---------------------------------------------------------------------------
+-- Snapshot rendering (step 6a)
+-- ---------------------------------------------------------------------------
+--
+-- The polymorphic 'renderLiveIngressSnapshotWith' lets tests
+-- substitute trivial @oscHandle@ / @midiHandle@ types (the
+-- production 'PortMIDISource' is opaque). A stub extractor returns
+-- a fixed 'ListenerInfo' so the rendered @oscPort=@ pin is stable.
+
+renderLiveIngressSnapshotTests :: [TestTree]
+renderLiveIngressSnapshotTests =
+  [ testCase "MrisClosed renders as 'closed'" $
+      renderLiveIngressSnapshot MrisClosed @?= "closed"
+
+  , testCase "MrisOpen with lihMIDI = Nothing renders midi=off" $
+      renderLiveIngressSnapshotWith
+        stubOSCExtractor
+        (MrisOpen
+          sampleTarget
+          LiveIngressHandle
+            { lihOSC  = ()
+            , lihMIDI = Nothing :: Maybe ()
+            })
+        @?= "open demo=demo ui-controls=1 osc-controls=1 midi-cc=0"
+            <> " defaultVoice=v0 oscPort=17005 midi=off"
+
+  , testCase "MrisOpen with lihMIDI = Just _ renders midi=on" $
+      renderLiveIngressSnapshotWith
+        stubOSCExtractor
+        (MrisOpen
+          sampleTarget
+          LiveIngressHandle
+            { lihOSC  = ()
+            , lihMIDI = Just ()
+            })
+        @?= "open demo=demo ui-controls=1 osc-controls=1 midi-cc=0"
+            <> " defaultVoice=v0 oscPort=17005 midi=on"
+
+  ]
+  where
+    stubOSCExtractor () = ListenerInfo { liBoundPort = 17005 }
+
+
+-- ---------------------------------------------------------------------------
+-- Initial-open issue rendering (step 6a)
+-- ---------------------------------------------------------------------------
+
+renderLiveProdIngressIssueTests :: [TestTree]
+renderLiveProdIngressIssueTests =
+  [ testCase "OSC bind failure renders the operator-facing string" $
+      renderLiveProdIngressIssue
+        Nothing
+        (LiiOSC (MoioiOpenFailed (MoloiBindFailed "address already in use")))
+        @?= "OSC ingress open failed: bind failed: address already in use"
+
+  , testCase "MIDI no-input-device with Just N pins the device id in the string" $
+      renderLiveProdIngressIssue
+        (Just 3)
+        (LiiMIDI (MmioiSourceOpenFailed MmppNoInputDevice))
+        @?= "no input device for --midi-device 3"
+
+  , testCase "MIDI PortMIDI open failure with Just N pins the device id" $
+      renderLiveProdIngressIssue
+        (Just 5)
+        (LiiMIDI (MmioiSourceOpenFailed MmppOpenFailed))
+        @?= "PortMIDI open failed for --midi-device 5"
+
+  , testCase "MIDI no-input-device with Nothing renders (unset) (totality fallback)" $
+      -- Guards against a regression to a fromJust-style partial
+      -- pattern. The MIDI arm is unreachable when --midi-device is
+      -- unset, but the renderer must stay total at the type level.
+      renderLiveProdIngressIssue
+        Nothing
+        (LiiMIDI (MmioiSourceOpenFailed MmppNoInputDevice))
+        @?= "no input device for --midi-device (unset)"
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- Renderer fixtures
+-- ---------------------------------------------------------------------------
+
+sampleTarget :: ManifestReloadIngressTarget
+sampleTarget = ManifestReloadIngressTarget
+  { mitUI =
+      ManifestUIIngressTarget
+        { muitDemoKey           = "demo"
+        , muitVoiceSelection    =
+            ManifestUIVoiceSelection
+              { muvsFocusedVoice = Nothing
+              , muvsDefaultVoice = VoiceKey "v0"
+              }
+        , muitControls          = [error "muitControls element never read"]
+        , muitArbitrationPolicy = FifoOnly
+        }
+  , mitOSC =
+      ManifestOSCIngressTarget
+        { motDemoKey           = "demo"
+        , motControls          = [error "motControls element never read"]
+        , motArbitrationPolicy = FifoOnly
+        }
+  , mitMIDI =
+      ManifestMIDIIngressTarget
+        { mmitDemoKey           = "demo"
+        , mmitDefaultVoice      = VoiceKey "v0"
+        , mmitControls          = []
+        , mmitCCRoutes          = M.empty
+        , mmitArbitrationPolicy = FifoOnly
+        }
+  }
 
 
 -- ---------------------------------------------------------------------------

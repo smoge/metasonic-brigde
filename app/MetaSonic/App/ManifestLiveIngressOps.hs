@@ -1,7 +1,11 @@
+{-# LANGUAGE LambdaCase #-}
+
 -- |
 -- Module      : MetaSonic.App.ManifestLiveIngressOps
 -- Description : Combinator over OSC and optional MIDI ingress-ops for the
---               manifest live-session entrypoint.
+--               manifest live-session entrypoint, plus production aliases
+--               and operator-string renderers for the bundled handle and
+--               issue types.
 --
 -- 'RealReloadHostStackInputs' is polymorphic in @(ingressIssue, handle)@
 -- but each instance is single-typed. The live session needs to drive both
@@ -13,11 +17,15 @@
 --
 -- The combinator is polymorphic in OSC and MIDI handle / issue types so
 -- pure tests can substitute trivial stubs ('()' handles, tiny-sum
--- issues). Production wiring specializes against
+-- issues). The production aliases below specialize against
 -- 'ManifestOSCIngressHandle' / 'ManifestMIDIIngressHandle PortMIDISource'
--- elsewhere; this module deliberately knows nothing about PortMIDI or
--- UDP. See @notes\/2026-05-23-c-live-values-portmidi-ingress-design.md@
--- for the surrounding 3c design.
+-- and the corresponding issue types so the live session can hand a
+-- single specialized bundle to 'RealReloadHostStackInputs'. The
+-- module deliberately knows nothing about UDP wire format or
+-- PortMIDI device handling; it consumes the existing OSC and MIDI
+-- adapters by reference. See
+-- @notes\/2026-05-23-c-live-values-portmidi-ingress-design.md@ for
+-- the surrounding 3c design.
 
 module MetaSonic.App.ManifestLiveIngressOps
   ( -- * Bundled handle and issue
@@ -26,10 +34,60 @@ module MetaSonic.App.ManifestLiveIngressOps
 
     -- * Combinator
   , manifestLiveIngressOps
+
+    -- * Production aliases
+    --
+    -- Specialize the polymorphic combinator types against the
+    -- landed OSC and PortMIDI-backed MIDI adapters. The live-session
+    -- entrypoint hands @RealReloadHostStackInputs@ these aliases;
+    -- the polymorphic forms above stay available for tests.
+  , LiveProdIngressHandle
+  , LiveProdIngressIssue
+
+    -- * Snapshot rendering
+    --
+    -- A live-session-only ingress-snapshot renderer that wraps the
+    -- existing target summary ('renderIngressTargetSummary' in
+    -- 'ManifestLiveCommon') and adds a @midi=on@ \/ @midi=off@
+    -- marker derived from @'lihMIDI'@. The shared
+    -- @renderIngressSnapshot@ is untouched for the demo \/ host-reload
+    -- smoke callers that stay OSC-only.
+  , renderLiveIngressSnapshot
+  , renderLiveIngressSnapshotWith
+  , printLiveIngressSnapshot
+  , printLiveIngressSnapshotWith
+
+    -- * Initial-open issue rendering
+    --
+    -- Operator-facing renderer for the bundled issue. Threaded
+    -- through @runSupervised@'s @projectInitialIngressFailure@
+    -- argument so the live-session entrypoint can @die@ with a
+    -- targeted message on @--midi-device@ startup failures, instead
+    -- of letting the shared @renderReloadHostStackOpenIssueTag@
+    -- collapse the failure to @"ingress-open-failed"@.
+  , renderLiveProdIngressIssue
   ) where
 
+import           MetaSonic.App.ManifestLiveCommon (renderIngressTargetSummary)
+import           MetaSonic.App.ManifestMIDIIngressOps
+                                                  (ManifestMIDIIngressHandle,
+                                                   ManifestMIDIIngressOpsIssue (..))
+import           MetaSonic.App.ManifestMIDIPortMIDI
+                                                  (ManifestMIDIPortMIDIError (..))
+import           MetaSonic.App.ManifestOSCIngressOps
+                                                  (ManifestOSCIngressHandle (..),
+                                                   ManifestOSCIngressOpsIssue (..))
+import           MetaSonic.App.ManifestOSCListener
+                                                  (ListenerInfo (..),
+                                                   ManifestOSCListenerOpenIssue (..))
 import           MetaSonic.App.ManifestReloadIngress
-                                                  (ManifestReloadIngressOps (..))
+                                                  (ManifestReloadIngressManager,
+                                                   ManifestReloadIngressOps (..),
+                                                   ManifestReloadIngressSnapshot (..),
+                                                   readManifestReloadIngressManager)
+import           MetaSonic.App.ManifestReloadIngressTarget
+                                                  (ManifestReloadIngressTarget)
+import           MetaSonic.Session.MIDIPortMIDI   (PortMIDISource)
 
 
 -- | Bundled handle for the combined live ingress.
@@ -171,3 +229,129 @@ manifestLiveIngressOps oscOps mMIDIOps = ManifestReloadIngressOps
                  Right () -> Right ()
                  Left oscIssue -> Left (LiiOSC oscIssue))
   }
+
+
+-- ---------------------------------------------------------------------------
+-- Production aliases
+-- ---------------------------------------------------------------------------
+
+-- | The bundled handle the live session hands to
+-- @RealReloadHostStackInputs@: OSC half via 'ManifestOSCIngressHandle',
+-- optional PortMIDI half via 'ManifestMIDIIngressHandle PortMIDISource'.
+type LiveProdIngressHandle =
+  LiveIngressHandle
+    ManifestOSCIngressHandle
+    (ManifestMIDIIngressHandle PortMIDISource)
+
+
+-- | The bundled issue type for the production combinator. OSC
+-- failures arrive as 'ManifestOSCIngressOpsIssue' (currently a
+-- single 'MoioiOpenFailed' arm); MIDI failures arrive as
+-- 'ManifestMIDIIngressOpsIssue ManifestMIDIPortMIDIError' (no input
+-- device or PortMIDI open failure).
+type LiveProdIngressIssue =
+  LiveIngressIssue
+    ManifestOSCIngressOpsIssue
+    (ManifestMIDIIngressOpsIssue ManifestMIDIPortMIDIError)
+
+
+-- ---------------------------------------------------------------------------
+-- Snapshot rendering
+-- ---------------------------------------------------------------------------
+
+-- | Render the live-session ingress snapshot. Closed snapshots stay
+-- @"closed"@; open snapshots produce
+-- @"open demo=... ui-controls=... osc-controls=... midi-cc=...
+-- defaultVoice=... oscPort=N midi=on\/off"@. The target summary is
+-- byte-for-byte identical to the OSC-only @renderIngressSnapshot@
+-- summary; only the trailing @midi=@ marker is new.
+renderLiveIngressSnapshot
+  :: ManifestReloadIngressSnapshot
+       ManifestReloadIngressTarget
+       LiveProdIngressHandle
+  -> String
+renderLiveIngressSnapshot =
+  renderLiveIngressSnapshotWith moihInfo
+
+
+-- | Polymorphic core of 'renderLiveIngressSnapshot'. The OSC-info
+-- extractor argument lets pure tests substitute trivial @oscHandle@
+-- and @midiHandle@ types (the production 'PortMIDISource' is opaque
+-- and cannot be constructed in-language). Production wiring passes
+-- 'moihInfo' to recover the bound port from a real OSC handle.
+renderLiveIngressSnapshotWith
+  :: (oscHandle -> ListenerInfo)
+  -> ManifestReloadIngressSnapshot
+       ManifestReloadIngressTarget
+       (LiveIngressHandle oscHandle midiHandle)
+  -> String
+renderLiveIngressSnapshotWith extractOSCInfo snapshot = case snapshot of
+  MrisClosed ->
+    "closed"
+  MrisOpen target handle ->
+    "open " <> renderIngressTargetSummary target
+    <> " oscPort="
+    <> show (liBoundPort (extractOSCInfo (lihOSC handle)))
+    <> " midi="
+    <> midiMarker (lihMIDI handle)
+  where
+    midiMarker Nothing  = "off"
+    midiMarker (Just _) = "on"
+
+
+-- | Print the live-session ingress snapshot to stdout via
+-- @putStrLn@. Mirrors 'printIngressSnapshot' in
+-- "MetaSonic.App.ManifestLiveCommon"; the sink-taking variant
+-- 'printLiveIngressSnapshotWith' is the live-session-friendly form.
+printLiveIngressSnapshot
+  :: ManifestReloadIngressManager
+       ManifestReloadIngressTarget
+       LiveProdIngressIssue
+       LiveProdIngressHandle
+  -> IO ()
+printLiveIngressSnapshot =
+  printLiveIngressSnapshotWith putStrLn
+
+
+-- | Sink-taking variant of 'printLiveIngressSnapshot'. The live
+-- session passes Haskeline's external-print sink so async snapshot
+-- prints redraw under an in-progress edit buffer.
+printLiveIngressSnapshotWith
+  :: (String -> IO ())
+  -> ManifestReloadIngressManager
+       ManifestReloadIngressTarget
+       LiveProdIngressIssue
+       LiveProdIngressHandle
+  -> IO ()
+printLiveIngressSnapshotWith output manager = do
+  snapshot <- readManifestReloadIngressManager manager
+  output ("  ingress: " <> renderLiveIngressSnapshot snapshot)
+
+
+-- ---------------------------------------------------------------------------
+-- Initial-open issue rendering
+-- ---------------------------------------------------------------------------
+
+-- | Operator-facing renderer for a 'LiveProdIngressIssue'. The
+-- @Maybe Int@ device id (the @optMidiDevice@ value at startup)
+-- threads through so the MIDI arms can name the device the
+-- operator selected. The @Nothing@ totality fallback exists so the
+-- function stays total even if a future caller decides to render
+-- a MIDI failure without a configured device id.
+--
+-- See the @\"Renderer seam for startup-time abort\"@ section in the
+-- 3c design note.
+renderLiveProdIngressIssue
+  :: Maybe Int
+  -> LiveProdIngressIssue
+  -> String
+renderLiveProdIngressIssue mDevice = \case
+  LiiOSC (MoioiOpenFailed (MoloiBindFailed msg)) ->
+    "OSC ingress open failed: bind failed: " <> msg
+  LiiMIDI (MmioiSourceOpenFailed MmppNoInputDevice) ->
+    "no input device for --midi-device " <> renderDeviceId mDevice
+  LiiMIDI (MmioiSourceOpenFailed MmppOpenFailed) ->
+    "PortMIDI open failed for --midi-device " <> renderDeviceId mDevice
+  where
+    renderDeviceId =
+      maybe "(unset)" show
