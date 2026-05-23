@@ -13,6 +13,7 @@ module MetaSonic.Spec.AppManifestLiveValueCache
   ( appManifestLiveValueCacheTests
   ) where
 
+import           Data.IORef       (modifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as M
 import qualified Data.Set        as Set
 import qualified Data.Text       as T
@@ -25,7 +26,13 @@ import           MetaSonic.App.ManifestLiveCommon
                                                 (acceptedFanInControlWrite,
                                                  acceptedMIDIProducerControlWrites,
                                                  acceptedOSCControlWrite,
-                                                 acceptedUIControlWrite)
+                                                 acceptedUIControlWrite,
+                                                 liveMIDIListenerHooksForObserved)
+import           MetaSonic.App.ManifestMIDIListener
+                                                (ManifestMIDIListenerHooks (..),
+                                                 ManifestMIDIListenerIssue (..))
+import           MetaSonic.App.ManifestReloadMIDIIngress
+                                                (ManifestMIDIIngressIssue (..))
 import           MetaSonic.App.ManifestLiveValueCache
                                                 (LiveControlValue (..),
                                                  LiveControlValueSource (..),
@@ -46,6 +53,7 @@ import qualified Data.ByteString.Char8       as BS
 import           MetaSonic.OSC.Dispatch.Internal (DispatchIssue (..))
 import           MetaSonic.Session.MIDIProducer (MIDIProducerCommandBatch (..),
                                                  MIDIProducerEnqueueResult (..),
+                                                 MIDIProducerEvent (..),
                                                  MIDIProducerIssue (..),
                                                  initialMIDIProducerState)
 import           MetaSonic.Session.OSCProducer  (OSCProducerEnqueueResult (..))
@@ -69,6 +77,7 @@ appManifestLiveValueCacheTests =
   , testGroup "acceptedOSCControlWrite"           acceptedOSCControlWriteTests
   , testGroup "acceptedUIControlWrite"            acceptedUIControlWriteTests
   , testGroup "acceptedMIDIProducerControlWrites" acceptedMIDIProducerControlWritesTests
+  , testGroup "liveMIDIListenerHooksForObserved"  liveMIDIListenerHooksForObservedTests
   ]
 
 
@@ -465,3 +474,58 @@ midiAttempted commands results =
       , mpcbState    = initialMIDIProducerState
       }
     results
+
+
+-- ---------------------------------------------------------------------------
+-- liveMIDIListenerHooksForObserved (step 3b)
+--
+-- The hook binds the accepted-write observer the same way
+-- 'ManifestLiveSession.recordAccepted' wires the OSC hook today:
+-- an 'IORef LiveValueCache' updated via 'recordAcceptedWrite'.
+-- Each test drives the hook and then asserts through
+-- 'lookupLiveValue' so the projection-to-cache loop is what is pinned,
+-- not a raw triple buffer.
+-- ---------------------------------------------------------------------------
+
+liveMIDIListenerHooksForObservedTests :: [TestTree]
+liveMIDIListenerHooksForObservedTests =
+  [ testCase "accepted CmdControlWrite updates the LiveValueCache" $ do
+      ref <- newIORef emptyLiveValueCache
+      let hooks = liveMIDIListenerHooksForObserved (recordInto ref)
+      mmlhOnAccepted hooks
+        (acceptedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0))
+      cache <- readIORef ref
+      lookupLiveValue (vk "v0") cutoffTag cache
+        @?= Just (LiveControlValue 900.0 LcvsAccepted)
+
+  , testCase "accepted non-control command leaves the cache untouched" $ do
+      ref <- newIORef emptyLiveValueCache
+      let hooks = liveMIDIListenerHooksForObserved (recordInto ref)
+      mmlhOnAccepted hooks
+        (acceptedFanIn (CmdVoiceOff (vk "v0")))
+      cache <- readIORef ref
+      lookupLiveValue (vk "v0") cutoffTag cache @?= Nothing
+
+  , testCase "rejected enqueue leaves the cache untouched" $ do
+      ref <- newIORef emptyLiveValueCache
+      let hooks = liveMIDIListenerHooksForObserved (recordInto ref)
+      mmlhOnAccepted hooks
+        (rejectedFanIn (CmdControlWrite (vk "v0") cutoffTag 900.0))
+      cache <- readIORef ref
+      lookupLiveValue (vk "v0") cutoffTag cache @?= Nothing
+
+  , testCase "issue path does not touch the cache" $ do
+      ref <- newIORef emptyLiveValueCache
+      let hooks = liveMIDIListenerHooksForObserved (recordInto ref)
+      mmlhOnIssue hooks (MmliIngressIssue (MmiiChannelFiltered 0))
+      mmlhOnIssue hooks
+        (MmliEnqueueRejected
+           (CmdControlWrite (vk "v0") cutoffTag 900.0)
+           SeiReloadInProgress)
+      mmlhOnIssue hooks (MmliIgnoredEvent (MIDIProducerNoteOn 0 60 64))
+      cache <- readIORef ref
+      lookupLiveValue (vk "v0") cutoffTag cache @?= Nothing
+  ]
+  where
+    recordInto ref voice ctag value =
+      modifyIORef' ref (recordAcceptedWrite voice ctag value)

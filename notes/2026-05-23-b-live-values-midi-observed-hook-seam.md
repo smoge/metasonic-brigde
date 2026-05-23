@@ -1,6 +1,14 @@
 # Phase 8h step 3b — Live `values` MIDI observed-hook seam
 
-Status: draft.
+Status: closed. Implementation landed alongside this note.
+`liveMIDIListenerHooksForObserved` is in
+`app/MetaSonic/App/ManifestLiveCommon.hs`; the four
+projection-to-cache tests live in
+`test/MetaSonic/Spec/AppManifestLiveValueCache.hs` under
+`testGroup "liveMIDIListenerHooksForObserved"`. Full
+`just stack-test` passes (1439 tests). The live shell still opens
+OSC ingress only; operator-visible MIDI `values` is the 3c slice,
+not opened here.
 
 This is the follow-on to step 3a
 (`eed8f47 Land producer-neutral accepted-write extractor seam`).

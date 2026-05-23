@@ -4009,12 +4009,29 @@ Still gated:
   `acceptedMIDIProducerControlWrites` peels are exported from
   `ManifestLiveCommon` and test-pinned. The OSC listener now
   delegates to the OSC peel; UI / MIDI peels exist but are
-  unwired until the live shell opens those ingress paths
-  (step 3b). Residual watch items only — MIDI/UI accepted-write
-  wiring (extractors landed step 3a; remaining work is the
-  app-level ingress wiring once UI/MIDI ingress is opened), ALSA
-  stderr noise on startup, and persistent command-history-file
-  behavior — none blocking on current evidence. Phase 8j closed the
+  unwired until the live shell opens those ingress paths.
+  Phase 8h step 3b landed the MIDI observed-hook seam (design
+  note:
+  [notes/2026-05-23-b-live-values-midi-observed-hook-seam.md](notes/2026-05-23-b-live-values-midi-observed-hook-seam.md)):
+  a single `liveMIDIListenerHooksForObserved` helper in
+  `ManifestLiveCommon` feeds every accepted manifest MIDI CC
+  enqueue result through `acceptedFanInControlWrite` into the
+  same `recordAcceptedWrite` updater the OSC observer uses, with
+  no operator output sink, no accept-line printer, and no
+  ingress-target parameter (scope A in the note). Pinned by four
+  hook-to-cache tests in `AppManifestLiveValueCache` that drive
+  `mmlhOnAccepted` / `mmlhOnIssue` directly and assert via
+  `lookupLiveValue`. The live shell still opens OSC ingress only;
+  operator-visible MIDI `values` is step 3c, gated on either
+  PortMIDI live-shell integration (VMPK / ALSA virtual MIDI on
+  Linux is the likely operator path; physical-device
+  verification is follow-on) or an in-process operator-driving
+  MIDI source. Residual watch items only — operator-visible MIDI
+  `values` (step 3c, gated as above), UI accepted-write wiring
+  (extractor landed step 3a; needs the live shell to open UI
+  ingress at all), ALSA stderr noise on startup, and persistent
+  command-history-file behavior — none blocking on current
+  evidence. Phase 8j closed the
   readline / TTY-line-discipline watch item with a `haskeline`
   boundary (`7df0586`, verification `6d11b3a`; design note:
   [notes/2026-05-22-h-live-session-tty-line-discipline-design.md](notes/2026-05-22-h-live-session-tty-line-discipline-design.md)):

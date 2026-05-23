@@ -42,6 +42,7 @@ module MetaSonic.App.ManifestLiveCommon
   , liveOSCListenerHooksForObserved
   , liveOSCListenerHooksForObservedWith
   , liveOSCListenerHooksWithControlsAndObserverAndOutput
+  , liveMIDIListenerHooksForObserved
   , liveIngressTargetPolicy
   , liveReloadProducer
   , liveAudioOptions
@@ -155,6 +156,9 @@ import           MetaSonic.App.Demos            (Demo (..))
 import           MetaSonic.App.ManifestOSCIngressOps
                                                 (ManifestOSCIngressHandle (..),
                                                  ManifestOSCIngressOpsIssue)
+import           MetaSonic.App.ManifestMIDIListener
+                                                (ManifestMIDIListenerHooks (..),
+                                                 defaultManifestMIDIListenerHooks)
 import           MetaSonic.App.ManifestOSCListener
                                                 (ManifestOSCListenerHooks (..),
                                                  ManifestOSCListenerIssue (..),
@@ -714,6 +718,31 @@ liveOSCListenerHooksWithControls
 liveOSCListenerHooksWithControls controls =
   liveOSCListenerHooksWithControlsAndObserverAndOutput
     controls (\_ _ _ -> pure ()) putStrLn
+
+
+-- | Phase 8h step 3b: MIDI analogue of 'liveOSCListenerHooksForObserved',
+-- in its minimum-viable shape. Feeds every accepted manifest MIDI CC
+-- enqueue result into the same producer-neutral observer the OSC hook
+-- uses (the @VoiceKey -> ControlTag -> Value -> IO ()@ updater shape).
+--
+-- No operator output sink, no accept-line printer, and no
+-- 'ManifestReloadIngressTarget' parameter. The live shell does not
+-- open 'ManifestMIDIListener' yet, so an accept-line printer would
+-- have no consumer; issue rendering similarly has no operator surface.
+-- See @notes\/2026-05-23-b-live-values-midi-observed-hook-seam.md@ for
+-- the scope decision (A over B). When 3c opens a live MIDI listener, a
+-- @liveMIDIListenerHooksForObservedWith@ variant can take a sink and
+-- target alongside this one without touching the 3b signature.
+liveMIDIListenerHooksForObserved
+  :: (VoiceKey -> ControlTag -> Value -> IO ())
+  -> ManifestMIDIListenerHooks
+liveMIDIListenerHooksForObserved observe =
+  defaultManifestMIDIListenerHooks
+    { mmlhOnAccepted = \result ->
+        case acceptedFanInControlWrite result of
+          Just (voice, tag, value) -> observe voice tag value
+          Nothing                  -> pure ()
+    }
 
 
 -- | Core variant: every operator-facing line goes through @output@.
