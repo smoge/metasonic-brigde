@@ -177,6 +177,7 @@ executables:
       - MetaSonic.App.ManifestReloadPreservingHostStack
       - MetaSonic.App.ManifestReloadTryPreservingHostStack
       - MetaSonic.App.ManifestLiveCommon
+      - MetaSonic.App.ManifestLiveIngressOps
       - MetaSonic.App.ManifestLiveReloadDemo
       - MetaSonic.App.ManifestLiveSession
       - MetaSonic.App.ManifestLiveValueCache
@@ -230,6 +231,7 @@ tests:
       - MetaSonic.App.ManifestReloadPreservingHostStack
       - MetaSonic.App.ManifestReloadTryPreservingHostStack
       - MetaSonic.App.ManifestLiveCommon
+      - MetaSonic.App.ManifestLiveIngressOps
       - MetaSonic.App.ManifestLiveReloadDemo
       - MetaSonic.App.ManifestLiveSession
       - MetaSonic.App.ManifestLiveValueCache
@@ -254,6 +256,7 @@ tests:
       - MetaSonic.Spec.AppManifestLiveCommonIngressPolicy
       - MetaSonic.Spec.AppManifestLiveCommonOSCControls
       - MetaSonic.Spec.AppManifestLiveCommonOSCRender
+      - MetaSonic.Spec.AppManifestLiveIngressOps
       - MetaSonic.Spec.AppManifestLiveReloadDemoRender
       - MetaSonic.Spec.AppManifestLiveSession
       - MetaSonic.Spec.AppManifestLiveSessionOutputSink

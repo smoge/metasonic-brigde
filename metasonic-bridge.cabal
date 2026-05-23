@@ -152,6 +152,7 @@ executable metasonic-bridge
       MetaSonic.App.ManifestReloadPreservingHostStack
       MetaSonic.App.ManifestReloadTryPreservingHostStack
       MetaSonic.App.ManifestLiveCommon
+      MetaSonic.App.ManifestLiveIngressOps
       MetaSonic.App.ManifestLiveReloadDemo
       MetaSonic.App.ManifestLiveSession
       MetaSonic.App.ManifestLiveValueCache
@@ -219,6 +220,7 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestReloadPreservingHostStack
       MetaSonic.App.ManifestReloadTryPreservingHostStack
       MetaSonic.App.ManifestLiveCommon
+      MetaSonic.App.ManifestLiveIngressOps
       MetaSonic.App.ManifestLiveReloadDemo
       MetaSonic.App.ManifestLiveSession
       MetaSonic.App.ManifestLiveValueCache
@@ -243,6 +245,7 @@ test-suite metasonic-bridge-test
       MetaSonic.Spec.AppManifestLiveCommonIngressPolicy
       MetaSonic.Spec.AppManifestLiveCommonOSCControls
       MetaSonic.Spec.AppManifestLiveCommonOSCRender
+      MetaSonic.Spec.AppManifestLiveIngressOps
       MetaSonic.Spec.AppManifestLiveReloadDemoRender
       MetaSonic.Spec.AppManifestLiveSession
       MetaSonic.Spec.AppManifestLiveSessionOutputSink
