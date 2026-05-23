@@ -3886,6 +3886,8 @@ Still gated:
   Unlike the two-shot `--manifest-live-reload-demo` operator
   smoke, the session shell runs an open-ended owner loop with
   a stdin command vocabulary (`demo:KEY` / `demo KEY` reload,
+  `demos` list, `controls` reprint of the OSC surface, `values`
+  reprint of the last accepted control target values,
   `status` / `<Enter>` snapshot, `help` / `?` vocabulary,
   `quit` / `exit` / `<Ctrl-D>` exit) — and is the first real
   consumer that all four supervisor outcomes (committed /
@@ -3984,7 +3986,27 @@ Still gated:
   the runbook documents the canonical command + expected
   bound-CC table + accepted-event line, and an exported
   `smokeIngressTargetPolicy` is build-time pinned by the
-  preserving-fixture test group. What remains here is real
+  preserving-fixture test group.
+  Phase 8h added a read-only `values` shell command (`2bb70cc`,
+  design note:
+  [notes/2026-05-22-g-live-control-value-introspection-design.md](notes/2026-05-22-g-live-control-value-introspection-design.md))
+  that reports the last accepted control target values for active
+  voices on the current manifest plan. Closed contract: an
+  app-local live-session target-value cache; OSC accepted-write
+  hook wired now via a producer-neutral
+  `(VoiceKey -> ControlTag -> Value -> IO ())` updater
+  (`acceptedControlWrite` + `liveOSCListenerHooksForObserved` in
+  `ManifestLiveCommon`); rows preserve manifest order so `values`
+  visually lines up with `controls` / addressable surface; cached
+  entries retain across preserving reloads (drop tags absent on
+  the new target) and reset on stopped-audio / fallback rebuild;
+  no DSP readback or runtime FFI surface. Residual watch items
+  only — MIDI/UI accepted-write seam (the cache shape already
+  takes it; needs a producer-neutral upstream hook), same-demo
+  reload's `committed (new plan installed)` wording, ALSA stderr
+  noise on startup, in-session command history / readline — none
+  blocking on current evidence.
+  What remains here is real
   hardware confirmation and the same hardware-gated CI question
   the device-backed paths share.
 - [ ] Failure/event semantics across compile, allocation, and stale
