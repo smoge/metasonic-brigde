@@ -48,6 +48,7 @@ module MetaSonic.App.ManifestMIDIIngressOps
 
     -- * Adapter
   , manifestMIDIIngressOps
+  , manifestMIDIIngressOpsWithTargetHooks
   ) where
 
 import           MetaSonic.App.ManifestMIDIListener
@@ -131,13 +132,15 @@ defaultManifestMIDIIngressOpsHooks = ManifestMIDIIngressOpsHooks
       \_ -> pure ()
   }
 
--- | Build a 'ManifestReloadIngressOps' that opens a fresh MIDI
--- source + listener pair on each call and releases them on close.
+-- | Build a 'ManifestReloadIngressOps' with a fixed
+-- 'ManifestMIDIListenerHooks'. Backwards-compatible wrapper around
+-- 'manifestMIDIIngressOpsWithTargetHooks'; callers that do not need
+-- per-generation hook metadata keep their existing call site
+-- unchanged.
 --
--- Listener hooks, adapter hooks, producer options, and the fan-in
--- host are captured at construction time; the source factory is
--- consulted per open so a preserving reload can replace the device
--- handle as part of the close-old/open-fresh cycle.
+-- See 'manifestMIDIIngressOpsWithTargetHooks' for the open / close
+-- lifecycle, the source-factory contract, and the close-failure
+-- policy.
 manifestMIDIIngressOps
   :: ManifestMIDIListenerHooks
   -> ManifestMIDIIngressOpsHooks issue
@@ -148,7 +151,40 @@ manifestMIDIIngressOps
        ManifestReloadIngressTarget
        (ManifestMIDIIngressOpsIssue issue)
        (ManifestMIDIIngressHandle source)
-manifestMIDIIngressOps listenerHooks adapterHooks opts host factory =
+manifestMIDIIngressOps listenerHooks =
+  manifestMIDIIngressOpsWithTargetHooks (const listenerHooks)
+
+
+-- | Build a 'ManifestReloadIngressOps' that opens a fresh MIDI
+-- source + listener pair on each call and releases them on close.
+-- The listener hooks are built from the just-projected target on
+-- every 'mrioOpenIngress' so callers can render or observe against
+-- the current generation's binding metadata
+-- (@'MetaSonic.App.ManifestReloadMIDIBinding.mmitControls'@) rather
+-- than the metadata captured at construction time.
+--
+-- This is the MIDI analogue of
+-- 'MetaSonic.App.ManifestOSCIngressOps.manifestOSCIngressOpsWithTargetHooks'.
+-- The Phase 8h step 3c live-session pass needs the per-target form
+-- so accept-line rendering survives a preserving reload that swaps
+-- one CC binding for another (see
+-- @notes\/2026-05-23-c-live-values-portmidi-ingress-design.md@).
+--
+-- Adapter hooks, producer options, the fan-in host, and the source
+-- factory are captured at construction time; the source factory is
+-- consulted per open so a preserving reload can replace the device
+-- handle as part of the close-old\/open-fresh cycle.
+manifestMIDIIngressOpsWithTargetHooks
+  :: (ManifestReloadIngressTarget -> ManifestMIDIListenerHooks)
+  -> ManifestMIDIIngressOpsHooks issue
+  -> MIDIProducerOptions
+  -> SessionFanInHost
+  -> ManifestMIDISourceFactory issue source
+  -> ManifestReloadIngressOps
+       ManifestReloadIngressTarget
+       (ManifestMIDIIngressOpsIssue issue)
+       (ManifestMIDIIngressHandle source)
+manifestMIDIIngressOpsWithTargetHooks listenerHooksFor adapterHooks opts host factory =
   ManifestReloadIngressOps
     { mrioOpenIngress =
         \target -> do
@@ -159,7 +195,7 @@ manifestMIDIIngressOps listenerHooks adapterHooks opts host factory =
             Right (sourceHandle, listenerSource) -> do
               listener <-
                 openManifestMIDIListener
-                  listenerHooks
+                  (listenerHooksFor target)
                   opts
                   (mitMIDI target)
                   host

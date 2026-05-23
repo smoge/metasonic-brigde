@@ -26,7 +26,8 @@ import           MetaSonic.App.ManifestMIDIIngressOps
                                                    ManifestMIDIIngressOpsIssue (..),
                                                    ManifestMIDISourceFactory (..),
                                                    defaultManifestMIDIIngressOpsHooks,
-                                                   manifestMIDIIngressOps)
+                                                   manifestMIDIIngressOps,
+                                                   manifestMIDIIngressOpsWithTargetHooks)
 import           MetaSonic.App.ManifestMIDIListener
                                                   (ManifestMIDIListenerHooks (..),
                                                    defaultManifestMIDIListenerHooks)
@@ -40,9 +41,12 @@ import           MetaSonic.App.ManifestReloadIngress
                                                    openFreshManifestReloadIngress,
                                                    readManifestReloadIngressManager)
 import           MetaSonic.App.ManifestReloadIngressTarget
-                                                  (ManifestReloadIngressTarget,
+                                                  (ManifestReloadIngressTarget (..),
                                                    ManifestReloadIngressTargetPolicy (..),
                                                    manifestReloadIngressTargetFromPlan)
+import           MetaSonic.App.ManifestReloadMIDIBinding
+                                                  (ManifestMIDIControlBinding (..),
+                                                   mmitControls)
 import           MetaSonic.App.ManifestReloadMIDIIngress
                                                   (ManifestMIDIIngressIssue (..))
 import           MetaSonic.Bridge.Source          (MigrationKey (..))
@@ -291,6 +295,91 @@ appManifestMIDIIngressOpsTests =
             MrisOpen _ _ ->
               assertFailure
                 "expected manager closed after openFresh failure"
+
+  , testCase "manifestMIDIIngressOpsWithTargetHooks installs fresh hooks per open" $ do
+      -- Each generation's hooks carry a generation-specific MVar. If
+      -- the builder were called once at construction time (the old
+      -- constant-hooks shape), the B generation would inherit A's
+      -- hooks and the B-specific MVar would never receive. Driving a
+      -- CC through both generations and seeing each MVar receive
+      -- exactly its own generation's accept proves the builder ran
+      -- per open with the current target.
+      let targetA = projectOrFail planA
+          targetB = projectOrFail planB
+
+      acceptedAMV <- newEmptyMVar
+      acceptedBMV <- newEmptyMVar
+
+      let hooksWriting mv = ManifestMIDIListenerHooks
+            { mmlhOnAccepted = putMVar mv
+            , mmlhOnIssue    = \_ -> pure ()
+            }
+
+          -- Dispatch on the target's MIDI binding shape rather than
+          -- target equality, which is not exposed at this layer.
+          builder target =
+            case map mmcbCC (mmitControls (mitMIDI target)) of
+              [7]  -> hooksWriting acceptedAMV
+              [11] -> hooksWriting acceptedBMV
+              _    -> defaultManifestMIDIListenerHooks
+
+      result <-
+        withSessionFanInHost
+          (TemplateGraph [] M.empty)
+          defaultSessionFanInOptions
+          $ \host -> do
+              factoryState <- newSourceFactoryState
+              let factory = chanSourceFactory factoryState
+                  ops =
+                    manifestMIDIIngressOpsWithTargetHooks
+                      builder
+                      defaultManifestMIDIIngressOpsHooks
+                      defaultMIDIProducerOptions
+                      host
+                      factory
+
+              openedA <- mrioOpenIngress ops targetA
+              handleA <-
+                case openedA of
+                  Left issue ->
+                    assertFailure
+                      ("expected initial open, got: " <> show issue)
+                    >> error "unreachable"
+                  Right h ->
+                    pure h
+
+              writeFactoryEvent factoryState
+                (Just (MIDIProducerControlChange 0 volCC 127))
+              ackA <- timeout 1000000 (takeMVar acceptedAMV)
+
+              manager <-
+                newManifestReloadIngressManager ops targetA handleA
+              reloadResult <-
+                openFreshManifestReloadIngress manager targetB
+              reloadResult @?= Right ()
+
+              -- Generation B's binding remaps vol to CC 11 (see
+              -- planB above). Sending CC 7 on this generation would
+              -- reject; sending CC 11 must accept and fire B's hook.
+              writeFactoryEvent factoryState
+                (Just (MIDIProducerControlChange 0 11 127))
+              ackB <- timeout 1000000 (takeMVar acceptedBMV)
+
+              _ <- closeManifestReloadIngress manager
+              pure (ackA, ackB)
+
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in host, got: " <> show issue)
+        Right (ackA, ackB) -> do
+          assertEnqueuedCommand
+            "generation A accept routed through A-specific hook"
+            (CmdControlWrite defaultVoice volTag 1.0)
+            ackA
+          assertEnqueuedCommand
+            "generation B accept routed through fresh B-specific hook"
+            (CmdControlWrite defaultVoice volTag 1.0)
+            ackB
   ]
 
 ------------------------------------------------------------
