@@ -1146,3 +1146,38 @@ sharper watch item; open it as a design lane only if another operator
 pass reproduces command-line editing friction or if it becomes the
 dominant source of pass mistakes. Same-demo reload wording appeared
 again but still did not block the pass.
+
+### 2026-05-22 — 8j TTY reproduction confirmed; calibrated exception opens lane
+
+Transcript: `/tmp/metasonic-live-session-8j-tty-reproduction.log`.
+
+Deliberate reproduction probe against
+`examples/manifests/saw-noise-filter.json`, starting from
+`noise-filter-soft` on the `require-preserving` route. This pass was
+not an independent organic operator pass; it intentionally timed OSC
+accept output while a command line was partially typed, to pin the
+line-buffer corruption that appeared incidentally in the 8i
+noise-values pass.
+
+- Probe A (`val` / OSC burst / `ues`) is not load-bearing: the
+  transcript shows `val` and `ues` submitted as separate commands, so
+  those two unknown-command lines are operator sequencing, not the
+  TTY mechanism. Treat Probe A as a setup error, not as a
+  non-reproduction of the TTY issue.
+- Probe B is load-bearing: partial `statu`, async OSC accept output,
+  then submitted `values` produced
+  `unknown command: "statuvalues"`.
+- Probe C is load-bearing: partial `stat`, async OSC accept output,
+  then submitted `status` produced
+  `unknown command: "statstatus"`.
+- The shell recovered after each bad line and exited cleanly at
+  `quit` (`COMMAND_EXIT_CODE=0`).
+
+Follow-up chosen from this pass: open **live-session TTY line
+discipline / history** as a narrow design lane. The evidence framing is
+a calibrated exception, not repeated independent organic friction: 8i
+surfaced the issue incidentally during normal operation; 8j
+deliberately reproduced the same phenomenon and pinned the mechanism.
+The implementation scope is not chosen here. The design note should
+decide deliberately between output serialization, prompt redraw, and a
+real line-editor boundary.
