@@ -87,49 +87,119 @@ The first implementation should protect the text shell contract:
 - No GUI shell.
 - No MIDI/UI value-cache wiring.
 
+## Input Model Constraint
+
+Before naming candidates, the structural property of the current input
+path needs pinning: `sessionLoop` reads stdin with plain `getLine` on
+a default (canonical-mode) TTY. In canonical mode the *kernel's* line
+discipline owns the edit buffer — echo, backspace, kill-line, line
+delivery on Enter — and userspace only receives the line when the
+operator presses Enter.
+
+Two consequences load-bear on the candidate set below:
+
+1. **Userspace cannot read the typed-but-not-submitted text.** It
+   lives in the kernel buffer, invisible to `getLine` until newline.
+2. **Userspace cannot redraw it.** Redraw means rewriting the edit
+   text after async output overwrites it visually; we do not have
+   the text to rewrite.
+
+Therefore any candidate that requires keeping `getLine` *and*
+redrawing on top of async output is structurally not implementable
+without leaving canonical mode and owning echo in userspace.
+
 ## Candidate Shapes To Decide
 
-This note deliberately does not pick the implementation in advance.
-The implementation design should choose one of these shapes, or explain
-why another shape is smaller and safer.
+The constraint above narrows the choice to two real options. A naïve
+"redraw the prompt after async output" is not an independent third
+option on the current input model — see the Line-Editor section.
 
-### Output Serialization
+This note deliberately does not pick between the two below; the
+implementation design note will, with the tradeoff stated.
 
-Serialize all operator-facing writes from the live-session shell
-through one output path. Async hooks would enqueue or call through an
-output abstraction instead of printing directly.
+### Small Safety Fix: Output Serialization With Deferred Async
 
-Questions:
+Smallest change that fixes command corruption. Take a stdout lock so
+every operator-facing write is atomic, and **defer** async output
+(OSC accept lines, anything from ingress hooks) until the operator
+submits a line. The kernel edit buffer is never disturbed mid-edit
+because nothing prints while typing; on Enter, the submitted command
+and any queued async lines flush together.
 
-- Does serialization alone solve command corruption, or only make
-  output ordering deterministic?
-- Can it be done without blocking ingress threads on slow terminal I/O?
-- Does it need a prompt redraw after async output?
+Cost: OSC accept lines become invisible during typing. The operator
+loses the real-time "I see the sweep landing as I type" feedback that
+the 8h pass made enjoyable. Worth it iff command correctness matters
+more than live OSC visibility for this surface.
 
-### Prompt Redraw Boundary
+Closes the command-corruption failure modes:
 
-Keep the current input model but redraw the prompt/current buffer
-after async output. This is the classic terminal behavior needed when
-background output appears during line editing.
+- `unknown command: "statuvalues"` (Probe B): writes deferred during
+  typing, so kernel buffer is not disturbed.
+- `unknown command: "statstatus"` (Probe C): same.
 
-Questions:
-
-- Is there enough state today to know the current edit buffer?
-- If the input path is still `getLine`, can this be made correct, or
-  does it require a real line editor?
-
-### Line-Editor Boundary
-
-Replace raw `getLine` behavior for the live-session shell with a small
-line editor / readline-style boundary that owns prompt, current buffer,
-history, and redraw.
+Does not close the existing command-history watch item.
 
 Questions:
 
-- Is adding a dependency justified for this operator shell?
-- Can tests cover the behavior without requiring a real terminal?
-- Does this also close the existing command-history watch item, or
-  should history remain a separate follow-up?
+- Can deferral be done without blocking ingress threads on the
+  command-loop's read? (A bounded queue with a non-blocking writer
+  is the obvious shape.)
+- How visible is the lag between an accepted OSC packet and its
+  printed accept line during a slow operator edit?
+
+### Proper Operator Shell: Line-Editor Boundary
+
+Replace canonical-mode `getLine` with a userspace line editor that
+owns prompt, current buffer, history, redraw, and the input read.
+Async output prints, then the prompt + current edit buffer is
+redrawn beneath it; the operator never sees their typed text get
+visually clobbered, and the kernel never delivers a corrupted
+submitted line because the kernel is no longer driving echo.
+
+The classic readline-style redraw behavior that an earlier draft of
+this note framed as a third candidate belongs *inside* this option,
+not as a standalone candidate — the canonical-mode constraint above
+makes "prompt redraw without leaving canonical mode" structurally
+unimplementable.
+
+Dependency cost (inspected 2026-05-22): `haskeline-0.8.2.1` is
+bundled with GHC as a boot library
+(`ghc-9.10.3/lib/package.conf.d`), and its transitive `terminfo`
+dependency is already present in the project's dependency tree.
+Adopting `haskeline` adds zero external dependencies to the snapshot
+— declaring it in `package.yaml` resolves to the GHC-bundled
+version.
+
+Closes the command-corruption failure modes and also closes the
+existing command-history watch item as a side effect.
+
+Questions:
+
+- Does `haskeline`'s `MonadException` / `InputT IO` API integrate
+  cleanly with the existing `sessionLoop` shape (IORef-threaded,
+  `mask` / `finally` around the supervisor bracket), or does it
+  force restructuring beyond this slice?
+- Can tests cover prompt + buffer state without requiring a real
+  terminal? `haskeline`'s `runInputTBehavior useFile` /
+  `useFileHandle` mode provides an in-process, no-TTY input path
+  that is the standard test seam.
+- Should command history land in the same slice, or be split out
+  to keep the first slice focused on corruption? (History is free
+  once `haskeline` is wired; splitting it would mean explicitly
+  disabling history, which is more work than just keeping it.)
+
+### Lean
+
+The user-facing live session is becoming a real operator surface, not
+just an internal smoke. Dependency / risk inspection found the
+`haskeline` cost is essentially nil (GHC boot library, transitive dep
+already present). The leaning recommendation, pending the
+implementation note's confirmation, is the **line-editor boundary**:
+it solves command corruption without the deferred-output operator
+regression, and incidentally closes the command-history watch item
+that would otherwise need its own slice later.
+
+The implementation design note remains the binding decision.
 
 ## Source Seams To Inspect
 
@@ -165,15 +235,25 @@ while OSC accept lines remain visible and final `status` is healthy.
 
 ## Open Questions Before Code
 
-- Which boundary should own operator output: a global shell output
-  lock, a queue drained by the command loop, or a terminal/line-editor
-  abstraction?
+The questions below are scoped to whichever candidate the
+implementation note picks; "Can prompt redraw be correct with
+`getLine`?" is no longer one of them — see the Input Model Constraint
+above.
+
+- For the line-editor option: how cleanly does `haskeline`'s
+  `InputT IO` integrate with `sessionLoop`'s existing IORef +
+  `mask` / `finally` shape, and is the right wiring point a
+  `runInputT` wrapper around the whole loop or per-iteration?
+- For the deferred-output option: bounded queue size, and behavior
+  on overflow during a long edit (drop, drop+counter, block
+  briefly)?
 - Is it acceptable for ingress hooks to block briefly while writing
   operator output, or must all async output become fire-and-forget?
-- Can prompt redraw be correct with `getLine`, or is that a false
-  economy?
 - Should command history land in the same slice if a line editor is
   chosen, or stay as a follow-up to keep the first fix focused on
   corruption?
 - What is the smallest deterministic test harness that proves command
-  payloads are not corrupted by async output?
+  payloads are not corrupted by async output? `haskeline`'s file-
+  backed input behavior is the obvious seam for the line-editor
+  option; the deferred-output option can be tested with the existing
+  in-language fake-hook patterns.
