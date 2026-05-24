@@ -1,6 +1,7 @@
-# VMPK / PortMIDI `values` Manual Test
+# VMPK / sclang / PortMIDI `values` Manual Test
 
-Status: ready to run.
+Status: passed for software ALSA / PortMIDI ingress via `sclang` on
+2026-05-24; VMPK GUI-specific confirmation remains optional.
 
 This note records the manual verification path for Phase 8h step 3c:
 live-session `values` must update from real PortMIDI MIDI CC input,
@@ -8,9 +9,10 @@ not only from OSC or pure test seams.
 
 ## Purpose
 
-Verify that a virtual MIDI controller can drive the manifest live
-session through PortMIDI and that the operator-facing `values`
-snapshot reflects accepted MIDI control writes.
+Verify that a virtual MIDI controller or software MIDI generator can
+drive the manifest live session through PortMIDI and that the
+operator-facing `values` snapshot reflects accepted MIDI control
+writes.
 
 The target manifest is:
 
@@ -23,6 +25,55 @@ The target controls are:
 - CC 74 -> `/v0/lpf/0` cutoff
 - CC 71 -> `/v0/lpf/1` q
 - CC 7 -> `/v0/gain/0` level
+
+The accepted closeout transcript is:
+
+```sh
+/tmp/metasonic-live-session-8h-3c-sclang.log
+```
+
+That pass used `sclang` to send CCs into the host's ALSA / PortMIDI
+route and started the live session with `--midi-device 1`, the
+input-capable `Midi Through Port-0` device on that run. It proved the
+software PortMIDI path: startup `midi=on`, CC 74 / 71 / 7 accepted,
+`values` changed to `source=accepted`, preserving reload retained
+MIDI-written values, a later CC 74 update landed after reload, final
+`status` stayed healthy, and the session exited with command code 0.
+
+## sclang CC Source
+
+If VMPK's controller UI is slower than a scriptable source, `sclang`
+can drive the same software ALSA / PortMIDI boundary.
+
+After `MIDIClient.init`, choose the input-capable PortMIDI id that
+matches the route you will send into. In the accepted 2026-05-24 run,
+MetaSonic used:
+
+```sh
+--midi-device 1
+```
+
+and `sclang` sent to `Midi Through Port-0`.
+
+The SuperCollider commands were:
+
+```supercollider
+(
+MIDIClient.init;
+~m = MIDIOut.newByName("Midi Through", "Midi Through Port-0");
+~m.latency = 0;
+
+~m.control(0, 74, 90);
+~m.control(0, 71, 40);
+~m.control(0, 7, 30);
+)
+```
+
+For the post-reload cutoff update:
+
+```supercollider
+~m.control(0, 74, 64);
+```
 
 ## One-Time Setup
 
@@ -254,13 +305,14 @@ quit
 The pass is good if:
 
 - startup succeeds with `--midi-device N`
-- every VMPK CC produces a `midi accept` line
+- every VMPK or `sclang` CC produces a `midi accept` line
 - `values` changes from `source=default` to `source=accepted`
 - preserving reload keeps MIDI-written values for surviving controls
 - `status` stays healthy
 - the session exits cleanly
 - the transcript is saved at
-  `/tmp/metasonic-live-session-8h-3c-vmpk.log`
+  `/tmp/metasonic-live-session-8h-3c-sclang.log` for the accepted
+  `sclang` route, or another clearly named path for a VMPK GUI route
 
 ## After A Clean Pass
 
@@ -278,4 +330,3 @@ Convert the manual pass into hand-off:
 - Update `ROADMAP.md` to name the closed slice. Demote the
   operator-visible MIDI `values` residual to a hardware-verification
   follow-up (physical controller, beyond VMPK).
-

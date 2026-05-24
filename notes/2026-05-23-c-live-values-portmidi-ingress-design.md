@@ -1,6 +1,32 @@
 # Phase 8h step 3c — Live `values` PortMIDI ingress design
 
-Status: draft, revised after review.
+Status: closed.
+
+Closed 2026-05-24 after the live-shell PortMIDI pass recorded at
+`/tmp/metasonic-live-session-8h-3c-sclang.log`. The manual pass used
+`sclang` as the CC generator into the host's ALSA / PortMIDI route
+rather than VMPK's controller UI, but it exercised the same live
+session `--midi-device` path: startup opened with `midi=on`, CC
+74 / 71 / 7 produced `midi accept` lines, `values` changed to
+`source=accepted`, preserving reloads retained the MIDI-written
+values, a later CC 74 update landed after reload, final `status`
+stayed healthy, and the session exited with command code 0.
+
+Landed implementation commits:
+
+- `4923307` pre-fix live MIDI default voice to `v0`.
+- `53f4677` add combined live ingress ops combinator.
+- `c72a11b` add MIDI listener-event renderers and observed-hook
+  builder.
+- `93fda77` thread `--midi-device` into `runManifestLiveSession`.
+- `92f3c73` add live ingress production aliases and operator
+  renderers.
+- `62286d2` wire the live session to combined ingress ops.
+- `670dad5` add the manual test documentation.
+
+Remaining follow-up: physical-controller or VMPK-GUI-specific
+confirmation. That follow-up is hardware/operator coverage, not part
+of the software PortMIDI ingress contract closed here.
 
 This is the operator-visible follow-on to step 3b
 (`a29e5f0 Land Phase 8h step 3b MIDI observed-hook seam`). The
@@ -336,6 +362,8 @@ sudo modprobe snd-virmidi
 
 ```sh
 # 1. Start VMPK with an ALSA MIDI Output. Note its client:port.
+#    A scriptable sclang MIDIOut source is also acceptable if it
+#    sends the same CCs through an ALSA / PortMIDI-visible route.
 vmpk &
 
 # 2. Discover the PortMIDI device id corresponding to that port.
@@ -345,7 +373,7 @@ stack exec -- metasonic-bridge --midi-list
 aconnect -o
 
 # 3. Run the live session with the chosen device id.
-script -q /tmp/metasonic-live-session-8h-3c-vmpk.log -c \
+script -q /tmp/metasonic-live-session-8h-3c-sclang.log -c \
   'stack exec -- metasonic-bridge \
      --session-osc-port 17005 \
      --midi-device <N> \
@@ -572,12 +600,15 @@ later refactor.
    `renderTryPreservingHostStackIssueTag`). On `Just e`,
    the supervisor `die`s through the renderer; on `Nothing`,
    the existing `causeLabel` path renders the failure as before.
-7. Manual VMPK pass; record the transcript at
-   `/tmp/metasonic-live-session-8h-3c-vmpk.log`.
+7. Manual ALSA / PortMIDI pass; accepted closeout transcript:
+   `/tmp/metasonic-live-session-8h-3c-sclang.log`. VMPK's GUI
+   controller path remains an optional follow-up, not the software
+   PortMIDI contract gate.
 8. ROADMAP / note-status update after the manual pass passes.
 
 Each in-language step (1–6) is independently testable; step 7 is
-the only step requiring a Linux host with ALSA + VMPK.
+the only step requiring a Linux host with ALSA plus either VMPK or a
+scriptable MIDI generator such as `sclang`.
 
 ## Tests
 
@@ -697,8 +728,8 @@ Step 7 is the operator transcript, not an automated test.
 1. `just stack-test` (combined ingress ops tests, hook renderer
    tests, CLI plumbing tests, live-session wiring smoke).
 2. `git diff --check`.
-3. Manual VMPK transcript at
-   `/tmp/metasonic-live-session-8h-3c-vmpk.log`, recorded with
+3. Manual ALSA / PortMIDI transcript at
+   `/tmp/metasonic-live-session-8h-3c-sclang.log`, recorded with
    `script -q`.
 4. Findings entry in
    `notes/2026-05-21-b-live-session-operator-pass-playbook.md`

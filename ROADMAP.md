@@ -4021,13 +4021,27 @@ Still gated:
   ingress-target parameter (scope A in the note). Pinned by four
   hook-to-cache tests in `AppManifestLiveValueCache` that drive
   `mmlhOnAccepted` / `mmlhOnIssue` directly and assert via
-  `lookupLiveValue`. The live shell still opens OSC ingress only;
-  operator-visible MIDI `values` is step 3c, gated on either
-  PortMIDI live-shell integration (VMPK / ALSA virtual MIDI on
-  Linux is the likely operator path; physical-device
-  verification is follow-on) or an in-process operator-driving
-  MIDI source. Residual watch items only — operator-visible MIDI
-  `values` (step 3c, gated as above), UI accepted-write wiring
+  `lookupLiveValue`. Phase 8h step 3c closed the
+  operator-visible MIDI `values` path for software ALSA /
+  PortMIDI live-shell ingress (design note:
+  [notes/2026-05-23-c-live-values-portmidi-ingress-design.md](notes/2026-05-23-c-live-values-portmidi-ingress-design.md)):
+  `MetaSonic.App.ManifestLiveIngressOps` combines OSC and optional
+  MIDI ingress handles, `--midi-device N` is threaded into
+  `runManifestLiveSession`, live ingress snapshots render
+  `midi=on` / `midi=off`, route-specific initial-open projectors
+  preserve the clear "no input device for --midi-device N" startup
+  failure, and accepted manifest MIDI CCs render as `midi accept`
+  lines while updating the same live-value cache as OSC. The manual
+  closeout transcript
+  `/tmp/metasonic-live-session-8h-3c-sclang.log` used `sclang` to
+  send CC 74 / 71 / 7 through the host's ALSA / PortMIDI route:
+  startup opened with `midi=on`, the three CCs changed cutoff, q,
+  and level from `source=default` to `source=accepted`, preserving
+  reload retained those MIDI-written values, a later CC 74 update
+  landed after reload, final status stayed healthy, and the session
+  exited with command code 0. Residual watch items only — physical
+  controller or VMPK-GUI-specific confirmation for the same
+  `hasDevice == True` operator boundary, UI accepted-write wiring
   (extractor landed step 3a; needs the live shell to open UI
   ingress at all), ALSA stderr noise on startup, and persistent
   command-history-file behavior — none blocking on current
@@ -4050,11 +4064,13 @@ Still gated:
   smoke lane and the hardware-paired live-reload demo), what
   remains is real hardware confirmation and the same hardware-gated
   CI question those paths share. The Phase 8h `values` slice has
-  no hardware-specific contract; its live verification is the
-  2026-05-22 operator transcript recorded in the playbook. The
-  Phase 8j line-editor closeout is likewise text-shell-only; its
-  live verification is the 2026-05-23 replay transcript recorded
-  in the playbook.
+  no hardware-specific contract beyond the software ALSA /
+  PortMIDI path above; its OSC live verification is the 2026-05-22
+  operator transcript recorded in the playbook, and its MIDI live
+  verification is the 2026-05-24 `sclang` / PortMIDI transcript
+  recorded there. The Phase 8j line-editor closeout is likewise
+  text-shell-only; its live verification is the 2026-05-23 replay
+  transcript recorded in the playbook.
 - [ ] Failure/event semantics across compile, allocation, and stale
   producer commands. The install/reload-strategy timeline is now
   covered by the `ManifestReloadEvent` ADT in

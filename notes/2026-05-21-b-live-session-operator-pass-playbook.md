@@ -1266,3 +1266,63 @@ Follow-up chosen from this pass: close the same-demo reload wording
 watch item. This was an operator-text refinement only: it did not turn
 same-demo reload into a no-op and did not claim new DSP, routing,
 reload, or audio behavior.
+
+### 2026-05-24 — 8h step 3c PortMIDI `values` pass, driven by sclang
+
+Transcript: `/tmp/metasonic-live-session-8h-3c-sclang.log`.
+
+Manual ALSA / PortMIDI check against
+`examples/manifests/saw-noise-filter.json`, starting from
+`saw-filter-dark` on the `require-preserving` route. The session was
+opened with `--midi-device 1`, the input-capable `Midi Through
+Port-0` device on this host. `sclang` generated the CC traffic into
+that route; this validates the same PortMIDI ingress surface without
+requiring VMPK's controller UI.
+
+Driving sequence: `controls`, `values`, MIDI CC 74 / 71 / 7,
+`values`, `demo saw-filter-bright`, `values`, MIDI CC 74,
+`values`, `demo saw-filter-dark`, `values`, `status`, `quit`.
+
+- Startup opened combined ingress with `midi=on`,
+  `midi-cc=3`, default voice `v0`, and the expected addressable
+  controls: `/v0/lpf/0` with `cc=74`, `/v0/lpf/1` with `cc=71`, and
+  `/v0/gain/0` with `cc=7`.
+- Baseline `values` rendered pitch, cutoff, q, and level as
+  `source=default`.
+- The first MIDI batch produced three operator-facing accept lines:
+  `/v0/lpf/0 name="cutoff" value=4310.23622`,
+  `/v0/lpf/1 name="q" value=1.465354`, and
+  `/v0/gain/0 name="level" value=0.11811`.
+- The following `values` print showed cutoff, q, and level as
+  `source=accepted`, with the accepted values scaled into each
+  manifest range rather than displayed as raw `0..127` CC values.
+- `demo saw-filter-bright` committed through the preserving route.
+  The next `values` print retained the MIDI-written accepted values
+  for cutoff, q, and level while updating the cutoff default to the
+  bright demo's `2400.0`.
+- A second MIDI CC 74 update on the bright plan produced
+  `/v0/lpf/0 name="cutoff" value=3122.834646`, and `values`
+  reflected that accepted update.
+- `demo saw-filter-dark` committed back through the preserving route.
+  The final `values` print retained the accepted cutoff, q, and level
+  values while returning the cutoff default to the dark demo's
+  `600.0`.
+- Final `status` stayed healthy: current plan `saw-filter-dark`, audio
+  running, queue depth 0, owner ready, reload normal, one active
+  voice, and ingress open with `midi=on`.
+- The session exited cleanly at `quit` with `COMMAND_EXIT_CODE=0`.
+
+Observed friction:
+
+- ALSA / PortAudio device-enumeration stderr remains noisy at startup.
+  It did not block this run and is consistent with the existing watch
+  item, not a new 3c regression.
+- The transcript includes normal Haskeline redraw/control bytes and a
+  typo-correction artifact while entering commands, but the intended
+  `values`, reload, `status`, and `quit` commands all executed.
+
+Follow-up chosen from this pass: close Phase 8h step 3c's
+operator-visible MIDI `values` residual for the software
+ALSA/PortMIDI path. Physical controller or VMPK-GUI-specific
+confirmation remains a hardware/operator follow-up, not a blocker for
+the live `values` MIDI ingress slice.
