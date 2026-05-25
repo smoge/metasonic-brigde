@@ -4133,8 +4133,13 @@ Still gated:
   recorded there. The Phase 8j line-editor closeout is likewise
   text-shell-only; its live verification is the 2026-05-23 replay
   transcript recorded in the playbook.
-- [ ] Failure/event semantics across compile and allocation/resource
-  recovery. The install/reload-strategy timeline is now
+- [x] Failure/event semantics across compile and allocation/resource
+  recovery — v1 closed across all four sub-lanes (install/reload
+  strategy, stale producer commands, compile-error preflight,
+  stopped-audio allocation/resource recovery). Two consumer-gated
+  follow-ups remain (graph allocation outcomes and voice allocation
+  outcomes), each scoped in the 2026-05-25-b note and waiting on a
+  real driver. The install/reload-strategy timeline is
   covered by the `ManifestReloadEvent` ADT in
   `MetaSonic.App.ManifestReloadEvent` plus the `*WithEvents`
   orchestrator and host entrypoints: strategy lifecycle, preserving
