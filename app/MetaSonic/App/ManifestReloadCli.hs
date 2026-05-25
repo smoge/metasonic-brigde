@@ -76,6 +76,8 @@ import           MetaSonic.App.ManifestReloadMIDIBinding
                                                    mmitControls)
 import           MetaSonic.App.ManifestReloadOSCBinding
                                                   (motControls)
+import           MetaSonic.App.ManifestReloadAudioEvent
+                                                  (noManifestReloadAudioEvents)
 import           MetaSonic.App.ManifestReloadEvent
                                                   (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHostStack
@@ -745,6 +747,8 @@ runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
                   defaultSessionFanInServiceHooks
               , rrhsiOnEvent =
                   appendSmokeReloadEvent reloadEventsRef
+              , rrhsiOnAudioEvent =
+                  noManifestReloadAudioEvents
               , rrhsiOnRetired =
                   \_ -> pure ()
               }

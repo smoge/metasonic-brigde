@@ -82,6 +82,7 @@ module MetaSonic.App.ManifestReloadTryPreservingHostStack
 
 import           Data.Bifunctor                              (first)
 
+import           MetaSonic.App.ManifestReloadAudioEvent      (ManifestReloadAudioEvent)
 import           MetaSonic.App.ManifestReloadEvent           (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost            (preservingAllowsStoppedAudioFallback)
 import           MetaSonic.App.ManifestReloadHost.Types      (ManifestReloadHostIssue)
@@ -306,6 +307,7 @@ fallbackEventForDecision = \case
 realTryPreservingInWindowReload
   :: Show ingressIssue
   => (ManifestReloadEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
+  -> (ManifestReloadAudioEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
   -> ProducerId
   -> ManifestReloadIngressTargetPolicy
   -> ReloadHostStack ManifestReloadIngressTarget ingressIssue handle
@@ -313,7 +315,7 @@ realTryPreservingInWindowReload
   -> MR.ManifestReloadPlan
   -> IO (InWindowReloadOutcome
           (TryPreservingInWindowIssue ingressIssue))
-realTryPreservingInWindowReload onEvent producer policy stack fallback requested = do
+realTryPreservingInWindowReload onEvent onAudioEvent producer policy stack fallback requested = do
   preservingOutcome <-
     realPreservingInWindowReload producer policy stack fallback requested
   let decision = decideTryPreservingNext preservingOutcome
@@ -323,7 +325,7 @@ realTryPreservingInWindowReload onEvent producer policy stack fallback requested
       pure InWindowReloadCommitted
     TpnRunFallback preservingIssue -> do
       stoppedOutcome <-
-        realStoppedAudioInWindowReload policy stack fallback requested
+        realStoppedAudioInWindowReload policy onAudioEvent stack fallback requested
       pure (composeFallbackOutcome preservingIssue stoppedOutcome)
     TpnDeclineFallback preservingIssue ->
       pure
@@ -357,6 +359,7 @@ realTryPreservingHostStackOps producer inputs = TryPreservingHostStackOps
   , tpahsoInWindowReload =
       realTryPreservingInWindowReload
         (rrhsiOnEvent inputs)
+        (rrhsiOnAudioEvent inputs)
         producer
         (rrhsiIngressTargetPolicy inputs)
   }

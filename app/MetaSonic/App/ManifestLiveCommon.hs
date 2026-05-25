@@ -103,6 +103,9 @@ module MetaSonic.App.ManifestLiveCommon
   , renderPreflightEvents
   , renderPreflightRejectionReason
 
+    -- * Audio-event timeline (stopped-audio reload)
+  , renderAudioEvents
+
     -- * Retired-binding rendering (Phase 8h step 3e v1 slice 2)
   , retiredBindingsFromEvents
   , renderRetiredBindings
@@ -227,6 +230,8 @@ import           MetaSonic.App.ManifestReloadCli
 import           MetaSonic.App.ManifestPreflightEvent
                                                 (ManifestPreflightEvent (..),
                                                  PreflightRejectionReason (..))
+import           MetaSonic.App.ManifestReloadAudioEvent
+                                                (ManifestReloadAudioEvent (..))
 import           MetaSonic.App.ManifestReloadEvent
                                                 (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
@@ -751,6 +756,34 @@ renderPreflightRejectionReason MprrCatalogMissed =
   "catalog-missed"
 renderPreflightRejectionReason (MprrPlanRejected detail) =
   "plan-rejected: " <> detail
+
+
+-- | Render the per-run audio-event timeline as a compact bullet
+-- list. Used by the live-session @audio events:@ block; mirrors
+-- 'renderPreflightEvents' and 'renderLiveReloadEvents' in indent
+-- and rejection shape so all three blocks read the same way.
+--
+-- 'runReloadWithSink' suppresses the block entirely when the
+-- timeline is empty (preserving reloads, or stopped-audio reloads
+-- that failed before audio ran), so this helper never has to print
+-- a @(none)@ placeholder.
+renderAudioEvents
+  :: Show issue
+  => [ManifestReloadAudioEvent issue] -> [String]
+renderAudioEvents = map renderAudioEvent
+  where
+    renderAudioEvent MraeStopAttempted =
+      "    - audio stop attempted"
+    renderAudioEvent MraeStopSucceeded =
+      "    - audio stop succeeded"
+    renderAudioEvent (MraeStopFailed issue) =
+      "    - audio stop failed: " <> show issue
+    renderAudioEvent MraeStartAttempted =
+      "    - audio start attempted"
+    renderAudioEvent MraeStartSucceeded =
+      "    - audio start succeeded"
+    renderAudioEvent (MraeStartFailed issue) =
+      "    - audio start failed: " <> show issue
 
 
 -- | Phase 8h step 3e v1 slice 2: scan a reload-event timeline for

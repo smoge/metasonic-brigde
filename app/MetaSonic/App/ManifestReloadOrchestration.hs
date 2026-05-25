@@ -28,10 +28,14 @@ module MetaSonic.App.ManifestReloadOrchestration
   , wireManifestReloadIngress
   , orchestrateHostStoppedAudioReload
   , orchestrateHostStoppedAudioReloadWithEvents
+  , orchestrateHostStoppedAudioReloadWithEventsAndAudio
   , orchestrateHostPreservingReload
   , orchestrateHostPreservingReloadWithEvents
   ) where
 
+import           MetaSonic.App.ManifestReloadAudioEvent
+                   (ManifestReloadAudioEvent (..),
+                    noManifestReloadAudioEvents)
 import           MetaSonic.App.ManifestReloadEvent
                    (ManifestReloadEvent (..),
                     noManifestReloadEvents)
@@ -81,11 +85,29 @@ orchestrateHostStoppedAudioReload
   -> request
   -> IO (Either (HostStoppedAudioReloadIssue issue) ())
 orchestrateHostStoppedAudioReload =
-  orchestrateHostStoppedAudioReloadWithEvents noManifestReloadEvents
+  orchestrateHostStoppedAudioReloadWithEventsAndAudio
+    noManifestReloadEvents
+    noManifestReloadAudioEvents
 
 -- | Run the stopped-audio reload window, emitting structured
 -- 'ManifestReloadEvent' transitions through @onEvent@ at each stage
--- boundary.
+-- boundary. No audio-stage events are emitted; see
+-- 'orchestrateHostStoppedAudioReloadWithEventsAndAudio' for the
+-- variant that also brackets the audible side-effects.
+orchestrateHostStoppedAudioReloadWithEvents
+  :: (ManifestReloadEvent issue -> IO ())
+  -> HostStoppedAudioReloadOps request plan issue
+  -> request
+  -> IO (Either (HostStoppedAudioReloadIssue issue) ())
+orchestrateHostStoppedAudioReloadWithEvents onEvent =
+  orchestrateHostStoppedAudioReloadWithEventsAndAudio
+    onEvent
+    noManifestReloadAudioEvents
+
+-- | Run the stopped-audio reload window, emitting both
+-- strategy-level 'ManifestReloadEvent' transitions through
+-- @onEvent@ and audio-stage 'ManifestReloadAudioEvent' brackets
+-- through @onAudioEvent@.
 --
 -- The lifecycle of one call is:
 --
@@ -112,12 +134,25 @@ orchestrateHostStoppedAudioReload =
 -- host is left with the old owner running but no live ingress.
 -- Terminal drain failures do not attempt automatic ingress
 -- resume.
-orchestrateHostStoppedAudioReloadWithEvents
+--
+-- Audio-stage events bracket @hsaroStopOldAudio@,
+-- @hsaroStartNewAudio@, and the listener-restart cleanup call to
+-- @hsaroStopNewAudio@. They are independent of the
+-- strategy-level @onEvent@ stream — consumers can subscribe to
+-- either or both. The retryable @hsaroRestartOldAudio@ call (which
+-- only fires on the pre-dispose reload-rejected branch) currently
+-- does *not* emit audio events: slice 1 keeps the audio timeline
+-- scoped to the main stop/start pair the operator transcript
+-- pairs with @audio running:@. A later slice can extend the family
+-- to cover restart-old-audio if a real consumer needs it.
+orchestrateHostStoppedAudioReloadWithEventsAndAudio
   :: (ManifestReloadEvent issue -> IO ())
+  -> (ManifestReloadAudioEvent issue -> IO ())
   -> HostStoppedAudioReloadOps request plan issue
   -> request
   -> IO (Either (HostStoppedAudioReloadIssue issue) ())
-orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
+orchestrateHostStoppedAudioReloadWithEventsAndAudio
+  onEvent onAudioEvent ops request = do
   onEvent MreStoppedAudioReloadStarted
   prepared <- hsaroPreparePlan ops request
   case prepared of
@@ -159,11 +194,14 @@ orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
           stopOldAudio plan
 
     stopOldAudio plan = do
+      onAudioEvent MraeStopAttempted
       result <- hsaroStopOldAudio ops
       case result of
-        Left issue ->
+        Left issue -> do
+          onAudioEvent (MraeStopFailed issue)
           finish (HsariStopOldAudioFailed issue)
-        Right () ->
+        Right () -> do
+          onAudioEvent MraeStopSucceeded
           reloadStopped plan
 
     reloadStopped plan = do
@@ -194,18 +232,23 @@ orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
             HsariReloadRejectedOldOwnerResumeFailed
 
     startNewAudio retired = do
+      onAudioEvent MraeStartAttempted
       result <- hsaroStartNewAudio ops
       case result of
-        Left issue ->
+        Left issue -> do
+          onAudioEvent (MraeStartFailed issue)
           finish (HsariAudioRestartFailed issue)
-        Right () ->
+        Right () -> do
+          onAudioEvent MraeStartSucceeded
           reopenIngress retired
 
     reopenIngress retired = do
       result <- hsaroReopenIngress ops
       case result of
         Left issue -> do
+          onAudioEvent MraeStopAttempted
           hsaroStopNewAudio ops
+          onAudioEvent MraeStopSucceeded
           finish (HsariListenerRestartFailed issue)
         Right () ->
           finishOk retired

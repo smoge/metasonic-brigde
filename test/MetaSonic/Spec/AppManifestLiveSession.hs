@@ -44,6 +44,8 @@ import           MetaSonic.App.ManifestLiveIngressOps
                                             (LiveProdIngressIssue)
 import           MetaSonic.App.ManifestPreflightEvent
                                             (PreflightRejectionReason (..))
+import           MetaSonic.App.ManifestReloadAudioEvent
+                                            (ManifestReloadAudioEvent (..))
 import           MetaSonic.App.ManifestReloadEvent
                                             (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
@@ -61,6 +63,7 @@ import           MetaSonic.Bridge.Source    (MigrationKey (..))
 import           MetaSonic.Pattern          (ControlTag (..),
                                              TemplateName (..),
                                              VoiceKey (..))
+import           MetaSonic.Session.FanIn    (SessionFanInAudioIssue (..))
 import           MetaSonic.Session.Resolve  (RetiredVoiceBinding (..),
                                              RetiredVoiceReason (..),
                                              VoiceBinding (..))
@@ -640,6 +643,13 @@ fakeSupOpsWithOutcome eventsRef outcome tag = SupervisorOps
 type LiveEvent =
   ManifestReloadEvent (ManifestReloadHostIssue LiveProdIngressIssue)
 
+-- | Local alias for the audio-event timeline ref. Same pin as
+-- 'LiveEvent' (production threads the live-shell issue type all the
+-- way down) so tests can assert on rendered output that depends on
+-- 'Show' for the issue payload.
+type LiveAudioEvent =
+  ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)
+
 
 -- | Helper: spin up the five IORefs 'runReloadWith' needs and pin
 -- the initial state explicitly. Tests then call 'runReloadWith'
@@ -657,6 +667,7 @@ withSessionRefs
       -> IORef StubPlan
       -> IORef (Maybe LiveSessionOutcome)
       -> IORef [LiveEvent]
+      -> IORef [LiveAudioEvent]
       -> IORef (M.Map VoiceKey RetiredVoiceReason)
       -> IO a)
   -> IO a
@@ -665,8 +676,10 @@ withSessionRefs initialPlan k = do
   currentPlanRef <- newIORef initialPlan
   lastOutcomeRef <- newIORef Nothing
   eventsRef      <- newIORef preExistingEvents
+  audioEventsRef <- newIORef []
   lastRetiredRef <- newIORef M.empty
-  k preExistingEvents currentPlanRef lastOutcomeRef eventsRef lastRetiredRef
+  k preExistingEvents currentPlanRef lastOutcomeRef eventsRef
+    audioEventsRef lastRetiredRef
 
 
 -- | Default no-op for 'runReloadWith's 'onLiveStackChanged' hook.
@@ -702,7 +715,7 @@ stubAlwaysReject reason =
 runReloadWithTests :: [TestTree]
 runReloadWithTests =
   [ testCase "bad demo key → LsoPlanRejected, SsContinue, currentPlan unchanged, supOps NOT called" $ do
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let -- supOps that asserts it was never called
             blockingSupOps :: SupervisorOps StubPlan String
             blockingSupOps = SupervisorOps
@@ -721,6 +734,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "bad-key"
         step @?= SsContinue
@@ -734,7 +748,7 @@ runReloadWithTests =
               "expected Just (LsoPlanRejected ...); got " <> show other
 
   , testCase "planning failure (resolver returns Left) → LsoPlanRejected, SsContinue, supOps NOT called" $ do
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let blockingSupOps :: SupervisorOps StubPlan String
             blockingSupOps = SupervisorOps
               { sopsInWindowReload = \_ _ ->
@@ -752,6 +766,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "any-key"
         step @?= SsContinue
@@ -768,7 +783,7 @@ runReloadWithTests =
               "expected Just (LsoPlanRejected ...); got " <> show other
 
   , testCase "Committed → LsoCommitted, SsContinue, currentPlan := requested, events reset" $ do
-      withSessionRefs 1 $ \prior currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \prior currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let resolver = stubResolver "next" 2
             supOps   =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 7
@@ -781,6 +796,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "next"
         step @?= SsContinue
@@ -802,7 +818,7 @@ runReloadWithTests =
       -- operator-facing outcome wording is refined so the status
       -- line stops saying "new plan installed" when nothing about
       -- the demo identity changed.
-      withSessionRefs 1 $ \prior currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \prior currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         hookCallsRef <- newIORef ([] :: [StubPlan])
         let recordingHook livePlan =
               modifyIORef' hookCallsRef (<> [livePlan])
@@ -821,6 +837,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "same"
         step @?= SsContinue
@@ -844,7 +861,7 @@ runReloadWithTests =
           (events /= prior)
 
   , testCase "RequestRejected → LsoRequestRejected, SsContinue, currentPlan unchanged" $ do
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let resolver = stubResolver "next" 2
             outcome  = InWindowReloadRejectedLiveFallback "live-fallback-cause"
             supOps   = fakeSupOpsWithOutcome eventsRef outcome 8
@@ -857,6 +874,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "next"
         step @?= SsContinue
@@ -872,7 +890,7 @@ runReloadWithTests =
       -- 'runReloadWith' returns. The fake supOps here simulates
       -- that compound outcome directly so we can pin the
       -- session's response to it.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         -- A real fake supOps that returns 'RejectedRecovered'
         -- would have to drive the supervisor's logic; here we
         -- short-circuit by overriding 'sopsInWindowReload' to
@@ -895,6 +913,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "next"
         step @?= SsContinue
@@ -903,7 +922,7 @@ runReloadWithTests =
         readIORef lastOutcomeRef >>= (@?= Just LsoRejectedRecovered)
 
   , testCase "Escalated → LsoEscalated, SsTerminate (ExitFailure 1), currentPlan unchanged" $ do
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let resolver = stubResolver "next" 2
             -- Drive the supervisor's escalation by failing BOTH
             -- the in-window reload (terminal) AND the subsequent
@@ -924,6 +943,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "next"
         step @?= SsTerminate (ExitFailure 1)
@@ -936,18 +956,18 @@ runReloadWithTests =
       -- two reloads back-to-back through the same IORefs; the
       -- second reload's eventsRef snapshot must contain only the
       -- second call's synthetic event, not the first's.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let resolver = stubResolver "next" 2
             supOpsFirst  =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 11
             supOpsSecond =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 12
         _ <- runReloadWith resolver show show noHook supOpsFirst
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         eventsAfterFirst <- readIORef eventsRef
         eventsAfterFirst @?= [syntheticEvent 11]
         _ <- runReloadWith resolver show show noHook supOpsSecond
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         eventsAfterSecond <- readIORef eventsRef
         eventsAfterSecond @?= [syntheticEvent 12]
         assertBool
@@ -969,7 +989,7 @@ runReloadWithTests =
           resolver = stubResolver "next" 2
       -- 1. PlanRejected: bad key, no supervisor call. Hook NOT
       --    called.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let blockingSupOps :: SupervisorOps StubPlan String
             blockingSupOps = SupervisorOps
               { sopsInWindowReload = \_ _ ->
@@ -979,34 +999,34 @@ runReloadWithTests =
                   assertFailure "open must not be called"
               }
         _ <- runReloadWith resolver show show recordingHook blockingSupOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "bad-key"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "bad-key"
         pure ()
       readIORef hookCallsRef >>= (@?= ([] :: [StubPlan]))
 
       -- 2. Committed: hook called with the requested plan.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let supOps =
               fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 100
         _ <- runReloadWith resolver show show recordingHook supOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2])  -- requestedPlan == 2
 
       -- 3. RequestRejected: stack unchanged, hook NOT called.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let supOps =
               fakeSupOpsWithOutcome eventsRef
                 (InWindowReloadRejectedLiveFallback "live-fallback")
                 101
         _ <- runReloadWith resolver show show recordingHook supOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         pure ()
       -- Hook list still just [2] from the Committed test above.
       readIORef hookCallsRef >>= (@?= [2])
 
       -- 4. RejectedRecovered: stack was rebuilt on the fallback
       --    plan; hook called with the fallback plan (== 1 here).
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let supOps = SupervisorOps
               { sopsInWindowReload = \_ _ -> do
                   modifyIORef' eventsRef (<> [syntheticEvent 102])
@@ -1015,13 +1035,13 @@ runReloadWithTests =
               , sopsOpenStack  = const (pure (Right ()))
               }
         _ <- runReloadWith resolver show show recordingHook supOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- recovered with fallback (1)
 
       -- 5. Escalated: session terminating, no live stack, hook
       --    NOT called.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let supOps = SupervisorOps
               { sopsInWindowReload = \_ _ -> do
                   modifyIORef' eventsRef (<> [syntheticEvent 103])
@@ -1030,7 +1050,7 @@ runReloadWithTests =
               , sopsOpenStack  = const (pure (Left "rebuild-cause"))
               }
         _ <- runReloadWith resolver show show recordingHook supOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- unchanged from step 4
 
@@ -1040,7 +1060,7 @@ runReloadWithTests =
       -- already pin the renderer/extractor; this test makes sure a
       -- future edit to 'runReloadWithSink' cannot silently drop the
       -- block while leaving the helpers intact.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         outputRef <- newIORef ([] :: [String])
         let captureOutput s =
               modifyIORef' outputRef (<> [s])
@@ -1075,6 +1095,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "next"
         step @?= SsContinue
@@ -1120,7 +1141,7 @@ runReloadWithTests =
       -- assertion then confirms 'runReloadWithSink' does *not*
       -- clobber the snapshot after the commit event renders, so a
       -- subsequent producer drain attributes correctly.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let leadRetired =
               RetiredVoiceBinding
                 (VoiceBinding (VoiceKey "lead/1") 0 (TemplateName "saw_lead"))
@@ -1146,7 +1167,7 @@ runReloadWithTests =
             resolver = stubResolver "next" (2 :: StubPlan)
         _ <- runReloadWith
                resolver show show noHook supOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         snapshot <- readIORef lastRetiredRef
         snapshot @?= M.fromList [(VoiceKey "lead/1", RvrTemplateGone)]
 
@@ -1156,7 +1177,7 @@ runReloadWithTests =
       -- The snapshot must still be cleared at reload start so a
       -- stale set from a *prior* commit cannot mis-attribute drains
       -- against the now-rejected attempt.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         -- Pre-seed the snapshot with a prior commit's retired set.
         writeIORef lastRetiredRef
           (M.fromList [(VoiceKey "pad/A", RvrOwnerReplaced)])
@@ -1173,7 +1194,7 @@ runReloadWithTests =
             resolver = stubResolver "next" (2 :: StubPlan)
         _ <- runReloadWith
                resolver show show noHook supOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         snapshot <- readIORef lastRetiredRef
         snapshot @?= M.empty
 
@@ -1189,7 +1210,7 @@ runReloadWithTests =
       -- (mirroring the orchestrator hook) and returns a terminal
       -- rejection (mirroring a later orchestration failure). After
       -- 'runReloadWithSink' returns, the snapshot must be empty.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         let leadRetired =
               RetiredVoiceBinding
                 (VoiceBinding (VoiceKey "lead/1") 0 (TemplateName "saw_lead"))
@@ -1216,7 +1237,7 @@ runReloadWithTests =
         -- assertion.
         _ <- try @SomeException $ runReloadWith
                resolver show show noHook supOps
-               currentPlanRef lastOutcomeRef eventsRef lastRetiredRef "next"
+               currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef "next"
         snapshot <- readIORef lastRetiredRef
         snapshot @?= M.empty
         -- And the payload we attempted to publish was non-empty,
@@ -1231,7 +1252,7 @@ runReloadWithTests =
       -- a 'preflight events:' block always renders, even on the
       -- short-circuit Left path, and the supervisor is still not
       -- invoked.
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         outputRef <- newIORef ([] :: [String])
         let captureOutput s =
               modifyIORef' outputRef (<> [s])
@@ -1261,6 +1282,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "unknown"
         step @?= SsContinue
@@ -1321,7 +1343,7 @@ runReloadWithTests =
       -- always rendered ahead of 'reload events:' so the operator
       -- transcript reads top-down through the lifecycle (preflight
       -- → strategy lifecycle → retired bindings).
-      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
         outputRef <- newIORef ([] :: [String])
         let captureOutput s =
               modifyIORef' outputRef (<> [s])
@@ -1339,6 +1361,7 @@ runReloadWithTests =
                   currentPlanRef
                   lastOutcomeRef
                   eventsRef
+                  audioEventsRef
                   lastRetiredRef
                   "next"
         step @?= SsContinue
@@ -1370,6 +1393,228 @@ runReloadWithTests =
         assertBool
           ("missing preflight succeeded bullet:\n" <> unlines output)
           (succeededRow `elem` output)
+
+  , testCase "Phase 8h step 3e v2 slice 2: stopped-audio reload renders 'audio events:' block between 'reload events:' and 'retired bindings:' with the full stop/start timeline" $ do
+      -- Caller-level coverage for the wiring in 'runReloadWithSink'.
+      -- The fake supOps stuffs synthetic audio events into the
+      -- shared ref the same way the production stopped-audio
+      -- orchestrator does via 'rrhsiOnAudioEvent', and emits a
+      -- commit event with a non-empty retired payload so the
+      -- 'retired bindings:' block also renders. The assertion
+      -- pins the relative order of the three blocks and the
+      -- per-bullet timeline shape.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
+        outputRef <- newIORef ([] :: [String])
+        let captureOutput s =
+              modifyIORef' outputRef (<> [s])
+            leadRetired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "lead/1") 0 (TemplateName "saw_lead"))
+                RvrOwnerReplaced
+            commitEvent :: LiveEvent
+            commitEvent = MreStoppedAudioReloadCommitted [leadRetired]
+            -- Full success-path audio timeline the stopped-audio
+            -- orchestrator emits: stop attempt + success then
+            -- start attempt + success.
+            audioTimeline :: [LiveAudioEvent]
+            audioTimeline =
+              [ MraeStopAttempted
+              , MraeStopSucceeded
+              , MraeStartAttempted
+              , MraeStartSucceeded
+              ]
+            supOps :: SupervisorOps StubPlan String
+            supOps = SupervisorOps
+              { sopsInWindowReload = \_ _ -> do
+                  modifyIORef' eventsRef (<> [commitEvent])
+                  modifyIORef' audioEventsRef (<> audioTimeline)
+                  pure InWindowReloadCommitted
+              , sopsCloseStack =
+                  assertFailure "sopsCloseStack should not run on a commit"
+              , sopsOpenStack  = \_ ->
+                  assertFailure "sopsOpenStack should not run on a commit"
+              }
+            resolver = stubResolver "next" (2 :: StubPlan)
+        step <- runReloadWithSink
+                  captureOutput
+                  resolver
+                  show
+                  show
+                  noHook
+                  supOps
+                  currentPlanRef
+                  lastOutcomeRef
+                  eventsRef
+                  audioEventsRef
+                  lastRetiredRef
+                  "next"
+        step @?= SsContinue
+        output <- readIORef outputRef
+        let block label = elemIndex' label output
+        -- Block ordering: reload events -> audio events -> retired bindings.
+        case ( block "  reload events:"
+             , block "  audio events:"
+             , block "  retired bindings:"
+             ) of
+          (Just rev, Just aud, Just ret)
+            | rev < aud && aud < ret -> pure ()
+            | otherwise ->
+                assertFailure $
+                  "expected order reload events < audio events < retired bindings,"
+                  <> " got reload@" <> show rev
+                  <> " audio@" <> show aud
+                  <> " retired@" <> show ret
+                  <> "\nfull output:\n" <> unlines output
+          (Nothing, _, _) ->
+            assertFailure $
+              "missing 'reload events:' header in output:\n" <> unlines output
+          (_, Nothing, _) ->
+            assertFailure $
+              "missing 'audio events:' header in output:\n" <> unlines output
+          (_, _, Nothing) ->
+            assertFailure $
+              "missing 'retired bindings:' header in output:\n" <> unlines output
+        -- Per-bullet timeline: the four success-path rows must
+        -- appear in declared order under the header.
+        let stopAttemptedRow  = "    - audio stop attempted"
+            stopSucceededRow  = "    - audio stop succeeded"
+            startAttemptedRow = "    - audio start attempted"
+            startSucceededRow = "    - audio start succeeded"
+            bulletIxs =
+              [ elemIndex' stopAttemptedRow  output
+              , elemIndex' stopSucceededRow  output
+              , elemIndex' startAttemptedRow output
+              , elemIndex' startSucceededRow output
+              ]
+        case sequence bulletIxs of
+          Nothing ->
+            assertFailure $
+              "one or more audio-event bullets missing; got "
+              <> show bulletIxs
+              <> "\nfull output:\n" <> unlines output
+          Just ixs ->
+            assertBool
+              ("audio-event bullets must be in declared order; got "
+               <> show ixs
+               <> "\nfull output:\n" <> unlines output)
+              (ixs == L.sort ixs)
+
+  , testCase "Phase 8h step 3e v2 slice 2: an audio-start failure surfaces as MraeStartFailed and the reload outcome is rejected" $ do
+      -- Simulates the production 'HsariAudioRestartFailed' branch:
+      -- the orchestrator runs stop OK, then start fails. The audio
+      -- timeline truncates at 'MraeStartFailed'; the supervisor
+      -- classifies the outcome as terminal and the live session
+      -- records a rejection. The renderer must surface the failure
+      -- payload (we rely on 'Show' for the issue, matching what
+      -- production does for the strategy-level 'HsariAudioRestart
+      -- Failed' line).
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
+        outputRef <- newIORef ([] :: [String])
+        let captureOutput s =
+              modifyIORef' outputRef (<> [s])
+            failedIssue :: ManifestReloadHostIssue LiveProdIngressIssue
+            failedIssue =
+              MrhiAudio (SfaiStartFailed 12)
+            audioTimeline :: [LiveAudioEvent]
+            audioTimeline =
+              [ MraeStopAttempted
+              , MraeStopSucceeded
+              , MraeStartAttempted
+              , MraeStartFailed failedIssue
+              ]
+            supOps :: SupervisorOps StubPlan String
+            supOps = SupervisorOps
+              { sopsInWindowReload = \_ _ -> do
+                  modifyIORef' audioEventsRef (<> audioTimeline)
+                  -- Stopped-audio terminal failure rebuilds; the
+                  -- supervisor's terminal branch is the closest
+                  -- analogue to a real audio-restart failure
+                  -- without dragging the full host stack into the
+                  -- fixture.
+                  pure (InWindowReloadTerminal "audio-restart-failed")
+              , sopsCloseStack  = pure ()
+              , sopsOpenStack   = const (pure (Right ()))
+              }
+            resolver = stubResolver "next" (2 :: StubPlan)
+        step <- runReloadWithSink
+                  captureOutput
+                  resolver
+                  show
+                  show
+                  noHook
+                  supOps
+                  currentPlanRef
+                  lastOutcomeRef
+                  eventsRef
+                  audioEventsRef
+                  lastRetiredRef
+                  "next"
+        step @?= SsContinue
+        output <- readIORef outputRef
+        -- Header must be present and the failure bullet must
+        -- include the issue payload's 'Show' rendering.
+        assertBool
+          ("missing 'audio events:' header in output:\n" <> unlines output)
+          ("  audio events:" `elem` output)
+        let startFailedRow =
+              "    - audio start failed: " <> show failedIssue
+        assertBool
+          ("missing 'audio start failed' bullet with issue payload "
+           <> show failedIssue <> ":\n" <> unlines output)
+          (startFailedRow `elem` output)
+        -- The recovered outcome (terminal in-window, rebuild OK)
+        -- is what 'runReloadWithSink' records when stopped-audio
+        -- fails terminally and the rebuild from the fallback plan
+        -- succeeds.
+        outcome <- readIORef lastOutcomeRef
+        case outcome of
+          Just LsoRejectedRecovered -> pure ()
+          other ->
+            assertFailure $
+              "expected Just LsoRejectedRecovered; got " <> show other
+
+  , testCase "Phase 8h step 3e v2 slice 2: a preserving reload (empty audio timeline) suppresses the 'audio events:' header entirely" $ do
+      -- The block is suppressed when no audio events fire so a
+      -- preserving reload's transcript does not carry a dead
+      -- header. The supOps here mirrors the slice 2 retired-
+      -- bindings test but does NOT push any audio events.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef -> do
+        outputRef <- newIORef ([] :: [String])
+        let captureOutput s =
+              modifyIORef' outputRef (<> [s])
+            commitEvent :: LiveEvent
+            commitEvent = MrePreservingReloadCommitted []
+            supOps :: SupervisorOps StubPlan String
+            supOps = SupervisorOps
+              { sopsInWindowReload = \_ _ -> do
+                  modifyIORef' eventsRef (<> [commitEvent])
+                  pure InWindowReloadCommitted
+              , sopsCloseStack =
+                  assertFailure "sopsCloseStack should not run on a commit"
+              , sopsOpenStack  = \_ ->
+                  assertFailure "sopsOpenStack should not run on a commit"
+              }
+            resolver = stubResolver "next" (2 :: StubPlan)
+        step <- runReloadWithSink
+                  captureOutput
+                  resolver
+                  show
+                  show
+                  noHook
+                  supOps
+                  currentPlanRef
+                  lastOutcomeRef
+                  eventsRef
+                  audioEventsRef
+                  lastRetiredRef
+                  "next"
+        step @?= SsContinue
+        output <- readIORef outputRef
+        assertBool
+          ("'audio events:' header must not render when the "
+           <> "timeline is empty (preserving / pre-audio failure)"
+           <> "; output:\n" <> unlines output)
+          (not ("  audio events:" `elem` output))
   ]
   where
     elemIndex' needle =

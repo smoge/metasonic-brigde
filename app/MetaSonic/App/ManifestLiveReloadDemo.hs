@@ -98,6 +98,8 @@ import           MetaSonic.App.ManifestOSCIngressOps
                                                  manifestOSCIngressOps)
 import           MetaSonic.App.ManifestOSCListener
                                                 (ListenerConfig)
+import           MetaSonic.App.ManifestReloadAudioEvent
+                                                (noManifestReloadAudioEvents)
 import           MetaSonic.App.ManifestReloadCli
                                                 (renderManifestReloadHostStrategy,
                                                  renderStrategyOutcome)
@@ -513,6 +515,8 @@ runSupervisedStoppedAudioLiveReload listenerCfg oldPlan newPlan oldTarget _newTa
         , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
+        , rrhsiOnAudioEvent        =
+            noManifestReloadAudioEvents
         , rrhsiOnRetired           =
             \_ -> pure ()
         }
@@ -700,6 +704,8 @@ runSupervisedTryPreservingLiveReload listenerCfg oldPlan newPlan oldTarget _newT
         , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
+        , rrhsiOnAudioEvent        =
+            noManifestReloadAudioEvents
         , rrhsiOnRetired           =
             \_ -> pure ()
         }
@@ -920,6 +926,8 @@ runSupervisedRequirePreservingLiveReload listenerCfg oldPlan newPlan oldTarget _
         , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
+        , rrhsiOnAudioEvent        =
+            noManifestReloadAudioEvents
         , rrhsiOnRetired           =
             \_ -> pure ()
         }

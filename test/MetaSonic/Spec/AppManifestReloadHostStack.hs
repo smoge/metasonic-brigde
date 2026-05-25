@@ -790,6 +790,7 @@ mkProductionInputs ingressOps audioFFI = RealReloadHostStackInputs
   , rrhsiServiceOptions      = defaultSessionFanInServiceOptions
   , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
   , rrhsiOnEvent             = \_ -> pure ()
+  , rrhsiOnAudioEvent        = \_ -> pure ()
   , rrhsiOnRetired           = \_ -> pure ()
   }
 
@@ -1047,6 +1048,7 @@ realInWindowReloadTests =
           reloadResult <-
             realStoppedAudioInWindowReload
               testIngressTargetPolicy
+              (\_ -> pure ())
               stack
               initialPlan
               newPlan

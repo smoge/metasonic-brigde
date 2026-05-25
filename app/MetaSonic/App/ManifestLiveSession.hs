@@ -144,11 +144,11 @@ import           MetaSonic.App.ManifestLiveCommon
                                                  printServiceSnapshotWith,
                                                  readManifestDocOrDie,
                                                  renderAcceptedCommand,
+                                                 renderAudioEvents,
                                                  renderLiveReloadEvents,
                                                  renderOSCControls,
                                                  renderOSCControlsWith,
                                                  renderPreflightEvents,
-                                                 renderPreflightRejectionReason,
                                                  renderRetiredBindings,
                                                  retiredBindingsFromEvents,
                                                  retiredVoiceKeyMap,
@@ -190,6 +190,8 @@ import           MetaSonic.App.ManifestReloadCli
 import           MetaSonic.App.ManifestPreflightEvent
                                                 (ManifestPreflightEvent (..),
                                                  PreflightRejectionReason (..))
+import           MetaSonic.App.ManifestReloadAudioEvent
+                                                (ManifestReloadAudioEvent)
 import           MetaSonic.App.ManifestReloadEvent
                                                 (ManifestReloadEvent)
 import           MetaSonic.App.ManifestReloadHost
@@ -764,6 +766,11 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
   hFlush stdout
 
   reloadEventsRef <- newIORef []
+  -- Phase 8h step 3e v2 slice 2: audio-stage timeline emitted by
+  -- the stopped-audio orchestrator inside 'sopsInWindowReload'.
+  -- 'runReloadWithSink' clears it before each reload and reads it
+  -- after to render the operator-facing 'audio events:' block.
+  audioEventsRef  <- newIORef []
   trackedStackRef <- newIORef Nothing
   currentPlanRef  <- newIORef initialPlan
   lastOutcomeRef  <- newIORef Nothing
@@ -853,6 +860,8 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         , rrhsiServiceHooks        = serviceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEventsRef (<> [ev])
+        , rrhsiOnAudioEvent        =
+            \ev -> modifyIORef' audioEventsRef (<> [ev])
         , rrhsiOnRetired           =
             -- Phase 8h step 3e v1 slice 4: publish the retired
             -- snapshot before ingress reopens. The orchestrator
@@ -889,6 +898,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         currentPlanRef
         lastOutcomeRef
         reloadEventsRef
+        audioEventsRef
         valueCacheRef
         lastRetiredRef
         extPrintRef
@@ -910,6 +920,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         currentPlanRef
         lastOutcomeRef
         reloadEventsRef
+        audioEventsRef
         valueCacheRef
         lastRetiredRef
         extPrintRef
@@ -931,6 +942,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         currentPlanRef
         lastOutcomeRef
         reloadEventsRef
+        audioEventsRef
         valueCacheRef
         lastRetiredRef
         extPrintRef
@@ -1004,6 +1016,7 @@ runSupervised
   -> IORef MR.ManifestReloadPlan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef LiveValueCache
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> IORef (String -> IO ())
@@ -1013,7 +1026,7 @@ runSupervised
     causeLabel projectInitialIngressFailure mMidiDevice
     factory doc catalog initialPlan initialTarget
     trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef
-    valueCacheRef lastRetiredRef extPrintRef extPrintDyn = do
+    audioEventsRef valueCacheRef lastRetiredRef extPrintRef extPrintDyn = do
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory initialPlan)
     case openResult of
@@ -1076,6 +1089,7 @@ runSupervised
                   currentPlanRef
                   lastOutcomeRef
                   reloadEventsRef
+                  audioEventsRef
                   valueCacheRef
                   lastRetiredRef
                   extPrint)
@@ -1100,13 +1114,14 @@ sessionLoop
   -> IORef MR.ManifestReloadPlan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef LiveValueCache
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> (String -> IO ())
   -> Haskeline.InputT IO ()
 sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
-            lastOutcomeRef reloadEventsRef valueCacheRef lastRetiredRef
-            extPrint = loop
+            lastOutcomeRef reloadEventsRef audioEventsRef valueCacheRef
+            lastRetiredRef extPrint = loop
   where
     prompt =
       "Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:\n> "
@@ -1170,6 +1185,7 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
           currentPlanRef
           lastOutcomeRef
           reloadEventsRef
+          audioEventsRef
           lastRetiredRef
           key
 
@@ -1310,6 +1326,7 @@ runReloadWith
   -> IORef plan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> String
   -> IO SessionStep
@@ -1333,10 +1350,11 @@ runReloadWithSink
   -> IORef plan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> String
   -> IO SessionStep
-runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef lastRetiredRef key =
+runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef audioEventsRef lastRetiredRef key =
   -- Phase 8h step 3e v2 slice 1: emit a resolver-stage preflight
   -- event timeline around the 'resolvePlan' call. The timeline is
   -- always [Started, Rejected] or [Started, Succeeded]; the
@@ -1370,6 +1388,12 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
       mapM_ output (renderPreflightEvents preflight)
       fallbackPlan <- readIORef currentPlanRef
       writeIORef reloadEventsRef []
+      -- Phase 8h step 3e v2 slice 2: clear the audio-event timeline
+      -- so the operator-facing 'audio events:' block reflects only
+      -- the current attempt. The stopped-audio in-window slot
+      -- writes into this ref during 'sopsInWindowReload';
+      -- preserving never stops audio and leaves it empty.
+      writeIORef audioEventsRef []
       -- Phase 8h step 3e v1 slice 4: clear the stale-attribution
       -- snapshot before the supervisor runs. Any drain item that
       -- lands during the reload window itself attributes against
@@ -1382,6 +1406,7 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
                (\ev -> modifyIORef' supervisorEventsRef (++ [ev]))
                supOps fallbackPlan requestedPlan
       events <- readIORef reloadEventsRef
+      audioEvents <- readIORef audioEventsRef
       supervisorEvents <- readIORef supervisorEventsRef
       output ""
       let (lsoBase, step) = stepFromOutcome out
@@ -1399,6 +1424,17 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
         "  supervised outcome: " <> renderLiveSessionOutcome lso
       output "  reload events:"
       mapM_ output (renderLiveReloadEvents events)
+      -- Phase 8h step 3e v2 slice 2: render the audio-stage
+      -- timeline emitted by the stopped-audio orchestrator. The
+      -- block is suppressed entirely when the timeline is empty
+      -- (preserving reloads, or stopped-audio reloads that failed
+      -- before the audio stage ran), so preserving runs do not
+      -- print a dead header.
+      case audioEvents of
+        [] -> pure ()
+        _  -> do
+          output "  audio events:"
+          mapM_ output (renderAudioEvents audioEvents)
       -- Phase 8h step 3e v1 slice 2: render the retired-binding
       -- payload that slice 1 plumbed onto the commit event. The
       -- block is printed only when a commit event surfaced; the

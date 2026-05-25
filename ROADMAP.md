@@ -4164,8 +4164,17 @@ Still gated:
   the orchestrator-stage `HpariPlanRejected` / `HsariPlanRejected`
   in-phase rejection events are unchanged for v1 and remain a
   later-slice question. Allocation/resource recovery streaming
-  remains open and consumer-gated — see
-  [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md).
+  is now scoped in
+  [Allocation and Resource Recovery Event Semantics](notes/2026-05-25-b-allocation-resource-recovery-event-semantics.md);
+  the next slice is `ManifestReloadAudioEvent`, an audio-stage
+  event family that brackets stopped-audio audio start/stop
+  transitions during a reload — ready-timeout is carried by the
+  start-failure payload (`SfaiReadyTimeout` inside
+  `MraeStartFailed`) rather than emitting a separate event, and
+  preserving reloads stay silent on the family. The new note
+  supersedes the remaining open lane from the older
+  [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md)
+  closeout.
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
 

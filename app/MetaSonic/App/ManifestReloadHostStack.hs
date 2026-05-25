@@ -113,6 +113,7 @@ import           Data.Maybe                                  (catMaybes,
 import           Data.Text                                   (Text)
 import qualified Data.Text                                   as T
 
+import           MetaSonic.App.ManifestReloadAudioEvent      (ManifestReloadAudioEvent)
 import           MetaSonic.App.ManifestReloadEvent           (ManifestReloadEvent)
 import           MetaSonic.App.ManifestReloadHost            (ManifestReloadHostConfig (..),
                                                               manifestReloadHostOps)
@@ -125,7 +126,7 @@ import           MetaSonic.App.ManifestReloadIngressTarget   (ManifestReloadIngr
                                                               ManifestReloadIngressTargetPolicy,
                                                               manifestReloadIngressTargetFromPlan)
 import           MetaSonic.App.ManifestReloadMIDIBinding     (ManifestMIDIProjectionIssue)
-import           MetaSonic.App.ManifestReloadOrchestration   (orchestrateHostStoppedAudioReloadWithEvents)
+import           MetaSonic.App.ManifestReloadOrchestration   (orchestrateHostStoppedAudioReloadWithEventsAndAudio)
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                                              (HostStoppedAudioReloadIssue (..),
                                                               HostStoppedAudioReloadOps (..))
@@ -356,13 +357,15 @@ data StoppedAudioHostStackIssue ingressIssue
 -- forces.
 realStoppedAudioInWindowReload
   :: ManifestReloadIngressTargetPolicy
+  -> (ManifestReloadAudioEvent (ManifestReloadHostIssue ingressIssue)
+        -> IO ())
   -> ReloadHostStack ManifestReloadIngressTarget ingressIssue handle
   -> MR.ManifestReloadPlan
   -> MR.ManifestReloadPlan
   -> IO (InWindowReloadOutcome
           (HostStoppedAudioReloadIssue
             (ManifestReloadHostIssue ingressIssue)))
-realStoppedAudioInWindowReload policy stack fallback requested =
+realStoppedAudioInWindowReload policy onAudioEvent stack fallback requested =
   case manifestReloadIngressTargetFromPlan policy requested of
     Left _projIssue ->
       pure
@@ -385,8 +388,9 @@ realStoppedAudioInWindowReload policy stack fallback requested =
                 , mrhcNewIngressTarget = newTarget
                 }
           in inWindowOutcomeFromEither
-               <$> orchestrateHostStoppedAudioReloadWithEvents
+               <$> orchestrateHostStoppedAudioReloadWithEventsAndAudio
                      (mrhcOnEvent freshConfig)
+                     onAudioEvent
                      (planNativeOps freshConfig)
                      syntheticRequest
   where
@@ -485,6 +489,18 @@ data RealReloadHostStackInputs ingressIssue handle =
       -- owner are attributed by the live shell's drain hook against
       -- the latest retired set. Construction sites that do not need
       -- the snapshot should set this to @\\_ -> pure ()@.
+    , rrhsiOnAudioEvent
+        :: !(ManifestReloadAudioEvent
+              (ManifestReloadHostIssue ingressIssue) -> IO ())
+      -- ^ Phase 8h step 3e v2 slice 2: audio-stage sink invoked by
+      -- the stopped-audio orchestrator at @hsaroStopOldAudio@,
+      -- @hsaroStartNewAudio@, and the listener-restart-cleanup
+      -- @hsaroStopNewAudio@ boundaries. Only the stopped-audio
+      -- in-window slot reads this (preserving never stops audio);
+      -- the @TryPreservingThenStoppedAudio@ route forwards it into
+      -- the stopped-audio fallback. Construction sites that do not
+      -- want audio events should set this to
+      -- 'noManifestReloadAudioEvents'.
     }
 
 
@@ -513,7 +529,9 @@ realStoppedAudioHostStackOps inputs = StoppedAudioHostStackOps
   { sahsoOpen           = realOpen inputs
   , sahsoClose          = realClose
   , sahsoInWindowReload =
-      realStoppedAudioInWindowReload (rrhsiIngressTargetPolicy inputs)
+      realStoppedAudioInWindowReload
+        (rrhsiIngressTargetPolicy inputs)
+        (rrhsiOnAudioEvent inputs)
   }
 
 
