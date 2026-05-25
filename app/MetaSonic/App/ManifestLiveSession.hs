@@ -354,10 +354,16 @@ parseLiveSessionCommand line =
           [k] -> LscReloadTo k
           _   -> LscUnknown line
       | "set " `isPrefixOf` s ->
-        -- Two-token rule: 'set <name>/<slot> <value>'. Empty payload,
-        -- wrong arity, missing slot separator, non-integer slot, and
-        -- non-finite values all reject as 'LscUnknown' rather than
-        -- silently dropping bad input into the live session.
+        -- Two-token rule: 'set <key>/<slot> <value>'. The tag is the
+        -- @<key>/<slot>@ path tail an operator copies from the
+        -- @controls@ addressable surface — note this is the manifest
+        -- @key@ field, not the human display @name@ (e.g. in
+        -- @saw-noise-filter.json@ the cutoff control has display
+        -- @name="cutoff"@ but key @lpf@ slot @0@, so the operator
+        -- types @set lpf/0 1500@). Empty payload, wrong arity,
+        -- missing slot separator, non-integer slot, and non-finite
+        -- values all reject as 'LscUnknown' rather than silently
+        -- dropping bad input into the live session.
         case words (drop 4 s) of
           [tagTok, valueTok] ->
             case (parseControlTag tagTok, readMaybe valueTok) of

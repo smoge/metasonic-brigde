@@ -152,40 +152,44 @@ parseLiveSessionCommandTests =
   , row "unknown command preserves the original (untrimmed) line"
       "  hello world  " (LscUnknown "  hello world  ")
 
-  -- set TAG VALUE (Phase 8h step 3d)
-  , row "set name/slot value parses as LscUISet"
-      "set cutoff/0 1500" (LscUISet cutoff0 1500)
+  -- set TAG VALUE (Phase 8h step 3d). TAG is the manifest @key/slot@
+  -- path tail an operator copies from the @controls@ output, not the
+  -- human display @name@. The fixture uses @lpf/0@ (the cutoff
+  -- control's key in @saw-noise-filter.json@) so the tests describe
+  -- what an operator actually types.
+  , row "set key/slot value parses as LscUISet"
+      "set lpf/0 1500" (LscUISet lpf0 1500)
   , row "set tolerates leading + trailing whitespace"
-      "  set cutoff/0 1500  " (LscUISet cutoff0 1500)
+      "  set lpf/0 1500  " (LscUISet lpf0 1500)
   , row "set parses negative values"
-      "set cutoff/0 -1.5" (LscUISet cutoff0 (-1.5))
-  , row "set parses fractional values"
-      "set q/1 0.7" (LscUISet (mkTag "q" 1) 0.7)
+      "set lpf/0 -1.5" (LscUISet lpf0 (-1.5))
+  , row "set parses fractional values (different key + slot)"
+      "set lpf/1 0.7" (LscUISet (mkTag "lpf" 1) 0.7)
   , row "set with missing value is unknown"
-      "set cutoff/0" (LscUnknown "set cutoff/0")
+      "set lpf/0" (LscUnknown "set lpf/0")
   , row "set with empty payload is unknown"
       "set " (LscUnknown "set ")
-  , row "set without tag separator is unknown"
-      "set cutoff 1500" (LscUnknown "set cutoff 1500")
+  , row "set without slot separator is unknown"
+      "set lpf 1500" (LscUnknown "set lpf 1500")
   , row "set with non-numeric slot is unknown"
-      "set cutoff/x 1500" (LscUnknown "set cutoff/x 1500")
+      "set lpf/x 1500" (LscUnknown "set lpf/x 1500")
   , row "set with negative slot is unknown"
-      "set cutoff/-1 1500" (LscUnknown "set cutoff/-1 1500")
-  , row "set with empty tag name is unknown"
+      "set lpf/-1 1500" (LscUnknown "set lpf/-1 1500")
+  , row "set with empty key is unknown"
       "set /0 1500" (LscUnknown "set /0 1500")
   , row "set with non-numeric value is unknown"
-      "set cutoff/0 abc" (LscUnknown "set cutoff/0 abc")
+      "set lpf/0 abc" (LscUnknown "set lpf/0 abc")
   , row "set with too many tokens is unknown"
-      "set cutoff/0 1500 extra" (LscUnknown "set cutoff/0 1500 extra")
+      "set lpf/0 1500 extra" (LscUnknown "set lpf/0 1500 extra")
   , row "uppercase 'SET' prefix is unknown (case-sensitive)"
-      "SET cutoff/0 1500" (LscUnknown "SET cutoff/0 1500")
+      "SET lpf/0 1500" (LscUnknown "SET lpf/0 1500")
   ]
   where
     row name input expected =
       testCase name $
         parseLiveSessionCommand input @?= expected
 
-    cutoff0 = mkTag "cutoff" 0
+    lpf0 = mkTag "lpf" 0
     mkTag k slot = ControlTag (MigrationKey k) slot
 
 
