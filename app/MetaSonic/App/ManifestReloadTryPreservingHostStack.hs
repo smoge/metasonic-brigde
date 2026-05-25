@@ -77,6 +77,7 @@ module MetaSonic.App.ManifestReloadTryPreservingHostStack
     -- * Production wiring
   , realTryPreservingHostStackOps
   , realTryPreservingInWindowReload
+  , realTryPreservingInWindowReloadWith
   , mkTryPreservingHostStackFactory
   ) where
 
@@ -315,9 +316,59 @@ realTryPreservingInWindowReload
   -> MR.ManifestReloadPlan
   -> IO (InWindowReloadOutcome
           (TryPreservingInWindowIssue ingressIssue))
-realTryPreservingInWindowReload onEvent onAudioEvent producer policy stack fallback requested = do
+realTryPreservingInWindowReload =
+  realTryPreservingInWindowReloadWith
+    realPreservingInWindowReload
+    realStoppedAudioInWindowReload
+
+
+-- | Generic composition of a try-preserving in-window reload over
+-- caller-supplied preserving and stopped-audio helpers. Production
+-- partial-applies the real helpers as 'realTryPreservingInWindowReload';
+-- the test suite injects stub helpers to pin the structural
+-- contract that the @onAudioEvent@ callback is forwarded into the
+-- stopped-audio helper on the @TpnRunFallback@ branch (and only
+-- on that branch). Splitting the helpers out is purely
+-- test-observability — the production path is unchanged.
+--
+-- The @policy@ and @target@ parameters are opaque to the
+-- composition (it never inspects them) and are kept polymorphic
+-- so the tests can pass placeholder values without constructing
+-- the heavy 'ManifestReloadIngressTargetPolicy' /
+-- 'ManifestReloadIngressTarget' fixtures the production helpers
+-- require. Production unifies @policy ~ ManifestReloadIngressTargetPolicy@
+-- and @target ~ ManifestReloadIngressTarget@.
+realTryPreservingInWindowReloadWith
+  :: Show ingressIssue
+  => (ProducerId
+        -> policy
+        -> ReloadHostStack target ingressIssue handle
+        -> MR.ManifestReloadPlan
+        -> MR.ManifestReloadPlan
+        -> IO (InWindowReloadOutcome
+                (HostPreservingReloadIssue
+                  (ManifestReloadHostIssue ingressIssue))))
+  -> (policy
+        -> (ManifestReloadAudioEvent (ManifestReloadHostIssue ingressIssue)
+              -> IO ())
+        -> ReloadHostStack target ingressIssue handle
+        -> MR.ManifestReloadPlan
+        -> MR.ManifestReloadPlan
+        -> IO (InWindowReloadOutcome
+                (HostStoppedAudioReloadIssue
+                  (ManifestReloadHostIssue ingressIssue))))
+  -> (ManifestReloadEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
+  -> (ManifestReloadAudioEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
+  -> ProducerId
+  -> policy
+  -> ReloadHostStack target ingressIssue handle
+  -> MR.ManifestReloadPlan
+  -> MR.ManifestReloadPlan
+  -> IO (InWindowReloadOutcome
+          (TryPreservingInWindowIssue ingressIssue))
+realTryPreservingInWindowReloadWith preservingHelper stoppedHelper onEvent onAudioEvent producer policy stack fallback requested = do
   preservingOutcome <-
-    realPreservingInWindowReload producer policy stack fallback requested
+    preservingHelper producer policy stack fallback requested
   let decision = decideTryPreservingNext preservingOutcome
   mapM_ onEvent (fallbackEventForDecision decision)
   case decision of
@@ -325,7 +376,7 @@ realTryPreservingInWindowReload onEvent onAudioEvent producer policy stack fallb
       pure InWindowReloadCommitted
     TpnRunFallback preservingIssue -> do
       stoppedOutcome <-
-        realStoppedAudioInWindowReload policy onAudioEvent stack fallback requested
+        stoppedHelper policy onAudioEvent stack fallback requested
       pure (composeFallbackOutcome preservingIssue stoppedOutcome)
     TpnDeclineFallback preservingIssue ->
       pure

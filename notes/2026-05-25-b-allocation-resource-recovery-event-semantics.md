@@ -462,9 +462,16 @@ smoke. Try-preserving emits audio events only when the preserving
 phase rejects and the fallback gate admits the stopped-audio
 fallback (`realTryPreservingInWindowReload` forwards
 `onAudioEvent` into the stopped-audio path); that forwarding is
-wired in the source but is **not yet pinned by a focused test** —
-`AppManifestLiveSession` pins rendering against synthetic
-timelines and `AppManifestReloadTryPreservingHostStack` asserts
-the combined fallback *outcome* without checking `onAudioEvent`
-forwarding. Closing that coverage gap is a follow-up; the
-forwarding itself is reachable today.
+pinned by the `realTryPreservingInWindowReload audio-event
+forwarding` group in `AppManifestReloadTryPreservingHostStack`,
+which calls a test-friendly generic
+`realTryPreservingInWindowReloadWith` (production is a partial
+application of the same function over the real preserving +
+stopped-audio helpers) with stub helpers covering three branches:
+preserving-commits (stopped-audio helper not invoked, audio sink
+empty), preserving-rejects-fallback-admitted (stopped-audio
+helper invoked exactly once and the four-bullet stop/start
+bracket arrives in the audio sink verbatim), and
+preserving-rejects-fallback-declined (stopped-audio helper not
+invoked, audio sink empty). The smoke above does not exercise the
+fallback branch.

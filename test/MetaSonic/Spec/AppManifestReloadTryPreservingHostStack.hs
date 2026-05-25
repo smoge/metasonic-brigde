@@ -39,6 +39,7 @@ module MetaSonic.Spec.AppManifestReloadTryPreservingHostStack
 
 import qualified Data.Map.Strict   as M
 import           Data.IORef        (IORef, modifyIORef', newIORef, readIORef)
+import qualified Data.Text         as T
 
 import           Test.Tasty
 import           Test.Tasty.HUnit
@@ -57,6 +58,8 @@ import           MetaSonic.App.ManifestReloadSupervisor
                                     reloadSupervised)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                    (withHostStackSupervisorAdapter)
+import           MetaSonic.App.ManifestReloadAudioEvent
+                                   (ManifestReloadAudioEvent (..))
 import           MetaSonic.App.ManifestReloadEvent
                                    (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadTryPreservingHostStack
@@ -67,11 +70,13 @@ import           MetaSonic.App.ManifestReloadTryPreservingHostStack
                                     composeFallbackOutcome,
                                     decideTryPreservingNext,
                                     fallbackEventForDecision,
-                                    mkTryPreservingHostStackFactory)
+                                    mkTryPreservingHostStackFactory,
+                                    realTryPreservingInWindowReloadWith)
 import           MetaSonic.Bridge.Templates (TemplateGraph (..))
 import           MetaSonic.Pattern        (SwapLabel (..))
 import           MetaSonic.Session.Arbitration (ArbitrationPolicy (..))
 import           MetaSonic.Session.FanIn  (SessionFanInAudioIssue (..))
+import           MetaSonic.Session.Queue  (ProducerId (..), ProducerKind (..))
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.RTGraphAdapter
                                    (defaultRTGraphAdapterOptions)
@@ -204,7 +209,138 @@ appManifestReloadTryPreservingHostStackTests =
   , composeFallbackOutcomeTests
   , fallbackEventForDecisionTests
   , factoryCompositionTests
+  , audioEventForwardingTests
   ]
+
+
+-- | Pin the structural contract that
+-- 'realTryPreservingInWindowReload' forwards its @onAudioEvent@
+-- callback into the stopped-audio helper on the @TpnRunFallback@
+-- branch (and only on that branch). The production function is a
+-- partial application of 'realTryPreservingInWindowReloadWith'
+-- against the real preserving + stopped-audio helpers; tests use
+-- 'realTryPreservingInWindowReloadWith' with stub helpers so the
+-- forwarding contract can be observed without invoking real audio.
+audioEventForwardingTests :: TestTree
+audioEventForwardingTests =
+  testGroup "realTryPreservingInWindowReload audio-event forwarding"
+  [ testCase "preserving commits → stopped-audio helper not invoked, audio-event sink stays empty" $ do
+      audioRef <- newIORef ([] :: [TestAudioEvent])
+      stoppedCalledRef <- newIORef (0 :: Int)
+      let preservingHelper _ _ _ _ _ =
+            pure InWindowReloadCommitted
+          stoppedHelper _ _ _ _ _ = do
+            modifyIORef' stoppedCalledRef (+ 1)
+            -- If the test reaches this branch, the test FAILS via
+            -- the @stoppedCalledRef@ assertion below; the outcome
+            -- is irrelevant.
+            pure
+              (InWindowReloadTerminal
+                (HsariReloadFailedNoOwner
+                  (MrhiAudio (SfaiStartFailed (-99)))))
+      outcome <-
+        realTryPreservingInWindowReloadWith
+          preservingHelper
+          stoppedHelper
+          (\_ -> pure ())
+          (\ev -> modifyIORef' audioRef (++ [ev]))
+          testProducerId
+          ()  -- policy is unused by the stub helpers
+          stubStack
+          planA
+          planB
+      outcome @?= InWindowReloadCommitted
+      stoppedCalls <- readIORef stoppedCalledRef
+      stoppedCalls @?= 0
+      audioEvents <- readIORef audioRef
+      audioEvents @?= []
+
+  , testCase "preserving rejects (fallback admitted) → stopped-audio helper receives the audio-event callback verbatim" $ do
+      audioRef <- newIORef ([] :: [TestAudioEvent])
+      stoppedCalledRef <- newIORef (0 :: Int)
+      let preservingHelper _ _ _ _ _ =
+            -- HpariReloadRejected is the only HostPreservingReloadIssue
+            -- constructor that 'preservingAllowsStoppedAudioFallback'
+            -- admits today (the other three RejectedLiveFallback
+            -- causes — PlanRejected, QuiesceRejected, DrainRejected —
+            -- decline). See 'decideTryPreservingNextTests' for the
+            -- full per-constructor table.
+            pure
+              (InWindowReloadRejectedLiveFallback
+                (HpariReloadRejected (MrhiIngress "test-trigger")))
+          -- Emit the canonical four-bullet stopped-audio bracket
+          -- through the forwarded callback so the test can read
+          -- back the exact sequence the production helper would
+          -- have produced on a real audio-start success.
+          stoppedHelper _ onAudio _ _ _ = do
+            modifyIORef' stoppedCalledRef (+ 1)
+            onAudio MraeStopAttempted
+            onAudio MraeStopSucceeded
+            onAudio MraeStartAttempted
+            onAudio MraeStartSucceeded
+            pure InWindowReloadCommitted
+      _ <-
+        realTryPreservingInWindowReloadWith
+          preservingHelper
+          stoppedHelper
+          (\_ -> pure ())
+          (\ev -> modifyIORef' audioRef (++ [ev]))
+          testProducerId
+          ()  -- policy is unused by the stub helpers
+          stubStack
+          planA
+          planB
+      stoppedCalls <- readIORef stoppedCalledRef
+      stoppedCalls @?= 1
+      audioEvents <- readIORef audioRef
+      audioEvents @?=
+        [ MraeStopAttempted
+        , MraeStopSucceeded
+        , MraeStartAttempted
+        , MraeStartSucceeded
+        ]
+
+  , testCase "preserving rejects (fallback declined) → stopped-audio helper not invoked" $ do
+      audioRef <- newIORef ([] :: [TestAudioEvent])
+      stoppedCalledRef <- newIORef (0 :: Int)
+      let preservingHelper _ _ _ _ _ =
+            -- HpariQuiesceRejected declines fallback (the stack is
+            -- still live but the gate refuses); per the
+            -- 'decideTryPreservingNextTests' table this collapses
+            -- to TpnDeclineFallback.
+            pure
+              (InWindowReloadRejectedLiveFallback
+                (HpariQuiesceRejected (MrhiIngress "quiesce-rejected")))
+          stoppedHelper _ _ _ _ _ = do
+            modifyIORef' stoppedCalledRef (+ 1)
+            pure
+              (InWindowReloadTerminal
+                (HsariReloadFailedNoOwner
+                  (MrhiAudio (SfaiStartFailed (-99)))))
+      _ <-
+        realTryPreservingInWindowReloadWith
+          preservingHelper
+          stoppedHelper
+          (\_ -> pure ())
+          (\ev -> modifyIORef' audioRef (++ [ev]))
+          testProducerId
+          ()
+          stubStack
+          planA
+          planB
+      stoppedCalls <- readIORef stoppedCalledRef
+      stoppedCalls @?= 0
+      audioEvents <- readIORef audioRef
+      audioEvents @?= []
+  ]
+  where
+    testProducerId =
+      ProducerId ProducerTest (T.pack "try-preserving-audio-forwarding-test")
+
+
+-- | The 'ingressIssue' parameter for the audio-forwarding tests.
+-- 'String' matches the 'TestStack' alias above.
+type TestAudioEvent = ManifestReloadAudioEvent (ManifestReloadHostIssue String)
 
 
 -- | Pure-core event-emission table. Mirrors the direct path's
