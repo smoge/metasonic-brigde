@@ -54,6 +54,9 @@ module MetaSonic.App.ManifestLiveSession
 
     -- * Outcome state machine (pure, table-tested)
   , LiveSessionOutcome (..)
+  , LiveSessionDivergedState (..)
+  , liveSessionCommandIsGatedWhileDiverged
+  , liveSessionDivergedRefusal
   , renderLiveSessionOutcome
   , SessionStep (..)
   , stepFromOutcome
@@ -108,6 +111,8 @@ module MetaSonic.App.ManifestLiveSession
   , catalogPlanResolver
   , runReloadWith
   , runReloadWithSink
+  , printStatusWith
+  , LiveStack
   ) where
 
 import           Control.Exception              (finally, mask)
@@ -493,8 +498,74 @@ renderLiveSessionOutcome = \case
     "plan-rejected (" <> reason <> ")"
 
 
+-- | Phase 8h step 3e v2 slice (supervision v1, 2026-05-25-f):
+-- terminal-state snapshot kept across the diverged window.
+--
+-- The reload supervisor emits 'SupervisedReloadEscalated !e !e'
+-- when an in-window failure escalated to a rebuild and the rebuild
+-- also failed. In that state @trackedStackRef@ is already 'Nothing'
+-- (the supervisor's @hsfCloseStack@ 'finally' cleared it) and the
+-- session has no live stack to serve from. Slice 1 keeps the
+-- session loop alive in that state instead of terminating with
+-- 'SsTerminate'; 'runReloadWithSink' renders the two causes
+-- through the live session's @causeLabel@ projection at the
+-- escalation site and writes them here so 'status' can report
+-- @no live stack: repair required@ with the same wording on every
+-- subsequent prompt.
+--
+-- The cause strings are rendered at write time so this type stays
+-- non-parametric; keeping the @e@ raw would force the type and
+-- every threading site to carry the supervisor's issue parameter
+-- through 'sessionLoop', 'runReloadWith', the test stubs, and the
+-- status renderer, and the operator-facing surface only ever needs
+-- the rendered string anyway.
+data LiveSessionDivergedState = LiveSessionDivergedState
+  { ldsInWindowCause :: !String
+  , ldsRebuildCause  :: !String
+  } deriving stock (Eq, Show)
+
+
+-- | Per-command gate policy for the diverged state. The dispatcher
+-- consults this on every prompt while 'divergedStateRef' is
+-- 'Just'; commands that pass the gate continue through
+-- 'handleCommand' as normal.
+--
+-- Today the gated set is reload / UI set / controls / values:
+-- those either touch the substrate directly ('LscReloadTo' calls
+-- into 'runReloadWithSink', which expects a live supervisor;
+-- 'LscUISet' submits through the UI ingress against a live owner)
+-- or report on a live surface ('LscControls', 'LscValues' read the
+-- service snapshot). 'LscStatus' / 'LscDemos' / 'LscHelp' /
+-- 'LscQuit' have no live-stack dependency and remain available so
+-- the operator can inspect the divergence and exit cleanly.
+liveSessionCommandIsGatedWhileDiverged
+  :: LiveSessionCommand -> Bool
+liveSessionCommandIsGatedWhileDiverged = \case
+  LscReloadTo _ -> True
+  LscUISet _ _  -> True
+  LscControls   -> True
+  LscValues     -> True
+  _             -> False
+
+
+-- | Operator-facing refusal text emitted when a gated command runs
+-- while the session is diverged. Three lines so the prompt
+-- transcript reads naturally; the list shape lets the dispatcher
+-- 'mapM_' it through whichever output sink is in scope.
+liveSessionDivergedRefusal :: [String]
+liveSessionDivergedRefusal =
+  [ "  no live stack: repair required."
+  , "  this command is unavailable while the session is diverged."
+  , "  available commands: status, demos, help, quit."
+  ]
+
+
 -- | Continue the session loop, or terminate with an exit code.
--- Only 'LsoEscalated' terminates today.
+-- After supervision v1 ('2026-05-25-f'), 'LsoEscalated' no longer
+-- terminates the loop — it leaves the session in the diverged
+-- state instead. No 'LiveSessionOutcome' currently maps to
+-- 'SsTerminate'; the constructor stays so a future
+-- bounded-fatal lane can use it without re-plumbing.
 data SessionStep
   = SsContinue
   | SsTerminate !ExitCode
@@ -514,7 +585,15 @@ stepFromOutcome = \case
   SupervisedReloadRejectedRecovered _ ->
     (LsoRejectedRecovered, SsContinue)
   SupervisedReloadEscalated _ _ ->
-    (LsoEscalated, SsTerminate (ExitFailure 1))
+    -- Phase 8h step 3e v2 slice (supervision v1, 2026-05-25-f):
+    -- Escalation no longer terminates the session. The loop stays
+    -- alive in a diverged state; 'runReloadWithSink' writes the two
+    -- causes into the diverged-state IORef, the 'status' renderer
+    -- prints a 'no live stack: repair required' block, and the
+    -- dispatch gate refuses 'demo:KEY' / 'set' / 'controls' /
+    -- 'values' until the slice is extended with an explicit repair
+    -- command.
+    (LsoEscalated, SsContinue)
 
 
 -- ============================================================================
@@ -782,6 +861,12 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
   -- 'runReloadWithSink'. The service drain hook reads this IORef on
   -- every drain to attribute incoming 'SiStaleVoice' rejections.
   lastRetiredRef  <- newIORef M.empty
+  -- Supervision v1 (2026-05-25-f): terminal-state holder, written
+  -- on 'SupervisedReloadEscalated' and read by 'printStatusWith' /
+  -- the dispatch gate. Cleared only when the slice is extended
+  -- with an explicit repair pathway; today the divergence is
+  -- sticky for the rest of the session.
+  divergedStateRef <- newIORef Nothing
 
   -- Phase 8j: indirect operator-output sink.
   --
@@ -901,6 +986,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         audioEventsRef
         valueCacheRef
         lastRetiredRef
+        divergedStateRef
         extPrintRef
         extPrintDyn
 
@@ -923,6 +1009,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         audioEventsRef
         valueCacheRef
         lastRetiredRef
+        divergedStateRef
         extPrintRef
         extPrintDyn
 
@@ -945,6 +1032,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         audioEventsRef
         valueCacheRef
         lastRetiredRef
+        divergedStateRef
         extPrintRef
         extPrintDyn
   where
@@ -1019,6 +1107,7 @@ runSupervised
   -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef LiveValueCache
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
+  -> IORef (Maybe LiveSessionDivergedState)
   -> IORef (String -> IO ())
   -> (String -> IO ())
   -> IO ()
@@ -1026,7 +1115,8 @@ runSupervised
     causeLabel projectInitialIngressFailure mMidiDevice
     factory doc catalog initialPlan initialTarget
     trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef
-    audioEventsRef valueCacheRef lastRetiredRef extPrintRef extPrintDyn = do
+    audioEventsRef valueCacheRef lastRetiredRef divergedStateRef
+    extPrintRef extPrintDyn = do
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory initialPlan)
     case openResult of
@@ -1092,6 +1182,7 @@ runSupervised
                   audioEventsRef
                   valueCacheRef
                   lastRetiredRef
+                  divergedStateRef
                   extPrint)
                 `finally` writeIORef extPrintRef putStrLn
         pure ()
@@ -1117,11 +1208,12 @@ sessionLoop
   -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef LiveValueCache
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
+  -> IORef (Maybe LiveSessionDivergedState)
   -> (String -> IO ())
   -> Haskeline.InputT IO ()
 sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
             lastOutcomeRef reloadEventsRef audioEventsRef valueCacheRef
-            lastRetiredRef extPrint = loop
+            lastRetiredRef divergedStateRef extPrint = loop
   where
     prompt =
       "Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:\n> "
@@ -1144,11 +1236,30 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
               extPrint "  Terminating session."
               exitWith code
 
-    dispatch = \case
+    -- Supervision v1 (2026-05-25-f): commands that need a live
+    -- stack are refused while the session is in the diverged
+    -- state. 'status', 'demos', 'help', and 'quit' continue to
+    -- work; they do not call into the substrate. Reload, set,
+    -- controls, and values either touch the substrate directly or
+    -- would observe a half-open surface, so they are gated until a
+    -- future slice introduces an explicit repair pathway. The
+    -- per-command policy and the refusal text live at module
+    -- top-level so unit tests can pin them.
+    dispatch cmd = do
+      mDiverged <- readIORef divergedStateRef
+      case mDiverged of
+        Just _ | liveSessionCommandIsGatedWhileDiverged cmd -> do
+          mapM_ extPrint liveSessionDivergedRefusal
+          pure SsContinue
+        _ ->
+          handleCommand cmd
+
+    handleCommand = \case
       LscQuit ->
         pure (SsTerminate ExitSuccess)
       LscStatus -> do
-        printStatusWith extPrint trackedStackRef currentPlanRef lastOutcomeRef
+        printStatusWith extPrint trackedStackRef currentPlanRef
+          lastOutcomeRef divergedStateRef
         pure SsContinue
       LscDemos -> do
         printDemosWith extPrint doc catalog currentPlanRef
@@ -1187,6 +1298,7 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
           reloadEventsRef
           audioEventsRef
           lastRetiredRef
+          divergedStateRef
           key
 
     -- | Post-reload hook called on 'SupervisedReloadCommitted' and
@@ -1313,10 +1425,18 @@ catalogPlanResolver doc catalog = ReloadResolver $ \key ->
 --     now the current plan.
 --
 -- The hook is NOT called on 'SupervisedReloadRequestRejected'
--- (stack unchanged), 'SupervisedReloadEscalated' (session
--- terminates), or on a command-level 'LsoPlanRejected' (supervisor
--- not invoked). Production uses the hook to do the post-reload
--- voice auto-start; tests pass @const (pure ())@.
+-- (stack unchanged), 'SupervisedReloadEscalated' (session enters
+-- the diverged state instead of terminating), or on a command-
+-- level 'LsoPlanRejected' (supervisor not invoked). Production
+-- uses the hook to do the post-reload voice auto-start; tests pass
+-- @const (pure ())@.
+--
+-- @divergedStateRef@ is the supervision-v1 sink:
+-- 'SupervisedReloadEscalated' renders both causes through
+-- @causeLabel@ and writes a 'LiveSessionDivergedState' into the
+-- ref; the dispatch loop and 'printStatusWith' read it on every
+-- prompt. Tests that do not care about the diverged path can pass
+-- a fresh @newIORef Nothing@ and ignore it.
 runReloadWith
   :: ReloadResolver plan
   -> (plan -> String)
@@ -1328,6 +1448,7 @@ runReloadWith
   -> IORef [LiveEvent]
   -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
+  -> IORef (Maybe LiveSessionDivergedState)
   -> String
   -> IO SessionStep
 runReloadWith =
@@ -1352,9 +1473,10 @@ runReloadWithSink
   -> IORef [LiveEvent]
   -> IORef [ManifestReloadAudioEvent (ManifestReloadHostIssue LiveProdIngressIssue)]
   -> IORef (M.Map VoiceKey RetiredVoiceReason)
+  -> IORef (Maybe LiveSessionDivergedState)
   -> String
   -> IO SessionStep
-runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef audioEventsRef lastRetiredRef key =
+runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef audioEventsRef lastRetiredRef divergedStateRef key =
   -- Phase 8h step 3e v2 slice 1: emit a resolver-stage preflight
   -- event timeline around the 'resolvePlan' call. The timeline is
   -- always [Started, Rejected] or [Started, Succeeded]; the
@@ -1477,10 +1599,20 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
         SupervisedReloadRejectedRecovered cause ->
           output ("  in-window cause: " <> causeLabel cause)
         SupervisedReloadEscalated inWindow rebuild -> do
-          output ("  in-window cause: " <> causeLabel inWindow)
-          output ("  rebuild cause:   " <> causeLabel rebuild)
+          let inWindowCause = causeLabel inWindow
+              rebuildCause  = causeLabel rebuild
+          output ("  in-window cause: " <> inWindowCause)
+          output ("  rebuild cause:   " <> rebuildCause)
           hPutStrLn stderr
             "live session escalated: no live stack remains."
+          -- Supervision v1 (2026-05-25-f): keep the loop alive
+          -- by recording the diverged state. 'stepFromOutcome' now
+          -- returns 'SsContinue' for escalation; the dispatcher
+          -- reads this ref on every prompt and refuses commands
+          -- that need a live stack until the slice is extended
+          -- with an explicit repair pathway.
+          writeIORef divergedStateRef
+            (Just (LiveSessionDivergedState inWindowCause rebuildCause))
       let timeline =
             resourceTimelineForOutcome fallbackPlan requestedPlan out
       output "  resource timeline:"
@@ -1507,8 +1639,10 @@ printStatusWith
   -> IORef (Maybe LiveStack)
   -> IORef MR.ManifestReloadPlan
   -> IORef (Maybe LiveSessionOutcome)
+  -> IORef (Maybe LiveSessionDivergedState)
   -> IO ()
-printStatusWith output trackedStackRef currentPlanRef lastOutcomeRef = do
+printStatusWith output trackedStackRef currentPlanRef lastOutcomeRef
+                divergedStateRef = do
   output ""
   output "  status:"
   currentPlan <- readIORef currentPlanRef
@@ -1525,6 +1659,18 @@ printStatusWith output trackedStackRef currentPlanRef lastOutcomeRef = do
       ingressSnapshot <- readManifestReloadIngressManager ingress
       output $
         "    ingress:           " <> renderLiveIngressSnapshot ingressSnapshot
+  -- Supervision v1 (2026-05-25-f): render the diverged-state
+  -- block when present. The two causes were captured at
+  -- 'SupervisedReloadEscalated' time through the live session's
+  -- 'causeLabel' projection, so the rendering is stable across
+  -- subsequent status reads.
+  mDiverged <- readIORef divergedStateRef
+  case mDiverged of
+    Nothing -> pure ()
+    Just (LiveSessionDivergedState inWindowCause rebuildCause) -> do
+      output "    no live stack:     repair required"
+      output ("      in-window cause: " <> inWindowCause)
+      output ("      rebuild cause:   " <> rebuildCause)
   mLast <- readIORef lastOutcomeRef
   case mLast of
     Nothing ->
