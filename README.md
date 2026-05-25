@@ -129,8 +129,15 @@ stack exec -- metasonic-bridge [MODE] [DEMO ...]
 | `--manifest-reload-plan DEMO` | Diagnose manifest reload planning             |
 | `--manifest-reload-plan-file MANIFEST.json DEMO` | Diagnose external manifest planning |
 | `--manifest-session-smoke MANIFEST.json DEMO` | Construct a fresh owner from a manifest |
+| `--manifest-stopped-audio-reload-smoke MANIFEST.json DEMO` | Reload a non-audio host through the stopped-audio helper |
+| `--manifest-midi-reload-smoke MANIFEST.json DEMO` | Drive the manifest MIDI ingress reload smoke |
+| `--manifest-host-reload-smoke STRATEGY MANIFEST.json DEMO` | Non-audio host-strategy reload smoke (preserving / stopped-audio / try-preserving) |
+| `--manifest-live-reload-demo STRATEGY MANIFEST.json OLD NEW` | Audible live reload from OLD to NEW under STRATEGY |
+| `--manifest-live-session MANIFEST.json DEMO [--strategy S]` | Open the operator-facing live shell over MANIFEST |
 | `--midi-list`                 | List Q / PortMIDI devices                     |
 | `--session-midi-smoke [SECONDS]` | Probe session MIDI ingress without audio   |
+| `--session-osc-arbitration-smoke [SECONDS]` | Non-audio OSC arbitration probe with TargetClaim policy |
+| `--session-midi-arbitration-smoke` | Scripted non-device MIDI arbitration probe; exits non-zero on counter mismatch |
 | `--plugin-list`               | Print the linked static plugin registry       |
 | `--osc-listen [PORT]`         | Run the OSC-controlled demo graph             |
 
@@ -140,6 +147,45 @@ Useful modifiers:
 - `--summary` switches `--fusion-cost-lab` from JSONL to a readable table.
 - `--midi-device N` selects the PortMIDI input for `midi-poly` and
   overrides the auto-selected input for `--session-midi-smoke`.
+- `--session-osc-port N` sets the UDP port for the session-OSC
+  arbitration smoke and for the live-session / live-reload OSC ingress.
+
+### Operator flows
+
+The commands above fall into three groups by what they touch:
+
+- **Deterministic / offline diagnostics.** No audio, no real
+  devices, no sockets; safe in CI and on machines without
+  hardware. `--fusion-survey`, `--worker-bench`,
+  `--fusion-cost-lab`, `--snapshot-check`, `--authoring-manifest`,
+  `--manifest-reload-plan` / `--manifest-reload-plan-file`,
+  `--manifest-session-smoke`,
+  `--manifest-stopped-audio-reload-smoke`, and
+  `--session-midi-arbitration-smoke` belong here. The last is
+  fully scripted and exits non-zero on counter mismatch, so it is
+  suitable for unattended runs.
+
+- **Opt-in live audio / device smokes.** Open real audio,
+  UDP listeners, or PortMIDI devices for a bounded window.
+  `--osc-listen`, `--session-midi-smoke`,
+  `--session-osc-arbitration-smoke`,
+  `--manifest-host-reload-smoke`,
+  `--manifest-midi-reload-smoke`, and
+  `--manifest-live-reload-demo` belong here. Hardware- or
+  socket-gated and not intended for unattended CI;
+  `--manifest-host-reload-smoke` binds a real UDP port and
+  surfaces bind failure through `MrciOSCIngressOpenFailed`.
+
+- **Open-ended live shell.** `--manifest-live-session
+  MANIFEST.json DEMO [--strategy S]` opens the persistent
+  operator session: line-editor input, supervised reload
+  lifecycle, audio + ingress brackets, status / repair commands.
+  This is the live path the live-app reload policy boundary
+  targets; everything above feeds into it. See
+  [notes/2026-05-20-b-manifest-live-session-v0.md](notes/2026-05-20-b-manifest-live-session-v0.md),
+  [notes/2026-05-25-i-live-app-manifest-reload-policy.md](notes/2026-05-25-i-live-app-manifest-reload-policy.md),
+  and
+  [notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md](notes/2026-05-19-b-manifest-host-reload-smoke-runbook.md).
 
 ### Demo targets
 
@@ -323,19 +369,35 @@ The landed pieces are deliberately small:
   `stopAudio`, validate manifests, drain queued commands, or restart listener
   threads.
 
-What is still intentionally absent: GUI toolkit bindings, live or
-host-level manifest-driven session reload/resource allocation beyond the
-diagnostic planning, construction-smoke CLI, non-audio stopped-audio
-owner-swap helper, and stopped-audio reload smoke CLI, broader MIDI behavior
-beyond the landed
-MIDI ingress surface (note/CC/sustain/pitch-bend/all-notes-off command
-translation, producer-local channel filtering, and the small
-PortMIDI-backed decoded source), broader OSC behavior beyond symbolic
-control writes, channel
-remapping/splits, MIDI clock, aftertouch, arbitration beyond FIFO,
-long-running supervision beyond the scoped fan-in service, unsupported
-respawn/reset policy for preserving swaps, and recovery after terminal
-runtime divergence.
+What has now landed at the app level: the session substrate
+(scoped owner, producer queue, fan-in host + scoped drain
+service, MIDI / OSC / UI / Pattern producer adapters), the opt-in
+service-owned arbitration substrate (pure policy, gateway,
+per-producer arbitrated helpers, listener wrappers on the OSC and
+MIDI sides, and the two non-audio operator probes), the
+operator-facing live shell (`--manifest-live-session` with
+supervisor, audio + ingress brackets, status / repair commands),
+and the live-app reload policy boundary
+(`MetaSonic.App.ManifestLivePolicy` plus the policy-native
+`runManifestLiveSessionWithPolicy` entrypoint).
+
+What is still intentionally absent, gated on a concrete caller:
+GUI ownership of the live-app reload policy (the boundary lands
+but no GUI constructs the policy yet), dynamic per-reload
+strategy resolver use (today's resolver is consulted once against
+the initial demo), live arbitration opt-in via the policy's
+existing `LiveArbitrationProfile` field, runtime resource
+overrides, and arbitration policy mutation (claim release / owner
+clearing). Also gated: broader MIDI behavior beyond
+note/CC/sustain/pitch-bend/all-notes-off translation, channel
+filtering, and the small PortMIDI source; broader OSC behavior
+beyond symbolic control writes; channel remapping/splits, MIDI
+clock, and aftertouch; hardware-gated CI for the audible smokes
+and PortMIDI device opens; and graph/voice allocation event
+families plus recovery beyond the landed terminal-divergence
+repair gesture. The current substrate, what it covers, and what
+each future slice is gated on are recorded in detail in
+[ROADMAP.md](ROADMAP.md)'s "Current decision" paragraph.
 
 ---
 
