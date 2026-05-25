@@ -32,6 +32,10 @@ module MetaSonic.Session.Resolve
   , ResolveRebuildIssue (..)
   , ResolveRebuildResult (..)
 
+    -- * Retired-voice projection (Phase 8h step 3e v1)
+  , RetiredVoiceBinding (..)
+  , RetiredVoiceReason (..)
+
     -- * Transformation
   , rebuildResolveState
   ) where
@@ -79,8 +83,46 @@ data ResolveRebuildResult = ResolveRebuildResult
     -- ^ Successfully populated OSC resolution map for the new graph.
   , rrrDropped :: ![ResolveRebuildIssue]
     -- ^ Bindings that could not migrate, preserved in input order.
+  , rrrRetired :: ![RetiredVoiceBinding]
+    -- ^ Phase 8h step 3e v1: each dropped binding paired with its
+    -- originating 'VoiceBinding' so downstream renderers have the
+    -- @VoiceKey + TemplateName@ context that 'rrrDropped' alone
+    -- cannot supply (the 'RriInvalidVoiceKey' issue carries no
+    -- template name). Same input order as 'rrrDropped'.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
+
+
+-- | Phase 8h step 3e v1: operator-facing projection of one retired
+-- voice. Pairs the original 'VoiceBinding' the session held with a
+-- structured retirement reason so the operator render can name the
+-- voice, its template, and why the reload dropped it.
+data RetiredVoiceBinding = RetiredVoiceBinding
+  { rvbBinding :: !VoiceBinding
+  , rvbReason  :: !RetiredVoiceReason
+  } deriving stock    (Eq, Show, Generic)
+    deriving anyclass (NFData)
+
+
+-- | Why a 'VoiceBinding' was retired. Preserving reloads produce the
+-- first two reasons (mapped from 'ResolveRebuildIssue'); the
+-- stopped-audio path produces only 'RvrOwnerReplaced' because the old
+-- owner is released wholesale.
+data RetiredVoiceReason
+  = RvrTemplateGone
+    -- ^ The new 'TemplateGraph' no longer carries the binding's
+    -- template. Corresponds to 'RriMissingTemplate'.
+  | RvrInvalidVoiceKey !DispatchIssue
+    -- ^ The new graph's dispatcher refused the binding's voice key
+    -- (e.g. reserved path segment, identifier profile failure).
+    -- Corresponds to 'RriInvalidVoiceKey'.
+  | RvrOwnerReplaced
+    -- ^ Stopped-audio reload: the old owner was released and a fresh
+    -- owner acquired with an empty 'ssVoices'. Every pre-reload
+    -- binding carries this reason regardless of whether its template
+    -- still exists in the new graph.
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
 
 -- | Rebuild OSC resolve state for a newly installed 'TemplateGraph'.
 --
@@ -95,22 +137,27 @@ rebuildResolveState
   -> [VoiceBinding]
   -> ResolveRebuildResult
 rebuildResolveState tg bindings =
-  let (rs, droppedRev) = foldl' step (emptyResolveState tg, []) bindings
+  let (rs, droppedRev, retiredRev) =
+        foldl' step (emptyResolveState tg, [], []) bindings
   in ResolveRebuildResult
        { rrrState   = rs
        , rrrDropped = reverse droppedRev
+       , rrrRetired = reverse retiredRev
        }
   where
     step
-      :: (ResolveState, [ResolveRebuildIssue])
+      :: (ResolveState, [ResolveRebuildIssue], [RetiredVoiceBinding])
       -> VoiceBinding
-      -> (ResolveState, [ResolveRebuildIssue])
-    step (rs, dropped) binding
+      -> (ResolveState, [ResolveRebuildIssue], [RetiredVoiceBinding])
+    step (rs, dropped, retired) binding
       | not (templateExists (vbTemplateName binding)) =
-          (rs, RriMissingTemplate
-                 (vbVoiceKey binding)
-                 (vbTemplateName binding)
-               : dropped)
+          ( rs
+          , RriMissingTemplate
+              (vbVoiceKey binding)
+              (vbTemplateName binding)
+            : dropped
+          , RetiredVoiceBinding binding RvrTemplateGone : retired
+          )
       | otherwise =
           case registerVoice
                  (voiceKeyBytes (vbVoiceKey binding))
@@ -118,9 +165,13 @@ rebuildResolveState tg bindings =
                  (templateNameBytes (vbTemplateName binding))
                  rs of
             Right rs' ->
-              (rs', dropped)
+              (rs', dropped, retired)
             Left issue ->
-              (rs, RriInvalidVoiceKey (vbVoiceKey binding) issue : dropped)
+              ( rs
+              , RriInvalidVoiceKey (vbVoiceKey binding) issue : dropped
+              , RetiredVoiceBinding binding (RvrInvalidVoiceKey issue)
+                : retired
+              )
 
     templateExists :: TemplateName -> Bool
     templateExists (TemplateName name) =

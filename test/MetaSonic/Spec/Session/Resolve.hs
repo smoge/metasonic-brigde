@@ -95,6 +95,31 @@ sessionResolveTests = testGroup "Session Prep A: resolve rebuild"
       OSC.resolveStateVoices (rrrState result)
         @?= M.fromList [(OBSC.pack "v0", (3, OBSC.pack "drone"))]
 
+  , testCase "Phase 8h step 3e v1: rrrRetired pairs each dropped issue with its originating VoiceBinding" $ do
+      -- The 'RetiredVoiceBinding' projection carries the full
+      -- 'VoiceBinding' (so the operator render has the template
+      -- name) plus a structured retirement reason. Order matches
+      -- 'rrrDropped' so renderers can iterate either.
+      let tg = patternTemplates droneVibrato
+          goneBinding =
+            VoiceBinding (VoiceKey "gone") 1 (TemplateName "missing")
+          badKeyBinding =
+            VoiceBinding (VoiceKey "bad/key") 2 (TemplateName "drone")
+          survivorBinding =
+            VoiceBinding (VoiceKey "v0") 3 (TemplateName "drone")
+          result = rebuildResolveState tg
+            [ goneBinding
+            , badKeyBinding
+            , survivorBinding
+            ]
+      rrrRetired result
+        @?= [ RetiredVoiceBinding goneBinding RvrTemplateGone
+            , RetiredVoiceBinding
+                badKeyBinding
+                (RvrInvalidVoiceKey
+                  (OSC.DiIdentifierProfile (OBSC.pack "bad/key")))
+            ]
+
   , testCase "retained binding resolves through rebuilt state" $ do
       let tg = patternTemplates droneVibrato
           result = rebuildResolveState tg

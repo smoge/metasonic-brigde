@@ -42,6 +42,7 @@ import           MetaSonic.Session.Owner         (SessionOwnerOptions,
                                                   SessionOwnerStatus)
 import           MetaSonic.Session.Queue         (ProducerId,
                                                   SessionEnqueueResult (..))
+import           MetaSonic.Session.Resolve       (RetiredVoiceBinding)
 import           MetaSonic.Session.State         (SessionState)
 
 
@@ -56,6 +57,13 @@ data ManifestStoppedAudioReloadReport = ManifestStoppedAudioReloadReport
   , msarrOwnerState           :: !SessionState
   , msarrOwnerStatus          :: !SessionOwnerStatus
   , msarrListenersMustRestart :: !Bool
+  , msarrRetired              :: ![RetiredVoiceBinding]
+    -- ^ Phase 8h step 3e v1: voice bindings the old owner held
+    -- immediately before release, forwarded verbatim from
+    -- 'sfirrRetired' on 'SessionFanInReloadReport'. Each entry
+    -- carries 'RvrOwnerReplaced' — the stopped-audio path discards
+    -- the entire pre-reload voice map regardless of template
+    -- survival.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -121,6 +129,8 @@ reloadManifestSessionStoppedAudio host baseOptions plan = do
             sfirrOwnerStatus report
         , msarrListenersMustRestart =
             True
+        , msarrRetired =
+            sfirrRetired report
         }
 
 -- | Submit a manifest reload as a preserving-only hot-swap command.

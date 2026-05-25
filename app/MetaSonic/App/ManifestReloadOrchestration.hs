@@ -130,8 +130,8 @@ orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
       onEvent (MreStoppedAudioReloadRejected issue)
       pure (Left issue)
 
-    finishOk = do
-      onEvent MreStoppedAudioReloadCommitted
+    finishOk retired = do
+      onEvent (MreStoppedAudioReloadCommitted retired)
       pure (Right ())
 
     quiesce plan = do
@@ -173,8 +173,8 @@ orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
           restartOldAudio issue
         Left (HsarfNoOwner issue) ->
           finish (HsariReloadFailedNoOwner issue)
-        Right () ->
-          startNewAudio
+        Right retired ->
+          startNewAudio retired
 
     restartOldAudio issue = do
       result <- hsaroRestartOldAudio ops
@@ -188,22 +188,22 @@ orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
             HsariReloadRejectedOldOwnerRestarted
             HsariReloadRejectedOldOwnerResumeFailed
 
-    startNewAudio = do
+    startNewAudio retired = do
       result <- hsaroStartNewAudio ops
       case result of
         Left issue ->
           finish (HsariAudioRestartFailed issue)
         Right () ->
-          reopenIngress
+          reopenIngress retired
 
-    reopenIngress = do
+    reopenIngress retired = do
       result <- hsaroReopenIngress ops
       case result of
         Left issue -> do
           hsaroStopNewAudio ops
           finish (HsariListenerRestartFailed issue)
         Right () ->
-          finishOk
+          finishOk retired
 
     resumeAfterFailure originalIssue mkResumed mkResumeFailed = do
       onEvent MreResumeOldIngressStarted
@@ -273,8 +273,8 @@ orchestrateHostPreservingReloadWithEvents onEvent ops request = do
       onEvent (MrePreservingReloadRejected issue)
       pure (Left issue)
 
-    finishOk = do
-      onEvent MrePreservingReloadCommitted
+    finishOk retired = do
+      onEvent (MrePreservingReloadCommitted retired)
       pure (Right ())
 
     quiesce plan = do
@@ -321,17 +321,17 @@ orchestrateHostPreservingReloadWithEvents onEvent ops request = do
             HpariReloadRejectedResumeFailed
         Left (HprfTerminal issue) ->
           finish (HpariReloadFailedTerminal issue)
-        Right () ->
-          reopenNewIngress
+        Right retired ->
+          reopenNewIngress retired
 
-    reopenNewIngress = do
+    reopenNewIngress retired = do
       hproResumeService ops
       result <- hproReopenIngress ops
       case result of
         Left issue ->
           finish (HpariIngressRestartFailed issue)
         Right () ->
-          finishOk
+          finishOk retired
 
     resumeAfterFailure originalIssue mkResumed mkResumeFailed = do
       hproResumeService ops

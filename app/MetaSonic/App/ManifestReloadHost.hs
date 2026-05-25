@@ -73,6 +73,7 @@ import           MetaSonic.Session.FanInService  (SessionFanInService,
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.ManifestReload.Runtime
                                                   (ManifestPreservingHotSwapReport (..),
+                                                   msarrRetired,
                                                    reloadManifestSessionPreservingHotSwap,
                                                    reloadManifestSessionStoppedAudio)
 import           MetaSonic.Session.Owner         (SessionOwnerOptions,
@@ -82,6 +83,8 @@ import           MetaSonic.Session.Queue         (ProducerId,
                                                   SessionDrainItem (..),
                                                   SessionDrainResult (..),
                                                   SessionEnqueueResult (..))
+import           MetaSonic.Session.Resolve       (RetiredVoiceBinding,
+                                                  rrrRetired)
 import           MetaSonic.Session.Step          (SessionStepResult (..))
 
 
@@ -224,8 +227,8 @@ manifestReloadHostOps config doc catalog =
       pure $ case result of
         Left issue ->
           Left (mapReloadIssue issue)
-        Right _report ->
-          Right ()
+        Right report ->
+          Right (msarrRetired report)
 
     discardStopAudioResult =
       stopSessionFanInHostAudioWith audioFFI host >> pure ()
@@ -605,7 +608,7 @@ mapPreservingReloadReport
   :: ManifestPreservingHotSwapReport
   -> Either
        (HostPreservingReloadFailure (ManifestReloadHostIssue ingressIssue))
-       ()
+       [RetiredVoiceBinding]
 mapPreservingReloadReport report =
   case sfierResult (mphsrEnqueueResult report) of
     SessionEnqueueRejected {} ->
@@ -672,8 +675,15 @@ mapPreservingReloadReport report =
 
     classifySessionStep step =
       case step of
-        StepCommitted _ (Just _) ->
-          Right ()
+        StepCommitted _ (Just rebuild) ->
+          -- Phase 8h step 3e v1: forward the commit-time retired
+          -- projection so 'orchestrateHostPreservingReloadWithEvents'
+          -- can attach it to 'MrePreservingReloadCommitted'. The
+          -- projection comes from 'rrrRetired' on the
+          -- 'ResolveRebuildResult' that 'applyPlannedCommit' already
+          -- pairs with the new state; without forwarding it here the
+          -- diagnostic is discarded at the host-op boundary.
+          Right (rrrRetired rebuild)
         StepRuntimeFailed {} ->
           oldOwnerStillInstalled
         StepRejected {} ->

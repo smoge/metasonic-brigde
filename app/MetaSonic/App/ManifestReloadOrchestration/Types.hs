@@ -24,6 +24,8 @@ module MetaSonic.App.ManifestReloadOrchestration.Types
   , HostPreservingReloadFailure (..)
   ) where
 
+import           MetaSonic.Session.Resolve  (RetiredVoiceBinding)
+
 
 -- | Operations owned by an audio-running host reload command.
 --
@@ -44,9 +46,13 @@ data HostStoppedAudioReloadOps request plan issue =
     , hsaroStopOldAudio      :: !(IO (Either issue ()))
       -- ^ Stop audio on the old owner after ingress is closed and the
       -- accepted queue has drained.
-    , hsaroReloadStopped     :: !(plan -> IO (Either (HostStoppedAudioReloadFailure issue) ()))
-      -- ^ Replace the stopped owner. The failure shape distinguishes
-      -- pre-dispose rejection from post-dispose no-owner failure.
+    , hsaroReloadStopped     :: !(plan -> IO (Either (HostStoppedAudioReloadFailure issue) [RetiredVoiceBinding]))
+      -- ^ Replace the stopped owner. On success returns the list of
+      -- voice bindings the old owner held immediately before release
+      -- (each carrying 'RvrOwnerReplaced'); the orchestrator forwards
+      -- this projection onto 'MreStoppedAudioReloadCommitted'. The
+      -- failure shape distinguishes pre-dispose rejection from
+      -- post-dispose no-owner failure.
     , hsaroRestartOldAudio   :: !(IO (Either issue ()))
       -- ^ Best-effort restart for pre-dispose reload rejection, where
       -- the old owner is still installed.
@@ -132,10 +138,15 @@ data HostPreservingReloadOps request plan issue =
       -- 'HprdfRetryable' for now: the old owner is still live, so the
       -- host can resume old ingress and let a later policy decide
       -- whether to retry, fence more strictly, or fall back.
-    , hproReloadPreserving  :: !(plan -> IO (Either (HostPreservingReloadFailure issue) ()))
+    , hproReloadPreserving  :: !(plan -> IO (Either (HostPreservingReloadFailure issue) [RetiredVoiceBinding]))
       -- ^ Submit the preserving-only hot-swap through the live fan-in
-      -- path. Failure shape distinguishes retryable old-owner-still-live
-      -- rejection from terminal owner/service failure.
+      -- path. On success returns the list of voice bindings that
+      -- could not migrate to the new graph (paired with the
+      -- 'RvrTemplateGone' / 'RvrInvalidVoiceKey' reason that retired
+      -- them); the orchestrator forwards this projection onto
+      -- 'MrePreservingReloadCommitted'. Failure shape distinguishes
+      -- retryable old-owner-still-live rejection from terminal
+      -- owner/service failure.
     , hproResumeService     :: !(IO ())
       -- ^ Reopen the fan-in service gate and worker before concrete
       -- ingress is reopened. This slot is intentionally infallible at

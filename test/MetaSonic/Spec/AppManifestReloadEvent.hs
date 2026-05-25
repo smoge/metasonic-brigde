@@ -44,6 +44,11 @@ import           MetaSonic.App.ManifestReloadOrchestration
                                                    HostStoppedAudioReloadOps (..),
                                                    orchestrateHostPreservingReloadWithEvents,
                                                    orchestrateHostStoppedAudioReloadWithEvents)
+import           MetaSonic.Pattern                (TemplateName (..),
+                                                   VoiceKey (..))
+import           MetaSonic.Session.Resolve        (RetiredVoiceBinding (..),
+                                                   RetiredVoiceReason (..),
+                                                   VoiceBinding (..))
 
 ------------------------------------------------------------
 -- Event capture
@@ -88,7 +93,7 @@ preservingOpsAllSuccess =
     { hproPreparePlan      = \_ -> pure (Right ())
     , hproQuiesceIngress   = pure (Right ())
     , hproDrainLive        = pure (Right ())
-    , hproReloadPreserving = \_ -> pure (Right ())
+    , hproReloadPreserving = \_ -> pure (Right [])
     , hproResumeService    = pure ()
     , hproResumeOldIngress = pure (Right ())
     , hproReopenIngress    = pure (Right ())
@@ -108,7 +113,7 @@ stoppedAudioOpsAllSuccess =
     , hsaroQuiesceIngress   = pure (Right ())
     , hsaroDrainLive        = pure (Right ())
     , hsaroStopOldAudio     = pure (Right ())
-    , hsaroReloadStopped    = \_ -> pure (Right ())
+    , hsaroReloadStopped    = \_ -> pure (Right [])
     , hsaroRestartOldAudio  = pure (Right ())
     , hsaroResumeOldIngress = pure (Right ())
     , hsaroStartNewAudio    = pure (Right ())
@@ -134,7 +139,37 @@ appManifestReloadEventTests =
         events <- readEvents ref
         events @?=
           [ MrePreservingReloadStarted
-          , MrePreservingReloadCommitted
+          , MrePreservingReloadCommitted []
+          ]
+
+    , testCase "preserving success: MrePreservingReloadCommitted carries the retired-binding payload from hproReloadPreserving" $ do
+        -- Phase 8h step 3e v1: the success arm of the preserving op
+        -- now returns '[RetiredVoiceBinding]'; the orchestrator must
+        -- forward that list verbatim onto the commit event so a
+        -- downstream renderer can show which bindings did not migrate.
+        (ref, onEvent) <- newEventLog
+        let leadRetired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "lead/1") 0 (TemplateName "saw_lead"))
+                RvrTemplateGone
+            padRetired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "pad/A") 1 (TemplateName "sustain"))
+                RvrTemplateGone
+            ops = preservingOpsAllSuccess
+              { hproReloadPreserving = \_ ->
+                  pure (Right [leadRetired, padRetired])
+              }
+        result <-
+          orchestrateHostPreservingReloadWithEvents
+            onEvent
+            ops
+            ()
+        result @?= Right ()
+        events <- readEvents ref
+        events @?=
+          [ MrePreservingReloadStarted
+          , MrePreservingReloadCommitted [leadRetired, padRetired]
           ]
 
     , testCase "preserving retryable rejection, resume success" $ do
@@ -254,7 +289,38 @@ appManifestReloadEventTests =
         events <- readEvents ref
         events @?=
           [ MreStoppedAudioReloadStarted
-          , MreStoppedAudioReloadCommitted
+          , MreStoppedAudioReloadCommitted []
+          ]
+
+    , testCase "stopped-audio success: MreStoppedAudioReloadCommitted carries the pre-release retired-voice snapshot" $ do
+        -- Phase 8h step 3e v1: stopped-audio always retires every
+        -- pre-reload binding (the old owner is released wholesale)
+        -- with reason 'RvrOwnerReplaced'. The orchestrator forwards
+        -- the list 'hsaroReloadStopped' returns; the real session
+        -- layer snapshots it before 'releaseSessionOwner'.
+        (ref, onEvent) <- newEventLog
+        let v0Retired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "v0") 0 (TemplateName "drone"))
+                RvrOwnerReplaced
+            v1Retired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "v1") 1 (TemplateName "drone"))
+                RvrOwnerReplaced
+            ops = stoppedAudioOpsAllSuccess
+              { hsaroReloadStopped = \_ ->
+                  pure (Right [v0Retired, v1Retired])
+              }
+        result <-
+          orchestrateHostStoppedAudioReloadWithEvents
+            onEvent
+            ops
+            ()
+        result @?= Right ()
+        events <- readEvents ref
+        events @?=
+          [ MreStoppedAudioReloadStarted
+          , MreStoppedAudioReloadCommitted [v0Retired, v1Retired]
           ]
 
     , testCase "strategy fallback admitted: preserving HpariReloadRejected → stopped-audio committed" $ do

@@ -45,6 +45,7 @@ import           MetaSonic.App.ManifestReloadHost.Types
 import           MetaSonic.App.ManifestReloadOrchestration.Types
                                                   (HostPreservingReloadIssue,
                                                    HostStoppedAudioReloadIssue)
+import           MetaSonic.Session.Resolve        (RetiredVoiceBinding)
 
 -- | One operator-visible transition in a manifest reload run.
 --
@@ -112,8 +113,12 @@ data ManifestReloadEvent issue
 
     -- | The preserving hot-swap installed cleanly. Audio was
     -- never stopped, voices were preserved, and ingress has been
-    -- reopened against the new owner.
-  | MrePreservingReloadCommitted
+    -- reopened against the new owner. The payload is the list of
+    -- voice bindings that could not migrate to the new graph
+    -- (template gone or invalid voice key under the new
+    -- dispatcher), in input order. Empty list means every
+    -- pre-reload binding survived.
+  | MrePreservingReloadCommitted ![RetiredVoiceBinding]
 
     -- | The preserving hot-swap command could not be enqueued at
     -- the fan-in service — the command never ran, the old owner
@@ -148,8 +153,12 @@ data ManifestReloadEvent issue
 
     -- | The stopped-audio reload installed cleanly. The new
     -- owner is live, audio has restarted, and ingress has been
-    -- reopened.
-  | MreStoppedAudioReloadCommitted
+    -- reopened. The payload is the list of voice bindings the old
+    -- owner held immediately before release; every entry carries
+    -- 'RvrOwnerReplaced'. The new owner starts with an empty
+    -- 'ssVoices', so every pre-reload binding is retired regardless
+    -- of whether its template still exists in the new graph.
+  | MreStoppedAudioReloadCommitted ![RetiredVoiceBinding]
 
     -- | The stopped-audio reload was rejected. The payload is
     -- the structured outcome from

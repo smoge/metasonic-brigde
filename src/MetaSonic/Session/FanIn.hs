@@ -71,6 +71,8 @@ import           Control.Monad                   (forM_)
 import           Foreign.Ptr                     (Ptr)
 import           GHC.Generics                    (Generic)
 
+import qualified Data.Map.Strict                 as M
+
 import qualified MetaSonic.Bridge.FFI            as FFI
 import           MetaSonic.Bridge.FFI            (RTGraph)
 import           MetaSonic.Bridge.Templates      (TemplateGraph)
@@ -99,7 +101,9 @@ import           MetaSonic.Session.Queue         (ProducerId,
                                                   enqueueSessionCommand,
                                                   newSessionCommandQueue,
                                                   queuedCommandCount)
-import           MetaSonic.Session.State         (SessionState,
+import           MetaSonic.Session.Resolve       (RetiredVoiceBinding (..),
+                                                  RetiredVoiceReason (..))
+import           MetaSonic.Session.State         (SessionState (..),
                                                   initialSessionState)
 
 
@@ -258,6 +262,13 @@ data SessionFanInReloadReport = SessionFanInReloadReport
   { sfirrQueueDepth  :: !Int
   , sfirrOwnerState  :: !SessionState
   , sfirrOwnerStatus :: !SessionOwnerStatus
+  , sfirrRetired     :: ![RetiredVoiceBinding]
+    -- ^ Phase 8h step 3e v1: voice bindings the old owner held
+    -- immediately before 'releaseSessionOwner', each paired with
+    -- 'RvrOwnerReplaced'. Snapshotted under the admission lock so the
+    -- old 'ssVoices' is captured before the release races. The new
+    -- owner always starts with an empty 'ssVoices', so this list is
+    -- the complete retired projection for the stopped-audio path.
   } deriving stock    (Eq, Show, Generic)
     deriving anyclass (NFData)
 
@@ -689,6 +700,16 @@ reloadSessionFanInHostOwnerStoppedAudio host graph opts = mask $ \_restore -> do
     Left issue ->
       pure (Left issue)
     Right oldOwner -> do
+      -- Phase 8h step 3e v1: snapshot the old owner's voices before
+      -- 'releaseSessionOwner' disposes them. Read happens after the
+      -- admission lock has flipped 'sfihsOwner' to 'Nothing' (so no
+      -- new commands can land in the old voice map) and before the
+      -- release runs, so the snapshot is the complete pre-release
+      -- voice set.
+      oldState <- sessionOwnerState (sessionOwnerHandleOwner oldOwner)
+      let retired =
+            map (\b -> RetiredVoiceBinding b RvrOwnerReplaced)
+                (M.elems (ssVoices oldState))
       releaseSessionOwner oldOwner
         `onException` markReloadFailed host
       acquired <- acquireSessionOwner graph opts
@@ -698,11 +719,11 @@ reloadSessionFanInHostOwnerStoppedAudio host graph opts = mask $ \_restore -> do
           markReloadFailed host
           pure (Left (SfriOwnerSetupFailed setupIssue))
         Right newOwner ->
-          installReloadedOwner newOwner
+          installReloadedOwner retired newOwner
             `onException`
               (releaseSessionOwner newOwner `finally` markReloadFailed host)
   where
-    installReloadedOwner newOwner = do
+    installReloadedOwner retired newOwner = do
       ownerState <- sessionOwnerState (sessionOwnerHandleOwner newOwner)
       ownerStatus <- sessionOwnerStatus (sessionOwnerHandleOwner newOwner)
       modifyMVar (sfihState host) $ \hostState ->
@@ -726,6 +747,8 @@ reloadSessionFanInHostOwnerStoppedAudio host graph opts = mask $ \_restore -> do
             ownerState
         , sfirrOwnerStatus =
             ownerStatus
+        , sfirrRetired =
+            retired
         }
 
 markReloadFailed :: SessionFanInHost -> IO ()

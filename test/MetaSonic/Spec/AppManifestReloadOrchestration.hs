@@ -17,6 +17,7 @@ import           Test.Tasty.HUnit
 
 import           MetaSonic.App.ManifestReloadIngress
 import           MetaSonic.App.ManifestReloadOrchestration
+import           MetaSonic.Session.Resolve                   (RetiredVoiceBinding)
 
 
 data FakeFailure
@@ -869,7 +870,7 @@ stopOldAudio ref = do
 reloadStopped
   :: IORef FakeState
   -> String
-  -> IO (Either (HostStoppedAudioReloadFailure FakeFailure) ())
+  -> IO (Either (HostStoppedAudioReloadFailure FakeFailure) [RetiredVoiceBinding])
 reloadStopped ref plan = do
   appendTrace ref (ReloadStopped plan)
   mode <- fsFailureMode <$> readIORef ref
@@ -883,12 +884,12 @@ reloadStopped ref plan = do
       pure (Left (HsarfNoOwner FakeOwnerSetupFailed))
     _ -> do
       modifyIORef' ref $ \state -> state { fsOwner = FakeNewOwner }
-      pure (Right ())
+      pure (Right [])
 
 reloadPreserving
   :: IORef FakeState
   -> String
-  -> IO (Either (HostPreservingReloadFailure FakeFailure) ())
+  -> IO (Either (HostPreservingReloadFailure FakeFailure) [RetiredVoiceBinding])
 reloadPreserving ref plan = do
   appendTrace ref (ReloadPreserving plan)
   mode <- fsFailureMode <$> readIORef ref
@@ -900,7 +901,7 @@ reloadPreserving ref plan = do
       pure (Left (HprfTerminal FakePreservingTerminal))
     _ -> do
       modifyIORef' ref $ \state -> state { fsOwner = FakePreservedOwner }
-      pure (Right ())
+      pure (Right [])
 
 restartOldAudio :: IORef FakeState -> IO (Either FakeFailure ())
 restartOldAudio ref = do

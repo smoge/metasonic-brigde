@@ -1549,7 +1549,12 @@ renderSmokeReloadEvent event =
       "    - strategy failed: " <> renderStrategyFailure issue
     MrePreservingReloadStarted ->
       "    - preserving phase started"
-    MrePreservingReloadCommitted ->
+    MrePreservingReloadCommitted _retired ->
+      -- Phase 8h step 3e v1: retired-binding payload is plumbed
+      -- through but not yet rendered here. The slice-2
+      -- 'retired bindings:' block (see
+      -- @notes/2026-05-24-b-stale-producer-command-semantics.md@)
+      -- is where this list becomes operator-visible.
       "    - preserving phase committed"
     MrePreservingReloadEnqueueRejected issue ->
       "    - preserving reload enqueue rejected: "
@@ -1558,7 +1563,9 @@ renderSmokeReloadEvent event =
       "    - preserving phase rejected: " <> renderHostPreservingIssueTag issue
     MreStoppedAudioReloadStarted ->
       "    - stopped-audio phase started"
-    MreStoppedAudioReloadCommitted ->
+    MreStoppedAudioReloadCommitted _retired ->
+      -- Phase 8h step 3e v1: payload plumbed through; slice-2
+      -- renderer will surface the count / per-binding rows.
       "    - stopped-audio phase committed"
     MreStoppedAudioReloadRejected issue ->
       "    - stopped-audio phase rejected: " <> renderHostStoppedAudioIssueTag issue
