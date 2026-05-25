@@ -58,9 +58,16 @@ data ManifestUIIngressInput = ManifestUIIngressInput
 -- | Module-level rejection produced before the UI producer is called.
 --
 -- Tags that were removed by reload and tags that never existed both
--- surface through 'MuiiUnknownControl'.
-newtype ManifestUIIngressIssue
-  = MuiiUnknownControl ControlTag
+-- surface through 'MuiiUnknownControl'. Values that fall outside the
+-- manifest-declared range surface through 'MuiiValueOutOfRange',
+-- mirroring the OSC ingress contract in
+-- 'MetaSonic.App.ManifestReloadOSCIngress'.
+data ManifestUIIngressIssue
+  = MuiiUnknownControl !ControlTag
+  | MuiiValueOutOfRange !ControlTag !Double !Double !Double
+    -- ^ The tag exists but the value is outside the manifest-declared
+    -- @[rangeMin, rangeMax]@. The triple carries the offending value,
+    -- the inclusive lower bound, and the inclusive upper bound.
   deriving (Eq, Show)
 
 -- | Outcome of one 'submitManifestUIIngress' call.
@@ -108,16 +115,27 @@ submitManifestUIIngress opts target retained input host =
         , muirRetainedValues =
             retained
         }
-    Just _binding -> do
-      let voiceKey = resolveManifestUIVoiceKey (muitVoiceSelection target)
-          intent   = UIControlWrite voiceKey tag (muiiValue input)
-      producerResult <- enqueueUIProducerIntent opts intent host
-      pure ManifestUIIngressResult
-        { muirOutcome =
-            Right producerResult
-        , muirRetainedValues =
-            applyRetainOnSuccess tag (muiiValue input) retained producerResult
-        }
+    Just binding
+      | let value = muiiValue input
+            lo = muicRangeMin binding
+            hi = muicRangeMax binding
+      , isNaN value || value < lo || value > hi ->
+          pure ManifestUIIngressResult
+            { muirOutcome =
+                Left (MuiiValueOutOfRange tag value lo hi)
+            , muirRetainedValues =
+                retained
+            }
+      | otherwise -> do
+          let voiceKey = resolveManifestUIVoiceKey (muitVoiceSelection target)
+              intent   = UIControlWrite voiceKey tag (muiiValue input)
+          producerResult <- enqueueUIProducerIntent opts intent host
+          pure ManifestUIIngressResult
+            { muirOutcome =
+                Right producerResult
+            , muirRetainedValues =
+                applyRetainOnSuccess tag (muiiValue input) retained producerResult
+            }
   where
     tag = muiiControlTag input
 

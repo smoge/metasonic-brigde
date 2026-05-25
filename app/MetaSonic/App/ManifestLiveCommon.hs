@@ -121,6 +121,7 @@ module MetaSonic.App.ManifestLiveCommon
   , renderOSCAcceptLine
   , renderOSCAcceptLineWithControls
   , renderOSCIssueLine
+  , renderAcceptedCommand
 
     -- * MIDI listener-event line renderers (pure, testable)
     --

@@ -122,6 +122,7 @@ import           Data.List                      (dropWhileEnd, find,
                                                  isPrefixOf)
 import qualified Data.Map.Strict                as M
 import qualified Data.Set                       as Set
+import           Text.Read                      (readMaybe)
 import           System.Exit                    (ExitCode (..), die,
                                                  exitWith)
 import           System.IO                      (BufferMode (..), hFlush,
@@ -131,7 +132,8 @@ import           System.IO                      (BufferMode (..), hFlush,
 import           MetaSonic.App.Demos            (Demo (..), demoTable,
                                                  demoManifestReloadCatalog)
 import           MetaSonic.App.ManifestLiveCommon
-                                                (autoStartTemplatesWith,
+                                                (acceptedUIControlWrite,
+                                                 autoStartTemplatesWith,
                                                  liveAudioOptions,
                                                  liveIngressTargetPolicy,
                                                  liveMIDIListenerHooksForObservedWith,
@@ -141,6 +143,7 @@ import           MetaSonic.App.ManifestLiveCommon
                                                  printAddressableSurfaceWith,
                                                  printServiceSnapshotWith,
                                                  readManifestDocOrDie,
+                                                 renderAcceptedCommand,
                                                  renderLiveReloadEvents,
                                                  renderOSCControls,
                                                  renderOSCControlsWith,
@@ -212,20 +215,31 @@ import           MetaSonic.App.ManifestReloadIngress
 import           MetaSonic.App.ManifestReloadIngressTarget
                                                 (ManifestReloadIngressTarget (..),
                                                  manifestReloadIngressTargetFromPlan)
+import           MetaSonic.App.ManifestReloadUIIngress
+                                                (ManifestUIIngressInput (..),
+                                                 ManifestUIIngressIssue (..),
+                                                 ManifestUIIngressResult (..),
+                                                 submitManifestUIIngress)
 import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
                                                  AuthoringManifestDoc (..))
+import           MetaSonic.Bridge.Source        (MigrationKey (..))
+import           MetaSonic.Pattern              (ControlTag (..))
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.FanIn        (SessionFanInSnapshot (..),
                                                  defaultSessionFanInAudioFFI)
 import           MetaSonic.Session.FanInService (defaultSessionFanInServiceHooks,
                                                  defaultSessionFanInServiceOptions,
-                                                 readSessionFanInService)
+                                                 readSessionFanInService,
+                                                 sessionFanInServiceHost)
 import           MetaSonic.Session.MIDIPortMIDI (PortMIDISourceOptions (..),
                                                  defaultPortMIDISourceOptions)
 import           MetaSonic.Session.MIDIProducer (defaultMIDIProducerOptions)
 import           MetaSonic.Session.OSCProducer  (defaultOSCProducerOptions)
 import           MetaSonic.Session.Owner        (defaultSessionOwnerOptions)
 import           MetaSonic.Session.State        (SessionState (..))
+import           MetaSonic.Session.UIProducer   (UIProducerEnqueueResult (..),
+                                                 UIProducerIssue (..),
+                                                 defaultUIProducerOptions)
 
 
 -- ============================================================================
@@ -286,6 +300,16 @@ data LiveSessionCommand
     -- control target values for active voices on the current plan
     -- (defaults shown for controls the session has not yet observed
     -- an accepted write for). Read-only; never reads back DSP state.
+  | LscUISet !ControlTag !Double
+    -- ^ @set KEY\/SLOT VALUE@. Submits one UI control write against
+    -- the projected ingress target's default voice. The tag form is
+    -- the @<key>\/<slot>@ path tail the operator sees in the
+    -- @controls@ addressable surface — note that this is the manifest
+    -- @key@ field, not the human-readable display @name@. E.g. in
+    -- @saw-noise-filter.json@ the cutoff control has display
+    -- @name="cutoff"@ but key @lpf@ slot @0@, so the operator types
+    -- @set lpf/0 1500@. The value parses as a 'Double'; non-finite
+    -- or malformed numerals fall through to 'LscUnknown'.
   | LscStatus
     -- ^ Empty line, whitespace-only line, or the literal @status@.
   | LscHelp
@@ -329,11 +353,40 @@ parseLiveSessionCommand line =
         case words (drop 5 s) of
           [k] -> LscReloadTo k
           _   -> LscUnknown line
+      | "set " `isPrefixOf` s ->
+        -- Two-token rule: 'set <name>/<slot> <value>'. Empty payload,
+        -- wrong arity, missing slot separator, non-integer slot, and
+        -- non-finite values all reject as 'LscUnknown' rather than
+        -- silently dropping bad input into the live session.
+        case words (drop 4 s) of
+          [tagTok, valueTok] ->
+            case (parseControlTag tagTok, readMaybe valueTok) of
+              (Just tag, Just value)
+                | not (isNaN value) && not (isInfinite value) ->
+                    LscUISet tag value
+              _ ->
+                LscUnknown line
+          _ ->
+            LscUnknown line
       | otherwise ->
         LscUnknown line
   where
     trimmed = trim line
     trim    = dropWhile isSpace . dropWhileEnd isSpace
+
+-- | Parse the @\<name\>/\<slot\>@ tag form used by the @set@ command.
+-- Inverse of [controlTagText](app/Main.hs#L1455). Splits on the /last/
+-- slash so a future control name containing a slash still parses; the
+-- slot must be a non-negative integer; the name must be non-empty.
+parseControlTag :: String -> Maybe ControlTag
+parseControlTag s = case break (== '/') (reverse s) of
+  (revSlot, '/' : revName)
+    | not (null revName)
+    , Just slot <- readMaybe (reverse revSlot)
+    , slot >= 0 ->
+        Just (ControlTag (MigrationKey (reverse revName)) slot)
+  _ ->
+    Nothing
 
 
 -- | The session-shell command vocabulary as a list of ready-to-print
@@ -354,6 +407,7 @@ renderLiveSessionCommandHelp =
   , "    demos       list manifest demo keys (marks current)"
   , "    controls    print current OSC control surface"
   , "    values      print last accepted control values per active voice"
+  , "    set TAG V   write UI control TAG to V (TAG=path from controls)"
   , "    status      print current status (same as <Enter>)"
   , "    help        print commands (same as ?)"
   , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
@@ -998,7 +1052,8 @@ sessionLoop
   -> (String -> IO ())
   -> Haskeline.InputT IO ()
 sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
-            lastOutcomeRef reloadEventsRef valueCacheRef extPrint = loop
+            lastOutcomeRef reloadEventsRef valueCacheRef
+            extPrint = loop
   where
     prompt =
       "Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:\n> "
@@ -1035,6 +1090,15 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
         pure SsContinue
       LscValues -> do
         printValuesWith extPrint trackedStackRef currentPlanRef valueCacheRef
+        pure SsContinue
+      LscUISet tag value -> do
+        dispatchUISet
+          extPrint
+          trackedStackRef
+          currentPlanRef
+          valueCacheRef
+          tag
+          value
         pure SsContinue
       LscHelp -> do
         mapM_ extPrint renderLiveSessionCommandHelp
@@ -1393,3 +1457,89 @@ printValuesWith output trackedStackRef currentPlanRef valueCacheRef = do
               bindings = motControls (mitOSC target)
           mapM_ output
             (renderValuesTable currentDemoKey voices bindings cache)
+
+
+-- | Phase 8h step 3d: dispatch one @set TAG VALUE@ operator command.
+--
+-- Projects the current ingress target from the live plan, looks up the
+-- fan-in host from the tracked stack, submits one UI write through the
+-- existing 'submitManifestUIIngress' path, and threads an accepted
+-- write through 'acceptedUIControlWrite' into the same
+-- 'recordAcceptedWrite' updater the OSC and MIDI listeners use. Range
+-- and existence checks are enforced inside 'submitManifestUIIngress',
+-- so an out-of-range write rejects before the fan-in enqueue — same
+-- contract as 'submitManifestOSCMessage'.
+--
+-- The producer-neutral retain map is intentionally not threaded back
+-- in: nothing in v1 reads 'muicCurrent' (the projection always uses
+-- the 'liveIngressTargetPolicy' constant with an empty retain map),
+-- so the operator-visible last-accepted value flows through the
+-- 'valueCacheRef' / @values@ command instead. If a future surface
+-- starts rendering @muicCurrent@, an 'IORef' threaded from the
+-- session entrypoint can join the projection at that point.
+--
+-- Operator lines mirror the OSC/MIDI accept/reject shape:
+-- @ui accept: /v0/lpf/0 name=\"cutoff\" value=1500@ on success;
+-- @ui reject: …@ otherwise. \"No live stack\" rejects without
+-- contacting the producer.
+dispatchUISet
+  :: (String -> IO ())
+  -> IORef (Maybe LiveStack)
+  -> IORef MR.ManifestReloadPlan
+  -> IORef LiveValueCache
+  -> ControlTag
+  -> Double
+  -> IO ()
+dispatchUISet output trackedStackRef currentPlanRef
+              valueCacheRef tag value = do
+  currentPlan <- readIORef currentPlanRef
+  output ""
+  case manifestReloadIngressTargetFromPlan
+         liveIngressTargetPolicy currentPlan of
+    Left issue ->
+      output $
+        "  ui reject: ingress projection failed: " <> show issue
+    Right target -> do
+      mStack <- readIORef trackedStackRef
+      case mStack of
+        Nothing ->
+          output "  ui reject: (no live stack)"
+        Just stack -> do
+          let host  = sessionFanInServiceHost (mrhcService (rhsConfig stack))
+              input = ManifestUIIngressInput
+                        { muiiControlTag = tag
+                        , muiiValue      = value
+                        }
+              bindings = motControls (mitOSC target)
+          result <- submitManifestUIIngress
+                      defaultUIProducerOptions
+                      (mitUI target)
+                      M.empty
+                      input
+                      host
+          case muirOutcome result of
+            Left (MuiiUnknownControl t) ->
+              output ("  ui reject: unknown control " <> showControlTag t)
+            Left (MuiiValueOutOfRange t v lo hi) ->
+              output ("  ui reject: value " <> show v
+                      <> " out of range [" <> show lo
+                      <> ", " <> show hi
+                      <> "] for " <> showControlTag t)
+            Right (UIProducerRejected (UpiNonFiniteControlValue t v)) ->
+              output ("  ui reject: non-finite value " <> showControlTag t
+                      <> " value=" <> show v)
+            Right (UIProducerRejected (UpiNonFiniteInitialControl t v)) ->
+              output ("  ui reject: non-finite initial control " <> showControlTag t
+                      <> " value=" <> show v)
+            Right producerResult@(UIProducerEnqueueAttempted cmd _enqueue) -> do
+              case acceptedUIControlWrite producerResult of
+                Just (voice, acceptedTag, acceptedValue) -> do
+                  modifyIORef' valueCacheRef
+                    (recordAcceptedWrite voice acceptedTag acceptedValue)
+                  output ("  ui accept: " <> renderAcceptedCommand bindings cmd)
+                Nothing ->
+                  output ("  ui reject: enqueue rejected for "
+                          <> renderAcceptedCommand bindings cmd)
+  where
+    showControlTag (ControlTag (MigrationKey k) slot) =
+      "\"" <> k <> "/" <> show slot <> "\""

@@ -51,6 +51,8 @@ import           MetaSonic.App.ManifestReloadSupervisor
                                              SupervisorOps (..))
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                             (HostStackFactory (..))
+import           MetaSonic.Bridge.Source    (MigrationKey (..))
+import           MetaSonic.Pattern          (ControlTag (..))
 import qualified MetaSonic.Session.ManifestReload as MR
 
 
@@ -149,11 +151,42 @@ parseLiveSessionCommandTests =
       "hello world" (LscUnknown "hello world")
   , row "unknown command preserves the original (untrimmed) line"
       "  hello world  " (LscUnknown "  hello world  ")
+
+  -- set TAG VALUE (Phase 8h step 3d)
+  , row "set name/slot value parses as LscUISet"
+      "set cutoff/0 1500" (LscUISet cutoff0 1500)
+  , row "set tolerates leading + trailing whitespace"
+      "  set cutoff/0 1500  " (LscUISet cutoff0 1500)
+  , row "set parses negative values"
+      "set cutoff/0 -1.5" (LscUISet cutoff0 (-1.5))
+  , row "set parses fractional values"
+      "set q/1 0.7" (LscUISet (mkTag "q" 1) 0.7)
+  , row "set with missing value is unknown"
+      "set cutoff/0" (LscUnknown "set cutoff/0")
+  , row "set with empty payload is unknown"
+      "set " (LscUnknown "set ")
+  , row "set without tag separator is unknown"
+      "set cutoff 1500" (LscUnknown "set cutoff 1500")
+  , row "set with non-numeric slot is unknown"
+      "set cutoff/x 1500" (LscUnknown "set cutoff/x 1500")
+  , row "set with negative slot is unknown"
+      "set cutoff/-1 1500" (LscUnknown "set cutoff/-1 1500")
+  , row "set with empty tag name is unknown"
+      "set /0 1500" (LscUnknown "set /0 1500")
+  , row "set with non-numeric value is unknown"
+      "set cutoff/0 abc" (LscUnknown "set cutoff/0 abc")
+  , row "set with too many tokens is unknown"
+      "set cutoff/0 1500 extra" (LscUnknown "set cutoff/0 1500 extra")
+  , row "uppercase 'SET' prefix is unknown (case-sensitive)"
+      "SET cutoff/0 1500" (LscUnknown "SET cutoff/0 1500")
   ]
   where
     row name input expected =
       testCase name $
         parseLiveSessionCommand input @?= expected
+
+    cutoff0 = mkTag "cutoff" 0
+    mkTag k slot = ControlTag (MigrationKey k) slot
 
 
 -- ---------------------------------------------------------------------------
@@ -168,8 +201,8 @@ parseLiveSessionCommandTests =
 -- with the command vocabulary the operator sees.
 renderLiveSessionCommandHelpTests :: [TestTree]
 renderLiveSessionCommandHelpTests =
-  [ testCase "renders nine lines: header + eight command rows" $
-      length renderLiveSessionCommandHelp @?= 9
+  [ testCase "renders ten lines: header + nine command rows" $
+      length renderLiveSessionCommandHelp @?= 10
 
   , testCase "first line is the 'commands:' header (two-space indent)" $
       take 1 renderLiveSessionCommandHelp @?= ["  commands:"]
@@ -182,6 +215,7 @@ renderLiveSessionCommandHelpTests =
             , "    demos       list manifest demo keys (marks current)"
             , "    controls    print current OSC control surface"
             , "    values      print last accepted control values per active voice"
+            , "    set TAG V   write UI control TAG to V (TAG=path from controls)"
             , "    status      print current status (same as <Enter>)"
             , "    help        print commands (same as ?)"
             , "    quit        close session cleanly (same as exit, <Ctrl-D>)"

@@ -36,7 +36,6 @@ import           MetaSonic.Session.Queue          (ProducerKind (..),
                                                    SessionQueueOptions (..))
 import           MetaSonic.Session.RTGraphAdapter (defaultRTGraphAdapterOptions)
 import           MetaSonic.Session.UIProducer     (UIProducerEnqueueResult (..),
-                                                   UIProducerIssue (..),
                                                    defaultUIProducerOptions,
                                                    uiProducerId)
 import           MetaSonic.Spec.SessionShared     (testProducer)
@@ -112,7 +111,57 @@ appManifestReloadUIIngressTests =
         -- Retain map is unchanged.
         muirRetainedValues result @?= M.fromList [(cutoffTag, 1500.0)]
 
-  , testCase "non-finite value rejects at the UI producer and keeps the retain map" $ do
+  , testCase "value below rangeMin rejects before fan-in enqueue" $ do
+      let target = projectedTarget focusedVoiceSelection
+          retainedBefore = M.fromList [(cutoffTag, 1500.0)]
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestUIIngress
+            defaultUIProducerOptions
+            target
+            retainedBefore
+            (ManifestUIIngressInput cutoffTag 100.0)
+            host
+        muirOutcome result @?= Left (MuiiValueOutOfRange cutoffTag 100.0 200.0 8000.0)
+        muirRetainedValues result @?= retainedBefore
+
+  , testCase "value above rangeMax rejects before fan-in enqueue" $ do
+      let target = projectedTarget focusedVoiceSelection
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestUIIngress
+            defaultUIProducerOptions
+            target
+            M.empty
+            (ManifestUIIngressInput cutoffTag 9000.0)
+            host
+        muirOutcome result @?= Left (MuiiValueOutOfRange cutoffTag 9000.0 200.0 8000.0)
+
+  , testCase "value at rangeMin boundary is accepted" $ do
+      let target = projectedTarget focusedVoiceSelection
+      withFanInOrFail $ \host -> do
+        result <-
+          submitManifestUIIngress
+            defaultUIProducerOptions
+            target
+            M.empty
+            (ManifestUIIngressInput cutoffTag 200.0)
+            host
+        case muirOutcome result of
+          Right (UIProducerEnqueueAttempted command _enq) ->
+            command @?= CmdControlWrite focusedKey cutoffTag 200.0
+          other ->
+            assertFailure
+              ("expected boundary-accepted enqueue, got: " <> show other)
+
+  , testCase "non-finite value rejects at the manifest range check (shadows UI producer's non-finite arm) and keeps the retain map" $ do
+      -- Phase 8h step 3d: the manifest range check fires before the UI
+      -- producer's 'UpiNonFiniteControlValue' arm because infinity
+      -- fails @value > rangeMax@ (and NaN trips the 'isNaN' guard).
+      -- Mirrors 'submitManifestOSCMessage' — the UI producer's
+      -- non-finite arm is still reachable for direct
+      -- 'enqueueUIProducerIntent' callers that bypass the manifest
+      -- wrapper.
       let target = projectedTarget focusedVoiceSelection
           infinity = 1.0 / 0.0
           retainedBefore = M.fromList [(cutoffTag, 1500.0)]
@@ -124,12 +173,7 @@ appManifestReloadUIIngressTests =
             retainedBefore
             (ManifestUIIngressInput cutoffTag infinity)
             host
-        case muirOutcome result of
-          Right (UIProducerRejected issue) ->
-            issue @?= UpiNonFiniteControlValue cutoffTag infinity
-          other ->
-            assertFailure
-              ("expected UI producer rejection, got: " <> show other)
+        muirOutcome result @?= Left (MuiiValueOutOfRange cutoffTag infinity 200.0 8000.0)
         muirRetainedValues result @?= retainedBefore
 
   , testCase "queue-full fan-in rejection keeps the retain map" $ do

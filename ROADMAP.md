@@ -4039,13 +4039,22 @@ Still gated:
   and level from `source=default` to `source=accepted`, preserving
   reload retained those MIDI-written values, a later CC 74 update
   landed after reload, final status stayed healthy, and the session
-  exited with command code 0. Residual watch items only — physical
-  controller or VMPK-GUI-specific confirmation for the same
-  `hasDevice == True` operator boundary, UI accepted-write wiring
-  (extractor landed step 3a; needs the live shell to open UI
-  ingress at all), ALSA stderr noise on startup, and persistent
-  command-history-file behavior — none blocking on current
-  evidence. Phase 8j closed the
+  exited with command code 0. Phase 8h step 3d closed the
+  operator-visible UI accepted-write path: the live shell parses
+  `set TAG V` (where TAG is the `<key>/<slot>` path tail from the
+  `controls` addressable surface), routes the write through
+  `submitManifestUIIngress` with manifest-range and existence
+  enforcement (mirroring `submitManifestOSCMessage`), threads the
+  accepted producer result through the producer-neutral
+  `acceptedUIControlWrite` extractor into the same
+  `recordAcceptedWrite` updater the OSC and MIDI listeners use, and
+  renders `ui accept:` / `ui reject:` lines next to the existing
+  `osc accept:` / `midi accept:` shapes. `set` writes immediately
+  show up in the next `values` call with `source=accepted`.
+  Residual watch items only — physical controller or VMPK-GUI-specific
+  confirmation for the same `hasDevice == True` operator boundary,
+  ALSA stderr noise on startup, and persistent command-history-file
+  behavior — none blocking on current evidence. Phase 8j closed the
   readline / TTY-line-discipline watch item with a `haskeline`
   boundary (`7df0586`, verification `6d11b3a`; design note:
   [notes/2026-05-22-h-live-session-tty-line-discipline-design.md](notes/2026-05-22-h-live-session-tty-line-discipline-design.md)):
