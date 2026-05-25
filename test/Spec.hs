@@ -181,48 +181,12 @@ main = defaultMain $ testGroup "MetaSonic"
       ]
   , testGroup "Phase 8"
       [ testGroup "app"
-          [ appDemoCatalogTests
-          , appFusionCostLabTests
-          , appManifestLiveCommonAddressableSurfaceTests
-          , appManifestLiveCommonIngressPolicyTests
-          , appManifestLiveCommonMIDIRenderTests
-          , appManifestLiveCommonOSCControlsTests
-          , appManifestLiveCommonOSCRenderTests
-          , appManifestLiveCommonRetiredBindingsTests
-          , appManifestLiveCommonStaleByReloadTests
-          , appManifestLiveIngressOpsTests
-          , appManifestLivePolicyTests
-          , appManifestLiveReloadDemoRenderTests
-          , appManifestLiveSessionTests
-          , appManifestLiveSessionOutputSinkTests
-          , appManifestLiveSessionProjectorsTests
-          , appManifestLiveValueCacheTests
-          , appManifestMIDIIngressOpsTests
-          , appManifestMIDIListenerTests
-          , appManifestMIDIPortMIDITests
-          , appManifestMIDIReloadE2ETests
-          , appManifestOSCIngressOpsTests
-          , appManifestOSCListenerTests
-          , appManifestOSCReloadE2ETests
-          , appManifestPreservingFixtureTests
-          , appManifestReloadHostStackTests
-          , appManifestReloadPreservingHostStackTests
-          , appManifestReloadTryPreservingHostStackTests
-          , appManifestReloadBindingTests
-          , appManifestReloadCliTests
-          , appManifestReloadEventTests
-          , appManifestReloadHostTests
-          , appManifestReloadIngressTests
-          , appManifestReloadIngressTargetTests
-          , appManifestReloadMIDIBindingTests
-          , appManifestReloadMIDIIngressTests
-          , appManifestReloadOrchestrationTests
-          , appManifestReloadOSCBindingTests
-          , appManifestReloadOSCIngressTests
-          , appManifestReloadSupervisorTests
-          , appManifestReloadSupervisorAdapterTests
-          , appManifestReloadUIIngressTests
-          ]
+          (  phase8AppCatalogTests
+          <> phase8LiveSessionTests
+          <> phase8ManifestIngressAdapterTests
+          <> phase8HostStackTests
+          <> phase8ManifestReloadCoreTests
+          )
       , testGroup "session-substrate"
           [ controlTargetTests
           , patternCorpusTests
@@ -254,4 +218,100 @@ main = defaultMain $ testGroup "MetaSonic"
           , sessionUIProducerTests
           ]
       ]
+  ]
+
+
+-- ---------------------------------------------------------------------------
+-- Phase 8 app cohort buckets
+--
+-- Source-organization buckets concatenated under the existing
+-- @testGroup "app"@. Splitting the flat 41-element list into named
+-- @[TestTree]@ values is a reviewability pass only: the Tasty tree
+-- shape ("MetaSonic" > "Phase 8" > "app") is unchanged, no
+-- subgroup nodes were added, and the within-bucket and
+-- between-bucket order preserves the previous test order so test
+-- selector paths and ordering stay stable.
+-- ---------------------------------------------------------------------------
+
+-- | Demo catalog and fusion cost-lab CLI tests. Not manifest-
+-- related; grouped first because they came first in the
+-- pre-split list.
+phase8AppCatalogTests :: [TestTree]
+phase8AppCatalogTests =
+  [ appDemoCatalogTests
+  , appFusionCostLabTests
+  ]
+
+-- | Live-session machinery: every @MetaSonic.App.ManifestLive*@
+-- module's test cohort. Covers the live shell's pure
+-- common-render layer, the live ingress ops combinator, the
+-- live-app reload policy boundary, the live session entrypoint
+-- and its projectors / output sink, and the live value cache.
+phase8LiveSessionTests :: [TestTree]
+phase8LiveSessionTests =
+  [ appManifestLiveCommonAddressableSurfaceTests
+  , appManifestLiveCommonIngressPolicyTests
+  , appManifestLiveCommonMIDIRenderTests
+  , appManifestLiveCommonOSCControlsTests
+  , appManifestLiveCommonOSCRenderTests
+  , appManifestLiveCommonRetiredBindingsTests
+  , appManifestLiveCommonStaleByReloadTests
+  , appManifestLiveIngressOpsTests
+  , appManifestLivePolicyTests
+  , appManifestLiveReloadDemoRenderTests
+  , appManifestLiveSessionTests
+  , appManifestLiveSessionOutputSinkTests
+  , appManifestLiveSessionProjectorsTests
+  , appManifestLiveValueCacheTests
+  ]
+
+-- | MIDI and OSC ingress adapter tests: the
+-- @MetaSonic.App.Manifest{MIDI,OSC}{IngressOps,Listener,
+-- PortMIDI}@ family plus the two @*ReloadE2E@ cohorts that
+-- drive real packet / CC traffic through those adapters.
+phase8ManifestIngressAdapterTests :: [TestTree]
+phase8ManifestIngressAdapterTests =
+  [ appManifestMIDIIngressOpsTests
+  , appManifestMIDIListenerTests
+  , appManifestMIDIPortMIDITests
+  , appManifestMIDIReloadE2ETests
+  , appManifestOSCIngressOpsTests
+  , appManifestOSCListenerTests
+  , appManifestOSCReloadE2ETests
+  ]
+
+-- | Host stack tests: the preserving fixture plus the three
+-- host-stack route modules (@ManifestReload{,Preserving,
+-- TryPreserving}HostStack@) that the supervisor instantiates
+-- one of per strategy.
+phase8HostStackTests :: [TestTree]
+phase8HostStackTests =
+  [ appManifestPreservingFixtureTests
+  , appManifestReloadHostStackTests
+  , appManifestReloadPreservingHostStackTests
+  , appManifestReloadTryPreservingHostStackTests
+  ]
+
+-- | Manifest-reload core tests: every @MetaSonic.App.ManifestReload*@
+-- module's cohort that is not a host stack. Covers the binding
+-- projection, CLI parser, event ADT, host orchestrator, ingress
+-- substrate, ingress target bundle, per-producer binding
+-- projections, orchestration, supervisor, supervisor adapter, and
+-- the UI ingress submission seam.
+phase8ManifestReloadCoreTests :: [TestTree]
+phase8ManifestReloadCoreTests =
+  [ appManifestReloadBindingTests
+  , appManifestReloadCliTests
+  , appManifestReloadEventTests
+  , appManifestReloadHostTests
+  , appManifestReloadIngressTests
+  , appManifestReloadIngressTargetTests
+  , appManifestReloadMIDIBindingTests
+  , appManifestReloadMIDIIngressTests
+  , appManifestReloadOrchestrationTests
+  , appManifestReloadOSCBindingTests
+  , appManifestReloadOSCIngressTests
+  , appManifestReloadSupervisorTests
+  , appManifestReloadSupervisorAdapterTests
+  , appManifestReloadUIIngressTests
   ]
