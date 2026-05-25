@@ -3529,7 +3529,14 @@ controls preserved and producer state held at the pre-fence value)
 applies identically when a flush is rejected by queue pressure or by
 policy denial. Policy denials surface to the listener as a new
 `SmliArbitrationRejected` issue alongside the existing service
-`SfsiiArbitrationRejected` hook.
+`SfsiiArbitrationRejected` hook. `--session-midi-arbitration-smoke`
+exercises that opt-in MIDI listener path with a scripted, non-device
+event stream (note-on, CC, all-notes-off fence) under a `TargetClaim`
+policy whose claimant is `ProducerPattern`; it asserts a
+listener/service arbitration counter match and the fence-drop
+outcome, then exits non-zero on any mismatch, so the probe is
+suitable for unattended operator and CI runs without PortMIDI or a
+network socket.
 Existing live paths are not routed through arbitration unless a caller
 explicitly chooses that wrapper/path.
 

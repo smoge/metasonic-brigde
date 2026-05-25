@@ -63,10 +63,30 @@ different user intents even when they write the same logical target.
 - `Session.PatternProducer` has an explicit arbitrated service enqueue
   helper for caller-driven Pattern blocks. Its existing pure queue,
   runner, and host helpers remain the default FIFO behavior.
+- `Session.MIDIProducer` has an explicit arbitrated service enqueue
+  helper for already-decoded MIDI events with the same state-advance
+  contract as the raw enqueue path: note/sustain/pitch-bend
+  bookkeeping advances only when every generated command is accepted.
+  Its existing host-based enqueue path remains the default FIFO
+  behavior.
+- `Session.MIDIListener` has the matching opt-in service-backed
+  listener wrapper over that helper. Both paths share one
+  decode/coalescing/fence/timed-flush core, so the fence-drop contract
+  (`SmliFenceDroppedForFlushFailure` with pending controls preserved
+  and producer state held at the pre-fence value) applies identically
+  whether the flush is rejected by queue pressure or by policy denial;
+  policy denial additionally surfaces as `SmliArbitrationRejected`.
+  Its existing host-based listener remains the default FIFO behavior.
 - `--session-osc-arbitration-smoke` exercises the opt-in OSC listener
   service path with a configured `TargetClaim` policy and reports both
   listener-level and service-level arbitration rejection counters. It is
   a non-audio diagnostic probe, not a default live-policy route.
+- `--session-midi-arbitration-smoke` is the MIDI counterpart with a
+  scripted, fully in-process event source (no PortMIDI, no socket).
+  It runs a fixed note-on / CC / all-notes-off fence script against a
+  `TargetClaim` whose claimant is `ProducerPattern`, asserts a
+  listener/service arbitration counter match plus the expected
+  fence-drop count, and exits non-zero on any mismatch.
 - The landed MIDI coalescer is listener-local. It can merge repeated
   MIDI-origin `CmdControlWrite`s before enqueue, but it cannot merge,
   reorder, or drop another producer's commands.
@@ -199,7 +219,11 @@ The manual `--session-osc-arbitration-smoke` command exposes that
 service issue alongside the OSC listener's `SoliArbitrationRejected`
 counter so operators can see both the cross-producer service signal and
 the producer-specific packet signal without treating either as queue
-pressure.
+pressure. The scripted `--session-midi-arbitration-smoke` does the same
+for the MIDI listener's `SmliArbitrationRejected` counter and additionally
+asserts the fence-drop outcome that the MIDI coalescer produces when a
+flush submission is policy-rejected, so the listener/service counter
+parity is checked in code rather than read off a transcript.
 
 ## Test Plan
 
@@ -251,11 +275,18 @@ above fan-in, using a small pure policy function or wrapper:
 9. Wire additional MIDI, UI, or Pattern producer/listener paths only
    when configuration can explicitly enable a non-FIFO policy. Done for
    UI producer: `enqueueArbitratedUIProducerIntent`; done for Pattern
-   producer: `enqueueArbitratedPatternBlock`. MIDI remains gated.
+   producer: `enqueueArbitratedPatternBlock`; done for MIDI producer:
+   `enqueueArbitratedMIDIProducerEvent`; done for MIDI listener:
+   `withArbitratedSessionMIDIListener` and friends, which share the
+   raw listener's decode/coalescing/fence/timed-flush core.
 10. Add smoke diagnostics if a live policy is enabled by configuration.
     Done: `--session-osc-arbitration-smoke` binds the opt-in
     arbitrated OSC listener path with a `TargetClaim` policy and reports
-    listener/service arbitration counters.
+    listener/service arbitration counters. Done:
+    `--session-midi-arbitration-smoke` runs a scripted, in-process MIDI
+    event sequence against the arbitrated MIDI listener under a
+    Pattern-pre-claimed `TargetClaim`, asserting listener/service
+    counter parity and the fence-drop outcome.
 
 ## Deferred Work
 
