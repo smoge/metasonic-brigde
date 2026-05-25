@@ -1655,6 +1655,117 @@ sessionMIDIListenerTests =
         Right other ->
           assertFailure ("expected MIDI listener service enqueue, got: "
                          <> show other)
+
+  , testCase "arbitrated listener drops fence when Pattern owns the CC target" $ do
+      let graph = patternTemplates droneVibrato
+          midiOpts = testMIDIPlayableOptions
+          midiProducer = midiProducerId midiOpts
+          patternProducer = testProducer ProducerPattern "pattern"
+          vkey = VoiceKey "m0-60"
+          target = ControlArbitrationTarget vkey midiLevelTag
+          patternCmd = CmdControlWrite vkey midiLevelTag 0.25
+          midiCCCmd = CmdControlWrite vkey midiLevelTag 1.0
+          priorityPolicy = ProducerPriority
+            [ProducerPattern, ProducerOSC, ProducerUI, ProducerMIDI]
+            emptyControlOwnerTable
+          serviceOpts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy = priorityPolicy
+                  }
+            }
+          listenerOpts = MIDIS.defaultSessionMIDIListenerOptions
+            { MIDIS.smloTimedControlFlushUsec = Nothing
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = midiProducer
+            , aiCommand   = midiCCCmd
+            , aiTarget    = Just target
+            , aiReason    = ArrLowerPriorityThan patternProducer
+            , aiRetryable = False
+            }
+      events <- newEmptyMVar
+      producerResults <- newEmptyMVar
+      issuesRef <- newIORef []
+      let source = midiMVarSource events
+          hooks = MIDIS.SessionMIDIArbitratedListenerHooks
+            { MIDIS.smlahOnProducerResult = putMVar producerResults
+            , MIDIS.smlahOnIssue = \issue ->
+                atomicModifyIORef' issuesRef (\xs -> (issue : xs, ()))
+            }
+      result <-
+        withSessionFanInService graph serviceOpts $ \service ->
+          MIDIS.withArbitratedSessionMIDIListenerHooksAndOptions
+            hooks
+            listenerOpts
+            midiOpts
+            initialMIDIProducerState
+            source
+            service
+            $ \listener -> do
+                putMVar events (Just (MIDIProducerNoteOn 0 60 100))
+                mOn <- timeout 1000000 (takeMVar producerResults)
+                patternRes <- enqueueArbitratedSessionFanInServiceCommand
+                                patternProducer patternCmd service
+                putMVar events (Just (MIDIProducerControlChange 0 7 127))
+                mCC <- timeout 1000000 (takeMVar producerResults)
+                putMVar events (Just (MIDIProducerAllNotesOff Nothing))
+                mFence <- timeout 1000000 (takeMVar producerResults)
+                stateAfter <- MIDIS.readSessionMIDIListenerState listener
+                statsAfter <-
+                  MIDIS.readSessionMIDIListenerCoalescingStats listener
+                issues <- readIORef issuesRef
+                pure ( mOn
+                     , patternRes
+                     , mCC
+                     , mFence
+                     , stateAfter
+                     , statsAfter
+                     , reverse issues
+                     )
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right ( mOn
+              , patternRes
+              , mCC
+              , mFence
+              , stateAfter
+              , statsAfter
+              , issues
+              ) -> do
+          case mOn of
+            Just (MIDIProducerArbitratedEnqueueAttempted
+                    _ [SagEnqueueAttempted _]) ->
+              pure ()
+            other ->
+              assertFailure
+                ("expected MIDI note-on accepted, got: " <> show other)
+          _ <- gatewayQueuedOrFail patternRes
+          case mCC of
+            Just (MIDIProducerArbitratedEnqueueAttempted _ []) ->
+              pure ()
+            other ->
+              assertFailure
+                ("expected MIDI CC to be deferred, got: " <> show other)
+          case mFence of
+            Just (MIDIProducerArbitratedEnqueueAttempted batch
+                    [SagArbitrationRejected actualIssue]) -> do
+              mpcbCommands batch @?= [midiCCCmd]
+              actualIssue @?= expectedIssue
+            other ->
+              assertFailure
+                ("expected fence-drop with policy rejection, got: "
+                 <> show other)
+          mpsActiveNotes stateAfter
+            @?= M.singleton (0, 60) vkey
+          MIDIS.smlcsPendingCount statsAfter @?= 1
+          let arbitrationIssues =
+                [ai | MIDIS.SmliArbitrationRejected ai <- issues]
+              fenceDropCounts =
+                [n | MIDIS.SmliFenceDroppedForFlushFailure _ n <- issues]
+          arbitrationIssues @?= [expectedIssue]
+          fenceDropCounts @?= [1]
   ]
 
 midiMVarSource :: MVar (Maybe MIDIProducerEvent) -> MIDIS.MIDIListenerSource

@@ -3520,10 +3520,16 @@ enqueue helper for already-decoded MIDI events, with the same
 state-advance contract as the raw enqueue path: producer
 note/sustain/pitch-bend bookkeeping advances only when every generated
 command is accepted, so a policy or queue rejection on any command
-leaves the original state. The decoded MIDI listener wrapper in
-`MetaSonic.Session.MIDIListener` still routes events through the raw
-FIFO fan-in path and is the next arbitration parity gap on the MIDI
-side.
+leaves the original state. `MetaSonic.Session.MIDIListener` exposes the
+matching opt-in arbitrated listener wrapper over the same producer
+helper; its raw FIFO entrypoints are unchanged, and both paths share
+the same decode/coalescing/fence/timed-flush machinery so the
+fence-drop contract (`SmliFenceDroppedForFlushFailure` with pending
+controls preserved and producer state held at the pre-fence value)
+applies identically when a flush is rejected by queue pressure or by
+policy denial. Policy denials surface to the listener as a new
+`SmliArbitrationRejected` issue alongside the existing service
+`SfsiiArbitrationRejected` hook.
 Existing live paths are not routed through arbitration unless a caller
 explicitly chooses that wrapper/path.
 
@@ -3803,10 +3809,10 @@ Still gated:
   the landed opt-in gateway, service-owned arbitrated enqueue path,
   explicit OSC producer helper, opt-in OSC listener path, explicit UI
   and Pattern producer helpers, and the explicit arbitrated MIDI
-  producer helper. The remaining gap on the MIDI side is service-shaped
-  arbitration wiring for `MetaSonic.Session.MIDIListener`, which still
-  routes decoded events through the raw FIFO fan-in path. The policy
-  boundary is recorded in
+  producer and listener helpers. With the listener path now
+  service-shaped, remaining MIDI-side coexistence work is the
+  use-case-gated policy mutation / voice-lifecycle ownership clearing
+  in the next bullet. The policy boundary is recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md).
 - [ ] Arbitration policy mutation API and voice-lifecycle ownership
   clearing. These remain use-case gated; do not implement them ahead of
