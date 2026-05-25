@@ -180,8 +180,9 @@ void rt_graph_template_set_polyphony(RTGraph *g, int template_id, int polyphony)
 // NodeKind::RecordBufMono) into a template with polyphony > 1
 // silently clamps the cap to 1 in place. See Note [§6.C.5 single-
 // writer-single-instance invariant] in rt_graph.cpp.
-void rt_graph_template_add_node(RTGraph *g, int template_id,
-                                int node_index, int node_kind);
+void rt_graph_template_add_node(
+    RTGraph *g, int template_id, int node_index, int node_kind
+);
 
 // [T:construction] Attach a Phase 5.2 migration identity key to one
 // node in a template. Keys are optional, scoped per template, and used
@@ -190,8 +191,8 @@ void rt_graph_template_add_node(RTGraph *g, int template_id,
 // not include NUL. Returns 1 on success, 0 on invalid args, duplicate
 // key in the same template, or overlong key.
 int rt_graph_template_set_node_migration_key(
-    RTGraph *g, int template_id, int node_index,
-    const char *key, int key_len);
+    RTGraph *g, int template_id, int node_index, const char *key, int key_len
+);
 
 // [T:construction] Attach a Phase 5.4.B template identity token. Used
 // only by rt_graph_prepare_swap_from_graph as a precondition: if any
@@ -201,25 +202,25 @@ int rt_graph_template_set_node_migration_key(
 // out of the precondition. key_len must be in 1..16; bytes are opaque
 // but may not include NUL. Returns 1 on success, 0 on invalid args.
 int rt_graph_template_set_identity(
-    RTGraph *g, int template_id,
-    const char *key, int key_len);
+    RTGraph *g, int template_id, const char *key, int key_len
+);
 
 // [T:construction] Set one entry of a template's spec.default_controls.
 // New instances created later via rt_graph_template_instance_add inherit
 // the value; existing instances are *not* mutated. Use
 // rt_graph_instance_set_control to update a specific live instance.
-void rt_graph_template_set_default(RTGraph *g, int template_id,
-                                   int node_index, int control_index,
-                                   double value);
+void rt_graph_template_set_default(
+    RTGraph *g, int template_id, int node_index, int control_index, double value
+);
 
 // [T:construction] Connect one source output port to one destination
 // input port within the named template. Wiring lives on the spec side
 // and is shared by every instance of the template. Both src and dst
 // must belong to the same template — cross-template signal flow goes
 // through the bus pool, not direct wiring.
-void rt_graph_template_connect(RTGraph *g, int template_id,
-                               int src_index, int src_port,
-                               int dst_index, int dst_port);
+void rt_graph_template_connect(
+    RTGraph *g, int template_id, int src_index, int src_port, int dst_index, int dst_port
+);
 
 // [T:construction] Mark a node in the named template as elided. An
 // elided node remains in the spec — its NodeIndex is preserved,
@@ -231,8 +232,7 @@ void rt_graph_template_connect(RTGraph *g, int template_id,
 //
 // Silent no-op on invalid template_id or node_index. Idempotent:
 // marking the same node elided twice is harmless.
-void rt_graph_template_set_node_elided(RTGraph *g, int template_id,
-                                       int node_index);
+void rt_graph_template_set_node_elided(RTGraph *g, int template_id, int node_index);
 
 // [T:construction] Wire one input port of a destination node so it
 // reads through a fused scaled-source form rather than from a
@@ -264,10 +264,15 @@ void rt_graph_template_set_node_elided(RTGraph *g, int template_id,
 // (dst_node, dst_port) overwrite the previous; the older scratch
 // slot becomes unused but is not reclaimed.
 void rt_graph_template_connect_fused_scale_input(
-    RTGraph *g, int template_id,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
-    int scale_node, int scale_control_index);
+    RTGraph *g,
+    int template_id,
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
+    int scale_node,
+    int scale_control_index
+);
 
 // [T:construction] Wire one input port of a destination node so it
 // reads through a chained fused scaled-source form: a single source
@@ -304,12 +309,16 @@ void rt_graph_template_connect_fused_scale_input(
 // lockstep with the new slot, mirroring the parallel-growth contract
 // of rt_graph_template_add_node.
 void rt_graph_template_connect_fused_scale_chain_input(
-    RTGraph *g, int template_id,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
+    RTGraph *g,
+    int template_id,
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
     int scale_count,
     const int *scale_nodes,
-    const int *scale_controls);
+    const int *scale_controls
+);
 
 // [T:construction] Phase 4.C.2: wire one input port through an
 // affine chain — a run of scalar Gain (multiply) and scalar Add
@@ -349,13 +358,17 @@ void rt_graph_template_connect_fused_scale_chain_input(
 // Construction-only; walks every live instance to grow scratch in
 // lockstep, mirroring the parallel-growth contract.
 void rt_graph_template_connect_fused_affine_input(
-    RTGraph *g, int template_id,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
+    RTGraph *g,
+    int template_id,
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
     int step_count,
     const int *step_kinds,
     const int *step_nodes,
-    const int *step_controls);
+    const int *step_controls
+);
 
 // [T:construction] Add one region to the named template's MetaDef.
 // Regions are an execution-order overlay on the template's node array;
@@ -382,8 +395,9 @@ void rt_graph_template_connect_fused_affine_input(
 // ABI ('rt_graph_template_set_default', 'rt_graph_realtime_set_control',
 // etc.). Future fusion passes that elide nodes must preserve or
 // redirect their control-slot identities.
-void rt_graph_template_add_region(RTGraph *g, int template_id,
-                                  int rate, int first_node, int node_count);
+void rt_graph_template_add_region(
+    RTGraph *g, int template_id, int rate, int first_node, int node_count
+);
 
 // [T:construction] Phase 4.B: add one region to the named template,
 // tagged with a region kernel selector. Generalises
@@ -409,6 +423,8 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //                                       NoiseGen -> Gain -> Out)
 //                  6 = BusInLpfGainOut (4-node sink-terminal:
 //                                       BusIn -> LPF -> Gain -> Out)
+//                  7 = NoiseLpfGainOut (4-node sink-terminal:
+//                                       NoiseGen -> LPF -> Gain -> Out)
 //                The Haskell side machine-checks tag agreement in a
 //                property test (mirroring the kindTag pattern in
 //                §0.5.1) so this set cannot drift between aligned
@@ -476,6 +492,12 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 //                   terminal slot. An out-of-range BusIn bus
 //                   silent-no-ops the block, mirroring
 //                   process_busin's invalid-bus contract.
+//   * NoiseLpfGainOut needs node_count == 4 and kinds
+//                   [NoiseGen, LPF, Gain, /sink/]. The noise
+//                   counterpart of SawLpfGainOut: one PRNG read per
+//                   sample feeds the same LPF + scalar gain +
+//                   sink-accumulate pipeline. Same Out/BusOut rule on
+//                   the terminal slot.
 // The runtime validates the kind sequence at dispatch time and
 // falls back to per-node iteration on any mismatch.
 //
@@ -484,9 +506,8 @@ void rt_graph_template_add_region(RTGraph *g, int template_id,
 // rather than introducing anonymous state. Silent no-op on invalid
 // template_id, range, or kernel_kind.
 void rt_graph_template_add_region_kernel(
-    RTGraph *g, int template_id,
-    int kernel_kind,
-    int rate, int first_node, int node_count);
+    RTGraph *g, int template_id, int kernel_kind, int rate, int first_node, int node_count
+);
 
 // [T:introspection] Returns 1 if @kernel_kind@ corresponds to a
 // region kernel the runtime knows how to dispatch (including
@@ -516,16 +537,15 @@ int rt_graph_region_kernel_supported(int kernel_kind);
 // Each op-append entry validates its program_id and silent-no-ops
 // on a stale or invalid id. The append order is the execution
 // order; the runtime does not reorder.
-int rt_graph_template_add_fusion_program(
-    RTGraph *g, int template_id, int scratch_slots);
+int rt_graph_template_add_fusion_program(RTGraph *g, int template_id, int scratch_slots);
 
 // [T:construction] Phase 7.D: append an OpLoadConst op to the named
 // program. Writes 'value' into scratch[scratch_dst] per sample.
 // Silent no-op on invalid template_id, program_id, or out-of-range
 // scratch_dst.
 void rt_graph_template_program_load_const(
-    RTGraph *g, int template_id, int program_id,
-    int scratch_dst, double value);
+    RTGraph *g, int template_id, int program_id, int scratch_dst, double value
+);
 
 // [T:construction] Phase 7.D: append an OpLoadInput op. Reads the
 // current sample from node @node_index@'s output port @port_index@
@@ -533,8 +553,13 @@ void rt_graph_template_program_load_const(
 // earlier in the same block (no feedback in v1). Silent no-op on
 // invalid handles.
 void rt_graph_template_program_load_input(
-    RTGraph *g, int template_id, int program_id,
-    int scratch_dst, int node_index, int port_index);
+    RTGraph *g,
+    int template_id,
+    int program_id,
+    int scratch_dst,
+    int node_index,
+    int port_index
+);
 
 // [T:construction] Phase 7.D: append an arithmetic op (OpAdd /
 // OpMul). Each source carries a tag plus a small union of data
@@ -547,16 +572,34 @@ void rt_graph_template_program_load_input(
 // Result lands in scratch[scratch_dst]. Silent no-op on any
 // out-of-range index.
 void rt_graph_template_program_add(
-    RTGraph *g, int template_id, int program_id,
+    RTGraph *g,
+    int template_id,
+    int program_id,
     int scratch_dst,
-    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
-    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b);
+    int src1_tag,
+    double src1_const,
+    int src1_idx_a,
+    int src1_idx_b,
+    int src2_tag,
+    double src2_const,
+    int src2_idx_a,
+    int src2_idx_b
+);
 
 void rt_graph_template_program_mul(
-    RTGraph *g, int template_id, int program_id,
+    RTGraph *g,
+    int template_id,
+    int program_id,
     int scratch_dst,
-    int src1_tag, double src1_const, int src1_idx_a, int src1_idx_b,
-    int src2_tag, double src2_const, int src2_idx_a, int src2_idx_b);
+    int src1_tag,
+    double src1_const,
+    int src1_idx_a,
+    int src1_idx_b,
+    int src2_tag,
+    double src2_const,
+    int src2_idx_a,
+    int src2_idx_b
+);
 
 // [T:construction] Phase 7.D: append an OpSinkWrite op. Writes the
 // source value into output bus @bus_index@ at the current sample.
@@ -568,10 +611,16 @@ void rt_graph_template_program_mul(
 // programs should emit SinkAccumulate.
 // Silent no-op on invalid handles or an unknown sink_policy.
 void rt_graph_template_program_sink_write(
-    RTGraph *g, int template_id, int program_id,
+    RTGraph *g,
+    int template_id,
+    int program_id,
     int bus_index,
-    int src_tag, double src_const, int src_idx_a, int src_idx_b,
-    int sink_policy);
+    int src_tag,
+    double src_const,
+    int src_idx_a,
+    int src_idx_b,
+    int sink_policy
+);
 
 // [T:construction] Phase 7.D: register a region that dispatches
 // through a generated fusion program instead of a hand-written
@@ -587,9 +636,8 @@ void rt_graph_template_program_sink_write(
 // Silent no-op on invalid template_id, program_id, or
 // first_node/node_count out of range.
 void rt_graph_template_add_region_generated(
-    RTGraph *g, int template_id,
-    int rate, int first_node, int node_count,
-    int program_id);
+    RTGraph *g, int template_id, int rate, int first_node, int node_count, int program_id
+);
 
 // [T:construction] Phase 7.H: register a generated region that
 // dispatches through the block-major executor
@@ -602,9 +650,8 @@ void rt_graph_template_add_region_generated(
 // difference is the C++ loop nest. Silent no-op rules match
 // rt_graph_template_add_region_generated.
 void rt_graph_template_add_region_generated_block(
-    RTGraph *g, int template_id,
-    int rate, int first_node, int node_count,
-    int program_id);
+    RTGraph *g, int template_id, int rate, int first_node, int node_count, int program_id
+);
 
 // [T:construction] Phase 7.I: register a generated region that
 // dispatches through the super-mode executor
@@ -618,28 +665,29 @@ void rt_graph_template_add_region_generated_block(
 // is which C++ function runs it. Silent no-op rules match
 // rt_graph_template_add_region_generated.
 void rt_graph_template_add_region_generated_super(
-    RTGraph *g, int template_id,
-    int rate, int first_node, int node_count,
-    int program_id);
+    RTGraph *g, int template_id, int rate, int first_node, int node_count, int program_id
+);
 
 // [T:introspection] Phase 7.D test surface. Counts and lookups for
 // the per-template fusion-program table populated by
 // rt_graph_template_add_fusion_program /
 // rt_graph_template_program_*. All return -1 on invalid handles.
-int rt_graph_test_template_fusion_program_count(
-    RTGraph *g, int template_id);
+int rt_graph_test_template_fusion_program_count(RTGraph *g, int template_id);
 
 int rt_graph_test_template_fusion_program_op_count(
-    RTGraph *g, int template_id, int program_id);
+    RTGraph *g, int template_id, int program_id
+);
 
 int rt_graph_test_template_fusion_program_scratch_slots(
-    RTGraph *g, int template_id, int program_id);
+    RTGraph *g, int template_id, int program_id
+);
 
 // Returns the generated program id attached to region
 // @region_index@, or -1 if that region uses kernel-based dispatch
 // or the handle is invalid.
 int rt_graph_test_template_region_generated_program(
-    RTGraph *g, int template_id, int region_index);
+    RTGraph *g, int template_id, int region_index
+);
 
 // [T:introspection] Phase 7.I: classify a registered fusion program
 // against the super-mode recognizer set. Returns:
@@ -649,8 +697,7 @@ int rt_graph_test_template_region_generated_program(
 //  -1 = invalid template_id / program_id
 // Classification is structural: it inspects the program's op
 // sequence and tagged operands, never executes the program.
-int rt_graph_test_fusion_program_super_kind(
-    RTGraph *g, int template_id, int program_id);
+int rt_graph_test_fusion_program_super_kind(RTGraph *g, int template_id, int program_id);
 
 // [T:construction] Phase §4.E.2.C0a: append one descriptive
 // schedule step to the named template, layering an interpretation
@@ -691,10 +738,8 @@ int rt_graph_test_fusion_program_super_kind(
 // so step ordinals are execution metadata rather than part of the
 // per-writer-slot identity.
 void rt_graph_template_add_schedule_step(
-    RTGraph *g, int template_id,
-    int kind,
-    int item_count,
-    const int *region_ordinals);
+    RTGraph *g, int template_id, int kind, int item_count, const int *region_ordinals
+);
 
 // [T:control] Spawn an instance of the named template. Returns
 // globally-unique instance_id (>= 0) or -1 on failure. Slot reuse: a
@@ -721,12 +766,12 @@ void rt_graph_add_node(RTGraph *g, int node_index, int node_kind);
 // node is set), which makes it a [T:construction] step in practice
 // during graph build. Existing callers always use it during graph
 // build, before audio starts; do not call after rt_graph_start_audio.
-void rt_graph_set_control(RTGraph *g, int node_index, int control_index,
-                          double value);
+void rt_graph_set_control(RTGraph *g, int node_index, int control_index, double value);
 
 // [T:construction] Template-0 shim for rt_graph_template_connect.
-void rt_graph_connect(RTGraph *g, int src_index, int src_port, int dst_index,
-                      int dst_port);
+void rt_graph_connect(
+    RTGraph *g, int src_index, int src_port, int dst_index, int dst_port
+);
 
 // [T:construction] Template-0 shim for rt_graph_template_add_region.
 void rt_graph_add_region(RTGraph *g, int rate, int first_node, int node_count);
@@ -738,9 +783,13 @@ void rt_graph_set_node_elided(RTGraph *g, int node_index);
 // rt_graph_template_connect_fused_scale_input.
 void rt_graph_connect_fused_scale_input(
     RTGraph *g,
-    int dst_node, int dst_port,
-    int src_node, int src_port,
-    int scale_node, int scale_control_index);
+    int dst_node,
+    int dst_port,
+    int src_node,
+    int src_port,
+    int scale_node,
+    int scale_control_index
+);
 
 // [T:render] Offline block rendering. Processes every live instance of
 // every template, in template registration (= execution) order.
@@ -817,7 +866,8 @@ void rt_graph_stop_audio_fade(RTGraph *g, int fade_ms);
 // total <= 0 or remaining <= 0 fills `data` with zeros and returns 0.
 // `frames` may exceed remaining; samples past remaining become zero.
 int rt_graph_test_apply_shutdown_fade_block(
-    float *data, int frames, int remaining, int total);
+    float *data, int frames, int remaining, int total
+);
 
 // [T:construction] Phase §6.C.3a: allocate a mono float32 buffer of
 // `frames` samples. Returns the assigned 0-based buffer ID on
@@ -836,10 +886,8 @@ int rt_graph_buffer_alloc(RTGraph *g, int frames);
 //   -1 if samples is null and frame_count > 0.
 // Construction-only: must run before rt_graph_start_audio.
 int rt_graph_buffer_load_f32(
-    RTGraph *g,
-    int buffer_id,
-    const float *samples,
-    int frame_count);
+    RTGraph *g, int buffer_id, const float *samples, int frame_count
+);
 
 // [T:construction] Phase §6.C.3a: stopped-audio fast path. Flip
 // `buffer_id` from Allocated back to Unallocated. The underlying
@@ -1106,8 +1154,9 @@ int rt_graph_test_contribution_slot_used(const RTGraph *g, int ws);
 // out[0..nframes). Returns 0 on success, -1 on null g, null out,
 // out-of-range ws, or nframes exceeding the slot capacity. The
 // destination is left untouched on error.
-int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
-                                         int nframes, float *out);
+int rt_graph_test_read_contribution_slot(
+    const RTGraph *g, int ws, int nframes, float *out
+);
 
 // [T:read-only] Phase §4.E.2.C0a test surface: number of schedule
 // steps registered for the named template via
@@ -1115,8 +1164,7 @@ int rt_graph_test_read_contribution_slot(const RTGraph *g, int ws,
 // template_id is out of range. Loaders are expected to ship one
 // step per Haskell ScheduleStep, so this should equal
 // length (layeredRegionSchedule rg) for any well-formed template.
-int rt_graph_test_template_schedule_step_count(
-    const RTGraph *g, int template_id);
+int rt_graph_test_template_schedule_step_count(const RTGraph *g, int template_id);
 
 // [T:read-only] Phase §4.E.2.C0a test surface: ScheduleStepKind
 // tag of the @step_index@-th step on the named template. Returns
@@ -1126,13 +1174,15 @@ int rt_graph_test_template_schedule_step_count(
 // is out of range. Pinned by Haskell-side metadata-equivalence
 // tests against layeredRegionSchedule.
 int rt_graph_test_template_schedule_step_kind(
-    const RTGraph *g, int template_id, int step_index);
+    const RTGraph *g, int template_id, int step_index
+);
 
 // [T:read-only] Phase §4.E.2.C0a test surface: number of regions
 // covered by the @step_index@-th step. Returns -1 on null g or
 // out-of-range indices.
 int rt_graph_test_template_schedule_step_item_count(
-    const RTGraph *g, int template_id, int step_index);
+    const RTGraph *g, int template_id, int step_index
+);
 
 // [T:read-only] Phase §4.E.2.C0a test surface: the scheduled-
 // region ordinal at @item_index@ within the @step_index@-th step,
@@ -1143,7 +1193,8 @@ int rt_graph_test_template_schedule_step_item_count(
 // corrupts the storage; the C ABI's add entry validates step
 // shapes up-front).
 int rt_graph_test_template_schedule_step_region(
-    const RTGraph *g, int template_id, int step_index, int item_index);
+    const RTGraph *g, int template_id, int step_index, int item_index
+);
 
 // [T:read-only] Phase §4.E.2.C0b test surfaces. The runtime
 // rebuilds a per-block "global schedule" at the top of every
@@ -1165,12 +1216,9 @@ int rt_graph_test_global_schedule_entry_count(const RTGraph *g);
 
 // Per-entry accessors. Return -1 on null g or out-of-range
 // entry_index (i.e. >= rt_graph_test_global_schedule_entry_count).
-int rt_graph_test_global_schedule_entry_template(
-    const RTGraph *g, int entry_index);
-int rt_graph_test_global_schedule_entry_instance(
-    const RTGraph *g, int entry_index);
-int rt_graph_test_global_schedule_entry_step(
-    const RTGraph *g, int entry_index);
+int rt_graph_test_global_schedule_entry_template(const RTGraph *g, int entry_index);
+int rt_graph_test_global_schedule_entry_instance(const RTGraph *g, int entry_index);
+int rt_graph_test_global_schedule_entry_step(const RTGraph *g, int entry_index);
 
 // [T:read-only] Phase §4.E.2.C0d test surfaces. The runtime derives a
 // second per-block vector of contiguous "bands" over the C0b global
@@ -1184,12 +1232,9 @@ int rt_graph_test_global_schedule_entry_step(
 // band_index for per-band accessors.
 
 int rt_graph_test_global_schedule_band_count(const RTGraph *g);
-int rt_graph_test_global_schedule_band_kind(
-    const RTGraph *g, int band_index);
-int rt_graph_test_global_schedule_band_first_entry(
-    const RTGraph *g, int band_index);
-int rt_graph_test_global_schedule_band_entry_count(
-    const RTGraph *g, int band_index);
+int rt_graph_test_global_schedule_band_kind(const RTGraph *g, int band_index);
+int rt_graph_test_global_schedule_band_first_entry(const RTGraph *g, int band_index);
+int rt_graph_test_global_schedule_band_entry_count(const RTGraph *g, int band_index);
 
 // [T:read-only] Phase §4.E.2.C1d-a test surfaces. The runtime expands
 // each GlobalScheduleEntry into one RegionLayerWorkItem per scheduled
@@ -1200,22 +1245,18 @@ int rt_graph_test_global_schedule_band_entry_count(
 // vector capacity so tests can pin the no-allocation audio-path bound.
 int rt_graph_test_region_layer_work_item_count(const RTGraph *g);
 int rt_graph_test_region_layer_work_item_capacity(const RTGraph *g);
-int rt_graph_test_region_layer_work_item_entry(
-    const RTGraph *g, int item_index);
-int rt_graph_test_region_layer_work_item_template(
-    const RTGraph *g, int item_index);
-int rt_graph_test_region_layer_work_item_instance(
-    const RTGraph *g, int item_index);
-int rt_graph_test_region_layer_work_item_step(
-    const RTGraph *g, int item_index);
-int rt_graph_test_region_layer_work_item_item(
-    const RTGraph *g, int item_index);
-int rt_graph_test_region_layer_work_item_region(
-    const RTGraph *g, int item_index);
+int rt_graph_test_region_layer_work_item_entry(const RTGraph *g, int item_index);
+int rt_graph_test_region_layer_work_item_template(const RTGraph *g, int item_index);
+int rt_graph_test_region_layer_work_item_instance(const RTGraph *g, int item_index);
+int rt_graph_test_region_layer_work_item_step(const RTGraph *g, int item_index);
+int rt_graph_test_region_layer_work_item_item(const RTGraph *g, int item_index);
+int rt_graph_test_region_layer_work_item_region(const RTGraph *g, int item_index);
 int rt_graph_test_region_layer_work_item_first_writer_slot(
-    const RTGraph *g, int item_index);
+    const RTGraph *g, int item_index
+);
 int rt_graph_test_region_layer_work_item_writer_slot_count(
-    const RTGraph *g, int item_index);
+    const RTGraph *g, int item_index
+);
 
 // [T:read-only] Phase §4.E.2.C1d-a counters from the most recent
 // process block. Candidate entries are multi-region FreeLayer steps
@@ -1234,8 +1275,7 @@ int rt_graph_test_last_c1d_serialized_sink_entry_count(const RTGraph *g);
 // the C1c worker pool both bypass this path; tests assert non-zero
 // only when the C1d-b path actually consumed RegionLayerWorkItem
 // entries. Returns 0 on null g.
-int rt_graph_test_last_c1d_serial_region_item_execution_count(
-    const RTGraph *g);
+int rt_graph_test_last_c1d_serial_region_item_execution_count(const RTGraph *g);
 
 // [T:read-only] Phase §4.E.2.C1d-c counters from the most recent
 // process block. `parallel_entry_count` increments once per multi-
@@ -1301,8 +1341,7 @@ RTGraphSwap *rt_graph_prepare_swap(RTGraph *g);
 // build a future world without duplicating every construction call for
 // RTGraphSwap. Returns null on invalid args or if source itself has a
 // swap in flight.
-RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target,
-                                              RTGraph *source);
+RTGraphSwap *rt_graph_prepare_swap_from_graph(RTGraph *target, RTGraph *source);
 
 // [T:construction] Free an unpublished swap. Silent no-op on null. Do
 // not call after rt_graph_publish_swap has succeeded for this swap;
@@ -1365,7 +1404,8 @@ int rt_graph_test_retired_swap_control_value(
     int instance_id,
     int node_index,
     int control_index,
-    double *out_value);
+    double *out_value
+);
 
 // [T:read-only] Phase 5.2.A/B/C migration-plan counters on a prepared or
 // collected swap. `committed_count` counts node matches committed into
@@ -1392,8 +1432,7 @@ int rt_graph_swap_migration_lifecycle_copy_count(const RTGraphSwap *swap);
 //   4 = KindMismatch
 //   5 = ArityMismatch
 //   6 = StateUnsupported
-int rt_graph_swap_migration_skipped_reason(
-    const RTGraphSwap *swap, int skip_index);
+int rt_graph_swap_migration_skipped_reason(const RTGraphSwap *swap, int skip_index);
 
 // ----------------------------------------------------------------
 // Multi-instance support
@@ -1488,9 +1527,9 @@ int rt_graph_instance_alive(RTGraph *g, int instance_id);
 // other thread should write to a Reserved slot. Once the producer
 // has enqueued Activate, all subsequent control changes must go
 // through rt_graph_realtime_set_control (queued).
-void rt_graph_instance_set_control(RTGraph *g, int instance_id,
-                                   int node_index, int control_index,
-                                   double value);
+void rt_graph_instance_set_control(
+    RTGraph *g, int instance_id, int node_index, int control_index, double value
+);
 
 // (rt_graph_instance_read_bus was removed in the post-§2.E ABI
 // cleanup. Under §2.C the bus pool is server-global, so an
@@ -1576,9 +1615,9 @@ int rt_graph_realtime_remove(RTGraph *g, int slot_id);
 // receive their initial controls from the producer's pre-enqueue
 // path (direct rt_graph_instance_set_control on the Reserved
 // slot). Returns 1 on success, 0 if the queue is full.
-int rt_graph_realtime_set_control(RTGraph *g, int slot_id,
-                                  int node_index, int control_index,
-                                  double value);
+int rt_graph_realtime_set_control(
+    RTGraph *g, int slot_id, int node_index, int control_index, double value
+);
 
 #ifdef __cplusplus
 }
