@@ -104,6 +104,13 @@ module MetaSonic.App.ManifestLiveCommon
   , renderRetiredBindings
   , renderRetiredVoiceReason
 
+    -- * Stale-by-reload attribution (Phase 8h step 3e v1 slice 3)
+  , AttributedStaleCommand (..)
+  , retiredVoiceKeyMap
+  , classifyStaleByReload
+  , classifyStaleByReloadAll
+  , renderStaleByReloadCommands
+
     -- * OSC control-surface rendering
   , renderOSCControls
   , renderOSCControlsWith
@@ -239,7 +246,9 @@ import           MetaSonic.Pattern              (ControlTag (..),
                                                  TemplateName (..),
                                                  Value,
                                                  VoiceKey (..))
-import           MetaSonic.Session.Command      (SessionCommand (..))
+import           MetaSonic.Session.Command      (SessionCommand (..),
+                                                 SessionIssue (..))
+import           MetaSonic.Session.Owner        (SessionOwnerStepResult (..))
 import           MetaSonic.Session.FanIn        (SessionFanInAudioOptions (..),
                                                  SessionFanInEnqueueResult (..),
                                                  SessionFanInSnapshot (..))
@@ -256,8 +265,10 @@ import           MetaSonic.Session.Resolve      (RetiredVoiceBinding (..),
 import           MetaSonic.Session.Queue        (ProducerId (..),
                                                  ProducerKind (..),
                                                  QueuedSessionCommand (..),
+                                                 SessionDrainItem (..),
                                                  SessionEnqueueIssue (..),
                                                  SessionEnqueueResult (..))
+import           MetaSonic.Session.Step         (SessionStepResult (..))
 import           MetaSonic.Session.State        (SessionState (..))
 
 
@@ -770,6 +781,129 @@ renderRetiredVoiceReason (RvrInvalidVoiceKey _issue) =
   "invalid-key"
 renderRetiredVoiceReason RvrOwnerReplaced =
   "owner-replaced"
+
+
+-- | Phase 8h step 3e v1 slice 3: stale-by-reload attribution.
+--
+-- One drain rejection attributed to a specific reload retirement.
+-- Carries enough context for the operator render and for downstream
+-- consumers (e.g. producer-facing rejection diagnostics) to name
+-- both the offending command and the reload that retired the
+-- binding.
+data AttributedStaleCommand = AttributedStaleCommand
+  { ascProducer :: !ProducerId
+  , ascCommand  :: !SessionCommand
+  , ascVoiceKey :: !VoiceKey
+  , ascReason   :: !RetiredVoiceReason
+  } deriving (Eq, Show)
+
+
+-- | Project a 'RetiredVoiceBinding' list to a lookup table keyed by
+-- 'VoiceKey'. Built once per reload commit so the per-drain-item
+-- classifier is O(log n) per rejection.
+retiredVoiceKeyMap :: [RetiredVoiceBinding] -> M.Map VoiceKey RetiredVoiceReason
+retiredVoiceKeyMap =
+  M.fromList . map entry
+  where
+    entry rb =
+      (vbVoiceKey (rvbBinding rb), rvbReason rb)
+
+
+-- | Classify one drain item against the most recent retired-voice
+-- set. Returns 'Just' when the item is a 'SiStaleVoice' rejection
+-- whose 'VoiceKey' appears in the retired map; otherwise 'Nothing'.
+--
+-- 'SiUnknownTemplate' is deliberately *not* classified here — that
+-- would need a separate template-name retired set, which slice 1
+-- did not compute. See @notes/2026-05-24-b-stale-producer-command-semantics.md@
+-- "Out of scope" for the v2 lane.
+--
+-- Both 'SessionOwnerStep' and 'SessionOwnerDivergedNow' carry the
+-- nested 'SessionStepResult'; either path can surface a stale-voice
+-- rejection so both are inspected. The classifier ignores divergent
+-- post-step state because the attribution only depends on the
+-- producer command, the issue, and the retired set.
+classifyStaleByReload
+  :: M.Map VoiceKey RetiredVoiceReason
+  -> SessionDrainItem
+  -> Maybe AttributedStaleCommand
+classifyStaleByReload retired item =
+  case sdiResult item of
+    SessionOwnerStep step ->
+      attribute step
+    SessionOwnerDivergedNow step _divergence ->
+      attribute step
+    SessionOwnerBlocked _divergence ->
+      Nothing
+  where
+    queued = sdiQueued item
+
+    attribute (StepRejected (SiStaleVoice vkey))
+      | Just reason <- M.lookup vkey retired =
+          Just AttributedStaleCommand
+            { ascProducer = qscProducer queued
+            , ascCommand  = qscCommand queued
+            , ascVoiceKey = vkey
+            , ascReason   = reason
+            }
+    attribute _ =
+      Nothing
+
+
+-- | Classify every drain item in input order. Convenience wrapper
+-- the live shell uses against a drained service-result snapshot.
+classifyStaleByReloadAll
+  :: M.Map VoiceKey RetiredVoiceReason
+  -> [SessionDrainItem]
+  -> [AttributedStaleCommand]
+classifyStaleByReloadAll retired items =
+  [ attributed
+  | item <- items
+  , Just attributed <- [classifyStaleByReload retired item]
+  ]
+
+
+-- | Render attributed stale-by-reload commands as an operator block,
+-- *without* the @stale-by-reload commands:@ header (the caller owns
+-- the header so the block can sit next to @retired bindings:@).
+--
+-- Empty list renders as a single @(none)@ row; non-empty input
+-- renders one bullet per attributed command, naming the offending
+-- voice and the retirement reason.
+renderStaleByReloadCommands :: [AttributedStaleCommand] -> [String]
+renderStaleByReloadCommands [] =
+  ["    (none)"]
+renderStaleByReloadCommands attributed =
+  map renderRow attributed
+  where
+    renderRow asc =
+      "    - " <> producerKindLabel (qscProducerKind (ascProducer asc))
+      <> " " <> renderRejectedCommand (ascCommand asc)
+      <> "  -> reload retired voice "
+      <> showVoiceKey (ascVoiceKey asc)
+      <> " (" <> renderRetiredVoiceReason (ascReason asc) <> ")"
+
+    qscProducerKind (ProducerId k _name) = k
+
+    producerKindLabel ProducerOSC     = "osc"
+    producerKindLabel ProducerMIDI    = "midi"
+    producerKindLabel ProducerUI      = "ui"
+    producerKindLabel ProducerPattern = "pattern"
+
+    renderRejectedCommand cmd = case cmd of
+      CmdVoiceOff vkey ->
+        "voice-off voice=" <> unVoiceKey vkey
+      CmdControlWrite vkey tag _value ->
+        "control-write voice=" <> unVoiceKey vkey
+        <> " tag=" <> show tag
+      _ ->
+        -- Other shapes don't carry a VoiceKey and so are never
+        -- attributed; keep a defensive render for forward
+        -- compatibility.
+        show cmd
+
+    showVoiceKey vk =
+      "\"" <> unVoiceKey vk <> "\""
 
 
 -- | The live OSC listener's operator-facing print surface. Both

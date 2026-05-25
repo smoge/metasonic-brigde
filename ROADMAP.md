@@ -4066,8 +4066,16 @@ Still gated:
   `(none)`, per-binding, and stopped-audio summary rows; the
   `runReloadWithSink` caller prints a `retired bindings:` block
   next to the existing `reload events:` output whenever a commit
-  payload exists. Slice 3 attributes `SiStaleVoice` rejects against
-  the most recent retired set. Design note:
+  payload exists. The slice 3 pure-helper half adds
+  `AttributedStaleCommand`, `retiredVoiceKeyMap`,
+  `classifyStaleByReload` / `classifyStaleByReloadAll`, and
+  `renderStaleByReloadCommands` in the same module (table-tested in
+  `AppManifestLiveCommonStaleByReload`): the classifier narrows to
+  `SiStaleVoice` on `CmdVoiceOff` / `CmdControlWrite` against a
+  retired key — `SiUnknownTemplate`, non-rejecting steps, and
+  non-retired keys all return `Nothing`. Runtime wiring (drain-hook
+  snapshot of the last retired set, operator block output) lands in
+  the next slice. Design note:
   [notes/2026-05-24-b-stale-producer-command-semantics.md](notes/2026-05-24-b-stale-producer-command-semantics.md).
   Residual watch items only — physical controller or VMPK-GUI-specific
   confirmation for the same `hasDevice == True` operator boundary,

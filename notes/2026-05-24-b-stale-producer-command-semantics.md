@@ -27,8 +27,19 @@ with deterministic tests in
 `runReloadWithSink` in
 [`MetaSonic.App.ManifestLiveSession`](../app/MetaSonic/App/ManifestLiveSession.hs)
 then prints the `retired bindings:` block next to `reload events:`
-whenever a commit payload exists. Slice 3 (stale-by-reload
-attribution) remains open.
+whenever a commit payload exists.
+
+Slice 3 splits the same way. The pure-helper half landed: a new
+`AttributedStaleCommand` record plus the
+`retiredVoiceKeyMap` / `classifyStaleByReload` /
+`classifyStaleByReloadAll` / `renderStaleByReloadCommands` quartet in
+[`MetaSonic.App.ManifestLiveCommon`](../app/MetaSonic/App/ManifestLiveCommon.hs),
+pinned by deterministic table tests in
+[`AppManifestLiveCommonStaleByReload`](../test/MetaSonic/Spec/AppManifestLiveCommonStaleByReload.hs).
+Runtime wiring (drain-hook snapshot of the last retired set,
+operator block output) is the next slice — the helpers exist on
+their own so a regression in attribution policy surfaces here
+rather than in the IO-driven live shell.
 
 The driving consumer is
 [`runManifestLiveSession`](../app/MetaSonic/App/ManifestLiveSession.hs).

@@ -24,6 +24,8 @@ import           MetaSonic.Spec.AppManifestLiveCommonOSCRender
                                                   (appManifestLiveCommonOSCRenderTests)
 import           MetaSonic.Spec.AppManifestLiveCommonRetiredBindings
                                                   (appManifestLiveCommonRetiredBindingsTests)
+import           MetaSonic.Spec.AppManifestLiveCommonStaleByReload
+                                                  (appManifestLiveCommonStaleByReloadTests)
 import           MetaSonic.Spec.AppManifestLiveIngressOps
                                                   (appManifestLiveIngressOpsTests)
 import           MetaSonic.Spec.AppManifestLiveReloadDemoRender
@@ -135,6 +137,7 @@ main = defaultMain $ testGroup "MetaSonic"
   , appManifestLiveCommonOSCControlsTests
   , appManifestLiveCommonOSCRenderTests
   , appManifestLiveCommonRetiredBindingsTests
+  , appManifestLiveCommonStaleByReloadTests
   , appManifestLiveIngressOpsTests
   , appManifestLiveReloadDemoRenderTests
   , appManifestLiveSessionTests
