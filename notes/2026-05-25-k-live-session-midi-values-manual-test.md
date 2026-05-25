@@ -177,3 +177,9 @@ listed items.
 - [notes/2026-05-25-j-app-mode-surface-audit.md](2026-05-25-j-app-mode-surface-audit.md)
   — `--manifest-live-session` classified as P/op; this run is
   one of the operator confirmations behind that classification.
+- [ROADMAP.md](../ROADMAP.md) Phase 8h step 3c paragraph —
+  carries the original 2026-05-24 wider three-CC closeout
+  transcript (`/tmp/metasonic-live-session-8h-3c-sclang.log`,
+  covering CC 74 / 71 / 7) for historical context; this note
+  is the durable repeatable software-device evidence ROADMAP
+  treats as canonical.

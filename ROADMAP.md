@@ -4079,7 +4079,17 @@ Still gated:
   and level from `source=default` to `source=accepted`, preserving
   reload retained those MIDI-written values, a later CC 74 update
   landed after reload, final status stayed healthy, and the session
-  exited with command code 0. Phase 8h step 3d closed the
+  exited with command code 0. The durable evidence artifact is now
+  [notes/2026-05-25-k-live-session-midi-values-manual-test.md](notes/2026-05-25-k-live-session-midi-values-manual-test.md)
+  (commit `a428381`), which records the same software ALSA /
+  PortMIDI route through the repeatable
+  [sc/live-session-midi-values.scd](sc/live-session-midi-values.scd)
+  replay script (commit `d1909b4`) with the exact invocation,
+  per-item cleaned transcript snippets, CC-scaling sanity, and
+  explicit non-goals (physical controller, VMPK-GUI, reject path,
+  unbound-CC, `set`, `repair`). The `/tmp` log stays referenced as
+  the original wider three-CC closeout; the new note is the
+  canonical repeatable software-device evidence. Phase 8h step 3d closed the
   operator-visible UI accepted-write path: the live shell parses
   `set TAG V` (where TAG is the `<key>/<slot>` path tail from the
   `controls` addressable surface), routes the write through
@@ -4169,8 +4179,10 @@ Still gated:
   no hardware-specific contract beyond the software ALSA /
   PortMIDI path above; its OSC live verification is the 2026-05-22
   operator transcript recorded in the playbook, and its MIDI live
-  verification is the 2026-05-24 `sclang` / PortMIDI transcript
-  recorded there. The Phase 8j line-editor closeout is likewise
+  verification is the durable 2026-05-25 manual test in
+  [notes/2026-05-25-k-live-session-midi-values-manual-test.md](notes/2026-05-25-k-live-session-midi-values-manual-test.md)
+  (the original 2026-05-24 `sclang` / PortMIDI transcript stays
+  referenced there for historical wider coverage). The Phase 8j line-editor closeout is likewise
   text-shell-only; its live verification is the 2026-05-23 replay
   transcript recorded in the playbook.
 - [x] Failure/event semantics across compile and allocation/resource
