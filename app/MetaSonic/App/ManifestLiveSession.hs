@@ -463,8 +463,11 @@ renderLiveSessionDemoList current keys =
 -- that does not resolve to a catalog demo, or planning failed
 -- against the loaded manifest) from /supervisor/ outcomes (the
 -- four 'SupervisedReloadOutcome' variants). This matters because
--- the session must terminate on supervisor escalation but only
--- reject the command (continue serving) on a planning failure.
+-- a supervisor escalation puts the session into the diverged state
+-- (supervision v1, 2026-05-25-f: loop stays alive,
+-- 'divergedStateRef' carries the two causes, and the dispatch gate
+-- refuses live-stack-needing commands) while a planning failure
+-- only rejects the command and keeps the live stack serving.
 --
 -- 'LsoCommitted' and 'LsoCommittedSameDemo' both correspond to
 -- 'SupervisedReloadCommitted'; 'runReloadWithSink' refines the
@@ -1188,8 +1191,14 @@ runSupervised
         pure ()
 
 
--- | Read-parse-dispatch loop. Returns when the user hits EOF or a
--- reload outcome maps to 'SsTerminate'.
+-- | Read-parse-dispatch loop. Returns when the user hits EOF or
+-- types @quit@ \/ @exit@; supervisor escalation no longer
+-- terminates (supervision v1, 2026-05-25-f). The only command
+-- that maps to 'SsTerminate' today is 'LscQuit'; every reload
+-- outcome — committed, request-rejected, recovered, escalated —
+-- maps to 'SsContinue' and the dispatcher reads
+-- 'divergedStateRef' on every prompt to decide whether to refuse
+-- live-stack-needing commands.
 --
 -- Phase 8j: input is read via Haskeline's 'getInputLine' inside an
 -- already-open 'runInputT' bracket (opened by 'runManifestLiveSession').

@@ -1080,8 +1080,12 @@ runReloadWithTests =
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- recovered with fallback (1)
 
-      -- 5. Escalated: session terminating, no live stack, hook
-      --    NOT called.
+      -- 5. Escalated: session enters the diverged state (no live
+      --    stack, dispatch gate refuses live-stack-needing
+      --    commands until repair), hook NOT called. Supervision
+      --    v1 (2026-05-25-f): escalation no longer terminates the
+      --    session loop, but the post-reload hook still does not
+      --    fire because there is no new live plan to hand it.
       withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef audioEventsRef lastRetiredRef divergedStateRef -> do
         let supOps = SupervisorOps
               { sopsInWindowReload = \_ _ -> do
