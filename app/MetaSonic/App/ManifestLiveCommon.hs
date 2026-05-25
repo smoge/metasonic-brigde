@@ -811,7 +811,16 @@ retiredVoiceKeyMap =
 
 -- | Classify one drain item against the most recent retired-voice
 -- set. Returns 'Just' when the item is a 'SiStaleVoice' rejection
--- whose 'VoiceKey' appears in the retired map; otherwise 'Nothing'.
+-- whose 'VoiceKey' appears in the retired map *and* whose queued
+-- command names the same voice key (a 'CmdVoiceOff' or
+-- 'CmdControlWrite' shape). Otherwise 'Nothing'.
+--
+-- The command-shape guard is defensive: the real
+-- 'admitSessionCommand' path only emits 'SiStaleVoice' for those
+-- two shapes, but the helper is exported and could see synthetic or
+-- future drain items in tests / extended runtime paths. Without the
+-- guard, a 'StepRejected (SiStaleVoice vkey)' arriving on an
+-- unrelated command shape would be misattributed.
 --
 -- 'SiUnknownTemplate' is deliberately *not* classified here — that
 -- would need a separate template-name retired set, which slice 1
@@ -839,7 +848,8 @@ classifyStaleByReload retired item =
     queued = sdiQueued item
 
     attribute (StepRejected (SiStaleVoice vkey))
-      | Just reason <- M.lookup vkey retired =
+      | commandTargetsVoice (qscCommand queued) vkey
+      , Just reason <- M.lookup vkey retired =
           Just AttributedStaleCommand
             { ascProducer = qscProducer queued
             , ascCommand  = qscCommand queued
@@ -848,6 +858,13 @@ classifyStaleByReload retired item =
             }
     attribute _ =
       Nothing
+
+    commandTargetsVoice (CmdVoiceOff k) v =
+      k == v
+    commandTargetsVoice (CmdControlWrite k _tag _value) v =
+      k == v
+    commandTargetsVoice _ _ =
+      False
 
 
 -- | Classify every drain item in input order. Convenience wrapper

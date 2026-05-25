@@ -34,6 +34,7 @@ import           MetaSonic.App.ManifestLiveSession
                                              renderLiveSessionSupervisorEvents,
                                              resourceTimelineForOutcome,
                                              runReloadWith,
+                                             runReloadWithSink,
                                              stepFromOutcome,
                                              withTrackedFactory)
 import           MetaSonic.App.ManifestLiveIngressOps
@@ -52,7 +53,12 @@ import           MetaSonic.App.ManifestReloadSupervisor
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                             (HostStackFactory (..))
 import           MetaSonic.Bridge.Source    (MigrationKey (..))
-import           MetaSonic.Pattern          (ControlTag (..))
+import           MetaSonic.Pattern          (ControlTag (..),
+                                             TemplateName (..),
+                                             VoiceKey (..))
+import           MetaSonic.Session.Resolve  (RetiredVoiceBinding (..),
+                                             RetiredVoiceReason (..),
+                                             VoiceBinding (..))
 import qualified MetaSonic.Session.ManifestReload as MR
 
 
@@ -1000,4 +1006,85 @@ runReloadWithTests =
                currentPlanRef lastOutcomeRef eventsRef "next"
         pure ()
       readIORef hookCallsRef >>= (@?= [2, 1])  -- unchanged from step 4
+
+  , testCase "Phase 8h step 3e v1 slice 2/3: runReloadWithSink emits 'retired bindings:' block immediately after 'reload events:' on a commit with retired payload" $ do
+      -- Caller-level coverage for the wiring in 'runReloadWithSink'.
+      -- The pure helpers in 'AppManifestLiveCommonRetiredBindings'
+      -- already pin the renderer/extractor; this test makes sure a
+      -- future edit to 'runReloadWithSink' cannot silently drop the
+      -- block while leaving the helpers intact.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef -> do
+        outputRef <- newIORef ([] :: [String])
+        let captureOutput s =
+              modifyIORef' outputRef (<> [s])
+            leadRetired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "lead/1") 0 (TemplateName "saw_lead"))
+                RvrTemplateGone
+            -- Inject a real commit event with a non-empty
+            -- retired-binding payload so the extractor in
+            -- 'runReloadWithSink' returns 'Just [leadRetired]' and
+            -- the wiring prints the corresponding block.
+            commitEvent :: LiveEvent
+            commitEvent = MrePreservingReloadCommitted [leadRetired]
+            supOps :: SupervisorOps StubPlan String
+            supOps = SupervisorOps
+              { sopsInWindowReload = \_ _ -> do
+                  modifyIORef' eventsRef (<> [commitEvent])
+                  pure InWindowReloadCommitted
+              , sopsCloseStack =
+                  assertFailure "sopsCloseStack should not run on a commit"
+              , sopsOpenStack  = \_ ->
+                  assertFailure "sopsOpenStack should not run on a commit"
+              }
+            resolver = stubResolver "next" (2 :: StubPlan)
+        step <- runReloadWithSink
+                  captureOutput
+                  resolver
+                  show
+                  show
+                  noHook
+                  supOps
+                  currentPlanRef
+                  lastOutcomeRef
+                  eventsRef
+                  "next"
+        step @?= SsContinue
+        output <- readIORef outputRef
+        let block label = elemIndex' label output
+        case (block "  reload events:", block "  retired bindings:") of
+          (Just rev, Just ret)
+            | ret > rev -> pure ()
+            | otherwise ->
+                assertFailure $
+                  "expected 'retired bindings:' after 'reload events:' but got reload@"
+                  <> show rev <> " retired@" <> show ret
+                  <> "\nfull output:\n" <> unlines output
+          (Nothing, _) ->
+            assertFailure $
+              "missing 'reload events:' header in captured output:\n"
+              <> unlines output
+          (_, Nothing) ->
+            assertFailure $
+              "missing 'retired bindings:' header in captured output:\n"
+              <> unlines output
+
+        -- The retired-binding row must actually render with the
+        -- voice key and reason; the renderer test pins the shape
+        -- but the caller could in principle pass an empty list to
+        -- the renderer instead of the real payload.
+        let retiredRow =
+              "    - voice \"lead/1\" template \"saw_lead\""
+                <> " reason: template-gone"
+        assertBool
+          ("expected retired-binding row in output:\n" <> unlines output)
+          (retiredRow `elem` output)
   ]
+  where
+    elemIndex' needle =
+      lookupIx 0
+      where
+        lookupIx _ [] = Nothing
+        lookupIx i (x : xs)
+          | x == needle = Just (i :: Int)
+          | otherwise   = lookupIx (i + 1) xs

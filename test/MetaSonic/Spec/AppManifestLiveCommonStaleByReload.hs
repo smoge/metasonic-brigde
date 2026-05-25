@@ -147,6 +147,41 @@ appManifestLiveCommonStaleByReloadTests =
                (SessionOwnerBlocked SodBackendStopped))
             @?= Nothing
 
+      , testCase "Command-shape guard: VoiceOn carrying SiStaleVoice does not attribute (defensive against synthetic items)" $
+          -- The real admitSessionCommand only emits SiStaleVoice for
+          -- CmdVoiceOff / CmdControlWrite, but the helper is
+          -- exported and could see a synthetic drain item where the
+          -- command is something else (e.g. CmdVoiceOn) but the
+          -- rejection still claims a stale voice. The guard prevents
+          -- that misattribution.
+          classifyStaleByReload retiredLead
+            (drainItem
+               oscProducer
+               (CmdVoiceOn (TemplateName "saw_lead") (VoiceKey "lead/1") [])
+               (rejected (SiStaleVoice (VoiceKey "lead/1"))))
+            @?= Nothing
+
+      , testCase "Voice-key cross-check: VoiceOff with mismatched key vs issue does not attribute" $
+          -- Defensive against synthetic items where the command's
+          -- voice key disagrees with the issue's voice key. The real
+          -- admission path can't produce this — it derives the issue
+          -- from the command — but the exported helper should not
+          -- attribute under that disagreement.
+          classifyStaleByReload retiredLead
+            (drainItem
+               oscProducer
+               (CmdVoiceOff (VoiceKey "other"))
+               (rejected (SiStaleVoice (VoiceKey "lead/1"))))
+            @?= Nothing
+
+      , testCase "Voice-key cross-check: ControlWrite with mismatched key vs issue does not attribute" $
+          classifyStaleByReload retiredLead
+            (drainItem
+               midiProducer
+               (CmdControlWrite (VoiceKey "other") cutoffTag 1500.0)
+               (rejected (SiStaleVoice (VoiceKey "lead/1"))))
+            @?= Nothing
+
       , testCase "Owner-diverged-now still attributes the underlying rejection" $
           -- The drain item carries the SessionStepResult that ran
           -- before the divergence finalized; if the step rejected
