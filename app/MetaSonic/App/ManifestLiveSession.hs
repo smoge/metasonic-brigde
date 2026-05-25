@@ -43,8 +43,9 @@
 -- against next.
 
 module MetaSonic.App.ManifestLiveSession
-  ( -- * Entry point
+  ( -- * Entry points
     runManifestLiveSession
+  , runManifestLiveSessionWithPolicy
 
     -- * Stdin command surface (pure, table-tested)
   , LiveSessionCommand (..)
@@ -140,7 +141,6 @@ import           MetaSonic.App.Demos            (Demo (..), demoTable,
 import           MetaSonic.App.ManifestLiveCommon
                                                 (acceptedUIControlWrite,
                                                  autoStartTemplatesWith,
-                                                 liveAudioOptions,
                                                  liveIngressTargetPolicy,
                                                  liveMIDIListenerHooksForObservedWith,
                                                  liveOSCListenerHooksForObservedWith,
@@ -157,8 +157,6 @@ import           MetaSonic.App.ManifestLiveCommon
                                                  renderPreflightEvents,
                                                  renderRetiredBindings,
                                                  retiredBindingsFromEvents,
-                                                 retiredVoiceKeyMap,
-                                                 staleByReloadDrainHook,
                                                  targetOrDie,
                                                  warnIfMissingVoicesWith)
 import           MetaSonic.App.ManifestLiveIngressOps
@@ -168,6 +166,14 @@ import           MetaSonic.App.ManifestLiveIngressOps
                                                  printLiveIngressSnapshotWith,
                                                  renderLiveIngressSnapshot,
                                                  renderLiveProdIngressIssue)
+import           MetaSonic.App.ManifestLivePolicy
+                                                (LiveAppReloadContext (..),
+                                                 LiveAppReloadPolicy,
+                                                 LiveIngressProfile (..),
+                                                 defaultLiveAppReloadPolicy,
+                                                 larpIngressProfile,
+                                                 larpStrategyResolver,
+                                                 projectLiveAppReloadPolicy)
 import           MetaSonic.App.ManifestMIDIIngressOps
                                                 (defaultManifestMIDIIngressOpsHooks,
                                                  manifestMIDIIngressOpsWithTargetHooks)
@@ -205,8 +211,7 @@ import           MetaSonic.App.ManifestReloadHost
                                                  ManifestReloadHostIssue,
                                                  ManifestReloadHostStrategy (..))
 import           MetaSonic.App.ManifestReloadHostStack
-                                                (RealReloadHostStackInputs (..),
-                                                 ReloadHostStack (..),
+                                                (ReloadHostStack (..),
                                                  ReloadHostStackOpenIssue (..),
                                                  StoppedAudioHostStackIssue (..),
                                                  mkStoppedAudioHostStackFactory,
@@ -244,18 +249,13 @@ import           MetaSonic.Pattern              (ControlTag (..),
                                                  VoiceKey)
 import           MetaSonic.Session.Resolve      (RetiredVoiceReason)
 import qualified MetaSonic.Session.ManifestReload as MR
-import           MetaSonic.Session.FanIn        (SessionFanInSnapshot (..),
-                                                 defaultSessionFanInAudioFFI)
-import           MetaSonic.Session.FanInService (SessionFanInServiceHooks (..),
-                                                 defaultSessionFanInServiceHooks,
-                                                 defaultSessionFanInServiceOptions,
-                                                 readSessionFanInService,
+import           MetaSonic.Session.FanIn        (SessionFanInSnapshot (..))
+import           MetaSonic.Session.FanInService (readSessionFanInService,
                                                  sessionFanInServiceHost)
 import           MetaSonic.Session.MIDIPortMIDI (PortMIDISourceOptions (..),
                                                  defaultPortMIDISourceOptions)
 import           MetaSonic.Session.MIDIProducer (defaultMIDIProducerOptions)
 import           MetaSonic.Session.OSCProducer  (defaultOSCProducerOptions)
-import           MetaSonic.Session.Owner        (defaultSessionOwnerOptions)
 import           MetaSonic.Session.State        (SessionState (..))
 import           MetaSonic.Session.UIProducer   (UIProducerEnqueueResult (..),
                                                  UIProducerIssue (..),
@@ -926,7 +926,36 @@ runManifestLiveSession
   -> ListenerConfig
   -> Maybe Int
   -> IO ()
-runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice = do
+runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice =
+  runManifestLiveSessionWithPolicy
+    manifestPath
+    initialDemo
+    (defaultLiveAppReloadPolicy strategy listenerCfg mMidiDevice)
+
+
+-- | Policy-native live-session entrypoint. Behavior-preserving
+-- wiring of 'runManifestLiveSession' through 'LiveAppReloadPolicy'
+-- so the per-axis defaults (resource bundle, ingress profile,
+-- arbitration profile) are explicit values the caller controls
+-- rather than ad-hoc literals inside this module. See
+-- @notes/2026-05-25-i-live-app-manifest-reload-policy.md@.
+--
+-- Strategy resolution is currently one-shot against 'initialDemo'
+-- to match today's CLI-supplied behavior; a future slice can
+-- consult the resolver per-reload once a concrete use case exists.
+runManifestLiveSessionWithPolicy
+  :: FilePath
+  -> Demo
+  -> LiveAppReloadPolicy
+  -> IO ()
+runManifestLiveSessionWithPolicy manifestPath initialDemo policy = do
+  -- 'listenerCfg' is not needed at this scope; the projector
+  -- reads it from the policy's ingress profile inside
+  -- 'larcBuildIngressOps'. 'mMidiDevice' is still derived here
+  -- because 'runSupervised' uses it to pin the device id in the
+  -- initial-open MIDI error renderer.
+  let strategy    = larpStrategyResolver policy initialDemo
+      mMidiDevice = lipMIDIDevice (larpIngressProfile policy)
   hSetBuffering stdout LineBuffering
   doc <- readManifestDocOrDie manifestPath
   catalog <- either die pure (demoManifestReloadCatalog demoTable)
@@ -1004,14 +1033,14 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
   -- MIDI half when --midi-device is set. The bundle goes through
   -- 'manifestLiveIngressOps' so the supervisor lifecycle drives
   -- both halves under the same open / close ordering.
-  let oscOpsFor host =
+  let oscOpsFor cfg host =
         manifestOSCIngressOpsWithTargetHooks
           (\target ->
              liveOSCListenerHooksForObservedWith
                target recordAccepted extPrintDyn)
           defaultOSCProducerOptions
           host
-          listenerCfg
+          cfg
 
       midiOpsFor host n =
         manifestMIDIIngressOpsWithTargetHooks
@@ -1024,44 +1053,26 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
           (manifestPortMIDISourceFactory
              defaultPortMIDISourceOptions { pmsoDeviceId = Just n })
 
-  -- Phase 8h step 3e v1 slice 4: install a service drain hook that
-  -- attributes stale-by-reload rejections against 'lastRetiredRef'
-  -- and emits a 'stale-by-reload commands:' block through the
-  -- Haskeline-safe 'extPrintDyn' sink. Inherits the no-op
-  -- 'sfshOnIssue' from the default bundle so producer-arbitration
-  -- rejections continue to flow through the existing path.
-  let serviceHooks = defaultSessionFanInServiceHooks
-        { sfshOnDrain =
-            staleByReloadDrainHook lastRetiredRef extPrintDyn
+  -- Route ingress + the resource-policy bundle through the
+  -- 'LiveAppReloadPolicy' boundary. The context carries the IORefs
+  -- and sinks the lowered callbacks close over; the projector
+  -- composes the stale-by-reload drain hook from those refs and
+  -- threads the policy's ingress profile into the per-stack
+  -- ingress builder. See
+  -- @notes/2026-05-25-i-live-app-manifest-reload-policy.md@ for
+  -- the boundary contract.
+  let context = LiveAppReloadContext
+        { larcReloadEventsRef = reloadEventsRef
+        , larcAudioEventsRef  = audioEventsRef
+        , larcLastRetiredRef  = lastRetiredRef
+        , larcExtPrint        = extPrintDyn
+        , larcBuildIngressOps = \profile host ->
+            manifestLiveIngressOps
+              (oscOpsFor (lipOSCListenerConfig profile) host)
+              (fmap (midiOpsFor host) (lipMIDIDevice profile))
         }
 
-  let inputs = RealReloadHostStackInputs
-        { rrhsiBuildIngressOps     = \host ->
-            manifestLiveIngressOps
-              (oscOpsFor host)
-              (fmap (midiOpsFor host) mMidiDevice)
-        , rrhsiIngressTargetPolicy = liveIngressTargetPolicy
-        , rrhsiAudioFFI            = defaultSessionFanInAudioFFI
-        , rrhsiAudioOptions        = liveAudioOptions
-        , rrhsiOwnerOptions        = defaultSessionOwnerOptions
-        , rrhsiServiceOptions      = defaultSessionFanInServiceOptions
-        , rrhsiServiceHooks        = serviceHooks
-        , rrhsiOnEvent             =
-            \ev -> modifyIORef' reloadEventsRef (<> [ev])
-        , rrhsiOnAudioEvent        =
-            \ev -> modifyIORef' audioEventsRef (<> [ev])
-        , rrhsiOnRetired           =
-            -- Phase 8h step 3e v1 slice 4: publish the retired
-            -- snapshot before ingress reopens. The orchestrator
-            -- invokes this on the 'Right retired' arm of
-            -- 'hproReloadPreserving' / 'hsaroReloadStopped' and
-            -- *before* 'hproResumeService' / 'hsaroStartNewAudio'
-            -- runs, so the next producer drain attributes against
-            -- the just-published map rather than racing the
-            -- async commit-event render in 'runReloadWithSink'.
-            \retired ->
-              writeIORef lastRetiredRef (retiredVoiceKeyMap retired)
-        }
+      inputs = projectLiveAppReloadPolicy policy context
 
   -- Per-route 'causeLabel' projections. Each renderer is
   -- structurally payload-free at every depth (see the F-1 leak

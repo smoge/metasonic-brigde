@@ -38,7 +38,9 @@ import           MetaSonic.App.ManifestReloadCli
 import           MetaSonic.App.ManifestLiveReloadDemo
                                             (runManifestLiveReloadDemo)
 import           MetaSonic.App.ManifestLiveSession
-                                            (runManifestLiveSession)
+                                            (runManifestLiveSessionWithPolicy)
+import           MetaSonic.App.ManifestLivePolicy
+                                            (defaultLiveAppReloadPolicy)
 import           MetaSonic.App.ManifestMIDIReloadSmoke
                                             (runManifestMIDIReloadSmoke)
 import           MetaSonic.App.ManifestReloadHost
@@ -1131,12 +1133,12 @@ main = do
           "--manifest-live-session"
           "--manifest-live-session MANIFEST.json DEMO_KEY [--strategy S]"
           opts
-      runManifestLiveSession
-        strategy
-        manifestPath
-        demo
-        (defaultListenerConfig (optSessionOscPort opts))
-        (optMidiDevice opts)
+      let policy =
+            defaultLiveAppReloadPolicy
+              strategy
+              (defaultListenerConfig (optSessionOscPort opts))
+              (optMidiDevice opts)
+      runManifestLiveSessionWithPolicy manifestPath demo policy
     ManifestMIDIReloadSmoke -> do
       manifestPath <- maybe
         (die "Missing manifest JSON file for --manifest-midi-reload-smoke")

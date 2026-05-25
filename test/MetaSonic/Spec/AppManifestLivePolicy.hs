@@ -28,6 +28,7 @@ import qualified Data.Text                             as T
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
+import           MetaSonic.App.Demos                   (Demo, demoTable)
 import           MetaSonic.App.ManifestLiveCommon      (liveAudioOptions,
                                                         liveIngressTargetPolicy)
 import           MetaSonic.App.ManifestLivePolicy
@@ -162,7 +163,32 @@ appManifestLivePolicyTests =
         ("expected stale-by-reload drain to print at least one line through"
          <> " the context sink, got " <> show printsAfter)
         (printsAfter > printsBefore)
+
+  , testCase "defaultLiveAppReloadPolicy round-trips strategy, listener config, and MIDI device" $ do
+      -- The wiring slice that landed
+      -- 'runManifestLiveSessionWithPolicy' relies on the default
+      -- constructor preserving exactly the three CLI-supplied
+      -- values it takes: the strategy is what the resolver returns
+      -- for any demo (one-strategy-per-session today), the OSC
+      -- listener config flows into the ingress profile unchanged,
+      -- and the MIDI device id likewise.
+      let strategy = TryPreservingThenStoppedAudio
+          cfg      = defaultListenerConfig 7042
+          midi     = Just 3
+          policy   = defaultLiveAppReloadPolicy strategy cfg midi
+          ingress  = larpIngressProfile policy
+
+      lipOSCListenerConfig ingress @?= cfg
+      lipMIDIDevice ingress        @?= midi
+      larpStrategyResolver policy someDemo @?= strategy
   ]
+
+
+-- | Any demo to feed the strategy resolver. The default resolver is
+-- @const strategy@, so any input is fine; this picks the first row
+-- of the canonical demo table.
+someDemo :: Demo
+someDemo = head demoTable
 
 
 -- ---------------------------------------------------------------------------
