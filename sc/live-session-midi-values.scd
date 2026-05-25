@@ -3,7 +3,14 @@
 Repeatable sclang MIDI sender for the MetaSonic manifest live-session
 values path.
 
-Suggested MetaSonic side:
+Run order:
+
+1. In terminal A, confirm the PortMIDI input id:
+
+stack exec -- metasonic-bridge --midi-list
+
+2. In terminal A, start the live session. Use the input-capable id from
+   step 1 as `--midi-device`; the common ALSA through input is often 1.
 
 stack exec -- metasonic-bridge \
   --manifest-live-session examples/manifests/preserve-cutoff.json \
@@ -11,20 +18,47 @@ stack exec -- metasonic-bridge \
   --strategy try-preserving \
   --midi-device 1
 
-Use `--midi-list` to confirm the PortMIDI input id. On the common
-ALSA through route, sclang sends to "Midi Through Port-0" and MetaSonic
-opens the matching input-capable PortMIDI device.
+3. Wait until terminal A prints `midi=on`.
 
-Live-session operator sequence while this runs:
+4. In terminal B, run this script:
+
+sclang sc/live-session-midi-values.scd
+
+5. In terminal A, type these live-session commands while the script runs:
 
   values
   demo:preserve-cutoff-bright
   values
+  wait for the second `midi accept` line
+  values
   status
   quit
 
-The script sends CC 74 / 71 / 7 first, waits for the reload window,
-then sends another CC 74 so the post-reload path is visible too.
+The script sends one bound CC 74 before the reload, waits for the reload
+window, then sends another bound CC 74 after reload. The expected result is
+two `midi accept` lines for `/v0/lpf/0`, with `values` showing
+`source=accepted` before and after the preserving reload.
+
+On the common ALSA through route, sclang sends to "Midi Through Port-0" and
+MetaSonic opens the matching input-capable PortMIDI device.
+
+Optional rejected-CC check, after this script has initialized:
+
+  ~metaSonicSendRejectedProbe.value;
+
+For preserve-cutoff.json this sends CC 71 and CC 7, which should print
+`midi reject (cc-unbound)` because only CC 74 is bound.
+
+Quick interactive sequence after evaluating this file in the SuperCollider IDE:
+
+  ~metaSonicSendInitialBatch.value;
+  values
+  demo:preserve-cutoff-bright
+  values
+  ~metaSonicSendPostReload.value;
+  values
+  status
+  quit
 
 */
 
@@ -33,12 +67,14 @@ then sends another CC 74 so the post-reload path is visible too.
 ~metaSonicMIDIPort = "Midi Through Port-0";
 ~metaSonicMIDIChannel = 0;
 
-// Seconds between the initial CC batch and the post-reload CC.
-// Increase this if you want more time to type `values` and `demo:...`.
-~metaSonicReloadPause = 10.0;
+// Seconds between the initial CC and the post-reload CC.
+// Keep this long enough to type `values`, `demo:...`, and another `values`.
+~metaSonicReloadPause = 30.0;
 
-// Set false when evaluating from an interactive SuperCollider IDE session.
-~metaSonicQuitWhenDone = true;
+// Leave false for SuperCollider IDE use so the interpreter stays open.
+// Set true for command-line `sclang sc/live-session-midi-values.scd`
+// when you want sclang to exit after the replay.
+~metaSonicQuitWhenDone = false;
 
 MIDIClient.init;
 
@@ -78,26 +114,29 @@ MIDIClient.destinations.do { |destination, index|
 
 ~metaSonicSendInitialBatch = {
     ~metaSonicSendControl.value(74, 90, "cutoff -> /v0/lpf/0");
-    0.20.wait;
-    ~metaSonicSendControl.value(71, 40, "q      -> /v0/lpf/1");
-    0.20.wait;
-    ~metaSonicSendControl.value(7, 30, "level  -> /v0/gain/0");
 };
 
 ~metaSonicSendPostReload = {
     ~metaSonicSendControl.value(74, 64, "post-reload cutoff -> /v0/lpf/0");
 };
 
+~metaSonicSendRejectedProbe = {
+    ~metaSonicSendControl.value(71, 40, "expected reject: q / CC 71");
+    0.20.wait;
+    ~metaSonicSendControl.value(7, 30, "expected reject: level / CC 7");
+};
+
 ~metaSonicRunReplay = {
     Routine({
-        "MetaSonic MIDI replay: initial batch starting.".postln;
+        "MetaSonic MIDI replay: initial bound CC starting.".postln;
         ~metaSonicSendInitialBatch.value;
 
         (
             "MetaSonic MIDI replay: waiting "
             ++ ~metaSonicReloadPause
-            ++ " seconds. Type live-session `values`, reload to "
-            ++ "`preserve-cutoff-bright`, then `values` again."
+            ++ " seconds. In the live session: type `values`, reload to "
+            ++ "`preserve-cutoff-bright`, then type `values` again. "
+            ++ "Wait for the next `midi accept` before the final `values`."
         ).postln;
         ~metaSonicReloadPause.wait;
 
