@@ -257,15 +257,28 @@ auto-start + value-cache-reconcile closure in that slot.
 
 ## What stays open after this slice
 
-The supervision v1 bullet in `ROADMAP.md` stays unchecked
-deliberately: slice 1 + slice 2 cover the in-shell operator gesture
-(observe divergence, manually retry), but the larger
-"long-running owner supervision" lane the 2026-05-25-f note scoped
-also names items that are still out of scope here — notably any
-background watchdog above the session, auto-retry with cooldown,
-cross-run persistent diverged-state telemetry, and the
-`ManifestReloadGraphEvent` / `SessionVoiceAllocationEvent`
-consumer-gated event families. A later pass can decide whether
-slices 1 + 2 are enough to close the lane (with the remaining items
-spun out as their own bullets) or whether the lane should stay open
-with a sharper remaining item list.
+The supervision v1 lane is closed. The ROADMAP bullet was flipped
+to `[x]` in `54837ae` immediately after this transcript landed:
+slice 1 (`f6c0ec0`) and slice 2 (`511eabd`) together cover the
+v1 scope the 2026-05-25-f note set — escalation stays in-shell,
+the operator sees divergence in `status`, the dispatch gate blocks
+live-stack-needing commands, a failed `repair` surfaces through
+the `last repair attempt failed:` row, and a successful `repair`
+clears divergence and reruns the post-open hook against the
+currently-serving plan.
+
+The items the 2026-05-25-f note also named but explicitly
+out-of-scope for v1 stay deferred and are not blockers for this
+closeout:
+
+* Background watchdog above the session, auto-retry with cooldown,
+  and any cross-run persistent diverged-state telemetry. The v1
+  policy was "one-shot terminal-state reporting inside
+  `runManifestLiveSession`, no watchdog above the session." If any
+  of these is pursued later, it gets its own ROADMAP bullet.
+
+* The consumer-gated `ManifestReloadGraphEvent` /
+  `SessionVoiceAllocationEvent` event families. These remain
+  deferred behind the same consumer-gate the 2026-05-25-b note
+  set, which the ROADMAP bullet still records in its closing
+  sentence.
