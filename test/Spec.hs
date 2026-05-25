@@ -130,7 +130,54 @@ import           MetaSonic.Spec.SessionMIDI
 
 main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
-  [ testGroup "Phase 8"
+  [ testGroup "Phase 7 and earlier"
+      [ testGroup "core"
+          [ unitTests
+          , properties
+          , crossCuttingTests
+          ]
+      , testGroup "ffi"
+          [ hotSwapTests
+          , busRoutingTests
+          , templateLifecycleTests
+          , fusedRenderTests
+          , t9DirectEqualsReductionTests
+          , c0aLoaderMetadataTests
+          , c0bGlobalScheduleTests
+          , c0cScheduleExecutorTests
+          , c0dGlobalScheduleBandTests
+          , c1cWorkerScheduleTests
+          ]
+      , testGroup "compiler"
+          [ capabilityTableTests
+          , plannerTests
+          , fusionProgramScaffoldTests
+          , fusionProgramExecutorTests
+          , fusionProgramBlockExecutorTests
+          , fusionProgramSuperExecutorTests
+          ]
+      , testGroup "authoring"
+          [ authoringDslTests
+          , authoringReportTests
+          , authoringManifestTests
+          ]
+      , testGroup "osc"
+          [ oscWireAndDispatchTests
+          , oscListenerTests
+          , oscEndToEndTests
+          , oscPortParserTests
+          ]
+      , testGroup "runtime-skeletons"
+          [ bufferPoolTests
+          , playBufMonoTests
+          , recordBufMonoSkeletonTests
+          , spectralFreezeSkeletonTests
+          , spectralLpfTests
+          , staticPluginSkeletonTests
+          , oneTapDelayPluginTests
+          ]
+      ]
+  , testGroup "Phase 8"
       [ testGroup "app"
           [ appDemoCatalogTests
           , appFusionCostLabTests
@@ -202,53 +249,6 @@ main = defaultMain $ testGroup "MetaSonic"
           , sessionStepTests
           , sessionSwapArtifactTests
           , sessionUIProducerTests
-          ]
-      ]
-  , testGroup "Phase 7 and earlier"
-      [ testGroup "core"
-          [ unitTests
-          , properties
-          , crossCuttingTests
-          ]
-      , testGroup "ffi"
-          [ hotSwapTests
-          , busRoutingTests
-          , templateLifecycleTests
-          , fusedRenderTests
-          , t9DirectEqualsReductionTests
-          , c0aLoaderMetadataTests
-          , c0bGlobalScheduleTests
-          , c0cScheduleExecutorTests
-          , c0dGlobalScheduleBandTests
-          , c1cWorkerScheduleTests
-          ]
-      , testGroup "compiler"
-          [ capabilityTableTests
-          , plannerTests
-          , fusionProgramScaffoldTests
-          , fusionProgramExecutorTests
-          , fusionProgramBlockExecutorTests
-          , fusionProgramSuperExecutorTests
-          ]
-      , testGroup "authoring"
-          [ authoringDslTests
-          , authoringReportTests
-          , authoringManifestTests
-          ]
-      , testGroup "osc"
-          [ oscWireAndDispatchTests
-          , oscListenerTests
-          , oscEndToEndTests
-          , oscPortParserTests
-          ]
-      , testGroup "runtime-skeletons"
-          [ bufferPoolTests
-          , playBufMonoTests
-          , recordBufMonoSkeletonTests
-          , spectralFreezeSkeletonTests
-          , spectralLpfTests
-          , staticPluginSkeletonTests
-          , oneTapDelayPluginTests
           ]
       ]
   ]
