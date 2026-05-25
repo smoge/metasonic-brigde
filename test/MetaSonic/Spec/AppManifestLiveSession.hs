@@ -31,6 +31,7 @@ import           MetaSonic.App.ManifestLiveSession
                                              ReloadResolver (..),
                                              SessionStep (..),
                                              LiveStack,
+                                             dispatchLiveSessionRepair,
                                              liveSessionCommandIsGatedWhileDiverged,
                                              liveSessionDivergedRefusal,
                                              parseLiveSessionCommand,
@@ -162,6 +163,14 @@ parseLiveSessionCommandTests =
       "quit" LscQuit
   , row "literal 'exit' is LscQuit"
       "exit" LscQuit
+  , row "literal 'repair' is LscRepair (supervision v1 slice 2)"
+      "repair" LscRepair
+  , row "  repair  with surrounding whitespace trims to LscRepair"
+      "  repair  " LscRepair
+  , row "uppercase REPAIR is unknown (case-sensitive)"
+      "REPAIR" (LscUnknown "REPAIR")
+  , row "repair with a trailing token is unknown"
+      "repair now" (LscUnknown "repair now")
   , row "named commands tolerate leading + trailing whitespace"
       "  help  " LscHelp
   , row "named commands are case-sensitive (HELP is unknown)"
@@ -230,8 +239,8 @@ parseLiveSessionCommandTests =
 -- with the command vocabulary the operator sees.
 renderLiveSessionCommandHelpTests :: [TestTree]
 renderLiveSessionCommandHelpTests =
-  [ testCase "renders ten lines: header + nine command rows" $
-      length renderLiveSessionCommandHelp @?= 10
+  [ testCase "renders eleven lines: header + ten command rows" $
+      length renderLiveSessionCommandHelp @?= 11
 
   , testCase "first line is the 'commands:' header (two-space indent)" $
       take 1 renderLiveSessionCommandHelp @?= ["  commands:"]
@@ -247,6 +256,7 @@ renderLiveSessionCommandHelpTests =
             , "    set TAG V   write UI control TAG to V (TAG=path from controls)"
             , "    status      print current status (same as <Enter>)"
             , "    help        print commands (same as ?)"
+            , "    repair      open a fresh stack on the current plan after divergence"
             , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
             ]
   ]
@@ -990,7 +1000,8 @@ runReloadWithTests =
         readIORef divergedStateRef >>= (@?=
           Just (LiveSessionDivergedState
                   (show ("in-window-cause" :: String))
-                  (show ("rebuild-cause"   :: String))))
+                  (show ("rebuild-cause"   :: String))
+                  Nothing))
 
   , testCase "two reloads in a row: second reload's events ref does NOT carry the first's events" $ do
       -- Belt-and-suspenders for the event-reset behavior. Run
@@ -1701,6 +1712,9 @@ supervisionDivergedTests =
       liveSessionCommandIsGatedWhileDiverged LscDemos    @?= False
       liveSessionCommandIsGatedWhileDiverged LscHelp     @?= False
       liveSessionCommandIsGatedWhileDiverged LscQuit     @?= False
+      -- 'repair' is the operator's way out of divergence, so it
+      -- must NOT be gated.
+      liveSessionCommandIsGatedWhileDiverged LscRepair   @?= False
 
   , testCase "refusal text is three lines naming the divergence and the available commands" $ do
       -- The exact wording matters because it is what the operator
@@ -1709,7 +1723,7 @@ supervisionDivergedTests =
       liveSessionDivergedRefusal @?=
         [ "  no live stack: repair required."
         , "  this command is unavailable while the session is diverged."
-        , "  available commands: status, demos, help, quit."
+        , "  available commands: status, demos, help, repair, quit."
         ]
 
   , testCase "printStatusWith renders 'no live stack: repair required' block when divergedStateRef is populated" $ do
@@ -1727,7 +1741,8 @@ supervisionDivergedTests =
       divergedStateRef <- newIORef
         (Just (LiveSessionDivergedState
                 "\"in-window-cause\""
-                "\"rebuild-cause\""))
+                "\"rebuild-cause\""
+                Nothing))
       printStatusWith
         captureOutput
         trackedStackRef
@@ -1786,6 +1801,160 @@ supervisionDivergedTests =
         ("unexpected 'no live stack: repair required' header in:\n"
          <> unlines output)
         (not ("    no live stack:     repair required" `elem` output))
+
+  , testCase "dispatchLiveSessionRepair: not diverged -> no-op refusal, divergedStateRef untouched, hook not called" $ do
+      outputRef       <- newIORef ([] :: [String])
+      hookCalledRef   <- newIORef (0 :: Int)
+      openCalledRef   <- newIORef (0 :: Int)
+      currentPlanRef  <- newIORef (1 :: StubPlan)
+      divergedStateRef <- newIORef Nothing
+      let captureOutput s = modifyIORef' outputRef (<> [s])
+          supOps :: SupervisorOps StubPlan String
+          supOps = SupervisorOps
+            { sopsInWindowReload = \_ _ ->
+                assertFailure
+                  "sopsInWindowReload should not run on a not-diverged repair"
+            , sopsCloseStack = pure ()
+            , sopsOpenStack  = \_ -> do
+                modifyIORef' openCalledRef (+ 1)
+                pure (Right ())
+            }
+      step <-
+        dispatchLiveSessionRepair
+          captureOutput
+          supOps
+          show
+          show
+          currentPlanRef
+          divergedStateRef
+          (\_ -> modifyIORef' hookCalledRef (+ 1))
+      step @?= SsContinue
+      readIORef divergedStateRef >>= (@?= Nothing)
+      readIORef openCalledRef    >>= (@?= 0)
+      readIORef hookCalledRef    >>= (@?= 0)
+      output <- readIORef outputRef
+      assertBool
+        ("expected not-diverged refusal line; got:\n" <> unlines output)
+        ("  repair: session is not diverged; nothing to repair."
+           `elem` output)
+
+  , testCase "dispatchLiveSessionRepair: diverged + open succeeds -> clears divergedStateRef and runs the post-open hook with the current plan" $ do
+      outputRef       <- newIORef ([] :: [String])
+      hookCalledWith  <- newIORef ([] :: [StubPlan])
+      currentPlanRef  <- newIORef (42 :: StubPlan)
+      divergedStateRef <- newIORef
+        (Just (LiveSessionDivergedState
+                "in-window-cause"
+                "rebuild-cause"
+                Nothing))
+      let captureOutput s = modifyIORef' outputRef (<> [s])
+          supOps :: SupervisorOps StubPlan String
+          supOps = SupervisorOps
+            { sopsInWindowReload = \_ _ ->
+                assertFailure
+                  "sopsInWindowReload should not run on a repair"
+            , sopsCloseStack = pure ()
+            , sopsOpenStack  = \_ -> pure (Right ())
+            }
+      step <-
+        dispatchLiveSessionRepair
+          captureOutput
+          supOps
+          show
+          show
+          currentPlanRef
+          divergedStateRef
+          (\plan -> modifyIORef' hookCalledWith (++ [plan]))
+      step @?= SsContinue
+      -- Divergence cleared.
+      readIORef divergedStateRef >>= (@?= Nothing)
+      -- Hook called once with the currently-serving plan; currentPlan
+      -- itself is unchanged (the operator never asked for a new key).
+      readIORef hookCalledWith   >>= (@?= [42])
+      readIORef currentPlanRef   >>= (@?= 42)
+      output <- readIORef outputRef
+      assertBool
+        ("expected attempt line; got:\n" <> unlines output)
+        ("  repair: opening a fresh stack on the current plan..."
+           `elem` output)
+      assertBool
+        ("expected success line; got:\n" <> unlines output)
+        ("  repair: succeeded; serving 42." `elem` output)
+
+  , testCase "dispatchLiveSessionRepair: diverged + open fails -> keeps divergedStateRef and records the latest failure into ldsLastRepairFailure" $ do
+      outputRef       <- newIORef ([] :: [String])
+      hookCalledRef   <- newIORef (0 :: Int)
+      currentPlanRef  <- newIORef (42 :: StubPlan)
+      divergedStateRef <- newIORef
+        (Just (LiveSessionDivergedState
+                "in-window-cause"
+                "rebuild-cause"
+                Nothing))
+      let captureOutput s = modifyIORef' outputRef (<> [s])
+          supOps :: SupervisorOps StubPlan String
+          supOps = SupervisorOps
+            { sopsInWindowReload = \_ _ ->
+                assertFailure
+                  "sopsInWindowReload should not run on a repair"
+            , sopsCloseStack = pure ()
+            , sopsOpenStack  = \_ ->
+                -- Synthetic open failure; rendered through 'show'
+                -- in the test (matches what production's
+                -- 'causeLabel' does for a String).
+                pure (Left "open-refused-retry")
+            }
+      step <-
+        dispatchLiveSessionRepair
+          captureOutput
+          supOps
+          show
+          show
+          currentPlanRef
+          divergedStateRef
+          (\_ -> modifyIORef' hookCalledRef (+ 1))
+      step @?= SsContinue
+      -- Divergence preserved; in-window + rebuild causes still present;
+      -- latest failure is now populated.
+      readIORef divergedStateRef >>= (@?=
+        Just (LiveSessionDivergedState
+                "in-window-cause"
+                "rebuild-cause"
+                (Just (show ("open-refused-retry" :: String)))))
+      -- Post-open hook MUST NOT run on a failed repair.
+      readIORef hookCalledRef    >>= (@?= 0)
+      output <- readIORef outputRef
+      assertBool
+        ("expected attempt line; got:\n" <> unlines output)
+        ("  repair: opening a fresh stack on the current plan..."
+           `elem` output)
+      assertBool
+        ("expected failure line carrying the rendered cause; got:\n"
+         <> unlines output)
+        (("  repair failed: " <> show ("open-refused-retry" :: String))
+           `elem` output)
+
+  , testCase "printStatusWith renders the last-repair-attempt row when ldsLastRepairFailure is Just" $ do
+      outputRef <- newIORef ([] :: [String])
+      let captureOutput s = modifyIORef' outputRef (<> [s])
+      trackedStackRef  <- newIORef (Nothing :: Maybe LiveStack)
+      currentPlanRef   <- newIORef (mkPlan "fallback")
+      lastOutcomeRef   <- newIORef (Just LsoEscalated)
+      divergedStateRef <- newIORef
+        (Just (LiveSessionDivergedState
+                "\"in-window-cause\""
+                "\"rebuild-cause\""
+                (Just "\"open-refused-retry\"")))
+      printStatusWith
+        captureOutput
+        trackedStackRef
+        currentPlanRef
+        lastOutcomeRef
+        divergedStateRef
+      output <- readIORef outputRef
+      assertBool
+        ("missing last-repair-attempt row in:\n" <> unlines output)
+        ("      last repair attempt failed: \"open-refused-retry\""
+           `elem` output)
 
   , testCase "supervision slice 1 operator transcript (end-to-end, sink-captured)" $ do
       -- Operator-facing evidence smoke for supervision-v1 slice 1.
@@ -1878,7 +2047,7 @@ supervisionDivergedTests =
       mustContain "    no live stack:     repair required"
       mustContain "  no live stack: repair required."
       mustContain "  this command is unavailable while the session is diverged."
-      mustContain "  available commands: status, demos, help, quit."
+      mustContain "  available commands: status, demos, help, repair, quit."
       mustContain "(passes the diverged gate; would be dispatched)"
   ]
   where

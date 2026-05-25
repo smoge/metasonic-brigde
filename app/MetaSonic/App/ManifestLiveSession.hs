@@ -57,6 +57,7 @@ module MetaSonic.App.ManifestLiveSession
   , LiveSessionDivergedState (..)
   , liveSessionCommandIsGatedWhileDiverged
   , liveSessionDivergedRefusal
+  , dispatchLiveSessionRepair
   , renderLiveSessionOutcome
   , SessionStep (..)
   , stepFromOutcome
@@ -221,7 +222,7 @@ import           MetaSonic.App.ManifestReloadTryPreservingHostStack
 import           MetaSonic.App.ManifestReloadSupervisor
                                                 (SupervisedReloadEvent (..),
                                                  SupervisedReloadOutcome (..),
-                                                 SupervisorOps,
+                                                 SupervisorOps (..),
                                                  reloadSupervisedWithEvents)
 import           MetaSonic.App.ManifestReloadSupervisorAdapter
                                                 (HostStackFactory (..),
@@ -338,6 +339,16 @@ data LiveSessionCommand
     -- ^ The literal @quit@ or @exit@. Also synthesized by the read
     -- loop on EOF (@<Ctrl-D>@) so all three terminate the session
     -- through the same code path.
+  | LscRepair
+    -- ^ Supervision v1 slice 2 (2026-05-25-f): the literal @repair@.
+    -- Allowed exactly when the session is in the diverged state;
+    -- dispatches a fresh @sopsOpenStack currentPlan@ through the
+    -- supervisor adapter's wrapped factory. On success the
+    -- diverged-state IORef is cleared and the post-open hook runs
+    -- against the new stack (auto-start voices, reset value
+    -- cache); on failure the divergence stays sticky and the
+    -- cause is recorded in 'ldsLastRepairFailure' for the next
+    -- @status@ read.
   | LscUnknown !String
     -- ^ Anything else; original (untrimmed) line preserved for
     -- the help echo.
@@ -358,6 +369,7 @@ parseLiveSessionCommand line =
     "?"      -> LscHelp
     "quit"   -> LscQuit
     "exit"   -> LscQuit
+    "repair" -> LscRepair
     s | "demo:" `isPrefixOf` s ->
         let key = trim (drop 5 s)
         in if null key
@@ -435,6 +447,7 @@ renderLiveSessionCommandHelp =
   , "    set TAG V   write UI control TAG to V (TAG=path from controls)"
   , "    status      print current status (same as <Enter>)"
   , "    help        print commands (same as ?)"
+  , "    repair      open a fresh stack on the current plan after divergence"
   , "    quit        close session cleanly (same as exit, <Ctrl-D>)"
   ]
 
@@ -523,8 +536,15 @@ renderLiveSessionOutcome = \case
 -- status renderer, and the operator-facing surface only ever needs
 -- the rendered string anyway.
 data LiveSessionDivergedState = LiveSessionDivergedState
-  { ldsInWindowCause :: !String
-  , ldsRebuildCause  :: !String
+  { ldsInWindowCause     :: !String
+  , ldsRebuildCause      :: !String
+  , ldsLastRepairFailure :: !(Maybe String)
+    -- ^ Most recent 'LscRepair' failure since the divergence began,
+    -- rendered through the live session's @causeLabel@ projection.
+    -- 'Nothing' means either no repair has been attempted yet, or
+    -- the divergence was just installed by escalation. Set on each
+    -- failed @repair@ attempt; cleared by a successful @repair@
+    -- (which also clears the whole 'LiveSessionDivergedState').
   } deriving stock (Eq, Show)
 
 
@@ -559,8 +579,85 @@ liveSessionDivergedRefusal :: [String]
 liveSessionDivergedRefusal =
   [ "  no live stack: repair required."
   , "  this command is unavailable while the session is diverged."
-  , "  available commands: status, demos, help, quit."
+  , "  available commands: status, demos, help, repair, quit."
   ]
+
+
+-- | Supervision v1 slice 2 (2026-05-25-f): explicit operator repair.
+--
+-- Allowed exactly when the session is in the diverged state (the
+-- top-level dispatch gate lets 'LscRepair' through and this helper
+-- double-checks via 'divergedStateRef'). Dispatches
+-- @'sopsOpenStack' supOps currentPlan@ through the supervisor
+-- adapter; the wrapped 'withTrackedFactory' writes 'Just s' into
+-- the production session's @trackedStackRef@ on success.
+--
+--   * Not diverged (@divergedStateRef = Nothing@): prints a
+--     one-line refusal and returns 'SsContinue' without touching
+--     the supervisor. This makes a stray @repair@ from a healthy
+--     session a no-op rather than an unprovoked open attempt.
+--   * Open succeeds: clears @divergedStateRef@, prints a success
+--     line naming the served plan, and runs the supplied post-open
+--     hook against the current plan. The hook is the same
+--     auto-start / value-cache reset path
+--     'runReloadWithSink' invokes on
+--     'SupervisedReloadRejectedRecovered'.
+--   * Open fails: leaves @divergedStateRef@ in place but updates
+--     'ldsLastRepairFailure' with the rendered cause; prints the
+--     failure cause and a one-line hint that @status@ /
+--     @repair@ / @quit@ remain available.
+--
+-- The helper is polymorphic in @plan@ / @e@ so the test suite can
+-- inject stub plans and stub supervisor ops without staging real
+-- audio.
+dispatchLiveSessionRepair
+  :: (String -> IO ())
+       -- ^ Operator output sink.
+  -> SupervisorOps plan e
+       -- ^ Supervisor ops (provides @sopsOpenStack@).
+  -> (e -> String)
+       -- ^ Render an open-failure error through the live session's
+       -- existing @causeLabel@ projection.
+  -> (plan -> String)
+       -- ^ Render the served-plan label used in the success line.
+       -- Production passes @MR.mrlpDemoKey@; tests use @show@.
+  -> IORef plan
+       -- ^ Currently-serving plan; never mutated by repair.
+  -> IORef (Maybe LiveSessionDivergedState)
+       -- ^ Diverged-state holder. Cleared on success; updated with
+       -- the latest failure on @Left@.
+  -> (plan -> IO ())
+       -- ^ Post-open hook to run on success. Identical shape to the
+       -- @onPlanChange@ closure 'runReloadWithSink' uses for
+       -- 'SupervisedReloadRejectedRecovered'.
+  -> IO SessionStep
+dispatchLiveSessionRepair output supOps causeLabel planLabel
+                          currentPlanRef divergedStateRef onPlanChange = do
+  mDiverged <- readIORef divergedStateRef
+  case mDiverged of
+    Nothing -> do
+      output "  repair: session is not diverged; nothing to repair."
+      pure SsContinue
+    Just lds -> do
+      currentPlan <- readIORef currentPlanRef
+      output "  repair: opening a fresh stack on the current plan..."
+      openResult <- sopsOpenStack supOps currentPlan
+      case openResult of
+        Right () -> do
+          writeIORef divergedStateRef Nothing
+          output $
+            "  repair: succeeded; serving " <> planLabel currentPlan <> "."
+          onPlanChange currentPlan
+          pure SsContinue
+        Left issue -> do
+          let renderedCause = causeLabel issue
+          writeIORef divergedStateRef
+            (Just lds { ldsLastRepairFailure = Just renderedCause })
+          output ("  repair failed: " <> renderedCause)
+          output
+            "  session remains diverged; type 'status' for context, \
+            \'repair' to retry, or 'quit' to exit."
+          pure SsContinue
 
 
 -- | Continue the session loop, or terminate with an exit code.
@@ -1309,6 +1406,15 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
           lastRetiredRef
           divergedStateRef
           key
+      LscRepair ->
+        dispatchLiveSessionRepair
+          extPrint
+          supOps
+          causeLabel
+          MR.mrlpDemoKey
+          currentPlanRef
+          divergedStateRef
+          onPlanChange
 
     -- | Post-reload hook called on 'SupervisedReloadCommitted' and
     -- 'SupervisedReloadRejectedRecovered'. Does two jobs:
@@ -1621,7 +1727,8 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
           -- that need a live stack until the slice is extended
           -- with an explicit repair pathway.
           writeIORef divergedStateRef
-            (Just (LiveSessionDivergedState inWindowCause rebuildCause))
+            (Just (LiveSessionDivergedState
+                    inWindowCause rebuildCause Nothing))
       let timeline =
             resourceTimelineForOutcome fallbackPlan requestedPlan out
       output "  resource timeline:"
@@ -1676,10 +1783,14 @@ printStatusWith output trackedStackRef currentPlanRef lastOutcomeRef
   mDiverged <- readIORef divergedStateRef
   case mDiverged of
     Nothing -> pure ()
-    Just (LiveSessionDivergedState inWindowCause rebuildCause) -> do
+    Just (LiveSessionDivergedState inWindowCause rebuildCause mLastRepair) -> do
       output "    no live stack:     repair required"
       output ("      in-window cause: " <> inWindowCause)
       output ("      rebuild cause:   " <> rebuildCause)
+      case mLastRepair of
+        Nothing -> pure ()
+        Just lastRepair ->
+          output ("      last repair attempt failed: " <> lastRepair)
   mLast <- readIORef lastOutcomeRef
   case mLast of
     Nothing ->
