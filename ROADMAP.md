@@ -3794,8 +3794,22 @@ Still gated:
   that distinguishes the `Nothing`-open case from the idle-handle
   case (closing the idle handle and reporting `MmppNoInputDevice`)
   and surfaces both shapes through the adapter as
-  `MmioiSourceOpenFailed`, broader MIDI
-  behavior beyond the landed
+  `MmioiSourceOpenFailed`, the live-app reload policy boundary
+  (`MetaSonic.App.ManifestLivePolicy`: pure `LiveAppReloadPolicy`
+  with the five axes from
+  [notes/2026-05-25-i-live-app-manifest-reload-policy.md](notes/2026-05-25-i-live-app-manifest-reload-policy.md);
+  runtime `LiveAppReloadContext`; `projectLiveAppReloadPolicy`
+  lowering both into `RealReloadHostStackInputs` for
+  `LiveProdIngressIssue`/`LiveProdIngressHandle`) plus the
+  policy-native `runManifestLiveSessionWithPolicy` entrypoint that
+  `Main` now constructs an explicit policy for (the old
+  `runManifestLiveSession` stays as a thin compatibility wrapper)
+  — GUI toolkit bindings to *produce* the policy, per-reload
+  strategy changes that consult the resolver dynamically, live
+  arbitration opt-in via the existing `LiveArbitrationProfile`
+  field, runtime resource overrides, and arbitration policy
+  mutation all stay use-case gated above this boundary, broader
+  MIDI behavior beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
@@ -4281,11 +4295,21 @@ core on the MIDI side, and the two non-audio operator probes
 `--session-osc-arbitration-smoke` and
 `--session-midi-arbitration-smoke`), plus the
 diagnostic/construction-time manifest reload v1, stopped-audio and
-preserving host reload strategies, and explicit app-level reload
-strategy selection. Do not
+preserving host reload strategies, explicit app-level reload
+strategy selection, and the live-app reload policy boundary
+(`MetaSonic.App.ManifestLivePolicy`'s pure `LiveAppReloadPolicy`,
+runtime `LiveAppReloadContext`, `projectLiveAppReloadPolicy`, and
+the `runManifestLiveSessionWithPolicy` entrypoint that `Main` now
+constructs an explicit policy for; the old `runManifestLiveSession`
+stays as a thin compatibility wrapper). Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration and live/host-level reload policy beyond the landed
-manifest diagnostic/construction-time v1 and host strategy substrate,
+manifest diagnostic/construction-time v1, host strategy substrate, and
+live-app reload policy boundary — GUI bindings that produce the
+policy, per-reload dynamic resolver use, live arbitration opt-in via
+the existing `LiveArbitrationProfile` field, runtime resource
+overrides, and arbitration policy mutation all stay use-case gated
+above this boundary —
 broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
 translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,

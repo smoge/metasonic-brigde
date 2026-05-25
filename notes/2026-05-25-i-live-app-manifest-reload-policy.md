@@ -393,6 +393,55 @@ one. Feature slices (per-demo strategy resolver, live
 arbitration opt-in, resource overrides) come one at a time
 after that, each gated on its own use case.
 
+The two-slice plan above (projector test, then wiring) has now
+landed; the planning paragraphs are kept for historical
+reference. "Slices landed" below records the realized state, and
+"Remaining gap" names the next code slice.
+
+## Slices landed
+
+- **Projector slice.** `MetaSonic.App.ManifestLivePolicy` defines
+  the pure `LiveAppReloadPolicy`, the runtime
+  `LiveAppReloadContext`, and the `projectLiveAppReloadPolicy`
+  function. The companion spec
+  `MetaSonic.Spec.AppManifestLivePolicy` pins the default
+  projection against today's implicit values, isolates the
+  `TargetClaim` arbitration flip to `sfsoArbitrationGatewayOptions`,
+  proves the projector composes `staleByReloadDrainHook` from
+  context refs, and round-trips strategy / listener config / MIDI
+  device through `defaultLiveAppReloadPolicy`.
+- **Wiring slice (012781b).** `runManifestLiveSessionWithPolicy ::
+  FilePath -> Demo -> LiveAppReloadPolicy -> IO ()` is the
+  policy-native entrypoint. The body builds a
+  `LiveAppReloadContext` from the existing IORefs / sinks /
+  ingress builders and calls `projectLiveAppReloadPolicy` instead
+  of hand-rolling `RealReloadHostStackInputs`. Strategy
+  resolution is one-shot against the initial demo, matching
+  today's one-strategy-per-session behavior. The old
+  `runManifestLiveSession` stays as a thin compatibility wrapper
+  that constructs `defaultLiveAppReloadPolicy`. `Main` was
+  switched to the policy-native entrypoint. `just stack-test`
+  passes 1578 tests after the wiring slice.
+
+## Remaining gap
+
+The first projector slice intentionally left
+`rrhsiBuildIngressOps` un-invoked — `SessionFanInHost`'s
+constructor is private, so a behavioral test of that callback
+needs a real host opened via `withSessionFanInHost` /
+`openSessionFanInHost` over a small fixture `TemplateGraph`.
+The next code slice will close that gap: drive the projected
+`rrhsiBuildIngressOps` with a real host and assert the
+policy's `LiveIngressProfile` reaches the context builder.
+No socket, no PortMIDI, no audio, no supervisor; just the
+ingress builder's profile threading. After that the
+boundary's behavioral surface is fully covered and the
+backlog reduces to use-case-gated feature slices (GUI
+binding, per-reload strategy changes, live arbitration
+opt-in, resource overrides, arbitration mutation), all of
+which stay gated on a concrete caller per the design note's
+non-goals.
+
 ## Open questions deferred to later notes
 
 - Should the policy record be one flat record or composed
