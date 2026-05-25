@@ -4073,9 +4073,31 @@ Still gated:
   `AppManifestLiveCommonStaleByReload`): the classifier narrows to
   `SiStaleVoice` on `CmdVoiceOff` / `CmdControlWrite` against a
   retired key — `SiUnknownTemplate`, non-rejecting steps, and
-  non-retired keys all return `Nothing`. Runtime wiring (drain-hook
-  snapshot of the last retired set, operator block output) lands in
-  the next slice. Design note:
+  non-retired keys all return `Nothing`. Slice 4 then wires the
+  runtime half: a live-session `IORef (Map VoiceKey
+  RetiredVoiceReason)` cleared at reload start by `runReloadWithSink`
+  and repopulated via a new in-orchestrator `hproOnRetired` /
+  `hsaroOnRetired` callback that fires *between* the reload op's
+  success arm and the subsequent service-resume /
+  audio-restart / ingress-reopen steps — so a producer packet
+  hitting the just-reopened ingress is attributed against the
+  fresh snapshot rather than racing the post-supervisor commit-
+  event render. The callback is threaded through
+  `ManifestReloadHostConfig.mrhcOnRetired` and
+  `RealReloadHostStackInputs.rrhsiOnRetired` so smoke CLIs and demo
+  runners wire a no-op while the live shell wires the IORef-update
+  closure. A `staleByReloadDrainHook` installed as `sfshOnDrain` on
+  the service hooks reads the IORef on every drain, runs
+  `classifyStaleByReloadAll`, and prints a
+  `stale-by-reload commands:` block through the Haskeline-safe
+  `extPrintDyn` sink when the result is non-empty. Empty results
+  stay silent so ordinary drain cycles don't flood the operator
+  transcript. The orchestration tests pin the hook position
+  inside the trace (`OnRetiredFired` between
+  `ReloadStopped` / `ReloadPreserving` and `StartNewAudio` /
+  `ResumeService`); the event tests assert the callback fires
+  before `hproResumeService` / `hsaroStartNewAudio` with the same
+  payload the commit event later carries. Design note:
   [notes/2026-05-24-b-stale-producer-command-semantics.md](notes/2026-05-24-b-stale-producer-command-semantics.md).
   Residual watch items only — physical controller or VMPK-GUI-specific
   confirmation for the same `hasDevice == True` operator boundary,

@@ -790,6 +790,7 @@ mkProductionInputs ingressOps audioFFI = RealReloadHostStackInputs
   , rrhsiServiceOptions      = defaultSessionFanInServiceOptions
   , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
   , rrhsiOnEvent             = \_ -> pure ()
+  , rrhsiOnRetired           = \_ -> pure ()
   }
 
 

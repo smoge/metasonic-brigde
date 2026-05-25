@@ -806,6 +806,8 @@ fixtureConfig fixture = ManifestReloadHostConfig
       defaultSessionOwnerOptions
   , mrhcOnEvent =
       noManifestReloadEvents
+  , mrhcOnRetired =
+      \_ -> pure ()
   }
 
 startFixtureAudio

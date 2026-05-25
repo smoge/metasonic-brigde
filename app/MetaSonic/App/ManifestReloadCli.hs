@@ -617,6 +617,12 @@ runManifestHostStrategyReloadSmokeResultWithListenerConfig
                 defaultSessionOwnerOptions
             , mrhcOnEvent =
                 appendSmokeReloadEvent reloadEvents
+            , mrhcOnRetired =
+                -- Phase 8h step 3e v1 slice 4: the smoke CLI does
+                -- not consume retired-set side-channels (the
+                -- operator-facing 'retired bindings:' block already
+                -- renders from the event payload).
+                \_ -> pure ()
             }
       audioStarted <-
         startSessionFanInHostAudioWith
@@ -739,6 +745,8 @@ runManifestSupervisedStoppedAudioReloadSmokeWithListenerConfig
                   defaultSessionFanInServiceHooks
               , rrhsiOnEvent =
                   appendSmokeReloadEvent reloadEventsRef
+              , rrhsiOnRetired =
+                  \_ -> pure ()
               }
             ops = realStoppedAudioHostStackOps inputs
             factory = mkStoppedAudioHostStackFactory ops

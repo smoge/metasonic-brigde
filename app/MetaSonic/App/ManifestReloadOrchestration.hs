@@ -173,7 +173,12 @@ orchestrateHostStoppedAudioReloadWithEvents onEvent ops request = do
           restartOldAudio issue
         Left (HsarfNoOwner issue) ->
           finish (HsariReloadFailedNoOwner issue)
-        Right retired ->
+        Right retired -> do
+          -- Phase 8h step 3e v1 slice 4: publish the retired
+          -- snapshot before ingress reopens so the next producer
+          -- drain attributes correctly. The commit event still
+          -- carries the same payload at 'finishOk' time.
+          hsaroOnRetired ops retired
           startNewAudio retired
 
     restartOldAudio issue = do
@@ -321,7 +326,12 @@ orchestrateHostPreservingReloadWithEvents onEvent ops request = do
             HpariReloadRejectedResumeFailed
         Left (HprfTerminal issue) ->
           finish (HpariReloadFailedTerminal issue)
-        Right retired ->
+        Right retired -> do
+          -- Phase 8h step 3e v1 slice 4: publish the retired
+          -- snapshot before service resume and ingress reopen so the
+          -- next producer drain attributes correctly. The commit
+          -- event still carries the same payload at 'finishOk' time.
+          hproOnRetired ops retired
           reopenNewIngress retired
 
     reopenNewIngress retired = do

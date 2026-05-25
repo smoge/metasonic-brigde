@@ -149,6 +149,8 @@ import           MetaSonic.App.ManifestLiveCommon
                                                  renderOSCControlsWith,
                                                  renderRetiredBindings,
                                                  retiredBindingsFromEvents,
+                                                 retiredVoiceKeyMap,
+                                                 staleByReloadDrainHook,
                                                  targetOrDie,
                                                  warnIfMissingVoicesWith)
 import           MetaSonic.App.ManifestLiveIngressOps
@@ -225,11 +227,14 @@ import           MetaSonic.App.ManifestReloadUIIngress
 import           MetaSonic.Authoring.Manifest   (AuthoringManifest (..),
                                                  AuthoringManifestDoc (..))
 import           MetaSonic.Bridge.Source        (MigrationKey (..))
-import           MetaSonic.Pattern              (ControlTag (..))
+import           MetaSonic.Pattern              (ControlTag (..),
+                                                 VoiceKey)
+import           MetaSonic.Session.Resolve      (RetiredVoiceReason)
 import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.FanIn        (SessionFanInSnapshot (..),
                                                  defaultSessionFanInAudioFFI)
-import           MetaSonic.Session.FanInService (defaultSessionFanInServiceHooks,
+import           MetaSonic.Session.FanInService (SessionFanInServiceHooks (..),
+                                                 defaultSessionFanInServiceHooks,
                                                  defaultSessionFanInServiceOptions,
                                                  readSessionFanInService,
                                                  sessionFanInServiceHost)
@@ -758,6 +763,13 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
   currentPlanRef  <- newIORef initialPlan
   lastOutcomeRef  <- newIORef Nothing
   valueCacheRef   <- newIORef emptyLiveValueCache
+  -- Phase 8h step 3e v1 slice 4: snapshot of the most recent
+  -- reload's retired-voice set. Cleared when a reload starts;
+  -- populated from the commit-event payload via 'retiredVoiceKeyMap'
+  -- once the reload's events have been collected in
+  -- 'runReloadWithSink'. The service drain hook reads this IORef on
+  -- every drain to attribute incoming 'SiStaleVoice' rejections.
+  lastRetiredRef  <- newIORef M.empty
 
   -- Phase 8j: indirect operator-output sink.
   --
@@ -812,6 +824,17 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
           (manifestPortMIDISourceFactory
              defaultPortMIDISourceOptions { pmsoDeviceId = Just n })
 
+  -- Phase 8h step 3e v1 slice 4: install a service drain hook that
+  -- attributes stale-by-reload rejections against 'lastRetiredRef'
+  -- and emits a 'stale-by-reload commands:' block through the
+  -- Haskeline-safe 'extPrintDyn' sink. Inherits the no-op
+  -- 'sfshOnIssue' from the default bundle so producer-arbitration
+  -- rejections continue to flow through the existing path.
+  let serviceHooks = defaultSessionFanInServiceHooks
+        { sfshOnDrain =
+            staleByReloadDrainHook lastRetiredRef extPrintDyn
+        }
+
   let inputs = RealReloadHostStackInputs
         { rrhsiBuildIngressOps     = \host ->
             manifestLiveIngressOps
@@ -822,9 +845,20 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         , rrhsiAudioOptions        = liveAudioOptions
         , rrhsiOwnerOptions        = defaultSessionOwnerOptions
         , rrhsiServiceOptions      = defaultSessionFanInServiceOptions
-        , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
+        , rrhsiServiceHooks        = serviceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEventsRef (<> [ev])
+        , rrhsiOnRetired           =
+            -- Phase 8h step 3e v1 slice 4: publish the retired
+            -- snapshot before ingress reopens. The orchestrator
+            -- invokes this on the 'Right retired' arm of
+            -- 'hproReloadPreserving' / 'hsaroReloadStopped' and
+            -- *before* 'hproResumeService' / 'hsaroStartNewAudio'
+            -- runs, so the next producer drain attributes against
+            -- the just-published map rather than racing the
+            -- async commit-event render in 'runReloadWithSink'.
+            \retired ->
+              writeIORef lastRetiredRef (retiredVoiceKeyMap retired)
         }
 
   -- Per-route 'causeLabel' projections. Each renderer is
@@ -851,6 +885,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         lastOutcomeRef
         reloadEventsRef
         valueCacheRef
+        lastRetiredRef
         extPrintRef
         extPrintDyn
 
@@ -871,6 +906,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         lastOutcomeRef
         reloadEventsRef
         valueCacheRef
+        lastRetiredRef
         extPrintRef
         extPrintDyn
 
@@ -891,6 +927,7 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
         lastOutcomeRef
         reloadEventsRef
         valueCacheRef
+        lastRetiredRef
         extPrintRef
         extPrintDyn
   where
@@ -963,6 +1000,7 @@ runSupervised
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
   -> IORef LiveValueCache
+  -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> IORef (String -> IO ())
   -> (String -> IO ())
   -> IO ()
@@ -970,7 +1008,7 @@ runSupervised
     causeLabel projectInitialIngressFailure mMidiDevice
     factory doc catalog initialPlan initialTarget
     trackedStackRef currentPlanRef lastOutcomeRef reloadEventsRef
-    valueCacheRef extPrintRef extPrintDyn = do
+    valueCacheRef lastRetiredRef extPrintRef extPrintDyn = do
   mask $ \restore -> do
     openResult <- restore (hsfOpenStack factory initialPlan)
     case openResult of
@@ -1034,6 +1072,7 @@ runSupervised
                   lastOutcomeRef
                   reloadEventsRef
                   valueCacheRef
+                  lastRetiredRef
                   extPrint)
                 `finally` writeIORef extPrintRef putStrLn
         pure ()
@@ -1057,10 +1096,11 @@ sessionLoop
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
   -> IORef LiveValueCache
+  -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> (String -> IO ())
   -> Haskeline.InputT IO ()
 sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
-            lastOutcomeRef reloadEventsRef valueCacheRef
+            lastOutcomeRef reloadEventsRef valueCacheRef lastRetiredRef
             extPrint = loop
   where
     prompt =
@@ -1125,6 +1165,7 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
           currentPlanRef
           lastOutcomeRef
           reloadEventsRef
+          lastRetiredRef
           key
 
     -- | Post-reload hook called on 'SupervisedReloadCommitted' and
@@ -1258,6 +1299,7 @@ runReloadWith
   -> IORef plan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> String
   -> IO SessionStep
 runReloadWith =
@@ -1280,9 +1322,10 @@ runReloadWithSink
   -> IORef plan
   -> IORef (Maybe LiveSessionOutcome)
   -> IORef [LiveEvent]
+  -> IORef (M.Map VoiceKey RetiredVoiceReason)
   -> String
   -> IO SessionStep
-runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef key =
+runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef lastRetiredRef key =
   case resolvePlan resolver key of
     Left reason -> do
       output ("  reload rejected: " <> reason)
@@ -1291,6 +1334,13 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
     Right requestedPlan -> do
       fallbackPlan <- readIORef currentPlanRef
       writeIORef reloadEventsRef []
+      -- Phase 8h step 3e v1 slice 4: clear the stale-attribution
+      -- snapshot before the supervisor runs. Any drain item that
+      -- lands during the reload window itself attributes against
+      -- nothing (silent); the snapshot is repopulated below from
+      -- the commit-event payload before subsequent drains can use
+      -- it.
+      writeIORef lastRetiredRef M.empty
       supervisorEventsRef <- newIORef []
       out <- reloadSupervisedWithEvents
                (\ev -> modifyIORef' supervisorEventsRef (++ [ev]))
@@ -1322,8 +1372,25 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
         Just retired -> do
           output "  retired bindings:"
           mapM_ output (renderRetiredBindings retired)
-        Nothing ->
+          -- The snapshot in 'lastRetiredRef' is already populated:
+          -- 'rrhsiOnRetired' fired synchronously inside the
+          -- orchestrator before ingress reopened, so drains that
+          -- raced into the just-installed owner are already being
+          -- attributed by 'staleByReloadDrainHook'. The render
+          -- block above is the operator-facing surface; the
+          -- snapshot is the runtime side-channel.
           pure ()
+        Nothing ->
+          -- No commit event observed. The orchestrator may still
+          -- have fired 'rrhsiOnRetired' before failing at a later
+          -- step (stopped-audio: 'hsaroStartNewAudio' /
+          -- 'hsaroReopenIngress'; preserving: 'hproReopenIngress')
+          -- — in that case 'lastRetiredRef' is now holding a set
+          -- that does not correspond to any committed reload, and
+          -- would misattribute subsequent stale drains. Roll it
+          -- back to empty so the drain hook stays silent until the
+          -- next successful commit publishes a fresh snapshot.
+          writeIORef lastRetiredRef M.empty
       output "  supervisor events:"
       mapM_ (output . ("    - " <>))
             (renderLiveSessionSupervisorEvents supervisorEvents)

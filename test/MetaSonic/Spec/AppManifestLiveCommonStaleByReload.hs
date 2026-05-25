@@ -1,11 +1,22 @@
 -- | Deterministic coverage for the stale-by-reload attribution
 -- helpers in "MetaSonic.App.ManifestLiveCommon".
 --
--- Phase 8h step 3e v1 slice 3 (pure-helper half): pins the
--- 'classifyStaleByReload' filter, the 'retiredVoiceKeyMap'
--- projection, and the 'renderStaleByReloadCommands' operator
--- render. Runtime wiring (drain-hook IORef snapshot, dispatcher
--- output block) lands in the follow-up slice.
+-- Pins the pure half (slice 3) and the drain-hook wiring (slice 4)
+-- side by side:
+--
+--   * 'classifyStaleByReload' and 'classifyStaleByReloadAll' —
+--     command-shape and voice-key cross-checks against a retired
+--     snapshot.
+--   * 'retiredVoiceKeyMap' — projection from
+--     '[RetiredVoiceBinding]' to a 'Map VoiceKey
+--     RetiredVoiceReason' lookup table.
+--   * 'renderStaleByReloadCommands' — operator block rows.
+--   * 'staleByReloadDrainHook' — service-hook drain callback that
+--     reads the IORef snapshot, classifies the drained items, and
+--     emits the @stale-by-reload commands:@ block through a sink
+--     only when there is at least one attributed row. Empty
+--     results stay silent so ordinary drain cycles don't flood
+--     the operator transcript.
 --
 -- The classifier intentionally narrows to 'SiStaleVoice' on
 -- 'CmdVoiceOff' / 'CmdControlWrite' against a retired key. Other
@@ -17,6 +28,8 @@ module MetaSonic.Spec.AppManifestLiveCommonStaleByReload
   ) where
 
 import qualified Data.ByteString.Char8                  as OBSC
+import           Data.IORef                             (modifyIORef', newIORef,
+                                                         readIORef)
 import qualified Data.Map.Strict                        as M
 import qualified Data.Text                              as T
 
@@ -27,7 +40,8 @@ import           MetaSonic.App.ManifestLiveCommon       (AttributedStaleCommand 
                                                          classifyStaleByReload,
                                                          classifyStaleByReloadAll,
                                                          renderStaleByReloadCommands,
-                                                         retiredVoiceKeyMap)
+                                                         retiredVoiceKeyMap,
+                                                         staleByReloadDrainHook)
 import           MetaSonic.Bridge.Source                (MigrationKey (..))
 import qualified MetaSonic.OSC.Dispatch                 as OSC
 import           MetaSonic.Pattern                      (ControlTag (..),
@@ -35,13 +49,15 @@ import           MetaSonic.Pattern                      (ControlTag (..),
                                                          VoiceKey (..))
 import           MetaSonic.Session.Command              (SessionCommand (..),
                                                          SessionIssue (..))
+import           MetaSonic.Session.FanIn                (SessionFanInDrainResult (..))
 import           MetaSonic.Session.Owner                (SessionOwnerDivergence (..),
                                                          SessionOwnerStepResult (..))
 import           MetaSonic.Session.Queue                (CommandSequence (..),
                                                          ProducerId (..),
                                                          ProducerKind (..),
                                                          QueuedSessionCommand (..),
-                                                         SessionDrainItem (..))
+                                                         SessionDrainItem (..),
+                                                         SessionDrainResult (..))
 import           MetaSonic.Session.Resolve              (RetiredVoiceBinding (..),
                                                          RetiredVoiceReason (..),
                                                          VoiceBinding (..))
@@ -290,6 +306,121 @@ appManifestLiveCommonStaleByReloadTests =
                 <> "-> reload retired voice \"pad/A\" (invalid-key)"
               ]
       ]
+
+  , testGroup "staleByReloadDrainHook"
+      [ testCase "matching stale-voice rejection prints header + per-row block through the sink" $ do
+          -- The hook reads the IORef snapshot, classifies the drain
+          -- items, and emits the operator block only when there is
+          -- at least one attributed command. Ordinary drains stay
+          -- silent.
+          retiredRef <- newIORef retiredLead
+          outputRef  <- newIORef ([] :: [String])
+          let captureOutput s =
+                modifyIORef' outputRef (<> [s])
+              drained = drainResult
+                [ drainItem
+                    oscProducer
+                    (CmdVoiceOff (VoiceKey "lead/1"))
+                    (rejected (SiStaleVoice (VoiceKey "lead/1")))
+                ]
+          staleByReloadDrainHook retiredRef captureOutput drained
+          readIORef outputRef >>=
+            (@?=
+              [ "  stale-by-reload commands:"
+              , "    - osc voice-off voice=lead/1  "
+                <> "-> reload retired voice \"lead/1\" (template-gone)"
+              ])
+
+      , testCase "non-retired voice key does not emit anything (silent on ordinary stale-voice rejects)" $ do
+          retiredRef <- newIORef retiredLead
+          outputRef  <- newIORef ([] :: [String])
+          let captureOutput s =
+                modifyIORef' outputRef (<> [s])
+              drained = drainResult
+                [ drainItem
+                    midiProducer
+                    (CmdVoiceOff (VoiceKey "untouched/0"))
+                    (rejected (SiStaleVoice (VoiceKey "untouched/0")))
+                ]
+          staleByReloadDrainHook retiredRef captureOutput drained
+          readIORef outputRef >>= (@?= [])
+
+      , testCase "empty retired snapshot emits nothing even when drain has stale-voice rejects" $ do
+          -- This is the steady state between reloads (or before the
+          -- first reload); the IORef has been cleared and no
+          -- commits have populated it yet. The hook must stay
+          -- silent rather than emitting a stale block with empty
+          -- content.
+          retiredRef <- newIORef (M.empty :: M.Map VoiceKey RetiredVoiceReason)
+          outputRef  <- newIORef ([] :: [String])
+          let captureOutput s =
+                modifyIORef' outputRef (<> [s])
+              drained = drainResult
+                [ drainItem
+                    oscProducer
+                    (CmdVoiceOff (VoiceKey "lead/1"))
+                    (rejected (SiStaleVoice (VoiceKey "lead/1")))
+                ]
+          staleByReloadDrainHook retiredRef captureOutput drained
+          readIORef outputRef >>= (@?= [])
+
+      , testCase "non-stale drain items emit nothing (accepted commits, unknown-template, control-accepted)" $ do
+          retiredRef <- newIORef retiredLead
+          outputRef  <- newIORef ([] :: [String])
+          let captureOutput s =
+                modifyIORef' outputRef (<> [s])
+              drained = drainResult
+                [ drainItem
+                    oscProducer
+                    (CmdControlWrite (VoiceKey "lead/1") cutoffTag 1500.0)
+                    (SessionOwnerStep StepControlAccepted)
+                , drainItem
+                    uiProducer
+                    (CmdVoiceOn (TemplateName "gone") (VoiceKey "v0") [])
+                    (rejected (SiUnknownTemplate (TemplateName "gone")))
+                ]
+          staleByReloadDrainHook retiredRef captureOutput drained
+          readIORef outputRef >>= (@?= [])
+
+      , testCase "empty drain emits nothing" $ do
+          retiredRef <- newIORef retiredLead
+          outputRef  <- newIORef ([] :: [String])
+          let captureOutput s =
+                modifyIORef' outputRef (<> [s])
+          staleByReloadDrainHook retiredRef captureOutput (drainResult [])
+          readIORef outputRef >>= (@?= [])
+
+      , testCase "mixed drain: only attributed rows reach the operator sink, in input order" $ do
+          retiredRef <- newIORef retiredLead
+          outputRef  <- newIORef ([] :: [String])
+          let captureOutput s =
+                modifyIORef' outputRef (<> [s])
+              drained = drainResult
+                [ drainItem
+                    oscProducer
+                    (CmdVoiceOff (VoiceKey "lead/1"))
+                    (rejected (SiStaleVoice (VoiceKey "lead/1")))
+                , drainItem
+                    midiProducer
+                    (CmdVoiceOff (VoiceKey "untouched/0"))
+                    (rejected (SiStaleVoice (VoiceKey "untouched/0")))
+                , drainItem
+                    uiProducer
+                    (CmdControlWrite (VoiceKey "lead/1") cutoffTag 1500.0)
+                    (rejected (SiStaleVoice (VoiceKey "lead/1")))
+                ]
+          staleByReloadDrainHook retiredRef captureOutput drained
+          readIORef outputRef >>=
+            (@?=
+              [ "  stale-by-reload commands:"
+              , "    - osc voice-off voice=lead/1  "
+                <> "-> reload retired voice \"lead/1\" (template-gone)"
+              , "    - ui control-write voice=lead/1 "
+                <> "tag=ControlTag {ctNodeTag = MigrationKey {unMigrationKey = \"lpf\"}, "
+                <> "ctSlot = 0}  "
+                <> "-> reload retired voice \"lead/1\" (template-gone)"
+              ])
+      ]
   ]
   where
     retiredLead =
@@ -311,4 +442,14 @@ appManifestLiveCommonStaleByReloadTests =
             , qscCommand  = cmd
             }
         , sdiResult = result
+        }
+
+    drainResult items =
+      SessionFanInDrainResult
+        { sfidrDrain = SessionDrainResult
+            { sdrItems     = items
+            , sdrRemaining = 0
+            , sdrStopped   = Nothing
+            }
+        , sfidrQueueDepth = 0
         }

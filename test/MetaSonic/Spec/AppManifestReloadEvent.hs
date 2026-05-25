@@ -94,6 +94,7 @@ preservingOpsAllSuccess =
     , hproQuiesceIngress   = pure (Right ())
     , hproDrainLive        = pure (Right ())
     , hproReloadPreserving = \_ -> pure (Right [])
+    , hproOnRetired        = \_ -> pure ()
     , hproResumeService    = pure ()
     , hproResumeOldIngress = pure (Right ())
     , hproReopenIngress    = pure (Right ())
@@ -114,6 +115,7 @@ stoppedAudioOpsAllSuccess =
     , hsaroDrainLive        = pure (Right ())
     , hsaroStopOldAudio     = pure (Right ())
     , hsaroReloadStopped    = \_ -> pure (Right [])
+    , hsaroOnRetired        = \_ -> pure ()
     , hsaroRestartOldAudio  = pure (Right ())
     , hsaroResumeOldIngress = pure (Right ())
     , hsaroStartNewAudio    = pure (Right ())
@@ -170,6 +172,57 @@ appManifestReloadEventTests =
         events @?=
           [ MrePreservingReloadStarted
           , MrePreservingReloadCommitted [leadRetired, padRetired]
+          ]
+
+    , testCase "preserving success: hproOnRetired fires before hproResumeService / hproReopenIngress with the same payload (race-fix)" $ do
+        -- Phase 8h step 3e v1 slice 4: the orchestrator must invoke
+        -- 'hproOnRetired' between the reload-op success and the
+        -- service / ingress reopen so a live-shell snapshot is
+        -- published *before* producer ingress can race the next
+        -- drain. The race is observable: if the hook fires after
+        -- 'hproResumeService' or 'hproReopenIngress', a producer
+        -- packet hitting the just-reopened ingress would attribute
+        -- against an empty snapshot.
+        seenRef <- newIORef ([] :: [String])
+        let leadRetired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "lead/1") 0 (TemplateName "saw_lead"))
+                RvrTemplateGone
+            recordSeen tag =
+              modifyIORef' seenRef (<> [tag])
+            ops = preservingOpsAllSuccess
+              { hproReloadPreserving = \_ -> do
+                  recordSeen "hproReloadPreserving"
+                  pure (Right [leadRetired])
+              , hproOnRetired = \retired -> do
+                  recordSeen
+                    ("hproOnRetired:" <> show (length retired) <> "-bindings")
+                  -- Cross-check that the payload is exactly what
+                  -- the reload op returned.
+                  retired @?= [leadRetired]
+              , hproResumeService = do
+                  recordSeen "hproResumeService"
+              , hproReopenIngress = do
+                  recordSeen "hproReopenIngress"
+                  pure (Right ())
+              }
+        (ref, onEvent) <- newEventLog
+        result <-
+          orchestrateHostPreservingReloadWithEvents onEvent ops ()
+        result @?= Right ()
+        seen <- readIORef seenRef
+        seen @?=
+          [ "hproReloadPreserving"
+          , "hproOnRetired:1-bindings"
+          , "hproResumeService"
+          , "hproReopenIngress"
+          ]
+        -- The commit event still fires after the entire sequence,
+        -- carrying the same payload.
+        events <- readEvents ref
+        events @?=
+          [ MrePreservingReloadStarted
+          , MrePreservingReloadCommitted [leadRetired]
           ]
 
     , testCase "preserving retryable rejection, resume success" $ do
@@ -321,6 +374,51 @@ appManifestReloadEventTests =
         events @?=
           [ MreStoppedAudioReloadStarted
           , MreStoppedAudioReloadCommitted [v0Retired, v1Retired]
+          ]
+
+    , testCase "stopped-audio success: hsaroOnRetired fires before hsaroStartNewAudio / hsaroReopenIngress with the same payload (race-fix)" $ do
+        -- Phase 8h step 3e v1 slice 4: the orchestrator must invoke
+        -- 'hsaroOnRetired' between the reload op's success and the
+        -- subsequent audio-restart / ingress-reopen, so a live-shell
+        -- snapshot is published before the new owner can serve
+        -- producer drains.
+        seenRef <- newIORef ([] :: [String])
+        let v0Retired =
+              RetiredVoiceBinding
+                (VoiceBinding (VoiceKey "v0") 0 (TemplateName "drone"))
+                RvrOwnerReplaced
+            recordSeen tag =
+              modifyIORef' seenRef (<> [tag])
+            ops = stoppedAudioOpsAllSuccess
+              { hsaroReloadStopped = \_ -> do
+                  recordSeen "hsaroReloadStopped"
+                  pure (Right [v0Retired])
+              , hsaroOnRetired = \retired -> do
+                  recordSeen
+                    ("hsaroOnRetired:" <> show (length retired) <> "-bindings")
+                  retired @?= [v0Retired]
+              , hsaroStartNewAudio = do
+                  recordSeen "hsaroStartNewAudio"
+                  pure (Right ())
+              , hsaroReopenIngress = do
+                  recordSeen "hsaroReopenIngress"
+                  pure (Right ())
+              }
+        (ref, onEvent) <- newEventLog
+        result <-
+          orchestrateHostStoppedAudioReloadWithEvents onEvent ops ()
+        result @?= Right ()
+        seen <- readIORef seenRef
+        seen @?=
+          [ "hsaroReloadStopped"
+          , "hsaroOnRetired:1-bindings"
+          , "hsaroStartNewAudio"
+          , "hsaroReopenIngress"
+          ]
+        events <- readEvents ref
+        events @?=
+          [ MreStoppedAudioReloadStarted
+          , MreStoppedAudioReloadCommitted [v0Retired]
           ]
 
     , testCase "strategy fallback admitted: preserving HpariReloadRejected → stopped-audio committed" $ do

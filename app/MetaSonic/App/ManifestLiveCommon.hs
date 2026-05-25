@@ -111,6 +111,9 @@ module MetaSonic.App.ManifestLiveCommon
   , classifyStaleByReloadAll
   , renderStaleByReloadCommands
 
+    -- * Stale-by-reload drain hook (Phase 8h step 3e v1 slice 4)
+  , staleByReloadDrainHook
+
     -- * OSC control-surface rendering
   , renderOSCControls
   , renderOSCControlsWith
@@ -176,7 +179,7 @@ module MetaSonic.App.ManifestLiveCommon
 
 import           Control.Concurrent             (threadDelay)
 import           Control.Monad                  (forM, forM_, unless)
-import           Data.IORef                     ()
+import           Data.IORef                     (IORef, readIORef)
 import           Data.List                      (dropWhileEnd, find, foldl',
                                                  sort)
 import qualified Data.Map.Strict                as M
@@ -250,6 +253,7 @@ import           MetaSonic.Session.Command      (SessionCommand (..),
                                                  SessionIssue (..))
 import           MetaSonic.Session.Owner        (SessionOwnerStepResult (..))
 import           MetaSonic.Session.FanIn        (SessionFanInAudioOptions (..),
+                                                 SessionFanInDrainResult (..),
                                                  SessionFanInEnqueueResult (..),
                                                  SessionFanInSnapshot (..))
 import           MetaSonic.Session.FanInService (SessionFanInService,
@@ -266,6 +270,7 @@ import           MetaSonic.Session.Queue        (ProducerId (..),
                                                  ProducerKind (..),
                                                  QueuedSessionCommand (..),
                                                  SessionDrainItem (..),
+                                                 SessionDrainResult (..),
                                                  SessionEnqueueIssue (..),
                                                  SessionEnqueueResult (..))
 import           MetaSonic.Session.Step         (SessionStepResult (..))
@@ -921,6 +926,40 @@ renderStaleByReloadCommands attributed =
 
     showVoiceKey vk =
       "\"" <> unVoiceKey vk <> "\""
+
+
+-- | Phase 8h step 3e v1 slice 4: a 'SessionFanInServiceHooks'-shaped
+-- drain callback that attributes stale-by-reload rejections against
+-- the most recent retired-voice snapshot.
+--
+-- The function reads the IORef on every drain, runs
+-- 'classifyStaleByReloadAll' against the drain's items, and emits a
+-- @stale-by-reload commands:@ block through the supplied sink *only*
+-- when at least one item is attributed. Empty results stay silent so
+-- ordinary drain cycles do not flood the operator transcript with
+-- @(none)@ rows — the pure 'renderStaleByReloadCommands' helper is
+-- still available for explicit summary surfaces that want the empty
+-- placeholder.
+--
+-- Callers wire this as @sfshOnDrain@ on the service-hook bundle
+-- supplied to 'rrhsiServiceHooks', closing the function over the
+-- live retired-set IORef and over a Haskeline-safe sink such as
+-- @extPrintDyn@.
+staleByReloadDrainHook
+  :: IORef (M.Map VoiceKey RetiredVoiceReason)
+  -> (String -> IO ())
+  -> SessionFanInDrainResult
+  -> IO ()
+staleByReloadDrainHook retiredRef output drained = do
+  retired <- readIORef retiredRef
+  let attributed =
+        classifyStaleByReloadAll retired (sdrItems (sfidrDrain drained))
+  case attributed of
+    [] ->
+      pure ()
+    _ -> do
+      output "  stale-by-reload commands:"
+      mapM_ output (renderStaleByReloadCommands attributed)
 
 
 -- | The live OSC listener's operator-facing print surface. Both

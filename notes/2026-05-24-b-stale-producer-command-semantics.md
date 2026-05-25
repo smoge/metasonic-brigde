@@ -29,17 +29,35 @@ with deterministic tests in
 then prints the `retired bindings:` block next to `reload events:`
 whenever a commit payload exists.
 
-Slice 3 splits the same way. The pure-helper half landed: a new
-`AttributedStaleCommand` record plus the
+Slice 3 splits the same way. The pure-helper half landed first: a
+new `AttributedStaleCommand` record plus the
 `retiredVoiceKeyMap` / `classifyStaleByReload` /
 `classifyStaleByReloadAll` / `renderStaleByReloadCommands` quartet in
 [`MetaSonic.App.ManifestLiveCommon`](../app/MetaSonic/App/ManifestLiveCommon.hs),
 pinned by deterministic table tests in
 [`AppManifestLiveCommonStaleByReload`](../test/MetaSonic/Spec/AppManifestLiveCommonStaleByReload.hs).
-Runtime wiring (drain-hook snapshot of the last retired set,
-operator block output) is the next slice — the helpers exist on
-their own so a regression in attribution policy surfaces here
-rather than in the IO-driven live shell.
+Slice 4 then wired the runtime half: a live-session `IORef
+(Map VoiceKey RetiredVoiceReason)` that `runReloadWithSink` clears
+when a reload starts; a new orchestration callback
+`hproOnRetired` / `hsaroOnRetired` invoked *inside* the
+orchestrator between the reload op's success and the subsequent
+`hproResumeService` / `hsaroStartNewAudio` / `hsaroReopenIngress`
+steps populates the IORef via `retiredVoiceKeyMap` *before*
+producer ingress can reopen. The callback is threaded through
+`ManifestReloadHostConfig.mrhcOnRetired` and
+`RealReloadHostStackInputs.rrhsiOnRetired` so the live shell can
+install its closure; non-consuming entrypoints (smoke CLIs, demo
+runners) wire a no-op. A `staleByReloadDrainHook` installed as
+`sfshOnDrain` on the service-hook bundle reads the IORef on every
+drain, runs `classifyStaleByReloadAll`, and prints a
+`stale-by-reload commands:` block through the Haskeline-safe
+`extPrintDyn` sink when the result is non-empty. Empty results stay
+silent so ordinary drain cycles don't flood the operator
+transcript. The race-fix matters: without an in-orchestrator
+callback, `MrePreservingReloadCommitted` fires *after*
+`hproResumeService` / `hproReopenIngress` and a producer packet
+reaching the just-reopened ingress can drain against an empty
+snapshot — the exact stale-by-reload case the slice exposes.
 
 The driving consumer is
 [`runManifestLiveSession`](../app/MetaSonic/App/ManifestLiveSession.hs).

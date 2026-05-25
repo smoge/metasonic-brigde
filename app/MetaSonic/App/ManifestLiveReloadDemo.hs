@@ -394,6 +394,8 @@ runDirectLiveReloadBody strategy listenerCfg doc catalog
                    , mrhcOnEvent =
                        \ev ->
                          modifyIORef' reloadEvents (<> [ev])
+                   , mrhcOnRetired =
+                       \_ -> pure ()
                    }
              outcome <-
                reloadManifestHostWithStrategyWithEvents
@@ -511,6 +513,8 @@ runSupervisedStoppedAudioLiveReload listenerCfg oldPlan newPlan oldTarget _newTa
         , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
+        , rrhsiOnRetired           =
+            \_ -> pure ()
         }
       ops     = realStoppedAudioHostStackOps inputs
       factory = mkStoppedAudioHostStackFactory ops
@@ -696,6 +700,8 @@ runSupervisedTryPreservingLiveReload listenerCfg oldPlan newPlan oldTarget _newT
         , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
+        , rrhsiOnRetired           =
+            \_ -> pure ()
         }
       -- Reuse the same producer identity the direct path passes
       -- to 'reloadManifestHostWithStrategyWithEvents' so the
@@ -914,6 +920,8 @@ runSupervisedRequirePreservingLiveReload listenerCfg oldPlan newPlan oldTarget _
         , rrhsiServiceHooks        = defaultSessionFanInServiceHooks
         , rrhsiOnEvent             =
             \ev -> modifyIORef' reloadEvents (<> [ev])
+        , rrhsiOnRetired           =
+            \_ -> pure ()
         }
       -- Same producer identity as the direct path's
       -- 'reloadManifestHostWithStrategyWithEvents' call so the

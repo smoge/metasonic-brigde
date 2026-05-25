@@ -153,6 +153,7 @@ import           MetaSonic.Session.FanInService              (SessionFanInServic
                                                               sessionFanInServiceHost)
 import qualified MetaSonic.Session.ManifestReload            as MR
 import           MetaSonic.Session.Owner                     (SessionOwnerOptions)
+import           MetaSonic.Session.Resolve                   (RetiredVoiceBinding)
 
 
 -- | The runtime objects that constitute one active supervised host
@@ -474,6 +475,16 @@ data RealReloadHostStackInputs ingressIssue handle =
         :: !SessionFanInServiceHooks
     , rrhsiOnEvent
         :: !(ManifestReloadEvent (ManifestReloadHostIssue ingressIssue) -> IO ())
+    , rrhsiOnRetired
+        :: !([RetiredVoiceBinding] -> IO ())
+      -- ^ Phase 8h step 3e v1 slice 4: forwarded into
+      -- 'mrhcOnRetired' on the per-stack 'ManifestReloadHostConfig'
+      -- and from there into the orchestrator's
+      -- 'hproOnRetired' / 'hsaroOnRetired' hooks. Fires *before*
+      -- ingress reopens so producers reaching the just-installed
+      -- owner are attributed by the live shell's drain hook against
+      -- the latest retired set. Construction sites that do not need
+      -- the snapshot should set this to @\\_ -> pure ()@.
     }
 
 
@@ -622,6 +633,7 @@ mkStack inputs target service ingressManager = ReloadHostStack
     , mrhcAudioOptions     = rrhsiAudioOptions inputs
     , mrhcOwnerOptions     = rrhsiOwnerOptions inputs
     , mrhcOnEvent          = rrhsiOnEvent inputs
+    , mrhcOnRetired        = rrhsiOnRetired inputs
     }
 
 

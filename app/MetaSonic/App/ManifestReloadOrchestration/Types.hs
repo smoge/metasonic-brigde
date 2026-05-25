@@ -53,6 +53,14 @@ data HostStoppedAudioReloadOps request plan issue =
       -- this projection onto 'MreStoppedAudioReloadCommitted'. The
       -- failure shape distinguishes pre-dispose rejection from
       -- post-dispose no-owner failure.
+    , hsaroOnRetired         :: !([RetiredVoiceBinding] -> IO ())
+      -- ^ Phase 8h step 3e v1 slice 4: side-channel hook invoked
+      -- with the retired set after 'hsaroReloadStopped' succeeds
+      -- and *before* 'hsaroStartNewAudio' / 'hsaroReopenIngress'.
+      -- Lets the host publish a 'lastRetiredRef'-style snapshot in
+      -- time for the next producer drain to attribute against it;
+      -- the 'MreStoppedAudioReloadCommitted' event still fires
+      -- afterwards inside 'finishOk'. Default 'pure ()'.
     , hsaroRestartOldAudio   :: !(IO (Either issue ()))
       -- ^ Best-effort restart for pre-dispose reload rejection, where
       -- the old owner is still installed.
@@ -147,6 +155,16 @@ data HostPreservingReloadOps request plan issue =
       -- 'MrePreservingReloadCommitted'. Failure shape distinguishes
       -- retryable old-owner-still-live rejection from terminal
       -- owner/service failure.
+    , hproOnRetired         :: !([RetiredVoiceBinding] -> IO ())
+      -- ^ Phase 8h step 3e v1 slice 4: side-channel hook invoked
+      -- with the retired set after 'hproReloadPreserving' succeeds
+      -- and *before* 'hproResumeService' / 'hproReopenIngress'.
+      -- Without this hook, producer ingress reopens before
+      -- 'MrePreservingReloadCommitted' fires and the live shell can
+      -- silently miss a stale-by-reload rejection that races a
+      -- newly-reopened producer. The 'MrePreservingReloadCommitted'
+      -- event still fires afterwards inside 'finishOk'. Default
+      -- 'pure ()'.
     , hproResumeService     :: !(IO ())
       -- ^ Reopen the fan-in service gate and worker before concrete
       -- ingress is reopened. This slot is intentionally infallible at

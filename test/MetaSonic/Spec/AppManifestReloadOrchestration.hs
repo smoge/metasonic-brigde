@@ -85,6 +85,7 @@ data FakeEvent
   | StartNewAudio
   | ReopenIngress
   | StopNewAudio
+  | OnRetiredFired ![RetiredVoiceBinding]
   deriving (Eq, Show)
 
 data FakeIngressTarget
@@ -250,6 +251,11 @@ appManifestReloadOrchestrationTests =
         , DrainLive 0
         , StopOldAudio
         , ReloadStopped preparedPlan
+          -- Phase 8h step 3e v1 slice 4: hsaroOnRetired must fire
+          -- *here*, between the reload op and StartNewAudio /
+          -- ReopenIngress, so a live-shell snapshot is published
+          -- before producer ingress can resume.
+        , OnRetiredFired []
         , StartNewAudio
         , ReopenIngress
         ]
@@ -321,6 +327,12 @@ appManifestReloadOrchestrationTests =
         , CloseIngress
         , DrainLive 0
         , ReloadPreserving preparedPlan
+          -- Phase 8h step 3e v1 slice 4: hproOnRetired must fire
+          -- *here*, between hproReloadPreserving and
+          -- hproResumeService / hproReopenIngress, so a live-shell
+          -- snapshot is published before producer ingress can
+          -- resume against the new owner.
+        , OnRetiredFired []
         , ResumeService
         , ReopenIngress
         ]
@@ -476,6 +488,7 @@ appManifestReloadOrchestrationTests =
         , CloseIngress
         , DrainLive 0
         , ReloadPreserving preparedPlan
+        , OnRetiredFired []
         , ResumeService
         , ReopenIngress
         ]
@@ -580,6 +593,7 @@ appManifestReloadOrchestrationTests =
         , DrainLive 0
         , StopOldAudio
         , ReloadStopped preparedPlan
+        , OnRetiredFired []
         , StartNewAudio
         , ReopenIngress
         , StopNewAudio
@@ -615,6 +629,7 @@ appManifestReloadOrchestrationTests =
         , DrainLive 0
         , StopOldAudio
         , ReloadStopped preparedPlan
+        , OnRetiredFired []
         , StartNewAudio
         , ReopenIngress
         ]
@@ -712,6 +727,7 @@ appManifestReloadOrchestrationTests =
         , DrainLive 0
         , StopOldAudio
         , ReloadStopped preparedPlan
+        , OnRetiredFired []
         , StartNewAudio
         , ReopenIngress
         , StopNewAudio
@@ -737,6 +753,8 @@ mkFakeOps state0 = do
             stopOldAudio ref
         , hsaroReloadStopped =
             reloadStopped ref
+        , hsaroOnRetired =
+            appendTrace ref . OnRetiredFired
         , hsaroRestartOldAudio =
             restartOldAudio ref
         , hsaroResumeOldIngress =
@@ -766,6 +784,8 @@ mkFakePreservingOps state0 = do
             drainPreservingLive ref
         , hproReloadPreserving =
             reloadPreserving ref
+        , hproOnRetired =
+            appendTrace ref . OnRetiredFired
         , hproResumeService =
             resumeService ref
         , hproResumeOldIngress =

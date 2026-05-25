@@ -418,6 +418,8 @@ appManifestOSCReloadE2ETests =
                             defaultSessionOwnerOptions
                         , mrhcOnEvent =
                             noManifestReloadEvents
+                        , mrhcOnRetired =
+                            \_ -> pure ()
                         }
                   outcome <-
                     reloadManifestHostWithStrategy
@@ -532,6 +534,8 @@ appManifestOSCReloadE2ETests =
                 defaultSessionOwnerOptions
             , mrhcOnEvent =
                 noManifestReloadEvents
+            , mrhcOnRetired =
+                \_ -> pure ()
             }
 
       outcome <-
@@ -739,6 +743,8 @@ appManifestOSCReloadE2ETests =
                 defaultSessionOwnerOptions
             , mrhcOnEvent =
                 noManifestReloadEvents
+            , mrhcOnRetired =
+                \_ -> pure ()
             }
       outcome <-
         reloadManifestHostWithStrategy

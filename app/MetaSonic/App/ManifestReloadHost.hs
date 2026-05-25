@@ -116,6 +116,13 @@ data ManifestReloadHostConfig target ingressIssue handle =
       -- callers stay silent regardless of what they pass here.
       -- Construction sites that do not want events should set
       -- this to 'noManifestReloadEvents'.
+    , mrhcOnRetired         :: !([RetiredVoiceBinding] -> IO ())
+      -- ^ Phase 8h step 3e v1 slice 4: side-channel hook the host
+      -- ops wire as 'hproOnRetired' / 'hsaroOnRetired'. Fires after
+      -- the reload op returns 'Right retired' and *before* ingress
+      -- reopens, so a live-shell IORef snapshot has the latest
+      -- retired set available for the next producer drain. Default
+      -- (no-events entrypoints) is a no-op.
     }
 
 -- | Build stopped-audio orchestration slots backed by the real session
@@ -140,6 +147,8 @@ manifestReloadHostOps config doc catalog =
         stopAudio
     , hsaroReloadStopped =
         reloadStopped
+    , hsaroOnRetired =
+        mrhcOnRetired config
     , hsaroRestartOldAudio =
         startAudio
     , hsaroResumeOldIngress =
@@ -254,6 +263,8 @@ manifestPreservingReloadHostOps producer config doc catalog =
         drainPreservingLive
     , hproReloadPreserving =
         reloadPreserving
+    , hproOnRetired =
+        mrhcOnRetired config
     , hproResumeService =
         resumeSessionFanInService service
     , hproResumeOldIngress =
@@ -339,7 +350,9 @@ reloadManifestStoppedAudioHost
           ())
 reloadManifestStoppedAudioHost config =
   reloadManifestStoppedAudioHostWithEvents
-    (config { mrhcOnEvent = noManifestReloadEvents })
+    (config { mrhcOnEvent   = noManifestReloadEvents
+            , mrhcOnRetired = \_ -> pure ()
+            })
 
 -- | Run one host-facing stopped-audio manifest reload attempt,
 -- emitting structured 'ManifestReloadEvent' transitions through
@@ -380,7 +393,9 @@ reloadManifestPreservingHost
 reloadManifestPreservingHost producer config =
   reloadManifestPreservingHostWithEvents
     producer
-    (config { mrhcOnEvent = noManifestReloadEvents })
+    (config { mrhcOnEvent   = noManifestReloadEvents
+            , mrhcOnRetired = \_ -> pure ()
+            })
 
 -- | Run one host-facing preserving manifest reload attempt, emitting
 -- structured 'ManifestReloadEvent' transitions through the
@@ -429,7 +444,9 @@ reloadManifestHostWithStrategy producer strategy config =
   reloadManifestHostWithStrategyWithEvents
     producer
     strategy
-    (config { mrhcOnEvent = noManifestReloadEvents })
+    (config { mrhcOnEvent   = noManifestReloadEvents
+            , mrhcOnRetired = \_ -> pure ()
+            })
 
 -- | Run one manifest reload through an explicit host strategy,
 -- emitting structured 'ManifestReloadEvent' transitions through
