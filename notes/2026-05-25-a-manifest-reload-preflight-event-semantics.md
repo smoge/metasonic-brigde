@@ -2,15 +2,21 @@
 
 Date: 2026-05-25
 
-Status: design note. Scopes the next open lane from the
+Status: design note + implementation log. Scopes the next open lane
+from the
 [ManifestReloadEvent Partial Coverage](2026-05-19-a-manifest-reload-event-partial-coverage.md)
 closeout: "compile-error events". The
 [Stale Producer Command Semantics](2026-05-24-b-stale-producer-command-semantics.md)
 note set the pattern: pin terminology, draw the state space, and
 name a concrete operator consumer before adding constructors. This
-note does the same for the preflight stage. It does **not** add
-event constructors yet; it scopes what the first slice should add
-and what the surrounding event timeline should look like.
+note does the same for the preflight stage.
+
+**Slice 1 landed in `2cc734a`** — the resolver-stage preflight event
+family is wired into the live session and rendered ahead of the
+existing `reload events:` block. The
+[Manual live-session evidence: 2026-05-25](#manual-live-session-evidence-2026-05-25)
+section below records the operator transcript for the
+unknown-demo-key path.
 
 ## What gap are we closing?
 
@@ -240,3 +246,75 @@ surface as the first consumer and an ordered test proving the
 preflight event precedes any strategy lifecycle event.
 Allocation/resource-recovery streaming remains separately
 consumer-gated.
+
+## Manual live-session evidence: 2026-05-25
+
+The slice 1 runtime wiring was validated with a real
+`--manifest-live-session` operator smoke driving the
+catalog-missed path.
+
+Commands:
+
+```sh
+stack exec -- metasonic-bridge --authoring-manifest named-control \
+  > /tmp/metasonic-preflight-named.json
+
+printf 'demo:bogus-demo\nstatus\nquit\n' \
+  | stack exec -- metasonic-bridge \
+      --manifest-live-session /tmp/metasonic-preflight-named.json named-control \
+      2>&1 | tee /tmp/metasonic-preflight-smoke.log
+```
+
+The session opened the `named-control` plan with one voice and one
+addressable OSC surface. Typing the unknown key `bogus-demo`
+produced the resolver-stage preflight block followed by the legacy
+keyed rejection line — and, critically, **no `reload events:`
+block**, because the supervisor was never invoked:
+
+```text
+Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:
+>   preflight events:
+    - preflight started: "bogus-demo"
+    - preflight rejected: "bogus-demo" (catalog-missed)
+  reload rejected: no demo named "bogus-demo" in catalog
+```
+
+The follow-up `status` confirmed the legacy keyed text survived
+into the persisted outcome read by `LscStatus`:
+
+```text
+  status:
+    current plan demo: named-control
+      fan-in:
+    audio running: yes
+    queue depth: 0
+    owner status: SessionOwnerReady
+    reload status: SessionFanInNormalOperation
+    active voices: 1
+    ingress:           open demo=named-control ui-controls=2 osc-controls=2 midi-cc=1 defaultVoice=v0 oscPort=7001 midi=off
+    last outcome:      plan-rejected (no demo named "bogus-demo" in catalog)
+```
+
+Transcript: `/tmp/metasonic-preflight-smoke.log`.
+
+What the transcript pins:
+
+* The new `preflight events:` block renders even on the
+  resolver-`Left` path that previously short-circuited with only
+  a `reload rejected:` line.
+* The preflight bullets carry the requested key (`"bogus-demo"`)
+  on both the started and rejected rows, with the rejection row
+  ending in the compact structured label `(catalog-missed)`.
+* The legacy `reload rejected:` line keeps its pre-slice wording
+  (`no demo named "bogus-demo" in catalog`), so any downstream
+  parser of that text continues to work.
+* The persisted `LsoPlanRejected` outcome reads as the same legacy
+  keyed text in the `status` line, so an operator who missed the
+  initial transcript can still see *which* key was rejected.
+* No `reload events:` block fires for the rejected command — the
+  supervisor never ran, and the operator transcript no longer
+  pretends a strategy lifecycle happened.
+
+The orchestrator-stage `HpariPlanRejected` / `HsariPlanRejected`
+in-phase rejection events are unchanged for v1; a future slice can
+decide whether to also bracket them under the preflight family.
