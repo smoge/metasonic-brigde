@@ -4187,7 +4187,7 @@ Still gated:
   from the older
   [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md)
   closeout.
-- [ ] Long-running owner supervision, teardown beyond the scoped
+- [x] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence. v1
   policy is scoped in
   [Long-Running Owner Supervision and Terminal-Divergence Recovery](notes/2026-05-25-f-long-running-owner-supervision-recovery.md)
@@ -4220,11 +4220,14 @@ Still gated:
   and `printStatusWith` surfaces with a single `SupervisorOps` value
   across all three opens — in
   [Supervision v1 Slice 2 — Repair Lifecycle Transcript Smoke](notes/2026-05-25-h-supervision-slice-2-repair-smoke.md).
-  The bullet stays unchecked pending a decision on whether slices
-  1 + 2 close the lane (with watchdog / cooldown / auto-retry /
-  cross-run persistent telemetry spun out as their own bullets) or
-  whether the lane should stay open with a sharper remaining item
-  list — see the note's closing section.
+  v1 closed by the slice 2 transcript: escalation stays in-shell,
+  the operator sees divergence in `status`, the dispatch gate
+  blocks live-stack-needing commands, a failed `repair` is visible
+  through the new `last repair attempt failed:` row, and a
+  successful `repair` clears divergence and reruns the post-open
+  hook. Watchdog / cooldown / auto-retry / cross-run persistent
+  diverged-state telemetry are larger future work, not blockers
+  for v1; they will be spun out as their own bullets if pursued.
   `ManifestReloadGraphEvent` / `SessionVoiceAllocationEvent`
   stay deferred behind the same consumer-gate the 2026-05-25-b
   note set.
