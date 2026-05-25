@@ -147,6 +147,8 @@ import           MetaSonic.App.ManifestLiveCommon
                                                  renderLiveReloadEvents,
                                                  renderOSCControls,
                                                  renderOSCControlsWith,
+                                                 renderRetiredBindings,
+                                                 retiredBindingsFromEvents,
                                                  targetOrDie,
                                                  warnIfMissingVoicesWith)
 import           MetaSonic.App.ManifestLiveIngressOps
@@ -1311,6 +1313,17 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
         "  supervised outcome: " <> renderLiveSessionOutcome lso
       output "  reload events:"
       mapM_ output (renderLiveReloadEvents events)
+      -- Phase 8h step 3e v1 slice 2: render the retired-binding
+      -- payload that slice 1 plumbed onto the commit event. The
+      -- block is printed only when a commit event surfaced; the
+      -- 'reload events:' block above already covers
+      -- rejection-only timelines.
+      case retiredBindingsFromEvents events of
+        Just retired -> do
+          output "  retired bindings:"
+          mapM_ output (renderRetiredBindings retired)
+        Nothing ->
+          pure ()
       output "  supervisor events:"
       mapM_ (output . ("    - " <>))
             (renderLiveSessionSupervisorEvents supervisorEvents)

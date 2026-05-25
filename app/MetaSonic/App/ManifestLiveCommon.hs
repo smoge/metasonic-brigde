@@ -99,6 +99,11 @@ module MetaSonic.App.ManifestLiveCommon
     -- * Reload-event timeline
   , renderLiveReloadEvents
 
+    -- * Retired-binding rendering (Phase 8h step 3e v1 slice 2)
+  , retiredBindingsFromEvents
+  , renderRetiredBindings
+  , renderRetiredVoiceReason
+
     -- * OSC control-surface rendering
   , renderOSCControls
   , renderOSCControlsWith
@@ -165,7 +170,8 @@ module MetaSonic.App.ManifestLiveCommon
 import           Control.Concurrent             (threadDelay)
 import           Control.Monad                  (forM, forM_, unless)
 import           Data.IORef                     ()
-import           Data.List                      (dropWhileEnd, find, sort)
+import           Data.List                      (dropWhileEnd, find, foldl',
+                                                 sort)
 import qualified Data.Map.Strict                as M
 import           Data.Maybe                     (mapMaybe)
 import qualified Data.Set                       as S
@@ -205,7 +211,7 @@ import           MetaSonic.App.ManifestReloadCli
                                                  renderManifestReloadCliIssue,
                                                  renderSmokeReloadEvent)
 import           MetaSonic.App.ManifestReloadEvent
-                                                (ManifestReloadEvent)
+                                                (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
                                                 (ManifestReloadHostIssue)
 import           MetaSonic.App.ManifestReloadIngress
@@ -244,6 +250,9 @@ import qualified MetaSonic.Session.ManifestReload as MR
 import           MetaSonic.Session.MIDIProducer (MIDIProducerEnqueueResult (..))
 import           MetaSonic.Session.OSCProducer  (OSCProducerEnqueueResult (..))
 import           MetaSonic.Session.UIProducer   (UIProducerEnqueueResult (..))
+import           MetaSonic.Session.Resolve      (RetiredVoiceBinding (..),
+                                                 RetiredVoiceReason (..),
+                                                 VoiceBinding (..))
 import           MetaSonic.Session.Queue        (ProducerId (..),
                                                  ProducerKind (..),
                                                  QueuedSessionCommand (..),
@@ -686,6 +695,81 @@ renderLiveReloadEvents events =
       ["    (none)"]
     _ ->
       map renderSmokeReloadEvent events
+
+
+-- | Phase 8h step 3e v1 slice 2: scan a reload-event timeline for
+-- the commit event's retired-binding payload.
+--
+-- The orchestrator emits at most one commit event per run (either
+-- 'MrePreservingReloadCommitted' or 'MreStoppedAudioReloadCommitted';
+-- the @TryPreservingThenStoppedAudio@ strategy can produce a
+-- preserving rejection followed by a stopped-audio commit). This
+-- helper walks the timeline and returns the last commit event's
+-- payload, or 'Nothing' if no commit fired.
+retiredBindingsFromEvents
+  :: [ManifestReloadEvent issue]
+  -> Maybe [RetiredVoiceBinding]
+retiredBindingsFromEvents =
+  foldl' step Nothing
+  where
+    step _acc (MrePreservingReloadCommitted retired) =
+      Just retired
+    step _acc (MreStoppedAudioReloadCommitted retired) =
+      Just retired
+    step acc _ =
+      acc
+
+
+-- | Render a retired-binding list as a compact operator block,
+-- *without* the @retired bindings:@ header (the caller owns the
+-- header so it can pair with the @reload events:@ block at the same
+-- indent).
+--
+-- Policy:
+--
+--   * Empty list renders as a single @(none)@ row.
+--   * If every entry is 'RvrOwnerReplaced' and the list is
+--     non-empty, render as a single summary row
+--     @all NN voices retired by owner replacement@ — typical of
+--     stopped-audio reloads, which retire every pre-reload binding.
+--   * Otherwise render one bullet per binding with voice key,
+--     template, and rendered reason.
+renderRetiredBindings :: [RetiredVoiceBinding] -> [String]
+renderRetiredBindings [] =
+  ["    (none)"]
+renderRetiredBindings retired
+  | all isOwnerReplaced retired =
+      ["    - all " <> show (length retired)
+       <> " voices retired by owner replacement"]
+  | otherwise =
+      map renderRow retired
+  where
+    isOwnerReplaced rb =
+      case rvbReason rb of
+        RvrOwnerReplaced -> True
+        _                -> False
+
+    renderRow (RetiredVoiceBinding binding reason) =
+      "    - voice " <> showVoiceKey (vbVoiceKey binding)
+      <> " template " <> showTemplateName (vbTemplateName binding)
+      <> " reason: " <> renderRetiredVoiceReason reason
+
+    showVoiceKey vk =
+      "\"" <> unVoiceKey vk <> "\""
+
+    showTemplateName tn =
+      "\"" <> unTemplateName tn <> "\""
+
+
+-- | Operator-facing label for a 'RetiredVoiceReason'. Stable strings
+-- so test fixtures can pin them without depending on 'Show' output.
+renderRetiredVoiceReason :: RetiredVoiceReason -> String
+renderRetiredVoiceReason RvrTemplateGone =
+  "template-gone"
+renderRetiredVoiceReason (RvrInvalidVoiceKey _issue) =
+  "invalid-key"
+renderRetiredVoiceReason RvrOwnerReplaced =
+  "owner-replaced"
 
 
 -- | The live OSC listener's operator-facing print surface. Both

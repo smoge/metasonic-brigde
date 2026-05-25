@@ -2,11 +2,33 @@
 
 Date: 2026-05-24
 
-Status: design note. Scopes one of the open lanes from the
+Status: design note + implementation log. Scopes one of the open
+lanes from the
 [ManifestReloadEvent Partial Coverage](2026-05-19-a-manifest-reload-event-partial-coverage.md)
-closeout: "stale producer commands". This note does not propose code
-yet — it pins terminology, draws the state space, and names what a
-later consumer-gated implementation would need to render and to test.
+closeout: "stale producer commands". Pins terminology, draws the
+state space, and names what each implementation slice needs to
+render and to test.
+
+**Slice 1 landed in `8a4a1d7`** — retired voice bindings flow
+through both `MrePreservingReloadCommitted` and
+`MreStoppedAudioReloadCommitted` event payloads. The "Plumbing the
+projection out" section below now describes the as-built shape; the
+"Carry the retired set" section names the `RetiredVoiceBinding` /
+`RetiredVoiceReason` types that landed in
+[`MetaSonic.Session.Resolve`](../src/MetaSonic/Session/Resolve.hs).
+
+Slice 2 keeps the pure renderer/extractor contract separate from the
+caller that prints it. The current slice adds
+`retiredBindingsFromEvents`, `renderRetiredBindings`, and
+`renderRetiredVoiceReason` in
+[`MetaSonic.App.ManifestLiveCommon`](../app/MetaSonic/App/ManifestLiveCommon.hs),
+with deterministic tests in
+[`AppManifestLiveCommonRetiredBindings`](../test/MetaSonic/Spec/AppManifestLiveCommonRetiredBindings.hs).
+`runReloadWithSink` in
+[`MetaSonic.App.ManifestLiveSession`](../app/MetaSonic/App/ManifestLiveSession.hs)
+then prints the `retired bindings:` block next to `reload events:`
+whenever a commit payload exists. Slice 3 (stale-by-reload
+attribution) remains open.
 
 The driving consumer is
 [`runManifestLiveSession`](../app/MetaSonic/App/ManifestLiveSession.hs).
@@ -137,48 +159,57 @@ stale.
 
 ## The gap, concretely
 
-Today the only operator-visible breadcrumb for outcome (5) is:
+Slice 1 (`8a4a1d7`) landed the structured retired-binding payload on
+the reload commit events. The operator-visible breadcrumb is now:
 
 * The fan-in drain emits a `SessionRejected cmd SiStaleVoice` record
   into producer-local rejection paths (e.g. `submitManifest*`
   consumer issue types).
-* The reload itself emits `MrePreservingReloadCommitted` /
-  `MreStoppedAudioReloadCommitted`. Neither event carries a
-  retired-binding payload, and the op-success types upstream have
-  no payload slot to thread one through (see
-  [Plumbing the projection out](#plumbing-the-projection-out)
-  below).
+* The reload emits
+  `MrePreservingReloadCommitted ![RetiredVoiceBinding]` /
+  `MreStoppedAudioReloadCommitted ![RetiredVoiceBinding]` carrying
+  the bindings the reload dropped.
+* The pure render surface now exists in `ManifestLiveCommon`:
+  `retiredBindingsFromEvents` extracts the most recent commit
+  payload, `renderRetiredVoiceReason` pins stable reason labels, and
+  `renderRetiredBindings` renders the `(none)`, per-binding, and
+  stopped-audio summary rows.
+* `runReloadWithSink` prints those rows under a `retired bindings:`
+  header after the existing `reload events:` block when the timeline
+  contains a commit event.
 
-The operator cannot answer "was this `SiStaleVoice` caused by the
-reload I just ran?" without correlating the rejection timestamp
-against the swap timestamp.
+The remaining gap for stale-command attribution (slice 3): an
+operator still cannot answer "was this `SiStaleVoice` caused by the
+reload I just ran?" without manually correlating the rejection
+against the recent retired-binding payload. Slice 3 wires that
+attribution end-to-end.
 
-Each reload path knows its retired set at a different point:
+Each reload path knows its retired set at a different point. Slice
+1 wired both into the structured `rrrRetired` /
+`SessionFanInReloadReport.sfirrRetired` projections; the timeline of
+how those values are built remains useful for slice 2 / slice 3
+context:
 
 * **Preserving:** the hot-swap commit produces `rrrDropped ::
-  [ResolveRebuildIssue]`
-  ([Resolve.hs:65](../src/MetaSonic/Session/Resolve.hs#L65)) in
+  [ResolveRebuildIssue]` plus `rrrRetired :: [RetiredVoiceBinding]`
+  ([Resolve.hs:77](../src/MetaSonic/Session/Resolve.hs#L77)) in
   input order — `RriMissingTemplate vkey tname` for bindings whose
   template vanished, `RriInvalidVoiceKey vkey dispatchIssue` for
   keys the new graph's dispatcher refused. `applyPlannedCommit`
-  returns the `ResolveRebuildResult` alongside the new state, then
-  the fan-in drain currently drops it.
+  returns the `ResolveRebuildResult` alongside the new state; slice
+  1 threads `rrrRetired` up through the drain, the preserving
+  host op, and `MrePreservingReloadCommitted`.
 * **Stopped-audio:** the retired set is the *entire* old
-  `ssVoices`. Today
+  `ssVoices`.
   [`reloadSessionFanInHostOwnerStoppedAudio`](../src/MetaSonic/Session/FanIn.hs#L656)
-  releases the old owner before producing the
-  `SessionFanInReloadReport`, so the snapshot has to be taken
-  *before* release. The current report carries new-owner state and
-  status only; nothing on its return path carries the old owner's
-  voice map.
+  snapshots the old owner's voice map *before* `releaseSessionOwner`
+  and forwards it as `sfirrRetired`, threaded up through
+  `msarrRetired` and `MreStoppedAudioReloadCommitted`. Each entry
+  carries `RvrOwnerReplaced`.
 
-In both cases the information needed to attribute incoming
-`SiStaleVoice` rejects exists at reload time and is then thrown
-away.
+## Implemented shape (slice 1, `8a4a1d7`)
 
-## Proposed shape (not yet implemented)
-
-The eventual implementation should:
+The actual type contract that landed:
 
 ### Carry the retired set onto the reload event
 
@@ -215,80 +246,65 @@ On the stopped-audio path the projection is even simpler: every
 old binding becomes a `RetiredVoiceBinding _ RvrOwnerReplaced`. No
 issue join is needed; the snapshot is the input.
 
-### Plumbing the projection out
+### Plumbing the projection out (slice 1 as-built)
 
-Neither path can attach a payload to the commit event today. The
-op-success types upstream are `()` or carry only new-owner
-state/status, and the orchestrator emits
-`MrePreservingReloadCommitted` / `MreStoppedAudioReloadCommitted`
-*after* observing that success. Each path needs three changes that
-together let the projection reach the event emitter:
+Slice 1 widened the op-success types and event constructors so a
+single `[RetiredVoiceBinding]` flows from the reload commit out to
+the event emitter. Each path is wired below; both converge at the
+commit event regardless of which reload path ran.
 
-**Preserving.** The drain already plumbs the rebuild result all the
-way down to the host op's drain report — no drain widening is needed.
+**Preserving.** The drain plumbs the rebuild result all the way
+down to the host op's drain report.
 `applyPlannedCommit` returns `Maybe ResolveRebuildResult` alongside
 the new state ([State.hs:179](../src/MetaSonic/Session/State.hs#L179)),
 `stepSessionCommand` packages that into
 `StepCommitted !SessionState !(Maybe ResolveRebuildResult)`
 ([Step.hs:60](../src/MetaSonic/Session/Step.hs#L60)), the drain
 carries it as `SessionDrainItem` ([Queue.hs:155](../src/MetaSonic/Session/Queue.hs#L155)),
-and `ManifestPreservingHotSwapReport` already retains the whole
-drain result as `mphsrDrainResult`
+and `ManifestPreservingHotSwapReport` retains the whole drain
+result as `mphsrDrainResult`
 ([ManifestReload/Runtime.hs:68](../src/MetaSonic/Session/ManifestReload/Runtime.hs#L68)).
 
-The discard happens one layer up. `mapPreservingReloadReport`'s
-`classifySessionStep` recognises `StepCommitted _ (Just _)` and
-collapses it to `Right ()`
-([ManifestReloadHost.hs:673-676](../app/MetaSonic/App/ManifestReloadHost.hs#L673-L676)),
-matching the current `hproReloadPreserving` success arm.
+Slice 1 then wires three sites:
 
-The required changes are therefore:
-
-1. `classifySessionStep` returns the `ResolveRebuildResult` instead
-   of `Right ()`; `mapPreservingReloadReport` builds the
-   `[RetiredVoiceBinding]` projection from it (paired with the
-   originating bindings via the same `M.elems (ssVoices …)` mapping
-   used inside `rebuildResolveState`).
-2. `hproReloadPreserving` widens from
-   `plan -> IO (Either (HostPreservingReloadFailure issue) ())` to
+1. `mapPreservingReloadReport`'s `classifySessionStep` returns
+   `Right (rrrRetired rebuild)` for `StepCommitted _ (Just rebuild)`
+   ([ManifestReloadHost.hs:673-689](../app/MetaSonic/App/ManifestReloadHost.hs#L673-L689)).
+2. `hproReloadPreserving` success type is
    `plan -> IO (Either (HostPreservingReloadFailure issue) [RetiredVoiceBinding])`
    ([Types.hs:135](../app/MetaSonic/App/ManifestReloadOrchestration/Types.hs#L135)).
-3. `MrePreservingReloadCommitted` widens to
-   `MrePreservingReloadCommitted ![RetiredVoiceBinding]`. The
-   orchestrator forwards the projection from `finishOk`
-   ([ManifestReloadOrchestration.hs:276](../app/MetaSonic/App/ManifestReloadOrchestration.hs#L276)).
+3. `MrePreservingReloadCommitted ![RetiredVoiceBinding]` is emitted
+   by the orchestrator's `finishOk` from the threaded value
+   ([ManifestReloadOrchestration.hs:276-278](../app/MetaSonic/App/ManifestReloadOrchestration.hs#L276-L278)).
 
-**Stopped-audio.** The retired set never enters the drain — the
-old owner is released wholesale — so the plumbing has to be added
-at every layer. Each layer below currently returns `Right ()` or a
-report that the next layer collapses to `()`:
+**Stopped-audio.** The retired set never enters the drain — the old
+owner is released wholesale — so slice 1 adds plumbing at every
+layer:
 
-1. `reloadSessionFanInHostOwnerStoppedAudio` takes a snapshot of
-   the old owner's `ssVoices` *before* `releaseSessionOwner`, maps
-   it to `[RetiredVoiceBinding _ RvrOwnerReplaced]`, and returns
-   it as a new `sfirrRetired` field on `SessionFanInReloadReport`
-   ([FanIn.hs:257](../src/MetaSonic/Session/FanIn.hs#L257)).
+1. `reloadSessionFanInHostOwnerStoppedAudio` snapshots the old
+   owner's `ssVoices` *before* `releaseSessionOwner`, maps it to
+   `[RetiredVoiceBinding _ RvrOwnerReplaced]`, and returns it via
+   the new `sfirrRetired` field on `SessionFanInReloadReport`
+   ([FanIn.hs:261-269](../src/MetaSonic/Session/FanIn.hs#L261-L269),
+   snapshot at [FanIn.hs:691-703](../src/MetaSonic/Session/FanIn.hs#L691-L703)).
 2. `ManifestStoppedAudioReloadReport`
-   ([ManifestReload/Runtime.hs:53](../src/MetaSonic/Session/ManifestReload/Runtime.hs#L53))
-   adds a `msarrRetired :: [RetiredVoiceBinding]` field and
-   `reloadManifestSessionStoppedAudio` forwards it from the new
-   `sfirrRetired`.
-3. `hsaroReloadStopped` widens from
-   `plan -> IO (Either (HostStoppedAudioReloadFailure issue) ())` to
+   ([ManifestReload/Runtime.hs:53-69](../src/MetaSonic/Session/ManifestReload/Runtime.hs#L53-L69))
+   has `msarrRetired :: [RetiredVoiceBinding]` and
+   `reloadManifestSessionStoppedAudio` forwards from `sfirrRetired`.
+3. `hsaroReloadStopped` success type is
    `plan -> IO (Either (HostStoppedAudioReloadFailure issue) [RetiredVoiceBinding])`
    ([Types.hs:47](../app/MetaSonic/App/ManifestReloadOrchestration/Types.hs#L47)).
    The concrete `reloadStopped` in
-   [ManifestReloadHost.hs:218-228](../app/MetaSonic/App/ManifestReloadHost.hs#L218-L228)
-   stops mapping `Right _report -> Right ()` and instead returns
-   `Right (msarrRetired report)`.
-4. `MreStoppedAudioReloadCommitted` widens to
-   `MreStoppedAudioReloadCommitted ![RetiredVoiceBinding]`. The
-   orchestrator's stopped-audio `finishOk` forwards the projection
-   from the widened `hsaroReloadStopped` success arm, mirroring
-   the preserving change.
+   [ManifestReloadHost.hs:219-229](../app/MetaSonic/App/ManifestReloadHost.hs#L219-L229)
+   returns `Right (msarrRetired report)`.
+4. `MreStoppedAudioReloadCommitted ![RetiredVoiceBinding]` is
+   emitted by the orchestrator's `finishOk` from the threaded
+   value, mirroring the preserving change.
 
 The two paths converge at the event: a single `[RetiredVoiceBinding]`
-flows to the attribution layer regardless of which reload happened.
+flows to any future attribution layer regardless of which reload
+happened. Slice 2 renders this list in the live-shell reload output.
+Slice 3 attributes `SiStaleVoice` rejects against it.
 
 ### Attribute admission rejections to the reload window
 
@@ -384,6 +400,24 @@ don't get conflated with stale-by-retirement. `SiUnknownTemplate`
 rejections still render as ordinary admission errors in v1 — see
 [Out of scope](#out-of-scope-for-this-note).
 
+Current slice 2 status: the pure renderer contract and live-shell
+caller are split but wired together. `retiredBindingsFromEvents`
+scans a reload-event timeline and returns the last commit event's
+retired-binding payload. `renderRetiredBindings` owns the rows under
+a caller-provided `retired bindings:` header:
+
+* `[]` renders as one `(none)` row.
+* A non-empty all-`RvrOwnerReplaced` list renders as
+  `- all N voices retired by owner replacement`.
+* Preserving-style and mixed lists render one row per binding,
+  preserving input order and using stable reason labels
+  `template-gone`, `invalid-key`, and `owner-replaced`.
+
+`runReloadWithSink` prints the header and rows immediately after
+`reload events:` when a commit payload is present. Rejection-only
+timelines suppress the block because there is no retired set to
+render.
+
 ## What tests would pin
 
 The boundary is small enough to cover with three test classes:
@@ -430,12 +464,18 @@ The boundary is small enough to cover with three test classes:
    `reloadSessionFanInHostOwnerStoppedAudio` coverage in the same
    suite.
 
-3. **App-layer render tests.** Mirroring
+3. **App-layer render tests.** The slice 2 pure-renderer coverage
+   lives in
+   [`AppManifestLiveCommonRetiredBindings`](../test/MetaSonic/Spec/AppManifestLiveCommonRetiredBindings.hs):
+   reason labels, empty rows, stopped-audio summary rows,
+   per-binding preserving rows, mixed fallback rows, and
+   `retiredBindingsFromEvents` extraction from preserving /
+   stopped-audio timelines. The caller-wiring assertion should mirror
    [`AppManifestReloadCli`](../test/MetaSonic/Spec/AppManifestReloadCli.hs)'s
-   `assertContainsInOrder` pattern, assert the operator render for a
-   commit-with-retired-bindings + arriving-stale-command sequence
-   produces the three blocks above in order, with the right
-   attribution.
+   `assertContainsInOrder` pattern and assert that the operator
+   output places `retired bindings:` after `reload events:`. Slice 3
+   then extends that into a commit-with-retired-bindings +
+   arriving-stale-command sequence with the right attribution.
 
 A small property worth adding: outcomes (2)/(3)/(5) are mutually
 exclusive for one command relative to one reload. The implementation
@@ -454,10 +494,8 @@ carry a `[RetiredVoiceBinding]` projection on both
 sourced from `rrrDropped` on the preserving path and from a
 pre-release `ssVoices` snapshot on the stopped-audio path; widen
 the preserving op success type and the stopped-audio reload report
-so the projection can reach the event emitter; attribute post-swap
-`SiStaleVoice` rejections against the retired `VoiceKey` set; render
-in three blocks. `SiUnknownTemplate` attribution is a separate v2
-lane on the same machinery. Implementation stays consumer-gated on
-[`runManifestLiveSession`](../app/MetaSonic/App/ManifestLiveSession.hs)
-asking for it — but the design question is now settled enough that
-the implementation lane can open without a second round of scoping.
+so the projection can reach the event emitter; render the retired
+list through pure, tested row helpers before caller wiring; then
+attribute post-swap `SiStaleVoice` rejections against the retired
+`VoiceKey` set. `SiUnknownTemplate` attribution is a separate v2
+lane on the same machinery.

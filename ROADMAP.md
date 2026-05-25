@@ -4051,6 +4051,24 @@ Still gated:
   renders `ui accept:` / `ui reject:` lines next to the existing
   `osc accept:` / `midi accept:` shapes. `set` writes immediately
   show up in the next `values` call with `source=accepted`.
+  Phase 8h step 3e v1 sub-slice 1 (`8a4a1d7`) opened the stale
+  producer-command lane named in the 2026-05-19 closeout. New
+  `RetiredVoiceBinding` / `RetiredVoiceReason` types in
+  `MetaSonic.Session.Resolve` carry the operator-facing projection
+  of each dropped voice; `MrePreservingReloadCommitted` and
+  `MreStoppedAudioReloadCommitted` event constructors now carry
+  `[RetiredVoiceBinding]`, sourced from `rrrRetired` on the
+  preserving path and from a pre-release `ssVoices` snapshot on the
+  stopped-audio path (every entry `RvrOwnerReplaced`). The current
+  slice 2 follow-up adds the live-shell renderer/extractor contract
+  in `ManifestLiveCommon`: `retiredBindingsFromEvents`,
+  `renderRetiredBindings`, and `renderRetiredVoiceReason` pin the
+  `(none)`, per-binding, and stopped-audio summary rows; the
+  `runReloadWithSink` caller prints a `retired bindings:` block
+  next to the existing `reload events:` output whenever a commit
+  payload exists. Slice 3 attributes `SiStaleVoice` rejects against
+  the most recent retired set. Design note:
+  [notes/2026-05-24-b-stale-producer-command-semantics.md](notes/2026-05-24-b-stale-producer-command-semantics.md).
   Residual watch items only — physical controller or VMPK-GUI-specific
   confirmation for the same `hasDevice == True` operator boundary,
   ALSA stderr noise on startup, and persistent command-history-file
