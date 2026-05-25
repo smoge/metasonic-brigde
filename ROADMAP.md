@@ -3515,6 +3515,15 @@ manual probe. `MetaSonic.Session.UIProducer` also exposes an explicit
 arbitrated service enqueue helper for already-decoded UI intents.
 `MetaSonic.Session.PatternProducer` exposes the same kind of explicit
 service-owned arbitration helper for caller-driven Pattern blocks.
+`MetaSonic.Session.MIDIProducer` exposes an explicit arbitrated service
+enqueue helper for already-decoded MIDI events, with the same
+state-advance contract as the raw enqueue path: producer
+note/sustain/pitch-bend bookkeeping advances only when every generated
+command is accepted, so a policy or queue rejection on any command
+leaves the original state. The decoded MIDI listener wrapper in
+`MetaSonic.Session.MIDIListener` still routes events through the raw
+FIFO fan-in path and is the next arbitration parity gap on the MIDI
+side.
 Existing live paths are not routed through arbitration unless a caller
 explicitly chooses that wrapper/path.
 
@@ -3792,8 +3801,12 @@ Still gated:
   swaps that cannot use runtime state migration.
 - [ ] MIDI live coexistence/arbitration wiring beyond
   the landed opt-in gateway, service-owned arbitrated enqueue path,
-  explicit OSC producer helper, opt-in OSC listener path, and explicit
-  UI and Pattern producer helpers. The policy boundary is recorded in
+  explicit OSC producer helper, opt-in OSC listener path, explicit UI
+  and Pattern producer helpers, and the explicit arbitrated MIDI
+  producer helper. The remaining gap on the MIDI side is service-shaped
+  arbitration wiring for `MetaSonic.Session.MIDIListener`, which still
+  routes decoded events through the raw FIFO fan-in path. The policy
+  boundary is recorded in
   [Session Producer Coexistence And Arbitration](notes/2026-05-14-a-session-producer-coexistence-arbitration.md).
 - [ ] Arbitration policy mutation API and voice-lifecycle ownership
   clearing. These remain use-case gated; do not implement them ahead of

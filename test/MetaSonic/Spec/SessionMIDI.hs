@@ -9,7 +9,8 @@ import qualified Data.Text                 as T
 import           Control.Concurrent        (MVar, newEmptyMVar, putMVar,
                                             takeMVar, threadDelay)
 import           Control.Monad             (forM, forM_)
-import           Data.IORef                (newIORef, readIORef, writeIORef)
+import           Data.IORef                (atomicModifyIORef', newIORef,
+                                            readIORef, writeIORef)
 import           Data.Maybe                (mapMaybe)
 import           Data.Word                 (Word16, Word8)
 import           System.Timeout            (timeout)
@@ -20,6 +21,8 @@ import           Test.Tasty.HUnit
 import           MetaSonic.Bridge.Source   (MigrationKey(..))
 import           MetaSonic.Pattern
 import           MetaSonic.Pattern.Corpus
+import           MetaSonic.Session.Arbitration
+import           MetaSonic.Session.ArbitrationGateway
 import           MetaSonic.Session.Command
 import           MetaSonic.Session.FanIn
 import           MetaSonic.Session.FanInService
@@ -809,6 +812,75 @@ sessionMIDIProducerTests =
           assertFailure "timed out waiting for MIDI service drain"
         Right other ->
           assertFailure ("expected MIDI service enqueue, got: " <> show other)
+
+  , testCase "arbitrated service rejects MIDI CC when Pattern owns the target" $ do
+      let graph = patternTemplates droneVibrato
+          midiOpts = testMIDIPlayableOptions
+          midiProducer = midiProducerId midiOpts
+          patternProducer = testProducer ProducerPattern "pattern"
+          vkey = VoiceKey "m0-60"
+          patternCmd = CmdControlWrite vkey midiLevelTag 0.25
+          midiCC = MIDIProducerControlChange 0 7 127
+          midiCmd = CmdControlWrite vkey midiLevelTag 1.0
+          target = ControlArbitrationTarget vkey midiLevelTag
+          priorityPolicy = ProducerPriority
+            [ProducerPattern, ProducerOSC, ProducerUI, ProducerMIDI]
+            emptyControlOwnerTable
+          serviceOpts = defaultSessionFanInServiceOptions
+            { sfsoArbitrationGatewayOptions =
+                Just defaultSessionArbitrationGatewayOptions
+                  { sagoInitialPolicy = priorityPolicy
+                  }
+            }
+          expectedIssue = ArbitrationIssue
+            { aiProducer  = midiProducer
+            , aiCommand   = midiCmd
+            , aiTarget    = Just target
+            , aiReason    = ArrLowerPriorityThan patternProducer
+            , aiRetryable = False
+            }
+      issuesRef <- newIORef []
+      let hooks = defaultSessionFanInServiceHooks
+            { sfshOnIssue = \issue ->
+                atomicModifyIORef' issuesRef (\xs -> (issue : xs, ()))
+            }
+      result <-
+        withSessionFanInServiceHooks hooks graph serviceOpts $ \service -> do
+          noteOnRes <- enqueueArbitratedMIDIProducerEvent
+                         midiOpts
+                         initialMIDIProducerState
+                         (MIDIProducerNoteOn 0 60 100)
+                         service
+          stateAfterNoteOn <- case noteOnRes of
+            MIDIProducerArbitratedEnqueueAttempted batch [SagEnqueueAttempted _] ->
+              pure (mpcbState batch)
+            other ->
+              assertFailure
+                ("expected MIDI note-on to enqueue through arbitrated service, got: "
+                 <> show other)
+                >> pure initialMIDIProducerState
+          patternRes <- enqueueArbitratedSessionFanInServiceCommand
+                          patternProducer patternCmd service
+          ccRes <- enqueueArbitratedMIDIProducerEvent
+                     midiOpts stateAfterNoteOn midiCC service
+          issues <- readIORef issuesRef
+          pure (patternRes, ccRes, stateAfterNoteOn, reverse issues)
+      case result of
+        Left issue ->
+          assertFailure ("expected fan-in service, got: " <> show issue)
+        Right (patternRes, ccRes, stateAfterNoteOn, issues) -> do
+          _ <- gatewayQueuedOrFail patternRes
+          case ccRes of
+            MIDIProducerArbitratedEnqueueAttempted batch [rejected] -> do
+              mpcbCommands batch @?= [midiCmd]
+              mpcbState batch @?= stateAfterNoteOn
+              rejected @?= SagArbitrationRejected expectedIssue
+            other ->
+              assertFailure
+                ("expected MIDI CC arbitration rejection, got: " <> show other)
+          let arbitrationIssues =
+                [ai | SfsiiArbitrationRejected ai <- issues]
+          arbitrationIssues @?= [expectedIssue]
   ]
 
 testMIDIProducerState :: M.Map (Word8, Word8) VoiceKey -> MIDIProducerState

@@ -9,11 +9,14 @@
 -- This module defines a narrow, protocol-neutral MIDI producer above
 -- 'MetaSonic.Session.FanIn'. It translates decoded MIDI note, CC,
 -- sustain-pedal, pitch-bend, and all-notes-off events into symbolic
--- 'SessionCommand's, then submits them as 'ProducerMIDI'.
+-- 'SessionCommand's, then submits them as 'ProducerMIDI'. Submission
+-- can target a plain 'SessionFanInHost' (raw FIFO) or the explicit
+-- service-owned arbitration path on a 'SessionFanInService'; the raw
+-- host path is the default and remains FIFO regardless of any gateway
+-- the service may carry.
 --
 -- It deliberately does not open PortMIDI devices, own a listener
--- thread, define a live clock, arbitrate against OSC beyond the
--- existing FIFO fan-in queue, or repair a diverged owner. The live
+-- thread, define a live clock, or repair a diverged owner. The live
 -- C++ MIDI demo path remains in "MetaSonic.Bridge.MidiDemo".
 
 module MetaSonic.Session.MIDIProducer
@@ -43,7 +46,9 @@ module MetaSonic.Session.MIDIProducer
 
     -- * Fan-in submission
   , MIDIProducerEnqueueResult (..)
+  , MIDIProducerArbitratedEnqueueResult (..)
   , enqueueMIDIProducerEvent
+  , enqueueArbitratedMIDIProducerEvent
   ) where
 
 import           Control.DeepSeq            (NFData)
@@ -56,10 +61,15 @@ import           GHC.Generics               (Generic)
 
 import           MetaSonic.Pattern          (ControlTag, TemplateName (..),
                                              Value, VoiceKey (..))
+import           MetaSonic.Session.ArbitrationGateway
+                                            (SessionArbitrationGatewayEnqueueResult (..))
 import           MetaSonic.Session.Command  (SessionCommand (..))
 import           MetaSonic.Session.FanIn    (SessionFanInEnqueueResult (..),
                                              SessionFanInHost,
                                              enqueueSessionFanInCommand)
+import           MetaSonic.Session.FanInService
+                                            (SessionFanInService,
+                                             enqueueArbitratedSessionFanInServiceCommand)
 import           MetaSonic.Session.Queue    (ProducerId (..),
                                              ProducerKind (..),
                                              SessionEnqueueResult (..))
@@ -224,6 +234,22 @@ data MIDIProducerEnqueueResult
   | MIDIProducerEnqueueAttempted
       !MIDIProducerCommandBatch
       ![SessionFanInEnqueueResult]
+  deriving stock    (Eq, Show, Generic)
+  deriving anyclass (NFData)
+
+-- | Result of translating and enqueueing one MIDI event through the
+-- explicitly arbitrated service path.
+--
+-- The list of results mirrors 'MIDIProducerEnqueueAttempted': one entry
+-- per generated session command, in submission order. If any submitted
+-- command was rejected — by policy or by fan-in — the attached batch's
+-- 'mpcbState' is the original input state, not the decode-time state,
+-- matching the raw enqueue behavior.
+data MIDIProducerArbitratedEnqueueResult
+  = MIDIProducerArbitratedRejected !MIDIProducerIssue !MIDIProducerState
+  | MIDIProducerArbitratedEnqueueAttempted
+      !MIDIProducerCommandBatch
+      ![SessionArbitrationGatewayEnqueueResult]
   deriving stock    (Eq, Show, Generic)
   deriving anyclass (NFData)
 
@@ -481,6 +507,43 @@ enqueueMIDIProducerEvent opts st event host =
                else batch { mpcbState = st }
       pure (MIDIProducerEnqueueAttempted finalBatch results)
 
+-- | Translate and enqueue one MIDI event through the explicit
+-- service-owned arbitration path.
+--
+-- Existing MIDI producers should keep using 'enqueueMIDIProducerEvent'
+-- unless the surrounding session deliberately opts into
+-- 'SessionFanInService' arbitration. With default service options this
+-- still preserves FIFO behavior; with configured gateway options, policy
+-- rejection is surfaced through the nested
+-- 'SessionArbitrationGatewayEnqueueResult' values and the service issue
+-- hook.
+--
+-- Stateful note-on/note-off bookkeeping advances only if every submitted
+-- command produced 'SagEnqueueAttempted' with an accepted fan-in enqueue.
+-- A policy rejection or queue rejection on any command leaves the
+-- original state, matching the raw enqueue behavior.
+enqueueArbitratedMIDIProducerEvent
+  :: MIDIProducerOptions
+  -> MIDIProducerState
+  -> MIDIProducerEvent
+  -> SessionFanInService
+  -> IO MIDIProducerArbitratedEnqueueResult
+enqueueArbitratedMIDIProducerEvent opts st event service =
+  case decodeMIDISessionCommands opts st event of
+    Left issue ->
+      pure (MIDIProducerArbitratedRejected issue st)
+    Right batch -> do
+      results <- traverse
+        (\cmd ->
+           enqueueArbitratedSessionFanInServiceCommand
+             (midiProducerId opts) cmd service)
+        (mpcbCommands batch)
+      let finalBatch =
+            if all arbitratedAccepted results
+               then batch
+               else batch { mpcbState = st }
+      pure (MIDIProducerArbitratedEnqueueAttempted finalBatch results)
+
 validateEvent :: MIDIProducerEvent -> Either MIDIProducerIssue ()
 validateEvent event = case event of
   MIDIProducerNoteOn ch note velocity -> do
@@ -600,3 +663,10 @@ enqueueAccepted result = case sfierResult result of
     True
   SessionEnqueueRejected {} ->
     False
+
+arbitratedAccepted :: SessionArbitrationGatewayEnqueueResult -> Bool
+arbitratedAccepted result = case result of
+  SagArbitrationRejected {} ->
+    False
+  SagEnqueueAttempted fanInResult ->
+    enqueueAccepted fanInResult
