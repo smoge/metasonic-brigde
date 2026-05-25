@@ -4164,15 +4164,22 @@ Still gated:
   the orchestrator-stage `HpariPlanRejected` / `HsariPlanRejected`
   in-phase rejection events are unchanged for v1 and remain a
   later-slice question. Allocation/resource recovery streaming
-  is now scoped in
+  has a v1 in the live session: `ManifestReloadAudioEvent`
+  (`MetaSonic.App.ManifestReloadAudioEvent`) brackets stopped-audio
+  audio start/stop transitions during a reload, with ready-timeout
+  carried inside the start-failure payload (`SfaiReadyTimeout`
+  inside `MraeStartFailed`) rather than as a separate event;
+  preserving reloads stay silent on the family. Wired in
+  `8b9fb8f` through `orchestrateHostStoppedAudioReloadWithEventsAndAudio`
+  and rendered as an `audio events:` block in `runReloadWithSink`
+  between `reload events:` and `retired bindings:`. Design and the
+  2026-05-25 stopped-audio manual smoke evidence live in
   [Allocation and Resource Recovery Event Semantics](notes/2026-05-25-b-allocation-resource-recovery-event-semantics.md);
-  the next slice is `ManifestReloadAudioEvent`, an audio-stage
-  event family that brackets stopped-audio audio start/stop
-  transitions during a reload — ready-timeout is carried by the
-  start-failure payload (`SfaiReadyTimeout` inside
-  `MraeStartFailed`) rather than emitting a separate event, and
-  preserving reloads stay silent on the family. The new note
-  supersedes the remaining open lane from the older
+  the remaining follow-ups are graph allocation outcomes (case 1,
+  a future `ManifestReloadGraphEvent` family) and voice allocation
+  outcomes (case 2a Haskell-side / 2b C++-side), all explicitly
+  consumer-gated. The new note supersedes the remaining open lane
+  from the older
   [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md)
   closeout.
 - [ ] Long-running owner supervision, teardown beyond the scoped

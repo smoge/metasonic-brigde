@@ -2,7 +2,8 @@
 
 Date: 2026-05-25
 
-Status: design note. Scopes the last remaining open lane from the
+Status: design note + implementation log. Scopes the last remaining
+open lane from the
 [ManifestReloadEvent Partial Coverage](2026-05-19-a-manifest-reload-event-partial-coverage.md)
 closeout: "allocation / resource recovery events". The
 [Stale Producer Command Semantics](2026-05-24-b-stale-producer-command-semantics.md)
@@ -11,8 +12,20 @@ note (closed end-to-end) and the
 note (resolver-stage v1 closed in `2cc734a`/`93bb1e7`) set the
 pattern: pin terminology, draw the state space, name a concrete
 operator consumer, and frame the smallest first slice before adding
-constructors. This note does the same for the allocation/resource
-lane. It does **not** add event constructors yet.
+constructors.
+
+**Slice 1 landed in `8b9fb8f`** — `ManifestReloadAudioEvent` brackets
+the stopped-audio reload's `hsaroStopOldAudio`,
+`hsaroStartNewAudio`, and the listener-restart cleanup
+`hsaroStopNewAudio` with attempt/succeeded/failed transitions,
+threaded through `orchestrateHostStoppedAudioReloadWithEventsAndAudio`
+and rendered as an `audio events:` block in the live-session shell
+between `reload events:` and `retired bindings:`. Ready-timeout
+rides inside the start-failure payload (`SfaiReadyTimeout` inside
+`MraeStartFailed`) for v1 rather than emitting a separate event;
+preserving reloads stay silent on the family. The
+[Manual live-session evidence: 2026-05-25 (stopped-audio)](#manual-live-session-evidence-2026-05-25-stopped-audio)
+section below records the operator transcript.
 
 ## What resource/allocation failures are currently invisible?
 
@@ -264,33 +277,34 @@ lowest implementation cost:
   composes with it directly.
 * No new FFI surface, no C++ changes, no schema migration.
 
-### Slice scope
+### Slice scope (as built in `8b9fb8f`)
 
-1. Add a small `ManifestReloadAudioEvent` family in a new module
-   `MetaSonic.App.ManifestReloadAudioEvent` (mirroring the layout
-   of `MetaSonic.App.ManifestPreflightEvent`). At minimum:
-   `MraeStopAttempted`, `MraeStopSucceeded`,
-   `MraeStopFailed !SessionFanInAudioIssue`,
-   `MraeStartAttempted`, `MraeStartSucceeded`,
-   `MraeStartFailed !SessionFanInAudioIssue`,
-   `MraeReadyWaitStarted`, `MraeReadyWaitSucceeded`,
-   `MraeReadyWaitTimedOut`. Final constructor list is the
-   slice-implementer's call; the rejection-payload shape is the
-   one v1 question.
-2. Wire a callback `mfsehOnAudioEvent` (or equivalent) through the
-   stopped-audio reload op only. Preserving reloads do not stop
-   audio, so they emit no audio events; the preserving path's
-   audio-event timeline is the empty list. (This is the
-   stopped-audio analog of the preflight family covering only
-   the resolver stage.)
-3. Render an `audio events:` block in `runReloadWithSink` after
-   `reload events:` and before `retired bindings:`. The block
-   suppresses entirely when empty so preserving reloads do not
-   print a dead header.
-4. Add ordered tests in `AppManifestLiveSession`:
-   * Stopped-audio reload success path: timeline contains
-     `MraeStopSucceeded`, `MraeStartAttempted`,
-     `MraeReadyWaitSucceeded` in order, and the block appears
+1. `ManifestReloadAudioEvent` lives in
+   `MetaSonic.App.ManifestReloadAudioEvent`, mirroring the layout
+   of `MetaSonic.App.ManifestPreflightEvent`. The final v1
+   constructor set brackets the three audio-touching boundaries the
+   stopped-audio op crosses (`hsaroStopOldAudio`,
+   `hsaroStartNewAudio`, and the listener-restart cleanup
+   `hsaroStopNewAudio`) with attempt / succeeded /
+   `*Failed !SessionFanInAudioIssue` triples. Ready-timeout rides
+   inside the start-failure payload (`SfaiReadyTimeout` inside
+   `MraeStartFailed`) rather than emitting its own pair of
+   constructors; that keeps the family small and pushes the wait
+   detail into the existing issue value.
+2. The callback is wired through
+   `orchestrateHostStoppedAudioReloadWithEventsAndAudio`, a new
+   entrypoint alongside the existing `*WithEvents` variant.
+   Preserving reloads emit no audio events; the preserving path's
+   audio-event timeline is the empty list, which the renderer
+   suppresses entirely so the header does not appear.
+3. The live shell renders an `audio events:` block in
+   `runReloadWithSink` after `reload events:` and before
+   `retired bindings:`. The block suppresses when empty so
+   preserving reloads (and any other run that did not touch audio)
+   do not print a dead header.
+4. Ordered tests in `AppManifestLiveSession`:
+   * Stopped-audio reload success path: timeline contains the
+     stop and start brackets in order, and the block appears
      between `reload events:` and `retired bindings:`.
    * Audio-start failure path (synthesized via a fake FFI that
      returns nonzero from `startAudio`): timeline ends with
@@ -298,34 +312,128 @@ lowest implementation cost:
      reload events block carries the matching strategy-level
      `HsariAudioRestartFailed`. The audio-event block surfaces the
      same payload one layer down.
-5. Manual `--manifest-live-session` smoke: drive a stopped-audio
-   reload between two valid demos, capture the operator transcript
-   showing both `reload events:` and the new `audio events:`
-   block, append the evidence section to this note as the
-   2026-05-24-b note captured its 2026-05-25 transcript.
+5. Manual `--manifest-live-session` smoke recorded below as the
+   [Manual live-session evidence: 2026-05-25 (stopped-audio)](#manual-live-session-evidence-2026-05-25-stopped-audio)
+   section.
 
-Slice 2 (a follow-up, not part of slice 1) extends the same family
-to the preserving reload's *internal* audio non-events (preserving
-should emit nothing, but the test should pin "preserving emits no
-audio events" rather than leave it unspecified), and to the
-recovery path inside `sopsOpenStack` so case 4's inner audio
-boundary is covered by the same family.
+Slice follow-ups (not part of slice 1):
 
-Slice 3 (later still) tackles case 1 (graph allocation outcomes)
-with a separate `ManifestReloadGraphEvent` family. Case 2a (the
-Haskell `runVoiceStart` allocation surface) follows on a separate
-slice surfacing `SriVoiceAllocationFailed` /
-`SriRealtimeQueueFull` as structured events; case 2b (the C++
-`VoiceAllocator` path) waits for a real producer-facing consumer
-that justifies a new FFI channel.
+* The recovery path inside `sopsOpenStack` reuses the audio-start
+  sequence and would naturally emit the same family; that wiring
+  is deferred until a real consumer asks for cross-recovery
+  audio-event visibility.
+* Case 1 (graph allocation outcomes) wants a separate
+  `ManifestReloadGraphEvent` family on the owner / adapter
+  boundary; not started.
+* Case 2a (the Haskell `runVoiceStart` allocation surface)
+  would surface `SriVoiceAllocationFailed` /
+  `SriRealtimeQueueFull` as structured events on the fan-in /
+  adapter layer.
+* Case 2b (the C++ `VoiceAllocator` path) waits for a real
+  producer-facing consumer that justifies a new FFI channel.
 
 ## How this leaves the ROADMAP
 
-After this lane closes through slice 1, the ROADMAP's
-"Failure/event semantics across compile and allocation/resource
-recovery" bullet will be entirely v1-covered for the live-session
-operator surface, with two open follow-up slices (graph allocation
-outcomes, polyphony exhaustion) that are explicitly consumer-gated
-and waiting for a real driver. Compile-error surfacing v1 is
-covered by the preflight family; allocation/resource recovery v1
-will be covered by the audio-event family.
+After `8b9fb8f`, the ROADMAP's "Failure/event semantics across
+compile and allocation/resource recovery" bullet is entirely
+v1-covered for the live-session operator surface. Compile-error
+surfacing v1 is covered by the preflight family; allocation/
+resource recovery v1 is covered by the audio-event family. Two
+follow-up slices remain explicitly consumer-gated and waiting for a
+real driver — graph allocation outcomes (case 1, a future
+`ManifestReloadGraphEvent` family on the owner/adapter boundary)
+and voice allocation outcomes (case 2a, surfacing
+`SriVoiceAllocationFailed` / `SriRealtimeQueueFull` as structured
+events; case 2b stays deferred behind a new FFI channel).
+
+## Manual live-session evidence: 2026-05-25 (stopped-audio)
+
+The slice 1 runtime wiring was validated with a real
+`--manifest-live-session` operator smoke driving a stopped-audio
+reload between two valid demos.
+
+Commands:
+
+```sh
+stack exec -- metasonic-bridge --authoring-manifest named-control send-return \
+  > /tmp/metasonic-audio-events-smoke.json
+
+printf 'demo:send-return\nstatus\nquit\n' \
+  | stack exec -- metasonic-bridge \
+      --manifest-live-session /tmp/metasonic-audio-events-smoke.json \
+      named-control --strategy stopped-audio-only \
+      2>&1 | grep -v "^ALSA lib" \
+      | tee /tmp/metasonic-audio-events-smoke.log
+```
+
+The session opened the `named-control` plan with one voice. Typing
+the known key `send-return` against `--strategy stopped-audio-only`
+forced the stopped-audio route. The transcript shows the new
+`audio events:` block rendered between `reload events:` and
+`retired bindings:`, with the full stop-then-start bracket on the
+audio side:
+
+```text
+Type a command, or <Enter> for status, 'help' for the command list, or <Ctrl-D> to exit:
+>   preflight events:
+    - preflight started: "send-return"
+    - preflight succeeded: "send-return"
+
+  supervised outcome: committed (new plan installed)
+  reload events:
+    - stopped-audio phase started
+    - stopped-audio phase committed
+  audio events:
+    - audio stop attempted
+    - audio stop succeeded
+    - audio start attempted
+    - audio start succeeded
+  retired bindings:
+    - all 1 voices retired by owner replacement
+  supervisor events:
+    - in-window: started
+    - in-window: committed
+  resource timeline:
+    - in-window reload committed
+    - serving plan: send-return
+```
+
+Status after the reload confirmed the new plan installed cleanly,
+with audio still running and `last outcome` reading the same
+committed-text from `LscStatus`:
+
+```text
+  status:
+    current plan demo: send-return
+      fan-in:
+    audio running: yes
+    queue depth: 0
+    owner status: SessionOwnerReady
+    reload status: SessionFanInNormalOperation
+    active voices: 2
+    ingress:           open demo=send-return ui-controls=0 osc-controls=0 midi-cc=0 defaultVoice=v0 oscPort=7001 midi=off
+    last outcome:      committed (new plan installed)
+```
+
+Transcript: `/tmp/metasonic-audio-events-smoke.log`.
+
+What the transcript pins:
+
+* The `audio events:` block renders only when a stopped-audio
+  reload runs (the preflight succeeded path proves the block is
+  present alongside a committed strategy outcome).
+* The block carries both halves of the audio bracket
+  (`audio stop attempted` → `audio stop succeeded` →
+  `audio start attempted` → `audio start succeeded`) so an
+  operator can see which side of the install failed if the
+  `audio start` half had reported a nonzero status.
+* Ordering is stable: `reload events:` precedes `audio events:`
+  precedes `retired bindings:`, mirroring the design's "between
+  reload events and retired bindings" placement.
+* `last outcome` continues to read the same committed-text it did
+  before the slice landed, so `LscStatus` consumers are unaffected.
+
+Preserving reloads (try-preserving / require-preserving) emit no
+audio events by design; that contract is pinned by the slice 2
+ordered tests in `AppManifestLiveSession` and is not exercised by
+this smoke.
