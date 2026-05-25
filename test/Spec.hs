@@ -130,105 +130,125 @@ import           MetaSonic.Spec.SessionMIDI
 
 main :: IO ()
 main = defaultMain $ testGroup "MetaSonic"
-  [ appDemoCatalogTests
-  , appManifestLiveCommonAddressableSurfaceTests
-  , appManifestLiveCommonIngressPolicyTests
-  , appManifestLiveCommonMIDIRenderTests
-  , appManifestLiveCommonOSCControlsTests
-  , appManifestLiveCommonOSCRenderTests
-  , appManifestLiveCommonRetiredBindingsTests
-  , appManifestLiveCommonStaleByReloadTests
-  , appManifestLiveIngressOpsTests
-  , appManifestLiveReloadDemoRenderTests
-  , appManifestLiveSessionTests
-  , appManifestLiveSessionOutputSinkTests
-  , appManifestLiveSessionProjectorsTests
-  , appManifestLiveValueCacheTests
-  , appManifestMIDIIngressOpsTests
-  , appManifestMIDIListenerTests
-  , appManifestMIDIPortMIDITests
-  , appManifestMIDIReloadE2ETests
-  , appManifestOSCIngressOpsTests
-  , appManifestOSCListenerTests
-  , appManifestOSCReloadE2ETests
-  , appManifestPreservingFixtureTests
-  , appManifestReloadHostStackTests
-  , appManifestReloadPreservingHostStackTests
-  , appManifestReloadTryPreservingHostStackTests
-  , appManifestReloadBindingTests
-  , appManifestReloadCliTests
-  , appManifestReloadEventTests
-  , appManifestReloadHostTests
-  , appManifestReloadIngressTests
-  , appManifestReloadIngressTargetTests
-  , appManifestReloadMIDIBindingTests
-  , appManifestReloadMIDIIngressTests
-  , appManifestReloadOrchestrationTests
-  , appManifestReloadOSCBindingTests
-  , appManifestReloadOSCIngressTests
-  , appManifestReloadSupervisorTests
-  , appManifestReloadSupervisorAdapterTests
-  , appManifestReloadUIIngressTests
-  , unitTests
-  , properties
-  , crossCuttingTests
-  , hotSwapTests
-  , busRoutingTests
-  , templateLifecycleTests
-  , fusedRenderTests
-  , t9DirectEqualsReductionTests
-  , c0aLoaderMetadataTests
-  , c0bGlobalScheduleTests
-  , c0cScheduleExecutorTests
-  , c0dGlobalScheduleBandTests
-  , c1cWorkerScheduleTests
-  , sessionCommandTests
-  , sessionResolveTests
-  , sessionReportTests
-  , sessionStateTests
-  , sessionStepTests
-  , controlTargetTests
-  , sessionRTGraphAdapterInstallTests
-  , sessionRTGraphAdapterHotSwapTests
-  , sessionSwapArtifactTests
-  , sessionOwnerTests
-  , sessionQueueTests
-  , sessionArbitrationTests
-  , sessionArbitrationGatewayTests
-  , sessionPatternProducerTests
-  , sessionRunnerTests
-  , sessionHostTests
-  , sessionPreservingHotSwapSpecTests
-  , sessionLiveHotSwapOrchestrationTests
-  , sessionFanInHostTests
-  , sessionFanInServiceTests
-  , sessionManifestReloadTests
-  , sessionMIDIProducerTests
-  , sessionMIDIListenerTests
-  , sessionMIDIPortMIDISourceTests
-  , sessionUIProducerTests
-  , sessionOSCProducerTests
-  , sessionOSCListenerTests
-  , patternCorpusTests
-  , oscWireAndDispatchTests
-  , oscListenerTests
-  , oscEndToEndTests
-  , oscPortParserTests
-  , bufferPoolTests
-  , playBufMonoTests
-  , recordBufMonoSkeletonTests
-  , spectralFreezeSkeletonTests
-  , spectralLpfTests
-  , staticPluginSkeletonTests
-  , oneTapDelayPluginTests
-  , appFusionCostLabTests
-  , authoringDslTests
-  , authoringReportTests
-  , authoringManifestTests
-  , capabilityTableTests
-  , plannerTests
-  , fusionProgramScaffoldTests
-  , fusionProgramExecutorTests
-  , fusionProgramBlockExecutorTests
-  , fusionProgramSuperExecutorTests
+  [ testGroup "Phase 8"
+      [ testGroup "app"
+          [ appDemoCatalogTests
+          , appFusionCostLabTests
+          , appManifestLiveCommonAddressableSurfaceTests
+          , appManifestLiveCommonIngressPolicyTests
+          , appManifestLiveCommonMIDIRenderTests
+          , appManifestLiveCommonOSCControlsTests
+          , appManifestLiveCommonOSCRenderTests
+          , appManifestLiveCommonRetiredBindingsTests
+          , appManifestLiveCommonStaleByReloadTests
+          , appManifestLiveIngressOpsTests
+          , appManifestLiveReloadDemoRenderTests
+          , appManifestLiveSessionTests
+          , appManifestLiveSessionOutputSinkTests
+          , appManifestLiveSessionProjectorsTests
+          , appManifestLiveValueCacheTests
+          , appManifestMIDIIngressOpsTests
+          , appManifestMIDIListenerTests
+          , appManifestMIDIPortMIDITests
+          , appManifestMIDIReloadE2ETests
+          , appManifestOSCIngressOpsTests
+          , appManifestOSCListenerTests
+          , appManifestOSCReloadE2ETests
+          , appManifestPreservingFixtureTests
+          , appManifestReloadHostStackTests
+          , appManifestReloadPreservingHostStackTests
+          , appManifestReloadTryPreservingHostStackTests
+          , appManifestReloadBindingTests
+          , appManifestReloadCliTests
+          , appManifestReloadEventTests
+          , appManifestReloadHostTests
+          , appManifestReloadIngressTests
+          , appManifestReloadIngressTargetTests
+          , appManifestReloadMIDIBindingTests
+          , appManifestReloadMIDIIngressTests
+          , appManifestReloadOrchestrationTests
+          , appManifestReloadOSCBindingTests
+          , appManifestReloadOSCIngressTests
+          , appManifestReloadSupervisorTests
+          , appManifestReloadSupervisorAdapterTests
+          , appManifestReloadUIIngressTests
+          ]
+      , testGroup "session-substrate"
+          [ controlTargetTests
+          , patternCorpusTests
+          , sessionArbitrationTests
+          , sessionArbitrationGatewayTests
+          , sessionCommandTests
+          , sessionFanInHostTests
+          , sessionFanInServiceTests
+          , sessionHostTests
+          , sessionLiveHotSwapOrchestrationTests
+          , sessionManifestReloadTests
+          , sessionMIDIListenerTests
+          , sessionMIDIPortMIDISourceTests
+          , sessionMIDIProducerTests
+          , sessionOSCListenerTests
+          , sessionOSCProducerTests
+          , sessionOwnerTests
+          , sessionPatternProducerTests
+          , sessionPreservingHotSwapSpecTests
+          , sessionQueueTests
+          , sessionReportTests
+          , sessionResolveTests
+          , sessionRTGraphAdapterHotSwapTests
+          , sessionRTGraphAdapterInstallTests
+          , sessionRunnerTests
+          , sessionStateTests
+          , sessionStepTests
+          , sessionSwapArtifactTests
+          , sessionUIProducerTests
+          ]
+      ]
+  , testGroup "Phase 7 and earlier"
+      [ testGroup "core"
+          [ unitTests
+          , properties
+          , crossCuttingTests
+          ]
+      , testGroup "ffi"
+          [ hotSwapTests
+          , busRoutingTests
+          , templateLifecycleTests
+          , fusedRenderTests
+          , t9DirectEqualsReductionTests
+          , c0aLoaderMetadataTests
+          , c0bGlobalScheduleTests
+          , c0cScheduleExecutorTests
+          , c0dGlobalScheduleBandTests
+          , c1cWorkerScheduleTests
+          ]
+      , testGroup "compiler"
+          [ capabilityTableTests
+          , plannerTests
+          , fusionProgramScaffoldTests
+          , fusionProgramExecutorTests
+          , fusionProgramBlockExecutorTests
+          , fusionProgramSuperExecutorTests
+          ]
+      , testGroup "authoring"
+          [ authoringDslTests
+          , authoringReportTests
+          , authoringManifestTests
+          ]
+      , testGroup "osc"
+          [ oscWireAndDispatchTests
+          , oscListenerTests
+          , oscEndToEndTests
+          , oscPortParserTests
+          ]
+      , testGroup "runtime-skeletons"
+          [ bufferPoolTests
+          , playBufMonoTests
+          , recordBufMonoSkeletonTests
+          , spectralFreezeSkeletonTests
+          , spectralLpfTests
+          , staticPluginSkeletonTests
+          , oneTapDelayPluginTests
+          ]
+      ]
   ]
