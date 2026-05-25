@@ -290,7 +290,11 @@ lowest implementation cost:
    constructor set brackets the two main audio-touching boundaries
    the stopped-audio op crosses (`hsaroStopOldAudio` and
    `hsaroStartNewAudio`) with full attempt / succeeded /
-   `*Failed !SessionFanInAudioIssue` triples, and the
+   `*Failed !issue` triples — the ADT is polymorphic in `issue`,
+   and production instantiates it as
+   `ManifestReloadHostIssue LiveProdIngressIssue` with audio
+   failures wrapped via `MrhiAudio` carrying the underlying
+   `SessionFanInAudioIssue` one layer below — and the
    listener-restart cleanup boundary (`hsaroStopNewAudio`,
    reached on `HsariListenerRestartFailed`) with just an
    attempt / succeeded pair — the cleanup slot is `IO ()` so
@@ -452,10 +456,15 @@ What the transcript pins:
 
 Require-preserving and preserving-success paths emit no audio
 events by design; that contract is pinned by the slice 1 ordered
-tests in `AppManifestLiveSession` and is not exercised by this
+tests in `AppManifestLiveSession` (which inject synthetic event
+timelines through a stub supervisor) and is not exercised by this
 smoke. Try-preserving emits audio events only when the preserving
 phase rejects and the fallback gate admits the stopped-audio
 fallback (`realTryPreservingInWindowReload` forwards
-`onAudioEvent` into the stopped-audio path); that scenario is
-covered by the slice 1 tests too and is also not exercised by
-this stopped-audio-only smoke.
+`onAudioEvent` into the stopped-audio path); that forwarding is
+wired in the source but is **not yet pinned by a focused test** —
+`AppManifestLiveSession` pins rendering against synthetic
+timelines and `AppManifestReloadTryPreservingHostStack` asserts
+the combined fallback *outcome* without checking `onAudioEvent`
+forwarding. Closing that coverage gap is a follow-up; the
+forwarding itself is reachable today.
