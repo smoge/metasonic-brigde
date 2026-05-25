@@ -43,16 +43,19 @@ digraph hot_swap_reload_current_interaction {
     reload_plan [label="ManifestReloadPlan\nTemplateGraph\nRTGraphAdapterOptions\nControlSurface\nArbitrationPolicy=FifoOnly"];
     command_projection [label="manifestReloadCommand"];
     owner_options_projection [label="manifestSessionOwnerOptions"];
-    cmd_hot_swap [label="CmdHotSwap\nSwapLabel + TemplateGraph"];
+    cmd_preserving_hot_swap [label="CmdHotSwapPreservingOnly\nSwapLabel + TemplateGraph\n(no clear/rebuild fallback)"];
   }
 
   subgraph cluster_cli {
-    label="Current diagnostic / smoke entry points";
+    label="Current CLI, smoke, and live entry points";
     color="#c084fc";
 
     cli_plan [label="--manifest-reload-plan\n--manifest-reload-plan-file"];
     cli_construct [label="--manifest-session-smoke"];
     cli_stopped_smoke [label="--manifest-stopped-audio-reload-smoke"];
+    cli_host_smoke [label="--manifest-host-reload-smoke\nstrategy selector smoke"];
+    cli_live_demo [label="--manifest-live-reload-demo\nsupervised route selector"];
+    cli_live_session [label="--manifest-live-session\nopen-ended supervised shell"];
   }
 
   subgraph cluster_construction {
@@ -64,6 +67,15 @@ digraph hot_swap_reload_current_interaction {
     new_adapter [label="newRTGraphAdapter"];
     install_graph [label="installSessionGraph\nloader clear/rebuild path"];
     rt_graph [label="RTGraph\nC++ runtime handle", fillcolor="#ecfdf5"];
+  }
+
+  subgraph cluster_ingress {
+    label="Landed ingress target and binding projections";
+    color="#a3e635";
+
+    ingress_target [label="manifestReloadIngressTargetFromPlan\nUI + OSC + MIDI bundle"];
+    ingress [label="ManifestReloadIngressManager\nclose / resume / open-fresh"];
+    live_ingress [label="ManifestLiveIngressOps\nOSC + optional MIDI handles"];
   }
 
   subgraph cluster_fanin {
@@ -86,38 +98,62 @@ digraph hot_swap_reload_current_interaction {
 
     reload_host [label="reloadManifestStoppedAudioHost\nManifestReloadHost"];
     host_ops [label="manifestReloadHostOps\nHostStoppedAudioReloadOps"];
-    stopped_orchestrator [label="orchestrateHostStoppedAudioReload\nplan -> quiesce -> drain ->\nstop -> reload -> start -> reopen"];
-    ingress [label="ManifestReloadIngress\nclose / resume / open-fresh"];
+    stopped_orchestrator [label="orchestrateHostStoppedAudioReloadWithEvents\nplan -> quiesce -> drain ->\nstop -> reload -> start -> reopen"];
     quiesce_drain [label="quiesceAndDrainSessionFanInService"];
     reload_stopped [label="reloadManifestSessionStoppedAudio\nManifestReload.Runtime"];
     fanin_reload [label="reloadSessionFanInHostOwnerStoppedAudio\nreplace owner only after queue empty\nand audio stopped"];
     release_acquire [label="release old owner\nacquire new owner"];
   }
 
-  subgraph cluster_hot_swap {
-    label="Existing command-level hot-swap runtime path";
+  subgraph cluster_preserving {
+    label="Landed preserving manifest reload and strategy selector";
     color="#14b8a6";
 
-    admit_hot_swap [label="admitSessionCommand\nCmdHotSwap -> PlanHotSwap"];
+    strategy_selector [label="reloadManifestHostWithStrategy\nRequirePreserving /\nTryPreservingThenStoppedAudio /\nStoppedAudioOnly"];
+    fallback_gate [label="preservingAllowsStoppedAudioFallback\nonly plain reload rejection\nadmits stopped-audio fallback"];
+    reload_preserving_host [label="reloadManifestPreservingHost\nManifestReloadHost"];
+    preserving_host_ops [label="manifestPreservingReloadHostOps\nHostPreservingReloadOps"];
+    preserving_orchestrator [label="orchestrateHostPreservingReloadWithEvents\nplan -> quiesce -> drain ->\nsubmit preserving -> resume -> reopen"];
+    reload_preserving [label="reloadManifestSessionPreservingHotSwap\nManifestReload.Runtime"];
+  }
+
+  subgraph cluster_supervised {
+    label="Supervised host-stack routes";
+    color="#0ea5e9";
+
+    live_route_selector [label="supervised route selection\nlive-demo: selectLiveReloadRoute\nlive-session: strategy case"];
+    host_stack_factory [label="HostStackFactory\nopen / close / in-window reload"];
+    supervisor_adapter [label="withHostStackSupervisorAdapter\nactive stack IORef"];
+    reload_supervised [label="reloadSupervised\nCommitted / RejectedLiveFallback /\nTerminal close+reopen fallback"];
+    real_open_close [label="realOpen / realClose\nSessionFanInService + audio + ingress"];
+    stopped_stack_ops [label="realStoppedAudioHostStackOps"];
+    preserving_stack_ops [label="realPreservingHostStackOps"];
+    try_stack_ops [label="realTryPreservingHostStackOps\npreserving + stopped fallback"];
+  }
+
+  subgraph cluster_hot_swap {
+    label="Command-level hot-swap runtime path";
+    color="#22c55e";
+
+    cmd_generic_hot_swap [label="CmdHotSwap\npattern/UI hot swap\nallow rebuild fallback"];
+    admit_hot_swap [label="admit/apply SessionCommand\nCmdHotSwap* -> PlanHotSwap\nHotSwapInstallMode"];
     run_hot_swap [label="RTGraphAdapter.runHotSwap"];
     preserving_probe [label="preservingHotSwapPlan\ncurrent RTGraphAdapterState +\ntarget TemplateGraph + resolve preview"];
     preserving_builder [label="installPreservingHotSwap\nprepare next world"];
     live_protocol [label="runLiveHotSwapProtocol\nread generation -> acquire -> publish ->\nwait -> collect retired stats -> verify"];
     scripted_preserving [label="scripted preserving path\nwhen audio is not running"];
-    fallback_clear [label="non-preserving fallback\ninstallSessionGraph\nstop/clear/rebuild", fillcolor="#fff7ed"];
+    preserving_only_reject [label="HotSwapPreservingOnly +\nno preserved bindings\nSriHotSwapRebuildForbidden", fillcolor="#fff7ed"];
+    fallback_clear [label="HotSwapAllowRebuild +\nno preserved bindings\ninstallSessionGraph\nrt_graph_clear stop/clear/rebuild", fillcolor="#fff7ed"];
     owner_divergence [label="SessionOwner divergence\non install failure / backend stopped /\ncommit mismatch / protocol bug", fillcolor="#fef2f2"];
   }
 
-  subgraph cluster_missing {
-    label="Not landed yet";
-    color="#64748b";
-    style="dashed";
+  subgraph cluster_events {
+    label="Operator-visible event streams";
+    color="#fb7185";
 
-    preserving_only_mode [label="preserving-only command or strategy\nmust not fall back to stop/clear", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
-    preserving_manifest_helper [label="reloadManifestSessionPreservingHotSwap\nmissing session helper", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
-    host_preserving_ops [label="HostPreservingReloadOps\neligibility/fence/submit/wait/verify/rebind", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
-    strategy_selector [label="host strategy selector\nprefer preserving -> explicit fallback", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
-    binding_rebuild [label="producer/listener binding rebuild contract\nstill missing", style="rounded,dashed,filled", fillcolor="#f1f5f9"];
+    preflight_events [label="ManifestPreflightEvent\nresolver-stage started / rejected / succeeded\n(catalog-missed or plan-rejected)"];
+    manifest_events [label="ManifestReloadEvent\nstrategy + phase + resume + fallback"];
+    supervisor_events [label="SupervisedReloadEvent\nin-window + close/open recovery"];
   }
 
   authoring_doc -> plan_manifest;
@@ -125,12 +161,19 @@ digraph hot_swap_reload_current_interaction {
   reload_request -> plan_manifest;
   plan_manifest -> reload_plan;
   reload_plan -> command_projection;
-  command_projection -> cmd_hot_swap;
+  command_projection -> cmd_preserving_hot_swap;
   reload_plan -> owner_options_projection;
+  reload_plan -> ingress_target;
 
   cli_plan -> plan_manifest;
   cli_construct -> construct_from_plan;
   cli_stopped_smoke -> reload_stopped;
+  cli_host_smoke -> strategy_selector [label="direct selector paths"];
+  cli_host_smoke -> stopped_stack_ops [label="StoppedAudioOnly route"];
+  cli_live_demo -> live_route_selector;
+  cli_live_session -> live_route_selector;
+  cli_live_session -> live_ingress;
+  cli_live_session -> preflight_events [label="resolver preflight\nbefore supervisor runs"];
 
   reload_plan -> construct_from_plan;
   construct_from_plan -> owner_options_projection;
@@ -139,6 +182,10 @@ digraph hot_swap_reload_current_interaction {
   new_adapter -> install_graph;
   install_graph -> rt_graph;
 
+  ingress_target -> ingress;
+  ingress_target -> live_ingress;
+  live_ingress -> ingress;
+
   fanin_service -> fanin_host;
   fanin_host -> session_queue;
   fanin_host -> session_owner;
@@ -146,44 +193,70 @@ digraph hot_swap_reload_current_interaction {
   session_owner -> step_owner;
   step_owner -> session_step;
   session_step -> session_state;
-  session_step -> cmd_hot_swap [style=dotted, label="when command is hot-swap"];
+
+  strategy_selector -> reload_preserving_host [label="preserving phase"];
+  strategy_selector -> fallback_gate [label="try-preserving decision"];
+  fallback_gate -> reload_host [label="admitted fallback"];
+  strategy_selector -> reload_host [label="stopped-audio phase"];
+  strategy_selector -> manifest_events;
 
   reload_host -> host_ops;
   host_ops -> stopped_orchestrator;
   stopped_orchestrator -> plan_manifest [label="prepare plan"];
-  stopped_orchestrator -> ingress [label="quiesce"];
+  stopped_orchestrator -> ingress [label="quiesce / reopen"];
   stopped_orchestrator -> quiesce_drain [label="drain live queue"];
   quiesce_drain -> fanin_service;
   stopped_orchestrator -> audio_lifecycle [label="stop old / start new"];
   stopped_orchestrator -> reload_stopped [label="with audio stopped"];
+  stopped_orchestrator -> manifest_events;
   reload_stopped -> owner_options_projection;
   reload_stopped -> fanin_reload;
   fanin_reload -> fanin_host;
   fanin_reload -> release_acquire;
   release_acquire -> session_owner;
-  stopped_orchestrator -> ingress [label="reopen or resume"];
 
-  cmd_hot_swap -> admit_hot_swap;
+  reload_preserving_host -> preserving_host_ops;
+  preserving_host_ops -> preserving_orchestrator;
+  preserving_orchestrator -> plan_manifest [label="prepare plan"];
+  preserving_orchestrator -> ingress [label="quiesce / resume / reopen"];
+  preserving_orchestrator -> quiesce_drain [label="quiesce service + final drain"];
+  preserving_orchestrator -> reload_preserving [label="submit after clean handoff"];
+  preserving_orchestrator -> manifest_events;
+  reload_preserving -> cmd_preserving_hot_swap;
+  reload_preserving -> fanin_host [label="enqueue + drain same owner"];
+
+  live_route_selector -> stopped_stack_ops [label="StoppedAudioOnly"];
+  live_route_selector -> try_stack_ops [label="TryPreservingThenStoppedAudio"];
+  live_route_selector -> preserving_stack_ops [label="RequirePreserving"];
+  stopped_stack_ops -> host_stack_factory;
+  preserving_stack_ops -> host_stack_factory;
+  try_stack_ops -> host_stack_factory;
+  host_stack_factory -> supervisor_adapter;
+  supervisor_adapter -> reload_supervised [label="SupervisorOps"];
+  reload_supervised -> host_stack_factory [label="drive in-window / recovery"];
+  reload_supervised -> real_open_close [label="terminal close+reopen fallback"];
+  reload_supervised -> supervisor_events;
+  real_open_close -> fanin_service;
+  real_open_close -> ingress;
+  real_open_close -> audio_lifecycle;
+  stopped_stack_ops -> stopped_orchestrator [label="in-window"];
+  preserving_stack_ops -> preserving_orchestrator [label="in-window"];
+  try_stack_ops -> preserving_orchestrator [label="first phase"];
+  try_stack_ops -> stopped_orchestrator [label="admitted fallback"];
+
+  cmd_generic_hot_swap -> admit_hot_swap;
+  cmd_preserving_hot_swap -> admit_hot_swap;
   admit_hot_swap -> session_step;
-  session_step -> run_hot_swap;
-  run_hot_swap -> preserving_probe [label="if preserved bindings exist"];
-  preserving_probe -> preserving_builder;
+  session_step -> run_hot_swap [label="PlanHotSwap"];
+  run_hot_swap -> preserving_probe [label="if resolve preview has preserved bindings"];
+  preserving_probe -> preserving_builder [label="supported graph/voice shape"];
   preserving_builder -> live_protocol [label="if audio running"];
   preserving_builder -> scripted_preserving [label="if audio stopped"];
   live_protocol -> rt_graph;
   scripted_preserving -> rt_graph;
-  run_hot_swap -> fallback_clear [label="if no preserved bindings"];
+  run_hot_swap -> preserving_only_reject [label="no preserved bindings + preserving-only"];
+  run_hot_swap -> fallback_clear [label="no preserved bindings + allow-rebuild"];
   fallback_clear -> install_graph;
   run_hot_swap -> owner_divergence [style=dashed, label="terminal failures"];
   session_owner -> owner_divergence [style=dashed];
-
-  reload_plan -> preserving_manifest_helper [style=dashed, label="future input"];
-  preserving_manifest_helper -> preserving_only_mode [style=dashed];
-  preserving_only_mode -> cmd_hot_swap [style=dashed];
-  preserving_manifest_helper -> fanin_host [style=dashed, label="future locked step"];
-  host_preserving_ops -> preserving_manifest_helper [style=dashed];
-  host_preserving_ops -> ingress [style=dashed, label="reuse close/open policy"];
-  host_preserving_ops -> binding_rebuild [style=dashed];
-  strategy_selector -> host_preserving_ops [style=dashed];
-  strategy_selector -> reload_host [style=dashed, label="explicit stopped-audio fallback"];
 }
