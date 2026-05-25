@@ -202,6 +202,7 @@ executables:
       - MetaSonic.App.ManifestReloadUIIngress
       - MetaSonic.App.Osc
       - MetaSonic.App.ProfitabilityGate
+      - MetaSonic.App.SessionMidiArbitrationSmoke
       - MetaSonic.App.SessionMidiSmoke
       - MetaSonic.App.SessionOscArbitrationSmoke
       - MetaSonic.App.SnapshotCheck

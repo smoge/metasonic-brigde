@@ -45,6 +45,8 @@ import           MetaSonic.App.ManifestReloadHost
                                             (ManifestReloadHostStrategy (..))
 import           MetaSonic.App.Osc          (runOscListen)
 import           MetaSonic.App.SessionMidiSmoke (runSessionMidiSmoke)
+import           MetaSonic.App.SessionMidiArbitrationSmoke
+                                             (runSessionMidiArbitrationSmoke)
 import           MetaSonic.App.SessionOscArbitrationSmoke
                                              (runSessionOscArbitrationSmoke)
 import           MetaSonic.App.SnapshotCheck (runSnapshotCheck)
@@ -127,6 +129,13 @@ data RunMode
     -- Opens the session-backed PortMIDI source, runs it through the
     -- decoded MIDI listener and fan-in service, and reports producer /
     -- drain activity. Targets are ignored.
+  | SessionMidiArbitrationSmoke
+    -- ^ Scripted non-audio smoke mode
+    -- (--session-midi-arbitration-smoke). Feeds a fixed MIDI script
+    -- (note-on, CC, all-notes-off fence) through the arbitrated MIDI
+    -- listener and a service whose gateway pre-claims the CC target for
+    -- 'ProducerPattern', then asserts listener / service arbitration
+    -- counters and the fence-drop outcome. Targets are ignored.
   | SessionOscArbitrationSmoke
     -- ^ Manual non-audio smoke mode
     -- (--session-osc-arbitration-smoke [SECONDS]). Binds an OSC
@@ -499,6 +508,8 @@ parseArgs = go defaultOptions
           go opts { optMode = SessionMidiSmoke
                   , optSessionMidiSmokeSeconds = seconds
                   } rest
+    go opts ("--session-midi-arbitration-smoke" : xs) =
+      go opts { optMode = SessionMidiArbitrationSmoke } xs
     go opts ("--session-osc-arbitration-smoke" : xs) =
       case takeSessionOscSmokeSeconds xs of
         Left err              -> Left err
@@ -648,6 +659,7 @@ usage prog = unlines
   , "  " <> prog <> " --manifest-midi-reload-smoke MANIFEST.json DEMO"
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke [SECONDS]"
+  , "  " <> prog <> " --session-midi-arbitration-smoke"
   , "  " <> prog <> " --session-osc-arbitration-smoke [SECONDS]"
   , "  " <> prog <> " --plugin-list"
   , "  " <> prog <> " --osc-listen [PORT]"
@@ -880,6 +892,15 @@ usage prog = unlines
   , "                   session commands were observed. When --midi-device is"
   , "                   omitted, the first input-capable device is selected."
   , "                   Default window is 10 seconds; demo targets are ignored."
+  , "  --session-midi-arbitration-smoke"
+  , "                   Scripted non-audio probe for the explicit session MIDI"
+  , "                   arbitration path. Runs a fixed MIDI script"
+  , "                   (note-on, CC, all-notes-off fence) through"
+  , "                   MetaSonic.Session.MIDIListener over a service whose"
+  , "                   gateway pre-claims the CC target for ProducerPattern,"
+  , "                   then asserts listener/service arbitration counters and"
+  , "                   fence-drop outcome. Exits non-zero on any mismatch."
+  , "                   Takes no arguments; demo targets are ignored."
   , "  --session-osc-arbitration-smoke [SECONDS]"
   , "                   Manual non-audio probe for the explicit session OSC"
   , "                   arbitration path. Binds a UDP listener, routes decoded"
@@ -922,6 +943,7 @@ usage prog = unlines
   , "  " <> prog <> " --midi-list"
   , "  " <> prog <> " --session-midi-smoke 10"
   , "  " <> prog <> " --midi-device 2 --session-midi-smoke 10"
+  , "  " <> prog <> " --session-midi-arbitration-smoke"
   , "  " <> prog <> " --session-osc-arbitration-smoke 10"
   , "  " <> prog <> " --manifest-reload-plan send-return"
   , "  " <> prog <> " --manifest-reload-plan-file manifest.json send-return"
@@ -1138,6 +1160,8 @@ main = do
       runSessionMidiSmoke
         (optMidiDevice opts)
         (optSessionMidiSmokeSeconds opts)
+    SessionMidiArbitrationSmoke ->
+      runSessionMidiArbitrationSmoke
     SessionOscArbitrationSmoke ->
       runSessionOscArbitrationSmoke
         (optSessionOscSmokeSeconds opts)
@@ -1514,6 +1538,7 @@ runDemo opts demo
     || optMode opts == OscListen
     || optMode opts == MidiList
     || optMode opts == SessionMidiSmoke
+    || optMode opts == SessionMidiArbitrationSmoke
     || optMode opts == SessionOscArbitrationSmoke
     || optMode opts == PluginList
     || optMode opts == AuthoringManifest
@@ -1593,6 +1618,8 @@ runSingleDemo opts demo g = do
       error "runSingleDemo: MidiList should be handled by main, never reach here"
     SessionMidiSmoke ->
       error "runSingleDemo: SessionMidiSmoke should be handled by main, never reach here"
+    SessionMidiArbitrationSmoke ->
+      error "runSingleDemo: SessionMidiArbitrationSmoke should be handled by main, never reach here"
     SessionOscArbitrationSmoke ->
       error "runSingleDemo: SessionOscArbitrationSmoke should be handled by main, never reach here"
     PluginList ->
