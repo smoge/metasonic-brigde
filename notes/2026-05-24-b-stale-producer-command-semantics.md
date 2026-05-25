@@ -59,6 +59,63 @@ callback, `MrePreservingReloadCommitted` fires *after*
 reaching the just-reopened ingress can drain against an empty
 snapshot — the exact stale-by-reload case the slice exposes.
 
+## Manual live-session evidence: 2026-05-25
+
+The runtime hook was validated with a real `--manifest-live-session`
+operator smoke.
+
+Commands:
+
+```sh
+stack exec -- metasonic-bridge --authoring-manifest send-return named-control \
+  > /tmp/metasonic-stale-by-reload.json
+
+script -q /tmp/metasonic-stale-by-reload-smoke.log -c 'stack exec -- metasonic-bridge --session-osc-port 17005 --manifest-live-session /tmp/metasonic-stale-by-reload.json send-return --strategy try-preserving'
+
+python3 tools/send_osc.py --port 17005 --address /fx/cutoff/1 --value 1500.0 --verbose
+python3 tools/send_osc.py --port 17005 --address /v0/cutoff/1 --value 1600.0 --verbose
+```
+
+The session started `send-return` with two voices:
+
+```text
+voice -> enqueued ... VoiceKey ... "v0"
+fx -> enqueued ... VoiceKey ... "fx"
+```
+
+Reloading with `demo named-control` used `try-preserving`, rejected the
+preserving path, admitted fallback, committed stopped-audio, and
+published the retired set:
+
+```text
+supervised outcome: committed (new plan installed)
+reload events:
+  - preserving phase rejected: reload-rejected (old owner still installed)
+  - fallback admitted: reload-rejected (old owner still installed)
+  - stopped-audio phase committed
+retired bindings:
+  - all 2 voices retired by owner replacement
+```
+
+Sending `/fx/cutoff/1` after the reload proved the new OSC target could
+decode the command while fan-in attributed the retired `fx` voice to the
+reload:
+
+```text
+osc accept: /fx/cutoff/1 name="cutoff" value=1500
+stale-by-reload commands:
+  - osc control-write voice=fx tag=ControlTag {ctNodeTag = MigrationKey {unMigrationKey = "cutoff"}, ctSlot = 1}  -> reload retired voice "fx" (owner-replaced)
+```
+
+Sending `/v0/cutoff/1` then proved the current voice still accepts
+normally without a stale-by-reload block:
+
+```text
+osc accept: /v0/cutoff/1 name="cutoff" value=1600
+```
+
+Transcript: `/tmp/metasonic-stale-by-reload-smoke.log`.
+
 The driving consumer is
 [`runManifestLiveSession`](../app/MetaSonic/App/ManifestLiveSession.hs).
 Its module header explicitly defers stale-command semantics: "No new

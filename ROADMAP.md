@@ -4097,7 +4097,12 @@ Still gated:
   `ReloadStopped` / `ReloadPreserving` and `StartNewAudio` /
   `ResumeService`); the event tests assert the callback fires
   before `hproResumeService` / `hsaroStartNewAudio` with the same
-  payload the commit event later carries. Design note:
+  payload the commit event later carries. A manual live-session smoke
+  on 2026-05-25 confirmed the operator path: `send-return ->
+  named-control` under `try-preserving` retired `v0` and `fx` by
+  owner replacement, `/fx/cutoff/1` printed the expected
+  `stale-by-reload commands:` attribution, and `/v0/cutoff/1`
+  remained a normal accepted write. Design note:
   [notes/2026-05-24-b-stale-producer-command-semantics.md](notes/2026-05-24-b-stale-producer-command-semantics.md).
   Residual watch items only — physical controller or VMPK-GUI-specific
   confirmation for the same `hasDevice == True` operator boundary,
