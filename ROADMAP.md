@@ -4195,11 +4195,19 @@ Still gated:
   `runManifestLiveSession`, no watchdog above the session, no
   auto-retry / cooldown / persistent cross-run state, and no new
   event families unless a renderer slice surfaces a real gap.
-  Implementation slice keeps the live-session loop alive past
-  `SupervisedReloadEscalated`, adds a diverged-state IORef
-  alongside the existing tracking refs, renders
-  `no live stack: repair required` in `status`, and gates
-  reload/set/controls/values commands while diverged.
+  Slice 1 landed as `f6c0ec0` (loop stays alive past
+  `SupervisedReloadEscalated`, diverged-state IORef alongside
+  the existing tracking refs, `no live stack: repair required`
+  block in `status`, dispatch gate refuses reload/set/controls/
+  values while diverged) plus the doc-tense cleanup `f0de6ba`.
+  Operator-facing transcript evidence — one escalation event plus
+  the diverged gate policy / refusal text, captured from the
+  production supervisor and renderers — in
+  [Supervision v1 Slice 1 — Operator Transcript Smoke](notes/2026-05-25-g-supervision-slice-1-smoke.md).
+  The bullet stays unchecked because the lane also covers
+  operator-driven repair (a future explicit `repair` command that
+  re-runs the substrate's `realOpen` from the diverged state),
+  which is not started yet.
   `ManifestReloadGraphEvent` / `SessionVoiceAllocationEvent`
   stay deferred behind the same consumer-gate the 2026-05-25-b
   note set.

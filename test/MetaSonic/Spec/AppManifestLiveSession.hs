@@ -19,7 +19,7 @@ import           Data.IORef                 (IORef, modifyIORef',
                                              writeIORef)
 import qualified Data.List                  as L
 import qualified Data.Map.Strict            as M
-import           System.Exit                (ExitCode (..))
+import           System.IO                  (hPutStrLn, stderr)
 import           Test.Tasty
 import           Test.Tasty.HUnit
 
@@ -1786,6 +1786,100 @@ supervisionDivergedTests =
         ("unexpected 'no live stack: repair required' header in:\n"
          <> unlines output)
         (not ("    no live stack:     repair required" `elem` output))
+
+  , testCase "supervision slice 1 operator transcript (end-to-end, sink-captured)" $ do
+      -- Operator-facing evidence smoke for supervision-v1 slice 1.
+      -- Drives the deliberate supervisor escalation branch
+      -- (InWindowReloadTerminal + Left from sopsOpenStack, NOT the
+      -- onException path) through the production
+      -- 'reloadSupervisedWithEvents' + 'runReloadWithSink' +
+      -- 'printStatusWith' plus the exported gate predicate and
+      -- refusal text. The substrate is stubbed; the supervisor and
+      -- renderers are real. The local 'sessionLoop' dispatch branch
+      -- is not exercised end-to-end here.
+      --
+      -- The captured transcript is echoed to stderr (tasty does
+      -- not suppress stderr) so an out-of-band smoke run can extract
+      -- it between the BEGIN/END markers; see
+      -- 'notes/2026-05-25-g-supervision-slice-1-smoke.md' for the
+      -- transcript-as-evidence and the regeneration recipe.
+      sinkRef <- newIORef ([] :: [String])
+      let sink line = modifyIORef' sinkRef (<> [line])
+          banner b = do
+            sink ""
+            sink ("== " <> b <> " ==")
+            sink ""
+      currentPlanRef   <- newIORef (mkPlan "preserve-cutoff-dark")
+      lastOutcomeRef   <- newIORef (Nothing :: Maybe LiveSessionOutcome)
+      eventsRef        <- newIORef ([] :: [LiveEvent])
+      audioEventsRef   <- newIORef ([] :: [LiveAudioEvent])
+      lastRetiredRef   <- newIORef M.empty
+      divergedStateRef <- newIORef Nothing
+      trackedStackRef  <- newIORef (Nothing :: Maybe LiveStack)
+      let resolver = ReloadResolver $ \k ->
+            Right (mkPlan k)
+          supOps :: SupervisorOps MR.ManifestReloadPlan String
+          supOps = SupervisorOps
+            { sopsInWindowReload = \_ _ ->
+                pure (InWindowReloadTerminal "in-window-cause")
+            , sopsCloseStack     = pure ()
+            , sopsOpenStack      = const (pure (Left "rebuild-cause"))
+            }
+      banner "operator types: demo:preserve-cutoff-bright"
+      _ <- runReloadWithSink
+            sink resolver MR.mrlpDemoKey id (\_ -> pure ()) supOps
+            currentPlanRef lastOutcomeRef eventsRef audioEventsRef
+            lastRetiredRef divergedStateRef
+            "preserve-cutoff-bright"
+      sink ""
+      -- Hand-written annotation. 'runReloadWithSink' writes
+      -- "live session escalated: no live stack remains." directly
+      -- to stderr (see ManifestLiveSession.hs L1615-L1616); the
+      -- actual stderr write is not part of this sink capture. The
+      -- '(stderr) ...' mirror below is emitted into the sink for
+      -- transcript readability, so the operator-facing timeline in
+      -- the evidence note shows where the stderr line lands
+      -- relative to the captured stdout-shaped flow.
+      sink "(stderr) live session escalated: no live stack remains."
+      banner "operator types: status"
+      printStatusWith sink trackedStackRef currentPlanRef
+                      lastOutcomeRef divergedStateRef
+      let gatedCommands =
+            [ ( "demo:preserve-cutoff-bright"
+              , LscReloadTo "preserve-cutoff-bright" )
+            , ( "set lpf 1500"
+              , LscUISet (ControlTag (MigrationKey "lpf") 0) 1500.0 )
+            , ( "controls", LscControls )
+            , ( "values",   LscValues )
+            ]
+          openCommands =
+            [ ( "status", LscStatus )
+            , ( "demos",  LscDemos )
+            , ( "help",   LscHelp )
+            , ( "quit",   LscQuit )
+            ]
+      sequence_
+        [ do banner ("operator types: " <> label)
+             if liveSessionCommandIsGatedWhileDiverged cmd
+               then mapM_ sink liveSessionDivergedRefusal
+               else sink "(passes the diverged gate; would be dispatched)"
+        | (label, cmd) <- gatedCommands <> openCommands
+        ]
+      transcript <- unlines <$> readIORef sinkRef
+      hPutStrLn stderr "<<<SUPERVISION-SLICE-1-TRANSCRIPT-BEGIN>>>"
+      hPutStrLn stderr transcript
+      hPutStrLn stderr "<<<SUPERVISION-SLICE-1-TRANSCRIPT-END>>>"
+      let mustContain marker =
+            assertBool ("missing operator-facing marker: " <> marker)
+              (marker `L.isInfixOf` transcript)
+      mustContain "supervised outcome: escalated (no live stack)"
+      mustContain "in-window cause: in-window-cause"
+      mustContain "rebuild cause:   rebuild-cause"
+      mustContain "    no live stack:     repair required"
+      mustContain "  no live stack: repair required."
+      mustContain "  this command is unavailable while the session is diverged."
+      mustContain "  available commands: status, demos, help, quit."
+      mustContain "(passes the diverged gate; would be dispatched)"
   ]
   where
     elemIndex' needle =

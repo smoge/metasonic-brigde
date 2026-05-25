@@ -253,3 +253,16 @@ proves a real gap. Implementation deferred to a follow-up slice
 that keeps the live-session loop alive past
 `SupervisedReloadEscalated`.* The bullet stays unchecked until
 that slice lands.
+
+## Slice 1 landed
+
+The implementation slice sketched in §"Likely v1 implementation
+slice (post-note)" landed as `f6c0ec0` (loop-alive change,
+diverged-state IORef, status-block render, dispatch gate) plus
+the doc-tense cleanup in `f0de6ba`. Operator-facing transcript
+evidence — one escalation event plus the diverged gate policy /
+refusal text captured from the production supervisor and renderers
+— is in
+[Supervision v1 Slice 1 — Operator Transcript Smoke](2026-05-25-g-supervision-slice-1-smoke.md).
+The repair-command follow-up (operator-driven re-open of the
+substrate from the diverged state) is still unstarted.
