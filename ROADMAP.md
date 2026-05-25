@@ -4152,8 +4152,19 @@ Still gated:
   session's operator output; see
   [Stale Producer Command Semantics](notes/2026-05-24-b-stale-producer-command-semantics.md)
   for the design and the 2026-05-25 manual smoke evidence recorded
-  there. Compile-error surfacing and allocation/resource recovery
-  streaming remain open and consumer-gated — see
+  there. Compile-error surfacing has a v1 in the live session: the
+  resolver-stage preflight event family
+  (`MetaSonic.App.ManifestPreflightEvent`) emits a
+  started → rejected/succeeded timeline around the `ReloadResolver`
+  call in `runReloadWithSink`, with rejection structured as
+  `MprrCatalogMissed` / `MprrPlanRejected` and an operator-facing
+  `preflight events:` block rendered ahead of `reload events:`. The
+  design is in
+  [Manifest Reload Preflight Event Semantics](notes/2026-05-25-a-manifest-reload-preflight-event-semantics.md);
+  the orchestrator-stage `HpariPlanRejected` / `HsariPlanRejected`
+  in-phase rejection events are unchanged for v1 and remain a
+  later-slice question. Allocation/resource recovery streaming
+  remains open and consumer-gated — see
   [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md).
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.

@@ -162,6 +162,7 @@ executable metasonic-bridge
       MetaSonic.App.ManifestMIDIReloadSmoke
       MetaSonic.App.ManifestOSCIngressOps
       MetaSonic.App.ManifestOSCListener
+      MetaSonic.App.ManifestPreflightEvent
       MetaSonic.App.ManifestReloadIngress
       MetaSonic.App.ManifestReloadIngressTarget
       MetaSonic.App.ManifestReloadMIDIBinding
@@ -230,6 +231,7 @@ test-suite metasonic-bridge-test
       MetaSonic.App.ManifestMIDIReloadSmoke
       MetaSonic.App.ManifestOSCIngressOps
       MetaSonic.App.ManifestOSCListener
+      MetaSonic.App.ManifestPreflightEvent
       MetaSonic.App.ManifestReloadIngress
       MetaSonic.App.ManifestReloadIngressTarget
       MetaSonic.App.ManifestReloadMIDIBinding

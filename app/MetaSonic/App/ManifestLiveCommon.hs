@@ -99,6 +99,10 @@ module MetaSonic.App.ManifestLiveCommon
     -- * Reload-event timeline
   , renderLiveReloadEvents
 
+    -- * Preflight-event timeline (resolver-stage)
+  , renderPreflightEvents
+  , renderPreflightRejectionReason
+
     -- * Retired-binding rendering (Phase 8h step 3e v1 slice 2)
   , retiredBindingsFromEvents
   , renderRetiredBindings
@@ -220,6 +224,9 @@ import           MetaSonic.App.ManifestReloadCli
                                                  readManifestReloadDocFile,
                                                  renderManifestReloadCliIssue,
                                                  renderSmokeReloadEvent)
+import           MetaSonic.App.ManifestPreflightEvent
+                                                (ManifestPreflightEvent (..),
+                                                 PreflightRejectionReason (..))
 import           MetaSonic.App.ManifestReloadEvent
                                                 (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
@@ -711,6 +718,39 @@ renderLiveReloadEvents events =
       ["    (none)"]
     _ ->
       map renderSmokeReloadEvent events
+
+
+-- | Render the per-run resolver-stage preflight timeline as a compact
+-- bullet list. Mirrors 'renderLiveReloadEvents' in shape so the two
+-- blocks can be printed in sequence with consistent indentation.
+--
+-- Empty list renders as a single @(none)@ row so the caller can keep
+-- the @preflight events:@ header in place regardless of whether any
+-- events were emitted.
+renderPreflightEvents :: [ManifestPreflightEvent] -> [String]
+renderPreflightEvents events =
+  case events of
+    [] ->
+      ["    (none)"]
+    _ ->
+      map renderPreflightEvent events
+  where
+    renderPreflightEvent (MpeStarted key) =
+      "    - preflight started: " <> show key
+    renderPreflightEvent (MpeRejected key reason) =
+      "    - preflight rejected: " <> show key
+        <> " (" <> renderPreflightRejectionReason reason <> ")"
+    renderPreflightEvent (MpeSucceeded key) =
+      "    - preflight succeeded: " <> show key
+
+
+-- | Operator-facing label for a 'PreflightRejectionReason'. Stable
+-- strings so test fixtures can pin them without depending on 'Show'.
+renderPreflightRejectionReason :: PreflightRejectionReason -> String
+renderPreflightRejectionReason MprrCatalogMissed =
+  "catalog-missed"
+renderPreflightRejectionReason (MprrPlanRejected detail) =
+  "plan-rejected: " <> detail
 
 
 -- | Phase 8h step 3e v1 slice 2: scan a reload-event timeline for

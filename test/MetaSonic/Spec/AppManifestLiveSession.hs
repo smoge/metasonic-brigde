@@ -17,6 +17,7 @@ import           Control.Exception          (SomeException, try)
 import           Data.IORef                 (IORef, modifyIORef',
                                              newIORef, readIORef,
                                              writeIORef)
+import qualified Data.List                  as L
 import qualified Data.Map.Strict            as M
 import           System.Exit                (ExitCode (..))
 import           Test.Tasty
@@ -41,6 +42,8 @@ import           MetaSonic.App.ManifestLiveSession
                                              withTrackedFactory)
 import           MetaSonic.App.ManifestLiveIngressOps
                                             (LiveProdIngressIssue)
+import           MetaSonic.App.ManifestPreflightEvent
+                                            (PreflightRejectionReason (..))
 import           MetaSonic.App.ManifestReloadEvent
                                             (ManifestReloadEvent (..))
 import           MetaSonic.App.ManifestReloadHost
@@ -675,18 +678,25 @@ noHook _ = pure ()
 
 
 -- | A stub resolver that maps a fixed key → @Right plan@ and
--- everything else → @Left reason@.
+-- everything else → a 'MprrPlanRejected' synthetic rejection. The
+-- mismatched-key path mirrors a planner-style rejection rather than
+-- a catalog miss; tests that need the catalog-miss path build the
+-- 'MprrCatalogMissed' reason inline.
 stubResolver :: String -> StubPlan -> ReloadResolver StubPlan
 stubResolver okKey okPlan = ReloadResolver $ \key ->
   if key == okKey
     then Right okPlan
-    else Left ("stub-resolver: no plan for key " <> show key)
+    else Left (MprrPlanRejected
+                 ("stub-resolver: no plan for key " <> show key))
 
 
--- | A stub resolver that always rejects (used for the
--- planning-failure case that is independent of the catalog).
+-- | A stub resolver that always rejects with a planner-style reason
+-- (used for the planning-failure case that is independent of the
+-- catalog). Wraps the caller's text into 'MprrPlanRejected' so the
+-- existing 'String'-keyed call sites keep working.
 stubAlwaysReject :: String -> ReloadResolver StubPlan
-stubAlwaysReject reason = ReloadResolver (const (Left reason))
+stubAlwaysReject reason =
+  ReloadResolver (const (Left (MprrPlanRejected reason)))
 
 
 runReloadWithTests :: [TestTree]
@@ -752,8 +762,7 @@ runReloadWithTests =
           Just (LsoPlanRejected reason) ->
             assertBool
               ("rejection reason should contain the resolver's text; got: " <> reason)
-              ("manifest does not name this demo" `elem` words reason
-               || reason == "manifest does not name this demo")
+              ("manifest does not name this demo" `L.isInfixOf` reason)
           other ->
             assertFailure $
               "expected Just (LsoPlanRejected ...); got " <> show other
@@ -1214,6 +1223,153 @@ runReloadWithTests =
         -- so the assertion is meaningful (not vacuously testing
         -- against the at-start clear).
         leadRetired `seq` pure ()
+
+  , testCase "Phase 8h step 3e v2 slice 1: unknown key emits preflight rejection block and does NOT call supervisor" $ do
+      -- The resolver-stage preflight slice closes the gap where a
+      -- resolver-Left used to print only 'reload rejected: <text>'
+      -- with no operator-visible event timeline. The new contract:
+      -- a 'preflight events:' block always renders, even on the
+      -- short-circuit Left path, and the supervisor is still not
+      -- invoked.
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+        outputRef <- newIORef ([] :: [String])
+        let captureOutput s =
+              modifyIORef' outputRef (<> [s])
+            blockingSupOps :: SupervisorOps StubPlan String
+            blockingSupOps = SupervisorOps
+              { sopsInWindowReload = \_ _ ->
+                  assertFailure
+                    "supOps should not be called on resolver-stage rejection"
+              , sopsCloseStack =
+                  assertFailure
+                    "sopsCloseStack should not run on resolver-stage rejection"
+              , sopsOpenStack  = \_ ->
+                  assertFailure
+                    "sopsOpenStack should not run on resolver-stage rejection"
+              }
+            -- Catalog-miss style rejection: 'MprrCatalogMissed'
+            -- with no planner-detail string.
+            resolver = ReloadResolver $ \_ ->
+              Left MprrCatalogMissed :: Either PreflightRejectionReason StubPlan
+        step <- runReloadWithSink
+                  captureOutput
+                  resolver
+                  show
+                  show
+                  noHook
+                  blockingSupOps
+                  currentPlanRef
+                  lastOutcomeRef
+                  eventsRef
+                  lastRetiredRef
+                  "unknown"
+        step @?= SsContinue
+        output <- readIORef outputRef
+        -- Preflight header must be present.
+        assertBool
+          ("missing 'preflight events:' header in captured output:\n"
+           <> unlines output)
+          ("  preflight events:" `elem` output)
+        -- Started + rejected bullets must both appear, in that
+        -- order, with the catalog-miss reason label.
+        let startedRow  = "    - preflight started: \"unknown\""
+            rejectedRow = "    - preflight rejected: \"unknown\""
+                            <> " (catalog-missed)"
+            started  = elemIndex' startedRow  output
+            rejected = elemIndex' rejectedRow output
+        case (started, rejected) of
+          (Just iStarted, Just iRejected)
+            | iRejected > iStarted -> pure ()
+            | otherwise ->
+                assertFailure $
+                  "expected preflight rejected after started but got "
+                  <> "started@" <> show iStarted
+                  <> " rejected@" <> show iRejected
+                  <> "\nfull output:\n" <> unlines output
+          _ ->
+            assertFailure $
+              "missing started/rejected bullets in output:\n"
+              <> unlines output
+        -- The 'reload events:' block must NOT render on a
+        -- resolver-stage rejection — the supervisor never ran, so
+        -- there is no strategy lifecycle to report. (The slice
+        -- preserves the existing short-circuit; the alternative
+        -- contract of rendering with '(none)' is rejected because
+        -- it implies a strategy was selected.)
+        assertBool
+          ("'reload events:' header should not render on "
+           <> "resolver-stage rejection but found it; output:\n"
+           <> unlines output)
+          (not ("  reload events:" `elem` output))
+        -- Outcome must be 'LsoPlanRejected' carrying the legacy
+        -- catalog-miss text (with the requested key) so 'status'
+        -- reads continue to identify which key was rejected. The
+        -- preflight bullet above carries the short structured label;
+        -- the legacy outcome string is preserved verbatim.
+        outcome <- readIORef lastOutcomeRef
+        case outcome of
+          Just (LsoPlanRejected reason) ->
+            reason @?= "no demo named \"unknown\" in catalog"
+          other ->
+            assertFailure $
+              "expected Just (LsoPlanRejected "
+              <> "\"no demo named \\\"unknown\\\" in catalog\"); got "
+              <> show other
+
+  , testCase "Phase 8h step 3e v2 slice 1: known key emits preflight started/succeeded BEFORE reload events" $ do
+      -- The success-path ordering contract: 'preflight events:' is
+      -- always rendered ahead of 'reload events:' so the operator
+      -- transcript reads top-down through the lifecycle (preflight
+      -- → strategy lifecycle → retired bindings).
+      withSessionRefs 1 $ \_ currentPlanRef lastOutcomeRef eventsRef lastRetiredRef -> do
+        outputRef <- newIORef ([] :: [String])
+        let captureOutput s =
+              modifyIORef' outputRef (<> [s])
+            supOps :: SupervisorOps StubPlan String
+            supOps =
+              fakeSupOpsWithOutcome eventsRef InWindowReloadCommitted 7
+            resolver = stubResolver "next" (2 :: StubPlan)
+        step <- runReloadWithSink
+                  captureOutput
+                  resolver
+                  show
+                  show
+                  noHook
+                  supOps
+                  currentPlanRef
+                  lastOutcomeRef
+                  eventsRef
+                  lastRetiredRef
+                  "next"
+        step @?= SsContinue
+        output <- readIORef outputRef
+        let block label = elemIndex' label output
+        case (block "  preflight events:", block "  reload events:") of
+          (Just pre, Just rel)
+            | pre < rel -> pure ()
+            | otherwise ->
+                assertFailure $
+                  "expected 'preflight events:' before 'reload events:' "
+                  <> "but got preflight@" <> show pre
+                  <> " reload@" <> show rel
+                  <> "\nfull output:\n" <> unlines output
+          (Nothing, _) ->
+            assertFailure $
+              "missing 'preflight events:' header in captured output:\n"
+              <> unlines output
+          (_, Nothing) ->
+            assertFailure $
+              "missing 'reload events:' header in captured output:\n"
+              <> unlines output
+        -- Started + succeeded bullets must both appear with the key.
+        let startedRow   = "    - preflight started: \"next\""
+            succeededRow = "    - preflight succeeded: \"next\""
+        assertBool
+          ("missing preflight started bullet:\n" <> unlines output)
+          (startedRow `elem` output)
+        assertBool
+          ("missing preflight succeeded bullet:\n" <> unlines output)
+          (succeededRow `elem` output)
   ]
   where
     elemIndex' needle =

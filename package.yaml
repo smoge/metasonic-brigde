@@ -187,6 +187,7 @@ executables:
       - MetaSonic.App.ManifestMIDIReloadSmoke
       - MetaSonic.App.ManifestOSCIngressOps
       - MetaSonic.App.ManifestOSCListener
+      - MetaSonic.App.ManifestPreflightEvent
       - MetaSonic.App.ManifestReloadIngress
       - MetaSonic.App.ManifestReloadIngressTarget
       - MetaSonic.App.ManifestReloadMIDIBinding
@@ -241,6 +242,7 @@ tests:
       - MetaSonic.App.ManifestMIDIReloadSmoke
       - MetaSonic.App.ManifestOSCIngressOps
       - MetaSonic.App.ManifestOSCListener
+      - MetaSonic.App.ManifestPreflightEvent
       - MetaSonic.App.ManifestReloadIngress
       - MetaSonic.App.ManifestReloadIngressTarget
       - MetaSonic.App.ManifestReloadMIDIBinding

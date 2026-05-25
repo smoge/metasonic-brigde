@@ -147,6 +147,8 @@ import           MetaSonic.App.ManifestLiveCommon
                                                  renderLiveReloadEvents,
                                                  renderOSCControls,
                                                  renderOSCControlsWith,
+                                                 renderPreflightEvents,
+                                                 renderPreflightRejectionReason,
                                                  renderRetiredBindings,
                                                  retiredBindingsFromEvents,
                                                  retiredVoiceKeyMap,
@@ -185,6 +187,9 @@ import           MetaSonic.App.ManifestReloadCli
                                                  renderPreservingHostStackIssueTag,
                                                  renderStoppedAudioHostStackIssueTag,
                                                  renderTryPreservingHostStackIssueTag)
+import           MetaSonic.App.ManifestPreflightEvent
+                                                (ManifestPreflightEvent (..),
+                                                 PreflightRejectionReason (..))
 import           MetaSonic.App.ManifestReloadEvent
                                                 (ManifestReloadEvent)
 import           MetaSonic.App.ManifestReloadHost
@@ -1239,15 +1244,21 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
 -- 'AuthoringManifestDoc' + catalog fixture; tests construct a
 -- stub resolver and a stub plan type.
 newtype ReloadResolver plan = ReloadResolver
-  { resolvePlan :: String -> Either String plan
+  { resolvePlan :: String -> Either PreflightRejectionReason plan
   }
 
 
 -- | Production plan resolver: catalog lookup against 'demoTable',
 -- then 'planManifestReloadForDemo' against the loaded doc +
--- catalog. The rejection reason is the rendered CLI issue (for
--- planning failures) or a short \"no demo named …\" string (for
--- catalog misses).
+-- catalog. The rejection structures the failure as
+-- 'MprrCatalogMissed' (the requested key was not in the loaded
+-- catalog) or 'MprrPlanRejected' carrying the rendered CLI issue
+-- (the catalog resolved but the planner refused the demo). The
+-- distinction surfaces in the resolver-stage preflight event family;
+-- 'runReloadWithSink' renders both reasons through
+-- 'renderPreflightRejectionReason' and threads the rendered string
+-- into the existing 'LsoPlanRejected' outcome so legacy snapshots
+-- read identically.
 catalogPlanResolver
   :: AuthoringManifestDoc
   -> [MR.ManifestReloadCatalogEntry]
@@ -1255,11 +1266,11 @@ catalogPlanResolver
 catalogPlanResolver doc catalog = ReloadResolver $ \key ->
   case find (\d -> demoKey d == key) demoTable of
     Nothing ->
-      Left ("no demo named " <> show key <> " in catalog")
+      Left MprrCatalogMissed
     Just demo ->
       case planManifestReloadForDemo doc catalog demo of
         Left issue ->
-          Left (renderManifestReloadCliIssue issue)
+          Left (MprrPlanRejected (renderManifestReloadCliIssue issue))
         Right plan ->
           Right plan
 
@@ -1326,12 +1337,37 @@ runReloadWithSink
   -> String
   -> IO SessionStep
 runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps currentPlanRef lastOutcomeRef reloadEventsRef lastRetiredRef key =
+  -- Phase 8h step 3e v2 slice 1: emit a resolver-stage preflight
+  -- event timeline around the 'resolvePlan' call. The timeline is
+  -- always [Started, Rejected] or [Started, Succeeded]; the
+  -- 'preflight events:' block renders first so a resolver-stage
+  -- rejection still surfaces in the operator transcript even though
+  -- the supervisor never runs.
   case resolvePlan resolver key of
     Left reason -> do
-      output ("  reload rejected: " <> reason)
-      writeIORef lastOutcomeRef (Just (LsoPlanRejected reason))
+      let preflight = [MpeStarted key, MpeRejected key reason]
+          -- The preflight bullet renders the structured short label
+          -- ('catalog-missed' / 'plan-rejected: …'). The legacy
+          -- 'reload rejected:' line and 'LsoPlanRejected' outcome
+          -- keep the pre-slice wording so 'status' reads (and any
+          -- downstream parser that depends on the old text) stay
+          -- intact across the slice — preserving the requested key
+          -- on a catalog miss and the planner diagnostic on a plan
+          -- rejection.
+          legacyReason = case reason of
+            MprrCatalogMissed ->
+              "no demo named " <> show key <> " in catalog"
+            MprrPlanRejected detail ->
+              detail
+      output "  preflight events:"
+      mapM_ output (renderPreflightEvents preflight)
+      output ("  reload rejected: " <> legacyReason)
+      writeIORef lastOutcomeRef (Just (LsoPlanRejected legacyReason))
       pure SsContinue
     Right requestedPlan -> do
+      let preflight = [MpeStarted key, MpeSucceeded key]
+      output "  preflight events:"
+      mapM_ output (renderPreflightEvents preflight)
       fallbackPlan <- readIORef currentPlanRef
       writeIORef reloadEventsRef []
       -- Phase 8h step 3e v1 slice 4: clear the stale-attribution
