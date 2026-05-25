@@ -4301,7 +4301,10 @@ strategy selection, and the live-app reload policy boundary
 runtime `LiveAppReloadContext`, `projectLiveAppReloadPolicy`, and
 the `runManifestLiveSessionWithPolicy` entrypoint that `Main` now
 constructs an explicit policy for; the old `runManifestLiveSession`
-stays as a thin compatibility wrapper). Do not
+stays as a thin compatibility wrapper; the `AppManifestLivePolicy`
+spec covers the boundary's behavioral surface including a real-host
+`withSessionFanInHost` fixture that proves the policy's ingress
+profile reaches the context builder). Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration and live/host-level reload policy beyond the landed
 manifest diagnostic/construction-time v1, host strategy substrate, and

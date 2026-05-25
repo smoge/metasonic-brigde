@@ -396,7 +396,8 @@ after that, each gated on its own use case.
 The two-slice plan above (projector test, then wiring) has now
 landed; the planning paragraphs are kept for historical
 reference. "Slices landed" below records the realized state, and
-"Remaining gap" names the next code slice.
+"Boundary coverage closed" records that the deferred behavioral
+gap is now covered.
 
 ## Slices landed
 
@@ -422,25 +423,35 @@ reference. "Slices landed" below records the realized state, and
   that constructs `defaultLiveAppReloadPolicy`. `Main` was
   switched to the policy-native entrypoint. `just stack-test`
   passes 1578 tests after the wiring slice.
+- **Ingress-profile coverage slice (d112a53).** New test
+  "projected `rrhsiBuildIngressOps` threads policy ingress
+  profile through context builder" in
+  `MetaSonic.Spec.AppManifestLivePolicy`. Opens a real
+  `SessionFanInHost` via `withSessionFanInHost` over
+  `TemplateGraph [] M.empty` (no socket, no PortMIDI, no audio,
+  no supervisor), projects the policy, invokes
+  `rrhsiBuildIngressOps` to get the bundled ingress ops, drives
+  `mrioOpenIngress`, and asserts the `LiveIngressProfile`
+  captured inside the stub builder's closure equals
+  `larpIngressProfile policy`. The stub returns a sentinel
+  `LiveProdIngressIssue` so the `Left` payload is also pinned.
 
-## Remaining gap
+## Boundary coverage closed
 
-The first projector slice intentionally left
-`rrhsiBuildIngressOps` un-invoked — `SessionFanInHost`'s
-constructor is private, so a behavioral test of that callback
-needs a real host opened via `withSessionFanInHost` /
-`openSessionFanInHost` over a small fixture `TemplateGraph`.
-The next code slice will close that gap: drive the projected
-`rrhsiBuildIngressOps` with a real host and assert the
-policy's `LiveIngressProfile` reaches the context builder.
-No socket, no PortMIDI, no audio, no supervisor; just the
-ingress builder's profile threading. After that the
-boundary's behavioral surface is fully covered and the
-backlog reduces to use-case-gated feature slices (GUI
-binding, per-reload strategy changes, live arbitration
-opt-in, resource overrides, arbitration mutation), all of
-which stay gated on a concrete caller per the design note's
-non-goals.
+The deferred behavioral gap the earlier slices intentionally
+left — invoking `rrhsiBuildIngressOps` against a real
+`SessionFanInHost` to prove `LiveIngressProfile` reaches the
+context builder — is now closed by the coverage slice above.
+The boundary's behavioral surface (structural-equal sub-records,
+counter-confirmed IORef callbacks, composed drain hook,
+default-constructor round-trip, real-host ingress-profile
+threading) is fully covered.
+
+The backlog reduces to use-case-gated feature slices (GUI
+binding, per-reload strategy changes, live arbitration opt-in
+via the existing `LiveArbitrationProfile` field, resource
+overrides, arbitration mutation), all of which stay gated on a
+concrete caller per this note's non-goals.
 
 ## Open questions deferred to later notes
 
