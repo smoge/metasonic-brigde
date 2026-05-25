@@ -4204,10 +4204,20 @@ Still gated:
   the diverged gate policy / refusal text, captured from the
   production supervisor and renderers — in
   [Supervision v1 Slice 1 — Operator Transcript Smoke](notes/2026-05-25-g-supervision-slice-1-smoke.md).
-  The bullet stays unchecked because the lane also covers
-  operator-driven repair (a future explicit `repair` command that
-  re-runs the substrate's `realOpen` from the diverged state),
-  which is not started yet.
+  Slice 2 landed as `511eabd`: explicit operator-driven `repair`
+  command. `LscRepair` is allowed exactly when the session is in
+  the diverged state and dispatches a fresh
+  `sopsOpenStack currentPlan` through the supervisor adapter's
+  wrapped factory; on success the diverged-state IORef is cleared
+  and the same post-open hook recovered reloads use runs against
+  the current plan, on failure the divergence stays sticky with
+  the rendered cause recorded into a new `ldsLastRepairFailure`
+  field that `status` renders as a `last repair attempt failed:`
+  row. `demo:KEY` / `set` / `controls` / `values` remain refused
+  while diverged. The bullet stays unchecked pending an
+  operator-facing transcript smoke for slice 2 (open-success path
+  and open-failure path against the real production supervisor),
+  the analog of the 2026-05-25-g note for slice 1.
   `ManifestReloadGraphEvent` / `SessionVoiceAllocationEvent`
   stay deferred behind the same consumer-gate the 2026-05-25-b
   note set.

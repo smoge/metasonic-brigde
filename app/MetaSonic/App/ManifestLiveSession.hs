@@ -691,8 +691,10 @@ stepFromOutcome = \case
     -- causes into the diverged-state IORef, the 'status' renderer
     -- prints a 'no live stack: repair required' block, and the
     -- dispatch gate refuses 'demo:KEY' / 'set' / 'controls' /
-    -- 'values' until the slice is extended with an explicit repair
-    -- command.
+    -- 'values' while diverged. Slice 2 (`511eabd`) added the
+    -- explicit 'repair' command that calls 'sopsOpenStack' against
+    -- the current plan to leave the diverged state when the
+    -- operator decides to retry; see 'dispatchLiveSessionRepair'.
     (LsoEscalated, SsContinue)
 
 
@@ -963,9 +965,10 @@ runManifestLiveSession strategy manifestPath initialDemo listenerCfg mMidiDevice
   lastRetiredRef  <- newIORef M.empty
   -- Supervision v1 (2026-05-25-f): terminal-state holder, written
   -- on 'SupervisedReloadEscalated' and read by 'printStatusWith' /
-  -- the dispatch gate. Cleared only when the slice is extended
-  -- with an explicit repair pathway; today the divergence is
-  -- sticky for the rest of the session.
+  -- the dispatch gate. Cleared by a successful 'LscRepair'
+  -- ('dispatchLiveSessionRepair'); kept across failed 'repair'
+  -- attempts with the rendered cause accumulated into
+  -- 'ldsLastRepairFailure' for subsequent 'status' reads.
   divergedStateRef <- newIORef Nothing
 
   -- Phase 8j: indirect operator-output sink.
@@ -1344,11 +1347,14 @@ sessionLoop causeLabel supOps doc catalog trackedStackRef currentPlanRef
 
     -- Supervision v1 (2026-05-25-f): commands that need a live
     -- stack are refused while the session is in the diverged
-    -- state. 'status', 'demos', 'help', and 'quit' continue to
-    -- work; they do not call into the substrate. Reload, set,
+    -- state. 'status', 'demos', 'help', 'repair', and 'quit'
+    -- continue to work; 'status' / 'demos' / 'help' / 'quit' do
+    -- not call into the substrate, and 'repair' (slice 2,
+    -- `511eabd`) is the operator's explicit way out — it
+    -- dispatches a fresh 'sopsOpenStack currentPlan' through the
+    -- supervisor adapter to clear the divergence. Reload, set,
     -- controls, and values either touch the substrate directly or
-    -- would observe a half-open surface, so they are gated until a
-    -- future slice introduces an explicit repair pathway. The
+    -- would observe a half-open surface, so they stay gated. The
     -- per-command policy and the refusal text live at module
     -- top-level so unit tests can pin them.
     dispatch cmd = do
@@ -1721,11 +1727,14 @@ runReloadWithSink output resolver planLabel causeLabel onLiveStackChanged supOps
           hPutStrLn stderr
             "live session escalated: no live stack remains."
           -- Supervision v1 (2026-05-25-f): keep the loop alive
-          -- by recording the diverged state. 'stepFromOutcome' now
+          -- by recording the diverged state. 'stepFromOutcome'
           -- returns 'SsContinue' for escalation; the dispatcher
-          -- reads this ref on every prompt and refuses commands
-          -- that need a live stack until the slice is extended
-          -- with an explicit repair pathway.
+          -- reads this ref on every prompt and refuses
+          -- live-stack-needing commands. Slice 2 (`511eabd`)
+          -- added the explicit 'repair' command that calls
+          -- 'sopsOpenStack' against the current plan and clears
+          -- this ref on success; see 'dispatchLiveSessionRepair'
+          -- for the success / failure semantics.
           writeIORef divergedStateRef
             (Just (LiveSessionDivergedState
                     inWindowCause rebuildCause Nothing))
