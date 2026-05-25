@@ -15,15 +15,20 @@ operator consumer, and frame the smallest first slice before adding
 constructors.
 
 **Slice 1 landed in `8b9fb8f`** — `ManifestReloadAudioEvent` brackets
-the stopped-audio reload's `hsaroStopOldAudio`,
-`hsaroStartNewAudio`, and the listener-restart cleanup
-`hsaroStopNewAudio` with attempt/succeeded/failed transitions,
-threaded through `orchestrateHostStoppedAudioReloadWithEventsAndAudio`
-and rendered as an `audio events:` block in the live-session shell
-between `reload events:` and `retired bindings:`. Ready-timeout
-rides inside the start-failure payload (`SfaiReadyTimeout` inside
-`MraeStartFailed`) for v1 rather than emitting a separate event;
-preserving reloads stay silent on the family. The
+the stopped-audio reload's two main audio boundaries
+(`hsaroStopOldAudio` and `hsaroStartNewAudio`) with full
+attempt/succeeded/failed triples, plus the listener-restart cleanup
+boundary (`hsaroStopNewAudio`) with an attempt/succeeded pair only —
+cleanup failures are silent at the `IO ()` level. Threaded through
+`orchestrateHostStoppedAudioReloadWithEventsAndAudio` and rendered
+as an `audio events:` block in the live-session shell between
+`reload events:` and `retired bindings:`. Ready-timeout rides
+inside the start-failure payload (`SfaiReadyTimeout` inside
+`MraeStartFailed`) for v1 rather than emitting a separate event.
+Require-preserving and preserving-success paths stay silent on the
+family; try-preserving emits audio events when it admits the
+stopped-audio fallback (`realTryPreservingInWindowReload` forwards
+`onAudioEvent` into `realStoppedAudioInWindowReload`). The
 [Manual live-session evidence: 2026-05-25 (stopped-audio)](#manual-live-session-evidence-2026-05-25-stopped-audio)
 section below records the operator transcript.
 
@@ -282,11 +287,17 @@ lowest implementation cost:
 1. `ManifestReloadAudioEvent` lives in
    `MetaSonic.App.ManifestReloadAudioEvent`, mirroring the layout
    of `MetaSonic.App.ManifestPreflightEvent`. The final v1
-   constructor set brackets the three audio-touching boundaries the
-   stopped-audio op crosses (`hsaroStopOldAudio`,
-   `hsaroStartNewAudio`, and the listener-restart cleanup
-   `hsaroStopNewAudio`) with attempt / succeeded /
-   `*Failed !SessionFanInAudioIssue` triples. Ready-timeout rides
+   constructor set brackets the two main audio-touching boundaries
+   the stopped-audio op crosses (`hsaroStopOldAudio` and
+   `hsaroStartNewAudio`) with full attempt / succeeded /
+   `*Failed !SessionFanInAudioIssue` triples, and the
+   listener-restart cleanup boundary (`hsaroStopNewAudio`,
+   reached on `HsariListenerRestartFailed`) with just an
+   attempt / succeeded pair — the cleanup slot is `IO ()` so
+   failures are silent at the orchestrator boundary, and v1
+   intentionally does not emit `MraeStopFailed` for the cleanup;
+   a future slice can split the cleanup into its own constructors
+   if a real consumer needs the distinction. Ready-timeout rides
    inside the start-failure payload (`SfaiReadyTimeout` inside
    `MraeStartFailed`) rather than emitting its own pair of
    constructors; that keeps the family small and pushes the wait
@@ -294,9 +305,15 @@ lowest implementation cost:
 2. The callback is wired through
    `orchestrateHostStoppedAudioReloadWithEventsAndAudio`, a new
    entrypoint alongside the existing `*WithEvents` variant.
-   Preserving reloads emit no audio events; the preserving path's
-   audio-event timeline is the empty list, which the renderer
-   suppresses entirely so the header does not appear.
+   Require-preserving and preserving-success paths emit no audio
+   events; try-preserving forwards `onAudioEvent` into
+   `realStoppedAudioInWindowReload` when the preserving phase
+   rejects and the fallback gate admits, so the audio-event
+   timeline matches the stopped-audio shape *only* when the
+   fallback actually ran (`realTryPreservingInWindowReload` in
+   `ManifestReloadTryPreservingHostStack`). Empty timelines —
+   require-preserving, preserving-success, declined fallback,
+   terminal preserving — render nothing.
 3. The live shell renders an `audio events:` block in
    `runReloadWithSink` after `reload events:` and before
    `retired bindings:`. The block suppresses when empty so
@@ -433,7 +450,12 @@ What the transcript pins:
 * `last outcome` continues to read the same committed-text it did
   before the slice landed, so `LscStatus` consumers are unaffected.
 
-Preserving reloads (try-preserving / require-preserving) emit no
-audio events by design; that contract is pinned by the slice 2
-ordered tests in `AppManifestLiveSession` and is not exercised by
-this smoke.
+Require-preserving and preserving-success paths emit no audio
+events by design; that contract is pinned by the slice 1 ordered
+tests in `AppManifestLiveSession` and is not exercised by this
+smoke. Try-preserving emits audio events only when the preserving
+phase rejects and the fallback gate admits the stopped-audio
+fallback (`realTryPreservingInWindowReload` forwards
+`onAudioEvent` into the stopped-audio path); that scenario is
+covered by the slice 1 tests too and is also not exercised by
+this stopped-audio-only smoke.
