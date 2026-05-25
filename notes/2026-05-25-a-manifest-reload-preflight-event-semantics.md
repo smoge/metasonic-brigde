@@ -18,26 +18,26 @@ existing `reload events:` block. The
 section below records the operator transcript for the
 unknown-demo-key path.
 
-## What gap are we closing?
+## What gap were we closing? (pre-slice-1 state)
 
-`ManifestReloadEvent` currently covers the strategy phases once a
-preserving or stopped-audio route has been chosen. The transitions
+`ManifestReloadEvent` covered the strategy phases once a
+preserving or stopped-audio route had been chosen. The transitions
 before route selection — catalog lookup, manifest target resolution,
-plan validation, graph compile/plan diagnostics — are *not* a
-separate event family. Today they surface in two structurally
-different ways:
+plan validation, graph compile/plan diagnostics — were *not* a
+separate event family. Before slice 1 (commit `2cc734a`), those
+failures surfaced in two structurally different ways:
 
 1. **Resolver-level failures (no event stream at all).** In
    [`ManifestLiveSession.runReloadWithSink`](../app/MetaSonic/App/ManifestLiveSession.hs)
-   the `ReloadResolver` runs *before* the supervisor is invoked.
-   `catalogPlanResolver` does the catalog lookup
+   the `ReloadResolver` ran *before* the supervisor was invoked.
+   `catalogPlanResolver` did the catalog lookup
    (`find demoKey == key`) and the `planManifestReloadForDemo` call;
-   on failure it returns `Left reason :: Either String plan`. The
-   live shell prints `reload rejected: <reason>` and writes
-   `LsoPlanRejected reason` to `lastOutcomeRef`. The supervisor is
-   never invoked, the `reloadEventsRef` stays empty, the
-   `reload events:` block never renders. From a `ManifestReloadEvent`
-   consumer's perspective, the failure is silent.
+   on failure it returned `Left reason :: Either String plan`. The
+   live shell printed `reload rejected: <reason>` and wrote
+   `LsoPlanRejected reason` to `lastOutcomeRef`. The supervisor was
+   never invoked, `reloadEventsRef` stayed empty, the
+   `reload events:` block never rendered. From a `ManifestReloadEvent`
+   consumer's perspective, the failure was silent.
 
 2. **Orchestrator-level plan-preparation failures (in-phase
    rejection event).** Once the supervisor *has* chosen a route and
@@ -48,15 +48,22 @@ different ways:
    `MreStoppedAudioReloadStarted` by then, so the rejection looks
    like an in-phase failure. There is no separate
    "validation started" / "validation rejected" event preceding the
-   phase-started event.
+   phase-started event. *Slice 1 left this surface unchanged; see
+   "What is explicitly out of scope?" below.*
 
-Both are real preflight failures — invalid demo key, missing
+Both were real preflight failures — invalid demo key, missing
 catalog entry, manifest target that the host cannot install, graph
-plan diagnostics — but they neither share a vocabulary nor occupy a
-consistent place in the event timeline. An operator-visible
-`reload events:` block today cannot answer "did validation reject
-this before route selection, or did the preserving phase reject the
-plan after entry?" without reading source.
+plan diagnostics — but they neither shared a vocabulary nor occupied
+a consistent place in the event timeline. An operator-visible
+`reload events:` block could not answer "did validation reject this
+before route selection, or did the preserving phase reject the plan
+after entry?" without reading source.
+
+After slice 1, the resolver-level path (1) is closed: it emits the
+`ManifestPreflightEvent` family
+(`MpeStarted` / `MpeRejected` / `MpeSucceeded`) and renders a
+`preflight events:` block ahead of `reload events:`. The
+orchestrator-level path (2) remains a later-slice question.
 
 ## Who is the first consumer?
 
