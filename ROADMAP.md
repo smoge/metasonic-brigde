@@ -4214,10 +4214,17 @@ Still gated:
   the rendered cause recorded into a new `ldsLastRepairFailure`
   field that `status` renders as a `last repair attempt failed:`
   row. `demo:KEY` / `set` / `controls` / `values` remain refused
-  while diverged. The bullet stays unchecked pending an
-  operator-facing transcript smoke for slice 2 (open-success path
-  and open-failure path against the real production supervisor),
-  the analog of the 2026-05-25-g note for slice 1.
+  while diverged. Operator-facing transcript evidence for slice 2
+  — a contiguous failed-then-successful `repair` lifecycle through
+  the real `reloadSupervisedWithEvents`, `dispatchLiveSessionRepair`,
+  and `printStatusWith` surfaces with a single `SupervisorOps` value
+  across all three opens — in
+  [Supervision v1 Slice 2 — Repair Lifecycle Transcript Smoke](notes/2026-05-25-h-supervision-slice-2-repair-smoke.md).
+  The bullet stays unchecked pending a decision on whether slices
+  1 + 2 close the lane (with watchdog / cooldown / auto-retry /
+  cross-run persistent telemetry spun out as their own bullets) or
+  whether the lane should stay open with a sharper remaining item
+  list — see the note's closing section.
   `ManifestReloadGraphEvent` / `SessionVoiceAllocationEvent`
   stay deferred behind the same consumer-gate the 2026-05-25-b
   note set.

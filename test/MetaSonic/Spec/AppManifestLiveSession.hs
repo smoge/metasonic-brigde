@@ -2049,6 +2049,166 @@ supervisionDivergedTests =
       mustContain "  this command is unavailable while the session is diverged."
       mustContain "  available commands: status, demos, help, repair, quit."
       mustContain "(passes the diverged gate; would be dispatched)"
+
+  , testCase "supervision slice 2 operator transcript (repair lifecycle, sink-captured)" $ do
+      -- Operator-facing evidence smoke for supervision-v1 slice 2
+      -- (511eabd). Builds on the slice 1 smoke above: forces the
+      -- same deliberate supervisor escalation branch through
+      -- 'reloadSupervisedWithEvents' + 'runReloadWithSink', then
+      -- drives the operator through two 'repair' attempts via the
+      -- real 'dispatchLiveSessionRepair' — first a 'Left' that
+      -- preserves divergence and populates 'ldsLastRepairFailure',
+      -- then a 'Right' that clears divergence and fires the
+      -- post-open hook. A single 'SupervisorOps' value lives across
+      -- all three opens (one rebuild + two repairs) so the test
+      -- mirrors the production session loop's lifecycle rather than
+      -- swapping ops mid-run.
+      --
+      -- 'trackedStackRef' is deliberately left 'Nothing' throughout:
+      -- the smoke uses a stubbed 'sopsOpenStack' that does not go
+      -- through the supervisor adapter's 'withTrackedFactory'
+      -- wrapper, so the wrapper-side update of the tracking ref is
+      -- out of scope here. The dispatch contract is what this smoke
+      -- pins; the wrapper is covered separately by the
+      -- 'withTrackedFactory' test group above.
+      --
+      -- The captured transcript is echoed to stderr between
+      -- '<<<SUPERVISION-SLICE-2-TRANSCRIPT-BEGIN>>>' and
+      -- '<<<SUPERVISION-SLICE-2-TRANSCRIPT-END>>>' markers; see
+      -- 'notes/2026-05-25-h-supervision-slice-2-repair-smoke.md'
+      -- for the evidence note and the regeneration recipe.
+      sinkRef <- newIORef ([] :: [String])
+      let sink line = modifyIORef' sinkRef (<> [line])
+          banner b = do
+            sink ""
+            sink ("== " <> b <> " ==")
+            sink ""
+      currentPlanRef   <- newIORef (mkPlan "preserve-cutoff-dark")
+      lastOutcomeRef   <- newIORef (Nothing :: Maybe LiveSessionOutcome)
+      eventsRef        <- newIORef ([] :: [LiveEvent])
+      audioEventsRef   <- newIORef ([] :: [LiveAudioEvent])
+      lastRetiredRef   <- newIORef M.empty
+      divergedStateRef <- newIORef Nothing
+      trackedStackRef  <- newIORef (Nothing :: Maybe LiveStack)
+      hookHistoryRef   <- newIORef ([] :: [String])
+      -- Scripted 'sopsOpenStack' outcomes consumed in order:
+      --   1. Escalation rebuild ('runReloadWithSink' fallback open).
+      --   2. First operator 'repair' — synthetic open failure.
+      --   3. Second operator 'repair' — open succeeds.
+      openScriptRef <- newIORef
+        ([ Left "rebuild-cause"
+         , Left "open-refused-retry"
+         , Right ()
+         ] :: [Either String ()])
+      let resolver = ReloadResolver $ \k -> Right (mkPlan k)
+          supOps :: SupervisorOps MR.ManifestReloadPlan String
+          supOps = SupervisorOps
+            { sopsInWindowReload = \_ _ ->
+                pure (InWindowReloadTerminal "in-window-cause")
+            , sopsCloseStack = pure ()
+            , sopsOpenStack  = \_plan -> do
+                script <- readIORef openScriptRef
+                case script of
+                  [] -> do
+                    assertFailure
+                      "sopsOpenStack called more times than scripted (3)"
+                    pure (Left "unreachable")
+                  (next : rest) -> do
+                    writeIORef openScriptRef rest
+                    pure next
+            }
+          postOpenHook plan = do
+            modifyIORef' hookHistoryRef (++ [MR.mrlpDemoKey plan])
+            sink ("  (post-open hook called with plan: "
+                  <> MR.mrlpDemoKey plan <> ")")
+
+      -- Phase 1: force escalation via the real supervisor path. The
+      -- rebuild 'Left "rebuild-cause"' (script entry 1) populates
+      -- divergedStateRef with both causes and lastRepair = Nothing.
+      banner "operator types: demo:preserve-cutoff-bright"
+      _ <- runReloadWithSink
+            sink resolver MR.mrlpDemoKey id (\_ -> pure ()) supOps
+            currentPlanRef lastOutcomeRef eventsRef audioEventsRef
+            lastRetiredRef divergedStateRef
+            "preserve-cutoff-bright"
+      sink ""
+      -- Hand-written stderr annotation matching slice 1's framing —
+      -- 'runReloadWithSink' writes this line directly to stderr; the
+      -- write is not captured by the sink. See slice 1 smoke note for
+      -- the full rationale on the framing.
+      sink "(stderr) live session escalated: no live stack remains."
+
+      -- Phase 2: status before any repair attempt — shows the
+      -- diverged block with the two causes, NO last-repair row yet.
+      banner "operator types: status"
+      printStatusWith sink trackedStackRef currentPlanRef
+                      lastOutcomeRef divergedStateRef
+
+      -- Phase 3: first 'repair' fails (script entry 2). Divergence is
+      -- preserved; ldsLastRepairFailure is now populated; the
+      -- post-open hook must NOT have fired.
+      banner "operator types: repair"
+      step1 <-
+        dispatchLiveSessionRepair
+          sink supOps id MR.mrlpDemoKey
+          currentPlanRef divergedStateRef postOpenHook
+      step1 @?= SsContinue
+
+      -- Phase 4: status after the failed repair — diverged block
+      -- now includes the 'last repair attempt failed:' row.
+      banner "operator types: status"
+      printStatusWith sink trackedStackRef currentPlanRef
+                      lastOutcomeRef divergedStateRef
+
+      -- Phase 5: second 'repair' succeeds (script entry 3).
+      -- divergedStateRef is cleared; the post-open hook fires
+      -- exactly once with the currently-serving plan.
+      banner "operator types: repair"
+      step2 <-
+        dispatchLiveSessionRepair
+          sink supOps id MR.mrlpDemoKey
+          currentPlanRef divergedStateRef postOpenHook
+      step2 @?= SsContinue
+
+      -- Phase 6: status after the successful repair — no diverged
+      -- block at all; currentPlanRef is unchanged from phase 1.
+      banner "operator types: status"
+      printStatusWith sink trackedStackRef currentPlanRef
+                      lastOutcomeRef divergedStateRef
+
+      -- Behavioral assertions across the lifecycle.
+      readIORef divergedStateRef >>= (@?= Nothing)
+      readIORef currentPlanRef
+        >>= (\p -> MR.mrlpDemoKey p @?= "preserve-cutoff-dark")
+      readIORef hookHistoryRef >>= (@?= ["preserve-cutoff-dark"])
+      readIORef openScriptRef  >>= (@?= [])
+
+      transcript <- unlines <$> readIORef sinkRef
+      hPutStrLn stderr "<<<SUPERVISION-SLICE-2-TRANSCRIPT-BEGIN>>>"
+      hPutStrLn stderr transcript
+      hPutStrLn stderr "<<<SUPERVISION-SLICE-2-TRANSCRIPT-END>>>"
+
+      let mustContain marker =
+            assertBool ("missing operator-facing marker: " <> marker)
+              (marker `L.isInfixOf` transcript)
+      -- Escalation surfaced and populated the diverged block.
+      mustContain "supervised outcome: escalated (no live stack)"
+      mustContain "    no live stack:     repair required"
+      mustContain "      in-window cause: in-window-cause"
+      mustContain "      rebuild cause:   rebuild-cause"
+      -- First repair: attempt line, failure cause, hint.
+      mustContain "  repair: opening a fresh stack on the current plan..."
+      mustContain "  repair failed: open-refused-retry"
+      mustContain
+        "  session remains diverged; type 'status' for context, \
+        \'repair' to retry, or 'quit' to exit."
+      -- Failure row now appears under the diverged block.
+      mustContain "      last repair attempt failed: open-refused-retry"
+      -- Second repair: success line + hook fires.
+      mustContain "  repair: succeeded; serving preserve-cutoff-dark."
+      mustContain
+        "  (post-open hook called with plan: preserve-cutoff-dark)"
+
   ]
   where
     elemIndex' needle =
