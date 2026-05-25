@@ -4188,7 +4188,21 @@ Still gated:
   [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md)
   closeout.
 - [ ] Long-running owner supervision, teardown beyond the scoped
-  bracket, and repair/recovery after terminal divergence.
+  bracket, and repair/recovery after terminal divergence. v1
+  policy is scoped in
+  [Long-Running Owner Supervision and Terminal-Divergence Recovery](notes/2026-05-25-f-long-running-owner-supervision-recovery.md)
+  (`734a15f`): one-shot terminal-state reporting inside
+  `runManifestLiveSession`, no watchdog above the session, no
+  auto-retry / cooldown / persistent cross-run state, and no new
+  event families unless a renderer slice surfaces a real gap.
+  Implementation slice keeps the live-session loop alive past
+  `SupervisedReloadEscalated`, adds a diverged-state IORef
+  alongside the existing tracking refs, renders
+  `no live stack: repair required` in `status`, and gates
+  reload/set/controls/values commands while diverged.
+  `ManifestReloadGraphEvent` / `SessionVoiceAllocationEvent`
+  stay deferred behind the same consumer-gate the 2026-05-25-b
+  note set.
 
 Current decision: treat Prep F through Prep P, the OSC control-write
 ingress follow-up, the minimal fan-in drain service, the Haskell-only
