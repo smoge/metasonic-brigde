@@ -1,5 +1,6 @@
-snapshot:
-  url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/24/41.yaml
+snapshot: nightly-2026-05-25
+# Previous stable baseline:
+# https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/24/41.yaml
 
 packages:
   - .

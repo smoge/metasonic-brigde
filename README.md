@@ -85,7 +85,7 @@ keeping their architectural modularity. This repo layout is temporary.
 
 ### Requirements
 
-- **GHC** — tested with 9.10.3
+- **GHC** — tested with 9.12.4 via Stack `nightly-2026-05-25`
 - **Stack** — deterministic dependency management
 - **C++20 compiler** — GCC or Clang
 - **PortAudio / PortMIDI** — must be installed separately on your system

@@ -261,6 +261,8 @@ tests:
       - MetaSonic.Spec.AppManifestLiveCommonMIDIRender
       - MetaSonic.Spec.AppManifestLiveCommonOSCControls
       - MetaSonic.Spec.AppManifestLiveCommonOSCRender
+      - MetaSonic.Spec.AppManifestLiveCommonRetiredBindings
+      - MetaSonic.Spec.AppManifestLiveCommonStaleByReload
       - MetaSonic.Spec.AppManifestLiveIngressOps
       - MetaSonic.Spec.AppManifestLiveReloadDemoRender
       - MetaSonic.Spec.AppManifestLiveSession
