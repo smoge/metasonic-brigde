@@ -4133,8 +4133,8 @@ Still gated:
   recorded there. The Phase 8j line-editor closeout is likewise
   text-shell-only; its live verification is the 2026-05-23 replay
   transcript recorded in the playbook.
-- [ ] Failure/event semantics across compile, allocation, and stale
-  producer commands. The install/reload-strategy timeline is now
+- [ ] Failure/event semantics across compile and allocation/resource
+  recovery. The install/reload-strategy timeline is now
   covered by the `ManifestReloadEvent` ADT in
   `MetaSonic.App.ManifestReloadEvent` plus the `*WithEvents`
   orchestrator and host entrypoints: strategy lifecycle, preserving
@@ -4144,9 +4144,16 @@ Still gated:
   operator-visible consumer is the `--manifest-host-reload-smoke`
   CLI, which renders a compact `reload events:` block beside its
   fake audio events and is regression-protected by ordered timeline
-  assertions in `MetaSonic.Spec.AppManifestReloadCli`. Compile-error
-  surfacing, allocation/resource recovery streaming, and stale
-  producer command semantics remain open and consumer-gated — see
+  assertions in `MetaSonic.Spec.AppManifestReloadCli`. Stale producer
+  command semantics are now covered end-to-end by the
+  retired-bindings projection on `ResolveRebuildResult` plus the
+  stale-by-reload attribution path that runs from the orchestrator
+  `OnRetired` callback through `staleByReloadDrainHook` into the live
+  session's operator output; see
+  [Stale Producer Command Semantics](notes/2026-05-24-b-stale-producer-command-semantics.md)
+  for the design and the 2026-05-25 manual smoke evidence recorded
+  there. Compile-error surfacing and allocation/resource recovery
+  streaming remain open and consumer-gated — see
   [ManifestReloadEvent Partial Coverage](notes/2026-05-19-a-manifest-reload-event-partial-coverage.md).
 - [ ] Long-running owner supervision, teardown beyond the scoped
   bracket, and repair/recovery after terminal divergence.
