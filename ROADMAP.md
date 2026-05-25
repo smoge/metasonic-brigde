@@ -4271,7 +4271,15 @@ default-omni channel filtering, bend replay for later note-on starts, and
 sustain-pedal deferred releases, a decoded-source MIDI listener with
 producer-local control coalescing, and the first Q / PortMIDI-backed
 decoded source with an auto-selecting manual CLI smoke probe, and
-already-decoded UI intent translation, plus the
+already-decoded UI intent translation, plus the landed opt-in
+service-owned arbitration substrate (pure policy module,
+`SessionArbitrationGateway`, optional `SessionFanInService` gateway
+integration, explicit arbitrated service helpers on the OSC, UI,
+Pattern, and MIDI producers, opt-in service-backed OSC and MIDI
+listener wrappers sharing one decode/coalescing/fence/timed-flush
+core on the MIDI side, and the two non-audio operator probes
+`--session-osc-arbitration-smoke` and
+`--session-midi-arbitration-smoke`), plus the
 diagnostic/construction-time manifest reload v1, stopped-audio and
 preserving host reload strategies, and explicit app-level reload
 strategy selection. Do not
@@ -4281,8 +4289,9 @@ manifest diagnostic/construction-time v1 and host strategy substrate,
 broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
 translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,
-arbitration/coalescing beyond the landed MIDI listener-local policy and
-the documented design constraints, unsupported respawn/reset policy,
+arbitration/coalescing beyond the landed MIDI listener-local policy,
+the landed opt-in arbitration substrate, and the documented design
+constraints, unsupported respawn/reset policy,
 long-running ownership of the live-audio hot-swap path, and recovery
 policies are specified and tested in their own slices. The session does
 not need a generated fusion executor to ship;
