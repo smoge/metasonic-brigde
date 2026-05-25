@@ -1,20 +1,29 @@
 -- | Live-app reload policy projector tests.
 --
--- First code slice from
--- @notes/2026-05-25-i-live-app-manifest-reload-policy.md@. Pins the
--- default projection against today's implicit
--- @runManifestLiveSession@ values and proves that flipping the
--- arbitration profile to 'TargetClaim' isolates the structural
--- change to 'sfsoArbitrationGatewayOptions'.
+-- Tracks the slices from
+-- @notes/2026-05-25-i-live-app-manifest-reload-policy.md@:
 --
--- The projector's 'rrhsiBuildIngressOps' field is intentionally not
--- invoked here: 'SessionFanInHost''s constructor is private (see
--- @src/MetaSonic/Session/FanIn.hs L110@), so a later slice that
--- needs to drive ingress opening will use
--- 'withSessionFanInHost' / 'openSessionFanInHost' over a fixture
--- 'TemplateGraph'. The fixture context installs an ingress builder
--- that errors on call so a regression that starts invoking it from
--- the projector is loud rather than silent.
+--   * Pins the default projection against today's implicit
+--     @runManifestLiveSession@ values.
+--   * Proves that flipping the arbitration profile to 'TargetClaim'
+--     isolates the structural change to 'sfsoArbitrationGatewayOptions'.
+--   * Verifies the projector composes 'staleByReloadDrainHook' from
+--     the context's retired-set ref and print sink (regression guard
+--     against a future refactor leaving 'defaultSessionFanInServiceHooks'
+--     in place).
+--   * Round-trips strategy, listener config, and MIDI device through
+--     'defaultLiveAppReloadPolicy' so the @Main -> policy -> projector@
+--     path has a direct guard.
+--   * Drives 'rrhsiBuildIngressOps' against a real 'SessionFanInHost'
+--     opened via 'withSessionFanInHost' over a fixture 'TemplateGraph'
+--     and asserts the policy's 'LiveIngressProfile' reaches the
+--     context builder. This closes the deferred coverage gap the
+--     earlier projector slices intentionally left: 'SessionFanInHost'
+--     has a private constructor (see
+--     @src/MetaSonic/Session/FanIn.hs L110@), so opening one inside
+--     'withSessionFanInHost' was the prerequisite for invoking
+--     'mrioOpenIngress' in-test. No socket, no PortMIDI, no audio,
+--     no supervisor.
 module MetaSonic.Spec.AppManifestLivePolicy
   ( appManifestLivePolicyTests
   ) where
@@ -31,14 +40,20 @@ import           Test.Tasty.HUnit
 import           MetaSonic.App.Demos                   (Demo, demoTable)
 import           MetaSonic.App.ManifestLiveCommon      (liveAudioOptions,
                                                         liveIngressTargetPolicy)
+import           MetaSonic.App.ManifestLiveIngressOps  (LiveIngressIssue (..),
+                                                        LiveProdIngressIssue)
 import           MetaSonic.App.ManifestLivePolicy
 import           MetaSonic.App.ManifestReloadAudioEvent
                                                        (ManifestReloadAudioEvent (..))
 import           MetaSonic.App.ManifestReloadEvent     (ManifestReloadEvent (..))
+import           MetaSonic.App.ManifestOSCIngressOps   (ManifestOSCIngressOpsIssue (..))
+import           MetaSonic.App.ManifestOSCListener     (ManifestOSCListenerOpenIssue (..))
 import           MetaSonic.App.ManifestReloadHost.Types
                                                        (ManifestReloadHostStrategy (..))
 import           MetaSonic.App.ManifestReloadHostStack (RealReloadHostStackInputs (..))
+import           MetaSonic.App.ManifestReloadIngress   (ManifestReloadIngressOps (..))
 import           MetaSonic.Bridge.Source               (MigrationKey (..))
+import           MetaSonic.Bridge.Templates            (TemplateGraph (..))
 import           MetaSonic.OSC.Listen                  (defaultListenerConfig)
 import           MetaSonic.Pattern                     (ControlTag (..),
                                                         VoiceKey (..))
@@ -51,7 +66,9 @@ import           MetaSonic.Session.ArbitrationGateway  (SessionArbitrationGatewa
                                                         sagoInitialPolicy)
 import           MetaSonic.Session.Command             (SessionCommand (..),
                                                         SessionIssue (..))
-import           MetaSonic.Session.FanIn               (SessionFanInDrainResult (..))
+import           MetaSonic.Session.FanIn               (SessionFanInDrainResult (..),
+                                                        defaultSessionFanInOptions,
+                                                        withSessionFanInHost)
 import           MetaSonic.Session.FanInService        (SessionFanInServiceHooks (..),
                                                         SessionFanInServiceOptions (..),
                                                         defaultSessionFanInServiceOptions)
@@ -164,6 +181,66 @@ appManifestLivePolicyTests =
          <> " the context sink, got " <> show printsAfter)
         (printsAfter > printsBefore)
 
+  , testCase "projected rrhsiBuildIngressOps threads policy ingress profile through context builder" $ do
+      -- Closes the deferred coverage gap named in
+      -- @notes/2026-05-25-i-live-app-manifest-reload-policy.md@:
+      -- 'SessionFanInHost' has a private constructor, so the earlier
+      -- projector tests asserted on @rrhsiBuildIngressOps@ only as
+      -- a set field. Here we open a real host through
+      -- 'withSessionFanInHost' (no audio, no socket, no PortMIDI, no
+      -- supervisor), drive the projected builder, then invoke
+      -- 'mrioOpenIngress'. The fixture context's builder captures
+      -- the 'LiveIngressProfile' the projector passes it; the
+      -- assertion proves it equals @larpIngressProfile policy@,
+      -- which is the structural fix's behavioral guarantee.
+      profileRef <- newIORef Nothing
+      -- 'LiveAppReloadContext' fields are strict, so the IORefs the
+      -- projector does not invoke in this test path still need real
+      -- values (not 'error').
+      unusedReload  <- newIORef []
+      unusedAudio   <- newIORef []
+      unusedRetired <- newIORef M.empty
+      let cfg     = defaultListenerConfig 7777
+          midi    = Just 9
+          policy  = defaultLiveAppReloadPolicy StoppedAudioOnly cfg midi
+          context = LiveAppReloadContext
+            { larcReloadEventsRef = unusedReload
+            , larcAudioEventsRef  = unusedAudio
+            , larcLastRetiredRef  = unusedRetired
+            , larcExtPrint        = \_ -> pure ()
+            , larcBuildIngressOps = \profile _host ->
+                ManifestReloadIngressOps
+                  { mrioOpenIngress = \_target -> do
+                      writeIORef profileRef (Just profile)
+                      pure (Left sentinelIngressIssue)
+                  , mrioCloseIngress = \_handle ->
+                      pure (Right ())
+                  }
+            }
+      hostResult <-
+        withSessionFanInHost
+          (TemplateGraph [] M.empty)
+          defaultSessionFanInOptions
+          $ \host -> do
+              let inputs = projectLiveAppReloadPolicy policy context
+                  ops    = rrhsiBuildIngressOps inputs host
+              -- The stub ignores its 'target' argument; the call
+              -- exercises the closure path through to the
+              -- profile-capturing IORef write.
+              mrioOpenIngress ops
+                (error "ManifestReloadIngressTarget not inspected by stub")
+      case hostResult of
+        Left setupIssue ->
+          assertFailure
+            ("expected fan-in host, got setup issue: " <> show setupIssue)
+        Right (Right _handle) ->
+          assertFailure
+            "expected stub mrioOpenIngress to return Left sentinel, got Right"
+        Right (Left actual) -> do
+          actual @?= sentinelIngressIssue
+          captured <- readIORef profileRef
+          captured @?= Just (larpIngressProfile policy)
+
   , testCase "defaultLiveAppReloadPolicy round-trips strategy, listener config, and MIDI device" $ do
       -- The wiring slice that landed
       -- 'runManifestLiveSessionWithPolicy' relies on the default
@@ -189,6 +266,14 @@ appManifestLivePolicyTests =
 -- of the canonical demo table.
 someDemo :: Demo
 someDemo = head demoTable
+
+-- | Sentinel @Left@ value the ingress-profile fixture stub returns
+-- from 'mrioOpenIngress'. The shape is the smallest constructable
+-- 'LiveProdIngressIssue' that round-trips through 'Eq' so the test
+-- can assert it landed unchanged.
+sentinelIngressIssue :: LiveProdIngressIssue
+sentinelIngressIssue =
+  LiiOSC (MoioiOpenFailed (MoloiBindFailed "live-policy-test-sentinel"))
 
 
 -- ---------------------------------------------------------------------------
