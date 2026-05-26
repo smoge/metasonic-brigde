@@ -4330,11 +4330,14 @@ profile reaches the context builder). Do not
 promote this into a full producer-facing session service until GUI
 toolkit integration and live/host-level reload policy beyond the landed
 manifest diagnostic/construction-time v1, host strategy substrate, and
-live-app reload policy boundary — GUI bindings that produce the
-policy, per-reload dynamic resolver use, live arbitration opt-in via
-the existing `LiveArbitrationProfile` field, runtime resource
-overrides, and arbitration policy mutation all stay use-case gated
-above this boundary —
+live-app reload policy boundary, and the minimal
+`--live-arbitration-gateway` CLI opt-in that flips the live-app
+reload policy to a `FifoOnly` service-owned gateway — GUI bindings
+that produce the policy, per-reload dynamic resolver use, richer
+arbitration shapes (`ProducerPriority`, `TargetClaim` with a
+populated table) requiring structured non-CLI input, runtime
+resource overrides, and arbitration policy mutation all stay
+use-case gated above this boundary —
 broader MIDI policy beyond note/CC/sustain/pitch-bend/all-notes-off
 translation, channel filtering, and source polling, broader OSC
 scope beyond symbolic control writes,
