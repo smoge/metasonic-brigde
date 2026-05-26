@@ -447,11 +447,23 @@ counter-confirmed IORef callbacks, composed drain hook,
 default-constructor round-trip, real-host ingress-profile
 threading) is fully covered.
 
-The backlog reduces to use-case-gated feature slices (GUI
-binding, per-reload strategy changes, live arbitration opt-in
-via the existing `LiveArbitrationProfile` field, resource
-overrides, arbitration mutation), all of which stay gated on a
-concrete caller per this note's non-goals.
+The minimal axis 4 opt-in has since landed: commit `4253bf8`
+adds the `--live-arbitration-gateway` CLI flag on
+`--manifest-live-session`, threaded through a single-purpose
+composable `withLiveArbitrationGateway` that flips
+`larpArbitrationProfile` to
+`LiveArbitrationProfile (Just defaultSessionArbitrationGatewayOptions)`
+(service-owned gateway with the `FifoOnly` initial policy). It
+is the smallest opt-in shape — a boolean — and uses the
+existing `LiveArbitrationProfile` field rather than expanding
+the policy surface.
+
+The remaining backlog is use-case-gated feature slices (GUI
+binding, per-reload strategy changes, richer arbitration shapes
+that carry structured non-CLI input — `ProducerPriority` and
+`TargetClaim` with a populated table — resource overrides,
+arbitration mutation), all of which stay gated on a concrete
+caller per this note's non-goals.
 
 ## Open questions deferred to later notes
 

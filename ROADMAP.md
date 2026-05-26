@@ -3808,13 +3808,18 @@ Still gated:
   `LiveProdIngressIssue`/`LiveProdIngressHandle`) plus the
   policy-native `runManifestLiveSessionWithPolicy` entrypoint that
   `Main` now constructs an explicit policy for (the old
-  `runManifestLiveSession` stays as a thin compatibility wrapper)
+  `runManifestLiveSession` stays as a thin compatibility wrapper),
+  and the minimal `--live-arbitration-gateway` CLI opt-in on
+  `--manifest-live-session` that composes `withLiveArbitrationGateway`
+  onto the default policy to enable a service-owned arbitration
+  gateway with the `FifoOnly` initial policy
   — GUI toolkit bindings to *produce* the policy, per-reload
-  strategy changes that consult the resolver dynamically, live
-  arbitration opt-in via the existing `LiveArbitrationProfile`
-  field, runtime resource overrides, and arbitration policy
-  mutation all stay use-case gated above this boundary, broader
-  MIDI behavior beyond the landed
+  strategy changes that consult the resolver dynamically, richer
+  arbitration shapes (`ProducerPriority`, `TargetClaim` with a
+  populated table) requiring structured non-CLI input,
+  runtime resource overrides, and arbitration policy mutation all
+  stay use-case gated above this boundary, broader MIDI behavior
+  beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
   beyond the landed symbolic control-write path.
