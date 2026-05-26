@@ -184,12 +184,15 @@ status:
 
 ## Follow-up
 
-If this path needs repeatable local evidence, add a sibling wrapper to
-`tools/manifest_live_session_require_preserving_smoke.sh` that passes
-`--live-arbitration-gateway`, defaults to a separate port such as
-`17006`, and reuses the same markers. The existing wrapper does not
-pass the flag today and should remain the no-gateway
-require-preserving baseline unless its scope is deliberately changed.
+The sibling wrapper landed in `903daf5` as
+`tools/manifest_live_session_arbitration_gateway_smoke.sh`. It is the
+repeatable counterpart to this manual evidence: passes
+`--live-arbitration-gateway`, defaults to port `17006`, and reuses
+the same acceptance markers. The `just`-discoverable form is
+`just manifest-live-session-arbitration-gateway-smoke port=N`. The
+no-gateway require-preserving wrapper
+(`tools/manifest_live_session_require_preserving_smoke.sh`) remains
+the deliberate no-gateway baseline and is not extended in place.
 
 - route line;
 - `audio running: yes`;

@@ -255,6 +255,24 @@ manifest-live-session-require-preserving-smoke port="17004": stack-build
     PORT={{port}} ./tools/manifest_live_session_require_preserving_smoke.sh
 
 # Live-audio operator smoke for the supervised
+# --manifest-live-session (require-preserving) route with
+# --live-arbitration-gateway enabled. Sibling of the smoke above;
+# keeps the baseline as the no-gateway require-preserving reference
+# and adds only the live-app policy opt-in flag.
+#
+# Default port is 17006 (vs 17004 for the no-gateway baseline) so the
+# two smokes do not collide if run in sequence. Override with
+# `just manifest-live-session-arbitration-gateway-smoke port=N`.
+#
+# Other parameters (manifest fixture, initial/target demo keys, work
+# dir for artifacts) are env-var configurable in the wrapper script;
+# see tools/manifest_live_session_arbitration_gateway_smoke.sh and the
+# recorded manual evidence in
+# notes/2026-05-25-n-live-arbitration-gateway-manual-smoke.md.
+manifest-live-session-arbitration-gateway-smoke port="17006": stack-build
+    PORT={{port}} ./tools/manifest_live_session_arbitration_gateway_smoke.sh
+
+# Live-audio operator smoke for the supervised
 # --manifest-live-session (require-preserving) /reject/ branch.
 # Sibling of the smoke above. Drives the reject-preserving-delay
 # fixture (KDelay voice template, preserve-unsupported) so the
