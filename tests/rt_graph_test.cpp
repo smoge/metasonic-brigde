@@ -7350,6 +7350,152 @@ TEST_CASE("reduction capture: fused sink kernel (SinGainOut) writes through Sink
     rt_graph_destroy(g);
 }
 
+// T-7 and T-8 close out the design-note §10 verification table for the
+// §4.E.2 substrate. See notes/2026-05-25-m-phase-4e2-substrate-closeout.md
+// for the full T-1..T-11 mapping. `inst.block_sink_peak` is updated
+// inside the bus-write kernel (rt_graph.cpp Note [Bus-write kernel])
+// independent of `target.add()`, so a regression that bypassed the
+// per-sink peak update would leave bus output bit-identical and only
+// surface in release-then-free timing. T-7 and T-8 are the labeled
+// regression homes for the peak path (T-7 via multi-sink release
+// timing) and the lifecycle path (T-8 single-sink) under
+// reduction-capture mode.
+
+TEST_CASE("§4.E.2 T-7: multi-sink per-instance peak invariant under reduction") {
+    // Two parallel Env→Out chains in one instance, both writing bus 0.
+    // Sink A has a fast release (R=2 ms); sink B has a slow release
+    // (R=20 ms). After release, sink A decays to silence first; sink B
+    // then determines `inst.block_sink_peak` and therefore extends the
+    // auto-free window beyond what a fast-only instance would give.
+    //
+    // Three measurements pin the invariant:
+    //   1. fast-only baseline (single Env, R=2ms) — auto-frees fast.
+    //   2. multi-sink direct mode — slow sink extends the window;
+    //      must take more blocks than the fast-only baseline.
+    //   3. multi-sink reduction-capture mode — must take the same
+    //      number of blocks as multi-sink direct.
+    //
+    // (1)+(2) prove the slow sink is actually contributing to
+    // `block_sink_peak` (a shared regression that ignored sink B in
+    // both modes would fail here, not just at the parity check).
+    // (2)+(3) prove reduction-capture doesn't bypass per-sink peak
+    // updates.
+    constexpr int kBlock = 256;
+    auto add_env_out = [](RTGraph *g, int env_id, int out_id, double release) {
+        rt_graph_add_node(g, env_id, 9);             // Env
+        rt_graph_set_control(g, env_id, 0, 1.0);     // gate high
+        rt_graph_set_control(g, env_id, 1, 0.0005);
+        rt_graph_set_control(g, env_id, 2, 0.002);
+        rt_graph_set_control(g, env_id, 3, 0.5);
+        rt_graph_set_control(g, env_id, 4, release);
+        rt_graph_add_node(g, out_id, 2);             // Out → bus 0
+        rt_graph_set_control(g, out_id, 0, 0.0);
+        rt_graph_connect(g, env_id, 0, out_id, 0);
+    };
+
+    auto count_blocks_to_free = [&](bool multi_sink, bool capture) {
+        auto *g = rt_graph_create(8, kBlock);
+        REQUIRE(g != nullptr);
+
+        add_env_out(g, 0, 1, 0.002);                 // fast sink A (R=2ms)
+        if (multi_sink) {
+            add_env_out(g, 2, 3, 0.020);             // slow sink B (R=20ms)
+        }
+        if (capture) rt_graph_test_set_reduction_capture(g, 1);
+
+        rt_graph_process(g, kBlock);
+        REQUIRE(rt_graph_instance_status(g, 0) == 0);
+
+        rt_graph_instance_release(g, 0);
+        CHECK(rt_graph_instance_status(g, 0) == 1);
+
+        int blocks = -1;
+        for (int i = 0; i < 64; ++i) {
+            rt_graph_process(g, kBlock);
+            if (rt_graph_instance_alive(g, 0) == 0) {
+                blocks = i + 1;
+                break;
+            }
+        }
+        if (capture) {
+            // Sanity that reduction-capture was actually exercised.
+            const int expected_slots = multi_sink ? 2 : 1;
+            CHECK(rt_graph_test_last_writer_slot_count(g) == expected_slots);
+        }
+        rt_graph_destroy(g);
+        return blocks;
+    };
+
+    const int fast_only_blocks       = count_blocks_to_free(false, false);
+    const int multi_sink_direct      = count_blocks_to_free(true,  false);
+    const int multi_sink_reduction   = count_blocks_to_free(true,  true);
+
+    REQUIRE(fast_only_blocks      > 0);
+    REQUIRE(multi_sink_direct     > 0);
+    REQUIRE(multi_sink_reduction  > 0);
+
+    // Slow sink must actually extend the auto-free window — without
+    // this, the parity assertion below is vacuous against a shared
+    // regression that drops sink B's peak from both modes.
+    CHECK(multi_sink_direct > fast_only_blocks);
+
+    // Direct and reduction-capture modes must agree on the window.
+    CHECK(multi_sink_direct == multi_sink_reduction);
+}
+
+TEST_CASE("§4.E.2 T-8: release-then-free auto-frees under reduction capture") {
+    // Mirrors the §2.E release-on-Env-bearing-instance test, with
+    // reduction-capture enabled. Release transition and auto-free
+    // counter must match the direct-mode path — the silence threshold
+    // is driven by `block_sink_peak`, which is updated in the kernel
+    // independent of bus-write mode in v1, so the auto-free window must
+    // not shift.
+    constexpr int kBlock = 256;
+    auto build = [](RTGraph *g) {
+        rt_graph_add_node(g, 0, 9);                  // Env
+        rt_graph_set_control(g, 0, 0, 1.0);          // gate high
+        rt_graph_set_control(g, 0, 1, 0.0005);
+        rt_graph_set_control(g, 0, 2, 0.002);
+        rt_graph_set_control(g, 0, 3, 0.5);
+        rt_graph_set_control(g, 0, 4, 0.002);        // R = 2 ms
+        rt_graph_add_node(g, 1, 2);                  // Out(bus 0)
+        rt_graph_set_control(g, 1, 0, 0.0);
+        rt_graph_connect(g, 0, 0, 1, 0);
+    };
+
+    auto count_blocks_to_free = [&](bool capture) {
+        auto *g = rt_graph_create(4, kBlock);
+        REQUIRE(g != nullptr);
+        build(g);
+        if (capture) rt_graph_test_set_reduction_capture(g, 1);
+
+        rt_graph_process(g, kBlock);
+        REQUIRE(rt_graph_instance_status(g, 0) == 0);
+
+        rt_graph_instance_release(g, 0);
+        CHECK(rt_graph_instance_status(g, 0) == 1);
+        CHECK(rt_graph_instance_alive(g, 0) == 1);
+
+        int blocks = -1;
+        for (int i = 0; i < 64; ++i) {
+            rt_graph_process(g, kBlock);
+            if (rt_graph_instance_alive(g, 0) == 0) {
+                blocks = i + 1;
+                break;
+            }
+        }
+        rt_graph_destroy(g);
+        return blocks;
+    };
+
+    const int direct_blocks  = count_blocks_to_free(false);
+    const int reduced_blocks = count_blocks_to_free(true);
+
+    REQUIRE(direct_blocks  > 0);
+    REQUIRE(reduced_blocks > 0);
+    CHECK(direct_blocks == reduced_blocks);
+}
+
 // ----------------------------------------------------------------
 // Phase §4.E.2.C0c: global-schedule serial executor
 // ----------------------------------------------------------------
