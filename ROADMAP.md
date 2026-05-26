@@ -3822,7 +3822,10 @@ Still gated:
   beyond the landed
   note/CC/sustain/pitch-bend/all-notes-off/channel-filter adapter and
   small PortMIDI source, and broader OSC producer scope
-  beyond the landed symbolic control-write path.
+  beyond the landed symbolic control-write path. Manual live-session
+  evidence for the FifoOnly gateway opt-in is recorded in
+  [notes/2026-05-25-n-live-arbitration-gateway-manual-smoke.md](notes/2026-05-25-n-live-arbitration-gateway-manual-smoke.md)
+  (24729ca).
 - [ ] Producer-specific throttling/coalescing beyond the landed MIDI
   listener-local control coalescer, MVar flush-lock optimization for
   the landed MIDI coalescer without contention evidence, queue-level
