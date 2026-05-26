@@ -64,6 +64,7 @@ module MetaSonic.App.ManifestLivePolicy
     -- * Pure policy
   , LiveAppReloadPolicy (..)
   , defaultLiveAppReloadPolicy
+  , withLiveArbitrationGateway
 
     -- * Runtime projection context
   , LiveAppReloadContext (..)
@@ -99,7 +100,8 @@ import           MetaSonic.App.ManifestReloadIngressTarget
 import           MetaSonic.OSC.Listen                (ListenerConfig)
 import           MetaSonic.Pattern                   (VoiceKey)
 import           MetaSonic.Session.ArbitrationGateway
-                                                     (SessionArbitrationGatewayOptions)
+                                                     (SessionArbitrationGatewayOptions,
+                                                      defaultSessionArbitrationGatewayOptions)
 import           MetaSonic.Session.FanIn             (SessionFanInAudioOptions,
                                                       SessionFanInHost,
                                                       defaultSessionFanInAudioFFI)
@@ -206,6 +208,26 @@ defaultLiveAppReloadPolicy strategy cfg mMidiDevice = LiveAppReloadPolicy
       }
   , larpArbitrationProfile = defaultLiveArbitrationProfile
   , larpResourcePolicy     = defaultLiveResourcePolicy
+  }
+
+-- | Override the arbitration profile on a live-app reload policy.
+-- When the flag is 'True', 'larpArbitrationProfile' becomes
+-- @'LiveArbitrationProfile' ('Just' 'defaultSessionArbitrationGatewayOptions')@:
+-- the service-owned arbitration gateway is active with the default
+-- 'FifoOnly' policy, which adds an admission-control + observability
+-- pathway above the raw FIFO. When 'False', the policy is returned
+-- unchanged, preserving today's no-gateway behavior.
+--
+-- This is the smallest opt-in surface for axis 4 of the live-app
+-- reload policy. Richer arbitration shapes ('ProducerPriority',
+-- 'TargetClaim' with a populated table) carry structured data and
+-- wait for a config-file or GUI surface.
+withLiveArbitrationGateway :: Bool -> LiveAppReloadPolicy -> LiveAppReloadPolicy
+withLiveArbitrationGateway False policy = policy
+withLiveArbitrationGateway True  policy = policy
+  { larpArbitrationProfile = LiveArbitrationProfile
+      { lapGatewayOptions = Just defaultSessionArbitrationGatewayOptions
+      }
   }
 
 -- | Runtime projection context. Holds the IORefs and sinks that

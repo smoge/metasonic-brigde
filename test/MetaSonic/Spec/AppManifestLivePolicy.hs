@@ -258,6 +258,66 @@ appManifestLivePolicyTests =
       lipOSCListenerConfig ingress @?= cfg
       lipMIDIDevice ingress        @?= midi
       larpStrategyResolver policy someDemo @?= strategy
+
+  , testCase "withLiveArbitrationGateway False is the identity on arbitration profile" $ do
+      -- The Main.hs ManifestLiveSession arm composes
+      -- 'withLiveArbitrationGateway (optLiveArbitrationGateway opts)'
+      -- onto the default policy. When the CLI flag is absent
+      -- ('optLiveArbitrationGateway = False'), the composable must
+      -- leave today's no-gateway behavior in place.
+      let basePolicy   = defaultLiveAppReloadPolicy
+            StoppedAudioOnly
+            (defaultListenerConfig 7001)
+            Nothing
+          ungated      = withLiveArbitrationGateway False basePolicy
+
+      larpArbitrationProfile ungated @?= larpArbitrationProfile basePolicy
+      lapGatewayOptions (larpArbitrationProfile ungated) @?= Nothing
+
+  , testCase "withLiveArbitrationGateway True opts in to FifoOnly through the service gateway" $ do
+      -- With the CLI flag set, the composable flips the arbitration
+      -- profile to 'LiveArbitrationProfile (Just defaultSessionArbitrationGatewayOptions)'.
+      -- The default gateway options carry the 'FifoOnly' initial
+      -- policy — the smallest opt-in surface for axis 4 of the
+      -- live-app reload policy. This pins the parser-args -> policy
+      -- join: the only thing the Main.hs glue does is route the
+      -- Bool, so once this composable is correct the join is
+      -- correct.
+      let basePolicy   = defaultLiveAppReloadPolicy
+            StoppedAudioOnly
+            (defaultListenerConfig 7001)
+            Nothing
+          gated        = withLiveArbitrationGateway True basePolicy
+
+      case lapGatewayOptions (larpArbitrationProfile gated) of
+        Nothing      ->
+          assertFailure
+            "expected arbitration gateway options to be Just after withLiveArbitrationGateway True"
+        Just gwOpts  -> do
+          gwOpts                  @?= defaultSessionArbitrationGatewayOptions
+          sagoInitialPolicy gwOpts @?= FifoOnly
+
+      -- Other axes are untouched — the composable is single-purpose.
+      larpIngressProfile gated @?= larpIngressProfile basePolicy
+      larpResourcePolicy gated @?= larpResourcePolicy basePolicy
+
+  , testCase "withLiveArbitrationGateway True projects to sfsoArbitrationGatewayOptions" $ do
+      -- Integration: the policy override reaches the lowered
+      -- 'RealReloadHostStackInputs.rrhsiServiceOptions' through the
+      -- existing projector. This is the same shape as the
+      -- "flipping arbitration profile to TargetClaim ..." case
+      -- above, but with the live-app's chosen FifoOnly opt-in.
+      env <- newFixtureEnv
+      let gated   = withLiveArbitrationGateway True $
+            defaultLiveAppReloadPolicy
+              StoppedAudioOnly
+              (defaultListenerConfig 7001)
+              Nothing
+          inputs  = projectLiveAppReloadPolicy gated (envContext env)
+          service = rrhsiServiceOptions inputs
+
+      sfsoArbitrationGatewayOptions service
+        @?= Just defaultSessionArbitrationGatewayOptions
   ]
 
 

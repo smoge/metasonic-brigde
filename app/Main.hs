@@ -40,7 +40,8 @@ import           MetaSonic.App.ManifestLiveReloadDemo
 import           MetaSonic.App.ManifestLiveSession
                                             (runManifestLiveSessionWithPolicy)
 import           MetaSonic.App.ManifestLivePolicy
-                                            (defaultLiveAppReloadPolicy)
+                                            (defaultLiveAppReloadPolicy,
+                                             withLiveArbitrationGateway)
 import           MetaSonic.App.ManifestMIDIReloadSmoke
                                             (runManifestMIDIReloadSmoke)
 import           MetaSonic.App.ManifestReloadHost
@@ -301,6 +302,14 @@ data Options = Options
     -- ^ UDP port for --session-osc-arbitration-smoke. Default 7001.
   , optManifestMIDISmokeSeconds :: Int
     -- ^ Manual smoke-test duration for --manifest-midi-reload-smoke.
+  , optLiveArbitrationGateway :: Bool
+    -- ^ When True, '--manifest-live-session' constructs its policy
+    -- with a non-default 'LiveArbitrationProfile' whose
+    -- 'lapGatewayOptions' is
+    -- 'Just defaultSessionArbitrationGatewayOptions' (gateway active
+    -- with the 'FifoOnly' initial policy). Default False — today's
+    -- implicit "no gateway, raw FIFO at the service" behavior. Only
+    -- consumed by the live-session arm; ignored everywhere else.
   } deriving (Eq, Show)
 
 defaultOptions :: Options
@@ -318,6 +327,7 @@ defaultOptions = Options
   , optSessionOscSmokeSeconds = 10
   , optSessionOscPort = 7001
   , optManifestMIDISmokeSeconds = 10
+  , optLiveArbitrationGateway = False
   }
 
 parseArgs :: [String] -> Either String Options
@@ -510,6 +520,8 @@ parseArgs = go defaultOptions
           go opts { optMode = SessionMidiSmoke
                   , optSessionMidiSmokeSeconds = seconds
                   } rest
+    go opts ("--live-arbitration-gateway" : xs) =
+      go opts { optLiveArbitrationGateway = True } xs
     go opts ("--session-midi-arbitration-smoke" : xs) =
       go opts { optMode = SessionMidiArbitrationSmoke } xs
     go opts ("--session-osc-arbitration-smoke" : xs) =
@@ -843,6 +855,12 @@ usage prog = unlines
   , "                   strategy positionally. Design rationale + acceptance"
   , "                   criteria at"
   , "                     notes/2026-05-20-b-manifest-live-session-v0.md."
+  , "                   --live-arbitration-gateway (optional) flips the"
+  , "                   live-app reload policy's arbitration profile from"
+  , "                   the implicit no-gateway FIFO default to a"
+  , "                   service-owned gateway with the FifoOnly policy;"
+  , "                   recognized ONLY for this command. See axis 4 in"
+  , "                     notes/2026-05-25-i-live-app-manifest-reload-policy.md."
   , "                   This mode is opt-in; normal demo execution is"
   , "                   unchanged."
   , "  --manifest-midi-reload-smoke MANIFEST.json DEMO"
@@ -1134,10 +1152,11 @@ main = do
           "--manifest-live-session MANIFEST.json DEMO_KEY [--strategy S]"
           opts
       let policy =
-            defaultLiveAppReloadPolicy
-              strategy
-              (defaultListenerConfig (optSessionOscPort opts))
-              (optMidiDevice opts)
+            withLiveArbitrationGateway (optLiveArbitrationGateway opts) $
+              defaultLiveAppReloadPolicy
+                strategy
+                (defaultListenerConfig (optSessionOscPort opts))
+                (optMidiDevice opts)
       runManifestLiveSessionWithPolicy manifestPath demo policy
     ManifestMIDIReloadSmoke -> do
       manifestPath <- maybe
