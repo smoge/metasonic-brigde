@@ -262,7 +262,9 @@ manifest-live-session-require-preserving-smoke port="17004": stack-build
 #
 # Default port is 17006 (vs 17004 for the no-gateway baseline) so the
 # two smokes do not collide if run in sequence. Override with
-# `just manifest-live-session-arbitration-gateway-smoke port=N`.
+# `just manifest-live-session-arbitration-gateway-smoke N`. The recipe
+# also accepts `port=N` and strips the prefix for compatibility with the
+# older comment style.
 #
 # Other parameters (manifest fixture, initial/target demo keys, work
 # dir for artifacts) are env-var configurable in the wrapper script;
@@ -270,7 +272,7 @@ manifest-live-session-require-preserving-smoke port="17004": stack-build
 # recorded manual evidence in
 # notes/2026-05-25-n-live-arbitration-gateway-manual-smoke.md.
 manifest-live-session-arbitration-gateway-smoke port="17006": stack-build
-    PORT={{port}} ./tools/manifest_live_session_arbitration_gateway_smoke.sh
+    port_arg="{{port}}"; PORT="${port_arg#port=}" ./tools/manifest_live_session_arbitration_gateway_smoke.sh
 
 # Live-audio operator smoke for the supervised
 # --manifest-live-session (require-preserving) /reject/ branch.

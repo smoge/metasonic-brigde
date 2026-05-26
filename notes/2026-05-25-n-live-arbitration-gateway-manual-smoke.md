@@ -189,7 +189,8 @@ The sibling wrapper landed in `903daf5` as
 repeatable counterpart to this manual evidence: passes
 `--live-arbitration-gateway`, defaults to port `17006`, and reuses
 the same acceptance markers. The `just`-discoverable form is
-`just manifest-live-session-arbitration-gateway-smoke port=N`. The
+`just manifest-live-session-arbitration-gateway-smoke N`; the recipe
+also accepts `port=N` for compatibility with the original comment. The
 no-gateway require-preserving wrapper
 (`tools/manifest_live_session_require_preserving_smoke.sh`) remains
 the deliberate no-gateway baseline and is not extended in place.
@@ -204,6 +205,41 @@ the deliberate no-gateway baseline and is not extended in place.
 - post-reload `value=900`;
 - status showing `current plan demo: preserve-cutoff-bright`;
 - clean EOF / process exit.
+
+### Wrapper validation
+
+The `just` recipe and wrapper were validated after the recipe learned
+to normalize both positional `N` and compatibility `port=N` forms:
+
+```sh
+just manifest-live-session-arbitration-gateway-smoke port=17006
+```
+
+The run built the executable, launched the wrapper with
+`PORT=17006`, observed every acceptance marker, released the UDP
+port, and exited 0:
+
+```text
+=== marker checks ===
+  [ok]   1.  supervised require-preserving session route
+  [ok]   2a. audio running
+  [ok]   2b. OSC ingress bound on configured port
+  [ok]   3.  pre-reload OSC accept (value=1800)
+  [ok]   4a. supervised outcome committed
+  [ok]   4b. preserving phase started
+  [ok]   4c. preserving phase committed
+  [ok]   4d. no stopped-audio phase (no fallback composition)
+  [ok]   5a. post-reload status shows current plan = new demo
+  [ok]   5b. post-reload OSC accept (value=900)
+  [ok]   6a. session exit 0
+  [ok]   6b. ss snapshot clean (no listener)
+  [ok]   6c. active bind probe rebound port
+
+=== SMOKE PASSED ===
+All acceptance markers observed.
+  transcript: /tmp/manifest-live-session-arbitration-gateway-transcript.txt
+  probe log:  /tmp/manifest-live-session-arbitration-gateway-probe.txt
+```
 
 Do not extend this into richer arbitration policy mutation until a
 concrete caller needs structured policy input.
