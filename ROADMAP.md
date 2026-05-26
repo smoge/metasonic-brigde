@@ -756,6 +756,11 @@ schedule introspection (`--fusion-survey` corpus FreeLayer-width
 table), and future RCU-style topology swap (Phase 5). A "no
 parallelism" outcome would not retire that infrastructure.
 
+The §4.E.2 substrate close-out — Phase A / B / C0 / C1 inventory plus
+the T-1..T-11 design-note coverage matrix — lives in
+`notes/2026-05-25-m-phase-4e2-substrate-closeout.md`. Consult it
+before reopening any §4.E / §4.E.2 work.
+
 ---
 
 ## 5 — Hot Graph Replacement
